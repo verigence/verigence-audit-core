@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+from audit_core.audit_review import router as audit_review_router
 from audit_core.bookings import router as booking_router
 from audit_core.commercials import router as commercials_router
 from audit_core.config import load_settings
@@ -38,6 +39,7 @@ app.include_router(payments_finance_router)
 app.include_router(insurance_tradein_router)
 app.include_router(vehicle_delivery_router)
 app.include_router(findings_router)
+app.include_router(audit_review_router)
 
 
 @app.get("/health")
