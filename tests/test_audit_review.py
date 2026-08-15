@@ -58,6 +58,18 @@ def test_pc_submit_send_back_and_pm_review_do_not_change_delivery_status() -> No
                 "category_id": category_id,
             },
         )
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.business_status_codes (
+                    tenant_id, domain_key, status_code, status_label
+                ) VALUES (
+                    :tenant_id, 'DELIVERY', 'DELIVERED_SOURCE_STATUS', 'Delivered'
+                )
+                """
+            ),
+            {"tenant_id": tenant_id},
+        )
         dealer_id = connection.execute(
             text(
                 "INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
@@ -153,7 +165,11 @@ def test_pc_submit_send_back_and_pm_review_do_not_change_delivery_status() -> No
         app.dependency_overrides[get_principal] = lambda: Principal(
             subject=pc_id,
             tenant_id=tenant_id,
-            permissions=("audit.journey.read", "audit.journey.update", "audit.journey.submit"),
+            permissions=(
+                "audit.journey.read",
+                "audit.journey.update",
+                "audit.journey.submit",
+            ),
         )
         started = client.post(f"{base}/audit/start")
         assert started.status_code == 200, started.text
