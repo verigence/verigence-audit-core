@@ -35,6 +35,23 @@ def create_escalation_with_task(
     if journey is None:
         raise LookupError("Journey not found for escalation")
 
+    connection.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+        {"lock_key": f"{tenant_id}:{effect_key}"},
+    )
+    existing = connection.execute(
+        text(
+            """
+            SELECT workflow_task_id, task_payload->>'escalationId' AS escalation_id
+            FROM auditcore.workflow_tasks
+            WHERE tenant_id = :tenant_id AND effect_key = :effect_key
+            """
+        ),
+        {"tenant_id": tenant_id, "effect_key": effect_key},
+    ).mappings().one_or_none()
+    if existing is not None:
+        return UUID(existing["escalation_id"]), existing["workflow_task_id"]
+
     escalation_id = connection.execute(
         text(
             """
