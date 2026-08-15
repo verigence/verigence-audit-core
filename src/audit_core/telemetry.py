@@ -171,7 +171,7 @@ def trace_span(
     outcome = "SUCCESS"
     try:
         yield resolved_trace_id, span_id
-    except Exception:  # noqa: BLE001 -- span must re-raise arbitrary business exceptions
+    except Exception:
         outcome = "FAILURE"
         raise
     finally:
