@@ -43,19 +43,22 @@ def _operations_from_spec(spec: dict) -> list[tuple[str, str, dict]]:
 def _clean_process_route_metadata() -> list[dict]:
     script = r'''
 import json
-from fastapi.routing import APIRoute
 from audit_core.main import app
 
 rows = []
 for route in app.routes:
-    if not isinstance(route, APIRoute):
+    path = getattr(route, "path", None)
+    methods = getattr(route, "methods", None)
+    if not path or not methods:
         continue
+    dependant = getattr(route, "dependant", None)
+    header_params = getattr(dependant, "header_params", []) if dependant is not None else []
     rows.append({
-        "path": route.path,
-        "methods": sorted(route.methods),
+        "path": path,
+        "methods": sorted(methods),
         "headers": [
             {"alias": field.alias, "required": field.required}
-            for field in route.dependant.header_params
+            for field in header_params
         ],
     })
 print(json.dumps(rows))
