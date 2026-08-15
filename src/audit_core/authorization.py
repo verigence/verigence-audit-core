@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from audit_core.security import Principal
 
 
-@dataclass(frozen=True)
+@dataclass
 class AuthorizationError(RuntimeError):
     error_code: str
     status_code: int
