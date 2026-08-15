@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verigence-audit-core"
+version = "0.1.0"
+description = "Verigence Audit Core service"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi==0.139.2",
+    "uvicorn[standard]==0.51.0",
+    "SQLAlchemy==2.0.51",
+    "alembic==1.18.5",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest==9.1.1",
+    "httpx==0.28.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
