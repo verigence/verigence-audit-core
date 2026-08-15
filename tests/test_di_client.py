@@ -179,14 +179,16 @@ def test_client_translates_di_problem_without_exposing_wire_body() -> None:
             },
         )
 
-    with DiClient(base_url="https://di.test", transport=httpx.MockTransport(handle)) as client:
-        with pytest.raises(DiClientError) as raised:
-            client.get_document(
-                token=TOKEN,
-                tenant_id=TENANT,
-                subject_id=SUBJECT,
-                document_id=DOCUMENT,
-            )
+    with (
+        DiClient(base_url="https://di.test", transport=httpx.MockTransport(handle)) as client,
+        pytest.raises(DiClientError) as raised,
+    ):
+        client.get_document(
+            token=TOKEN,
+            tenant_id=TENANT,
+            subject_id=SUBJECT,
+            document_id=DOCUMENT,
+        )
 
     assert raised.value.status_code == 503
     assert raised.value.code == "STORAGE_UNAVAILABLE"
@@ -197,14 +199,16 @@ def test_client_translates_di_problem_without_exposing_wire_body() -> None:
 def test_client_rejects_malformed_di_success_contract() -> None:
     transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"unexpected": True}))
 
-    with DiClient(base_url="https://di.test", transport=transport) as client:
-        with pytest.raises(DiClientError) as raised:
-            client.get_document(
-                token=TOKEN,
-                tenant_id=TENANT,
-                subject_id=SUBJECT,
-                document_id=DOCUMENT,
-            )
+    with (
+        DiClient(base_url="https://di.test", transport=transport) as client,
+        pytest.raises(DiClientError) as raised,
+    ):
+        client.get_document(
+            token=TOKEN,
+            tenant_id=TENANT,
+            subject_id=SUBJECT,
+            document_id=DOCUMENT,
+        )
 
     assert raised.value.status_code == 502
     assert raised.value.code == "DI_CONTRACT_ERROR"
