@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import jwt
 import pytest
@@ -36,7 +36,7 @@ def _token(private_key, **overrides) -> str:
         "sub": "user-123",
         "tenant_id": "tenant-123",
         "permissions": ["audit.journey.read"],
-        "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+        "exp": datetime.now(UTC) + timedelta(minutes=5),
     }
     claims.update(overrides)
     return jwt.encode(claims, private_key, algorithm="RS256")
@@ -84,7 +84,7 @@ def test_security_token_rejects_invalid_signature() -> None:
 
 def test_security_token_rejects_expired_token() -> None:
     private_key = _private_key()
-    expired_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    expired_at = datetime.now(UTC) - timedelta(seconds=1)
 
     with pytest.raises(SecurityTokenError):
         _validator(private_key).validate(_token(private_key, exp=expired_at))
