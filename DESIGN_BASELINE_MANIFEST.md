@@ -6,6 +6,8 @@
 **Superseded review candidate:** `VAC-SD-002` / v2.0 — retained for traceability  
 **Current implementation baseline:** `VAC-SD-003` / Audit Core Solution Design v2.1 — **APPROVED / BASELINED FOR IMPLEMENTATION**  
 **Approved authentication amendment:** `VAC-SD-AUTH-001` / Audit Core Cross-Module Authentication Design v1.0 — **APPROVED ARCHITECTURE DECISION**  
+**Approved role-bundle amendment:** `VAC-SD-RBAC-001` / Audit Core Default Operational Role Bundles v1.0 — **APPROVED ARCHITECTURE DECISION**  
+**Current Security permission catalogue:** `design/AUDIT_CORE_SECURITY_CATALOG_v2.1.json` — **APPROVED FOR SECURITY REGISTRATION**  
 **Current physical-schema baseline:** `VAC-DB-002` / Audit Core PostgreSQL Schema v2.1 — **APPROVED / BASELINED FOR IMPLEMENTATION**  
 **Requirements:** `VAC-REQ-001 v1.0` + authoritative corrections `VAC-REQ-ADD-001 v1.1` and `VAC-REQ-ADD-002 v1.2`  
 **Implementation baseline approval date:** 2026-08-15
@@ -19,6 +21,8 @@
 | `docs/AUDIT_CORE_REQUIREMENTS_CORRECTION_ADDENDUM_v1.2.md` | `VAC-REQ-ADD-002` | APPROVED BUSINESS CORRECTIONS |
 | `docs/AUDIT_CORE_SOLUTION_DESIGN_v2.1.md` | `VAC-SD-003` | APPROVED / BASELINED FOR IMPLEMENTATION |
 | `docs/AUDIT_CORE_CROSS_MODULE_AUTH_DESIGN_v1.0.md` | `VAC-SD-AUTH-001` | APPROVED ARCHITECTURE DECISION / AUTHENTICATION AMENDMENT |
+| `docs/AUDIT_CORE_DEFAULT_ROLE_BUNDLES_v1.0.md` | `VAC-SD-RBAC-001` | APPROVED ARCHITECTURE DECISION / DEFAULT ROLE BUNDLES |
+| `design/AUDIT_CORE_SECURITY_CATALOG_v2.1.json` | Audit Core permission catalogue v2.1 | APPROVED FOR SECURITY REGISTRATION |
 | `docs/AUDIT_CORE_DESIGN_RECONCILIATION_v2.1.md` | `VAC-DR-003` | APPROVED / BASELINED FOR IMPLEMENTATION |
 | `docs/AUDIT_CORE_API_CONTRACT_v1.0.md` | `VAC-API-001` | APPROVED / BASELINED FOR IMPLEMENTATION |
 | `api/openapi-v1.yaml` | machine-readable API companion | APPROVED / BASELINED FOR IMPLEMENTATION |
@@ -49,6 +53,7 @@
 19. `VAC-DB-002` implements durable workflow persistence, immutable task history, retry/lease recovery, dead-letter visibility, idempotency and outbox/inbox structures.
 20. `VAC-DB-002` protects published master versions and their child rows from post-publication mutation.
 21. **Cross-module authentication is Security-mediated:** user-driven synchronous downstream calls use OAuth delegated token exchange/on-behalf-of semantics; module-owned admin/system work and background continuation of already-authorized work use a short-lived Tenant-scoped Audit Core `SERVICE` token. Service identity must never be used to bypass a user's role authorization.
+22. **Default operational RBAC is cross-module and Tenant-customizable:** Security provides PC, TL, PM and CRM onboarding templates containing approved `audit.*` and `di.*` permissions. Tenant Admin may customize those four templates for its Tenant; Super Admin may customize Tenant templates and platform defaults. The resolved `permissions[]` claim remains authoritative, PC has no default formal verification-write authority, and destructive/platform-admin DI permissions are excluded from these operational templates.
 
 ## v2.0 package — historical review traceability
 
@@ -62,7 +67,7 @@ v2.0 is superseded by the approved v2.1 implementation baseline, particularly fo
 
 - `docs/AUDIT_CORE_SOLUTION_DESIGN_v1.0.md` — `VAC-SD-001` — IMPLEMENTATION HOLD
 - `database/AUDIT_CORE_POSTGRESQL_SCHEMA_v1.0.sql` — `VAC-DB-001` — IMPLEMENTATION HOLD
-- `design/AUDIT_CORE_SECURITY_CATALOG_v1.0.json` — REGISTRATION HOLD
+- `design/AUDIT_CORE_SECURITY_CATALOG_v1.0.json` — REGISTRATION HOLD / SUPERSEDED BY v2.1
 - `docs/AUDIT_CORE_REQUIREMENTS_BASELINE_v1.0.md` — `VAC-REQ-001`, corrected by v1.1/v1.2 addenda where conflicts exist
 
 ## Retained architecture principles
@@ -79,8 +84,8 @@ v2.0 is superseded by the approved v2.1 implementation baseline, particularly fo
 
 ## Governance
 
-The project owner approved the current v2.1 package for implementation on 2026-08-15. `VAC-SD-003`, `VAC-API-001`, `VAC-ERR-001`, `VAC-DM-002`, `VAC-DB-002` and `api/openapi-v1.yaml` are therefore the formal Audit Core implementation baseline. `VAC-SD-AUTH-001` is an approved architecture amendment to that baseline for cross-module authentication and authorization. Material changes must follow requirements/design/API/schema change control rather than being introduced silently during implementation.
+The project owner approved the current v2.1 package for implementation on 2026-08-15. `VAC-SD-003`, `VAC-API-001`, `VAC-ERR-001`, `VAC-DM-002`, `VAC-DB-002` and `api/openapi-v1.yaml` are therefore the formal Audit Core implementation baseline. `VAC-SD-AUTH-001` is an approved architecture amendment to that baseline for cross-module authentication and authorization. `VAC-SD-RBAC-001` and `design/AUDIT_CORE_SECURITY_CATALOG_v2.1.json` are the approved role/permission amendments for Security registration and Tenant onboarding. Material changes must follow requirements/design/API/schema change control rather than being introduced silently during implementation.
 
 `VAC-DB-002` is a fresh target physical schema, not an automatic in-place migration from `VAC-DB-001`. Migration/deployment sequencing shall be defined by the implementation tasks after runtime/tooling is confirmed.
 
-The Audit Core Security catalogue must also be realigned to the approved v2.1 role/DI façade model before Security registration. Security must implement the service-token and delegated OAuth token-exchange capabilities defined by `VAC-SD-AUTH-001`; no direct DI authentication bypass is permitted.
+The v1.0 Audit Core Security catalogue remains on hold. Security SHALL register/use the v2.1 Audit Core permission catalogue and the approved four default operational role templates. Security must continue to implement the service-token and delegated OAuth token-exchange capabilities defined by `VAC-SD-AUTH-001`; no direct DI authentication bypass is permitted.
