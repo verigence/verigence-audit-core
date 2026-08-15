@@ -17,6 +17,7 @@ class ProjectResponse(BaseModel):
     tenantId: str
     projectCode: str
     projectName: str
+    timezone: str
 
 
 class ProjectPatch(BaseModel):
@@ -35,7 +36,7 @@ def _project(connection: Connection, tenant_id: str) -> ProjectResponse:
     row = connection.execute(
         text(
             """
-            SELECT tenant_id, project_code, project_name
+            SELECT tenant_id, project_code, project_name, timezone_name
             FROM auditcore.projects
             WHERE tenant_id = :tenant_id
             """
@@ -48,6 +49,7 @@ def _project(connection: Connection, tenant_id: str) -> ProjectResponse:
         tenantId=row["tenant_id"],
         projectCode=row["project_code"],
         projectName=row["project_name"],
+        timezone=row["timezone_name"],
     )
 
 
@@ -80,7 +82,7 @@ def patch_project(
                 updated_at_utc = now(),
                 version_no = version_no + 1
             WHERE tenant_id = :tenant_id
-            RETURNING tenant_id, project_code, project_name
+            RETURNING tenant_id, project_code, project_name, timezone_name
             """
         ),
         {
@@ -95,4 +97,5 @@ def patch_project(
         tenantId=row["tenant_id"],
         projectCode=row["project_code"],
         projectName=row["project_name"],
+        timezone=row["timezone_name"],
     )
