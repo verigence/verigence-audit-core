@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 
 from fastapi import FastAPI, Request
@@ -5,7 +6,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from audit_core.authorization import AuthorizationError
+from audit_core.observability import get_correlation_id
 from audit_core.security import SecurityTokenError
+
+logger = logging.getLogger("audit_core")
 
 
 @dataclass(frozen=True)
@@ -37,7 +41,15 @@ def _problem(
     title: str,
     detail: str,
 ) -> JSONResponse:
-    correlation_id = request.headers.get("X-Correlation-ID", "unknown")
+    correlation_id = get_correlation_id(request)
+    logger.warning(
+        "api_error",
+        extra={
+            "correlation_id": correlation_id,
+            "error_code": error_code,
+            "status_code": status_code,
+        },
+    )
     return JSONResponse(
         status_code=status_code,
         media_type="application/problem+json",
