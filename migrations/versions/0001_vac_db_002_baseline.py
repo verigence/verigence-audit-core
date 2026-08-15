@@ -37,7 +37,11 @@ def _load_frozen_schema() -> str:
 
 
 def upgrade() -> None:
-    op.get_bind().exec_driver_sql(_load_frozen_schema())
+    # Psycopg uses percent tokens for client-side parameter placeholders. VAC-DB-002
+    # legitimately contains PostgreSQL format() tokens such as %I, so escape percent
+    # characters for the driver; PostgreSQL receives the original SQL unchanged.
+    driver_safe_schema = _load_frozen_schema().replace("%", "%%")
+    op.get_bind().exec_driver_sql(driver_safe_schema)
 
 
 def downgrade() -> None:
