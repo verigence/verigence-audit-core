@@ -182,6 +182,7 @@ def test_vehicle_registration_and_delivery_status_history_are_journey_facts() ->
 
         ready = client.put(
             f"{base}/delivery",
+            headers={"Idempotency-Key": f"delivery-ready-{suffix}"},
             json={
                 "plannedDeliveryAt": "2026-08-16T10:00:00Z",
                 "actualDeliveryStatusCode": "READY_TEST",
@@ -193,6 +194,7 @@ def test_vehicle_registration_and_delivery_status_history_are_journey_facts() ->
 
         delivered = client.put(
             f"{base}/delivery",
+            headers={"Idempotency-Key": f"delivery-delivered-{suffix}"},
             json={
                 "plannedDeliveryAt": "2026-08-16T10:00:00Z",
                 "actualDeliveryStatusCode": "DELIVERED_TEST",
