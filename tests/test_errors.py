@@ -1,6 +1,6 @@
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-import pytest
 
 from audit_core.errors import ConflictError, NotFoundError, install_error_handlers
 from audit_core.security import SecurityTokenError
