@@ -118,7 +118,7 @@ def set_telemetry_sink(sink: TelemetrySink) -> TelemetrySink:
 
 def record_metric(
     name: str,
-    value: int | float = 1,
+    value: float = 1,
     *,
     kind: str = "counter",
     labels: Mapping[str, str] | None = None,
@@ -133,7 +133,7 @@ def record_metric(
     )
     try:
         _sink.metric(point)
-    except Exception:
+    except Exception:  # noqa: BLE001 -- telemetry must never block business processing
         logger.warning("telemetry_metric_export_failed", exc_info=False)
 
 
@@ -171,7 +171,7 @@ def trace_span(
     outcome = "SUCCESS"
     try:
         yield resolved_trace_id, span_id
-    except Exception:
+    except Exception:  # noqa: BLE001 -- span must re-raise arbitrary business exceptions
         outcome = "FAILURE"
         raise
     finally:
@@ -190,5 +190,5 @@ def trace_span(
         )
         try:
             _sink.span(record)
-        except Exception:
+        except Exception:  # noqa: BLE001 -- telemetry must never block business processing
             logger.warning("telemetry_trace_export_failed", exc_info=False)
