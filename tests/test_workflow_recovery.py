@@ -181,7 +181,9 @@ def test_worker_retry_and_stale_lease_recovery_reuse_the_same_task() -> None:
             text(
                 """
                 UPDATE auditcore.workflow_tasks
-                SET lease_expires_at_utc = now() - interval '1 second'
+                SET lease_acquired_at_utc = now() - interval '2 minutes',
+                    lease_heartbeat_at_utc = now() - interval '2 minutes',
+                    lease_expires_at_utc = now() - interval '1 minute'
                 WHERE tenant_id = :tenant_id AND workflow_task_id = :task_id
                 """
             ),
