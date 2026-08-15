@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+from audit_core.bookings import router as booking_router
 from audit_core.config import load_settings
 from audit_core.customers import router as customer_router
 from audit_core.dealers import router as dealer_router
@@ -26,8 +27,9 @@ app.include_router(customer_router)
 app.include_router(journey_router)
 app.include_router(evidence_router)
 app.include_router(evidence_read_router)
+app.include_router(booking_router)
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status":"ok"}
+    return {"status": "ok"}
