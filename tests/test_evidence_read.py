@@ -7,7 +7,12 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-from audit_core.dependencies import get_bearer_token, get_connection, get_engine, get_principal
+from audit_core.dependencies import (
+    get_bearer_token,
+    get_connection,
+    get_engine,
+    get_principal,
+)
 from audit_core.di_client import DiDocument, DiFact
 from audit_core.evidence import get_di_client, get_security_oauth_client
 from audit_core.main import app
