@@ -1,6 +1,5 @@
-from fastapi import FastAPI
-
 from audit_core.config import settings
+from fastapi import FastAPI
 
 
 app = FastAPI(
