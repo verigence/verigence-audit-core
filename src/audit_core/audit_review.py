@@ -8,12 +8,14 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Connection, text
 
+from audit_core.audit_events import append_audit_event, append_outbox_event
 from audit_core.authorization import AuthorizationError, authorize
 from audit_core.business_assignments import require_business_scope
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_principal
 from audit_core.errors import AuditCoreError, NotFoundError
 from audit_core.security import Principal
+from audit_core.workflow import create_workflow_task
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/journeys/{journey_id}", tags=["audit-review"])
 
@@ -143,6 +145,35 @@ def _require_reviewer_role(
         )
 
 
+def _append_transition_events(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    event_type: str,
+    payload: dict[str, str],
+    actor_id: str,
+) -> None:
+    append_audit_event(
+        connection,
+        tenant_id=tenant_id,
+        entity_type="JOURNEY",
+        entity_id=str(journey_id),
+        event_type=event_type,
+        event_payload=payload,
+        actor_id=actor_id,
+    )
+    append_outbox_event(
+        connection,
+        tenant_id=tenant_id,
+        event_type=event_type,
+        aggregate_type="JOURNEY",
+        aggregate_id=str(journey_id),
+        journey_id=journey_id,
+        event_payload=payload,
+    )
+
+
 @router.get("/audit", response_model=AuditStateResponse)
 def get_audit_state(
     tenant_id: str,
@@ -152,12 +183,7 @@ def get_audit_state(
 ) -> AuditStateResponse:
     authorize(principal, tenant_id=tenant_id, permission="audit.journey.read")
     set_tenant_context(connection, tenant_id)
-    row = _scope(
-        connection,
-        principal,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-    )
+    row = _scope(connection, principal, tenant_id=tenant_id, journey_id=journey_id)
     return _state_response(journey_id, row)
 
 
@@ -170,12 +196,7 @@ def start_audit(
 ) -> AuditStateResponse:
     authorize(principal, tenant_id=tenant_id, permission="audit.journey.update")
     set_tenant_context(connection, tenant_id)
-    row = _scope(
-        connection,
-        principal,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-    )
+    row = _scope(connection, principal, tenant_id=tenant_id, journey_id=journey_id)
     if row["audit_state"] not in {"NOT_STARTED", "IN_PROGRESS"}:
         raise AuditCoreError(
             error_code="VAC-CONFLICT-002",
@@ -196,6 +217,14 @@ def start_audit(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     )
+    _append_transition_events(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        event_type="AUDIT_STARTED",
+        payload={"auditState": "IN_PROGRESS"},
+        actor_id=principal.subject,
+    )
     return _state_response(journey_id, _journey(connection, tenant_id, journey_id))
 
 
@@ -208,12 +237,7 @@ def submit_audit(
 ) -> AuditStateResponse:
     authorize(principal, tenant_id=tenant_id, permission="audit.journey.submit")
     set_tenant_context(connection, tenant_id)
-    row = _scope(
-        connection,
-        principal,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-    )
+    row = _scope(connection, principal, tenant_id=tenant_id, journey_id=journey_id)
     if row["audit_state"] not in {"IN_PROGRESS", "SENT_BACK"}:
         raise AuditCoreError(
             error_code="VAC-CONFLICT-002",
@@ -235,6 +259,26 @@ def submit_audit(
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
+    )
+    create_workflow_task(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        workflow_type="AUDIT_REVIEW",
+        process_area="AUDIT",
+        task_type="TL_REVIEW",
+        assigned_role_code="TL",
+        dealer_id=row["dealer_id"],
+        outlet_id=row["outlet_id"],
+        task_payload={"reason": "PC_SUBMITTED"},
+    )
+    _append_transition_events(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        event_type="AUDIT_SUBMITTED",
+        payload={"auditState": "PC_SUBMITTED", "nextTask": "TL_REVIEW"},
+        actor_id=principal.subject,
     )
     return _state_response(journey_id, _journey(connection, tenant_id, journey_id))
 
@@ -285,12 +329,7 @@ def create_review_decision(
 ) -> ReviewDecisionResponse:
     authorize(principal, tenant_id=tenant_id, permission="audit.review.decide")
     set_tenant_context(connection, tenant_id)
-    journey = _scope(
-        connection,
-        principal,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-    )
+    journey = _scope(connection, principal, tenant_id=tenant_id, journey_id=journey_id)
     _require_reviewer_role(
         connection,
         principal,
@@ -357,6 +396,38 @@ def create_review_decision(
             "audit_outcome": outcome,
             "completed_at": completed_at,
         },
+    )
+
+    if payload.decision == "SEND_BACK":
+        create_workflow_task(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            workflow_type="AUDIT_CORRECTION",
+            process_area="AUDIT",
+            task_type="PC_CORRECTION",
+            assigned_role_code="PC",
+            dealer_id=journey["dealer_id"],
+            outlet_id=journey["outlet_id"],
+            task_payload={
+                "reason": "SEND_BACK",
+                "reviewDecisionId": str(decision_id),
+            },
+        )
+
+    event_type = "AUDIT_SENT_BACK" if payload.decision == "SEND_BACK" else "AUDIT_REVIEW_COMPLETED"
+    _append_transition_events(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        event_type=event_type,
+        payload={
+            "auditState": next_state,
+            "auditOutcome": outcome,
+            "decision": payload.decision,
+            "reviewerRoleCode": payload.reviewerRoleCode,
+        },
+        actor_id=principal.subject,
     )
     row = connection.execute(
         text(
