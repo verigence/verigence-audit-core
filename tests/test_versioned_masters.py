@@ -195,7 +195,7 @@ def test_document_control_and_policy_versions_are_immutable_and_referenceable() 
                 connection.execute(
                     text(
                         "UPDATE auditcore.project_policy_versions "
-                        "SET policy_settings = '{\"changed\":true}'::jsonb "
+                        "SET policy_settings = jsonb_build_object('changed', true) "
                         "WHERE tenant_id = :tenant_id AND policy_version_id = :version_id"
                     ),
                     {"tenant_id": tenant_id, "version_id": policy_version_id},
