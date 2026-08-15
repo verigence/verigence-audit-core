@@ -15,7 +15,12 @@ from audit_core.price_lists import (
     resolve_effective_price_list_version,
     retire_price_list_version,
 )
-from audit_core.product_catalogue import create_model, create_oem, create_sku, create_variant
+from audit_core.product_catalogue import (
+    create_model,
+    create_oem,
+    create_sku,
+    create_variant,
+)
 
 
 def test_price_list_publish_resolve_immutable_and_retire() -> None:
@@ -121,15 +126,17 @@ def test_price_list_publish_resolve_immutable_and_retire() -> None:
                 effective_on=date(2026, 8, 15),
             ) == version_id
 
-            with pytest.raises(DBAPIError, match="child rows may only be changed"):
-                with connection.begin_nested():
-                    connection.execute(
-                        text(
-                            "UPDATE auditcore.price_list_items SET standard_amount = 102000 "
-                            "WHERE tenant_id = :tenant_id AND price_list_item_id = :item_id"
-                        ),
-                        {"tenant_id": tenant_id, "item_id": item_id},
-                    )
+            with (
+                pytest.raises(DBAPIError, match="child rows may only be changed"),
+                connection.begin_nested(),
+            ):
+                connection.execute(
+                    text(
+                        "UPDATE auditcore.price_list_items SET standard_amount = 102000 "
+                        "WHERE tenant_id = :tenant_id AND price_list_item_id = :item_id"
+                    ),
+                    {"tenant_id": tenant_id, "item_id": item_id},
+                )
 
             retire_price_list_version(
                 connection,
