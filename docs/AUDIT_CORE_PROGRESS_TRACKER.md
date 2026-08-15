@@ -29,23 +29,23 @@ Rules:
 ## 2. Current position
 
 **Implementation tasks:** 48  
-**COMPLETE:** 4  
+**COMPLETE:** 9  
 **VERIFIED:** 0  
 **CODE COMPLETE:** 0  
 **IN PROGRESS:** 0  
 **BLOCKED:** 0  
-**NOT STARTED:** 44  
-**Implementation completion:** 8.3%
+**NOT STARTED:** 39  
+**Implementation completion:** 18.8%
 
-The v2.1 implementation package and runtime/tooling baseline are approved. A-01 and A-02 are complete; the repository now has a minimal FastAPI service plus a passing build/lint/unit-test GitHub Actions quality gate. A-03 is the next eligible task.
+Repository/CI foundation and the PostgreSQL foundation are complete. Runtime configuration now fails safely when `APP_ENV` is absent; VAC-DB-002 is an immutable Alembic baseline applied from a fresh PostgreSQL database; the runtime DB role is non-owner/non-BYPASSRLS, cross-Tenant RLS is verified, DELETE is denied, and published master mutation is rejected. C-01 Security JWT verification is the next eligible task.
 
 ## 3. Increment summary
 
 | Increment | Scope | Tasks | Complete | Status |
 |---|---|---:|---:|---|
 | P0 | Freeze implementation inputs | 2 | 2 | COMPLETE |
-| A | Repository and CI foundation | 3 | 2 | IN PROGRESS |
-| B | PostgreSQL foundation | 4 | 0 | NOT STARTED |
+| A | Repository and CI foundation | 3 | 3 | COMPLETE |
+| B | PostgreSQL foundation | 4 | 4 | COMPLETE |
 | C | Security, errors and request context | 4 | 0 | NOT STARTED |
 | D | Project landscape and assignments | 4 | 0 | NOT STARTED |
 | E | Versioned masters | 4 | 0 | NOT STARTED |
@@ -65,11 +65,11 @@ The v2.1 implementation package and runtime/tooling baseline are approved. A-01 
 | P0-02 | Confirm runtime/tooling | COMPLETE | Project-owner confirmation recorded 2026-08-15; `docs/AUDIT_CORE_RUNTIME_TOOLING_v1.0.md` committed as the approved runtime/tooling/hosting baseline in commit `823ff236aabb95e3e05b9389017299d7da527e0a` and verified by repository read | None |
 | A-01 | Scaffold Audit Core service | COMPLETE | Service scaffold committed in `a1601fb0f417708ebf2d4918882e89b6f4e7e219`; `pytest -q` passed 2 tests; Uvicorn startup verified `/health` = 200 with `{"status":"ok"}`, while `/` and `/docs` = 404; committed files re-read from `main` | None |
 | A-02 | Add CI quality gate | COMPLETE | CI workflow and Ruff gate introduced in `05b766cd740e93e02d88037557124b152fed998e`; lint corrections completed through `aa4ae93915aaa109f2c6f69a19e6d17f8d8ebf13`; GitHub Actions run `31878194470` passed build, Ruff lint and `pytest -q` unit tests on `main` | None |
-| A-03 | Add environment/config validation | NOT STARTED | — | Depends A-01 |
-| B-01 | Convert VAC-DB-002 into migration baseline | NOT STARTED | — | Depends P0-01/P0-02 |
-| B-02 | Enforce Tenant RLS runtime pattern | NOT STARTED | — | Critical tenant-isolation task |
-| B-03 | Verify no-delete DB privileges | NOT STARTED | — | Critical destructive-access task |
-| B-04 | Verify master immutability | NOT STARTED | — | Published master protections |
+| A-03 | Add environment/config validation | COMPLETE | `src/audit_core/config.py`, startup validation in `src/audit_core/main.py`, and `tests/test_config.py` implemented through commits `0c41b851e302ecf080535e24b694d0b35bb8dee1`, `9fd9c9ea0ec5fd48e4d3a896377e4c283305b6df`, and `80e3fc7f4fa4458a0eba24e8697c17cee5aa11ba`; GitHub Actions run `31878482855` passed after test-environment lint correction `56a1e50e2a7df10cdbef5b77c2aea0daeebbb4bc`; missing `APP_ENV` is covered by a negative startup test without secret values in the error | None |
+| B-01 | Convert VAC-DB-002 into migration baseline | COMPLETE | Alembic config/environment and frozen migration `0001_vac_db_002_baseline.py` implemented; migration verifies the source Git blob before execution and strips source transaction wrappers; PostgreSQL driver format-token handling corrected in `e2d45396c558de63d9e4e7f1f70b477ec19f41f1`; GitHub Actions run `31878639884` applied the migration from a fresh PostgreSQL 16 database and passed build/lint/tests | None |
+| B-02 | Enforce Tenant RLS runtime pattern | COMPLETE | `0002_runtime_role_rls.py` creates non-login, non-owner, non-superuser, non-BYPASSRLS `audit_core_runtime`; `src/audit_core/db.py` sets transaction-local validated tenant context; `tests/test_database_security.py` verifies runtime-role properties, same-Tenant visibility, cross-Tenant invisibility and cross-Tenant INSERT rejection; GitHub Actions run `31878786632` passed fresh migrations and all security tests | None |
+| B-03 | Verify no-delete DB privileges | COMPLETE | Runtime role grants omit and explicitly revoke DELETE; `tests/test_database_security.py` verifies `has_table_privilege(..., 'DELETE') = false` and a runtime-role DELETE attempt fails with permission denied; GitHub Actions run `31878786632` passed | None |
+| B-04 | Verify master immutability | COMPLETE | `tests/test_database_security.py` publishes a project-policy master version and verifies a subsequent content mutation is rejected by the VAC-DB-002 immutability trigger; GitHub Actions run `31878786632` passed | None |
 | C-01 | Implement Security JWT verification | NOT STARTED | — | Verify current Security contract at implementation time |
 | C-02 | Enforce Tenant and permission checks | NOT STARTED | — | Depends C-01 |
 | C-03 | Implement common error handling | NOT STARTED | — | Must map VAC-ERR-001 |
