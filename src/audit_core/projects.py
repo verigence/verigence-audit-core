@@ -1,3 +1,5 @@
+from typing import Annotated
+
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
@@ -52,8 +54,8 @@ def _project(connection: Connection, tenant_id: str) -> ProjectResponse:
 @router.get("", response_model=ProjectResponse)
 def get_project(
     tenant_id: str,
-    principal: Principal = Depends(get_principal),
-    connection: Connection = Depends(get_connection),
+    principal: Annotated[Principal, Depends(get_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
 ) -> ProjectResponse:
     require_tenant(principal, tenant_id)
     set_tenant_context(connection, tenant_id)
@@ -64,8 +66,8 @@ def get_project(
 def patch_project(
     tenant_id: str,
     patch: ProjectPatch,
-    principal: Principal = Depends(get_principal),
-    connection: Connection = Depends(get_connection),
+    principal: Annotated[Principal, Depends(get_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
 ) -> ProjectResponse:
     require_tenant(principal, tenant_id)
     set_tenant_context(connection, tenant_id)
