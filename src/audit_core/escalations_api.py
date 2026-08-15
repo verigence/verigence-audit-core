@@ -13,7 +13,11 @@ from audit_core.business_assignments import require_business_scope
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_principal
 from audit_core.errors import NotFoundError
-from audit_core.escalations import create_escalation_with_task, get_escalation, resolve_escalation
+from audit_core.escalations import (
+    create_escalation_with_task,
+    get_escalation,
+    resolve_escalation,
+)
 from audit_core.idempotency import execute_idempotent_json_command
 from audit_core.security import Principal
 
