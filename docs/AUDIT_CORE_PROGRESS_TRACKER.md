@@ -29,15 +29,15 @@ Rules:
 ## 2. Current position
 
 **Implementation tasks:** 48  
-**COMPLETE:** 14  
+**COMPLETE:** 15  
 **VERIFIED:** 0  
 **CODE COMPLETE:** 0  
 **IN PROGRESS:** 0  
 **BLOCKED:** 0  
-**NOT STARTED:** 34  
-**Implementation completion:** 29.2%
+**NOT STARTED:** 33  
+**Implementation completion:** 31.3%
 
-Repository/CI, PostgreSQL foundation, and Security/error/request-context increment C are complete. D-01 now exposes Tenant-bound Project GET/PATCH against the one-Project-per-Tenant database key. D-02 Dealer and Outlet APIs is the next eligible task.
+Repository/CI, PostgreSQL foundation, and Security/error/request-context increment C are complete. D-01 Project projection and D-02 Dealer/Outlet APIs are complete with Tenant/Dealer hierarchy enforcement and no DELETE routes. D-03 dealership staff references is the next eligible task.
 
 ## 3. Increment summary
 
@@ -47,7 +47,7 @@ Repository/CI, PostgreSQL foundation, and Security/error/request-context increme
 | A | Repository and CI foundation | 3 | 3 | COMPLETE |
 | B | PostgreSQL foundation | 4 | 4 | COMPLETE |
 | C | Security, errors and request context | 4 | 4 | COMPLETE |
-| D | Project landscape and assignments | 4 | 1 | IN PROGRESS |
+| D | Project landscape and assignments | 4 | 2 | IN PROGRESS |
 | E | Versioned masters | 4 | 0 | NOT STARTED |
 | F | Customer and Journey | 3 | 0 | NOT STARTED |
 | G | Internal DI façade | 5 | 0 | NOT STARTED |
@@ -75,7 +75,7 @@ Repository/CI, PostgreSQL foundation, and Security/error/request-context increme
 | C-03 | Implement common error handling | COMPLETE | `src/audit_core/errors.py` provides typed Audit Core exceptions and centralized FastAPI mapping to `application/problem+json`; `src/audit_core/main.py` installs the handlers; `tests/test_errors.py` verifies representative validation, authentication, not-found, conflict and unexpected-system failures against VAC-ERR-001 without leaking the raw system error; implementation commits `5ebf41f6b06c995f15c4e3f63f66d9823d5fe3b1`, `ed1a70f2a0e9e0ae7bbf347c34a68718b9179f2a`, `7071e6d5f00b2817fb73acdcf1785133f79b68e8`, lint fix `727c589654c02b4ca8c74cfa0f89fba62801cd24`; GitHub Actions run `31879368138` passed build, lint, fresh DB migration and tests | None |
 | C-04 | Implement correlation and safe structured logging | COMPLETE | `src/audit_core/observability.py` adds correlation middleware plus safe request/dependency structured fields; `src/audit_core/errors.py` correlates error responses/logs and avoids raw exception/payload logging; `tests/test_observability.py` verifies provided/generated correlation IDs, correlation on error responses, dependency log fields, and absence of token/PAN values from captured logs; commits `40d4fbfafe570bdc67de77c5285c6444d64d02d8`, `5d28f4f55d039b27bdb679eef660958b9da91c87`, `ca6a653cebd03a197b101544795fb0ba3972a0e2`, `ef7c2ae3052dc776a214124d4737b287eaf3f64c`, `6e849b95479da067ba0a3636c1d2fd9d9159b421`, `c0f297204d2944475b12cab2179062a8215c75eb`, `de6be3fdf704be9181cd11f6c8acc1f5f7ce485b`; GitHub Actions run `31879550810` passed build, lint, fresh DB migration and tests | None |
 | D-01 | Implement Project projection | COMPLETE | `src/audit_core/projects.py` adds Tenant-bound GET/PATCH Project routes over the existing `projects.tenant_id` primary key; `src/audit_core/dependencies.py` wires request DB/JWT dependencies without changing Security; `tests/test_projects.py` verifies one Tenant sees/updates only its Project and Tenant mismatch is denied; CI run `31879955713` passed build, lint, fresh migration and all tests after minimal lint/test fixes through commit `67c36e810e245f20703553d8aa960a6c53fa7170` | Exact per-operation Security permission names are not defined in the current approved Audit Core sources, so D-01 enforces the approved Tenant boundary without inventing permission vocabulary |
-| D-02 | Implement Dealer and Outlet APIs | NOT STARTED | — | No DELETE route |
+| D-02 | Implement Dealer and Outlet APIs | COMPLETE | `src/audit_core/dealers.py` implements Dealer/Outlet create, list, read, update and inactivate routes using the approved hierarchy and existing schema; `tests/test_dealers.py` verifies Dealer/Outlet CRUD/inactivation, matching Dealer hierarchy for Outlet creation, and that DELETE is not exposed; implementation commits `46ceb808ad8ef453e13fc73f6f7f0e23f84d99e8`, `8a1435ff0b4a11c7b592a08eb30269cfd471bd28`, `5f42a5f0e7d40f57b57376ffcbeb2c62a0f8674e`; GitHub Actions run `31880123064` passed build, lint, fresh DB migration and all tests | Exact per-operation Security permission names remain undefined in the approved Audit Core sources; Tenant boundary is enforced without inventing permission vocabulary |
 | D-03 | Implement dealership staff references | NOT STARTED | — | Dealer staff are reference participants |
 | D-04 | Implement Verigence business assignments | NOT STARTED | — | Dealer/Outlet coverage, not competing identity/RBAC |
 | E-01 | Implement product catalogue | NOT STARTED | — | OEM/Model/Variant/Colour/SKU |
