@@ -144,7 +144,8 @@ def test_pc_submit_rolls_back_when_required_task_insert_fails(monkeypatch) -> No
     try:
         client = TestClient(app, raise_server_exceptions=False)
         response = client.post(
-            f"/v1/tenants/{tenant_id}/journeys/{journey_id}/audit/submit"
+            f"/v1/tenants/{tenant_id}/journeys/{journey_id}/audit/submit",
+            headers={"Idempotency-Key": f"atomic-submit-{suffix}"},
         )
         assert response.status_code == 500
 
@@ -188,12 +189,26 @@ def test_pc_submit_rolls_back_when_required_task_insert_fails(monkeypatch) -> No
                 ),
                 {"tenant_id": tenant_id, "journey_id": journey_id},
             ).scalar_one()
+            idempotency_count = connection.execute(
+                text(
+                    """
+                    SELECT count(*) FROM auditcore.idempotency_records
+                    WHERE tenant_id = :tenant_id
+                      AND operation_key = :operation_key
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "operation_key": f"audit.submit:{journey_id}",
+                },
+            ).scalar_one()
 
         assert state["audit_state"] == "IN_PROGRESS"
         assert state["audit_outcome"] == "PENDING"
         assert task_count == 0
         assert audit_event_count == 0
         assert outbox_count == 0
+        assert idempotency_count == 0
     finally:
         app.dependency_overrides.clear()
         engine.dispose()
