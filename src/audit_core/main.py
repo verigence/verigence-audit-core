@@ -8,6 +8,7 @@ from audit_core.dealers import router as dealer_router
 from audit_core.errors import install_error_handlers
 from audit_core.evidence import router as evidence_router
 from audit_core.evidence_read import router as evidence_read_router
+from audit_core.findings import router as findings_router
 from audit_core.insurance_tradein import router as insurance_tradein_router
 from audit_core.journeys import router as journey_router
 from audit_core.observability import install_observability
@@ -36,6 +37,7 @@ app.include_router(commercials_router)
 app.include_router(payments_finance_router)
 app.include_router(insurance_tradein_router)
 app.include_router(vehicle_delivery_router)
+app.include_router(findings_router)
 
 
 @app.get("/health")
