@@ -163,16 +163,19 @@ def test_journey_links_customer_hierarchy_and_keeps_audit_fields_separate(journe
         journey_setup
     )
     client = TestClient(app, raise_server_exceptions=False)
+    create_headers = {"Idempotency-Key": f"journey-create-{uuid4().hex}"}
+    create_payload = {
+        "journeyReference": "JR-001",
+        "observedStatusCode": "SOURCE_STATUS",
+        "observedStatusSource": "OPERATIONAL_INPUT",
+        "documentRequirementProfileVersionId": str(profile_version_id),
+        "policyVersionId": str(policy_version_id),
+    }
 
     created = client.post(
         f"/v1/tenants/{tenant_id}/customers/{customer_id}/journeys",
-        json={
-            "journeyReference": "JR-001",
-            "observedStatusCode": "SOURCE_STATUS",
-            "observedStatusSource": "OPERATIONAL_INPUT",
-            "documentRequirementProfileVersionId": str(profile_version_id),
-            "policyVersionId": str(policy_version_id),
-        },
+        headers=create_headers,
+        json=create_payload,
     )
     assert created.status_code == 201
     body = created.json()
@@ -185,9 +188,18 @@ def test_journey_links_customer_hierarchy_and_keeps_audit_fields_separate(journe
     assert body["documentRequirementProfileVersionId"] == str(profile_version_id)
     assert body["policyVersionId"] == str(policy_version_id)
 
+    replayed = client.post(
+        f"/v1/tenants/{tenant_id}/customers/{customer_id}/journeys",
+        headers=create_headers,
+        json=create_payload,
+    )
+    assert replayed.status_code == 201
+    assert replayed.json() == body
+
     listed = client.get(f"/v1/tenants/{tenant_id}/customers/{customer_id}/journeys")
     assert listed.status_code == 200
     assert listed.json()[0]["journeyId"] == journey_id
+    assert len(listed.json()) == 1
 
     updated = client.patch(
         f"/v1/tenants/{tenant_id}/journeys/{journey_id}",
