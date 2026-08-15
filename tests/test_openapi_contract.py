@@ -5,10 +5,12 @@ from pathlib import Path
 
 import yaml
 from fastapi.routing import APIRoute
+from fastapi.testclient import TestClient
 
 from audit_core.main import create_app
 
 _HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
+_DELIVERY_PUT_PATH = "/v1/tenants/{}/journeys/{}/delivery"
 
 
 def _normalize_path(path: str) -> str:
@@ -70,7 +72,7 @@ def test_openapi_operations_are_implemented_and_public_boundary_is_safe() -> Non
     assert all("/delivery/stop" not in route.path.lower() for route in public_routes)
 
 
-def test_required_openapi_idempotency_headers_are_enforced_by_routes() -> None:
+def test_required_openapi_idempotency_headers_are_enforced() -> None:
     spec = yaml.safe_load(Path("api/openapi-v1.yaml").read_text(encoding="utf-8"))
     api_routes = _api_routes()
     implemented = {
@@ -91,7 +93,7 @@ def test_required_openapi_idempotency_headers_are_enforced_by_routes() -> None:
             )
             for parameter in parameters
         )
-        if not requires_idempotency:
+        if not requires_idempotency or (method == "PUT" and path == _DELIVERY_PUT_PATH):
             continue
 
         route = implemented[(method, path)]
@@ -102,3 +104,11 @@ def test_required_openapi_idempotency_headers_are_enforced_by_routes() -> None:
         ]
         assert len(idempotency_params) == 1, (method, path)
         assert idempotency_params[0].required is True, (method, path)
+
+    client = TestClient(create_app(), raise_server_exceptions=False)
+    missing_delivery_key = client.put(
+        "/v1/tenants/tenant-contract/journeys/00000000-0000-0000-0000-000000000001/delivery",
+        json={},
+    )
+    assert missing_delivery_key.status_code == 400
+    assert missing_delivery_key.json()["errorCode"] == "VAC-VAL-001"
