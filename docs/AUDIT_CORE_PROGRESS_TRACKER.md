@@ -29,15 +29,15 @@ Rules:
 ## 2. Current position
 
 **Implementation tasks:** 48  
-**COMPLETE:** 16  
+**COMPLETE:** 17  
 **VERIFIED:** 0  
 **CODE COMPLETE:** 0  
 **IN PROGRESS:** 0  
 **BLOCKED:** 0  
-**NOT STARTED:** 32  
-**Implementation completion:** 33.3%
+**NOT STARTED:** 31  
+**Implementation completion:** 35.4%
 
-Repository/CI, PostgreSQL foundation, and Security/error/request-context increment C are complete. D-01 Project projection, D-02 Dealer/Outlet APIs, and D-03 dealership staff references are complete. Dealership staff are Outlet-scoped business references and can be linked to Booking without a Security identity. D-04 Verigence business assignments is the next eligible task.
+Repository/CI, PostgreSQL foundation, Security/error/request-context, and Project landscape/assignment increment D are complete. Dealer/Outlet hierarchy, dealership staff references, and Verigence Dealer/Outlet business-scope assignments are implemented. E-01 product catalogue is the next eligible task.
 
 ## 3. Increment summary
 
@@ -47,7 +47,7 @@ Repository/CI, PostgreSQL foundation, and Security/error/request-context increme
 | A | Repository and CI foundation | 3 | 3 | COMPLETE |
 | B | PostgreSQL foundation | 4 | 4 | COMPLETE |
 | C | Security, errors and request context | 4 | 4 | COMPLETE |
-| D | Project landscape and assignments | 4 | 3 | IN PROGRESS |
+| D | Project landscape and assignments | 4 | 4 | COMPLETE |
 | E | Versioned masters | 4 | 0 | NOT STARTED |
 | F | Customer and Journey | 3 | 0 | NOT STARTED |
 | G | Internal DI façade | 5 | 0 | NOT STARTED |
@@ -77,7 +77,7 @@ Repository/CI, PostgreSQL foundation, and Security/error/request-context increme
 | D-01 | Implement Project projection | COMPLETE | `src/audit_core/projects.py` adds Tenant-bound GET/PATCH Project routes over the existing `projects.tenant_id` primary key; `src/audit_core/dependencies.py` wires request DB/JWT dependencies without changing Security; `tests/test_projects.py` verifies one Tenant sees/updates only its Project and Tenant mismatch is denied; CI run `31879955713` passed build, lint, fresh migration and all tests after minimal lint/test fixes through commit `67c36e810e245f20703553d8aa960a6c53fa7170` | Exact per-operation Security permission names are not defined in the current approved Audit Core sources, so D-01 enforces the approved Tenant boundary without inventing permission vocabulary |
 | D-02 | Implement Dealer and Outlet APIs | COMPLETE | `src/audit_core/dealers.py` implements Dealer/Outlet create, list, read, update and inactivate routes using the approved hierarchy and existing schema; `tests/test_dealers.py` verifies Dealer/Outlet CRUD/inactivation, matching Dealer hierarchy for Outlet creation, and that DELETE is not exposed; implementation commits `46ceb808ad8ef453e13fc73f6f7f0e23f84d99e8`, `8a1435ff0b4a11c7b592a08eb30269cfd471bd28`, `5f42a5f0e7d40f57b57376ffcbeb2c62a0f8674e`; GitHub Actions run `31880123064` passed build, lint, fresh DB migration and all tests | Exact per-operation Security permission names remain undefined in the approved Audit Core sources; Tenant boundary is enforced without inventing permission vocabulary |
 | D-03 | Implement dealership staff references | COMPLETE | `src/audit_core/dealership_staff.py` adds Outlet-scoped create/read/inactivate reference operations without any Security identity dependency; `tests/test_dealership_staff.py` creates dealership staff, links its `dealership_staff_id` directly to `bookings.sales_staff_id`, reads it and inactivates it; commits `9072cbed64ed611a8d10885c2db0130a17e52eec`, `54436e2a02dd1cf0c2dc8ee34b54743c5e96348a`; GitHub Actions run `31880258386` passed build, lint, fresh DB migration and all tests | Kept internal because the approved public API contract does not define dealership-staff management routes; no undocumented public route was invented |
-| D-04 | Implement Verigence business assignments | NOT STARTED | — | Dealer/Outlet coverage, not competing identity/RBAC |
+| D-04 | Implement Verigence business assignments | COMPLETE | `src/audit_core/business_assignments.py` persists Security actor business-role coverage at Tenant/Dealer/Outlet scope and enforces active/effective assignment scope using catalogue error `VAC-AUTH-004`; `tests/test_business_assignments.py` verifies an assigned Dealer/Outlet scope is allowed and an unassigned scope is denied; commits `a12ecfa39f33aed83b39795b6cd832bef924c0fd`, `da78994fdcde03479389f79f252c991e43f3d335`; GitHub Actions run `31880364181` passed build, lint, fresh DB migration and all tests | Business-role codes remain reference values; no competing identity/permission system was introduced |
 | E-01 | Implement product catalogue | NOT STARTED | — | OEM/Model/Variant/Colour/SKU |
 | E-02 | Implement Price List version lifecycle | NOT STARTED | — | Published immutable |
 | E-03 | Implement Discount Scheme version lifecycle | NOT STARTED | — | Do not invent unresolved formulas |
