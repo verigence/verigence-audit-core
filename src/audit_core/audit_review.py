@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Connection, text
 
@@ -14,6 +14,7 @@ from audit_core.business_assignments import require_business_scope
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_principal
 from audit_core.errors import AuditCoreError, NotFoundError
+from audit_core.idempotency import execute_idempotent_json_command
 from audit_core.security import Principal
 from audit_core.workflow import create_workflow_task
 
@@ -232,55 +233,77 @@ def start_audit(
 def submit_audit(
     tenant_id: str,
     journey_id: UUID,
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=8, max_length=200),
+    ],
     principal: Annotated[Principal, Depends(get_principal)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> AuditStateResponse:
     authorize(principal, tenant_id=tenant_id, permission="audit.journey.submit")
     set_tenant_context(connection, tenant_id)
-    row = _scope(connection, principal, tenant_id=tenant_id, journey_id=journey_id)
-    if row["audit_state"] not in {"IN_PROGRESS", "SENT_BACK"}:
-        raise AuditCoreError(
-            error_code="VAC-CONFLICT-002",
-            status_code=409,
-            title="Invalid audit state transition",
-            detail="Audit can be submitted only from IN_PROGRESS or SENT_BACK.",
+    _scope(connection, principal, tenant_id=tenant_id, journey_id=journey_id)
+
+    def execute() -> dict:
+        row = _journey(connection, tenant_id, journey_id)
+        if row["audit_state"] not in {"IN_PROGRESS", "SENT_BACK"}:
+            raise AuditCoreError(
+                error_code="VAC-CONFLICT-002",
+                status_code=409,
+                title="Invalid audit state transition",
+                detail="Audit can be submitted only from IN_PROGRESS or SENT_BACK.",
+            )
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.journeys
+                SET audit_state = 'PC_SUBMITTED',
+                    pc_submitted_at_utc = now(),
+                    audit_outcome = 'PENDING',
+                    review_completed_at_utc = NULL,
+                    updated_at_utc = now(),
+                    version_no = version_no + 1
+                WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
         )
-    connection.execute(
-        text(
-            """
-            UPDATE auditcore.journeys
-            SET audit_state = 'PC_SUBMITTED',
-                pc_submitted_at_utc = now(),
-                audit_outcome = 'PENDING',
-                review_completed_at_utc = NULL,
-                updated_at_utc = now(),
-                version_no = version_no + 1
-            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    )
-    create_workflow_task(
+        create_workflow_task(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            workflow_type="AUDIT_REVIEW",
+            process_area="AUDIT",
+            task_type="TL_REVIEW",
+            assigned_role_code="TL",
+            dealer_id=row["dealer_id"],
+            outlet_id=row["outlet_id"],
+            task_payload={"reason": "PC_SUBMITTED"},
+        )
+        _append_transition_events(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            event_type="AUDIT_SUBMITTED",
+            payload={"auditState": "PC_SUBMITTED", "nextTask": "TL_REVIEW"},
+            actor_id=principal.subject,
+        )
+        response = _state_response(
+            journey_id,
+            _journey(connection, tenant_id, journey_id),
+        )
+        return response.model_dump(mode="json")
+
+    body, _ = execute_idempotent_json_command(
         connection,
         tenant_id=tenant_id,
-        journey_id=journey_id,
-        workflow_type="AUDIT_REVIEW",
-        process_area="AUDIT",
-        task_type="TL_REVIEW",
-        assigned_role_code="TL",
-        dealer_id=row["dealer_id"],
-        outlet_id=row["outlet_id"],
-        task_payload={"reason": "PC_SUBMITTED"},
+        operation_key=f"audit.submit:{journey_id}",
+        idempotency_key=idempotency_key,
+        request_payload={"journeyId": str(journey_id)},
+        execute=execute,
+        logical_result_id=str(journey_id),
     )
-    _append_transition_events(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        event_type="AUDIT_SUBMITTED",
-        payload={"auditState": "PC_SUBMITTED", "nextTask": "TL_REVIEW"},
-        actor_id=principal.subject,
-    )
-    return _state_response(journey_id, _journey(connection, tenant_id, journey_id))
+    return AuditStateResponse.model_validate(body)
 
 
 def _decision_response(row) -> ReviewDecisionResponse:
@@ -324,6 +347,10 @@ def create_review_decision(
     tenant_id: str,
     journey_id: UUID,
     payload: ReviewDecisionInput,
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=8, max_length=200),
+    ],
     principal: Annotated[Principal, Depends(get_principal)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> ReviewDecisionResponse:
@@ -338,106 +365,124 @@ def create_review_decision(
         outlet_id=journey["outlet_id"],
         role_code=payload.reviewerRoleCode,
     )
-    if journey["audit_state"] not in {"PC_SUBMITTED", "TL_REVIEW", "PM_REVIEW"}:
-        raise AuditCoreError(
-            error_code="VAC-CONFLICT-002",
-            status_code=409,
-            title="Invalid audit review state",
-            detail="Review decision requires submitted or active review work.",
-        )
 
-    decision_id = connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.review_decisions (
-                tenant_id, journey_id, decision, reviewer_actor_id,
-                reviewer_role_code, remarks
-            ) VALUES (
-                :tenant_id, :journey_id, :decision, :actor_id,
-                :role_code, :remarks
-            ) RETURNING review_decision_id
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "decision": payload.decision,
-            "actor_id": principal.subject,
-            "role_code": payload.reviewerRoleCode,
-            "remarks": payload.remarks,
-        },
-    ).scalar_one()
+    def execute() -> dict:
+        current = _journey(connection, tenant_id, journey_id)
+        if current["audit_state"] not in {"PC_SUBMITTED", "TL_REVIEW", "PM_REVIEW"}:
+            raise AuditCoreError(
+                error_code="VAC-CONFLICT-002",
+                status_code=409,
+                title="Invalid audit review state",
+                detail="Review decision requires submitted or active review work.",
+            )
 
-    if payload.decision == "SEND_BACK":
-        next_state = "SENT_BACK"
-        outcome = "PENDING"
-        completed_at = None
-    else:
-        next_state = "REVIEW_COMPLETE"
-        outcome = payload.decision
-        completed_at = datetime.now().astimezone()
+        decision_id = connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.review_decisions (
+                    tenant_id, journey_id, decision, reviewer_actor_id,
+                    reviewer_role_code, remarks
+                ) VALUES (
+                    :tenant_id, :journey_id, :decision, :actor_id,
+                    :role_code, :remarks
+                ) RETURNING review_decision_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "decision": payload.decision,
+                "actor_id": principal.subject,
+                "role_code": payload.reviewerRoleCode,
+                "remarks": payload.remarks,
+            },
+        ).scalar_one()
 
-    connection.execute(
-        text(
-            """
-            UPDATE auditcore.journeys
-            SET audit_state = :audit_state,
-                audit_outcome = :audit_outcome,
-                review_completed_at_utc = :completed_at,
-                updated_at_utc = now(),
-                version_no = version_no + 1
-            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "audit_state": next_state,
-            "audit_outcome": outcome,
-            "completed_at": completed_at,
-        },
-    )
+        if payload.decision == "SEND_BACK":
+            next_state = "SENT_BACK"
+            outcome = "PENDING"
+            completed_at = None
+        else:
+            next_state = "REVIEW_COMPLETE"
+            outcome = payload.decision
+            completed_at = datetime.now().astimezone()
 
-    if payload.decision == "SEND_BACK":
-        create_workflow_task(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            workflow_type="AUDIT_CORRECTION",
-            process_area="AUDIT",
-            task_type="PC_CORRECTION",
-            assigned_role_code="PC",
-            dealer_id=journey["dealer_id"],
-            outlet_id=journey["outlet_id"],
-            task_payload={
-                "reason": "SEND_BACK",
-                "reviewDecisionId": str(decision_id),
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.journeys
+                SET audit_state = :audit_state,
+                    audit_outcome = :audit_outcome,
+                    review_completed_at_utc = :completed_at,
+                    updated_at_utc = now(),
+                    version_no = version_no + 1
+                WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "audit_state": next_state,
+                "audit_outcome": outcome,
+                "completed_at": completed_at,
             },
         )
 
-    event_type = "AUDIT_SENT_BACK" if payload.decision == "SEND_BACK" else "AUDIT_REVIEW_COMPLETED"
-    _append_transition_events(
+        if payload.decision == "SEND_BACK":
+            create_workflow_task(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                workflow_type="AUDIT_CORRECTION",
+                process_area="AUDIT",
+                task_type="PC_CORRECTION",
+                assigned_role_code="PC",
+                dealer_id=current["dealer_id"],
+                outlet_id=current["outlet_id"],
+                task_payload={
+                    "reason": "SEND_BACK",
+                    "reviewDecisionId": str(decision_id),
+                },
+            )
+
+        event_type = (
+            "AUDIT_SENT_BACK"
+            if payload.decision == "SEND_BACK"
+            else "AUDIT_REVIEW_COMPLETED"
+        )
+        _append_transition_events(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            event_type=event_type,
+            payload={
+                "auditState": next_state,
+                "auditOutcome": outcome,
+                "decision": payload.decision,
+                "reviewerRoleCode": payload.reviewerRoleCode,
+            },
+            actor_id=principal.subject,
+        )
+        row = connection.execute(
+            text(
+                """
+                SELECT review_decision_id, decision, reviewer_actor_id,
+                       reviewer_role_code, remarks, decided_at_utc
+                FROM auditcore.review_decisions
+                WHERE tenant_id = :tenant_id AND review_decision_id = :decision_id
+                """
+            ),
+            {"tenant_id": tenant_id, "decision_id": decision_id},
+        ).mappings().one()
+        return _decision_response(row).model_dump(mode="json")
+
+    body, _ = execute_idempotent_json_command(
         connection,
         tenant_id=tenant_id,
-        journey_id=journey_id,
-        event_type=event_type,
-        payload={
-            "auditState": next_state,
-            "auditOutcome": outcome,
-            "decision": payload.decision,
-            "reviewerRoleCode": payload.reviewerRoleCode,
-        },
-        actor_id=principal.subject,
+        operation_key=f"review_decision.create:{journey_id}",
+        idempotency_key=idempotency_key,
+        request_payload=payload.model_dump(mode="json"),
+        execute=execute,
+        response_status=201,
     )
-    row = connection.execute(
-        text(
-            """
-            SELECT review_decision_id, decision, reviewer_actor_id,
-                   reviewer_role_code, remarks, decided_at_utc
-            FROM auditcore.review_decisions
-            WHERE tenant_id = :tenant_id AND review_decision_id = :decision_id
-            """
-        ),
-        {"tenant_id": tenant_id, "decision_id": decision_id},
-    ).mappings().one()
-    return _decision_response(row)
+    return ReviewDecisionResponse.model_validate(body)
