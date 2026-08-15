@@ -19,18 +19,22 @@ def install_observability(app: FastAPI) -> None:
     async def correlation_and_request_log(request: Request, call_next) -> Response:
         correlation_id = request.headers.get(CORRELATION_HEADER) or str(uuid4())
         request.state.correlation_id = correlation_id
-        response = await call_next(request)
-        response.headers[CORRELATION_HEADER] = correlation_id
-        logger.info(
-            "request_complete",
-            extra={
-                "correlation_id": correlation_id,
-                "method": request.method,
-                "path": request.url.path,
-                "status_code": response.status_code,
-            },
-        )
-        return response
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            response.headers[CORRELATION_HEADER] = correlation_id
+            return response
+        finally:
+            logger.info(
+                "request_complete",
+                extra={
+                    "correlation_id": correlation_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status_code": status_code,
+                },
+            )
 
 
 def log_dependency(*, correlation_id: str, dependency: str, operation: str, result: str) -> None:
