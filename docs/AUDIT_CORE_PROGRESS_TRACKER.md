@@ -29,15 +29,15 @@ Rules:
 ## 2. Current position
 
 **Implementation tasks:** 48  
-**COMPLETE:** 18  
+**COMPLETE:** 19  
 **VERIFIED:** 0  
 **CODE COMPLETE:** 0  
 **IN PROGRESS:** 0  
 **BLOCKED:** 0  
-**NOT STARTED:** 30  
-**Implementation completion:** 37.5%
+**NOT STARTED:** 29  
+**Implementation completion:** 39.6%
 
-Repository/CI, PostgreSQL foundation, Security/error/request-context, and Project landscape/assignment increment D are complete. E-01 product catalogue domain operations now create and resolve the OEM/Model/Variant/Colour/SKU hierarchy for an active sellable configuration. E-02 Price List lifecycle is the next eligible task.
+Repository/CI, PostgreSQL foundation, Security/error/request-context, and Project landscape/assignment increment D are complete. E-01 product catalogue and E-02 Price List lifecycle are complete; published Price List data is immutable and the effective published version resolves by date. E-03 Discount Scheme lifecycle is the next eligible task.
 
 ## 3. Increment summary
 
@@ -48,7 +48,7 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, and Projec
 | B | PostgreSQL foundation | 4 | 4 | COMPLETE |
 | C | Security, errors and request context | 4 | 4 | COMPLETE |
 | D | Project landscape and assignments | 4 | 4 | COMPLETE |
-| E | Versioned masters | 4 | 1 | IN PROGRESS |
+| E | Versioned masters | 4 | 2 | IN PROGRESS |
 | F | Customer and Journey | 3 | 0 | NOT STARTED |
 | G | Internal DI façade | 5 | 0 | NOT STARTED |
 | H | Vehicle-sale Journey process data | 5 | 0 | NOT STARTED |
@@ -79,7 +79,7 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, and Projec
 | D-03 | Implement dealership staff references | COMPLETE | `src/audit_core/dealership_staff.py` adds Outlet-scoped create/read/inactivate reference operations without any Security identity dependency; `tests/test_dealership_staff.py` creates dealership staff, links its `dealership_staff_id` directly to `bookings.sales_staff_id`, reads it and inactivates it; commits `9072cbed64ed611a8d10885c2db0130a17e52eec`, `54436e2a02dd1cf0c2dc8ee34b54743c5e96348a`; GitHub Actions run `31880258386` passed build, lint, fresh DB migration and all tests | Kept internal because the approved public API contract does not define dealership-staff management routes; no undocumented public route was invented |
 | D-04 | Implement Verigence business assignments | COMPLETE | `src/audit_core/business_assignments.py` persists Security actor business-role coverage at Tenant/Dealer/Outlet scope and enforces active/effective assignment scope using catalogue error `VAC-AUTH-004`; `tests/test_business_assignments.py` verifies an assigned Dealer/Outlet scope is allowed and an unassigned scope is denied; commits `a12ecfa39f33aed83b39795b6cd832bef924c0fd`, `da78994fdcde03479389f79f252c991e43f3d335`; GitHub Actions run `31880364181` passed build, lint, fresh DB migration and all tests | Business-role codes remain reference values; no competing identity/permission system was introduced |
 | E-01 | Implement product catalogue | COMPLETE | `src/audit_core/product_catalogue.py` provides lean OEM/Model/Variant/Colour/SKU create operations and active sellable-configuration resolution; `tests/test_product_catalogue.py` builds the full hierarchy and resolves the SKU back to its OEM/Model/Variant/Colour; commits `0667a825eb65884eacc0e0c680fbe0e048add6d5`, `8baff3233411ed12ea2bd832bebe987f1b4ac3e0`, `b2351701a9fd7418d99ff0d5fad5aa4440a43d98`; GitHub Actions run `31880463677` passed build, lint, fresh DB migration and all tests | Kept as internal domain operations because the approved public API contract does not define product-catalogue management routes |
-| E-02 | Implement Price List version lifecycle | NOT STARTED | — | Published immutable |
+| E-02 | Implement Price List version lifecycle | COMPLETE | `src/audit_core/price_lists.py` implements Price List create, version create, item management, publish, retire and effective-date resolution; `tests/test_price_lists.py` verifies DRAFT item mutation, publish, effective-version resolution, post-publish item mutation rejection and retire; commits `a3eded3cd4ccf19bad1da5c8e7d29bc9ed0bea9d`, `9c2887521693bdf3c530571fd34346f2966514d7`, lint fix `cac4c101ff64fde5f9dae34dcab3367c8292e42f`; GitHub Actions run `31880630434` passed build, lint, fresh DB migration and all tests | None |
 | E-03 | Implement Discount Scheme version lifecycle | NOT STARTED | — | Do not invent unresolved formulas |
 | E-04 | Implement document/control/policy version lifecycles | NOT STARTED | — | Published immutable |
 | F-01 | Implement Customer APIs | NOT STARTED | — | Outlet-scoped business entity |
