@@ -40,6 +40,7 @@ class JourneyPatch(BaseModel):
 
 class JourneyResponse(BaseModel):
     journeyId: UUID
+    tenantId: str
     customerId: UUID
     dealerId: UUID
     outletId: UUID
@@ -48,6 +49,8 @@ class JourneyResponse(BaseModel):
     observedStatusSource: str | None
     auditState: str
     auditOutcome: str
+    actualDeliveryStatusCode: str | None = None
+    versionNo: int
     documentRequirementProfileVersionId: UUID | None
     policyVersionId: UUID | None
     priceListVersionId: UUID | None
@@ -69,6 +72,7 @@ def _not_found(resource: str) -> NotFoundError:
 def _journey_response(row) -> JourneyResponse:
     return JourneyResponse(
         journeyId=row["journey_id"],
+        tenantId=row["tenant_id"],
         customerId=row["customer_id"],
         dealerId=row["dealer_id"],
         outletId=row["outlet_id"],
@@ -77,6 +81,8 @@ def _journey_response(row) -> JourneyResponse:
         observedStatusSource=row["observed_status_source"],
         auditState=row["audit_state"],
         auditOutcome=row["audit_outcome"],
+        actualDeliveryStatusCode=row.get("actual_delivery_status_code"),
+        versionNo=row["version_no"],
         documentRequirementProfileVersionId=row[
             "document_requirement_profile_version_id"
         ],
@@ -180,9 +186,9 @@ def create_journey(
                     :document_profile_version_id, :policy_version_id,
                     :price_list_version_id, :actor_id
                 )
-                RETURNING journey_id, customer_id, dealer_id, outlet_id,
+                RETURNING tenant_id, journey_id, customer_id, dealer_id, outlet_id,
                           journey_reference, observed_status_code, observed_status_source,
-                          audit_state, audit_outcome,
+                          audit_state, audit_outcome, version_no,
                           document_requirement_profile_version_id, policy_version_id,
                           price_list_version_id
                 """
@@ -227,14 +233,17 @@ def list_journeys(
     rows = connection.execute(
         text(
             """
-            SELECT journey_id, customer_id, dealer_id, outlet_id,
-                   journey_reference, observed_status_code, observed_status_source,
-                   audit_state, audit_outcome,
-                   document_requirement_profile_version_id, policy_version_id,
-                   price_list_version_id
-            FROM auditcore.journeys
-            WHERE tenant_id = :tenant_id AND customer_id = :customer_id
-            ORDER BY created_at_utc, journey_id
+            SELECT j.tenant_id, j.journey_id, j.customer_id, j.dealer_id, j.outlet_id,
+                   j.journey_reference, j.observed_status_code, j.observed_status_source,
+                   j.audit_state, j.audit_outcome, j.version_no,
+                   j.document_requirement_profile_version_id, j.policy_version_id,
+                   j.price_list_version_id,
+                   d.actual_delivery_status_code
+            FROM auditcore.journeys j
+            LEFT JOIN auditcore.deliveries d
+              ON d.tenant_id = j.tenant_id AND d.journey_id = j.journey_id
+            WHERE j.tenant_id = :tenant_id AND j.customer_id = :customer_id
+            ORDER BY j.created_at_utc, j.journey_id
             """
         ),
         {"tenant_id": tenant_id, "customer_id": customer_id},
@@ -253,13 +262,16 @@ def get_journey(
     row = connection.execute(
         text(
             """
-            SELECT journey_id, customer_id, dealer_id, outlet_id,
-                   journey_reference, observed_status_code, observed_status_source,
-                   audit_state, audit_outcome,
-                   document_requirement_profile_version_id, policy_version_id,
-                   price_list_version_id
-            FROM auditcore.journeys
-            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+            SELECT j.tenant_id, j.journey_id, j.customer_id, j.dealer_id, j.outlet_id,
+                   j.journey_reference, j.observed_status_code, j.observed_status_source,
+                   j.audit_state, j.audit_outcome, j.version_no,
+                   j.document_requirement_profile_version_id, j.policy_version_id,
+                   j.price_list_version_id,
+                   d.actual_delivery_status_code
+            FROM auditcore.journeys j
+            LEFT JOIN auditcore.deliveries d
+              ON d.tenant_id = j.tenant_id AND d.journey_id = j.journey_id
+            WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
@@ -289,9 +301,9 @@ def patch_journey(
                 updated_at_utc = now(),
                 version_no = version_no + 1
             WHERE tenant_id = :tenant_id AND journey_id = :journey_id
-            RETURNING journey_id, customer_id, dealer_id, outlet_id,
+            RETURNING tenant_id, journey_id, customer_id, dealer_id, outlet_id,
                       journey_reference, observed_status_code, observed_status_source,
-                      audit_state, audit_outcome,
+                      audit_state, audit_outcome, version_no,
                       document_requirement_profile_version_id, policy_version_id,
                       price_list_version_id
             """
