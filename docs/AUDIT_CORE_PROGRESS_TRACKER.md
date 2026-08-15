@@ -29,15 +29,15 @@ Rules:
 ## 2. Current position
 
 **Implementation tasks:** 48  
-**COMPLETE:** 17  
+**COMPLETE:** 18  
 **VERIFIED:** 0  
 **CODE COMPLETE:** 0  
 **IN PROGRESS:** 0  
 **BLOCKED:** 0  
-**NOT STARTED:** 31  
-**Implementation completion:** 35.4%
+**NOT STARTED:** 30  
+**Implementation completion:** 37.5%
 
-Repository/CI, PostgreSQL foundation, Security/error/request-context, and Project landscape/assignment increment D are complete. Dealer/Outlet hierarchy, dealership staff references, and Verigence Dealer/Outlet business-scope assignments are implemented. E-01 product catalogue is the next eligible task.
+Repository/CI, PostgreSQL foundation, Security/error/request-context, and Project landscape/assignment increment D are complete. E-01 product catalogue domain operations now create and resolve the OEM/Model/Variant/Colour/SKU hierarchy for an active sellable configuration. E-02 Price List lifecycle is the next eligible task.
 
 ## 3. Increment summary
 
@@ -48,7 +48,7 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, and Projec
 | B | PostgreSQL foundation | 4 | 4 | COMPLETE |
 | C | Security, errors and request context | 4 | 4 | COMPLETE |
 | D | Project landscape and assignments | 4 | 4 | COMPLETE |
-| E | Versioned masters | 4 | 0 | NOT STARTED |
+| E | Versioned masters | 4 | 1 | IN PROGRESS |
 | F | Customer and Journey | 3 | 0 | NOT STARTED |
 | G | Internal DI façade | 5 | 0 | NOT STARTED |
 | H | Vehicle-sale Journey process data | 5 | 0 | NOT STARTED |
@@ -78,7 +78,7 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, and Projec
 | D-02 | Implement Dealer and Outlet APIs | COMPLETE | `src/audit_core/dealers.py` implements Dealer/Outlet create, list, read, update and inactivate routes using the approved hierarchy and existing schema; `tests/test_dealers.py` verifies Dealer/Outlet CRUD/inactivation, matching Dealer hierarchy for Outlet creation, and that DELETE is not exposed; implementation commits `46ceb808ad8ef453e13fc73f6f7f0e23f84d99e8`, `8a1435ff0b4a11c7b592a08eb30269cfd471bd28`, `5f42a5f0e7d40f57b57376ffcbeb2c62a0f8674e`; GitHub Actions run `31880123064` passed build, lint, fresh DB migration and all tests | Exact per-operation Security permission names remain undefined in the approved Audit Core sources; Tenant boundary is enforced without inventing permission vocabulary |
 | D-03 | Implement dealership staff references | COMPLETE | `src/audit_core/dealership_staff.py` adds Outlet-scoped create/read/inactivate reference operations without any Security identity dependency; `tests/test_dealership_staff.py` creates dealership staff, links its `dealership_staff_id` directly to `bookings.sales_staff_id`, reads it and inactivates it; commits `9072cbed64ed611a8d10885c2db0130a17e52eec`, `54436e2a02dd1cf0c2dc8ee34b54743c5e96348a`; GitHub Actions run `31880258386` passed build, lint, fresh DB migration and all tests | Kept internal because the approved public API contract does not define dealership-staff management routes; no undocumented public route was invented |
 | D-04 | Implement Verigence business assignments | COMPLETE | `src/audit_core/business_assignments.py` persists Security actor business-role coverage at Tenant/Dealer/Outlet scope and enforces active/effective assignment scope using catalogue error `VAC-AUTH-004`; `tests/test_business_assignments.py` verifies an assigned Dealer/Outlet scope is allowed and an unassigned scope is denied; commits `a12ecfa39f33aed83b39795b6cd832bef924c0fd`, `da78994fdcde03479389f79f252c991e43f3d335`; GitHub Actions run `31880364181` passed build, lint, fresh DB migration and all tests | Business-role codes remain reference values; no competing identity/permission system was introduced |
-| E-01 | Implement product catalogue | NOT STARTED | — | OEM/Model/Variant/Colour/SKU |
+| E-01 | Implement product catalogue | COMPLETE | `src/audit_core/product_catalogue.py` provides lean OEM/Model/Variant/Colour/SKU create operations and active sellable-configuration resolution; `tests/test_product_catalogue.py` builds the full hierarchy and resolves the SKU back to its OEM/Model/Variant/Colour; commits `0667a825eb65884eacc0e0c680fbe0e048add6d5`, `8baff3233411ed12ea2bd832bebe987f1b4ac3e0`, `b2351701a9fd7418d99ff0d5fad5aa4440a43d98`; GitHub Actions run `31880463677` passed build, lint, fresh DB migration and all tests | Kept as internal domain operations because the approved public API contract does not define product-catalogue management routes |
 | E-02 | Implement Price List version lifecycle | NOT STARTED | — | Published immutable |
 | E-03 | Implement Discount Scheme version lifecycle | NOT STARTED | — | Do not invent unresolved formulas |
 | E-04 | Implement document/control/policy version lifecycles | NOT STARTED | — | Published immutable |
