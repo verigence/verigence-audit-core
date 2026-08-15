@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-import audit_core.audit_review as audit_review
+from audit_core import audit_review
 from audit_core.dependencies import get_connection, get_principal
 from audit_core.main import app
 from audit_core.security import Principal
