@@ -5,9 +5,10 @@
 **Historical baseline:** Audit Core Solution Design v1.0 — BASELINED historically, **IMPLEMENTATION HOLD**  
 **Superseded review candidate:** `VAC-SD-002` / v2.0 — retained for traceability  
 **Current design candidate:** `VAC-SD-003` / Audit Core Solution Design v2.1 — **DRAFT FOR REVIEW**  
+**Current physical-schema candidate:** `VAC-DB-002` / Audit Core PostgreSQL Schema v2.1 — **DRAFT FOR REVIEW**  
 **Requirements:** `VAC-REQ-001 v1.0` + authoritative corrections `VAC-REQ-ADD-001 v1.1` and `VAC-REQ-ADD-002 v1.2`
 
-> No historical v1.0/v2.0 artifact shall be implemented where it conflicts with the approved correction addenda or v2.1 review candidate. `VAC-DB-001` and the v1.0 Security catalogue remain on implementation/registration hold until replacement/alignment to an approved v2.x design.
+> No historical v1.0/v2.0 artifact shall be implemented where it conflicts with the approved correction addenda or v2.1 review package. `VAC-DB-001` and the v1.0 Security catalogue remain on implementation/registration hold.
 
 ## Current v2.1 review package
 
@@ -19,6 +20,8 @@
 | `docs/AUDIT_CORE_API_CONTRACT_v1.0.md` | `VAC-API-001` | DRAFT FOR REVIEW |
 | `api/openapi-v1.yaml` | machine-readable API companion | DRAFT FOR REVIEW |
 | `docs/AUDIT_CORE_ERROR_CATALOG_v1.0.md` | `VAC-ERR-001` | DRAFT FOR REVIEW |
+| `docs/AUDIT_CORE_PHYSICAL_DATA_MODEL_v2.1.md` | `VAC-DM-002` | DRAFT FOR REVIEW |
+| `database/AUDIT_CORE_POSTGRESQL_SCHEMA_v2.1.sql` | `VAC-DB-002` | DRAFT FOR REVIEW / CURRENT SCHEMA CANDIDATE |
 
 ## Authoritative foundational corrections
 
@@ -38,6 +41,10 @@
 14. Executive has tenant-wide Audit Core super privileges **except delete/purge/destructive removal**.
 15. Baseline public Audit Core API contains no HTTP DELETE operations.
 16. Audit Core maintains an explicit human-readable API contract plus OpenAPI representation.
+17. `VAC-DB-002` physically separates observed business/delivery status from audit state/outcome.
+18. `VAC-DB-002` hides DI identifiers behind Audit Core evidence IDs and includes durable evidence-ingestion recovery state.
+19. `VAC-DB-002` implements durable workflow persistence, immutable task history, retry/lease recovery, dead-letter visibility, idempotency and outbox/inbox structures.
+20. `VAC-DB-002` protects published master versions and their child rows from post-publication mutation.
 
 ## v2.0 package — historical review traceability
 
@@ -68,6 +75,8 @@ v2.0 is superseded as the current review candidate by v2.1, particularly for the
 
 ## Governance
 
-No implementation shall treat `VAC-SD-003`, `VAC-API-001`, `VAC-ERR-001` or `api/openapi-v1.yaml` as a formally approved baseline until project-owner review/approval.
+No implementation shall treat `VAC-SD-003`, `VAC-API-001`, `VAC-ERR-001`, `VAC-DM-002`, `VAC-DB-002` or `api/openapi-v1.yaml` as a formally approved baseline until project-owner review/approval.
 
-After approval, a replacement physical DDL (`VAC-DB-002`) and aligned Audit Core Security catalogue shall be produced. No change to Security or DI repositories is implied by this design documentation.
+`VAC-DB-002` is a fresh target physical schema, not an automatic in-place migration from `VAC-DB-001`. Migration/deployment sequencing shall be designed only after approval of the v2.1 package.
+
+The Audit Core Security catalogue must also be realigned to the approved v2.1 role/DI façade model before Security registration. No change to Security or DI repositories is implied by this design documentation.
