@@ -1,11 +1,12 @@
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
 from audit_core.authorization import require_tenant
+from audit_core.customer_matching import find_customer_matches
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_principal
 from audit_core.errors import NotFoundError
@@ -41,6 +42,14 @@ class CustomerResponse(BaseModel):
     emailReference: str | None
     externalCustomerRef: str | None
     status: str
+
+
+class CustomerMatchResponse(BaseModel):
+    customerId: UUID
+    dealerId: UUID
+    outletId: UUID
+    displayName: str
+    identityType: str
 
 
 def _scope(connection: Connection, principal: Principal, tenant_id: str) -> None:
@@ -148,6 +157,33 @@ def list_customers(
         {"tenant_id": tenant_id, "outlet_id": outlet_id},
     ).mappings()
     return [_customer_response(row) for row in rows]
+
+
+@router.get("/customers/matches", response_model=list[CustomerMatchResponse])
+def match_customers(
+    tenant_id: str,
+    identity_type: Annotated[str, Query(alias="identityType", min_length=1, max_length=40)],
+    match_hash: Annotated[str, Query(alias="matchHash", min_length=1, max_length=256)],
+    principal: Annotated[Principal, Depends(get_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> list[CustomerMatchResponse]:
+    _scope(connection, principal, tenant_id)
+    rows = find_customer_matches(
+        connection,
+        tenant_id=tenant_id,
+        identity_type=identity_type,
+        match_hash=match_hash,
+    )
+    return [
+        CustomerMatchResponse(
+            customerId=row["customer_id"],
+            dealerId=row["dealer_id"],
+            outletId=row["outlet_id"],
+            displayName=row["display_name"],
+            identityType=row["identity_type"],
+        )
+        for row in rows
+    ]
 
 
 @router.get("/customers/{customer_id}", response_model=CustomerResponse)
