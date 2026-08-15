@@ -29,15 +29,15 @@ Rules:
 ## 2. Current position
 
 **Implementation tasks:** 48  
-**COMPLETE:** 30  
+**COMPLETE:** 32  
 **VERIFIED:** 0  
 **CODE COMPLETE:** 0  
 **IN PROGRESS:** 0  
 **BLOCKED:** 0  
-**NOT STARTED:** 18  
-**Implementation completion:** 62.5%
+**NOT STARTED:** 16  
+**Implementation completion:** 66.7%
 
-Repository/CI, PostgreSQL foundation, Security/error/request-context, Project landscape/assignment, versioned-master increment E, Customer/Journey increment F, the full internal DI façade increment G, and H-01 Booking/product selection are complete. G-05 is backed by GitHub Actions run `31902227322`, which passed build, lint, fresh PostgreSQL migration and all tests for Audit Core evidence list/get/facts/refresh with no public DI identifiers. H-01 is backed by GitHub Actions run `31902404906`, which passed build, lint, fresh PostgreSQL migration and the booking/product snapshot integration test. H-02 commercials and discounts is the next eligible task.
+Repository/CI, PostgreSQL foundation, Security/error/request-context, Project landscape/assignment, versioned-master increment E, Customer/Journey increment F, the full internal DI façade increment G, and H-01 through H-03 are complete. H-02 commercials/discounts preserves Standard-vs-Actual values, provenance and exact published master-version references and is backed by GitHub Actions run `31902757881`. H-03 supports multiple payments, append-only payment verification events and Journey finance data without using an audit exception to block later transaction recording; GitHub Actions run `31903045712` passed build, lint, fresh PostgreSQL migration and all tests. H-04 Insurance, VAS and Trade-In is the next eligible task.
 
 ## 3. Increment summary
 
@@ -51,7 +51,7 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, Project la
 | E | Versioned masters | 4 | 4 | COMPLETE |
 | F | Customer and Journey | 3 | 3 | COMPLETE |
 | G | Internal DI façade | 5 | 5 | COMPLETE |
-| H | Vehicle-sale Journey process data | 5 | 1 | IN PROGRESS |
+| H | Vehicle-sale Journey process data | 5 | 3 | IN PROGRESS |
 | I | Audit controls, findings and review | 3 | 0 | NOT STARTED |
 | J | Durable Audit workflow | 4 | 0 | NOT STARTED |
 | K | Daily operations, CRM and escalations | 3 | 0 | NOT STARTED |
@@ -91,8 +91,8 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, Project la
 | G-04 | Implement ingestion recovery/idempotency | COMPLETE | `src/audit_core/evidence.py` persists request hashes and ingestion state around DI calls, caches successful Audit Core responses, and recovers accepted DI documents without re-upload; `tests/test_evidence.py` proves exact replay returns one evidence/one DI upload, different-content key reuse returns `VAC-CONFLICT-003`, and simulated outer link failure leaves durable `DI_ACCEPTED` state that replay completes through delegated `di.document.read`; implementation/fixes through `a9bf393d2764432386e35ae214dc1f272371170c`, `3a5c163114610d9740a926bb653d75f57e94c36f`, `fc686b38e8027ad0c1d241987bcb398e497e620a`, `fbc8a5a2d4a6e85e374f82bb04630355ef25baa8`; GitHub Actions run `31893685054` passed build, lint, fresh PostgreSQL migration and all tests | None |
 | G-05 | Implement evidence facts/read façade | COMPLETE | `src/audit_core/evidence_read.py` implements Audit Core evidence list/get/facts plus delegated DI status/fact refresh; `tests/test_evidence_read.py` proves normal reads stay inside Audit Core, public responses contain no DI identifiers, refresh narrows to `di.document.read` + `di.document.fields.read`, supersedes stale facts and persists current projections; lint fixes `db260bcf0964c7cccbf8bd0e8d10e246e0ced531` and `386a7bb6d57a365be9b4718a487cf50c75c45db2`; GitHub Actions run `31902227322` passed build, lint, fresh PostgreSQL migration and all tests | None |
 | H-01 | Implement Booking and product selection | COMPLETE | `src/audit_core/bookings.py` implements approved PUT/GET booking routes with active same-Outlet dealership sales-staff reference and master-derived Journey product snapshot; route registration `85a6bd057b34aab1c831288adfc7db8df4c88d0b`; `tests/test_bookings.py` verifies SC reference and exact SKU/model/variant/colour snapshot round-trip; implementation/test commits `d5470e0476f4a4f36000104621f4f6ef83e78a49`, `2d124dfa29fcba78a89697f77bb834262720ed51`; GitHub Actions run `31902404906` passed build, lint, fresh PostgreSQL migration and all tests | Booking remains Journey process data; no rule makes it a universal root and no dealer-process control was added |
-| H-02 | Implement commercials and discounts | NOT STARTED | — | Standard vs Actual + provenance |
-| H-03 | Implement Payments and Finance | NOT STARTED | — | Audit records exceptions; does not block transaction |
+| H-02 | Implement commercials and discounts | COMPLETE | `src/audit_core/commercials.py` implements approved GET/PUT commercials using published Price List items for Standard values, operational/evidence/source Actual provenance and exact Price List/Discount Scheme version references; `tests/test_commercials.py` verifies Standard-vs-Actual amounts, provenance and exact master references; commits `99002fce9f947a0f65fb0da643a4c4ccc1fb72a4`, `2113e9d581f60c438a722acd6189b0b73fa0511b`, `a1c8a49dd525d66ea3c31716dd7181aead966e53`, fixture correction `ef0f78d04b4a874da7906aec7747c770819e527f`; GitHub Actions run `31902757881` passed build, lint, fresh PostgreSQL migration and all tests | Percentage/Total Discount/Above Scheme formulas remain unimplemented; configured benefit data is retained without inventing a calculation |
+| H-03 | Implement Payments and Finance | COMPLETE | `src/audit_core/payments_finance.py` implements documented GET/POST/PATCH payments and GET/PUT finance routes using `audit.payment.*` permissions, including append-only verification events; `tests/test_payments_finance.py` proves two payments can be recorded, an `EXCEPTION` verification event is retained without blocking later payment recording, and finance data round-trips; commits `33c669d6fe0e8e968553ce1e54246a38ab0b8267`, `d2a8b9c5a061aae03f986d0ec85ba268b9014deb`, `c460a07061f600d1c527065ff485dd9552ab2ee0`; GitHub Actions run `31903045712` passed build, lint, fresh PostgreSQL migration and all tests | PO/DO/Refund realised-payment formula remains open and was not implemented; exceptions are audit observations, not dealer-transaction controls |
 | H-04 | Implement Insurance, VAS and Trade-In | NOT STARTED | — | Open formulas stay open/configured |
 | H-05 | Implement Vehicle, Registration and Delivery | NOT STARTED | — | Actual delivery status separate from audit state |
 | I-01 | Implement control evaluation framework | NOT STARTED | — | Reproducible version/evidence snapshot |
