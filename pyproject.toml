@@ -13,6 +13,7 @@ dependencies = [
     "SQLAlchemy==2.0.51",
     "alembic==1.18.5",
     "psycopg[binary]==3.3.4",
+    "PyJWT[crypto]==2.13.0",
 ]
 
 [project.optional-dependencies]
