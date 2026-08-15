@@ -29,15 +29,15 @@ Rules:
 ## 2. Current position
 
 **Implementation tasks:** 48  
-**COMPLETE:** 21  
+**COMPLETE:** 22  
 **VERIFIED:** 0  
 **CODE COMPLETE:** 0  
 **IN PROGRESS:** 0  
 **BLOCKED:** 0  
-**NOT STARTED:** 27  
-**Implementation completion:** 43.8%
+**NOT STARTED:** 26  
+**Implementation completion:** 45.8%
 
-Repository/CI, PostgreSQL foundation, Security/error/request-context, Project landscape/assignment, and versioned-master increment E are complete. Project Policy, Document Requirement Profile, and Audit Control versions can be published/retired, are immutable after publish, and Journeys retain exact published Profile/Policy version references. F-01 Customer APIs is the next eligible task.
+Repository/CI, PostgreSQL foundation, Security/error/request-context, Project landscape/assignment, and versioned-master increment E are complete. F-01 Customer APIs are now implemented with Tenant/Dealer/Outlet hierarchy enforcement. F-02 protected customer matching is the next eligible task.
 
 ## 3. Increment summary
 
@@ -49,7 +49,7 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, Project la
 | C | Security, errors and request context | 4 | 4 | COMPLETE |
 | D | Project landscape and assignments | 4 | 4 | COMPLETE |
 | E | Versioned masters | 4 | 4 | COMPLETE |
-| F | Customer and Journey | 3 | 0 | NOT STARTED |
+| F | Customer and Journey | 3 | 1 | IN PROGRESS |
 | G | Internal DI façade | 5 | 0 | NOT STARTED |
 | H | Vehicle-sale Journey process data | 5 | 0 | NOT STARTED |
 | I | Audit controls, findings and review | 3 | 0 | NOT STARTED |
@@ -82,7 +82,7 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, Project la
 | E-02 | Implement Price List version lifecycle | COMPLETE | `src/audit_core/price_lists.py` implements Price List create, version create, item management, publish, retire and effective-date resolution; `tests/test_price_lists.py` verifies DRAFT item mutation, publish, effective-version resolution, post-publish item mutation rejection and retire; commits `a3eded3cd4ccf19bad1da5c8e7d29bc9ed0bea9d`, `9c2887521693bdf3c530571fd34346f2966514d7`, lint fix `cac4c101ff64fde5f9dae34dcab3367c8292e42f`; GitHub Actions run `31880630434` passed build, lint, fresh DB migration and all tests | None |
 | E-03 | Implement Discount Scheme version lifecycle | COMPLETE | `src/audit_core/discount_schemes.py` implements Discount Scheme/version creation, eligibility, configured benefits, publish and retire; `tests/test_discount_schemes.py` verifies DRAFT benefit mutation, publish, post-publish child mutation rejection, persisted configured amount and retire; commits `8d2c663166bd85b89b6f26cbda2e264a48f355f3`, `ced619950c965ef71ce112719122959b4a1586e0`; GitHub Actions run `31880755333` passed build, lint, fresh DB migration and all tests | No Total Discount / Above Scheme or other unresolved formula was implemented; benefits remain configured data |
 | E-04 | Implement document/control/policy version lifecycles | COMPLETE | `src/audit_core/versioned_masters.py` implements Project Policy, Document Requirement Profile and Audit Control version creation plus publish/retire lifecycle; `tests/test_versioned_masters.py` publishes all three, verifies Journey references the exact published Profile/Policy version IDs, rejects post-publish Policy/Profile-child/Control mutations, and retires all three; commits `9a1b680cfb1c6b8f3c70af48d606db33858bf0f9`, `4afb904b88e70c298d073cb97ea54a72ff58f0e9`, fix `e49294695902796be0396729b9b152cc130bef9c`; GitHub Actions run `31880966992` passed build, lint, fresh DB migration and all tests | No audit evaluator/business formula was added; this task is limited to master lifecycle and exact version references |
-| F-01 | Implement Customer APIs | NOT STARTED | — | Outlet-scoped business entity |
+| F-01 | Implement Customer APIs | COMPLETE | `src/audit_core/customers.py` implements Outlet-scoped customer create/list/read/update routes and resolves the Dealer from the Tenant-scoped Outlet before insert; `src/audit_core/main.py` exposes the approved customer routes; `tests/test_customers.py` verifies create/list/read/update/inactivate and rejects a missing Outlet hierarchy; commits `b6e7992359336dfb65a95eed3dbb0ee0be8960a7`, `95b7bf6160c66220b192236c7300dd7586e01304`, `76aa28ce1bb0c5a9fa923a0df355c071371d85a3`; GitHub Actions run `31881129769` passed build, lint, fresh DB migration and all tests | Exact per-operation Security permission names remain undefined; Tenant boundary is enforced without inventing permission vocabulary |
 | F-02 | Implement protected customer matching | NOT STARTED | — | Cross-Dealer/Outlet match without raw-ID logging |
 | F-03 | Implement Journey APIs | NOT STARTED | — | Journey is audit correlation, not dealer workflow control |
 | G-01 | Verify Audit Core→DI authentication mechanism | NOT STARTED | — | Explicit Security/service-auth dependency; no bypass |
