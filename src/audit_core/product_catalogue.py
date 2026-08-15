@@ -2,7 +2,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
-from audit_core.errors import NotFoundError
+from audit_core.errors import AuditCoreError
 
 
 def create_oem(connection: Connection, *, code: str, name: str) -> UUID:
@@ -118,8 +118,9 @@ def resolve_sellable_configuration(
         {"product_sku_id": product_sku_id},
     ).mappings().one_or_none()
     if row is None:
-        raise NotFoundError(
+        raise AuditCoreError(
             error_code="VAC-VAL-002",
+            status_code=422,
             title="Product configuration unavailable",
             detail="The requested sellable product configuration is not active.",
         )
