@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, Self
 
 import httpx
 
@@ -37,7 +37,7 @@ class SecurityOAuthClient:
     def close(self) -> None:
         self._client.close()
 
-    def __enter__(self) -> SecurityOAuthClient:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
