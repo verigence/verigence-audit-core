@@ -6,10 +6,17 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import create_engine, text
 
-from audit_core.workflow import create_workflow_task, get_workflow_task
+from audit_core.workflow import (
+    cancel_workflow_task,
+    claim_workflow_task,
+    complete_workflow_task,
+    create_workflow_task,
+    get_workflow_task,
+    start_workflow_task,
+)
 
 
-def test_workflow_task_survives_new_engine_process_boundary() -> None:
+def test_workflow_tasks_persist_and_support_command_lifecycle() -> None:
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         pytest.skip("DATABASE_URL is required for workflow persistence test")
@@ -113,6 +120,17 @@ def test_workflow_task_survives_new_engine_process_boundary() -> None:
             task_payload={"reason": "PC_SUBMITTED"},
             correlation_id="workflow-persist-1",
         )
+        cancelled_task_id = create_workflow_task(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            workflow_type="AUDIT_REVIEW",
+            process_area="AUDIT",
+            task_type="FOLLOW_UP",
+            assigned_role_code="TL",
+            dealer_id=dealer_id,
+            outlet_id=outlet_id,
+        )
 
     engine.dispose()
 
@@ -126,19 +144,68 @@ def test_workflow_task_survives_new_engine_process_boundary() -> None:
             )
             assert task["task_status"] == "READY"
             assert task["workflow_status"] == "ACTIVE"
-            assert task["task_type"] == "TL_REVIEW"
-            assert task["assigned_role_code"] == "TL"
             assert task["task_payload"] == {"reason": "PC_SUBMITTED"}
-            event_count = connection.execute(
+
+            claim_workflow_task(
+                connection,
+                tenant_id=tenant_id,
+                workflow_task_id=task_id,
+                actor_id="tl-1",
+            )
+            start_workflow_task(
+                connection,
+                tenant_id=tenant_id,
+                workflow_task_id=task_id,
+                actor_id="tl-1",
+            )
+            complete_workflow_task(
+                connection,
+                tenant_id=tenant_id,
+                workflow_task_id=task_id,
+                actor_id="tl-1",
+            )
+            completed = get_workflow_task(
+                connection,
+                tenant_id=tenant_id,
+                workflow_task_id=task_id,
+            )
+            assert completed["task_status"] == "COMPLETED"
+            assert completed["assigned_actor_id"] == "tl-1"
+            assert completed["claimed_at_utc"] is not None
+            assert completed["started_at_utc"] is not None
+            assert completed["completed_at_utc"] is not None
+
+            cancel_workflow_task(
+                connection,
+                tenant_id=tenant_id,
+                workflow_task_id=cancelled_task_id,
+                actor_id="tl-1",
+                reason="No longer required",
+            )
+            cancelled = get_workflow_task(
+                connection,
+                tenant_id=tenant_id,
+                workflow_task_id=cancelled_task_id,
+            )
+            assert cancelled["task_status"] == "CANCELLED"
+            assert cancelled["cancelled_at_utc"] is not None
+
+            events = connection.execute(
                 text(
                     """
-                    SELECT count(*)
+                    SELECT event_type, from_status, to_status
                     FROM auditcore.workflow_task_events
                     WHERE tenant_id = :tenant_id AND workflow_task_id = :task_id
+                    ORDER BY occurred_at_utc, workflow_task_event_id
                     """
                 ),
                 {"tenant_id": tenant_id, "task_id": task_id},
-            ).scalar_one()
-            assert event_count == 1
+            ).mappings().all()
+            assert [(row["event_type"], row["to_status"]) for row in events] == [
+                ("CREATED", "READY"),
+                ("CLAIMED", "CLAIMED"),
+                ("STARTED", "IN_PROGRESS"),
+                ("COMPLETED", "COMPLETED"),
+            ]
     finally:
         restarted_engine.dispose()
