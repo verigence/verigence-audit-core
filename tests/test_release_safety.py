@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi.routing import APIRoute
 
 from audit_core.authorization import AuthorizationError, authorize
-from audit_core.main import app
+from audit_core.main import create_app
 from audit_core.security import Principal
 
 
@@ -18,9 +18,10 @@ def test_security_catalog_and_public_api_expose_no_destructive_delete_capability
     assert all("delete" not in key.lower() for key in permission_keys)
     assert all("purge" not in key.lower() for key in permission_keys)
 
+    application = create_app()
     public_routes = [
         route
-        for route in app.routes
+        for route in application.routes
         if isinstance(route, APIRoute) and route.path.startswith("/v1/")
     ]
     assert public_routes
