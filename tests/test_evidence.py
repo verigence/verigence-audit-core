@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-from audit_core.dependencies import get_bearer_token, get_connection, get_principal
+from audit_core.dependencies import get_bearer_token, get_engine, get_principal
 from audit_core.di_client import DiDocument, DiSubject
 from audit_core.evidence import get_di_client, get_security_oauth_client
 from audit_core.main import app
@@ -31,6 +31,21 @@ class FakeDiClient:
         self.uploaded_content: bytes | None = None
         self.upload_token: str | None = None
         self.upload_subject_id: str | None = None
+        self.upload_calls = 0
+        self.read_calls = 0
+
+    def _document(self, subject_id: str) -> DiDocument:
+        return DiDocument(
+            document_id=str(self.document_id),
+            subject_id=subject_id,
+            upload_status="FIT",
+            processing_status="PROCESSING",
+            confirmation_status="PENDING",
+            verification_state="NOT_VERIFIED",
+            human_verification_status=None,
+            confidence_score=None,
+            correlation_id="di-corr-1",
+        )
 
     def create_subject(
         self,
@@ -69,20 +84,25 @@ class FakeDiClient:
         assert captured_at is None
         assert source_reference is None
         assert replaces_document_id is None
+        self.upload_calls += 1
         self.uploaded_content = content
         self.upload_token = token
         self.upload_subject_id = subject_id
-        return DiDocument(
-            document_id=str(self.document_id),
-            subject_id=subject_id,
-            upload_status="FIT",
-            processing_status="PROCESSING",
-            confirmation_status="PENDING",
-            verification_state="NOT_VERIFIED",
-            human_verification_status=None,
-            confidence_score=None,
-            correlation_id="di-corr-1",
-        )
+        return self._document(subject_id)
+
+    def get_document(
+        self,
+        *,
+        token: str,
+        tenant_id: str,
+        subject_id: str,
+        document_id: str,
+    ) -> DiDocument:
+        assert token == "delegated:di.document.read"
+        assert tenant_id.startswith("tenant-evidence-")
+        assert document_id == str(self.document_id)
+        self.read_calls += 1
+        return self._document(subject_id)
 
 
 @pytest.fixture
@@ -200,15 +220,16 @@ def evidence_setup():
     security_client = FakeSecurityClient()
     di_client = FakeDiClient()
 
-    def connection_override():
-        with engine.begin() as connection:
-            yield connection
-
-    app.dependency_overrides[get_connection] = connection_override
+    app.dependency_overrides[get_engine] = lambda: engine
     app.dependency_overrides[get_principal] = lambda: Principal(
         subject=actor_id,
         tenant_id=tenant_id,
-        permissions=("audit.evidence.upload", "di.subject.create", "di.document.upload"),
+        permissions=(
+            "audit.evidence.upload",
+            "di.subject.create",
+            "di.document.upload",
+            "di.document.read",
+        ),
     )
     app.dependency_overrides[get_bearer_token] = lambda: "user-token"
     app.dependency_overrides[get_security_oauth_client] = lambda: security_client
@@ -220,6 +241,25 @@ def evidence_setup():
         engine.dispose()
 
 
+def _post_evidence(
+    client: TestClient,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    key: str,
+    content: bytes,
+):
+    return client.post(
+        f"/v1/tenants/{tenant_id}/journeys/{journey_id}/evidence",
+        headers={"Idempotency-Key": key},
+        data={
+            "evidencePurpose": "BOOKING_CAPTURE",
+            "documentTypeKey": "BOOKING_FORM",
+        },
+        files={"file": ("booking.pdf", content, "application/pdf")},
+    )
+
+
 def test_upload_facade_returns_only_audit_core_evidence_id_and_persists_no_binary(
     evidence_setup,
 ) -> None:
@@ -229,14 +269,12 @@ def test_upload_facade_returns_only_audit_core_evidence_id_and_persists_no_binar
     raw_document = b"UNIQUE-RAW-DOCUMENT-BYTES-DO-NOT-PERSIST"
     client = TestClient(app, raise_server_exceptions=False)
 
-    response = client.post(
-        f"/v1/tenants/{tenant_id}/journeys/{journey_id}/evidence",
-        headers={"Idempotency-Key": "evidence-key-0001"},
-        data={
-            "evidencePurpose": "BOOKING_CAPTURE",
-            "documentTypeKey": "BOOKING_FORM",
-        },
-        files={"file": ("booking.pdf", raw_document, "application/pdf")},
+    response = _post_evidence(
+        client,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        key="evidence-key-0001",
+        content=raw_document,
     )
 
     assert response.status_code == 201, response.text
@@ -286,6 +324,16 @@ def test_upload_facade_returns_only_audit_core_evidence_id_and_persists_no_binar
             ),
             {"tenant_id": tenant_id, "customer_id": customer_id},
         ).mappings().one()
+        operation = connection.execute(
+            text(
+                """
+                SELECT operation_status, evidence_id, di_subject_id, di_document_id
+                FROM auditcore.evidence_ingestion_operations
+                WHERE tenant_id = :tenant_id AND idempotency_key = 'evidence-key-0001'
+                """
+            ),
+            {"tenant_id": tenant_id},
+        ).mappings().one()
 
     assert evidence["customer_id"] == customer_id
     assert evidence["di_subject_id"] == di_client.subject_id
@@ -297,7 +345,174 @@ def test_upload_facade_returns_only_audit_core_evidence_id_and_persists_no_binar
     assert mapping["customer_id"] == customer_id
     assert mapping["di_subject_id"] == di_client.subject_id
     assert mapping["di_subject_type"] == "OTHER"
+    assert operation["operation_status"] == "LINKED"
+    assert operation["evidence_id"] == evidence_id
+    assert operation["di_subject_id"] == di_client.subject_id
+    assert operation["di_document_id"] == di_client.document_id
     assert actor_id
+
+
+def test_replay_returns_same_evidence_without_duplicate_di_upload(evidence_setup) -> None:
+    engine, tenant_id, journey_id, _, _, security_client, di_client = evidence_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    content = b"IDEMPOTENT-DOCUMENT"
+
+    first = _post_evidence(
+        client,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        key="evidence-replay-0001",
+        content=content,
+    )
+    requests_after_first = list(security_client.requests)
+    second = _post_evidence(
+        client,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        key="evidence-replay-0001",
+        content=content,
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert second.json() == first.json()
+    assert di_client.upload_calls == 1
+    assert di_client.read_calls == 0
+    assert security_client.requests == requests_after_first
+    with engine.begin() as connection:
+        count = connection.execute(
+            text(
+                "SELECT count(*) FROM auditcore.evidence "
+                "WHERE tenant_id = :tenant_id AND journey_id = :journey_id"
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one()
+    assert count == 1
+
+
+def test_di_accepted_outer_failure_is_recovered_without_second_upload(evidence_setup) -> None:
+    engine, tenant_id, journey_id, _, _, security_client, di_client = evidence_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    content = b"RECOVERY-DOCUMENT"
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE OR REPLACE FUNCTION auditcore.test_fail_evidence_link()
+                RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF NEW.tenant_id = :tenant_id THEN
+                        RAISE EXCEPTION 'simulated outer evidence link failure';
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$
+                """
+            ),
+            {"tenant_id": tenant_id},
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TRIGGER test_fail_evidence_link
+                BEFORE INSERT ON auditcore.evidence
+                FOR EACH ROW EXECUTE FUNCTION auditcore.test_fail_evidence_link()
+                """
+            )
+        )
+
+    try:
+        failed = _post_evidence(
+            client,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            key="evidence-recovery-0001",
+            content=content,
+        )
+        assert failed.status_code == 500
+        assert di_client.upload_calls == 1
+
+        with engine.begin() as connection:
+            operation = connection.execute(
+                text(
+                    """
+                    SELECT operation_status, di_subject_id, di_document_id, evidence_id
+                    FROM auditcore.evidence_ingestion_operations
+                    WHERE tenant_id = :tenant_id
+                      AND idempotency_key = 'evidence-recovery-0001'
+                    """
+                ),
+                {"tenant_id": tenant_id},
+            ).mappings().one()
+        assert operation["operation_status"] == "DI_ACCEPTED"
+        assert operation["di_subject_id"] == di_client.subject_id
+        assert operation["di_document_id"] == di_client.document_id
+        assert operation["evidence_id"] is None
+    finally:
+        with engine.begin() as connection:
+            connection.execute(text("DROP TRIGGER IF EXISTS test_fail_evidence_link ON auditcore.evidence"))
+            connection.execute(text("DROP FUNCTION IF EXISTS auditcore.test_fail_evidence_link()"))
+
+    recovered = _post_evidence(
+        client,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        key="evidence-recovery-0001",
+        content=content,
+    )
+
+    assert recovered.status_code == 201, recovered.text
+    assert di_client.upload_calls == 1
+    assert di_client.read_calls == 1
+    assert security_client.requests[-1] == ("di.document.read",)
+    with engine.begin() as connection:
+        operation = connection.execute(
+            text(
+                """
+                SELECT operation_status, evidence_id
+                FROM auditcore.evidence_ingestion_operations
+                WHERE tenant_id = :tenant_id
+                  AND idempotency_key = 'evidence-recovery-0001'
+                """
+            ),
+            {"tenant_id": tenant_id},
+        ).mappings().one()
+        evidence_count = connection.execute(
+            text(
+                "SELECT count(*) FROM auditcore.evidence "
+                "WHERE tenant_id = :tenant_id AND journey_id = :journey_id"
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one()
+    assert operation["operation_status"] == "LINKED"
+    assert operation["evidence_id"] == UUID(recovered.json()["evidenceId"])
+    assert evidence_count == 1
+
+
+def test_same_idempotency_key_with_different_document_is_conflict(evidence_setup) -> None:
+    _, tenant_id, journey_id, _, _, _, di_client = evidence_setup
+    client = TestClient(app, raise_server_exceptions=False)
+
+    first = _post_evidence(
+        client,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        key="evidence-conflict-0001",
+        content=b"FIRST-DOCUMENT",
+    )
+    second = _post_evidence(
+        client,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        key="evidence-conflict-0001",
+        content=b"DIFFERENT-DOCUMENT",
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 409
+    assert second.json()["errorCode"] == "VAC-CONFLICT-003"
+    assert di_client.upload_calls == 1
 
 
 def test_upload_facade_requires_audit_evidence_permission(evidence_setup) -> None:
