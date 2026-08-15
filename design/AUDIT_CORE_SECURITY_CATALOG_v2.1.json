@@ -1,0 +1,78 @@
+{
+  "moduleKey": "audit",
+  "moduleName": "Audit Core",
+  "catalogVersion": "2.1",
+  "status": "APPROVED_FOR_SECURITY_REGISTRATION",
+  "authority": "Project-owner decision 2026-08-15",
+  "notes": [
+    "This catalogue supersedes AUDIT_CORE_SECURITY_CATALOG_v1.0 for registration and implementation.",
+    "Security permissions are authoritative for capability access; Audit Core additionally enforces Tenant and Project/Dealer/Outlet business scope.",
+    "The four default cross-module operating bundles PC/TL/PM/CRM are defined in docs/AUDIT_CORE_DEFAULT_ROLE_BUNDLES_v1.0.md and owned operationally by Security.",
+    "No Audit Core permission authorizes destructive delete/purge of audit evidence or audit history."
+  ],
+  "permissions": [
+    {"key": "audit.project.read", "name": "Read Audit Project"},
+    {"key": "audit.project.update", "name": "Update permitted Audit Project settings"},
+    {"key": "audit.project.assignment.manage", "name": "Manage Audit Project business assignments/scopes"},
+
+    {"key": "audit.master.read", "name": "Read Audit Core master data"},
+    {"key": "audit.master.write", "name": "Create/update draft Audit Core master data"},
+    {"key": "audit.master.publish", "name": "Publish/retire Audit Core master versions"},
+
+    {"key": "audit.customer.read", "name": "Read customers within permitted business scope"},
+    {"key": "audit.customer.write", "name": "Create/update/inactivate customers within permitted business scope"},
+
+    {"key": "audit.journey.create", "name": "Create customer/audit Journey"},
+    {"key": "audit.journey.read", "name": "Read customer/audit Journey"},
+    {"key": "audit.journey.update", "name": "Record/update permitted Journey facts"},
+    {"key": "audit.journey.submit", "name": "Submit PC-completed audit work for review"},
+
+    {"key": "audit.evidence.read", "name": "Read Audit Core evidence requirements, links, status and projected facts"},
+    {"key": "audit.evidence.upload", "name": "Upload evidence through the Audit Core DI facade"},
+    {"key": "audit.evidence.refresh", "name": "Refresh DI processing/status/facts through Audit Core"},
+
+    {"key": "audit.payment.read", "name": "Read payment/finance audit data"},
+    {"key": "audit.payment.write", "name": "Record/update payment/finance audit data"},
+    {"key": "audit.payment.verify", "name": "Record permitted payment/finance verification"},
+
+    {"key": "audit.delivery.read", "name": "Read delivery audit data"},
+    {"key": "audit.delivery.write", "name": "Record/update observed delivery data"},
+    {"key": "audit.delivery.verify", "name": "Record permitted delivery verification"},
+
+    {"key": "audit.trade_in.read", "name": "Read trade-in audit data"},
+    {"key": "audit.trade_in.write", "name": "Record/update trade-in audit data"},
+    {"key": "audit.trade_in.verify", "name": "Record permitted trade-in verification"},
+
+    {"key": "audit.finding.read", "name": "Read audit evaluations/findings"},
+    {"key": "audit.finding.create", "name": "Create permitted manual finding/observation"},
+    {"key": "audit.finding.update", "name": "Update permitted finding workflow metadata"},
+    {"key": "audit.finding.resolve", "name": "Resolve/void finding under permitted policy"},
+
+    {"key": "audit.review.read", "name": "Read audit review history"},
+    {"key": "audit.review.decide", "name": "Record permitted TL/PM audit review decision"},
+
+    {"key": "audit.work.read", "name": "Read assigned/permitted Audit Core work items"},
+    {"key": "audit.work.update", "name": "Claim/start/complete permitted Audit Core work items"},
+    {"key": "audit.work.manage", "name": "Reassign/cancel/manage Audit Core work items within scope"},
+
+    {"key": "audit.daily_ops.read", "name": "Read Daily/EOD audit operations"},
+    {"key": "audit.daily_ops.execute", "name": "Execute PC Daily/EOD audit operations"},
+    {"key": "audit.daily_ops.review", "name": "Review team Daily/EOD audit operations"},
+
+    {"key": "audit.crm.read", "name": "Read CRM follow-up work/interactions"},
+    {"key": "audit.crm.execute", "name": "Record CRM attempts/outcomes"},
+    {"key": "audit.crm.manage", "name": "Manage CRM follow-up queues/rules within scope"},
+
+    {"key": "audit.escalation.read", "name": "Read Audit Core escalations"},
+    {"key": "audit.escalation.manage", "name": "Open/assign/update/close Audit Core escalations"},
+
+    {"key": "audit.analytics.read", "name": "Read Audit Core operational/business analytics"},
+    {"key": "audit.audit_trail.read", "name": "Read authoritative Audit Core audit trail"}
+  ],
+  "defaultOperationalRoles": [
+    {"key": "PC", "source": "docs/AUDIT_CORE_DEFAULT_ROLE_BUNDLES_v1.0.md"},
+    {"key": "TL", "source": "docs/AUDIT_CORE_DEFAULT_ROLE_BUNDLES_v1.0.md"},
+    {"key": "PM", "source": "docs/AUDIT_CORE_DEFAULT_ROLE_BUNDLES_v1.0.md"},
+    {"key": "CRM", "source": "docs/AUDIT_CORE_DEFAULT_ROLE_BUNDLES_v1.0.md"}
+  ]
+}
