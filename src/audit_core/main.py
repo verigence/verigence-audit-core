@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 
-from audit_core.config import settings
+from audit_core.config import load_settings
+
+settings = load_settings()
 
 app = FastAPI(
     title=settings.service_name,
