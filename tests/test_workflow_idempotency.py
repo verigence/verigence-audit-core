@@ -183,6 +183,22 @@ def test_effect_key_is_idempotent_and_retry_exhaustion_is_visible() -> None:
         assert dead_letter["next_attempt_at_utc"] is None
         assert dead_letter["last_error_code"] == "DEPENDENCY_UNAVAILABLE"
 
+        persisted_dead_letter = connection.execute(
+            text(
+                """
+                SELECT resolution_status, dead_letter_reason,
+                       last_error_code, last_error_summary
+                FROM auditcore.workflow_dead_letters
+                WHERE tenant_id = :tenant_id AND workflow_task_id = :task_id
+                """
+            ),
+            {"tenant_id": tenant_id, "task_id": first_task_id},
+        ).mappings().one()
+        assert persisted_dead_letter["resolution_status"] == "OPEN"
+        assert persisted_dead_letter["dead_letter_reason"] == "Dependency remained unavailable"
+        assert persisted_dead_letter["last_error_code"] == "DEPENDENCY_UNAVAILABLE"
+        assert persisted_dead_letter["last_error_summary"] == "Dependency remained unavailable"
+
         attempt = connection.execute(
             text(
                 """
