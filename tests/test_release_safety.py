@@ -13,13 +13,13 @@ from audit_core.security import Principal
 def _clean_process_public_methods() -> list[list[str]]:
     script = r'''
 import json
-from fastapi.routing import APIRoute
 from audit_core.main import app
 
 print(json.dumps([
     sorted(route.methods)
     for route in app.routes
-    if isinstance(route, APIRoute) and route.path.startswith("/v1/")
+    if getattr(route, "path", "").startswith("/v1/")
+    and getattr(route, "methods", None)
 ]))
 '''
     env = os.environ.copy()
