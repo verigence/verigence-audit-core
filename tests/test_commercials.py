@@ -185,11 +185,11 @@ def test_commercials_preserve_standard_actual_provenance_and_master_versions() -
             text(
                 """
                 INSERT INTO auditcore.price_list_versions (
-                    tenant_id, price_list_id, version_no, lifecycle_status,
-                    effective_from, currency_code, published_at_utc
+                    tenant_id, price_list_id, version_no,
+                    effective_from, currency_code
                 ) VALUES (
-                    :tenant_id, :price_list_id, 1, 'PUBLISHED',
-                    CURRENT_DATE, 'INR', now()
+                    :tenant_id, :price_list_id, 1,
+                    CURRENT_DATE, 'INR'
                 ) RETURNING price_list_version_id
                 """
             ),
@@ -213,6 +213,17 @@ def test_commercials_preserve_standard_actual_provenance_and_master_versions() -
                 "sku_id": sku_id,
             },
         ).scalar_one()
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.price_list_versions
+                SET lifecycle_status = 'PUBLISHED', published_at_utc = now()
+                WHERE tenant_id = :tenant_id
+                  AND price_list_version_id = :version_id
+                """
+            ),
+            {"tenant_id": tenant_id, "version_id": price_version_id},
+        )
         scheme_id = connection.execute(
             text(
                 """
@@ -228,11 +239,9 @@ def test_commercials_preserve_standard_actual_provenance_and_master_versions() -
             text(
                 """
                 INSERT INTO auditcore.discount_scheme_versions (
-                    tenant_id, discount_scheme_id, version_no,
-                    lifecycle_status, effective_from, published_at_utc
+                    tenant_id, discount_scheme_id, version_no, effective_from
                 ) VALUES (
-                    :tenant_id, :scheme_id, 1,
-                    'PUBLISHED', CURRENT_DATE, now()
+                    :tenant_id, :scheme_id, 1, CURRENT_DATE
                 ) RETURNING discount_scheme_version_id
                 """
             ),
@@ -247,6 +256,17 @@ def test_commercials_preserve_standard_actual_provenance_and_master_versions() -
                 ) VALUES (
                     :tenant_id, :version_id, 'CONSUMER_OFFER', 'AMOUNT', 25000.00
                 )
+                """
+            ),
+            {"tenant_id": tenant_id, "version_id": scheme_version_id},
+        )
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.discount_scheme_versions
+                SET lifecycle_status = 'PUBLISHED', published_at_utc = now()
+                WHERE tenant_id = :tenant_id
+                  AND discount_scheme_version_id = :version_id
                 """
             ),
             {"tenant_id": tenant_id, "version_id": scheme_version_id},
