@@ -11,7 +11,12 @@ from sqlalchemy import Connection, Engine, text
 from audit_core.authorization import authorize
 from audit_core.business_assignments import require_business_scope
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import get_bearer_token, get_connection, get_engine, get_principal
+from audit_core.dependencies import (
+    get_bearer_token,
+    get_connection,
+    get_engine,
+    get_principal,
+)
 from audit_core.di_client import DiClient, DiClientError, DiFact
 from audit_core.errors import NotFoundError
 from audit_core.evidence import (
