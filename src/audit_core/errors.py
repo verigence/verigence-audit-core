@@ -6,7 +6,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from audit_core.authorization import AuthorizationError
-from audit_core.observability import get_correlation_id
+from audit_core.observability import CORRELATION_HEADER, get_correlation_id
 from audit_core.security import SecurityTokenError
 
 logger = logging.getLogger("audit_core")
@@ -53,6 +53,7 @@ def _problem(
     return JSONResponse(
         status_code=status_code,
         media_type="application/problem+json",
+        headers={CORRELATION_HEADER: correlation_id},
         content={
             "type": f"urn:verigence:audit-core:error:{error_code}",
             "title": title,
