@@ -25,12 +25,17 @@ def get_connection() -> Iterator[Connection]:
         yield connection
 
 
-def get_principal(
+def get_bearer_token(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
-) -> Principal:
+) -> str:
     if credentials is None:
         raise SecurityTokenError("Missing Security token")
+    return credentials.credentials
 
+
+def get_principal(
+    bearer_token: Annotated[str, Depends(get_bearer_token)],
+) -> Principal:
     jwks_url = os.environ.get("SECURITY_JWKS_URL", "").strip()
     issuer = os.environ.get("SECURITY_ISSUER", "").strip()
     audience = os.environ.get("SECURITY_AUDIENCE", "").strip()
@@ -41,4 +46,4 @@ def get_principal(
         jwks_url=jwks_url,
         issuer=issuer,
         audience=audience,
-    ).validate(credentials.credentials)
+    ).validate(bearer_token)
