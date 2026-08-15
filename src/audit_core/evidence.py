@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 from collections.abc import Iterator
-from typing import Annotated, Any
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, Header, Request, UploadFile, status
