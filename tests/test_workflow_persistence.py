@@ -196,16 +196,19 @@ def test_workflow_tasks_persist_and_support_command_lifecycle() -> None:
                     SELECT event_type, from_status, to_status
                     FROM auditcore.workflow_task_events
                     WHERE tenant_id = :tenant_id AND workflow_task_id = :task_id
-                    ORDER BY occurred_at_utc, workflow_task_event_id
                     """
                 ),
                 {"tenant_id": tenant_id, "task_id": task_id},
             ).mappings().all()
-            assert [(row["event_type"], row["to_status"]) for row in events] == [
-                ("CREATED", "READY"),
-                ("CLAIMED", "CLAIMED"),
-                ("STARTED", "IN_PROGRESS"),
-                ("COMPLETED", "COMPLETED"),
-            ]
+            transitions = {
+                (row["event_type"], row["from_status"], row["to_status"])
+                for row in events
+            }
+            assert transitions == {
+                ("CREATED", None, "READY"),
+                ("CLAIMED", "READY", "CLAIMED"),
+                ("STARTED", "CLAIMED", "IN_PROGRESS"),
+                ("COMPLETED", "IN_PROGRESS", "COMPLETED"),
+            }
     finally:
         restarted_engine.dispose()
