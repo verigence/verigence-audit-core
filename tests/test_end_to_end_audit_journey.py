@@ -33,17 +33,7 @@ class FakeDiClient:
     create_calls: int = 0
     upload_calls: int = 0
 
-    def create_subject(self, **kwargs) -> DiSubject:
-        assert kwargs["token"] == "service-token"
-        assert kwargs["tenant_id"] == self.tenant_id
-        self.create_calls += 1
-        return DiSubject(subject_id=self.subject_id, status="ACTIVE")
-
-    def upload_document(self, **kwargs) -> DiDocument:
-        assert kwargs["token"] == "service-token"
-        assert kwargs["tenant_id"] == self.tenant_id
-        assert kwargs["subject_id"] == self.subject_id
-        self.upload_calls += 1
+    def _document(self) -> DiDocument:
         return DiDocument(
             document_id=self.document_id,
             subject_id=self.subject_id,
@@ -56,8 +46,25 @@ class FakeDiClient:
             correlation_id="di-e2e",
         )
 
+    def create_subject(self, **kwargs) -> DiSubject:
+        assert kwargs["token"] == "service-token"
+        assert kwargs["tenant_id"] == self.tenant_id
+        self.create_calls += 1
+        return DiSubject(subject_id=self.subject_id, status="ACTIVE")
+
+    def upload_document(self, **kwargs) -> DiDocument:
+        assert kwargs["token"] == "service-token"
+        assert kwargs["tenant_id"] == self.tenant_id
+        assert kwargs["subject_id"] == self.subject_id
+        self.upload_calls += 1
+        return self._document()
+
     def get_document(self, **kwargs) -> DiDocument:
-        return self.upload_document(**kwargs)
+        assert kwargs["token"] == "service-token"
+        assert kwargs["tenant_id"] == self.tenant_id
+        assert kwargs["subject_id"] == self.subject_id
+        assert kwargs["document_id"] == self.document_id
+        return self._document()
 
 
 def test_critical_journey_uses_audit_core_only_and_keeps_delivery_independent() -> None:
@@ -171,6 +178,7 @@ def test_critical_journey_uses_audit_core_only_and_keeps_delivery_independent() 
 
         journey = client.post(
             f"/v1/tenants/{tenant_id}/customers/{customer_id}/journeys",
+            headers={"Idempotency-Key": f"journey-{suffix}"},
             json={"journeyReference": f"J-{suffix}"},
         )
         assert journey.status_code == 201, journey.text
@@ -220,6 +228,7 @@ def test_critical_journey_uses_audit_core_only_and_keeps_delivery_independent() 
 
         delivery = client.put(
             f"/v1/tenants/{tenant_id}/journeys/{journey_id}/delivery",
+            headers={"Idempotency-Key": f"delivery-{suffix}"},
             json={
                 "actualDeliveryStatusCode": "DELIVERED",
                 "actualDeliveredAt": "2026-08-15T12:00:00Z",
