@@ -402,15 +402,11 @@ def test_di_accepted_outer_failure_is_recovered_without_second_upload(evidence_s
                 CREATE OR REPLACE FUNCTION auditcore.test_fail_evidence_link()
                 RETURNS trigger LANGUAGE plpgsql AS $$
                 BEGIN
-                    IF NEW.tenant_id = :tenant_id THEN
-                        RAISE EXCEPTION 'simulated outer evidence link failure';
-                    END IF;
-                    RETURN NEW;
+                    RAISE EXCEPTION 'simulated outer evidence link failure';
                 END;
                 $$
                 """
-            ),
-            {"tenant_id": tenant_id},
+            )
         )
         connection.execute(
             text(
