@@ -12,6 +12,22 @@ permissions:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: auditcore_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d auditcore_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/auditcore_test
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -30,7 +46,20 @@ jobs:
         run: python -m pip wheel . --no-deps --wheel-dir dist
 
       - name: Lint
-        run: ruff check src tests
+        run: ruff check src tests migrations
+
+      - name: Apply fresh database migration
+        run: |
+          alembic upgrade head
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+
+          engine = create_engine(os.environ["DATABASE_URL"])
+          with engine.connect() as connection:
+              assert connection.execute(text("select to_regclass('auditcore.projects')::text")).scalar_one() == "auditcore.projects"
+              assert connection.execute(text("select version_num from alembic_version")).scalar_one() == "0001_vac_db_002"
+          PY
 
       - name: Unit tests
         run: pytest -q
