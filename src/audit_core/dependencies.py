@@ -20,8 +20,12 @@ def _engine() -> Engine:
     return create_engine(database_url)
 
 
+def get_engine() -> Engine:
+    return _engine()
+
+
 def get_connection() -> Iterator[Connection]:
-    with _engine().begin() as connection:
+    with get_engine().begin() as connection:
         yield connection
 
 
