@@ -2,74 +2,72 @@
 
 ## Current status
 
-**Historical baseline:** Audit Core Solution Design v1.0  
-**Historical status:** BASELINED on 2026-08-15, but **IMPLEMENTATION HOLD** after explicit project-owner corrections  
-**Current design candidate:** `VAC-SD-002` / Audit Core Solution Design v2.0 — **DRAFT FOR REVIEW**  
-**Requirements:** `VAC-REQ-001 v1.0` plus authoritative correction addendum `VAC-REQ-ADD-001 v1.1`
+**Historical baseline:** Audit Core Solution Design v1.0 — BASELINED historically, **IMPLEMENTATION HOLD**  
+**Superseded review candidate:** `VAC-SD-002` / v2.0 — retained for traceability  
+**Current design candidate:** `VAC-SD-003` / Audit Core Solution Design v2.1 — **DRAFT FOR REVIEW**  
+**Requirements:** `VAC-REQ-001 v1.0` + authoritative corrections `VAC-REQ-ADD-001 v1.1` and `VAC-REQ-ADD-002 v1.2`
 
-> v1.0 remains preserved as design history. It SHALL NOT be implemented unchanged because its Tenant→Project, Customer/Audit Case and Booking-root assumptions were corrected by the project owner. The existing `VAC-DB-001` physical schema and v1.0 Security catalogue are also on implementation/registration hold until replaced/aligned to the approved v2.0 design.
+> No historical v1.0/v2.0 artifact shall be implemented where it conflicts with the approved correction addenda or v2.1 review candidate. `VAC-DB-001` and the v1.0 Security catalogue remain on implementation/registration hold until replacement/alignment to an approved v2.x design.
 
-## v2.0 review package
+## Current v2.1 review package
 
-| Artifact | Document ID | Status | Git blob SHA | Commit |
-|---|---|---|---|---|
-| `docs/AUDIT_CORE_REQUIREMENTS_CORRECTION_ADDENDUM_v1.1.md` | `VAC-REQ-ADD-001` | APPROVED BUSINESS CORRECTIONS | `0dd38f27edbaef0a24df9bd9f127ce15f49b56f6` | `f75579a07d2ab32e63bc7d6b5283858cf020752c` |
-| `docs/AUDIT_CORE_SOLUTION_DESIGN_v2.0.md` | `VAC-SD-002` | DRAFT FOR REVIEW | `5c2033c42b31c5c9132dbc7cb534e225471ba543` | `f75579a07d2ab32e63bc7d6b5283858cf020752c` |
-| `docs/AUDIT_CORE_DESIGN_RECONCILIATION_v2.0.md` | `VAC-DR-002` | DRAFT FOR REVIEW | `bc4eb4ca863a876ced605b4c8d6627ec7e0beebd` | `f75579a07d2ab32e63bc7d6b5283858cf020752c` |
+| Artifact | Document ID | Status |
+|---|---|---|
+| `docs/AUDIT_CORE_REQUIREMENTS_CORRECTION_ADDENDUM_v1.2.md` | `VAC-REQ-ADD-002` | APPROVED BUSINESS CORRECTIONS |
+| `docs/AUDIT_CORE_SOLUTION_DESIGN_v2.1.md` | `VAC-SD-003` | DRAFT FOR REVIEW |
+| `docs/AUDIT_CORE_DESIGN_RECONCILIATION_v2.1.md` | `VAC-DR-003` | DRAFT FOR REVIEW |
+| `docs/AUDIT_CORE_API_CONTRACT_v1.0.md` | `VAC-API-001` | DRAFT FOR REVIEW |
+| `api/openapi-v1.yaml` | machine-readable API companion | DRAFT FOR REVIEW |
+| `docs/AUDIT_CORE_ERROR_CATALOG_v1.0.md` | `VAC-ERR-001` | DRAFT FOR REVIEW |
 
-The v2.0 candidate freezes nothing beyond the explicit business corrections until project-owner review/approval. After approval, a new v2.0 baseline manifest revision and replacement physical DDL (`VAC-DB-002`) shall be produced.
-
-## Foundational corrections already authoritative
+## Authoritative foundational corrections
 
 1. **One Security Tenant = one Audit Project.**
-2. Canonical business hierarchy: **Project → Dealer → Dealer Outlet → Customer → Customer/Audit Journey**.
-3. Booking starts the Journey; Booking, Delivery, Payments, Finance, Insurance/VAS, Trade-In, Vehicle/Registration and related processes are peer parts of the Journey rather than children of one Booking aggregate.
-4. Decision-relevant master data remains versioned/effective-dated; published versions are immutable.
-5. Workflow/tasks must be durable and recoverable; committed tasks cannot be lost on restart/crash/deploy/retry.
-6. PC capture/upload responsibilities are separated from formal TL/PM verification/validation responsibilities.
-7. Dealer staff remain business reference participants in the current scope.
-8. Dealer Outlet is an Audit Core business entity; any Security Location mapping is explicit rather than assumed.
+2. Business hierarchy: **Project -> Dealer -> Dealer Outlet -> Customer -> Customer/Audit Journey**.
+3. Booking starts the Journey; Booking, Delivery, Payments, Finance, Insurance/VAS, Trade-In, Vehicle/Registration and related processes are peer parts of the Journey.
+4. Decision-relevant master data is versioned/effective-dated; published versions are immutable.
+5. Audit workflow/tasks are durable/recoverable; committed tasks cannot silently disappear.
+6. PC capture/upload responsibilities are separated from formal TL/PM verification/validation.
+7. Dealer staff are business reference participants in the current scope.
+8. Dealer Outlet is an Audit Core business entity; Security Location mapping is explicit rather than assumed.
+9. **Audit Core audits/observes; it does not stop, block, approve, reject or control dealer business operations.**
+10. **Actual delivery/business status is separate from Audit Core audit state/outcome.**
+11. **DI is internal-only behind Audit Core for user-facing journeys; Web/Mobile never calls DI directly.**
+12. Audit business logic remains in Audit Core; DI remains generic document intelligence.
+13. Audit Core uses structured logging, typed exceptions, centralized error mapping and a stable error catalogue.
+14. Executive has tenant-wide Audit Core super privileges **except delete/purge/destructive removal**.
+15. Baseline public Audit Core API contains no HTTP DELETE operations.
+16. Audit Core maintains an explicit human-readable API contract plus OpenAPI representation.
 
-## Historical v1.0 package — retained for traceability only
+## v2.0 package — historical review traceability
 
-| Artifact | Document ID | Historical status | Git blob SHA | Original commit |
-|---|---|---|---|---|
-| `docs/AUDIT_CORE_SOLUTION_DESIGN_v1.0.md` | `VAC-SD-001` | BASELINED / IMPLEMENTATION HOLD | `35cefb4429066bf6fac6a3801a7a5c7395a3de4b` | `fcf78704c5c467faae7b8237b336e5181d21444d` |
-| `database/AUDIT_CORE_POSTGRESQL_SCHEMA_v1.0.sql` | `VAC-DB-001` | BASELINED PHYSICAL DESIGN / IMPLEMENTATION HOLD | `ae9f27a8f37be8672cbe77ad15ef03bb028038b5` | `88269e25913ce1e18959448a9c068d8c337c595f` |
-| `design/AUDIT_CORE_SECURITY_CATALOG_v1.0.json` | design companion | PROPOSED / REGISTRATION HOLD | `f5bde0bc839dbc6c11607755227896da7b8be505` | `e73c505bb3c0be4a9ad18eddd533bc3e160f38f6` |
+- `docs/AUDIT_CORE_REQUIREMENTS_CORRECTION_ADDENDUM_v1.1.md` — `VAC-REQ-ADD-001`
+- `docs/AUDIT_CORE_SOLUTION_DESIGN_v2.0.md` — `VAC-SD-002`
+- `docs/AUDIT_CORE_DESIGN_RECONCILIATION_v2.0.md` — `VAC-DR-002`
 
-Requirements baseline history remains:
+v2.0 is superseded as the current review candidate by v2.1, particularly for the direct Client->DI flow and any language that could imply Audit Core controls dealer delivery/business lifecycle.
 
-- `docs/AUDIT_CORE_REQUIREMENTS_BASELINE_v1.0.md`
-- Document ID `VAC-REQ-001`
-- requirements blob SHA `c59721009214681eed793bf21b427ebd0253d462`
-- corrected by `VAC-REQ-ADD-001 v1.1` where conflicts exist.
+## Historical v1.0 package — traceability only
 
-## v1.0 decisions retained in v2.0 unless changed explicitly
+- `docs/AUDIT_CORE_SOLUTION_DESIGN_v1.0.md` — `VAC-SD-001` — IMPLEMENTATION HOLD
+- `database/AUDIT_CORE_POSTGRESQL_SCHEMA_v1.0.sql` — `VAC-DB-001` — IMPLEMENTATION HOLD
+- `design/AUDIT_CORE_SECURITY_CATALOG_v1.0.json` — REGISTRATION HOLD
+- `docs/AUDIT_CORE_REQUIREMENTS_BASELINE_v1.0.md` — `VAC-REQ-001`, corrected by v1.1/v1.2 addenda where conflicts exist
 
-The following v1.0 architecture principles remain useful and are retained/strengthened in the v2.0 candidate:
+## Retained architecture principles
 
-- Audit Core as a modular monolith initially;
+- modular monolith initially;
 - Security as identity/effective-permission authority;
-- DI as document/evidence-content and document-intelligence authority;
-- no Security/DI private database reads or cross-module database foreign keys;
+- DI as generic document/evidence-content and document-intelligence authority;
+- no Security/DI private database reads or cross-module DB foreign keys;
 - immutable/versioned published master configuration;
-- PostgreSQL tenant isolation with composite tenant keys, `ENABLE ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY`, using a non-owner runtime role without `BYPASSRLS`;
-- transactional outbox and inbox/idempotency patterns;
-- authoritative Audit Core business audit trail distinct from operational Observability logs;
+- PostgreSQL Tenant isolation with RLS/forced RLS and a non-owner runtime role without `BYPASSRLS`;
+- transactional outbox/inbox/idempotency;
+- authoritative Audit Core audit history distinct from operational Observability logs;
 - unresolved business formulas/thresholds remain open/configurable rather than guessed.
-
-## External contract review points
-
-The current candidate design is insulated through adapters and was checked against the then-current development contracts of:
-
-- `verigence-security` — Security-issued access token/JWKS model with Tenant and effective `permissions[]` claims;
-- `verigence-di` — Tenant-scoped Subjects (`PERSON`, `ORGANIZATION`, `OTHER`), document operations and generic document external-entity links.
-
-These external repositories are not modified by this Audit Core design work. Their future changes must be absorbed through Audit Core integration adapters and separately approved integration changes.
 
 ## Governance
 
-Material changes to Project/Tenant identity, Dealer/Outlet/Customer/Journey hierarchy, workflow durability, Security/DI ownership, master versioning, event contracts or physical data ownership require explicit design change control.
+No implementation shall treat `VAC-SD-003`, `VAC-API-001`, `VAC-ERR-001` or `api/openapi-v1.yaml` as a formally approved baseline until project-owner review/approval.
 
-No implementation shall use `VAC-SD-002` as a baselined contract until the project owner approves the v2.0 design candidate. No change to Security or DI is implied by merely documenting proposed Audit Core integration/permission requirements.
+After approval, a replacement physical DDL (`VAC-DB-002`) and aligned Audit Core Security catalogue shall be produced. No change to Security or DI repositories is implied by this design documentation.
