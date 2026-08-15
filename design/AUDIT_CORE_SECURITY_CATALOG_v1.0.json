@@ -1,0 +1,209 @@
+{
+  "moduleKey": "audit",
+  "moduleName": "Audit Core",
+  "catalogVersion": "1.0",
+  "status": "PROPOSED_FOR_SECURITY_REGISTRATION",
+  "notes": [
+    "This catalog is owned by the Audit Core design package until separately approved/registered in Verigence Security.",
+    "Security permissions are authoritative for capability access; Audit Core additionally enforces Project/Dealer/Outlet business scope.",
+    "Security location/device context is not the same as Audit Core Dealer Outlet business scope."
+  ],
+  "permissions": [
+    {"key": "audit.project.create", "name": "Create project"},
+    {"key": "audit.project.read", "name": "Read project"},
+    {"key": "audit.project.update", "name": "Update project"},
+    {"key": "audit.project.activate", "name": "Activate/suspend/close project"},
+    {"key": "audit.project.assignment.manage", "name": "Manage project business assignments/scopes"},
+
+    {"key": "audit.master.read", "name": "Read Audit Core master data"},
+    {"key": "audit.master.write", "name": "Create/update draft master data"},
+    {"key": "audit.master.publish", "name": "Publish/retire master data versions"},
+
+    {"key": "audit.case.create", "name": "Create Audit Case/Booking"},
+    {"key": "audit.case.read", "name": "Read Audit Case/Booking"},
+    {"key": "audit.case.update", "name": "Update permitted Audit Case business facts"},
+    {"key": "audit.case.transition", "name": "Execute permitted Audit Case business-stage transitions"},
+    {"key": "audit.case.submit", "name": "Submit PC-completed case for TL review"},
+
+    {"key": "audit.evidence.read", "name": "Read Audit Core evidence requirements/links/status"},
+    {"key": "audit.evidence.link", "name": "Link/unlink DI evidence to Audit Case"},
+    {"key": "audit.evidence.refresh", "name": "Refresh DI evidence status/facts for Audit Case"},
+
+    {"key": "audit.payment.read", "name": "Read payment/finance audit data"},
+    {"key": "audit.payment.write", "name": "Record/update payment/finance audit data"},
+    {"key": "audit.payment.verify", "name": "Record payment verification result"},
+
+    {"key": "audit.delivery.read", "name": "Read delivery audit data"},
+    {"key": "audit.delivery.write", "name": "Record/update delivery audit data"},
+    {"key": "audit.delivery.verify", "name": "Complete delivery physical/business verification"},
+
+    {"key": "audit.trade_in.read", "name": "Read trade-in audit data"},
+    {"key": "audit.trade_in.write", "name": "Record/update trade-in audit data"},
+    {"key": "audit.trade_in.verify", "name": "Complete trade-in verification"},
+
+    {"key": "audit.finding.read", "name": "Read evaluations/findings"},
+    {"key": "audit.finding.create", "name": "Create permitted manual finding/observation"},
+    {"key": "audit.finding.update", "name": "Acknowledge/update finding workflow metadata"},
+    {"key": "audit.finding.resolve", "name": "Resolve/void finding under permitted policy"},
+
+    {"key": "audit.review.read", "name": "Read review history"},
+    {"key": "audit.review.decide", "name": "Record TL review decision (Breach/No Breach/Send Back)"},
+
+    {"key": "audit.work.read", "name": "Read assigned/permitted work items"},
+    {"key": "audit.work.update", "name": "Claim/start/complete permitted work items"},
+    {"key": "audit.work.manage", "name": "Reassign/cancel/manage work items within scope"},
+
+    {"key": "audit.daily_ops.read", "name": "Read daily/EOD operations"},
+    {"key": "audit.daily_ops.execute", "name": "Execute PC daily/EOD operations"},
+    {"key": "audit.daily_ops.review", "name": "Review team daily/EOD operations"},
+
+    {"key": "audit.crm.read", "name": "Read CRM follow-up work/interactions"},
+    {"key": "audit.crm.execute", "name": "Record CRM call attempts/outcomes"},
+    {"key": "audit.crm.manage", "name": "Manage CRM follow-up queues/rules within scope"},
+
+    {"key": "audit.escalation.read", "name": "Read business escalations"},
+    {"key": "audit.escalation.manage", "name": "Open/assign/update/close business escalations"},
+
+    {"key": "audit.analytics.read", "name": "Read Audit Core operational/business analytics"},
+    {"key": "audit.audit_trail.read", "name": "Read authoritative Audit Core audit trail"}
+  ],
+  "roleTemplates": [
+    {
+      "key": "audit.process_consultant",
+      "name": "PROCESS_CONSULTANT",
+      "businessRole": "PC",
+      "permissions": [
+        "audit.project.read",
+        "audit.master.read",
+        "audit.case.create",
+        "audit.case.read",
+        "audit.case.update",
+        "audit.case.transition",
+        "audit.case.submit",
+        "audit.evidence.read",
+        "audit.evidence.link",
+        "audit.evidence.refresh",
+        "audit.payment.read",
+        "audit.payment.write",
+        "audit.payment.verify",
+        "audit.delivery.read",
+        "audit.delivery.write",
+        "audit.delivery.verify",
+        "audit.trade_in.read",
+        "audit.trade_in.write",
+        "audit.trade_in.verify",
+        "audit.finding.read",
+        "audit.finding.create",
+        "audit.work.read",
+        "audit.work.update",
+        "audit.daily_ops.read",
+        "audit.daily_ops.execute"
+      ]
+    },
+    {
+      "key": "audit.team_lead",
+      "name": "TEAM_LEAD",
+      "businessRole": "TL",
+      "permissions": [
+        "audit.project.read",
+        "audit.master.read",
+        "audit.case.read",
+        "audit.case.update",
+        "audit.case.transition",
+        "audit.evidence.read",
+        "audit.evidence.refresh",
+        "audit.payment.read",
+        "audit.delivery.read",
+        "audit.trade_in.read",
+        "audit.finding.read",
+        "audit.finding.create",
+        "audit.finding.update",
+        "audit.review.read",
+        "audit.review.decide",
+        "audit.work.read",
+        "audit.work.update",
+        "audit.work.manage",
+        "audit.daily_ops.read",
+        "audit.daily_ops.review",
+        "audit.escalation.read",
+        "audit.analytics.read"
+      ]
+    },
+    {
+      "key": "audit.project_manager",
+      "name": "PROJECT_MANAGER",
+      "businessRole": "PM",
+      "permissions": [
+        "audit.project.read",
+        "audit.project.update",
+        "audit.project.assignment.manage",
+        "audit.master.read",
+        "audit.case.read",
+        "audit.evidence.read",
+        "audit.payment.read",
+        "audit.delivery.read",
+        "audit.trade_in.read",
+        "audit.finding.read",
+        "audit.finding.update",
+        "audit.finding.resolve",
+        "audit.review.read",
+        "audit.work.read",
+        "audit.work.manage",
+        "audit.daily_ops.read",
+        "audit.daily_ops.review",
+        "audit.crm.read",
+        "audit.escalation.read",
+        "audit.escalation.manage",
+        "audit.analytics.read",
+        "audit.audit_trail.read"
+      ]
+    },
+    {
+      "key": "audit.crm",
+      "name": "CRM",
+      "businessRole": "CRM",
+      "permissions": [
+        "audit.project.read",
+        "audit.case.read",
+        "audit.finding.read",
+        "audit.work.read",
+        "audit.work.update",
+        "audit.crm.read",
+        "audit.crm.execute",
+        "audit.escalation.read"
+      ]
+    },
+    {
+      "key": "audit.executive",
+      "name": "EXECUTIVE",
+      "businessRole": "EXECUTIVE",
+      "permissions": [
+        "audit.project.read",
+        "audit.master.read",
+        "audit.case.read",
+        "audit.payment.read",
+        "audit.delivery.read",
+        "audit.trade_in.read",
+        "audit.finding.read",
+        "audit.review.read",
+        "audit.daily_ops.read",
+        "audit.crm.read",
+        "audit.escalation.read",
+        "audit.analytics.read",
+        "audit.audit_trail.read"
+      ]
+    },
+    {
+      "key": "audit.configuration_admin",
+      "name": "AUDIT_CONFIGURATION_ADMIN",
+      "businessRole": null,
+      "permissions": [
+        "audit.project.read",
+        "audit.master.read",
+        "audit.master.write",
+        "audit.master.publish",
+        "audit.audit_trail.read"
+      ]
+    }
+  ]
+}
