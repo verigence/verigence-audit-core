@@ -6,7 +6,11 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from audit_core.errors import AuditCoreError
-from audit_core.workflow import create_workflow_task, get_workflow_task, schedule_worker_retry
+from audit_core.workflow import (
+    create_workflow_task,
+    get_workflow_task,
+    schedule_worker_retry,
+)
 
 
 def create_workflow_task_once(
