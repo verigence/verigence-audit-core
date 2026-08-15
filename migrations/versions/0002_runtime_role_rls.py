@@ -29,10 +29,16 @@ def upgrade() -> None:
         f"GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA auditcore TO {_RUNTIME_ROLE}"
     )
     op.execute(f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA auditcore TO {_RUNTIME_ROLE}")
+    op.execute(
+        f"GRANT EXECUTE ON FUNCTION auditcore.current_tenant_id() TO {_RUNTIME_ROLE}"
+    )
     op.execute(f"REVOKE DELETE ON ALL TABLES IN SCHEMA auditcore FROM {_RUNTIME_ROLE}")
 
 
 def downgrade() -> None:
+    op.execute(
+        f"REVOKE EXECUTE ON FUNCTION auditcore.current_tenant_id() FROM {_RUNTIME_ROLE}"
+    )
     op.execute(f"REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA auditcore FROM {_RUNTIME_ROLE}")
     op.execute(f"REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA auditcore FROM {_RUNTIME_ROLE}")
     op.execute(f"REVOKE USAGE ON SCHEMA auditcore FROM {_RUNTIME_ROLE}")
