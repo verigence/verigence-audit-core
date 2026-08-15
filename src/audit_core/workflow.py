@@ -105,6 +105,10 @@ def get_workflow_task(
                    wt.effect_key, wt.correlation_id,
                    wt.claimed_at_utc, wt.started_at_utc,
                    wt.completed_at_utc, wt.cancelled_at_utc,
+                   wt.attempt_count, wt.max_attempts, wt.next_attempt_at_utc,
+                   wt.lease_owner, wt.lease_acquired_at_utc,
+                   wt.lease_heartbeat_at_utc, wt.lease_expires_at_utc,
+                   wt.last_error_code, wt.last_error_summary,
                    wi.workflow_type, wi.workflow_status
             FROM auditcore.workflow_tasks wt
             JOIN auditcore.workflow_instances wi
@@ -217,6 +221,357 @@ def cancel_workflow_task(
             "cancel_reason = :reason,"
         ),
     )
+
+
+def claim_worker_task(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    workflow_task_id: UUID,
+    worker_id: str,
+    lease_seconds: int = 60,
+) -> int:
+    if lease_seconds <= 0:
+        raise ValueError("lease_seconds must be positive")
+    row = connection.execute(
+        text(
+            """
+            UPDATE auditcore.workflow_tasks
+            SET task_status = 'CLAIMED',
+                attempt_count = attempt_count + 1,
+                claimed_at_utc = now(),
+                lease_owner = :worker_id,
+                lease_acquired_at_utc = now(),
+                lease_heartbeat_at_utc = now(),
+                lease_expires_at_utc = now() + (:lease_seconds * interval '1 second'),
+                next_attempt_at_utc = NULL,
+                updated_at_utc = now(),
+                version_no = version_no + 1
+            WHERE tenant_id = :tenant_id
+              AND workflow_task_id = :task_id
+              AND available_at_utc <= now()
+              AND task_status IN ('READY','RETRY_WAIT')
+              AND (task_status = 'READY' OR next_attempt_at_utc IS NULL OR next_attempt_at_utc <= now())
+              AND attempt_count < max_attempts
+            RETURNING workflow_instance_id, journey_id, correlation_id, attempt_count
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "task_id": workflow_task_id,
+            "worker_id": worker_id,
+            "lease_seconds": lease_seconds,
+        },
+    ).mappings().one_or_none()
+    if row is None:
+        task = get_workflow_task(
+            connection,
+            tenant_id=tenant_id,
+            workflow_task_id=workflow_task_id,
+        )
+        raise _transition_error(task["task_status"], "CLAIMED")
+
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.workflow_task_attempts (
+                tenant_id, workflow_task_id, attempt_no,
+                worker_id, started_at_utc, correlation_id
+            ) VALUES (
+                :tenant_id, :task_id, :attempt_no,
+                :worker_id, now(), :correlation_id
+            )
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "task_id": workflow_task_id,
+            "attempt_no": row["attempt_count"],
+            "worker_id": worker_id,
+            "correlation_id": row["correlation_id"],
+        },
+    )
+    _append_task_event(
+        connection,
+        tenant_id=tenant_id,
+        task_id=workflow_task_id,
+        workflow_instance_id=row["workflow_instance_id"],
+        journey_id=row["journey_id"],
+        event_type="WORKER_CLAIMED",
+        from_status="READY",
+        to_status="CLAIMED",
+        actor_id=None,
+        reason=None,
+        correlation_id=row["correlation_id"],
+    )
+    return row["attempt_count"]
+
+
+def start_worker_task(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    workflow_task_id: UUID,
+    worker_id: str,
+    lease_seconds: int = 60,
+) -> None:
+    if lease_seconds <= 0:
+        raise ValueError("lease_seconds must be positive")
+    row = connection.execute(
+        text(
+            """
+            UPDATE auditcore.workflow_tasks
+            SET task_status = 'IN_PROGRESS',
+                started_at_utc = COALESCE(started_at_utc, now()),
+                lease_heartbeat_at_utc = now(),
+                lease_expires_at_utc = now() + (:lease_seconds * interval '1 second'),
+                updated_at_utc = now(),
+                version_no = version_no + 1
+            WHERE tenant_id = :tenant_id
+              AND workflow_task_id = :task_id
+              AND task_status = 'CLAIMED'
+              AND lease_owner = :worker_id
+              AND lease_expires_at_utc > now()
+            RETURNING workflow_instance_id, journey_id, correlation_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "task_id": workflow_task_id,
+            "worker_id": worker_id,
+            "lease_seconds": lease_seconds,
+        },
+    ).mappings().one_or_none()
+    if row is None:
+        task = get_workflow_task(
+            connection,
+            tenant_id=tenant_id,
+            workflow_task_id=workflow_task_id,
+        )
+        raise _transition_error(task["task_status"], "IN_PROGRESS")
+    _append_task_event(
+        connection,
+        tenant_id=tenant_id,
+        task_id=workflow_task_id,
+        workflow_instance_id=row["workflow_instance_id"],
+        journey_id=row["journey_id"],
+        event_type="WORKER_STARTED",
+        from_status="CLAIMED",
+        to_status="IN_PROGRESS",
+        actor_id=None,
+        reason=None,
+        correlation_id=row["correlation_id"],
+    )
+
+
+def heartbeat_worker_task(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    workflow_task_id: UUID,
+    worker_id: str,
+    lease_seconds: int = 60,
+) -> None:
+    if lease_seconds <= 0:
+        raise ValueError("lease_seconds must be positive")
+    updated = connection.execute(
+        text(
+            """
+            UPDATE auditcore.workflow_tasks
+            SET lease_heartbeat_at_utc = now(),
+                lease_expires_at_utc = now() + (:lease_seconds * interval '1 second'),
+                updated_at_utc = now(),
+                version_no = version_no + 1
+            WHERE tenant_id = :tenant_id
+              AND workflow_task_id = :task_id
+              AND task_status IN ('CLAIMED','IN_PROGRESS')
+              AND lease_owner = :worker_id
+              AND lease_expires_at_utc > now()
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "task_id": workflow_task_id,
+            "worker_id": worker_id,
+            "lease_seconds": lease_seconds,
+        },
+    ).rowcount
+    if updated != 1:
+        task = get_workflow_task(
+            connection,
+            tenant_id=tenant_id,
+            workflow_task_id=workflow_task_id,
+        )
+        raise _transition_error(task["task_status"], task["task_status"])
+
+
+def schedule_worker_retry(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    workflow_task_id: UUID,
+    worker_id: str,
+    retry_after_seconds: int,
+    error_code: str,
+    error_summary: str,
+) -> None:
+    if retry_after_seconds < 0:
+        raise ValueError("retry_after_seconds cannot be negative")
+    row = connection.execute(
+        text(
+            """
+            UPDATE auditcore.workflow_tasks
+            SET task_status = 'RETRY_WAIT',
+                next_attempt_at_utc = now() + (:retry_after_seconds * interval '1 second'),
+                lease_owner = NULL,
+                lease_acquired_at_utc = NULL,
+                lease_heartbeat_at_utc = NULL,
+                lease_expires_at_utc = NULL,
+                last_error_code = :error_code,
+                last_error_summary = :error_summary,
+                updated_at_utc = now(),
+                version_no = version_no + 1
+            WHERE tenant_id = :tenant_id
+              AND workflow_task_id = :task_id
+              AND task_status IN ('CLAIMED','IN_PROGRESS')
+              AND lease_owner = :worker_id
+              AND attempt_count < max_attempts
+            RETURNING workflow_instance_id, journey_id, correlation_id, attempt_count
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "task_id": workflow_task_id,
+            "worker_id": worker_id,
+            "retry_after_seconds": retry_after_seconds,
+            "error_code": error_code,
+            "error_summary": error_summary,
+        },
+    ).mappings().one_or_none()
+    if row is None:
+        task = get_workflow_task(
+            connection,
+            tenant_id=tenant_id,
+            workflow_task_id=workflow_task_id,
+        )
+        raise _transition_error(task["task_status"], "RETRY_WAIT")
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.workflow_task_attempts
+            SET ended_at_utc = now(),
+                attempt_result = 'RETRYABLE_FAILURE',
+                error_code = :error_code,
+                error_summary = :error_summary,
+                next_retry_at_utc = now() + (:retry_after_seconds * interval '1 second')
+            WHERE tenant_id = :tenant_id
+              AND workflow_task_id = :task_id
+              AND attempt_no = :attempt_no
+              AND ended_at_utc IS NULL
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "task_id": workflow_task_id,
+            "attempt_no": row["attempt_count"],
+            "retry_after_seconds": retry_after_seconds,
+            "error_code": error_code,
+            "error_summary": error_summary,
+        },
+    )
+    _append_task_event(
+        connection,
+        tenant_id=tenant_id,
+        task_id=workflow_task_id,
+        workflow_instance_id=row["workflow_instance_id"],
+        journey_id=row["journey_id"],
+        event_type="RETRY_SCHEDULED",
+        from_status="IN_PROGRESS",
+        to_status="RETRY_WAIT",
+        actor_id=None,
+        reason=error_code,
+        correlation_id=row["correlation_id"],
+    )
+
+
+def recover_stale_worker_tasks(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    limit: int = 100,
+) -> list[UUID]:
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    rows = connection.execute(
+        text(
+            """
+            WITH stale AS (
+                SELECT workflow_task_id
+                FROM auditcore.workflow_tasks
+                WHERE tenant_id = :tenant_id
+                  AND task_status IN ('CLAIMED','IN_PROGRESS')
+                  AND lease_expires_at_utc IS NOT NULL
+                  AND lease_expires_at_utc <= now()
+                  AND attempt_count < max_attempts
+                ORDER BY lease_expires_at_utc, workflow_task_id
+                FOR UPDATE SKIP LOCKED
+                LIMIT :limit
+            )
+            UPDATE auditcore.workflow_tasks wt
+            SET task_status = 'READY',
+                next_attempt_at_utc = NULL,
+                lease_owner = NULL,
+                lease_acquired_at_utc = NULL,
+                lease_heartbeat_at_utc = NULL,
+                lease_expires_at_utc = NULL,
+                last_error_code = 'LEASE_LOST',
+                last_error_summary = 'Worker lease expired before task completion',
+                updated_at_utc = now(),
+                version_no = version_no + 1
+            FROM stale
+            WHERE wt.tenant_id = :tenant_id
+              AND wt.workflow_task_id = stale.workflow_task_id
+            RETURNING wt.workflow_task_id, wt.workflow_instance_id,
+                      wt.journey_id, wt.correlation_id, wt.attempt_count
+            """
+        ),
+        {"tenant_id": tenant_id, "limit": limit},
+    ).mappings().all()
+    for row in rows:
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.workflow_task_attempts
+                SET ended_at_utc = now(),
+                    attempt_result = 'LEASE_LOST',
+                    error_code = 'LEASE_LOST',
+                    error_summary = 'Worker lease expired before task completion'
+                WHERE tenant_id = :tenant_id
+                  AND workflow_task_id = :task_id
+                  AND attempt_no = :attempt_no
+                  AND ended_at_utc IS NULL
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "task_id": row["workflow_task_id"],
+                "attempt_no": row["attempt_count"],
+            },
+        )
+        _append_task_event(
+            connection,
+            tenant_id=tenant_id,
+            task_id=row["workflow_task_id"],
+            workflow_instance_id=row["workflow_instance_id"],
+            journey_id=row["journey_id"],
+            event_type="STALE_LEASE_RECOVERED",
+            from_status="IN_PROGRESS",
+            to_status="READY",
+            actor_id=None,
+            reason="LEASE_LOST",
+            correlation_id=row["correlation_id"],
+        )
+    return [row["workflow_task_id"] for row in rows]
 
 
 def _transition_task(
