@@ -4,24 +4,25 @@
 
 **Historical baseline:** Audit Core Solution Design v1.0 — BASELINED historically, **IMPLEMENTATION HOLD**  
 **Superseded review candidate:** `VAC-SD-002` / v2.0 — retained for traceability  
-**Current design candidate:** `VAC-SD-003` / Audit Core Solution Design v2.1 — **DRAFT FOR REVIEW**  
-**Current physical-schema candidate:** `VAC-DB-002` / Audit Core PostgreSQL Schema v2.1 — **DRAFT FOR REVIEW**  
-**Requirements:** `VAC-REQ-001 v1.0` + authoritative corrections `VAC-REQ-ADD-001 v1.1` and `VAC-REQ-ADD-002 v1.2`
+**Current implementation baseline:** `VAC-SD-003` / Audit Core Solution Design v2.1 — **APPROVED / BASELINED FOR IMPLEMENTATION**  
+**Current physical-schema baseline:** `VAC-DB-002` / Audit Core PostgreSQL Schema v2.1 — **APPROVED / BASELINED FOR IMPLEMENTATION**  
+**Requirements:** `VAC-REQ-001 v1.0` + authoritative corrections `VAC-REQ-ADD-001 v1.1` and `VAC-REQ-ADD-002 v1.2`  
+**Implementation baseline approval date:** 2026-08-15
 
-> No historical v1.0/v2.0 artifact shall be implemented where it conflicts with the approved correction addenda or v2.1 review package. `VAC-DB-001` and the v1.0 Security catalogue remain on implementation/registration hold.
+> No historical v1.0/v2.0 artifact shall be implemented where it conflicts with the approved correction addenda or v2.1 implementation baseline. `VAC-DB-001` and the v1.0 Security catalogue remain on implementation/registration hold.
 
-## Current v2.1 review package
+## Current v2.1 implementation baseline
 
 | Artifact | Document ID | Status |
 |---|---|---|
 | `docs/AUDIT_CORE_REQUIREMENTS_CORRECTION_ADDENDUM_v1.2.md` | `VAC-REQ-ADD-002` | APPROVED BUSINESS CORRECTIONS |
-| `docs/AUDIT_CORE_SOLUTION_DESIGN_v2.1.md` | `VAC-SD-003` | DRAFT FOR REVIEW |
-| `docs/AUDIT_CORE_DESIGN_RECONCILIATION_v2.1.md` | `VAC-DR-003` | DRAFT FOR REVIEW |
-| `docs/AUDIT_CORE_API_CONTRACT_v1.0.md` | `VAC-API-001` | DRAFT FOR REVIEW |
-| `api/openapi-v1.yaml` | machine-readable API companion | DRAFT FOR REVIEW |
-| `docs/AUDIT_CORE_ERROR_CATALOG_v1.0.md` | `VAC-ERR-001` | DRAFT FOR REVIEW |
-| `docs/AUDIT_CORE_PHYSICAL_DATA_MODEL_v2.1.md` | `VAC-DM-002` | DRAFT FOR REVIEW |
-| `database/AUDIT_CORE_POSTGRESQL_SCHEMA_v2.1.sql` | `VAC-DB-002` | DRAFT FOR REVIEW / CURRENT SCHEMA CANDIDATE |
+| `docs/AUDIT_CORE_SOLUTION_DESIGN_v2.1.md` | `VAC-SD-003` | APPROVED / BASELINED FOR IMPLEMENTATION |
+| `docs/AUDIT_CORE_DESIGN_RECONCILIATION_v2.1.md` | `VAC-DR-003` | APPROVED / BASELINED FOR IMPLEMENTATION |
+| `docs/AUDIT_CORE_API_CONTRACT_v1.0.md` | `VAC-API-001` | APPROVED / BASELINED FOR IMPLEMENTATION |
+| `api/openapi-v1.yaml` | machine-readable API companion | APPROVED / BASELINED FOR IMPLEMENTATION |
+| `docs/AUDIT_CORE_ERROR_CATALOG_v1.0.md` | `VAC-ERR-001` | APPROVED / BASELINED FOR IMPLEMENTATION |
+| `docs/AUDIT_CORE_PHYSICAL_DATA_MODEL_v2.1.md` | `VAC-DM-002` | APPROVED / BASELINED FOR IMPLEMENTATION |
+| `database/AUDIT_CORE_POSTGRESQL_SCHEMA_v2.1.sql` | `VAC-DB-002` | APPROVED / BASELINED FOR IMPLEMENTATION |
 
 ## Authoritative foundational corrections
 
@@ -52,7 +53,7 @@
 - `docs/AUDIT_CORE_SOLUTION_DESIGN_v2.0.md` — `VAC-SD-002`
 - `docs/AUDIT_CORE_DESIGN_RECONCILIATION_v2.0.md` — `VAC-DR-002`
 
-v2.0 is superseded as the current review candidate by v2.1, particularly for the direct Client->DI flow and any language that could imply Audit Core controls dealer delivery/business lifecycle.
+v2.0 is superseded by the approved v2.1 implementation baseline, particularly for the direct Client->DI flow and any language that could imply Audit Core controls dealer delivery/business lifecycle.
 
 ## Historical v1.0 package — traceability only
 
@@ -75,8 +76,8 @@ v2.0 is superseded as the current review candidate by v2.1, particularly for the
 
 ## Governance
 
-No implementation shall treat `VAC-SD-003`, `VAC-API-001`, `VAC-ERR-001`, `VAC-DM-002`, `VAC-DB-002` or `api/openapi-v1.yaml` as a formally approved baseline until project-owner review/approval.
+The project owner approved the current v2.1 package for implementation on 2026-08-15. `VAC-SD-003`, `VAC-API-001`, `VAC-ERR-001`, `VAC-DM-002`, `VAC-DB-002` and `api/openapi-v1.yaml` are therefore the formal Audit Core implementation baseline. Material changes must follow requirements/design/API/schema change control rather than being introduced silently during implementation.
 
-`VAC-DB-002` is a fresh target physical schema, not an automatic in-place migration from `VAC-DB-001`. Migration/deployment sequencing shall be designed only after approval of the v2.1 package.
+`VAC-DB-002` is a fresh target physical schema, not an automatic in-place migration from `VAC-DB-001`. Migration/deployment sequencing shall be defined by the implementation tasks after runtime/tooling is confirmed.
 
-The Audit Core Security catalogue must also be realigned to the approved v2.1 role/DI façade model before Security registration. No change to Security or DI repositories is implied by this design documentation.
+The Audit Core Security catalogue must also be realigned to the approved v2.1 role/DI façade model before Security registration. No change to Security or DI repositories is implied by this baseline approval.
