@@ -4,9 +4,12 @@ from audit_core.audit_review import router as audit_review_router
 from audit_core.bookings import router as booking_router
 from audit_core.commercials import router as commercials_router
 from audit_core.config import load_settings
+from audit_core.crm_api import router as crm_router
 from audit_core.customers import router as customer_router
+from audit_core.daily_operations_api import router as daily_operations_router
 from audit_core.dealers import router as dealer_router
 from audit_core.errors import install_error_handlers
+from audit_core.escalations_api import router as escalation_router
 from audit_core.evidence import router as evidence_router
 from audit_core.evidence_read import router as evidence_read_router
 from audit_core.findings import router as findings_router
@@ -42,6 +45,9 @@ app.include_router(vehicle_delivery_router)
 app.include_router(findings_router)
 app.include_router(audit_review_router)
 app.include_router(task_router)
+app.include_router(daily_operations_router)
+app.include_router(crm_router)
+app.include_router(escalation_router)
 
 
 @app.get("/health")
