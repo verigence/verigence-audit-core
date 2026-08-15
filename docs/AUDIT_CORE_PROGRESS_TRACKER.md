@@ -29,15 +29,15 @@ Rules:
 ## 2. Current position
 
 **Implementation tasks:** 48  
-**COMPLETE:** 28  
+**COMPLETE:** 30  
 **VERIFIED:** 0  
 **CODE COMPLETE:** 0  
-**IN PROGRESS:** 1  
+**IN PROGRESS:** 0  
 **BLOCKED:** 0  
-**NOT STARTED:** 19  
-**Implementation completion:** 58.3%
+**NOT STARTED:** 18  
+**Implementation completion:** 62.5%
 
-Repository/CI, PostgreSQL foundation, Security/error/request-context, Project landscape/assignment, versioned-master increment E, Customer/Journey increment F, and G-01 through G-04 are complete. G-04 ingestion recovery/idempotency is backed by GitHub Actions run `31893685054`, which passed build, lint, fresh PostgreSQL migration and all tests proving replay does not duplicate evidence and DI-accepted/outer-failure recovery completes without a second upload. G-05 evidence facts/read façade is now IN PROGRESS and is scoped to the approved public Audit Core evidence list/get/refresh contract with no public DI identifiers.
+Repository/CI, PostgreSQL foundation, Security/error/request-context, Project landscape/assignment, versioned-master increment E, Customer/Journey increment F, the full internal DI façade increment G, and H-01 Booking/product selection are complete. G-05 is backed by GitHub Actions run `31902227322`, which passed build, lint, fresh PostgreSQL migration and all tests for Audit Core evidence list/get/facts/refresh with no public DI identifiers. H-01 is backed by GitHub Actions run `31902404906`, which passed build, lint, fresh PostgreSQL migration and the booking/product snapshot integration test. H-02 commercials and discounts is the next eligible task.
 
 ## 3. Increment summary
 
@@ -50,8 +50,8 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, Project la
 | D | Project landscape and assignments | 4 | 4 | COMPLETE |
 | E | Versioned masters | 4 | 4 | COMPLETE |
 | F | Customer and Journey | 3 | 3 | COMPLETE |
-| G | Internal DI façade | 5 | 4 | IN PROGRESS |
-| H | Vehicle-sale Journey process data | 5 | 0 | NOT STARTED |
+| G | Internal DI façade | 5 | 5 | COMPLETE |
+| H | Vehicle-sale Journey process data | 5 | 1 | IN PROGRESS |
 | I | Audit controls, findings and review | 3 | 0 | NOT STARTED |
 | J | Durable Audit workflow | 4 | 0 | NOT STARTED |
 | K | Daily operations, CRM and escalations | 3 | 0 | NOT STARTED |
@@ -89,8 +89,8 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, Project la
 | G-02 | Implement DI anti-corruption client | COMPLETE | `src/audit_core/di_client.py` isolates DI wire contracts behind `DiSubject`, `DiDocument`, `DiFact`, `DiVerification` and `DiClientError`; `tests/test_di_client.py` covers Subject create, multipart upload, document status, extracted facts, permitted verification, stable DI problem translation and malformed success rejection; commits `d0923b14bdfe3387d63fb87b94c8c9f0e49eee7b`, `39db10c307a64c9af8171eccc09b9ae19b387fab`, lint fix `ddec4fe942ef06d3d60eb229ed166fac5e1dad74`; GitHub Actions run `31892592841` passed build, lint, fresh PostgreSQL migration and all tests | None |
 | G-03 | Implement evidence upload façade | COMPLETE | `src/audit_core/evidence.py` implements Audit Core authorization/business scope, delegated DI tokens, subject mapping, multipart forwarding and Audit Core evidence persistence; `tests/test_evidence.py` proves the client receives only Audit Core evidence fields/`evidenceId`, raw bytes are forwarded to DI but not stored in Audit Core, internal DI IDs remain private, and missing `audit.evidence.upload` is denied; GitHub Actions run `31893032207` passed build, lint, fresh PostgreSQL migration and all tests | None |
 | G-04 | Implement ingestion recovery/idempotency | COMPLETE | `src/audit_core/evidence.py` persists request hashes and ingestion state around DI calls, caches successful Audit Core responses, and recovers accepted DI documents without re-upload; `tests/test_evidence.py` proves exact replay returns one evidence/one DI upload, different-content key reuse returns `VAC-CONFLICT-003`, and simulated outer link failure leaves durable `DI_ACCEPTED` state that replay completes through delegated `di.document.read`; implementation/fixes through `a9bf393d2764432386e35ae214dc1f272371170c`, `3a5c163114610d9740a926bb653d75f57e94c36f`, `fc686b38e8027ad0c1d241987bcb398e497e620a`, `fbc8a5a2d4a6e85e374f82bb04630355ef25baa8`; GitHub Actions run `31893685054` passed build, lint, fresh PostgreSQL migration and all tests | None |
-| G-05 | Implement evidence facts/read façade | IN PROGRESS | Tracker started after G-04 completion | Implement approved evidence list/get/refresh; public contract must expose Audit Core evidence IDs/facts and no DI IDs |
-| H-01 | Implement Booking and product selection | NOT STARTED | — | Booking starts Journey but is not universal root |
+| G-05 | Implement evidence facts/read façade | COMPLETE | `src/audit_core/evidence_read.py` implements Audit Core evidence list/get/facts plus delegated DI status/fact refresh; `tests/test_evidence_read.py` proves normal reads stay inside Audit Core, public responses contain no DI identifiers, refresh narrows to `di.document.read` + `di.document.fields.read`, supersedes stale facts and persists current projections; lint fixes `db260bcf0964c7cccbf8bd0e8d10e246e0ced531` and `386a7bb6d57a365be9b4718a487cf50c75c45db2`; GitHub Actions run `31902227322` passed build, lint, fresh PostgreSQL migration and all tests | None |
+| H-01 | Implement Booking and product selection | COMPLETE | `src/audit_core/bookings.py` implements approved PUT/GET booking routes with active same-Outlet dealership sales-staff reference and master-derived Journey product snapshot; route registration `85a6bd057b34aab1c831288adfc7db8df4c88d0b`; `tests/test_bookings.py` verifies SC reference and exact SKU/model/variant/colour snapshot round-trip; implementation/test commits `d5470e0476f4a4f36000104621f4f6ef83e78a49`, `2d124dfa29fcba78a89697f77bb834262720ed51`; GitHub Actions run `31902404906` passed build, lint, fresh PostgreSQL migration and all tests | Booking remains Journey process data; no rule makes it a universal root and no dealer-process control was added |
 | H-02 | Implement commercials and discounts | NOT STARTED | — | Standard vs Actual + provenance |
 | H-03 | Implement Payments and Finance | NOT STARTED | — | Audit records exceptions; does not block transaction |
 | H-04 | Implement Insurance, VAS and Trade-In | NOT STARTED | — | Open formulas stay open/configured |
