@@ -168,6 +168,27 @@ def fail_worker_task(
     connection.execute(
         text(
             """
+            INSERT INTO auditcore.workflow_dead_letters (
+                tenant_id, workflow_task_id, journey_id,
+                dead_letter_reason, last_error_code, last_error_summary
+            ) VALUES (
+                :tenant_id, :task_id, :journey_id,
+                :dead_letter_reason, :error_code, :error_summary
+            )
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "task_id": workflow_task_id,
+            "journey_id": row["journey_id"],
+            "dead_letter_reason": error_summary,
+            "error_code": error_code,
+            "error_summary": error_summary,
+        },
+    )
+    connection.execute(
+        text(
+            """
             INSERT INTO auditcore.workflow_task_events (
                 tenant_id, workflow_task_id, workflow_instance_id,
                 journey_id, event_type, from_status, to_status,
