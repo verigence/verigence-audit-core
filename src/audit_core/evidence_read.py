@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from decimal import Decimal
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -154,7 +153,7 @@ def _fact_rows(
 def _value_projection(value: Any) -> tuple[str, Any, str | None]:
     if isinstance(value, bool):
         return "BOOLEAN", value, "true" if value else "false"
-    if isinstance(value, int | float | Decimal) and not isinstance(value, bool):
+    if isinstance(value, int | float) and not isinstance(value, bool):
         return "NUMBER", value, str(value)
     if isinstance(value, str):
         return "TEXT", value, value
@@ -368,7 +367,10 @@ def refresh_journey_evidence(
     bearer_token: Annotated[str, Depends(get_bearer_token)],
     connection: Annotated[Connection, Depends(get_connection)],
     engine: Annotated[Engine, Depends(get_engine)],
-    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
+    security_client: Annotated[
+        SecurityOAuthClient,
+        Depends(get_security_oauth_client),
+    ],
     di_client: Annotated[DiClient, Depends(get_di_client)],
 ) -> EvidenceDetailResponse:
     authorize(principal, tenant_id=tenant_id, permission="audit.evidence.refresh")
