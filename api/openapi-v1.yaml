@@ -1,0 +1,287 @@
+openapi: 3.1.0
+info:
+  title: Verigence Audit Core API
+  version: 1.0.0-draft
+  description: >-
+    User-facing Audit Core contract. Audit Core audits/observes dealer business operations and
+    does not control or stop them. DI is internal-only and is never called directly by Web/Mobile
+    clients through this contract.
+servers:
+  - url: /v1
+security:
+  - bearerAuth: []
+paths:
+  /tenants/{tenantId}/project:
+    get:
+      operationId: getProject
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+      responses:
+        '200':
+          description: Project
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Project'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/customers/{customerId}/journeys:
+    post:
+      operationId: createJourney
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/CustomerId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '201':
+          description: Journey created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Journey'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/journeys/{journeyId}:
+    get:
+      operationId: getJourney
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+      responses:
+        '200':
+          description: Journey
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Journey'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/journeys/{journeyId}/delivery:
+    put:
+      operationId: upsertObservedDelivery
+      description: Records observed/actual delivery facts. Does not approve, block, stop or cancel dealer delivery.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DeliveryObservation'}
+      responses:
+        '200':
+          description: Delivery observation recorded
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DeliveryObservation'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/journeys/{journeyId}/evidence:
+    post:
+      operationId: uploadJourneyEvidence
+      description: Audit Core façade over internal DI. Client never calls DI directly.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, evidencePurpose]
+              properties:
+                file: {type: string, format: binary}
+                evidencePurpose: {type: string}
+                requirementKey: {type: string}
+                documentTypeKey: {type: string}
+      responses:
+        '201':
+          description: Evidence accepted by Audit Core
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Evidence'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+    get:
+      operationId: listJourneyEvidence
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+      responses:
+        '200':
+          description: Evidence list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Evidence'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/journeys/{journeyId}/audit/submit:
+    post:
+      operationId: submitAuditWork
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Audit work submitted; resulting review task is durable
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AuditStatus'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/journeys/{journeyId}/review-decisions:
+    post:
+      operationId: createReviewDecision
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReviewDecisionRequest'}
+      responses:
+        '201':
+          description: Review decision recorded
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AuditStatus'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/tasks/{taskId}/complete:
+    post:
+      operationId: completeAuditTask
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/TaskId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Durable audit task completed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Task'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    TenantId:
+      name: tenantId
+      in: path
+      required: true
+      schema: {type: string, maxLength: 128}
+    CustomerId:
+      name: customerId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    JourneyId:
+      name: journeyId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    TaskId:
+      name: taskId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, minLength: 8, maxLength: 200}
+  schemas:
+    Project:
+      type: object
+      required: [tenantId, projectName]
+      properties:
+        tenantId: {type: string}
+        projectCode: {type: string}
+        projectName: {type: string}
+    Journey:
+      type: object
+      required: [journeyId, tenantId, customerId, auditState, auditOutcome]
+      properties:
+        journeyId: {type: string, format: uuid}
+        tenantId: {type: string}
+        customerId: {type: string, format: uuid}
+        outletId: {type: string, format: uuid}
+        auditState:
+          type: string
+          enum: [NOT_STARTED, IN_PROGRESS, PC_SUBMITTED, TL_REVIEW, SENT_BACK, PM_REVIEW, REVIEW_COMPLETE]
+        auditOutcome:
+          type: string
+          enum: [PENDING, NO_BREACH, BREACH]
+        actualDeliveryStatusCode:
+          type: [string, 'null']
+          description: Configured observed delivery-status code. Canonical values remain business-configured.
+        versionNo: {type: integer, minimum: 1}
+    DeliveryObservation:
+      type: object
+      properties:
+        plannedDeliveryAt: {type: [string, 'null'], format: date-time}
+        deliveryIntimatedAt: {type: [string, 'null'], format: date-time}
+        actualDeliveryStatusCode: {type: [string, 'null']}
+        actualDeliveredAt: {type: [string, 'null'], format: date-time}
+        statusSource:
+          type: [string, 'null']
+          enum: [EVIDENCE, OPERATIONAL_INPUT, SOURCE_SYSTEM, null]
+        remarks: {type: [string, 'null'], maxLength: 4000}
+    Evidence:
+      type: object
+      required: [evidenceId, journeyId, processingStatus]
+      properties:
+        evidenceId: {type: string, format: uuid}
+        journeyId: {type: string, format: uuid}
+        documentTypeKey: {type: [string, 'null']}
+        evidencePurpose: {type: string}
+        processingStatus: {type: string}
+        verificationStatus: {type: [string, 'null']}
+        createdAtUtc: {type: string, format: date-time}
+    ReviewDecisionRequest:
+      type: object
+      required: [decision]
+      properties:
+        decision:
+          type: string
+          enum: [BREACH, NO_BREACH, SEND_BACK]
+        remarks: {type: [string, 'null'], maxLength: 4000}
+    AuditStatus:
+      type: object
+      required: [auditState, auditOutcome]
+      properties:
+        auditState: {type: string}
+        auditOutcome: {type: string}
+    Task:
+      type: object
+      required: [taskId, status, taskType]
+      properties:
+        taskId: {type: string, format: uuid}
+        taskType: {type: string}
+        status: {type: string}
+        dueAtUtc: {type: [string, 'null'], format: date-time}
+        assignedActorId: {type: [string, 'null']}
+        assignedRole: {type: [string, 'null']}
+    Problem:
+      type: object
+      required: [type, title, status, errorCode, correlationId]
+      properties:
+        type: {type: string}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        errorCode: {type: string}
+        correlationId: {type: string}
+        fieldErrors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: {type: string}
+              message: {type: string}
+  responses:
+    ProblemResponse:
+      description: Audit Core error
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
