@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Self
 
 import httpx
+
+from audit_core.telemetry import record_metric, trace_span
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,7 @@ class DiClient:
         payload = self._request_json(
             "POST",
             f"/v1/tenants/{tenant_id}/subjects",
+            operation="create_subject",
             token=token,
             json={"subjectType": subject_type, "displayName": display_name},
         )
@@ -123,6 +127,7 @@ class DiClient:
         response = self._request_json(
             "POST",
             f"/v1/tenants/{tenant_id}/subjects/{subject_id}/documents",
+            operation="upload_document",
             token=token,
             data={key: value for key, value in form.items() if value is not None},
             files={"file": (filename, content, content_type)},
@@ -140,6 +145,7 @@ class DiClient:
         payload = self._request_json(
             "GET",
             f"/v1/tenants/{tenant_id}/subjects/{subject_id}/documents/{document_id}",
+            operation="get_document",
             token=token,
         )
         return _document(payload)
@@ -155,6 +161,7 @@ class DiClient:
         payload = self._request_json(
             "GET",
             f"/v1/tenants/{tenant_id}/subjects/{subject_id}/documents/{document_id}/fields",
+            operation="get_document_facts",
             token=token,
         )
         fields = payload.get("fields")
@@ -175,6 +182,7 @@ class DiClient:
         payload = self._request_json(
             "POST",
             f"/v1/tenants/{tenant_id}/subjects/{subject_id}/documents/{document_id}/verification",
+            operation="verify_document",
             token=token,
             json={
                 "remarks": remarks,
@@ -194,6 +202,7 @@ class DiClient:
         method: str,
         path: str,
         *,
+        operation: str,
         token: str,
         **kwargs: Any,
     ) -> dict[str, Any]:
@@ -201,24 +210,56 @@ class DiClient:
             raise ValueError("DI bearer token is required")
         headers = dict(kwargs.pop("headers", {}))
         headers["Authorization"] = f"Bearer {token}"
+        started = time.perf_counter()
+        result = "SUCCESS"
         try:
-            response = self._client.request(method, path, headers=headers, **kwargs)
-        except httpx.HTTPError as exc:
-            raise DiClientError(
-                status_code=503,
-                code="DI_UNAVAILABLE",
-                retryable=True,
-            ) from exc
+            with trace_span(
+                "audit_core.dependency.di",
+                attributes={
+                    "dependency": "di",
+                    "operation": operation,
+                    "method": method,
+                },
+            ):
+                try:
+                    response = self._client.request(method, path, headers=headers, **kwargs)
+                except httpx.HTTPError as exc:
+                    result = "UNAVAILABLE"
+                    raise DiClientError(
+                        status_code=503,
+                        code="DI_UNAVAILABLE",
+                        retryable=True,
+                    ) from exc
 
-        if response.status_code < 200 or response.status_code >= 300:
-            raise _http_error(response)
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise _contract_error() from exc
-        if not isinstance(payload, dict):
-            raise _contract_error()
-        return payload
+                if response.status_code < 200 or response.status_code >= 300:
+                    result = "FAILURE"
+                    raise _http_error(response)
+                try:
+                    payload = response.json()
+                except ValueError as exc:
+                    result = "CONTRACT_ERROR"
+                    raise _contract_error() from exc
+                if not isinstance(payload, dict):
+                    result = "CONTRACT_ERROR"
+                    raise _contract_error()
+                return payload
+        finally:
+            duration_ms = (time.perf_counter() - started) * 1000.0
+            labels = {
+                "dependency": "di",
+                "operation": operation,
+                "method": method,
+                "result": result,
+            }
+            record_metric("audit_core.dependency.calls", labels=labels)
+            record_metric(
+                "audit_core.dependency.duration_ms",
+                duration_ms,
+                kind="histogram",
+                labels=labels,
+            )
+            if result != "SUCCESS":
+                record_metric("audit_core.dependency.errors", labels=labels)
 
 
 def _document(payload: dict[str, Any]) -> DiDocument:
