@@ -30,14 +30,14 @@ Rules:
 
 **Implementation tasks:** 48  
 **COMPLETE:** 27  
-**VERIFIED:** 0  
+**VERIFIED:** 1  
 **CODE COMPLETE:** 0  
-**IN PROGRESS:** 1  
+**IN PROGRESS:** 0  
 **BLOCKED:** 0  
 **NOT STARTED:** 20  
 **Implementation completion:** 56.3%
 
-Repository/CI, PostgreSQL foundation, Security/error/request-context, Project landscape/assignment, versioned-master increment E, Customer/Journey increment F, and G-01 through G-03 are complete. G-03 evidence upload façade is backed by GitHub Actions run `31893032207`, which passed build, lint, fresh PostgreSQL migration and all tests proving Audit Core-only evidence IDs and no raw-binary persistence. G-04 ingestion recovery/idempotency is now IN PROGRESS and is scoped to the existing `evidence_ingestion_operations` persistence model and the required replay/DI-accepted outer-failure recovery scenario.
+Repository/CI, PostgreSQL foundation, Security/error/request-context, Project landscape/assignment, versioned-master increment E, Customer/Journey increment F, and G-01 through G-03 are complete. G-04 ingestion recovery/idempotency is VERIFIED: persisted `idempotency_records` and `evidence_ingestion_operations` make exact replay return the same Audit Core evidence without a second DI upload, reject key reuse for different content, and recover a DI-accepted/outer-Audit-Core failure by refreshing the already accepted DI document and linking it without re-upload. GitHub Actions run `31893685054` passed build, lint, fresh PostgreSQL migration and all tests.
 
 ## 3. Increment summary
 
@@ -88,7 +88,7 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, Project la
 | G-01 | Verify Audit Core→DI authentication mechanism | COMPLETE | `src/audit_core/security_integration.py` implements approved Security confidential-client calls for OAuth token exchange and Tenant-scoped `client_credentials`; `tests/test_security_integration.py` proves delegated-user narrowing, service flow, DI JWT issuer/audience/Tenant/permission compatibility, Tenant mismatch rejection and no service fallback on delegated denial; GitHub Actions run `31892184880` passed build, Ruff, fresh PostgreSQL migration and all tests | None |
 | G-02 | Implement DI anti-corruption client | COMPLETE | `src/audit_core/di_client.py` isolates DI wire contracts behind `DiSubject`, `DiDocument`, `DiFact`, `DiVerification` and `DiClientError`; `tests/test_di_client.py` covers Subject create, multipart upload, document status, extracted facts, permitted verification, stable DI problem translation and malformed success rejection; commits `d0923b14bdfe3387d63fb87b94c8c9f0e49eee7b`, `39db10c307a64c9af8171eccc09b9ae19b387fab`, lint fix `ddec4fe942ef06d3d60eb229ed166fac5e1dad74`; GitHub Actions run `31892592841` passed build, lint, fresh PostgreSQL migration and all tests | None |
 | G-03 | Implement evidence upload façade | COMPLETE | `src/audit_core/evidence.py` implements Audit Core authorization/business scope, delegated DI tokens, subject mapping, multipart forwarding and Audit Core evidence persistence; `tests/test_evidence.py` proves the client receives only Audit Core evidence fields/`evidenceId`, raw bytes are forwarded to DI but not stored in Audit Core, internal DI IDs remain private, and missing `audit.evidence.upload` is denied; GitHub Actions run `31893032207` passed build, lint, fresh PostgreSQL migration and all tests | None |
-| G-04 | Implement ingestion recovery/idempotency | IN PROGRESS | Tracker started after G-03 completion | Persisted evidence-ingestion operation with retry/recovery; replay must not duplicate evidence and DI-accepted/outer-failure must be recoverable |
+| G-04 | Implement ingestion recovery/idempotency | VERIFIED | `src/audit_core/evidence.py` persists request hashes and ingestion state before/after DI calls, caches the successful Audit Core response, recovers existing `di_document_id` through delegated `di.document.read`, and never re-uploads accepted DI evidence; `tests/test_evidence.py` proves exact replay returns one evidence/one DI upload, different-content key reuse returns `VAC-CONFLICT-003`, and a simulated outer link failure leaves durable `DI_ACCEPTED` state that replay completes without a second upload; implementation/fixes through `a9bf393d2764432386e35ae214dc1f272371170c`, `3a5c163114610d9740a926bb653d75f57e94c36f`, `fc686b38e8027ad0c1d241987bcb398e497e620a`, `fbc8a5a2d4a6e85e374f82bb04630355ef25baa8`; GitHub Actions run `31893685054` passed build, lint, fresh PostgreSQL migration and all tests | Acceptance verified; ready for COMPLETE transition |
 | G-05 | Implement evidence facts/read façade | NOT STARTED | — | No public DI identifiers/routes |
 | H-01 | Implement Booking and product selection | NOT STARTED | — | Booking starts Journey but is not universal root |
 | H-02 | Implement commercials and discounts | NOT STARTED | — | Standard vs Actual + provenance |
