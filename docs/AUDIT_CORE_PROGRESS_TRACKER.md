@@ -32,12 +32,12 @@ Rules:
 **COMPLETE:** 23  
 **VERIFIED:** 0  
 **CODE COMPLETE:** 0  
-**IN PROGRESS:** 0  
-**BLOCKED:** 0  
-**NOT STARTED:** 25  
+**IN PROGRESS:** 1  
+**BLOCKED:** 1  
+**NOT STARTED:** 23  
 **Implementation completion:** 47.9%
 
-Repository/CI, PostgreSQL foundation, Security/error/request-context, Project landscape/assignment, and versioned-master increment E are complete. F-01 Customer APIs and F-02 protected project-wide customer matching are complete. F-03 Journey APIs is the next eligible task.
+Repository/CI, PostgreSQL foundation, Security/error/request-context, Project landscape/assignment, and versioned-master increment E are complete. F-01 Customer APIs and F-02 protected project-wide customer matching are complete. F-03 Journey API code/tests are committed but its latest CI run failed, so F-03 remains IN PROGRESS. The G-01 cross-module authentication architecture decision is resolved by `VAC-SD-AUTH-001`; implementation is BLOCKED until Security provides the approved service-token and OAuth delegated-token-exchange capability.
 
 ## 3. Increment summary
 
@@ -50,7 +50,7 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, Project la
 | D | Project landscape and assignments | 4 | 4 | COMPLETE |
 | E | Versioned masters | 4 | 4 | COMPLETE |
 | F | Customer and Journey | 3 | 2 | IN PROGRESS |
-| G | Internal DI façade | 5 | 0 | NOT STARTED |
+| G | Internal DI façade | 5 | 0 | BLOCKED |
 | H | Vehicle-sale Journey process data | 5 | 0 | NOT STARTED |
 | I | Audit controls, findings and review | 3 | 0 | NOT STARTED |
 | J | Durable Audit workflow | 4 | 0 | NOT STARTED |
@@ -84,8 +84,8 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, Project la
 | E-04 | Implement document/control/policy version lifecycles | COMPLETE | `src/audit_core/versioned_masters.py` implements Project Policy, Document Requirement Profile and Audit Control version creation plus publish/retire lifecycle; `tests/test_versioned_masters.py` publishes all three, verifies Journey references the exact published Profile/Policy version IDs, rejects post-publish Policy/Profile-child/Control mutations, and retires all three; commits `9a1b680cfb1c6b8f3c70af48d606db33858bf0f9`, `4afb904b88e70c298d073cb97ea54a72ff58f0e9`, fix `e49294695902796be0396729b9b152cc130bef9c`; GitHub Actions run `31880966992` passed build, lint, fresh DB migration and all tests | No audit evaluator/business formula was added; this task is limited to master lifecycle and exact version references |
 | F-01 | Implement Customer APIs | COMPLETE | `src/audit_core/customers.py` implements Outlet-scoped customer create/list/read/update routes and resolves the Dealer from the Tenant-scoped Outlet before insert; `src/audit_core/main.py` exposes the approved customer routes; `tests/test_customers.py` verifies create/list/read/update/inactivate and rejects a missing Outlet hierarchy; commits `b6e7992359336dfb65a95eed3dbb0ee0be8960a7`, `95b7bf6160c66220b192236c7300dd7586e01304`, `76aa28ce1bb0c5a9fa923a0df355c071371d85a3`; GitHub Actions run `31881129769` passed build, lint, fresh DB migration and all tests | Exact per-operation Security permission names remain undefined; Tenant boundary is enforced without inventing permission vocabulary |
 | F-02 | Implement protected customer matching | COMPLETE | `src/audit_core/customer_matching.py` stores/searches protected identity-index hashes and provides HMAC protection for already-normalized values without persisting raw identifiers; `GET /v1/tenants/{tenantId}/customers/matches` accepts only protected `matchHash` plus `identityType`; `tests/test_customer_matching.py` verifies one protected PAN key matches active customers across two Dealers/Outlets and neither the raw PAN nor protected hash enters Audit Core logs; commits `0291411530696e75597467385536d9df633bb78b`, `e1ec3c8d8a3bc4c8c943ab80a3211eb31d8fdd60`, `cc8e3c31ce5f1c6e7c90ba5486f6e509534a5de9`; GitHub Actions run `31881346997` passed build, lint, fresh DB migration and all tests | Normalization/scoring rules were not invented; the helper protects an already-normalized approved identity value and the query operates project-wide by Tenant |
-| F-03 | Implement Journey APIs | NOT STARTED | — | Journey is audit correlation, not dealer workflow control |
-| G-01 | Verify Audit Core→DI authentication mechanism | NOT STARTED | — | Explicit Security/service-auth dependency; no bypass |
+| F-03 | Implement Journey APIs | IN PROGRESS | `src/audit_core/journeys.py` implemented in commit `9021693163e1939e0e3c1ba990b611a5567264dc`; journey hierarchy/audit-separation tests added in `ad12d6dac093f06db2c0e1e3e93129e08c5c1203`; GitHub Actions run `31881510146` failed, therefore acceptance is not yet proven | Correct the current CI failure, rerun once, then verify before marking COMPLETE |
+| G-01 | Verify Audit Core→DI authentication mechanism | BLOCKED | Architecture decision approved in `docs/AUDIT_CORE_CROSS_MODULE_AUTH_DESIGN_v1.0.md` commit `09693bf0b6a501ee529947e0c9a69b29947e290f` and registered in the baseline manifest in `a97e67d74ea10a0b2b659dedac99ca9c85e66d78` | Architecture decision RESOLVED. Implementation waits for Security to provide Tenant-scoped `SERVICE` token issuance plus OAuth delegated token exchange/on-behalf-of support; no private bypass or service-token fallback for new user actions |
 | G-02 | Implement DI anti-corruption client | NOT STARTED | — | DI internal only |
 | G-03 | Implement evidence upload façade | NOT STARTED | — | Client sees Audit Core evidenceId only |
 | G-04 | Implement ingestion recovery/idempotency | NOT STARTED | — | Critical partial-failure/replay task |
