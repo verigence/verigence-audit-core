@@ -8,7 +8,6 @@ from urllib.parse import parse_qs
 import httpx
 import jwt
 import pytest
-from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from audit_core.security_integration import SecurityOAuthClient, SecurityTokenError
@@ -257,12 +256,14 @@ def test_delegated_denial_fails_closed_without_service_fallback(
         permissions=["audit.evidence.upload", "di.document.upload"]
     )
 
-    with _oauth_client(controlled_security) as security_client:
-        with pytest.raises(SecurityTokenError, match="invalid_scope"):
-            security_client.exchange_user_token(
-                subject_token=user_token,
-                permissions=["di.verification.write"],
-            )
+    with (
+        _oauth_client(controlled_security) as security_client,
+        pytest.raises(SecurityTokenError, match="invalid_scope"),
+    ):
+        security_client.exchange_user_token(
+            subject_token=user_token,
+            permissions=["di.verification.write"],
+        )
 
     assert controlled_security.grant_types == [
         "urn:ietf:params:oauth:grant-type:token-exchange"
