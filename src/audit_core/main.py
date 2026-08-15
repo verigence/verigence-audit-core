@@ -13,6 +13,7 @@ from audit_core.journeys import router as journey_router
 from audit_core.observability import install_observability
 from audit_core.payments_finance import router as payments_finance_router
 from audit_core.projects import router as project_router
+from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
 settings = load_settings()
 
@@ -34,6 +35,7 @@ app.include_router(booking_router)
 app.include_router(commercials_router)
 app.include_router(payments_finance_router)
 app.include_router(insurance_tradein_router)
+app.include_router(vehicle_delivery_router)
 
 
 @app.get("/health")
