@@ -29,15 +29,15 @@ Rules:
 ## 2. Current position
 
 **Implementation tasks:** 48  
-**COMPLETE:** 35  
+**COMPLETE:** 38  
 **VERIFIED:** 0  
 **CODE COMPLETE:** 0  
 **IN PROGRESS:** 0  
 **BLOCKED:** 0  
-**NOT STARTED:** 13  
-**Implementation completion:** 72.9%
+**NOT STARTED:** 10  
+**Implementation completion:** 79.2%
 
-Repository/CI, PostgreSQL foundation, Security/error/request-context, Project landscape/assignment, versioned-master increment E, Customer/Journey increment F, the full internal DI façade increment G, all Vehicle-sale Journey process-data tasks in increment H, and I-01 are complete. H-05 records Vehicle, Registration and configured Delivery business-status history without changing Journey audit state/outcome; GitHub Actions run `31903601186` passed build, lint, fresh PostgreSQL migration and all tests. I-01 stores exact published Audit Control version, evaluator key and expected/observed snapshots so reruns remain distinguishable after a master-version change; GitHub Actions run `31903813952` passed build, lint, fresh PostgreSQL migration and all tests. I-02 Findings and evidence linkage is the next eligible task.
+Repository/CI, PostgreSQL foundation, Security/error/request-context, Project landscape/assignment, versioned-master increment E, Customer/Journey increment F, the full internal DI façade increment G, all Vehicle-sale Journey process-data tasks in increment H, all Audit control/finding/review tasks in increment I, and J-01 durable workflow persistence are complete. I-02 links Findings only to same-Journey Audit Core Evidence/facts and does not mutate dealer business status; GitHub Actions run `31904014990` passed. I-03 implements PC submit, TL/PM review decisions and SEND_BACK as audit-only state; after the test fixture was aligned to the configured delivery-status contract, GitHub Actions run `31904677813` passed build, lint, fresh PostgreSQL migration and all tests. J-01 persists Workflow Instance/Task/Event state and proves the task survives a fresh process/engine boundary in the same successful run. J-02 atomic audit-transition/task creation is the next eligible task.
 
 ## 3. Increment summary
 
@@ -52,8 +52,8 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, Project la
 | F | Customer and Journey | 3 | 3 | COMPLETE |
 | G | Internal DI façade | 5 | 5 | COMPLETE |
 | H | Vehicle-sale Journey process data | 5 | 5 | COMPLETE |
-| I | Audit controls, findings and review | 3 | 1 | IN PROGRESS |
-| J | Durable Audit workflow | 4 | 0 | NOT STARTED |
+| I | Audit controls, findings and review | 3 | 3 | COMPLETE |
+| J | Durable Audit workflow | 4 | 1 | IN PROGRESS |
 | K | Daily operations, CRM and escalations | 3 | 0 | NOT STARTED |
 | L | API/observability/release verification | 4 | 0 | NOT STARTED |
 
@@ -96,9 +96,9 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, Project la
 | H-04 | Implement Insurance, VAS and Trade-In | COMPLETE | `src/audit_core/insurance_tradein.py` implements documented Insurance GET/PUT with Journey add-ons plus Trade-In GET/PUT; `tests/test_insurance_tradein.py` verifies insurance premium facts, VAS/add-on persistence and Trade-In values remain independent Journey data; commits `62f66dd9d8d30b3155717f60701300c4e9aa6fc3`, `2cb36e32c52dd42893eed3537cdf4c62ebc441cc`, `f184d92cf4f08d2d29a81695e02362585040eda9`; GitHub Actions run `31903303166` passed build, lint, fresh PostgreSQL migration and all tests | Insurance Calculator provider/rules and Trade-In ageing threshold remain open and were not invented; values are persisted with source/provenance only |
 | H-05 | Implement Vehicle, Registration and Delivery | COMPLETE | `src/audit_core/vehicle_delivery.py` implements documented Vehicle, Registration and Delivery GET/PUT routes with configured DELIVERY status lookup and append-only status history; `tests/test_vehicle_delivery.py` proves two observed delivery statuses are recorded while Journey `audit_state`/`audit_outcome` remain unchanged; commits `1070d26b375401fc4b67459be88b288b45d11dee`, `658d2c8f26cb1cbbd92a7cdebfcea897f0828c67`, `784e7e3f40b99ca850e92061dce596e688b26135`; GitHub Actions run `31903601186` passed build, lint, fresh PostgreSQL migration and all tests | Delivery status values remain configured data; no approve/block/stop/cancel dealer-delivery action was introduced |
 | I-01 | Implement control evaluation framework | COMPLETE | `src/audit_core/audit_evaluation.py` executes the exact published Audit Control version and persists evaluator-key, expected and observed snapshots; `tests/test_audit_evaluation.py` proves a v1 evaluation remains traceable and a v2 control change produces a separately attributable result against the same observed snapshot; commits `2f12d739a4aa636d1305ace2c2968d2d360c0180`, `b28646e686168d8576c784dba8b5c1c03aa36d6a`; GitHub Actions run `31903813952` passed build, lint, fresh PostgreSQL migration and all tests | Only the reviewed generic `EXACT_SNAPSHOT_MATCH` evaluator is implemented; no unresolved dealership formula/control rule was invented |
-| I-02 | Implement findings and evidence linkage | NOT STARTED | — | Finding must not mutate dealer business status |
-| I-03 | Implement PC submit and TL/PM review | NOT STARTED | — | SEND_BACK is audit work state, not delivery/business state |
-| J-01 | Implement workflow/task persistence | NOT STARTED | — | Critical durable-work task |
+| I-02 | Implement findings and evidence linkage | COMPLETE | `src/audit_core/findings.py` implements findings with optional same-Journey evaluation linkage plus validated same-Journey Evidence/Evidence Fact references; `tests/test_findings.py` creates/resolves a finding citing an Audit Core Evidence ID/fact and proves the existing delivery business status is unchanged; commits `bdd6c55c1d2868eab9a9a29c12d91545360af433`, `daf0cc1fee72ca3bce6c1436f2a2fa7c6ec7c8d0`, `cad6a1e646e7503d1f5a1fa362ed859f68d619cc`; GitHub Actions run `31904014990` passed build, lint, fresh PostgreSQL migration and all tests | Finding lifecycle is audit-only and does not mutate dealership business state |
+| I-03 | Implement PC submit and TL/PM review | COMPLETE | `src/audit_core/audit_review.py` implements audit start/submit plus append-only Review Decision history with permission + active business-assignment checks for TL/PM; `tests/test_audit_review.py` proves PC submit → TL SEND_BACK → PC resubmit → PM BREACH while delivery status remains unchanged; implementation/fixes through `90e72e49c49d6e62f4c3c3fc882eb1bf29ac0fd2`, `1831c629efd73d0bf8bb6f767df230ea73be967b`, `99d21f69b6b5bd7da9d53eb2146821ca144e4ef9`, `53f9f0a32688fcb364c7cc6f99c8970fbb97916d`, `cb47ec7da1d1b6a10ec3f59d8c099e195a96a976`; GitHub Actions run `31904677813` passed build, lint, fresh PostgreSQL migration and all tests | Exact normal-path versus exception-path TL/PM policy remains open; implementation does not invent a PM gate and only enforces Security permission plus configured active role assignment |
+| J-01 | Implement workflow/task persistence | COMPLETE | `src/audit_core/workflow.py` persists Workflow Instance, Workflow Task and CREATED event; `tests/test_workflow_persistence.py` creates a TL review task, disposes the engine, opens a fresh engine and verifies READY task/payload/assignment/event still exist; commits `b9ea0b062c3157e931f6207a888fed92826fa8c4`, `c6f165315be437379cc85fc6c22c6e3a099fef51`; GitHub Actions run `31904677813` passed build, lint, fresh PostgreSQL migration and all tests | Persistence only; transition atomicity, worker leasing/retry and task idempotency/dead-letter remain J-02/J-03/J-04 |
 | J-02 | Make task creation atomic with audit transitions | NOT STARTED | — | Critical no-lost-task invariant |
 | J-03 | Implement worker retry and lease recovery | NOT STARTED | — | Critical crash recovery |
 | J-04 | Implement task idempotency and dead-letter handling | NOT STARTED | — | Critical duplicate/retry protection |
