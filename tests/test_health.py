@@ -12,5 +12,8 @@ def test_health_endpoint() -> None:
     assert response.json() == {"status": "ok"}
 
 
-def test_health_is_only_exposed_route() -> None:
-    assert {route.path for route in app.routes} == {"/health"}
+def test_only_implemented_routes_are_exposed() -> None:
+    assert {route.path for route in app.routes} == {
+        "/health",
+        "/v1/tenants/{tenant_id}/project",
+    }
