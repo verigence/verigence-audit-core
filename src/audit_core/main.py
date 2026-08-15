@@ -21,35 +21,40 @@ from audit_core.projects import router as project_router
 from audit_core.tasks_api import router as task_router
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
-settings = load_settings()
 
-app = FastAPI(
-    title=settings.service_name,
-    docs_url=None,
-    redoc_url=None,
-    openapi_url=None,
-)
-install_error_handlers(app)
-install_observability(app)
-app.include_router(project_router)
-app.include_router(dealer_router)
-app.include_router(customer_router)
-app.include_router(journey_router)
-app.include_router(evidence_router)
-app.include_router(evidence_read_router)
-app.include_router(booking_router)
-app.include_router(commercials_router)
-app.include_router(payments_finance_router)
-app.include_router(insurance_tradein_router)
-app.include_router(vehicle_delivery_router)
-app.include_router(findings_router)
-app.include_router(audit_review_router)
-app.include_router(task_router)
-app.include_router(daily_operations_router)
-app.include_router(crm_router)
-app.include_router(escalation_router)
+def create_app() -> FastAPI:
+    settings = load_settings()
+    application = FastAPI(
+        title=settings.service_name,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    install_error_handlers(application)
+    install_observability(application)
+    application.include_router(project_router)
+    application.include_router(dealer_router)
+    application.include_router(customer_router)
+    application.include_router(journey_router)
+    application.include_router(evidence_router)
+    application.include_router(evidence_read_router)
+    application.include_router(booking_router)
+    application.include_router(commercials_router)
+    application.include_router(payments_finance_router)
+    application.include_router(insurance_tradein_router)
+    application.include_router(vehicle_delivery_router)
+    application.include_router(findings_router)
+    application.include_router(audit_review_router)
+    application.include_router(task_router)
+    application.include_router(daily_operations_router)
+    application.include_router(crm_router)
+    application.include_router(escalation_router)
+
+    @application.get("/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    return application
 
 
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+app = create_app()
