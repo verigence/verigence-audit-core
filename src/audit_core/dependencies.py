@@ -1,6 +1,7 @@
 import os
 from collections.abc import Iterator
 from functools import lru_cache
+from typing import Annotated
 
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -25,7 +26,7 @@ def get_connection() -> Iterator[Connection]:
 
 
 def get_principal(
-    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
 ) -> Principal:
     if credentials is None:
         raise SecurityTokenError("Missing Security token")
