@@ -4,6 +4,7 @@ from audit_core.audit_review import router as audit_review_router
 from audit_core.bookings import router as booking_router
 from audit_core.commercials import router as commercials_router
 from audit_core.config import load_settings
+from audit_core.contract_guards import install_contract_guards
 from audit_core.crm_api import router as crm_router
 from audit_core.customers import router as customer_router
 from audit_core.daily_operations_api import router as daily_operations_router
@@ -32,6 +33,7 @@ def create_app() -> FastAPI:
     )
     install_error_handlers(application)
     install_observability(application)
+    install_contract_guards(application)
     application.include_router(project_router)
     application.include_router(dealer_router)
     application.include_router(customer_router)
