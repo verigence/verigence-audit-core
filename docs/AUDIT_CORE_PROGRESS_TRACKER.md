@@ -29,21 +29,21 @@ Rules:
 ## 2. Current position
 
 **Implementation tasks:** 48  
-**COMPLETE:** 1  
+**COMPLETE:** 2  
 **VERIFIED:** 0  
 **CODE COMPLETE:** 0  
 **IN PROGRESS:** 0  
 **BLOCKED:** 0  
-**NOT STARTED:** 47  
-**Implementation completion:** 2.1%
+**NOT STARTED:** 46  
+**Implementation completion:** 4.2%
 
-The current v2.1 design/schema/API package was explicitly approved by the project owner on 2026-08-15 and is now the implementation baseline. P0-01 is complete; runtime/tooling confirmation remains the next implementation-input task.
+The v2.1 implementation package is approved and the runtime/tooling baseline is now fixed: Python 3.12, FastAPI, SQLAlchemy 2.x, Alembic and pytest, with Railway for application hosting and Neon for managed PostgreSQL. P0 is complete; A-01 is the first eligible implementation task.
 
 ## 3. Increment summary
 
 | Increment | Scope | Tasks | Complete | Status |
 |---|---|---:|---:|---|
-| P0 | Freeze implementation inputs | 2 | 1 | IN PROGRESS |
+| P0 | Freeze implementation inputs | 2 | 2 | COMPLETE |
 | A | Repository and CI foundation | 3 | 0 | NOT STARTED |
 | B | PostgreSQL foundation | 4 | 0 | NOT STARTED |
 | C | Security, errors and request context | 4 | 0 | NOT STARTED |
@@ -62,7 +62,7 @@ The current v2.1 design/schema/API package was explicitly approved by the projec
 | ID | Task | Status | Evidence / verification | Blocker / note |
 |---|---|---|---|---|
 | P0-01 | Approve v2.1 design package | COMPLETE | Project-owner approval recorded 2026-08-15; `DESIGN_BASELINE_MANIFEST.md` marked APPROVED / BASELINED FOR IMPLEMENTATION in commit `f4f4bcabe720c50c36ff967fda269b9ec82746e5` and verified by commit diff | None |
-| P0-02 | Confirm runtime/tooling | NOT STARTED | — | Do not assume framework/migration/test tooling |
+| P0-02 | Confirm runtime/tooling | COMPLETE | Project-owner confirmation recorded 2026-08-15; `docs/AUDIT_CORE_RUNTIME_TOOLING_v1.0.md` committed as the approved runtime/tooling/hosting baseline in commit `823ff236aabb95e3e05b9389017299d7da527e0a` and verified by repository read | None |
 | A-01 | Scaffold Audit Core service | NOT STARTED | — | Depends P0-02 |
 | A-02 | Add CI quality gate | NOT STARTED | — | Depends A-01 |
 | A-03 | Add environment/config validation | NOT STARTED | — | Depends A-01 |
