@@ -29,21 +29,21 @@ Rules:
 ## 2. Current position
 
 **Implementation tasks:** 48  
-**COMPLETE:** 0  
+**COMPLETE:** 1  
 **VERIFIED:** 0  
 **CODE COMPLETE:** 0  
 **IN PROGRESS:** 0  
 **BLOCKED:** 0  
-**NOT STARTED:** 48  
-**Implementation completion:** 0%
+**NOT STARTED:** 47  
+**Implementation completion:** 2.1%
 
-Planning/design artifacts already exist, but they are not counted as implemented application functionality. The current v2.1 design/schema/API package remains a review candidate until P0-01 is explicitly completed.
+The current v2.1 design/schema/API package was explicitly approved by the project owner on 2026-08-15 and is now the implementation baseline. P0-01 is complete; runtime/tooling confirmation remains the next implementation-input task.
 
 ## 3. Increment summary
 
 | Increment | Scope | Tasks | Complete | Status |
 |---|---|---:|---:|---|
-| P0 | Freeze implementation inputs | 2 | 0 | NOT STARTED |
+| P0 | Freeze implementation inputs | 2 | 1 | IN PROGRESS |
 | A | Repository and CI foundation | 3 | 0 | NOT STARTED |
 | B | PostgreSQL foundation | 4 | 0 | NOT STARTED |
 | C | Security, errors and request context | 4 | 0 | NOT STARTED |
@@ -61,7 +61,7 @@ Planning/design artifacts already exist, but they are not counted as implemented
 
 | ID | Task | Status | Evidence / verification | Blocker / note |
 |---|---|---|---|---|
-| P0-01 | Approve v2.1 design package | NOT STARTED | — | Owner approval required before implementation baseline freeze |
+| P0-01 | Approve v2.1 design package | COMPLETE | Project-owner approval recorded 2026-08-15; `DESIGN_BASELINE_MANIFEST.md` marked APPROVED / BASELINED FOR IMPLEMENTATION in commit `f4f4bcabe720c50c36ff967fda269b9ec82746e5` and verified by commit diff | None |
 | P0-02 | Confirm runtime/tooling | NOT STARTED | — | Do not assume framework/migration/test tooling |
 | A-01 | Scaffold Audit Core service | NOT STARTED | — | Depends P0-02 |
 | A-02 | Add CI quality gate | NOT STARTED | — | Depends A-01 |
