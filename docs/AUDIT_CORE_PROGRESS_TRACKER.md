@@ -29,22 +29,22 @@ Rules:
 ## 2. Current position
 
 **Implementation tasks:** 48  
-**COMPLETE:** 3  
+**COMPLETE:** 4  
 **VERIFIED:** 0  
 **CODE COMPLETE:** 0  
 **IN PROGRESS:** 0  
 **BLOCKED:** 0  
-**NOT STARTED:** 45  
-**Implementation completion:** 6.3%
+**NOT STARTED:** 44  
+**Implementation completion:** 8.3%
 
-The v2.1 implementation package and runtime/tooling baseline are approved. A-01 is complete with a minimal FastAPI service, configuration layout and health-only route. A-02 is the next eligible task.
+The v2.1 implementation package and runtime/tooling baseline are approved. A-01 and A-02 are complete; the repository now has a minimal FastAPI service plus a passing build/lint/unit-test GitHub Actions quality gate. A-03 is the next eligible task.
 
 ## 3. Increment summary
 
 | Increment | Scope | Tasks | Complete | Status |
 |---|---|---:|---:|---|
 | P0 | Freeze implementation inputs | 2 | 2 | COMPLETE |
-| A | Repository and CI foundation | 3 | 1 | IN PROGRESS |
+| A | Repository and CI foundation | 3 | 2 | IN PROGRESS |
 | B | PostgreSQL foundation | 4 | 0 | NOT STARTED |
 | C | Security, errors and request context | 4 | 0 | NOT STARTED |
 | D | Project landscape and assignments | 4 | 0 | NOT STARTED |
@@ -64,7 +64,7 @@ The v2.1 implementation package and runtime/tooling baseline are approved. A-01 
 | P0-01 | Approve v2.1 design package | COMPLETE | Project-owner approval recorded 2026-08-15; `DESIGN_BASELINE_MANIFEST.md` marked APPROVED / BASELINED FOR IMPLEMENTATION in commit `f4f4bcabe720c50c36ff967fda269b9ec82746e5` and verified by commit diff | None |
 | P0-02 | Confirm runtime/tooling | COMPLETE | Project-owner confirmation recorded 2026-08-15; `docs/AUDIT_CORE_RUNTIME_TOOLING_v1.0.md` committed as the approved runtime/tooling/hosting baseline in commit `823ff236aabb95e3e05b9389017299d7da527e0a` and verified by repository read | None |
 | A-01 | Scaffold Audit Core service | COMPLETE | Service scaffold committed in `a1601fb0f417708ebf2d4918882e89b6f4e7e219`; `pytest -q` passed 2 tests; Uvicorn startup verified `/health` = 200 with `{"status":"ok"}`, while `/` and `/docs` = 404; committed files re-read from `main` | None |
-| A-02 | Add CI quality gate | NOT STARTED | — | Depends A-01 |
+| A-02 | Add CI quality gate | COMPLETE | CI workflow and Ruff gate introduced in `05b766cd740e93e02d88037557124b152fed998e`; lint corrections completed through `aa4ae93915aaa109f2c6f69a19e6d17f8d8ebf13`; GitHub Actions run `31878194470` passed build, Ruff lint and `pytest -q` unit tests on `main` | None |
 | A-03 | Add environment/config validation | NOT STARTED | — | Depends A-01 |
 | B-01 | Convert VAC-DB-002 into migration baseline | NOT STARTED | — | Depends P0-01/P0-02 |
 | B-02 | Enforce Tenant RLS runtime pattern | NOT STARTED | — | Critical tenant-isolation task |
