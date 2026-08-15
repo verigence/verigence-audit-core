@@ -60,6 +60,18 @@ def journey_setup():
                 "category_id": category_id,
             },
         )
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.business_status_codes (
+                    tenant_id, domain_key, status_code, status_label
+                ) VALUES
+                    (:tenant_id, 'JOURNEY', 'SOURCE_STATUS', 'Source status'),
+                    (:tenant_id, 'JOURNEY', 'SOURCE_STATUS_UPDATED', 'Updated source status')
+                """
+            ),
+            {"tenant_id": tenant_id},
+        )
         dealer_id = connection.execute(
             text(
                 "INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
