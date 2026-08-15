@@ -1,7 +1,7 @@
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Header, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Connection, text
 
@@ -9,6 +9,7 @@ from audit_core.authorization import require_tenant
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_principal
 from audit_core.errors import AuditCoreError, NotFoundError
+from audit_core.idempotency import execute_idempotent_json_command
 from audit_core.security import Principal
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["journeys"])
@@ -147,6 +148,10 @@ def create_journey(
     tenant_id: str,
     customer_id: UUID,
     payload: JourneyCreate,
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=8, max_length=200),
+    ],
     principal: Annotated[Principal, Depends(get_principal)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> JourneyResponse:
@@ -159,42 +164,55 @@ def create_journey(
         policy_version_id=payload.policyVersionId,
         price_list_version_id=payload.priceListVersionId,
     )
-    row = connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.journeys (
-                tenant_id, dealer_id, outlet_id, customer_id,
-                journey_reference, observed_status_code, observed_status_source,
-                document_requirement_profile_version_id, policy_version_id,
-                price_list_version_id, created_by_actor_id
-            ) VALUES (
-                :tenant_id, :dealer_id, :outlet_id, :customer_id,
-                :journey_reference, :observed_status_code, :observed_status_source,
-                :document_profile_version_id, :policy_version_id,
-                :price_list_version_id, :actor_id
-            )
-            RETURNING journey_id, customer_id, dealer_id, outlet_id,
-                      journey_reference, observed_status_code, observed_status_source,
-                      audit_state, audit_outcome,
-                      document_requirement_profile_version_id, policy_version_id,
-                      price_list_version_id
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "dealer_id": customer["dealer_id"],
-            "outlet_id": customer["outlet_id"],
-            "customer_id": customer_id,
-            "journey_reference": payload.journeyReference,
-            "observed_status_code": payload.observedStatusCode,
-            "observed_status_source": payload.observedStatusSource,
-            "document_profile_version_id": payload.documentRequirementProfileVersionId,
-            "policy_version_id": payload.policyVersionId,
-            "price_list_version_id": payload.priceListVersionId,
-            "actor_id": principal.subject,
-        },
-    ).mappings().one()
-    return _journey_response(row)
+
+    def execute() -> dict:
+        row = connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.journeys (
+                    tenant_id, dealer_id, outlet_id, customer_id,
+                    journey_reference, observed_status_code, observed_status_source,
+                    document_requirement_profile_version_id, policy_version_id,
+                    price_list_version_id, created_by_actor_id
+                ) VALUES (
+                    :tenant_id, :dealer_id, :outlet_id, :customer_id,
+                    :journey_reference, :observed_status_code, :observed_status_source,
+                    :document_profile_version_id, :policy_version_id,
+                    :price_list_version_id, :actor_id
+                )
+                RETURNING journey_id, customer_id, dealer_id, outlet_id,
+                          journey_reference, observed_status_code, observed_status_source,
+                          audit_state, audit_outcome,
+                          document_requirement_profile_version_id, policy_version_id,
+                          price_list_version_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "dealer_id": customer["dealer_id"],
+                "outlet_id": customer["outlet_id"],
+                "customer_id": customer_id,
+                "journey_reference": payload.journeyReference,
+                "observed_status_code": payload.observedStatusCode,
+                "observed_status_source": payload.observedStatusSource,
+                "document_profile_version_id": payload.documentRequirementProfileVersionId,
+                "policy_version_id": payload.policyVersionId,
+                "price_list_version_id": payload.priceListVersionId,
+                "actor_id": principal.subject,
+            },
+        ).mappings().one()
+        return _journey_response(row).model_dump(mode="json")
+
+    body, _ = execute_idempotent_json_command(
+        connection,
+        tenant_id=tenant_id,
+        operation_key=f"journey.create:{customer_id}",
+        idempotency_key=idempotency_key,
+        request_payload=payload.model_dump(mode="json"),
+        execute=execute,
+        response_status=201,
+    )
+    return JourneyResponse.model_validate(body)
 
 
 @router.get("/customers/{customer_id}/journeys", response_model=list[JourneyResponse])
