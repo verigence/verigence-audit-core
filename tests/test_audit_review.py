@@ -175,9 +175,13 @@ def test_pc_submit_send_back_and_pm_review_do_not_change_delivery_status() -> No
         assert started.status_code == 200, started.text
         assert started.json()["auditState"] == "IN_PROGRESS"
 
-        submitted = client.post(f"{base}/audit/submit")
+        submit_headers = {"Idempotency-Key": f"submit-1-{suffix}"}
+        submitted = client.post(f"{base}/audit/submit", headers=submit_headers)
         assert submitted.status_code == 200, submitted.text
         assert submitted.json()["auditState"] == "PC_SUBMITTED"
+        replayed_submit = client.post(f"{base}/audit/submit", headers=submit_headers)
+        assert replayed_submit.status_code == 200, replayed_submit.text
+        assert replayed_submit.json() == submitted.json()
 
         app.dependency_overrides[get_principal] = lambda: Principal(
             subject=tl_id,
@@ -186,6 +190,7 @@ def test_pc_submit_send_back_and_pm_review_do_not_change_delivery_status() -> No
         )
         sent_back = client.post(
             f"{base}/review-decisions",
+            headers={"Idempotency-Key": f"review-tl-{suffix}"},
             json={
                 "decision": "SEND_BACK",
                 "reviewerRoleCode": "TL",
@@ -199,7 +204,10 @@ def test_pc_submit_send_back_and_pm_review_do_not_change_delivery_status() -> No
             tenant_id=tenant_id,
             permissions=("audit.journey.read", "audit.journey.submit"),
         )
-        resubmitted = client.post(f"{base}/audit/submit")
+        resubmitted = client.post(
+            f"{base}/audit/submit",
+            headers={"Idempotency-Key": f"submit-2-{suffix}"},
+        )
         assert resubmitted.status_code == 200, resubmitted.text
         assert resubmitted.json()["auditState"] == "PC_SUBMITTED"
 
@@ -208,8 +216,10 @@ def test_pc_submit_send_back_and_pm_review_do_not_change_delivery_status() -> No
             tenant_id=tenant_id,
             permissions=("audit.review.read", "audit.review.decide"),
         )
+        final_headers = {"Idempotency-Key": f"review-pm-{suffix}"}
         final = client.post(
             f"{base}/review-decisions",
+            headers=final_headers,
             json={
                 "decision": "BREACH",
                 "reviewerRoleCode": "PM",
@@ -217,6 +227,18 @@ def test_pc_submit_send_back_and_pm_review_do_not_change_delivery_status() -> No
             },
         )
         assert final.status_code == 201, final.text
+        replayed_final = client.post(
+            f"{base}/review-decisions",
+            headers=final_headers,
+            json={
+                "decision": "BREACH",
+                "reviewerRoleCode": "PM",
+                "remarks": "Review completed",
+            },
+        )
+        assert replayed_final.status_code == 201, replayed_final.text
+        assert replayed_final.json() == final.json()
+
         decisions = client.get(f"{base}/review-decisions")
         assert decisions.status_code == 200
         assert [item["decision"] for item in decisions.json()] == ["SEND_BACK", "BREACH"]
