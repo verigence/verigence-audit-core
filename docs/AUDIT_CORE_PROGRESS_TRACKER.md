@@ -30,14 +30,14 @@ Rules:
 
 **Implementation tasks:** 48  
 **COMPLETE:** 25  
-**VERIFIED:** 0  
+**VERIFIED:** 1  
 **CODE COMPLETE:** 0  
-**IN PROGRESS:** 1  
+**IN PROGRESS:** 0  
 **BLOCKED:** 0  
 **NOT STARTED:** 22  
 **Implementation completion:** 52.1%
 
-Repository/CI, PostgreSQL foundation, Security/error/request-context, Project landscape/assignment, versioned-master increment E, and Customer/Journey increment F are complete. G-01 cross-module authentication is COMPLETE after controlled Audit Core -> Security -> DI verification proved narrowed delegated authority, Tenant-scoped service tokens, DI issuer/audience/Tenant/permission compatibility, Tenant mismatch rejection and fail-closed delegated denial without service fallback; GitHub Actions run `31892184880` passed build, lint, fresh PostgreSQL migration and all tests. G-02 DI anti-corruption client implementation is now IN PROGRESS with its adapter/tests committed and CI run `31892592841` passing; tracker verification/closure remains before moving on.
+Repository/CI, PostgreSQL foundation, Security/error/request-context, Project landscape/assignment, versioned-master increment E, Customer/Journey increment F, and G-01 cross-module authentication are complete. G-02 DI anti-corruption client is VERIFIED: Audit Core domain/application callers can work with stable `DiSubject`, `DiDocument`, `DiFact` and `DiVerification` integration objects while DI wire parsing/error translation stays inside `src/audit_core/di_client.py`. GitHub Actions run `31892592841` passed build, lint, fresh PostgreSQL migration and all tests.
 
 ## 3. Increment summary
 
@@ -86,7 +86,7 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, Project la
 | F-02 | Implement protected customer matching | COMPLETE | `src/audit_core/customer_matching.py` stores/searches protected identity-index hashes and provides HMAC protection for already-normalized values without persisting raw identifiers; `GET /v1/tenants/{tenantId}/customers/matches` accepts only protected `matchHash` plus `identityType`; `tests/test_customer_matching.py` verifies one protected PAN key matches active customers across two Dealers/Outlets and neither the raw PAN nor protected hash enters Audit Core logs; commits `0291411530696e75597467385536d9df633bb78b`, `e1ec3c8d8a3bc4c8c943ab80a3211eb31d8fdd60`, `cc8e3c31ce5f1c6e7c90ba5486f6e509534a5de9`; GitHub Actions run `31881346997` passed build, lint, fresh DB migration and all tests | Normalization/scoring rules were not invented; the helper protects an already-normalized approved identity value and the query operates project-wide by Tenant |
 | F-03 | Implement Journey APIs | COMPLETE | `src/audit_core/journeys.py` implementation plus route registration commit `b85a82114792eb1678c6bded55b576f9172cc231`; configured Journey-status test fixture corrected in `ae9526e22b66fff796f6607e2bfec099a55b4e43`; `tests/test_journeys.py` verifies hierarchy, exact published master references, observed-status/audit separation and rejection of audit-state mutation through normal Journey PATCH; GitHub Actions run `31891744663` passed build, lint, fresh PostgreSQL migration and all tests | None |
 | G-01 | Verify Audit Core→DI authentication mechanism | COMPLETE | `src/audit_core/security_integration.py` implements approved Security confidential-client calls for OAuth token exchange and Tenant-scoped `client_credentials`; `tests/test_security_integration.py` proves delegated-user narrowing, service flow, DI JWT issuer/audience/Tenant/permission compatibility, Tenant mismatch rejection and no service fallback on delegated denial; GitHub Actions run `31892184880` passed build, Ruff, fresh PostgreSQL migration and all tests | None |
-| G-02 | Implement DI anti-corruption client | IN PROGRESS | `src/audit_core/di_client.py` and `tests/test_di_client.py` implement and exercise Subject create, multipart upload, document status, extracted facts, permitted verification, stable DI error translation and malformed-contract rejection; implementation commits `d0923b14bdfe3387d63fb87b94c8c9f0e49eee7b`, `39db10c307a64c9af8171eccc09b9ae19b387fab`, lint fix `ddec4fe942ef06d3d60eb229ed166fac5e1dad74`; GitHub Actions run `31892592841` passed build, lint, fresh PostgreSQL migration and all tests | Acceptance evidence present; move through verification before COMPLETE |
+| G-02 | Implement DI anti-corruption client | VERIFIED | `src/audit_core/di_client.py` isolates DI wire contracts behind `DiSubject`, `DiDocument`, `DiFact`, `DiVerification` and `DiClientError`; `tests/test_di_client.py` covers Subject create, multipart upload, document status, extracted facts, permitted verification, stable DI problem translation and malformed success rejection; commits `d0923b14bdfe3387d63fb87b94c8c9f0e49eee7b`, `39db10c307a64c9af8171eccc09b9ae19b387fab`, lint fix `ddec4fe942ef06d3d60eb229ed166fac5e1dad74`; GitHub Actions run `31892592841` passed build, lint, fresh PostgreSQL migration and all tests | Acceptance verified; ready for COMPLETE transition |
 | G-03 | Implement evidence upload façade | NOT STARTED | — | Client sees Audit Core evidenceId only |
 | G-04 | Implement ingestion recovery/idempotency | NOT STARTED | — | Critical partial-failure/replay task |
 | G-05 | Implement evidence facts/read façade | NOT STARTED | — | No public DI identifiers/routes |
