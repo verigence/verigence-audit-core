@@ -107,40 +107,39 @@ def test_runtime_role_cannot_read_or_insert_cross_tenant(database_engine) -> Non
     with database_engine.begin() as owner_connection:
         tenant_a, tenant_b = _seed_projects(owner_connection)
 
-    with database_engine.connect() as connection:
-        with connection.begin():
-            connection.execute(text("SET ROLE audit_core_runtime"))
-            try:
-                set_tenant_context(connection, tenant_a)
-                visible_tenants = connection.execute(
-                    text("SELECT tenant_id FROM auditcore.projects ORDER BY tenant_id")
-                ).scalars().all()
-                cross_tenant = connection.execute(
+    with database_engine.connect() as connection, connection.begin():
+        connection.execute(text("SET ROLE audit_core_runtime"))
+        try:
+            set_tenant_context(connection, tenant_a)
+            visible_tenants = connection.execute(
+                text("SELECT tenant_id FROM auditcore.projects ORDER BY tenant_id")
+            ).scalars().all()
+            cross_tenant = connection.execute(
+                text("SELECT tenant_id FROM auditcore.projects WHERE tenant_id = :tenant_id"),
+                {"tenant_id": tenant_b},
+            ).scalar_one_or_none()
+
+            assert visible_tenants == [tenant_a]
+            assert cross_tenant is None
+
+            with (
+                pytest.raises(DBAPIError, match="row-level security"),
+                connection.begin_nested(),
+            ):
+                connection.execute(
                     text(
-                        "SELECT tenant_id FROM auditcore.projects WHERE tenant_id = :tenant_id"
+                        """
+                        INSERT INTO auditcore.business_status_codes (
+                            tenant_id, domain_key, status_code, status_label
+                        ) VALUES (
+                            :tenant_id, 'JOURNEY', 'TEST', 'Test'
+                        )
+                        """
                     ),
                     {"tenant_id": tenant_b},
-                ).scalar_one_or_none()
-
-                assert visible_tenants == [tenant_a]
-                assert cross_tenant is None
-
-                with pytest.raises(DBAPIError, match="row-level security"):
-                    with connection.begin_nested():
-                        connection.execute(
-                            text(
-                                """
-                                INSERT INTO auditcore.business_status_codes (
-                                    tenant_id, domain_key, status_code, status_label
-                                ) VALUES (
-                                    :tenant_id, 'JOURNEY', 'TEST', 'Test'
-                                )
-                                """
-                            ),
-                            {"tenant_id": tenant_b},
-                        )
-            finally:
-                connection.execute(text("RESET ROLE"))
+                )
+        finally:
+            connection.execute(text("RESET ROLE"))
 
 
 def test_runtime_role_has_no_delete_privilege(database_engine) -> None:
@@ -154,19 +153,20 @@ def test_runtime_role_has_no_delete_privilege(database_engine) -> None:
 
     assert can_delete is False
 
-    with database_engine.connect() as connection:
-        with connection.begin():
-            connection.execute(text("SET ROLE audit_core_runtime"))
-            try:
-                set_tenant_context(connection, tenant_a)
-                with pytest.raises(DBAPIError, match="permission denied"):
-                    with connection.begin_nested():
-                        connection.execute(
-                            text("DELETE FROM auditcore.projects WHERE tenant_id = :tenant_id"),
-                            {"tenant_id": tenant_a},
-                        )
-            finally:
-                connection.execute(text("RESET ROLE"))
+    with database_engine.connect() as connection, connection.begin():
+        connection.execute(text("SET ROLE audit_core_runtime"))
+        try:
+            set_tenant_context(connection, tenant_a)
+            with (
+                pytest.raises(DBAPIError, match="permission denied"),
+                connection.begin_nested(),
+            ):
+                connection.execute(
+                    text("DELETE FROM auditcore.projects WHERE tenant_id = :tenant_id"),
+                    {"tenant_id": tenant_a},
+                )
+        finally:
+            connection.execute(text("RESET ROLE"))
 
 
 def test_published_master_content_is_immutable(database_engine) -> None:
@@ -196,15 +196,17 @@ def test_published_master_content_is_immutable(database_engine) -> None:
             {"tenant_id": tenant_a, "policy_version_id": policy_version_id},
         )
 
-        with pytest.raises(DBAPIError, match="published master version can only be retired"):
-            with connection.begin_nested():
-                connection.execute(
-                    text(
-                        """
-                        UPDATE auditcore.project_policy_versions
-                        SET policy_settings = '{"mode":"mutated"}'::jsonb
-                        WHERE tenant_id = :tenant_id AND policy_version_id = :policy_version_id
-                        """
-                    ),
-                    {"tenant_id": tenant_a, "policy_version_id": policy_version_id},
-                )
+        with (
+            pytest.raises(DBAPIError, match="published master version can only be retired"),
+            connection.begin_nested(),
+        ):
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.project_policy_versions
+                    SET policy_settings = '{"mode":"mutated"}'::jsonb
+                    WHERE tenant_id = :tenant_id AND policy_version_id = :policy_version_id
+                    """
+                ),
+                {"tenant_id": tenant_a, "policy_version_id": policy_version_id},
+            )
