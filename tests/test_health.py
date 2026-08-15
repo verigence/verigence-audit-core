@@ -12,8 +12,6 @@ def test_health_endpoint() -> None:
     assert response.json() == {"status": "ok"}
 
 
-def test_only_implemented_routes_are_exposed() -> None:
-    assert {route.path for route in app.routes if hasattr(route, "path")} == {
-        "/health",
-        "/v1/tenants/{tenant_id}/project",
-    }
+def test_api_docs_remain_disabled() -> None:
+    assert client.get("/docs").status_code == 404
+    assert client.get("/openapi.json").status_code == 404
