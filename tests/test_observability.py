@@ -4,7 +4,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from audit_core.errors import install_error_handlers
-from audit_core.observability import CORRELATION_HEADER, install_observability, log_dependency
+from audit_core.observability import (
+    CORRELATION_HEADER,
+    install_observability,
+    log_dependency,
+)
 
 
 def _app() -> FastAPI:
