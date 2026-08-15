@@ -30,14 +30,14 @@ Rules:
 
 **Implementation tasks:** 48  
 **COMPLETE:** 26  
-**VERIFIED:** 0  
+**VERIFIED:** 1  
 **CODE COMPLETE:** 0  
-**IN PROGRESS:** 1  
+**IN PROGRESS:** 0  
 **BLOCKED:** 0  
 **NOT STARTED:** 21  
 **Implementation completion:** 54.2%
 
-Repository/CI, PostgreSQL foundation, Security/error/request-context, Project landscape/assignment, versioned-master increment E, Customer/Journey increment F, G-01 cross-module authentication, and G-02 DI anti-corruption client are complete. G-02 is backed by GitHub Actions run `31892592841`, which passed build, lint, fresh PostgreSQL migration and all tests. G-03 evidence upload façade is now IN PROGRESS; it will use the completed Security token client plus DI anti-corruption client and must return only an Audit Core `evidenceId` without persisting raw file bytes in Audit Core.
+Repository/CI, PostgreSQL foundation, Security/error/request-context, Project landscape/assignment, versioned-master increment E, Customer/Journey increment F, G-01 cross-module authentication, and G-02 DI anti-corruption client are complete. G-03 evidence upload façade is VERIFIED: the public multipart endpoint authorizes Audit Core scope, obtains narrowed delegated Security tokens, creates/resolves the internal DI subject, forwards evidence to DI, stores only Audit Core evidence metadata/DI identifiers, and returns only the Audit Core `evidenceId`. GitHub Actions run `31893032207` passed build, lint, fresh PostgreSQL migration and all tests; the test proves raw document bytes are forwarded to DI and never stored in Audit Core.
 
 ## 3. Increment summary
 
@@ -87,7 +87,7 @@ Repository/CI, PostgreSQL foundation, Security/error/request-context, Project la
 | F-03 | Implement Journey APIs | COMPLETE | `src/audit_core/journeys.py` implementation plus route registration commit `b85a82114792eb1678c6bded55b576f9172cc231`; configured Journey-status test fixture corrected in `ae9526e22b66fff796f6607e2bfec099a55b4e43`; `tests/test_journeys.py` verifies hierarchy, exact published master references, observed-status/audit separation and rejection of audit-state mutation through normal Journey PATCH; GitHub Actions run `31891744663` passed build, lint, fresh PostgreSQL migration and all tests | None |
 | G-01 | Verify Audit Core→DI authentication mechanism | COMPLETE | `src/audit_core/security_integration.py` implements approved Security confidential-client calls for OAuth token exchange and Tenant-scoped `client_credentials`; `tests/test_security_integration.py` proves delegated-user narrowing, service flow, DI JWT issuer/audience/Tenant/permission compatibility, Tenant mismatch rejection and no service fallback on delegated denial; GitHub Actions run `31892184880` passed build, Ruff, fresh PostgreSQL migration and all tests | None |
 | G-02 | Implement DI anti-corruption client | COMPLETE | `src/audit_core/di_client.py` isolates DI wire contracts behind `DiSubject`, `DiDocument`, `DiFact`, `DiVerification` and `DiClientError`; `tests/test_di_client.py` covers Subject create, multipart upload, document status, extracted facts, permitted verification, stable DI problem translation and malformed success rejection; commits `d0923b14bdfe3387d63fb87b94c8c9f0e49eee7b`, `39db10c307a64c9af8171eccc09b9ae19b387fab`, lint fix `ddec4fe942ef06d3d60eb229ed166fac5e1dad74`; GitHub Actions run `31892592841` passed build, lint, fresh PostgreSQL migration and all tests | None |
-| G-03 | Implement evidence upload façade | IN PROGRESS | Tracker started after G-02 completion | Audit Core multipart upload → Security delegated DI token → DI via anti-corruption client → Audit Core evidence record; client must receive only `evidenceId`, and Audit Core must not persist raw file bytes |
+| G-03 | Implement evidence upload façade | VERIFIED | `src/audit_core/evidence.py` implements Audit Core authorization/business scope, delegated `di.subject.create`/`di.document.upload` token exchange, internal DI subject mapping, multipart forwarding and Audit Core evidence persistence; route registration and multipart runtime support committed through `c77c75a2f98550c7a1ea7e308d9c89efb2c093b3`, `9a9096c71db464323974f1fe349b79f427593e5a`, `46474bbcaed93b5ad3fd719d8db326fc102931e9`; `tests/test_evidence.py` proves the response exposes only Audit Core evidence fields/`evidenceId`, raw bytes are forwarded only to DI, internal DI IDs are persisted but never returned, and missing `audit.evidence.upload` is denied; GitHub Actions run `31893032207` passed build, lint, fresh PostgreSQL migration and all tests | Acceptance verified; ready for COMPLETE transition |
 | G-04 | Implement ingestion recovery/idempotency | NOT STARTED | — | Critical partial-failure/replay task |
 | G-05 | Implement evidence facts/read façade | NOT STARTED | — | No public DI identifiers/routes |
 | H-01 | Implement Booking and product selection | NOT STARTED | — | Booking starts Journey but is not universal root |
