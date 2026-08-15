@@ -29,15 +29,15 @@ Rules:
 ## 2. Current position
 
 **Implementation tasks:** 48  
-**COMPLETE:** 11  
+**COMPLETE:** 12  
 **VERIFIED:** 0  
 **CODE COMPLETE:** 0  
 **IN PROGRESS:** 0  
 **BLOCKED:** 0  
-**NOT STARTED:** 37  
-**Implementation completion:** 22.9%
+**NOT STARTED:** 36  
+**Implementation completion:** 25.0%
 
-Repository/CI foundation and the PostgreSQL foundation are complete. Security JWT verification and Tenant/effective-permission authorization are now implemented and verified. C-03 common error handling is the next eligible task.
+Repository/CI foundation and the PostgreSQL foundation are complete. Security JWT verification, Tenant/effective-permission authorization, and common catalogue-based API error handling are implemented and verified. C-04 correlation and safe structured logging is the next eligible task.
 
 ## 3. Increment summary
 
@@ -46,7 +46,7 @@ Repository/CI foundation and the PostgreSQL foundation are complete. Security JW
 | P0 | Freeze implementation inputs | 2 | 2 | COMPLETE |
 | A | Repository and CI foundation | 3 | 3 | COMPLETE |
 | B | PostgreSQL foundation | 4 | 4 | COMPLETE |
-| C | Security, errors and request context | 4 | 2 | IN PROGRESS |
+| C | Security, errors and request context | 4 | 3 | IN PROGRESS |
 | D | Project landscape and assignments | 4 | 0 | NOT STARTED |
 | E | Versioned masters | 4 | 0 | NOT STARTED |
 | F | Customer and Journey | 3 | 0 | NOT STARTED |
@@ -72,7 +72,7 @@ Repository/CI foundation and the PostgreSQL foundation are complete. Security JW
 | B-04 | Verify master immutability | COMPLETE | `tests/test_database_security.py` publishes a project-policy master version and verifies a subsequent content mutation is rejected by the VAC-DB-002 immutability trigger; GitHub Actions run `31878786632` passed | None |
 | C-01 | Implement Security JWT verification | COMPLETE | `src/audit_core/security.py` implements JWKS-based JWT validation and immutable principal context using approved `tenant_id` and `permissions[]` claims; `tests/test_security.py` covers valid token plus invalid issuer, audience, signature and expiry; implementation landed through commits `a154913ac21db6097abc6f399f5bd9b2c04939a8`, `793ed669a5f2af38d560e90cad1f0038373953f9`, `ea8113874473e9b10632d492f5724d1ef246f836` and lint correction `d480abe613008e6d7b2719f3557f70d6aefd72dd`; GitHub Actions run `31879035125` passed build, lint, fresh DB migration and tests | Current `verigence-security` repository contains no implementation contract beyond README; validator follows the approved Audit Core Security JWT/JWKS contract and accepts issuer/audience/JWKS endpoint as configuration inputs |
 | C-02 | Enforce Tenant and permission checks | COMPLETE | `src/audit_core/authorization.py` implements Tenant match and effective-permission checks using catalogue codes `VAC-AUTH-003` and `VAC-AUTH-002`; `tests/test_authorization.py` covers allowed access, Tenant mismatch and missing permission; commits `f08fd8e6554b0932ff032c77a95d930bb6090d9f` and `1decad83fa15506c4f849406c366fe3604de618d`; GitHub Actions run `31879211853` passed build, lint, fresh DB migration and tests | None |
-| C-03 | Implement common error handling | NOT STARTED | — | Must map VAC-ERR-001 |
+| C-03 | Implement common error handling | COMPLETE | `src/audit_core/errors.py` provides typed Audit Core exceptions and centralized FastAPI mapping to `application/problem+json`; `src/audit_core/main.py` installs the handlers; `tests/test_errors.py` verifies representative validation, authentication, not-found, conflict and unexpected-system failures against VAC-ERR-001 without leaking the raw system error; implementation commits `5ebf41f6b06c995f15c4e3f63f66d9823d5fe3b1`, `ed1a70f2a0e9e0ae7bbf347c34a68718b9179f2a`, `7071e6d5f00b2817fb73acdcf1785133f79b68e8`, lint fix `727c589654c02b4ca8c74cfa0f89fba62801cd24`; GitHub Actions run `31879368138` passed build, lint, fresh DB migration and tests | None |
 | C-04 | Implement correlation and safe structured logging | NOT STARTED | — | No sensitive payload logging |
 | D-01 | Implement Project projection | NOT STARTED | — | One Tenant = one Project |
 | D-02 | Implement Dealer and Outlet APIs | NOT STARTED | — | No DELETE route |
