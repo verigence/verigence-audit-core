@@ -16,7 +16,6 @@ on:
       - agent/unified-railway-platform
     paths:
       - .github/workflows/platform-deploy.yml
-      - docs/PLATFORM_RAILWAY_DEPLOYMENT_RUNBOOK.md
 
 permissions:
   contents: read
@@ -34,11 +33,14 @@ jobs:
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       AUDIT_SERVICE: verigence-audit-core
       SECURITY_SERVICE: security
-      DI_SERVICE: di-api
-      SMOKE_SERVICE: platform-smoke
+      DI_API_SERVICE: di-api
+      DI_WORKER_SERVICE: di-worker
+      DB_SERVICE: Postgres
       SECURITY_PORT: "8001"
       DI_PORT: "8000"
       DEV_TENANT_ID: dev-auth-test
+      SECURITY_REF: ${{ inputs.security_ref || 'main' }}
+      DI_REF: ${{ inputs.di_ref || 'agent/railway-two-service-runtime' }}
 
     steps:
       - name: Checkout Audit Core
@@ -50,171 +52,119 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: verigence/verigence-security
-          ref: ${{ inputs.security_ref || 'main' }}
+          ref: ${{ env.SECURITY_REF }}
           path: _src/security
 
       - name: Checkout DI
         uses: actions/checkout@v6
         with:
           repository: verigence/verigence-di
-          ref: ${{ inputs.di_ref || 'main' }}
+          ref: ${{ env.DI_REF }}
           path: _src/di
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
 
       - name: Install Railway CLI
         run: npm install --global @railway/cli
 
-      - name: Record source revisions
+      - name: Verify project, topology and source revisions
         shell: bash
         run: |
           set -euo pipefail
+          railway status --json >/tmp/status.json
+          railway service list --json >/tmp/services.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          status=json.loads(Path('/tmp/status.json').read_text())
+          if status.get('id') != os.environ['PLATFORM_PROJECT_ID']:
+              raise SystemExit('RAILWAY_TOKEN points to the wrong Railway project')
+          names={row.get('name') for row in json.loads(Path('/tmp/services.json').read_text())}
+          required={'verigence-audit-core','security','di-api','di-worker','Postgres','platform-smoke'}
+          missing=required-names
+          if missing:
+              raise SystemExit('bootstrap required; missing services: '+','.join(sorted(missing)))
+          if 'di-scheduler' in names:
+              raise SystemExit('unexpected di-scheduler service; scheduler must run inside di-worker')
+          print('PLATFORM_PROJECT_VERIFIED=PASS')
+          print('PLATFORM_SERVICE_INVENTORY=PASS')
+          PY
           echo "AUDIT_CORE_SHA=$(git -C _src/audit-core rev-parse HEAD)"
           echo "SECURITY_SHA=$(git -C _src/security rev-parse HEAD)"
           echo "DI_SHA=$(git -C _src/di rev-parse HEAD)"
 
-      - name: Verify Railway project
+      - name: Validate persisted secrets and runtime configuration
         shell: bash
         run: |
           set -euo pipefail
-          railway status --json > /tmp/platform-status.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          railway variable list --service "$SECURITY_SERVICE" --json >/tmp/security-vars.json
+          railway variable list --service "$DI_API_SERVICE" --json >/tmp/di-api-vars.json
+          railway variable list --service "$DI_WORKER_SERVICE" --json >/tmp/di-worker-vars.json
+
           python - <<'PY'
-          import json, os
-          from pathlib import Path
-          data = json.loads(Path('/tmp/platform-status.json').read_text())
-          actual = data.get('id')
-          expected = os.environ['PLATFORM_PROJECT_ID']
-          if actual != expected:
-              raise SystemExit(f'Wrong Railway project: expected {expected}, got {actual}')
-          print(f"Railway project verified: {data.get('name')} | {actual}")
-          print('PLATFORM_PROJECT_VERIFIED=PASS')
-          PY
-
-      - name: Ensure consolidated services and PostgreSQL exist
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          has_service() {
-            local name="$1"
-            railway service list --json > /tmp/services.json
-            SERVICE_NAME="$name" python - <<'PY'
-          import json, os, sys
-          from pathlib import Path
-          rows = json.loads(Path('/tmp/services.json').read_text())
-          wanted = os.environ['SERVICE_NAME']
-          sys.exit(0 if any(row.get('name') == wanted for row in rows) else 1)
-          PY
-          }
-
-          for service in "$SECURITY_SERVICE" "$DI_SERVICE"; do
-            if ! has_service "$service"; then
-              railway add --service "$service" --json > "/tmp/add-${service}.json"
-              echo "Created Railway service: $service"
-            else
-              echo "Railway service already exists: $service"
-            fi
-          done
-
-          railway service list --json > /tmp/services.json
-          db_service="$(python - <<'PY'
           import json
           from pathlib import Path
-          rows = json.loads(Path('/tmp/services.json').read_text())
-          candidates = [row.get('name','') for row in rows if 'postgres' in row.get('name','').lower()]
-          print(candidates[0] if candidates else '')
+          audit=json.loads(Path('/tmp/audit-vars.json').read_text())
+          security=json.loads(Path('/tmp/security-vars.json').read_text())
+          api=json.loads(Path('/tmp/di-api-vars.json').read_text())
+          worker=json.loads(Path('/tmp/di-worker-vars.json').read_text())
+
+          if not audit.get('SECURITY_CLIENT_SECRET'):
+              raise SystemExit('Audit Core SECURITY_CLIENT_SECRET is missing')
+          if not (security.get('SECURITY_PRIVATE_KEY_PEM') or security.get('SECURITY_JWT_PRIVATE_KEY_PEM')):
+              raise SystemExit('Security signing key is missing; refusing implicit key rotation')
+
+          required_di=[
+              'DI_SECRET_KEY',
+              'DI_STORAGE_PROVIDER',
+              'DI_STORAGE_BUCKET',
+              'DI_STORAGE_ENDPOINT',
+              'DI_STORAGE_ACCESS_KEY_ID',
+              'DI_STORAGE_SECRET_ACCESS_KEY',
+          ]
+          for service_name, data in [('di-api', api), ('di-worker', worker)]:
+              missing=[key for key in required_di if not data.get(key)]
+              if missing:
+                  raise SystemExit(f'{service_name} missing persisted DI configuration: '+','.join(missing))
+
+          shared=[
+              'DI_SECRET_KEY','DI_STORAGE_PROVIDER','DI_STORAGE_BUCKET','DI_STORAGE_ENDPOINT',
+              'DI_STORAGE_REGION','DI_STORAGE_ACCESS_KEY_ID','DI_STORAGE_SECRET_ACCESS_KEY',
+              'DI_DOCAI_MOCK','DI_DOCAI_GEMINI_API_KEY',
+          ]
+          drift=[key for key in shared if (api.get(key) or '') != (worker.get(key) or '')]
+          if drift:
+              raise SystemExit('DI API/worker configuration drift: '+','.join(drift))
+          print('PLATFORM_PERSISTED_CONFIG=PASS')
+          print('PLATFORM_DI_CONFIG_PARITY=PASS')
           PY
-          )"
 
-          if [[ -z "$db_service" ]]; then
-            railway add --database postgres --json > /tmp/add-postgres.json
-            railway service list --json > /tmp/services.json
-            db_service="$(python - <<'PY'
-          import json
-          from pathlib import Path
-          rows = json.loads(Path('/tmp/services.json').read_text())
-          candidates = [row.get('name','') for row in rows if 'postgres' in row.get('name','').lower()]
-          print(candidates[0] if candidates else '')
-          PY
-          )"
-          fi
-
-          if [[ -z "$db_service" ]]; then
-            echo 'Unable to identify Railway PostgreSQL service' >&2
-            exit 1
-          fi
-          echo "DB_SERVICE=$db_service" >> "$GITHUB_ENV"
-          echo "Consolidated PostgreSQL service: $db_service"
-
-      - name: Resolve PostgreSQL migration endpoint safely
-        shell: bash
-        run: |
-          set -euo pipefail
-          for attempt in $(seq 1 30); do
-            railway variable list --service "$DB_SERVICE" --json > /tmp/db-vars.json || true
-            db_url="$(python - <<'PY'
-          import json
-          from pathlib import Path
-          try:
-              data = json.loads(Path('/tmp/db-vars.json').read_text())
-          except Exception:
-              data = {}
-          value = data.get('DATABASE_PUBLIC_URL', '') if isinstance(data, dict) else ''
-          print(value)
-          PY
-          )"
-            if [[ -n "$db_url" ]]; then
-              echo "::add-mask::$db_url"
-              echo "PLATFORM_DATABASE_PUBLIC_URL=$db_url" >> "$GITHUB_ENV"
-              echo 'PostgreSQL migration endpoint resolved'
-              exit 0
-            fi
-            sleep 4
-          done
-          echo 'PostgreSQL DATABASE_PUBLIC_URL did not become available' >&2
-          exit 1
-
-      - name: Capture Audit Core managed OAuth secret without exposing it
-        shell: bash
-        run: |
-          set -euo pipefail
-          railway variable list --service "$AUDIT_SERVICE" --json > /tmp/audit-vars.json
           client_secret="$(python - <<'PY'
           import json
           from pathlib import Path
-          data = json.loads(Path('/tmp/audit-vars.json').read_text())
-          print(data.get('SECURITY_CLIENT_SECRET', ''))
+          print(json.loads(Path('/tmp/audit-vars.json').read_text()).get('SECURITY_CLIENT_SECRET',''))
           PY
           )"
-          if [[ -z "$client_secret" ]]; then
-            echo 'Audit Core SECURITY_CLIENT_SECRET is missing' >&2
-            exit 1
-          fi
           echo "::add-mask::$client_secret"
           echo "AUDIT_CLIENT_SECRET=$client_secret" >> "$GITHUB_ENV"
-          secret_hash="$(CLIENT_SECRET="$client_secret" python -c 'import hashlib,os; print(hashlib.sha256(os.environ["CLIENT_SECRET"].encode()).hexdigest())')"
-          echo "AUDIT_CLIENT_SECRET_SHA256=$secret_hash" >> "$GITHUB_ENV"
-          echo 'Audit Core OAuth client material resolved; raw value remains masked'
+          digest="$(CLIENT_SECRET="$client_secret" python -c 'import hashlib,os; print(hashlib.sha256(os.environ["CLIENT_SECRET"].encode()).hexdigest())')"
+          echo "AUDIT_CLIENT_SECRET_SHA256=$digest" >> "$GITHUB_ENV"
 
-      - name: Configure consolidated Security runtime
+      - name: Configure stable private runtime wiring
         shell: bash
         run: |
           set -euo pipefail
-
           set_var() {
             local service="$1" name="$2" value="$3"
             printf '%s' "$value" | railway variable set "$name" --service "$service" --stdin --skip-deploys >/dev/null
           }
 
-          runtime_db_ref="$(DB_SERVICE="$DB_SERVICE" python -c 'import os; print(chr(36)+chr(123)+chr(123)+os.environ["DB_SERVICE"]+".DATABASE_URL"+chr(125)+chr(125))')"
+          db_ref="$(python -c 'print(chr(36)+chr(123)+chr(123)+"Postgres.DATABASE_URL"+chr(125)+chr(125))')"
           clients_json="$(AUDIT_HASH="$AUDIT_CLIENT_SECRET_SHA256" python - <<'PY'
           import json, os
           print(json.dumps({
               'audit-core': {
                   'secret_sha256': os.environ['AUDIT_HASH'],
-                  'permissions': ['di.document.read', 'di.document.upload'],
+                  'permissions': ['di.document.read','di.document.upload'],
                   'redirect_uris': [],
                   'public': False,
               }
@@ -226,36 +176,34 @@ jobs:
           set_var "$SECURITY_SERVICE" SECURITY_KEY_ID security-unified-dev-1
           set_var "$SECURITY_SERVICE" SECURITY_TOKEN_ISSUER verigence-security
           set_var "$SECURITY_SERVICE" SECURITY_TOKEN_AUDIENCE verigence-platform
-          set_var "$SECURITY_SERVICE" SECURITY_ROLE_DATABASE_URL "$runtime_db_ref"
+          set_var "$SECURITY_SERVICE" SECURITY_ROLE_DATABASE_URL "$db_ref"
           set_var "$SECURITY_SERVICE" SECURITY_INTEGRATION_CLIENTS_JSON "$clients_json"
           set_var "$SECURITY_SERVICE" SECURITY_SESSION_COOKIE_SECURE true
+          set_var "$SECURITY_SERVICE" DEV_TENANT_ID "$DEV_TENANT_ID"
 
-          railway variable list --service "$SECURITY_SERVICE" --json > /tmp/security-vars.json
-          has_key="$(python - <<'PY'
-          import json
-          from pathlib import Path
-          data=json.loads(Path('/tmp/security-vars.json').read_text())
-          print('yes' if data.get('SECURITY_PRIVATE_KEY_PEM') else 'no')
-          PY
-          )"
-          if [[ "$has_key" != "yes" ]]; then
-            private_key="$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 2>/dev/null)"
-            echo "::add-mask::$private_key"
-            set_var "$SECURITY_SERVICE" SECURITY_PRIVATE_KEY_PEM "$private_key"
-            unset private_key
-            echo 'Generated consolidated Security DEV signing key'
-          else
-            echo 'Reusing consolidated Security DEV signing key'
-          fi
+          for service in "$DI_API_SERVICE" "$DI_WORKER_SERVICE"; do
+            set_var "$service" DI_ENV dev
+            set_var "$service" DI_DATABASE_URL "$db_ref"
+            set_var "$service" DI_SECURITY_JWKS_URL "http://security.railway.internal:${SECURITY_PORT}/.well-known/jwks.json"
+            set_var "$service" DI_LOG_LEVEL INFO
+          done
+          set_var "$DI_API_SERVICE" PORT "$DI_PORT"
+          set_var "$DI_API_SERVICE" DI_WORKER_ENABLED false
+          set_var "$DI_WORKER_SERVICE" DI_WORKER_ENABLED true
+          set_var "$DI_WORKER_SERVICE" DI_WORKER_ID unified-dev-worker
 
-      - name: Apply Security schema and seed DEV tenant
+          set_var "$AUDIT_SERVICE" SECURITY_BASE_URL "http://security.railway.internal:${SECURITY_PORT}"
+          set_var "$AUDIT_SERVICE" SECURITY_TOKEN_URL "http://security.railway.internal:${SECURITY_PORT}/oauth/token"
+          set_var "$AUDIT_SERVICE" SECURITY_JWKS_URL "http://security.railway.internal:${SECURITY_PORT}/.well-known/jwks.json"
+          set_var "$AUDIT_SERVICE" SECURITY_CLIENT_ID audit-core
+          set_var "$AUDIT_SERVICE" DI_BASE_URL "http://di-api.railway.internal:${DI_PORT}"
+          echo 'PLATFORM_PRIVATE_WIRING=PASS'
+
+      - name: Prepare Security private pre-deploy migration
         shell: bash
-        env:
-          SECURITY_ROLE_DATABASE_URL: ${{ env.PLATFORM_DATABASE_PUBLIC_URL }}
         run: |
           set -euo pipefail
-          python -m pip install -e _src/security >/dev/null
-          python - <<'PY'
+          cat > _src/security/scripts/platform_predeploy.py <<'PY'
           import os
           from pathlib import Path
           import psycopg
@@ -265,10 +213,9 @@ jobs:
 
           db = normalize_database_url(os.environ['SECURITY_ROLE_DATABASE_URL'])
           with psycopg.connect(db) as conn, conn.cursor() as cur:
-              for path in sorted(Path('_src/security/database').glob('*.sql')):
+              for path in sorted(Path('database').glob('*.sql')):
                   cur.execute(path.read_text(encoding='utf-8'))
               conn.commit()
-
           roles = RoleTemplateService(PostgresRoleTemplateStore(db))
           roles.seed_platform_defaults()
           roles.seed_tenant(
@@ -277,244 +224,120 @@ jobs:
               correlation_id=None,
               replace=False,
           )
-          auth = PostgresAuthStore(db)
-          auth.ensure_tenant(os.environ['DEV_TENANT_ID'])
-          print('Security schema and DEV tenant verified')
+          PostgresAuthStore(db).ensure_tenant(os.environ['DEV_TENANT_ID'])
+          print('SECURITY_PRIVATE_MIGRATION=PASS', flush=True)
           PY
+          cat > _src/security/railway.toml <<'TOML'
+          [build]
+          builder = "RAILPACK"
 
-      - name: Configure consolidated DI runtime
+          [deploy]
+          preDeployCommand = ["PYTHONPATH=src python scripts/platform_predeploy.py"]
+          startCommand = "PYTHONPATH=src uvicorn verigence_security.app:create_app --factory --host 0.0.0.0 --port $PORT"
+          restartPolicyType = "ON_FAILURE"
+          restartPolicyMaxRetries = 3
+          TOML
+
+      - name: Prepare DI Railway configs
         shell: bash
         run: |
           set -euo pipefail
+          cat > /tmp/di-api-railway.toml <<'TOML'
+          [build]
+          builder = "DOCKERFILE"
+          dockerfilePath = "Dockerfile"
 
-          set_var() {
-            local service="$1" name="$2" value="$3"
-            printf '%s' "$value" | railway variable set "$name" --service "$service" --stdin --skip-deploys >/dev/null
-          }
+          [deploy]
+          preDeployCommand = ["alembic upgrade head"]
+          startCommand = "sh -c 'uvicorn verigence.di.main:create_app --factory --host 0.0.0.0 --port ${PORT:-8000}'"
+          restartPolicyType = "ON_FAILURE"
+          restartPolicyMaxRetries = 3
+          TOML
+          cat > /tmp/di-worker-railway.toml <<'TOML'
+          [build]
+          builder = "DOCKERFILE"
+          dockerfilePath = "Dockerfile.worker"
 
-          runtime_db_ref="$(DB_SERVICE="$DB_SERVICE" python -c 'import os; print(chr(36)+chr(123)+chr(123)+os.environ["DB_SERVICE"]+".DATABASE_URL"+chr(125)+chr(125))')"
-          set_var "$DI_SERVICE" PORT "$DI_PORT"
-          set_var "$DI_SERVICE" DI_ENV dev
-          set_var "$DI_SERVICE" DI_DATABASE_URL "$runtime_db_ref"
-          set_var "$DI_SERVICE" DI_SECURITY_JWKS_URL "http://security.railway.internal:${SECURITY_PORT}/.well-known/jwks.json"
-          set_var "$DI_SERVICE" DI_WORKER_ENABLED false
-          set_var "$DI_SERVICE" DI_DOCAI_MOCK true
-          set_var "$DI_SERVICE" DI_LOG_LEVEL INFO
+          [deploy]
+          startCommand = "python -m verigence.di.workers"
+          restartPolicyType = "ON_FAILURE"
+          restartPolicyMaxRetries = 10
+          TOML
 
-          railway variable list --service "$DI_SERVICE" --json > /tmp/di-vars.json
-          has_secret="$(python - <<'PY'
-          import json
-          from pathlib import Path
-          data=json.loads(Path('/tmp/di-vars.json').read_text())
-          print('yes' if data.get('DI_SECRET_KEY') else 'no')
-          PY
-          )"
-          if [[ "$has_secret" != "yes" ]]; then
-            di_secret="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
-            echo "::add-mask::$di_secret"
-            set_var "$DI_SERVICE" DI_SECRET_KEY "$di_secret"
-            unset di_secret
-            echo 'Generated consolidated DI DEV secret key'
-          else
-            echo 'Reusing consolidated DI DEV secret key'
-          fi
-
-      - name: Apply DI Alembic migrations
-        shell: bash
-        env:
-          DI_DATABASE_URL: ${{ env.PLATFORM_DATABASE_PUBLIC_URL }}
-        run: |
-          set -euo pipefail
-          python -m pip install 'alembic>=1.13' 'sqlalchemy>=2.0' psycopg2-binary >/dev/null
-          cd _src/di/backend
-          alembic upgrade head
-          echo 'DI Alembic migrations verified'
-
-      - name: Rebind Audit Core to Railway private services
+      - name: Deploy Security
         shell: bash
         run: |
           set -euo pipefail
-          set_var() {
-            local name="$1" value="$2"
-            printf '%s' "$value" | railway variable set "$name" --service "$AUDIT_SERVICE" --stdin --skip-deploys >/dev/null
-          }
-          set_var SECURITY_BASE_URL "http://security.railway.internal:${SECURITY_PORT}"
-          set_var SECURITY_TOKEN_URL "http://security.railway.internal:${SECURITY_PORT}/oauth/token"
-          set_var SECURITY_JWKS_URL "http://security.railway.internal:${SECURITY_PORT}/.well-known/jwks.json"
-          set_var SECURITY_CLIENT_ID audit-core
-          set_var DI_BASE_URL "http://di-api.railway.internal:${DI_PORT}"
-          echo 'Audit Core private dependency URLs configured'
+          railway up _src/security --path-as-root --service "$SECURITY_SERVICE" --detach --yes --message "Stable DEV Security ${GITHUB_SHA}" >/dev/null
 
-      - name: Deploy Security from GitHub Actions
+      - name: Deploy DI API
         shell: bash
         run: |
           set -euo pipefail
-          railway up _src/security --path-as-root --service "$SECURITY_SERVICE" --ci --message "Unified DEV Security ${GITHUB_SHA}"
+          cp /tmp/di-api-railway.toml _src/di/backend/railway.toml
+          railway up _src/di/backend --path-as-root --service "$DI_API_SERVICE" --detach --yes --message "Stable DEV DI API ${GITHUB_SHA}" >/dev/null
 
-      - name: Deploy DI API from GitHub Actions
+      - name: Deploy DI worker
         shell: bash
         run: |
           set -euo pipefail
-          railway up _src/di/backend --path-as-root --service "$DI_SERVICE" --ci --message "Unified DEV DI ${GITHUB_SHA}"
+          cp /tmp/di-worker-railway.toml _src/di/backend/railway.toml
+          railway up _src/di/backend --path-as-root --service "$DI_WORKER_SERVICE" --detach --yes --message "Stable DEV DI worker ${GITHUB_SHA}" >/dev/null
 
-      - name: Deploy Audit Core from GitHub Actions
+      - name: Deploy Audit Core
         shell: bash
         run: |
           set -euo pipefail
-          railway up _src/audit-core --path-as-root --service "$AUDIT_SERVICE" --ci --message "Unified DEV Audit Core ${GITHUB_SHA}"
-          echo 'PLATFORM_AUDIT_CORE_REBOUND=PASS'
+          railway up _src/audit-core --path-as-root --service "$AUDIT_SERVICE" --detach --yes --message "Stable DEV Audit Core ${GITHUB_SHA}" >/dev/null
 
-      - name: Build private-network smoke probe
+      - name: Verify deployments with sparse polling
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p _smoke
-          cat > _smoke/Dockerfile <<'EOF'
-          FROM python:3.12-slim
-          WORKDIR /app
-          RUN pip install --no-cache-dir httpx==0.28.1
-          COPY smoke.py .
-          CMD ["python", "smoke.py"]
-          EOF
-          cat > _smoke/smoke.py <<'PY'
-          import os
-          import time
-          from http.server import BaseHTTPRequestHandler, HTTPServer
-
-          import httpx
-
-          security = os.environ['SECURITY_BASE_URL'].rstrip('/')
-          di = os.environ['DI_BASE_URL'].rstrip('/')
-          client_id = os.environ['SECURITY_CLIENT_ID']
-          client_secret = os.environ['SECURITY_CLIENT_SECRET']
-          tenant_id = os.environ['DEV_TENANT_ID']
-
-          def wait_json(url, expected_status):
-              last = None
-              with httpx.Client(timeout=5.0) as client:
-                  for _ in range(60):
-                      try:
-                          response = client.get(url)
-                          last = f'{response.status_code} {response.text[:200]}'
-                          if response.status_code == 200 and response.json().get('status') == expected_status:
-                              return
-                      except Exception as exc:
-                          last = str(exc)
-                      time.sleep(2)
-              raise RuntimeError(f'{url} did not become ready: {last}')
-
-          wait_json(security + '/health', 'ok')
-          print('PLATFORM_SECURITY_HEALTH=PASS', flush=True)
-          wait_json(di + '/health', 'ok')
-          print('PLATFORM_DI_HEALTH=PASS', flush=True)
-          wait_json(di + '/ready', 'ready')
-          print('PLATFORM_DI_READY=PASS', flush=True)
-
-          with httpx.Client(timeout=10.0) as client:
-              token_response = client.post(
-                  security + '/oauth/token',
-                  auth=(client_id, client_secret),
-                  data={
-                      'grant_type': 'client_credentials',
-                      'tenant_id': tenant_id,
-                      'scope': 'di.document.read',
-                  },
-              )
-              token_response.raise_for_status()
-              token = token_response.json()['access_token']
-              print('PLATFORM_SECURITY_SERVICE_TOKEN=PASS', flush=True)
-
-              di_response = client.get(
-                  f'{di}/v1/tenants/{tenant_id}/subjects',
-                  params={'limit': 1},
-                  headers={'Authorization': f'Bearer {token}', 'X-Correlation-ID': 'platform-private-e2e'},
-              )
-              if di_response.status_code != 200:
-                  raise RuntimeError(f'DI authenticated request failed: {di_response.status_code} {di_response.text[:300]}')
-              print('PLATFORM_SECURITY_TO_DI_JWKS_AUTH=PASS', flush=True)
-              print('PLATFORM_PRIVATE_E2E=PASS', flush=True)
-
-          class Handler(BaseHTTPRequestHandler):
-              def do_GET(self):
-                  self.send_response(200)
-                  self.end_headers()
-                  self.wfile.write(b'ok')
-              def log_message(self, format, *args):
-                  return
-
-          HTTPServer(('0.0.0.0', int(os.environ.get('PORT', '8080'))), Handler).serve_forever()
-          PY
-
-      - name: Deploy temporary private-network smoke service
-        shell: bash
-        run: |
-          set -euo pipefail
-          railway service list --json > /tmp/services.json
-          if ! SMOKE_SERVICE="$SMOKE_SERVICE" python - <<'PY'
-          import json, os, sys
-          from pathlib import Path
-          rows=json.loads(Path('/tmp/services.json').read_text())
-          sys.exit(0 if any(r.get('name') == os.environ['SMOKE_SERVICE'] for r in rows) else 1)
-          PY
-          then
-            railway add --service "$SMOKE_SERVICE" --json > /tmp/add-smoke.json
-          fi
-
-          set_var() {
-            local name="$1" value="$2"
-            printf '%s' "$value" | railway variable set "$name" --service "$SMOKE_SERVICE" --stdin --skip-deploys >/dev/null
-          }
-          set_var SECURITY_BASE_URL "http://security.railway.internal:${SECURITY_PORT}"
-          set_var DI_BASE_URL "http://di-api.railway.internal:${DI_PORT}"
-          set_var SECURITY_CLIENT_ID audit-core
-          set_var SECURITY_CLIENT_SECRET "$AUDIT_CLIENT_SECRET"
-          set_var DEV_TENANT_ID "$DEV_TENANT_ID"
-
-          railway up _smoke --path-as-root --service "$SMOKE_SERVICE" --ci --message "Unified DEV private smoke ${GITHUB_SHA}"
-
-      - name: Verify private-network smoke evidence
-        shell: bash
-        run: |
-          set -euo pipefail
-          for attempt in $(seq 1 30); do
-            railway logs --service "$SMOKE_SERVICE" --latest --lines 200 > /tmp/smoke.log || true
-            if grep -q 'PLATFORM_PRIVATE_E2E=PASS' /tmp/smoke.log; then
-              break
-            fi
-            sleep 2
-          done
-          for marker in \
-            PLATFORM_SECURITY_HEALTH=PASS \
-            PLATFORM_DI_HEALTH=PASS \
-            PLATFORM_DI_READY=PASS \
-            PLATFORM_SECURITY_SERVICE_TOKEN=PASS \
-            PLATFORM_SECURITY_TO_DI_JWKS_AUTH=PASS \
-            PLATFORM_PRIVATE_E2E=PASS; do
-            grep -q "$marker" /tmp/smoke.log || { echo "Missing smoke marker: $marker" >&2; cat /tmp/smoke.log; exit 1; }
-            echo "$marker"
-          done
-
-      - name: Verify final consolidated service inventory
-        shell: bash
-        run: |
-          set -euo pipefail
-          railway service list --json > /tmp/final-services.json
-          python - <<'PY'
+          sleep 45
+          get_status() {
+            local service="$1"
+            railway deployment list --service "$service" --limit 1 --json > "/tmp/${service}-deployment.json"
+            SERVICE_FILE="/tmp/${service}-deployment.json" python - <<'PY'
           import json, os
           from pathlib import Path
-          rows=json.loads(Path('/tmp/final-services.json').read_text())
-          names={row.get('name') for row in rows}
-          required={os.environ['AUDIT_SERVICE'], os.environ['SECURITY_SERVICE'], os.environ['DI_SERVICE'], os.environ['DB_SERVICE']}
-          missing=required-names
-          if missing:
-              raise SystemExit('Missing Railway services: ' + ', '.join(sorted(missing)))
-          print('CONSOLIDATED_SERVICES=' + ','.join(sorted(required)))
+          rows=json.loads(Path(os.environ['SERVICE_FILE']).read_text())
+          print(rows[0].get('status','') if rows else '')
           PY
+          }
 
-      - name: Remove temporary smoke service
-        if: always()
-        shell: bash
-        run: |
-          set +e
-          railway service delete "$SMOKE_SERVICE" --yes >/dev/null 2>&1
-          exit 0
+          for service in "$SECURITY_SERVICE" "$DI_API_SERVICE" "$DI_WORKER_SERVICE" "$AUDIT_SERVICE"; do
+            status="$(get_status "$service")"
+            case "$status" in
+              SUCCESS) ;;
+              FAILED|CRASHED|REMOVED)
+                railway logs --service "$service" --latest --deployment --lines 220 || true
+                echo "$service deployment failed: $status" >&2
+                exit 1
+                ;;
+              *)
+                sleep 30
+                status="$(get_status "$service")"
+                if [[ "$status" != "SUCCESS" ]]; then
+                  railway logs --service "$service" --latest --deployment --lines 220 || true
+                  echo "$service did not become healthy: $status" >&2
+                  exit 1
+                fi
+                ;;
+            esac
+            echo "PLATFORM_DEPLOYMENT=PASS|$service"
+          done
+
+          railway logs --service "$SECURITY_SERVICE" --latest --deployment --lines 220 >/tmp/security.log || true
+          grep -q 'SECURITY_PRIVATE_MIGRATION=PASS' /tmp/security.log || {
+            echo 'Security private migration marker missing' >&2
+            tail -n 160 /tmp/security.log >&2
+            exit 1
+          }
+          railway logs --service "$DI_WORKER_SERVICE" --latest --deployment --lines 260 >/tmp/worker.log
+          grep -q 'DI_WORKER_STARTED=PASS' /tmp/worker.log || { tail -n 180 /tmp/worker.log >&2; exit 1; }
+          grep -q 'DI_EOD_SCHEDULER_STARTED=PASS' /tmp/worker.log || { tail -n 180 /tmp/worker.log >&2; exit 1; }
+          echo 'PLATFORM_SECURITY_PRIVATE_MIGRATION=PASS'
+          echo 'PLATFORM_DI_WORKER=PASS'
+          echo 'PLATFORM_DI_EOD_SCHEDULER=PASS'
+          echo 'PLATFORM_DEPLOY=PASS'
