@@ -52,7 +52,7 @@ jobs:
           print('Railway project/environment link established for bootstrap')
           PY
 
-      - name: Create missing application and smoke services
+      - name: Create only proven platform services
         shell: bash
         run: |
           set -euo pipefail
@@ -74,8 +74,6 @@ jobs:
           }
           ensure_service security
           ensure_service di-api
-          ensure_service di-worker
-          ensure_service di-scheduler
           ensure_service platform-smoke
 
       - name: Create PostgreSQL if missing
@@ -108,14 +106,7 @@ jobs:
           from pathlib import Path
           rows=json.loads(Path('/tmp/final-services.json').read_text())
           names={r.get('name') for r in rows}
-          required={
-              'verigence-audit-core',
-              'security',
-              'di-api',
-              'di-worker',
-              'di-scheduler',
-              'platform-smoke',
-          }
+          required={'verigence-audit-core','security','di-api','platform-smoke'}
           missing=required-names
           if missing:
               raise SystemExit('Missing services: '+','.join(sorted(missing)))
@@ -125,4 +116,5 @@ jobs:
           print('PLATFORM_BOOTSTRAP=PASS')
           print('APPLICATION_SERVICES=' + ','.join(sorted(required)))
           print('DATABASE_SERVICE=' + db[0])
+          print('DI_PROCESS_TOPOLOGY=NOT_SPLIT_BY_BOOTSTRAP')
           PY
