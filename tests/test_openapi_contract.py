@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import subprocess
-import sys
 from pathlib import Path
 
 import yaml
+from fastapi.testclient import TestClient
+
+from audit_core.main import create_app
 
 _HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 _DELIVERY_PUT_PATH = "/v1/tenants/{}/journeys/{}/delivery"
@@ -40,43 +40,31 @@ def _operations_from_spec(spec: dict) -> list[tuple[str, str, dict]]:
     return operations
 
 
-def _clean_process_route_metadata() -> list[dict]:
-    script = r'''
-import json
-from audit_core.main import app
-
-rows = []
-for route in app.routes:
-    path = getattr(route, "path", None)
-    methods = getattr(route, "methods", None)
-    if not path or not methods:
-        continue
-    dependant = getattr(route, "dependant", None)
-    header_params = getattr(dependant, "header_params", []) if dependant is not None else []
-    rows.append({
-        "path": path,
-        "methods": sorted(methods),
-        "headers": [
-            {"alias": field.alias, "required": field.required}
-            for field in header_params
-        ],
-    })
-print(json.dumps(rows))
-'''
-    env = os.environ.copy()
-    env.setdefault("APP_ENV", "test")
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return json.loads(result.stdout)
+def _fresh_route_metadata() -> list[dict]:
+    app = create_app()
+    rows = []
+    for route in app.routes:
+        path = getattr(route, "path", None)
+        methods = getattr(route, "methods", None)
+        if not path or not methods:
+            continue
+        dependant = getattr(route, "dependant", None)
+        header_params = getattr(dependant, "header_params", []) if dependant is not None else []
+        rows.append(
+            {
+                "path": path,
+                "methods": sorted(methods),
+                "headers": [
+                    {"alias": field.alias, "required": field.required}
+                    for field in header_params
+                ],
+            }
+        )
+    return rows
 
 
 def _implemented_routes() -> dict[tuple[str, str], dict]:
-    metadata = _clean_process_route_metadata()
+    metadata = _fresh_route_metadata()
     return {
         (method, _normalize_path(route["path"])): route
         for route in metadata
@@ -137,27 +125,11 @@ def test_required_openapi_idempotency_headers_are_enforced() -> None:
         assert len(idempotency_params) == 1, (method, path)
         assert idempotency_params[0]["required"] is True, (method, path)
 
-    script = r'''
-import json
-from fastapi.testclient import TestClient
-from audit_core.main import app
-
-client = TestClient(app, raise_server_exceptions=False)
-response = client.put(
-    "/v1/tenants/tenant-contract/journeys/00000000-0000-0000-0000-000000000001/delivery",
-    json={},
-)
-print(json.dumps({"status": response.status_code, "body": response.json()}))
-'''
-    env = os.environ.copy()
-    env.setdefault("APP_ENV", "test")
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
+    client = TestClient(create_app(), raise_server_exceptions=False)
+    response = client.put(
+        "/v1/tenants/tenant-contract/journeys/00000000-0000-0000-0000-000000000001/delivery",
+        json={},
     )
-    response = json.loads(result.stdout)
-    assert response["status"] == 400
-    assert response["body"]["errorCode"] == "VAC-VAL-001"
+    body = json.loads(response.content)
+    assert response.status_code == 400
+    assert body["errorCode"] == "VAC-VAL-001"
