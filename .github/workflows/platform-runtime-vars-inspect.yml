@@ -1,0 +1,64 @@
+name: Inspect Railway runtime variable names
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/unified-railway-platform
+    paths:
+      - .github/workflows/platform-runtime-vars-inspect.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      LEGACY_DI_PROJECT_ID: 62c22163-78d0-4a86-a2f7-dbf39e64aa4d
+      TARGET_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      TARGET_ENVIRONMENT_ID: 398c3cfb-d7c7-4aaf-b5a4-3b44d3087451
+    steps:
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Inspect legacy DI variable names only
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .railway
+          railway link --project "$LEGACY_DI_PROJECT_ID" --environment production --json >/dev/null
+          for service in di-api verigence-di; do
+            railway variable list --service "$service" --json > "/tmp/${service}.json"
+            SERVICE="$service" FILE="/tmp/${service}.json" python - <<'PY'
+          import json, os
+          from pathlib import Path
+          data=json.loads(Path(os.environ['FILE']).read_text())
+          keys=sorted(k for k in data if not k.startswith('RAILWAY_')) if isinstance(data,dict) else []
+          print(f"LEGACY_DI_VARIABLE_KEYS={os.environ['SERVICE']}|{','.join(keys)}")
+          PY
+          done
+
+      - name: Inspect target variable names only
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .railway
+          railway link --project "$TARGET_PROJECT_ID" --environment "$TARGET_ENVIRONMENT_ID" --json >/dev/null
+          for service in verigence-audit-core security di-api di-worker Postgres; do
+            railway variable list --service "$service" --json > "/tmp/target-${service}.json" || true
+            SERVICE="$service" FILE="/tmp/target-${service}.json" python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p=Path(os.environ['FILE'])
+          try:
+              data=json.loads(p.read_text())
+          except Exception:
+              data={}
+          keys=sorted(k for k in data if not k.startswith('RAILWAY_')) if isinstance(data,dict) else []
+          print(f"TARGET_VARIABLE_KEYS={os.environ['SERVICE']}|{','.join(keys)}")
+          PY
+          done
+          echo 'RUNTIME_VARIABLE_NAME_INSPECTION=PASS'
