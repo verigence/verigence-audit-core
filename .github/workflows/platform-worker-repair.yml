@@ -1,0 +1,74 @@
+name: Repair DI worker deployment
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/unified-railway-platform
+    paths:
+      - .github/workflows/platform-worker-repair.yml
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      TARGET_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      TARGET_ENVIRONMENT_ID: 398c3cfb-d7c7-4aaf-b5a4-3b44d3087451
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: verigence/verigence-di
+          ref: agent/railway-two-service-runtime
+          path: di
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      - name: Link unified DEV
+        shell: bash
+        run: railway link --project "$TARGET_PROJECT_ID" --environment "$TARGET_ENVIRONMENT_ID" --json >/dev/null
+      - name: Deploy corrected worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > di/backend/railway.toml <<'TOML'
+          [build]
+          builder = "DOCKERFILE"
+          dockerfilePath = "Dockerfile.worker"
+
+          [deploy]
+          startCommand = "python -m verigence.di.workers"
+          restartPolicyType = "ON_FAILURE"
+          restartPolicyMaxRetries = 10
+          TOML
+          railway up di/backend --path-as-root --service di-worker --detach --yes --message "Repair DI worker ${GITHUB_SHA}" >/dev/null
+      - name: Verify worker and scheduler
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 120); do
+            railway deployment list --service di-worker --limit 1 --json >/tmp/deploy.json
+            status="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/deploy.json').read_text())
+          print(rows[0].get('status','') if rows else '')
+          PY
+            )"
+            if [[ "$status" == "FAILED" || "$status" == "CRASHED" ]]; then
+              railway logs --service di-worker --latest --deployment --lines 250 || true
+              exit 1
+            fi
+            railway logs --service di-worker --latest --deployment --lines 300 >/tmp/worker.log || true
+            if grep -q 'DI_WORKER_STARTED=PASS' /tmp/worker.log && grep -q 'DI_EOD_SCHEDULER_STARTED=PASS' /tmp/worker.log; then
+              echo 'PLATFORM_DI_WORKER=PASS'
+              echo 'PLATFORM_DI_EOD_SCHEDULER=PASS'
+              exit 0
+            fi
+            sleep 3
+          done
+          tail -n 200 /tmp/worker.log >&2 || true
+          exit 1
