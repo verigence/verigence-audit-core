@@ -2,6 +2,11 @@ name: Verify unified Railway platform DEV
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - agent/unified-railway-platform
+    paths:
+      - .github/workflows/platform-verify.yml
 
 permissions:
   contents: read
@@ -114,6 +119,9 @@ jobs:
           client_secret=os.environ['SECURITY_CLIENT_SECRET']
           tenant_id=os.environ['DEV_TENANT_ID']
 
+          TOKEN_EXCHANGE_GRANT='urn:ietf:params:oauth:grant-type:token-exchange'
+          ACCESS_TOKEN_TYPE='urn:ietf:params:oauth:token-type:access_token'
+
           def wait_json(url, expected):
               last=''
               with httpx.Client(timeout=5.0) as client:
@@ -148,6 +156,30 @@ jobs:
               token_response.raise_for_status()
               token=token_response.json()['access_token']
               print('PLATFORM_SECURITY_SERVICE_TOKEN=PASS', flush=True)
+
+              delegated_response=client.post(
+                  security + '/oauth/token',
+                  auth=(client_id, client_secret),
+                  data={
+                      'grant_type':TOKEN_EXCHANGE_GRANT,
+                      'subject_token':token,
+                      'subject_token_type':ACCESS_TOKEN_TYPE,
+                      'scope':'di.document.upload',
+                  },
+              )
+              if delegated_response.status_code == 200:
+                  raise RuntimeError('Security incorrectly accepted a SERVICE token as delegated USER input')
+              try:
+                  delegated_error=delegated_response.json().get('error')
+              except ValueError as exc:
+                  raise RuntimeError('Security delegated-token rejection was not valid OAuth JSON') from exc
+              if delegated_error != 'invalid_grant':
+                  raise RuntimeError(
+                      f'Unexpected delegated-token rejection: '
+                      f'{delegated_response.status_code} {delegated_error}'
+                  )
+              print('PLATFORM_DELEGATED_SERVICE_TOKEN_REJECTED=PASS', flush=True)
+
               di_response=client.get(
                   f'{di}/v1/tenants/{tenant_id}/subjects',
                   params={'limit':1},
@@ -202,6 +234,7 @@ jobs:
             PLATFORM_DI_HEALTH=PASS \
             PLATFORM_DI_READY=PASS \
             PLATFORM_SECURITY_SERVICE_TOKEN=PASS \
+            PLATFORM_DELEGATED_SERVICE_TOKEN_REJECTED=PASS \
             PLATFORM_SECURITY_TO_DI_JWKS_AUTH=PASS \
             PLATFORM_PRIVATE_E2E=PASS; do
             grep -q "$marker" /tmp/smoke.log || {
