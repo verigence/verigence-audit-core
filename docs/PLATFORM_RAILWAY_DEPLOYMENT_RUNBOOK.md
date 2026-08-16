@@ -1,82 +1,98 @@
-# Verigence Platform DEV — Railway Deployment Runbook
+# Verigence Platform DEV — Railway Stable Deployment Runbook
 
 **Owner:** Platform / Audit Core  
 **Target Railway project:** `verigence-audit-core` (`cf00a1cd-623e-4c72-8836-db95652c63db`)  
 **Target Railway environment:** `dev` (`398c3cfb-d7c7-4aaf-b5a4-3b44d3087451`)  
 **Control plane:** GitHub Actions only
 
-## 1. Purpose
+## 1. Stable operating model
 
-Consolidate Audit Core, Security and Document Intelligence into one Railway project so backend traffic uses Railway private networking.
+Audit Core, Security and Document Intelligence run in one Railway project so backend traffic stays on Railway private networking.
 
-Verified target services:
+Persistent services:
 
 - `verigence-audit-core` — Audit Core;
-- `security` — source `verigence/verigence-security`;
-- `di-api` — DI HTTP API;
-- `di-worker` — DI ProcessingWorker + EODRetryScheduler;
-- `platform-smoke` — retained operational private-network verification service, normally scaled down;
-- `Postgres` — consolidated DEV database for Security/DI.
+- `security` — Verigence Security;
+- `di-api` — DI HTTP API only;
+- `di-worker` — DI ProcessingWorker plus EODRetryScheduler;
+- `Postgres` — consolidated DEV database;
+- `platform-smoke` — retained verification service; compute is stopped after verification.
 
-There is no `di-scheduler` Railway service. The EOD scheduler runs inside `di-worker`.
+There is **no** `di-scheduler` Railway service. `EODRetryScheduler` runs inside `di-worker`.
 
-Legacy standalone Security and DI projects are retained during stabilization and are not deleted by this deployment.
+Legacy standalone Security and DI Railway projects remain intact during the stabilization period. The stable deployment workflows do not delete them.
 
-## 2. Mandatory operating rule
+## 2. Canonical GitHub Actions workflows
 
-All Railway mutations for this consolidated platform are executed by GitHub Actions in `verigence/verigence-audit-core`.
+Normal platform operation uses exactly three Railway workflows in `verigence/verigence-audit-core`:
 
-Do not use Railway UI or local CLI for normal service creation, variable changes, migrations, deployment, dependency binding or rollback. GitHub Actions explicitly performs Railway operations and retains deployment evidence.
+1. `platform-bootstrap.yml` — exceptional/idempotent resource creation only;
+2. `platform-deploy.yml` — normal deployment and private migration path;
+3. `platform-verify.yml` — independent private-network acceptance test after deployment.
 
-## 3. Railway credentials
+Do not restore or use versioned migration-era workflows (`*-v2`, `*-v3`, `*-v4`, `*-v5`, `*-v7`, `*-v8`, `*-v9`) for normal operation.
+
+Audit Core source CI and the existing Neon schema workflow remain separate from these Railway platform workflows.
+
+## 3. Mandatory operating rule
+
+All normal Railway mutations for this consolidated platform are performed by GitHub Actions.
+
+Do not use Railway UI or a local Railway CLI for routine variable changes, migrations, dependency binding, deployment, verification or rollback. This keeps configuration changes reproducible and leaves an Actions audit trail.
+
+## 4. Credentials and privilege separation
 
 | GitHub secret | Purpose |
 |---|---|
-| `RAILWAY_TOKEN` | Project-scoped token for normal deploy/runtime operations in `verigence-audit-core`. |
-| `RAILWAY_API_TOKEN` | Workspace/account-level token for workspace discovery and exceptional resource bootstrap. |
+| `RAILWAY_TOKEN` | Project-scoped token for normal deploy, variable, log and verification operations. |
+| `RAILWAY_API_TOKEN` | Workspace/account token reserved for bootstrap/resource creation and exceptional discovery. |
 
-The project token is used for normal deployment and verification. The broader token is reserved for workspace discovery and creation/recreation operations.
+Normal deploy and verify must use only the project-scoped token. Bootstrap is the only canonical workflow allowed to require the broader token.
 
-## 4. Verified DI runtime topology
+## 5. Bootstrap workflow
 
-Read-only Railway discovery of the legacy `verigence-di` project proved exactly two service objects:
+Run bootstrap only when a required service/database object is missing or the consolidated project is being recreated.
 
-```text
-verigence-di
-├── di-api
-└── verigence-di   # historical worker service name
-```
-
-The historical second service used:
+Bootstrap is idempotent and ensures:
 
 ```text
-Dockerfile.worker
-python -m verigence.di.workers
-```
-
-No independent scheduler service existed.
-
-The consolidated topology therefore preserves two DI services:
-
-```text
+verigence-audit-core   # already present as project service
+security
 di-api
-└── HTTP API only; DI_WORKER_ENABLED=false
-
 di-worker
-├── ProcessingWorker
-└── EODRetryScheduler
+platform-smoke
+Postgres
 ```
 
-The worker emits explicit startup markers:
+It must never create `di-scheduler`.
+
+Bootstrap creates resource objects only. Runtime variables, migrations and application deployment belong to `platform-deploy.yml`.
+
+## 6. Deployment workflow
+
+`platform-deploy.yml` is the canonical deployment path.
+
+Before changing runtime state it validates:
+
+- the project token resolves to the expected Railway project;
+- all required service objects already exist;
+- no `di-scheduler` service exists;
+- Audit Core has an OAuth client secret;
+- Security already has signing-key material — normal deployment **must not implicitly rotate keys**;
+- DI API and DI worker have the required persisted storage/secret configuration;
+- shared DI API/worker secret, storage and Document-AI settings are identical.
+
+The workflow then applies private service wiring and deploys in this order:
 
 ```text
-DI_WORKER_STARTED=PASS
-DI_EOD_SCHEDULER_STARTED=PASS
+Security -> DI API -> DI worker -> Audit Core
 ```
 
-## 5. Private endpoints
+A deploy is not accepted merely because a container was submitted. The workflow requires all four latest deployments to become `SUCCESS` and verifies the Security migration plus DI worker/scheduler startup markers.
 
-Backend-to-backend communication uses Railway private DNS:
+## 7. Private endpoints
+
+Backend communication uses Railway private DNS:
 
 ```text
 SECURITY_BASE_URL=http://security.railway.internal:8001
@@ -85,115 +101,136 @@ SECURITY_JWKS_URL=http://security.railway.internal:8001/.well-known/jwks.json
 DI_BASE_URL=http://di-api.railway.internal:8000
 ```
 
-Audit Core does not require public URLs for Security or DI in consolidated DEV.
+Audit Core does not require public Security or DI endpoints in consolidated DEV.
 
-## 6. Database migrations
+## 8. Database migration policy
 
-Security and DI migrations run inside Railway rather than from a GitHub-hosted runner. This keeps PostgreSQL private and avoids requiring `DATABASE_PUBLIC_URL`.
+Security and DI database migrations execute **inside Railway** using pre-deploy commands so Postgres remains private.
 
-- Security schema/tenant initialization executes as a Railway pre-deploy command.
+- Security schema/default-role/dev-tenant initialization runs as a Railway pre-deploy command.
 - DI runs `alembic upgrade head` as a Railway pre-deploy command.
-- DI runtime includes `psycopg2-binary` because Alembic uses the synchronous PostgreSQL driver while application traffic uses `asyncpg`.
+- DI includes `psycopg2-binary` for Alembic's synchronous PostgreSQL path while application traffic uses `asyncpg`.
 
-Do not expose PostgreSQL publicly merely to run deployment migrations.
+Do not create or depend on `DATABASE_PUBLIC_URL` merely to run migrations from a GitHub-hosted runner.
 
-## 7. DI RLS tenant context
+Do not execute destructive database down-migrations automatically during rollback.
 
-DI tenant-scoped transactions set `app.tenant_id` using parameter-safe PostgreSQL configuration:
+## 9. DI runtime topology
+
+The stable DI process model is:
+
+```text
+di-api
+└── HTTP API only
+    DI_WORKER_ENABLED=false
+
+di-worker
+├── ProcessingWorker
+└── EODRetryScheduler
+    DI_WORKER_ENABLED=true
+```
+
+Both are built from the same DI revision. The worker must emit:
+
+```text
+DI_WORKER_STARTED=PASS
+DI_EOD_SCHEDULER_STARTED=PASS
+```
+
+## 10. DI tenant RLS context
+
+Tenant-scoped transactions set `app.tenant_id` with parameter-safe PostgreSQL configuration:
 
 ```sql
 SELECT set_config('app.tenant_id', :tid, true)
 ```
 
-The `true` argument makes the setting transaction-local. Do not use a bind parameter directly in `SET LOCAL app.tenant_id = :tid`; asyncpg/PostgreSQL rejects that form.
+The final `true` makes the setting transaction-local. Do not parameterize `SET LOCAL app.tenant_id = :tid`; asyncpg/PostgreSQL rejects that syntax.
 
-## 8. Security key handling
+## 11. Security signing-key rule
 
-Security signing key material must never be printed to Actions logs.
+Normal deployment must preserve existing signing-key material and fail if it is unexpectedly absent. Signing-key generation/rotation is a deliberate security operation, not a deployment side effect.
 
-During initial consolidation testing one generated DEV key appeared in an Actions log because multiline masking was ineffective. That key was immediately rotated and is no longer valid. The replacement key was written to Railway through stdin/file handling and was not printed.
+Private key values must never be printed in Actions logs. Use stdin/file handling for secret writes.
 
-Future signing-key generation/rotation must use file/stdin handling, not shell echo of multiline private-key content.
+An earlier migration-era DEV key that appeared in an Actions log was immediately rotated and invalidated; the replacement was stored without printing it.
 
-## 9. Verified DEV acceptance evidence
+## 12. Verification workflow
 
-Final successful cutover verification:
+Run `platform-verify.yml` after deployment or whenever platform connectivity/authentication needs independent confirmation.
 
-- GitHub Actions run: `31958949627`
-- Workflow: `Final unified Railway DEV cutover v9`
-- Result: `success`
-
-Required runtime markers all passed:
+The private smoke container verifies:
 
 ```text
-PLATFORM_PROJECT_VERIFIED=PASS
-PLATFORM_DI_DEPLOYMENT=PASS|di-api
-PLATFORM_DI_DEPLOYMENT=PASS|di-worker
-PLATFORM_DI_WORKER=PASS
-PLATFORM_DI_EOD_SCHEDULER=PASS
+platform-smoke
+  -> Security /health
+  -> DI /health
+  -> DI /ready
+  -> Security /oauth/token using Audit Core client credentials
+  -> authenticated DI tenant request
+  -> DI validates the Security JWT using Security JWKS over private DNS
+  -> tenant-scoped database query succeeds
+```
+
+Required acceptance markers:
+
+```text
 PLATFORM_SECURITY_HEALTH=PASS
 PLATFORM_DI_HEALTH=PASS
 PLATFORM_DI_READY=PASS
 PLATFORM_SECURITY_SERVICE_TOKEN=PASS
 PLATFORM_SECURITY_TO_DI_JWKS_AUTH=PASS
 PLATFORM_PRIVATE_E2E=PASS
-FINAL_SERVICE=PASS|verigence-audit-core
-FINAL_SERVICE=PASS|security
-FINAL_SERVICE=PASS|di-api
-FINAL_SERVICE=PASS|di-worker
+PLATFORM_DI_WORKER=PASS
+PLATFORM_DI_EOD_SCHEDULER=PASS
 FINAL_TOPOLOGY=PASS
 DI_PROCESS_TOPOLOGY=API_PLUS_WORKER
 DI_SCHEDULER_SERVICE=NONE
 ```
 
-The private E2E path verified:
+`platform-smoke` compute is always stopped after verification, including failure paths. The service object remains for future checks.
 
-```text
-platform-smoke
-  -> security.railway.internal /health
-  -> di-api.railway.internal /health + /ready
-  -> security.railway.internal /oauth/token
-  -> DI authenticated request using Security-issued JWT
-  -> DI obtains Security JWKS over Railway private networking
-  -> tenant-scoped DI database request succeeds
-```
+## 13. Canonical stable evidence
 
-After verification, `platform-smoke` compute is stopped with `railway down`; the service object is retained for future operational checks.
+The migration-era final cutover was first proven by Actions run `31958949627`.
 
-## 10. Current persistent topology
+The cleaned canonical workflows were then executed independently and passed:
 
-```text
-verigence-audit-core
-security
-di-api
-di-worker
-Postgres
-platform-smoke   # service retained, compute normally stopped
-```
+- `31959607760` — **Deploy unified Railway platform DEV** — `success`;
+- `31959629154` — **Verify unified Railway platform DEV** — `success`;
+- `31959614313` — Audit Core source **CI** — `success`.
 
-`di-scheduler` must not be created.
+These canonical runs supersede the versioned diagnostic/cutover workflows as the operational reference.
 
-## 11. Secret handling
+## 14. DI repository quality gate
 
-No Security client secret, active JWT private key, DI secret key, database password or object-storage credential is committed to GitHub.
+DI CI must run the full pytest suite. Lint/type checking is applied to files changed relative to the PR base so unrelated historical Ruff debt does not make every focused runtime change impossible.
 
-Secret values are written to Railway without being printed. Audit Core keeps its OAuth client secret; Security stores the configured verifier/client representation required for token issuance.
+The repository previously declared a 70% coverage gate while its measured suite covered about 49%, making `main` permanently red. The stable branch enforces the measured 49% baseline so coverage cannot regress. Raising coverage toward 70% remains an explicit engineering backlog objective; do not lower the 49% floor to make a change pass.
 
-## 12. Rollback
+The placeholder `ops-ui` is not treated as a buildable frontend until `package.json` and `package-lock.json` exist. Once implementation starts, the same CI workflow automatically enables Node install/build checks.
 
-Keep legacy standalone Security and DI Railway projects intact until the consolidated path has completed the desired stabilization period.
+## 15. Rollback
 
-Rollback is executed through GitHub Actions by restoring the previously recorded service endpoints/source revisions and redeploying. Do not run destructive database down-migrations automatically.
+Rollback is performed through GitHub Actions by deploying a previously known-good source revision and restoring previously recorded private endpoint/configuration values if necessary.
 
-## 13. Merge and cleanup
+Rules:
 
-The runtime cutover is green, but repository PRs remain draft and unmerged until explicitly approved.
+- do not delete or alter legacy standalone projects as part of an application rollback;
+- do not automatically down-migrate the consolidated database;
+- do not rotate Security signing keys merely because an application revision is rolled back;
+- after rollback, run `platform-verify.yml` and require the complete private E2E markers again.
 
-Before merge:
+## 16. Release checklist
 
-1. reduce the temporary diagnostic/cutover workflows created during migration to a small canonical bootstrap/deploy/verify set;
-2. keep the final acceptance evidence in this runbook;
-3. ensure normal source CI is green or document unrelated pre-existing failures;
-4. do not delete legacy Railway projects as part of PR merge.
+A platform revision is considered stable only when all of the following are true:
 
-Legacy project deletion, if desired later, is a separate explicitly approved cleanup action.
+- repository CI for the changed components is green;
+- canonical `platform-deploy.yml` succeeds;
+- canonical `platform-verify.yml` succeeds;
+- all four persistent application services show latest deployment `SUCCESS`;
+- DI worker and EOD scheduler markers are present;
+- private OAuth/JWKS/DI E2E passes;
+- `platform-smoke` compute is stopped afterward;
+- no temporary diagnostic workflows are required for operation;
+- legacy Railway projects remain untouched unless a separate deletion change is explicitly approved.
