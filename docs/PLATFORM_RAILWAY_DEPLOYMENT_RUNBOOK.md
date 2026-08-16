@@ -30,6 +30,8 @@ Normal platform operation uses exactly three Railway workflows in `verigence/ver
 2. `platform-deploy.yml` — normal deployment and private migration path;
 3. `platform-verify.yml` — independent private-network acceptance test after deployment.
 
+All three are **manual `workflow_dispatch` workflows**. A repository push must not implicitly bootstrap, deploy or run smoke compute.
+
 Do not restore or use versioned migration-era workflows (`*-v2`, `*-v3`, `*-v4`, `*-v5`, `*-v7`, `*-v8`, `*-v9`) for normal operation.
 
 Audit Core source CI and the existing Neon schema workflow remain separate from these Railway platform workflows.
@@ -64,13 +66,13 @@ platform-smoke
 Postgres
 ```
 
-It must never create `di-scheduler`.
+It must never create `di-scheduler` and fails if that unexpected topology is detected.
 
 Bootstrap creates resource objects only. Runtime variables, migrations and application deployment belong to `platform-deploy.yml`.
 
 ## 6. Deployment workflow
 
-`platform-deploy.yml` is the canonical deployment path.
+`platform-deploy.yml` is the canonical deployment path. Its normal source defaults are `verigence-security@main` and `verigence-di@main`; an alternate ref must be supplied explicitly when manually dispatching the workflow.
 
 Before changing runtime state it validates:
 
@@ -137,6 +139,8 @@ DI_WORKER_STARTED=PASS
 DI_EOD_SCHEDULER_STARTED=PASS
 ```
 
+The stabilized DI runtime was merged to `verigence/verigence-di@main` as commit `d0ae8d7c94e34ad49804f6e8cefe00c540dc4bec` and its post-merge CI is green.
+
 ## 10. DI tenant RLS context
 
 Tenant-scoped transactions set `app.tenant_id` with parameter-safe PostgreSQL configuration:
@@ -167,6 +171,7 @@ platform-smoke
   -> DI /health
   -> DI /ready
   -> Security /oauth/token using Audit Core client credentials
+  -> SERVICE token cannot be exchanged as delegated USER input
   -> authenticated DI tenant request
   -> DI validates the Security JWT using Security JWKS over private DNS
   -> tenant-scoped database query succeeds
@@ -179,6 +184,7 @@ PLATFORM_SECURITY_HEALTH=PASS
 PLATFORM_DI_HEALTH=PASS
 PLATFORM_DI_READY=PASS
 PLATFORM_SECURITY_SERVICE_TOKEN=PASS
+PLATFORM_DELEGATED_SERVICE_TOKEN_REJECTED=PASS
 PLATFORM_SECURITY_TO_DI_JWKS_AUTH=PASS
 PLATFORM_PRIVATE_E2E=PASS
 PLATFORM_DI_WORKER=PASS
@@ -190,6 +196,8 @@ DI_SCHEDULER_SERVICE=NONE
 
 `platform-smoke` compute is always stopped after verification, including failure paths. The service object remains for future checks.
 
+The former `security-client-inspect.yml` workflow is intentionally removed: its client/authentication verification is now covered by canonical deploy configuration checks and the stronger private smoke assertions above.
+
 ## 13. Canonical stable evidence
 
 The migration-era final cutover was first proven by Actions run `31958949627`.
@@ -197,8 +205,10 @@ The migration-era final cutover was first proven by Actions run `31958949627`.
 The cleaned canonical workflows were then executed independently and passed:
 
 - `31959607760` — **Deploy unified Railway platform DEV** — `success`;
-- `31959629154` — **Verify unified Railway platform DEV** — `success`;
-- `31959614313` — Audit Core source **CI** — `success`.
+- `31959629154` — initial canonical **Verify unified Railway platform DEV** — `success`;
+- `31960242314` — strengthened canonical verifier including delegated SERVICE-token rejection — `success`;
+- `31959614313` — Audit Core source **CI** — `success`;
+- `31959998559` — DI `main` post-merge **CI** — `success`.
 
 These canonical runs supersede the versioned diagnostic/cutover workflows as the operational reference.
 
@@ -231,6 +241,7 @@ A platform revision is considered stable only when all of the following are true
 - all four persistent application services show latest deployment `SUCCESS`;
 - DI worker and EOD scheduler markers are present;
 - private OAuth/JWKS/DI E2E passes;
+- SERVICE-token delegation fails closed;
 - `platform-smoke` compute is stopped afterward;
 - no temporary diagnostic workflows are required for operation;
 - legacy Railway projects remain untouched unless a separate deletion change is explicitly approved.
