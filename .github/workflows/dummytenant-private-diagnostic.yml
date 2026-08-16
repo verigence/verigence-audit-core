@@ -1,0 +1,153 @@
+name: Diagnose DummyTenant private networking
+
+on:
+  push:
+    branches:
+      - test/dummytenant-booking-e2e
+    paths:
+      - .github/workflows/dummytenant-private-diagnostic.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      AUDIT_SERVICE: verigence-audit-core
+      SECURITY_SERVICE: security
+      DI_API_SERVICE: di-api
+      SMOKE_SERVICE: platform-smoke
+
+    steps:
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Inspect safe service networking metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          for service in "$AUDIT_SERVICE" "$SECURITY_SERVICE" "$DI_API_SERVICE"; do
+            railway variable list --service "$service" --json > "/tmp/${service}-vars.json"
+            railway deployment list --service "$service" --limit 1 --json > "/tmp/${service}-deployment.json"
+            SERVICE="$service" python - <<'PY'
+          import json, os
+          from pathlib import Path
+          service=os.environ['SERVICE']
+          vars_=json.loads(Path(f'/tmp/{service}-vars.json').read_text())
+          deployments=json.loads(Path(f'/tmp/{service}-deployment.json').read_text())
+          print(f'SERVICE={service}')
+          print(f'PRIVATE_DOMAIN={vars_.get("RAILWAY_PRIVATE_DOMAIN", "UNSET")}')
+          print(f'PORT={vars_.get("PORT", "UNSET")}')
+          print(f'DEPLOYMENT_STATUS={deployments[0].get("status", "NONE") if deployments else "NONE"}')
+          PY
+          done
+
+      - name: Capture Audit Core runtime logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 220 > /tmp/audit.log || true
+          echo '--- AUDIT CORE SAFE RUNTIME LOG ---'
+          grep -E 'Uvicorn|Started server|Application startup|Running on|ERROR|Error|Traceback|port|listening|Listening' /tmp/audit.log || true
+          echo '--- END AUDIT CORE SAFE RUNTIME LOG ---'
+
+      - name: Build network probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf probe && mkdir probe
+          cat > probe/Dockerfile <<'DOCKER'
+          FROM python:3.12-slim
+          WORKDIR /app
+          COPY probe.py .
+          CMD ["python", "probe.py"]
+          DOCKER
+          cat > probe/probe.py <<'PY'
+          import os
+          import socket
+          import urllib.request
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+          targets = [
+              ('AUDIT', os.environ['AUDIT_HOST'], int(os.environ['AUDIT_PORT'])),
+              ('SECURITY', os.environ['SECURITY_HOST'], int(os.environ['SECURITY_PORT'])),
+              ('DI', os.environ['DI_HOST'], int(os.environ['DI_PORT'])),
+          ]
+          for name, host, port in targets:
+              print(f'{name}_TARGET={host}:{port}', flush=True)
+              try:
+                  infos=socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+                  rendered=[]
+                  for family, _, _, _, sockaddr in infos:
+                      rendered.append(('IPv6' if family == socket.AF_INET6 else 'IPv4', sockaddr[0]))
+                  print(f'{name}_DNS={rendered}', flush=True)
+              except Exception as exc:
+                  print(f'{name}_DNS_ERROR={type(exc).__name__}:{exc}', flush=True)
+              try:
+                  with socket.create_connection((host, port), timeout=5):
+                      print(f'{name}_TCP=PASS', flush=True)
+              except Exception as exc:
+                  print(f'{name}_TCP=FAIL|{type(exc).__name__}|{exc}', flush=True)
+              try:
+                  with urllib.request.urlopen(f'http://{host}:{port}/health', timeout=5) as response:
+                      body=response.read(200).decode('utf-8','replace')
+                      print(f'{name}_HTTP={response.status}|{body}', flush=True)
+              except Exception as exc:
+                  print(f'{name}_HTTP=FAIL|{type(exc).__name__}|{exc}', flush=True)
+
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+              def log_message(self, format, *args):
+                  return
+          HTTPServer(('0.0.0.0', int(os.environ.get('PORT','8080'))), Handler).serve_forever()
+          PY
+
+      - name: Configure probe with actual Railway domains
+        shell: bash
+        run: |
+          set -euo pipefail
+          safe_get() {
+            SERVICE="$1" KEY="$2" python - <<'PY'
+          import json, os
+          from pathlib import Path
+          data=json.loads(Path(f'/tmp/{os.environ["SERVICE"]}-vars.json').read_text())
+          print(data.get(os.environ['KEY'],'') or '')
+          PY
+          }
+          set_var() { printf '%s' "$2" | railway variable set "$1" --service "$SMOKE_SERVICE" --stdin --skip-deploys >/dev/null; }
+
+          audit_host="$(safe_get "$AUDIT_SERVICE" RAILWAY_PRIVATE_DOMAIN)"
+          audit_port="$(safe_get "$AUDIT_SERVICE" PORT)"
+          security_host="$(safe_get "$SECURITY_SERVICE" RAILWAY_PRIVATE_DOMAIN)"
+          security_port="$(safe_get "$SECURITY_SERVICE" PORT)"
+          di_host="$(safe_get "$DI_API_SERVICE" RAILWAY_PRIVATE_DOMAIN)"
+          di_port="$(safe_get "$DI_API_SERVICE" PORT)"
+
+          test -n "$audit_host" && test -n "$audit_port" && test -n "$security_host" && test -n "$security_port" && test -n "$di_host" && test -n "$di_port"
+          set_var AUDIT_HOST "$audit_host"
+          set_var AUDIT_PORT "$audit_port"
+          set_var SECURITY_HOST "$security_host"
+          set_var SECURITY_PORT "$security_port"
+          set_var DI_HOST "$di_host"
+          set_var DI_PORT "$di_port"
+
+      - name: Run private network probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway up probe --path-as-root --service "$SMOKE_SERVICE" --detach --yes --message "Audit private network diagnostic ${GITHUB_SHA}" >/dev/null
+          sleep 35
+          railway logs --service "$SMOKE_SERVICE" --latest --deployment --lines 200 > /tmp/probe.log || true
+          cat /tmp/probe.log
+
+      - name: Stop probe compute
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          railway down --service "$SMOKE_SERVICE" --yes >/dev/null 2>&1
