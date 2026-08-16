@@ -367,13 +367,33 @@ def seed_di_profile() -> None:
 
         cur.execute(
             """
-            SELECT profile_id FROM docintel.extraction_profiles
-            WHERE document_type_id=%s AND scope_tenant_id=%s AND status='PUBLISHED'
+            SELECT profile_id, status FROM docintel.extraction_profiles
+            WHERE document_type_id=%s AND scope_tenant_id=%s
+            ORDER BY version_no DESC
+            LIMIT 1
             """,
             (document_type_id, TENANT_ID),
         )
         profile_row = cur.fetchone()
-        profile_id = profile_row[0] if profile_row else PROFILE_ID
+        if profile_row is not None and profile_row[1] == "PUBLISHED":
+            cur.execute(
+                """
+                SELECT count(*) FROM docintel.extraction_profile_fields
+                WHERE profile_id=%s AND enabled=true
+                """,
+                (profile_row[0],),
+            )
+            enabled_count = cur.fetchone()[0]
+            if enabled_count < len(BOOKING_FIELDS):
+                raise RuntimeError(
+                    "DummyTenant has an incomplete PUBLISHED Booking Form profile; "
+                    "refusing to mutate published profile children"
+                )
+            conn.commit()
+            marker("DUMMYTENANT_BOOKING_PROFILE")
+            return
+
+        profile_id = profile_row[0] if profile_row is not None else PROFILE_ID
         if profile_row is None:
             cur.execute(
                 """
@@ -382,11 +402,13 @@ def seed_di_profile() -> None:
                     profile_name, status, classification_hint,
                     created_by_actor_id, published_by_actor_id,
                     created_at_utc, published_at_utc, updated_at_utc
-                ) VALUES (%s, %s, %s, 1, 'DummyTenant Booking Form v1', 'PUBLISHED',
-                          'Booking Form', 'DUMMY_E2E', 'DUMMY_E2E', now(), now(), now())
+                ) VALUES (%s, %s, %s, 1, 'DummyTenant Booking Form v1', 'DRAFT',
+                          'Booking Form', 'DUMMY_E2E', NULL, now(), NULL, now())
                 """,
                 (profile_id, document_type_id, TENANT_ID),
             )
+        elif profile_row[1] != "DRAFT":
+            raise RuntimeError(f"Unexpected DummyTenant Booking Form profile state: {profile_row[1]}")
 
         for sequence, (field_key, data_type, required, description) in enumerate(BOOKING_FIELDS, 1):
             cur.execute(
@@ -426,6 +448,16 @@ def seed_di_profile() -> None:
                 """,
                 (_uid(f"profile-field:{field_key}"), profile_id, field_id, required, description, sequence),
             )
+
+        cur.execute(
+            """
+            UPDATE docintel.extraction_profiles
+            SET status='PUBLISHED', published_by_actor_id='DUMMY_E2E',
+                published_at_utc=now(), updated_at_utc=now()
+            WHERE profile_id=%s AND status='DRAFT'
+            """,
+            (profile_id,),
+        )
         conn.commit()
     marker("DUMMYTENANT_BOOKING_PROFILE")
 
