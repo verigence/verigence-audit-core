@@ -21,11 +21,11 @@ class DiDocument:
     subject_id: str | None
     upload_status: str
     processing_status: str
-    confirmation_status: str
-    verification_state: str
+    confirmation_status: str | None
+    verification_state: str | None
     human_verification_status: str | None
     confidence_score: float | None
-    correlation_id: str
+    correlation_id: str | None
 
 
 @dataclass(frozen=True)
@@ -56,7 +56,13 @@ class DiClientError(RuntimeError):
 
 
 class DiClient:
-    """Maps DI HTTP contracts into stable Audit Core integration objects."""
+    """Maps DI HTTP contracts into stable Audit Core integration objects.
+
+    DI currently has two compatible wire generations in DEV: the original flat
+    resource responses and the newer ``ApiResponse`` envelope.  Audit Core keeps
+    that wire-format difference inside this client so business routes do not
+    need to care which DI revision is deployed.
+    """
 
     def __init__(
         self,
@@ -132,7 +138,7 @@ class DiClient:
             data={key: value for key, value in form.items() if value is not None},
             files={"file": (filename, content, content_type)},
         )
-        return _document(response)
+        return _document(response, subject_id=subject_id)
 
     def get_document(
         self,
@@ -148,7 +154,7 @@ class DiClient:
             operation="get_document",
             token=token,
         )
-        return _document(payload)
+        return _document(payload, subject_id=subject_id)
 
     def get_document_facts(
         self,
@@ -242,6 +248,27 @@ class DiClient:
                 if not isinstance(payload, dict):
                     result = "CONTRACT_ERROR"
                     raise _contract_error()
+
+                # Newer DI revisions use {errorCode,errorMessage,data}.  Keep
+                # original flat responses supported for backward compatibility.
+                if "errorCode" in payload:
+                    error_code = payload.get("errorCode")
+                    if not isinstance(error_code, str):
+                        result = "CONTRACT_ERROR"
+                        raise _contract_error()
+                    if error_code != "000":
+                        result = "FAILURE"
+                        raise DiClientError(
+                            status_code=409,
+                            code=f"DI_{error_code}",
+                            retryable=False,
+                        )
+                    data = payload.get("data")
+                    if not isinstance(data, dict):
+                        result = "CONTRACT_ERROR"
+                        raise _contract_error()
+                    return data
+
                 return payload
         finally:
             duration_ms = (time.perf_counter() - started) * 1000.0
@@ -262,17 +289,20 @@ class DiClient:
                 record_metric("audit_core.dependency.errors", labels=labels)
 
 
-def _document(payload: dict[str, Any]) -> DiDocument:
+def _document(payload: dict[str, Any], *, subject_id: str | None = None) -> DiDocument:
+    processing_status = _optional_str(payload, "processingStatus")
+    if processing_status is None:
+        raise _contract_error()
     return DiDocument(
         document_id=_required_str(payload, "documentId"),
-        subject_id=_optional_str(payload, "subjectId"),
+        subject_id=_optional_str(payload, "subjectId") or subject_id,
         upload_status=_required_str(payload, "uploadStatus"),
-        processing_status=_required_str(payload, "processingStatus"),
-        confirmation_status=_required_str(payload, "confirmationStatus"),
-        verification_state=_required_str(payload, "verificationState"),
+        processing_status=processing_status,
+        confirmation_status=_optional_str(payload, "confirmationStatus"),
+        verification_state=_optional_str(payload, "verificationState"),
         human_verification_status=_optional_str(payload, "humanVerificationStatus"),
         confidence_score=_optional_float(payload, "confidenceScore"),
-        correlation_id=_required_str(payload, "correlationId"),
+        correlation_id=_optional_str(payload, "correlationId"),
     )
 
 
@@ -297,7 +327,7 @@ def _http_error(response: httpx.Response) -> DiClientError:
     except ValueError:
         payload = None
     if isinstance(payload, dict):
-        candidate = payload.get("code")
+        candidate = payload.get("code") or payload.get("errorCode")
         if isinstance(candidate, str) and candidate:
             code = candidate
         retryable_value = payload.get("retryable")
