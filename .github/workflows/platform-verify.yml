@@ -2,11 +2,6 @@ name: Verify unified Railway platform DEV
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - agent/unified-railway-platform
-    paths:
-      - .github/workflows/platform-verify.yml
 
 permissions:
   contents: read
