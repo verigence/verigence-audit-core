@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: unified-railway-di-processes-dev
@@ -31,14 +32,49 @@ jobs:
       DI_API_SERVICE: di-api
       DI_WORKER_SERVICE: di-worker
       DI_SCHEDULER_SERVICE: di-scheduler
+      GH_TOKEN: ${{ github.token }}
 
     steps:
+      - name: Resolve exact DI revision
+        shell: bash
+        env:
+          MANUAL_DI_REF: ${{ inputs.di_ref || 'main' }}
+          TRIGGER_RUN_ID: ${{ github.event.workflow_run.id || '' }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            di_ref="$MANUAL_DI_REF"
+          else
+            gh run view "$TRIGGER_RUN_ID" --repo verigence/verigence-audit-core --log > /tmp/core-platform.log
+            di_ref="$(sed -n 's/.*DI_SHA=\([0-9a-f]\{40\}\).*/\1/p' /tmp/core-platform.log | tail -1)"
+            if [[ -z "$di_ref" ]]; then
+              echo 'Unable to resolve DI_SHA from triggering core platform deployment' >&2
+              exit 1
+            fi
+          fi
+          echo "DI_DEPLOY_REF=$di_ref" >> "$GITHUB_ENV"
+          echo "DI process deployment revision resolved: $di_ref"
+
       - name: Checkout DI
         uses: actions/checkout@v6
         with:
           repository: verigence/verigence-di
-          ref: ${{ inputs.di_ref || 'main' }}
           path: _src/di
+          fetch-depth: 0
+
+      - name: Pin DI checkout to deployment revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C _src/di fetch origin "$DI_DEPLOY_REF"
+          git -C _src/di checkout --detach "$DI_DEPLOY_REF"
+          actual="$(git -C _src/di rev-parse HEAD)"
+          echo "DI_PROCESS_SHA=$actual"
+          if [[ "$DI_DEPLOY_REF" =~ ^[0-9a-f]{40}$ ]] && [[ "$actual" != "$DI_DEPLOY_REF" ]]; then
+            echo 'DI process checkout does not match the core deployment SHA' >&2
+            exit 1
+          fi
+          echo 'DI_PROCESS_SOURCE_PIN=PASS'
 
       - name: Install Railway CLI
         run: npm install --global @railway/cli
@@ -190,13 +226,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          railway up _src/di/backend --path-as-root --service "$DI_WORKER_SERVICE" --ci --message "Unified DEV DI worker ${GITHUB_SHA}"
+          railway up _src/di/backend --path-as-root --service "$DI_WORKER_SERVICE" --ci --message "Unified DEV DI worker ${DI_DEPLOY_REF}"
 
       - name: Deploy DI scheduler
         shell: bash
         run: |
           set -euo pipefail
-          railway up _src/di/backend --path-as-root --service "$DI_SCHEDULER_SERVICE" --ci --message "Unified DEV DI scheduler ${GITHUB_SHA}"
+          railway up _src/di/backend --path-as-root --service "$DI_SCHEDULER_SERVICE" --ci --message "Unified DEV DI scheduler ${DI_DEPLOY_REF}"
 
       - name: Verify worker and scheduler startup
         shell: bash
