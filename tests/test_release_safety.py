@@ -7,14 +7,19 @@ from audit_core.authorization import AuthorizationError, authorize
 from audit_core.main import create_app
 from audit_core.security import Principal
 
+_HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 
-def _fresh_public_methods() -> list[list[str]]:
-    app = create_app()
+
+def _public_methods() -> list[list[str]]:
+    runtime_spec = create_app().openapi()
     return [
-        sorted(route.methods)
-        for route in app.routes
-        if getattr(route, "path", "").startswith("/v1/")
-        and getattr(route, "methods", None)
+        [
+            method.upper()
+            for method in path_item
+            if method.lower() in _HTTP_METHODS
+        ]
+        for path, path_item in runtime_spec["paths"].items()
+        if path.startswith("/v1/")
     ]
 
 
@@ -26,7 +31,7 @@ def test_security_catalog_and_public_api_expose_no_destructive_delete_capability
     assert all("delete" not in key.lower() for key in permission_keys)
     assert all("purge" not in key.lower() for key in permission_keys)
 
-    public_methods = _fresh_public_methods()
+    public_methods = _public_methods()
     assert public_methods
     assert all("DELETE" not in methods for methods in public_methods)
 
