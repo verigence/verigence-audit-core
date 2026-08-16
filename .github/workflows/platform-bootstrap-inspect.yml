@@ -1,0 +1,66 @@
+name: Inspect consolidated Railway project
+
+on:
+  push:
+    branches:
+      - agent/unified-railway-platform
+    paths:
+      - .github/workflows/platform-bootstrap-inspect.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+    steps:
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Inspect project, services and CLI capabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway status --json > /tmp/status.json
+          railway service list --json > /tmp/services.json
+          echo '--- PROJECT ---'
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('/tmp/status.json').read_text())
+          for key in ('id','name','environment','environmentId'):
+              if key in data:
+                  print(f'{key}={data[key]}')
+          PY
+          echo '--- SERVICES ---'
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('/tmp/services.json').read_text())
+          for row in data:
+              print(f"{row.get('name')}|{row.get('id')}")
+          PY
+          echo '--- RAILWAY ADD HELP ---'
+          railway add --help
+
+      - name: List Audit Core variable names only
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway variable list --service verigence-audit-core --json > /tmp/vars.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/vars.json').read_text())
+          if isinstance(data, dict):
+              keys=sorted(data.keys())
+          elif isinstance(data, list):
+              keys=sorted(str(row.get('name') or row.get('key')) for row in data if isinstance(row, dict))
+          else:
+              keys=[]
+          print('AUDIT_CORE_VARIABLE_NAMES=' + ','.join(keys))
+          PY
