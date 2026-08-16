@@ -1,0 +1,65 @@
+name: Inspect Audit Core Security client binding
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/security-client-inspect.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      AUDIT_CORE_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_CORE_SERVICE_ID: d8fb0a34-9097-40ba-b47c-ac3f82b7a3dd
+
+    steps:
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Verify project token context
+        shell: bash
+        run: |
+          set -euo pipefail
+          env -u RAILWAY_API_TOKEN railway status --json > /tmp/status.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          data = json.loads(Path('/tmp/status.json').read_text())
+          if data.get('id') != os.environ['AUDIT_CORE_PROJECT_ID']:
+              raise SystemExit(f"Unexpected Railway project: {data.get('name')} | {data.get('id')}")
+          print(f"Audit Core Railway project: {data.get('name')} | {data.get('id')}")
+          PY
+
+      - name: Inspect Security client variable names and credential hash only
+        shell: bash
+        run: |
+          set -euo pipefail
+          env -u RAILWAY_API_TOKEN railway run --service "$AUDIT_CORE_SERVICE_ID" --no-local python - <<'PY'
+          import hashlib
+          import os
+
+          names = [
+              'SECURITY_BASE_URL',
+              'SECURITY_TOKEN_URL',
+              'SECURITY_CLIENT_ID',
+              'SECURITY_CLIENT_SECRET',
+              'SECURITY_JWKS_URL',
+          ]
+          for name in names:
+              print(f'{name}: {"present" if os.environ.get(name) else "missing"}')
+          secret = os.environ.get('SECURITY_CLIENT_SECRET', '')
+          if secret:
+              print('SECURITY_CLIENT_SECRET_SHA256=' + hashlib.sha256(secret.encode()).hexdigest())
+          client_id = os.environ.get('SECURITY_CLIENT_ID', '')
+          if client_id:
+              print('SECURITY_CLIENT_ID_VALUE=' + client_id)
+          PY
