@@ -2,108 +2,111 @@
 
 **Owner:** Platform / Audit Core  
 **Target Railway project:** `verigence-audit-core` (`cf00a1cd-623e-4c72-8836-db95652c63db`)  
-**Deployment control plane:** GitHub Actions only  
-**Primary workflow:** `.github/workflows/platform-deploy.yml`
+**Target Railway environment:** `398c3cfb-d7c7-4aaf-b5a4-3b44d3087451`  
+**Control plane:** GitHub Actions only
 
 ## 1. Purpose
 
-This runbook defines the controlled DEV deployment of the three backend modules into one Railway project so Railway private networking can be used between them:
+This runbook consolidates the three backend modules into one Railway project so they can use Railway private networking:
 
 - `verigence-audit-core` — existing Audit Core service;
-- `security` — Verigence Security service sourced from `verigence/verigence-security`;
-- `di-api` — Document Intelligence API sourced from `verigence/verigence-di`;
-- one Railway-managed PostgreSQL service used by the consolidated DEV Security and DI services.
+- `security` — source: `verigence/verigence-security`;
+- `di-api` — source: `verigence/verigence-di`;
+- `platform-smoke` — operational verification service only;
+- one Railway-managed PostgreSQL service used by consolidated DEV Security and DI.
 
-The existing standalone Security and DI Railway projects are deliberately not deleted during initial cutover. They remain rollback references until the consolidated platform is proven stable.
+Legacy standalone Security and DI Railway projects are retained during stabilization as rollback references. They are not deleted by this runbook.
 
-## 2. Operating rule — GitHub Actions only
+## 2. Mandatory operating rule
 
-All Railway mutations for this consolidated DEV platform must be executed by GitHub Actions in `verigence/verigence-audit-core`.
+All Railway changes for the consolidated platform are made through GitHub Actions in `verigence/verigence-audit-core`.
 
-Do not use the Railway UI or a local Railway CLI to create services, set variables, deploy, redeploy, migrate databases, or change the Audit Core dependency URLs during normal operation. Emergency manual changes must be documented and reconciled back into the workflow before the next deployment.
+Do not use the Railway UI or a local Railway CLI for normal service creation, database creation, variable changes, migrations, deployments, dependency URL changes, or rollback. Railway repository auto-deploy is not the platform deployment mechanism; GitHub Actions explicitly deploys source with `railway up`.
 
-The Railway services are intentionally deployed by `railway up` from GitHub Actions rather than relying on Railway repository auto-deploys. This keeps deployment orchestration and evidence in one auditable place.
+## 3. Why there are two Railway tokens
 
-## 3. Required GitHub secret
+Railway project tokens are intentionally environment/deployment scoped. They are appropriate for normal deployments and service-specific automation, but the live bootstrap test confirmed they cannot link/create new project resources.
 
-Repository: `verigence/verigence-audit-core`
+Therefore the GitHub Actions design separates privileges:
 
-| Secret | Purpose |
-|---|---|
-| `RAILWAY_TOKEN` | Project-scoped Railway token for `cf00a1cd-623e-4c72-8836-db95652c63db`. |
+| GitHub secret | Scope | Used by | Purpose |
+|---|---|---|---|
+| `RAILWAY_API_TOKEN` | Railway workspace or account token | `.github/workflows/platform-bootstrap.yml` | One-time/exceptional creation of `security`, `di-api`, `platform-smoke`, and PostgreSQL. |
+| `RAILWAY_TOKEN` | Project token for `cf00a1cd-623e-4c72-8836-db95652c63db` | `.github/workflows/platform-deploy.yml` | Normal variable management, migrations/deployments, logs and redeploy operations inside the already-created project environment. |
 
-No Security client secret, JWT private key, DI secret key, or database password is committed to GitHub. Runtime secrets are generated or read inside the workflow and written directly to Railway using stdin. Secret values must never be printed.
+`RAILWAY_API_TOKEN` is required only for bootstrap/recreation of project resources. Keep the narrower project token as the day-to-day deployment credential.
 
 ## 4. Target topology
 
 ```text
 Railway project: verigence-audit-core
-Current environment
+Environment: 398c3cfb-d7c7-4aaf-b5a4-3b44d3087451
 
 verigence-audit-core
-   |-- Security OAuth/JWKS --> http://security.railway.internal:8001
-   `-- Document Intelligence -> http://di-api.railway.internal:8000
+   |-- OAuth/JWKS ------> http://security.railway.internal:8001
+   `-- DI --------------> http://di-api.railway.internal:8000
 
 security
-   `-- PostgreSQL (security schema/tables)
+   `-- PostgreSQL
 
 di-api
-   |-- JWKS --> http://security.railway.internal:8001/.well-known/jwks.json
-   `-- PostgreSQL (docintel schema/tables)
+   |-- JWKS ------------> http://security.railway.internal:8001/.well-known/jwks.json
+   `-- PostgreSQL
+
+platform-smoke
+   `-- temporary deployment used to prove private routing/auth; the service object remains available for future smoke runs
 ```
 
 Canonical private endpoints:
 
-- Security base: `http://security.railway.internal:8001`
-- Security token endpoint: `http://security.railway.internal:8001/oauth/token`
-- Security JWKS: `http://security.railway.internal:8001/.well-known/jwks.json`
-- DI base: `http://di-api.railway.internal:8000`
+- Security: `http://security.railway.internal:8001`
+- Token: `http://security.railway.internal:8001/oauth/token`
+- JWKS: `http://security.railway.internal:8001/.well-known/jwks.json`
+- DI: `http://di-api.railway.internal:8000`
 - DI liveness: `http://di-api.railway.internal:8000/health`
 - DI readiness: `http://di-api.railway.internal:8000/ready`
 
-## 5. Source repositories
+## 5. Bootstrap procedure
 
-The central workflow checks out the following immutable source inputs for each run:
+Bootstrap is required only when the consolidated services/database do not exist.
 
-| Service | Repository | Default ref |
-|---|---|---|
-| Audit Core | `verigence/verigence-audit-core` | workflow ref / `main` after merge |
-| Security | `verigence/verigence-security` | `main` |
-| DI API | `verigence/verigence-di` | `main` |
+1. Add `RAILWAY_API_TOKEN` to GitHub Actions secrets in `verigence/verigence-audit-core`. Use a Railway workspace or account token authorized to create resources in the target project.
+2. Run **Bootstrap unified Railway platform DEV** (`.github/workflows/platform-bootstrap.yml`).
+3. The Action links explicitly to project `cf00a1cd-623e-4c72-8836-db95652c63db` and environment `398c3cfb-d7c7-4aaf-b5a4-3b44d3087451`.
+4. It idempotently ensures these resource objects exist:
+   - `verigence-audit-core` (already present);
+   - `security`;
+   - `di-api`;
+   - `platform-smoke`;
+   - one PostgreSQL service.
+5. Accept bootstrap only when the log contains `PLATFORM_BOOTSTRAP=PASS`.
 
-A deployment record must retain the Git SHAs used for all three repositories.
+The bootstrap workflow creates empty application services. It does not connect them to Railway GitHub auto-deploy sources.
 
-## 6. What the workflow does
+## 6. Normal deployment procedure
 
-The workflow is idempotent. On every deployment it:
+Normal deployment uses only the project-scoped `RAILWAY_TOKEN`.
 
-1. verifies that `RAILWAY_TOKEN` resolves to Railway project `cf00a1cd-623e-4c72-8836-db95652c63db`;
-2. ensures `security` and `di-api` services exist without enabling Railway GitHub auto-deploy;
-3. ensures one Railway PostgreSQL database exists for consolidated DEV Security and DI;
-4. retrieves the existing Audit Core `SECURITY_CLIENT_SECRET` inside the Action without printing it and derives only its SHA-256 verifier for Security;
-5. generates a Security RSA private key only when the consolidated `security` service does not already have one;
-6. configures the consolidated Security service with issuer `verigence-security`, audience `verigence-platform`, database connectivity, and least-privilege `audit-core` permissions (`di.document.read`, `di.document.upload`);
-7. applies Security database SQL and seeds the retained DEV tenant `dev-auth-test`;
-8. generates a stable DI DEV secret key only when absent, configures DI to use the shared PostgreSQL service and Security's private JWKS endpoint, and keeps Document AI in DEV mock mode until a real provider is deliberately configured;
-9. applies DI Alembic migrations;
-10. deploys Security from `verigence/verigence-security` and DI from `verigence/verigence-di` using `railway up`;
-11. rewires the existing Audit Core service to the private Security and DI endpoints and redeploys Audit Core;
-12. creates a temporary `platform-smoke` service inside the same Railway project, obtains an `audit-core` SERVICE token from Security, validates DI `/health` and `/ready`, and calls DI with the Security-issued token;
-13. records PASS markers in the GitHub Actions log and deletes the temporary smoke service.
+1. Run **Deploy unified Railway platform DEV** (`.github/workflows/platform-deploy.yml`).
+2. Security and DI default to their `main` branches; explicit SHAs/refs may be supplied for controlled testing or rollback.
+3. The workflow records the Audit Core, Security and DI Git SHAs.
+4. It verifies the target Railway project and required pre-created services.
+5. It retrieves the existing Audit Core `SECURITY_CLIENT_SECRET` without printing it and derives only its SHA-256 verifier for Security.
+6. It creates a stable Security RSA signing key only if the consolidated Security service does not already have one.
+7. It configures Security with issuer `verigence-security`, audience `verigence-platform`, the shared DEV PostgreSQL service and least-privilege `audit-core` scopes:
+   - `di.document.read`
+   - `di.document.upload`
+8. It applies Security schema SQL and ensures tenant `dev-auth-test` exists.
+9. It configures DI with the shared PostgreSQL service and the private Security JWKS URL. The API worker is disabled in the API service and Document AI stays in DEV mock mode until a real provider is deliberately configured.
+10. It runs DI Alembic migrations.
+11. It rewires Audit Core to private Security/DI URLs.
+12. It deploys Security, DI and Audit Core explicitly with `railway up` from the three checked-out repositories.
+13. It deploys a smoke image to the pre-created `platform-smoke` service to prove actual private networking and authentication.
+14. It removes the smoke deployment after verification while retaining the service object for the next run.
 
-## 7. Deployment procedure
+## 7. Expected acceptance markers
 
-### Normal deployment
-
-1. Open GitHub Actions in `verigence/verigence-audit-core`.
-2. Select **Deploy unified Railway platform DEV**.
-3. Run the workflow from `main`.
-4. Keep the default Security and DI refs unless a controlled rollback or candidate test requires a specific commit SHA.
-5. Do not run old Security or DI Railway deployment workflows; platform deployment is centralized here.
-
-### Expected verification markers
-
-A successful run must contain all of the following:
+A deployment is accepted only when the GitHub Actions log contains:
 
 ```text
 PLATFORM_PROJECT_VERIFIED=PASS
@@ -116,72 +119,64 @@ PLATFORM_PRIVATE_E2E=PASS
 PLATFORM_AUDIT_CORE_REBOUND=PASS
 ```
 
-A missing marker means the deployment is not accepted even if an individual Railway deployment shows `SUCCESS`.
+## 8. Secret handling
 
-## 8. Security model
+No Security client secret, JWT private key, DI secret key, or database password is committed to GitHub.
 
-The raw Audit Core OAuth client secret remains stored in the Audit Core Railway service. The central workflow reads it only within the ephemeral GitHub runner, masks it immediately, and registers only its SHA-256 verifier in Security.
-
-The consolidated Security service is initially bootstrapped for backend SERVICE-token operation. The workflow does not copy Clerk credentials from the legacy Security Railway project because those secret values are intentionally outside this project's token scope. Interactive USER OAuth/Clerk cutover must be performed separately through an approved secret-provisioning Action if/when the consolidated Security service becomes the interactive login endpoint.
-
-The `audit-core` confidential client is restricted to:
-
-- `di.document.read`
-- `di.document.upload`
+The workflow writes secret values to Railway through stdin, masks temporary values immediately in GitHub Actions, and never prints raw variable JSON containing secret values. The raw Audit Core client secret remains stored in the Audit Core Railway service; Security stores only its SHA-256 verifier.
 
 ## 9. Database model
 
-Audit Core continues using its existing `DATABASE_URL` and database boundary.
+Audit Core keeps its existing `DATABASE_URL` and database boundary.
 
-Security and DI share one managed PostgreSQL instance for DEV infrastructure efficiency but keep application objects isolated by their existing schema/table conventions. Migrations are executed from GitHub Actions against the database public migration endpoint; runtime services use the Railway private database reference.
+The consolidated DEV Security and DI services share one Railway-managed PostgreSQL instance for infrastructure efficiency while retaining their existing application schema/table boundaries. GitHub Actions uses the database public migration endpoint only for migrations and masks it before use; runtime services use Railway private/reference variables.
 
-Never print database URLs in Actions logs. The workflow masks the temporary migration URL before use.
+Destructive automatic down-migrations are not part of rollback.
 
-## 10. Private-network verification
+## 10. What the private smoke proves
 
-GitHub-hosted runners cannot directly resolve Railway private DNS. Therefore the workflow deploys a temporary `platform-smoke` service inside the project to verify actual private routing.
+GitHub-hosted runners cannot directly resolve Railway private DNS, so a deployment inside the pre-created `platform-smoke` service performs verification from the Railway private network.
 
 The smoke proves:
 
-1. `security.railway.internal:8001` is reachable;
-2. `di-api.railway.internal:8000` is reachable and database-ready;
-3. the real `audit-core` confidential client can obtain a SERVICE token;
-4. DI can retrieve Security JWKS through the private network;
-5. DI accepts a correctly scoped Security-issued token for tenant `dev-auth-test`.
+1. Security private liveness;
+2. DI private liveness and DB readiness;
+3. the real `audit-core` confidential client can obtain a Security SERVICE token for `dev-auth-test`;
+4. DI retrieves Security JWKS through the private network;
+5. DI accepts the Security-issued token on a tenant-scoped API request.
 
-The temporary smoke service is deleted after verification.
+This is a backend SERVICE-path verification. Interactive USER OAuth/Clerk migration is intentionally separate because legacy Security secret values are outside this project token's scope. Do not claim positive end-to-end USER delegation until Clerk/user state is provisioned into the consolidated Security service and tested.
 
 ## 11. Rollback
 
-During the stabilization period, do not delete the legacy standalone Security or DI Railway projects.
+During stabilization, keep the legacy standalone Security and DI Railway projects intact.
 
-If the consolidated deployment fails before Audit Core is rebound, no Audit Core rollback is required.
+Rollback must also be executed through GitHub Actions. Re-run a known-good platform workflow revision or a controlled rollback revision that restores previously recorded dependency endpoints and redeploys Audit Core. Do not patch Railway variables manually.
 
-If Audit Core has already been rebound and the consolidated Security/DI path subsequently fails, rollback must also be performed by GitHub Actions. Re-run a known-good platform workflow or use a dedicated rollback revision of the same workflow that restores the previously recorded Security/DI endpoints and redeploys Audit Core. Do not patch variables manually in the Railway UI.
+Database rollback is forward-compatible only; do not automatically execute destructive down-migrations.
 
-Database migrations must be treated as forward-compatible. Do not automatically run destructive down-migrations during rollback.
+## 12. Legacy deployment retirement
 
-## 12. Legacy workflow retirement
+Only after the consolidated run is green:
 
-After the first successful consolidated deployment:
+- retire Railway mutation workflows in `verigence/verigence-security` that deploy to the old Security project;
+- retire `.github/workflows/deploy-dev.yml` in `verigence/verigence-di` as a direct Railway deployer;
+- remove temporary inspection workflows;
+- retain CI/test workflows in each source repository;
+- point each repository's deployment documentation to this runbook.
 
-- Security Railway mutation workflows in `verigence/verigence-security` must be disabled or converted to informational/manual guard workflows;
-- DI `.github/workflows/deploy-dev.yml` must no longer deploy directly to its legacy Railway project;
-- the temporary DI Railway inspection workflow must be removed;
-- CI workflows remain in their source repositories and continue to validate code before central deployment.
+## 13. DEV limitations before production
 
-## 13. Promotion and production
-
-This runbook is DEV-only. Production must use a separate Railway project/environment token, explicit production databases/storage/Document AI configuration, a production secret-management policy, and approval gates. Do not promote DEV mock Document AI configuration or DEV-generated credentials into production.
+This setup is DEV only. Production requires a separate Railway project/environment, production tokens, production databases/storage, real Document AI configuration, Clerk/interactive auth provisioning, approval gates, and production secret management. DEV-generated credentials and mock Document AI settings must not be promoted.
 
 ## 14. Evidence to retain
 
-For every accepted deployment retain:
+For each accepted deployment retain:
 
-- central GitHub Actions run ID;
-- Audit Core, Security, and DI commit SHAs;
-- Railway project ID;
-- Railway service IDs;
-- migration completion output without secret values;
-- all PASS markers from section 7;
+- bootstrap run ID when resources are created/recreated;
+- platform deployment run ID;
+- Audit Core, Security and DI commit SHAs;
+- Railway project/environment IDs and service IDs;
+- migration completion evidence without secret values;
+- all acceptance markers;
 - any rollback or exception record.
