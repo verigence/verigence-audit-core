@@ -1,0 +1,59 @@
+name: Diagnose Audit Core runtime DB role
+
+on:
+  push:
+    branches:
+      - test/dummytenant-booking-e2e
+    paths:
+      - .github/workflows/dummytenant-audit-role-diagnostic.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      AUDIT_SERVICE: verigence-audit-core
+
+    steps:
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Inspect database role membership
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway run --service "$AUDIT_SERVICE" --no-local python - <<'PY'
+          import os
+          import psycopg
+
+          url=os.environ['DATABASE_URL']
+          with psycopg.connect(url) as conn, conn.cursor() as cur:
+              cur.execute('SELECT current_user, session_user')
+              print('AUDIT_DB_USER='+repr(cur.fetchone()))
+              cur.execute('''
+                  SELECT rolname, rolsuper, rolcreaterole, rolcreatedb, rolcanlogin
+                  FROM pg_roles
+                  WHERE rolname IN (current_user, 'audit_core_runtime')
+                  ORDER BY rolname
+              ''')
+              for row in cur.fetchall():
+                  print('AUDIT_DB_ROLE='+repr(row))
+              cur.execute("SELECT pg_has_role(current_user, 'audit_core_runtime', 'MEMBER')")
+              print('AUDIT_RUNTIME_ROLE_MEMBER='+str(cur.fetchone()[0]))
+              cur.execute("SELECT pg_has_role(current_user, 'audit_core_runtime', 'USAGE')")
+              print('AUDIT_RUNTIME_ROLE_USAGE='+str(cur.fetchone()[0]))
+              cur.execute('''
+                  SELECT parent.rolname, member.rolname, m.admin_option
+                  FROM pg_auth_members m
+                  JOIN pg_roles parent ON parent.oid=m.roleid
+                  JOIN pg_roles member ON member.oid=m.member
+                  WHERE parent.rolname='audit_core_runtime'
+              ''')
+              rows=cur.fetchall()
+              print('AUDIT_RUNTIME_ROLE_MEMBERS='+repr(rows))
+          PY
