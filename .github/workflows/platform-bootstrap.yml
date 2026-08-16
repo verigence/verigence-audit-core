@@ -1,12 +1,12 @@
 name: Bootstrap unified Railway platform DEV
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - agent/unified-railway-platform
     paths:
       - .github/workflows/platform-bootstrap.yml
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -20,34 +20,39 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
-      AUDIT_SERVICE: verigence-audit-core
+      PLATFORM_ENVIRONMENT_ID: 398c3cfb-d7c7-4aaf-b5a4-3b44d3087451
     steps:
-      - name: Install Railway CLI
-        run: npm install --global @railway/cli
-
-      - name: Resolve and link target environment
+      - name: Require workspace/account Railway token
         shell: bash
         run: |
           set -euo pipefail
-          railway variable list --service "$AUDIT_SERVICE" --json > /tmp/audit-vars.json
-          environment_id="$(python - <<'PY'
-          import json
-          from pathlib import Path
-          data=json.loads(Path('/tmp/audit-vars.json').read_text())
-          print(data.get('RAILWAY_ENVIRONMENT_ID',''))
-          PY
-          )"
-          if [[ -z "$environment_id" ]]; then
-            echo 'Unable to resolve Audit Core Railway environment ID' >&2
+          if [[ -z "${RAILWAY_API_TOKEN:-}" ]]; then
+            echo 'RAILWAY_API_TOKEN is required for one-time service/database creation.' >&2
+            echo 'Use a Railway workspace or account token; the project token remains the normal deployment token.' >&2
             exit 1
           fi
-          railway link --project "$PLATFORM_PROJECT_ID" --environment "$environment_id" --json > /tmp/link.json
-          echo "PLATFORM_ENVIRONMENT_ID=$environment_id" >> "$GITHUB_ENV"
-          echo 'Railway project/environment link established for CI'
 
-      - name: Create missing application services
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Link target project and environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment "$PLATFORM_ENVIRONMENT_ID" --json > /tmp/link.json
+          railway status --json > /tmp/status.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          data=json.loads(Path('/tmp/status.json').read_text())
+          if data.get('id') != os.environ['PLATFORM_PROJECT_ID']:
+              raise SystemExit('Railway bootstrap linked to the wrong project')
+          print('Railway project/environment link established for bootstrap')
+          PY
+
+      - name: Create missing application and smoke services
         shell: bash
         run: |
           set -euo pipefail
