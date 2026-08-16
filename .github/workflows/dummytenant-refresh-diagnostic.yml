@@ -1,0 +1,78 @@
+name: Diagnose DummyTenant Booking refresh
+
+on:
+  push:
+    branches:
+      - test/dummytenant-booking-e2e
+    paths:
+      - .github/workflows/dummytenant-refresh-diagnostic.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      AUDIT_SERVICE: verigence-audit-core
+      DI_API_SERVICE: di-api
+      DI_WORKER_SERVICE: di-worker
+
+    steps:
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Read Audit Core errors
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 700 >/tmp/audit.log || true
+          echo '--- AUDIT ERROR DIAGNOSTIC ---'
+          grep -E -B 12 -A 35 'VAC-SYS-001|bc776afe|7086b957|Traceback|ERROR|Exception' /tmp/audit.log | tail -n 260 || true
+          echo '--- END AUDIT ERROR DIAGNOSTIC ---'
+
+      - name: Read DI worker errors
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway logs --service "$DI_WORKER_SERVICE" --latest --deployment --lines 900 >/tmp/worker.log || true
+          echo '--- DI WORKER DIAGNOSTIC ---'
+          grep -E -B 10 -A 30 'DummyTenant|job_failed|processing_run_failed|provider|ERROR|error|Traceback' /tmp/worker.log | tail -n 320 || true
+          echo '--- END DI WORKER DIAGNOSTIC ---'
+
+      - name: Read latest DummyTenant DI database state
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway run --service "$DI_API_SERVICE" --no-local python - <<'PY'
+          import os
+          import psycopg
+
+          url=os.environ['DI_DATABASE_URL'].replace('postgresql+asyncpg://','postgresql://')
+          with psycopg.connect(url) as conn, conn.cursor() as cur:
+              cur.execute("SELECT set_config('app.tenant_id', %s, true)", ('DummyTenant',))
+              cur.execute('''
+                  SELECT document_id, upload_status, processing_status,
+                         confirmation_status, processing_failure_code,
+                         confidence_score, current_processing_run_id
+                  FROM docintel.documents
+                  WHERE tenant_id='DummyTenant'
+                  ORDER BY registered_at_utc DESC
+                  LIMIT 3
+              ''')
+              for row in cur.fetchall():
+                  print('DI_DOCUMENT_STATE='+repr(row))
+              cur.execute('''
+                  SELECT processing_job_id, document_id, job_type, job_status,
+                         attempt_count, last_error_code, left(coalesce(last_error_detail,''),300)
+                  FROM docintel.processing_jobs
+                  WHERE tenant_id='DummyTenant'
+                  ORDER BY created_at_utc DESC
+                  LIMIT 5
+              ''')
+              for row in cur.fetchall():
+                  print('DI_JOB_STATE='+repr(row))
+          PY
