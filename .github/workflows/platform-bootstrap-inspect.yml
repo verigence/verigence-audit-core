@@ -109,6 +109,44 @@ jobs:
               present=any(needle in text for needle in needles)
               print(f"DI_RUNTIME_MARKER={os.environ['SERVICE_NAME']}|{label}={'YES' if present else 'NO'}")
           PY
+
+            railway deployment list --service "$service" --limit 3 --json > "/tmp/${service}-deployments.json" || true
+            SERVICE_NAME="$service" DEPLOY_FILE="/tmp/${service}-deployments.json" python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p=Path(os.environ['DEPLOY_FILE'])
+          if not p.exists() or not p.read_text().strip():
+              print(f"DI_DEPLOYMENT_META={os.environ['SERVICE_NAME']}|NO_DEPLOYMENT_DATA")
+              raise SystemExit(0)
+          try:
+              data=json.loads(p.read_text())
+          except Exception:
+              print(f"DI_DEPLOYMENT_META={os.environ['SERVICE_NAME']}|UNPARSEABLE")
+              raise SystemExit(0)
+
+          safe_keys={
+              'startcommand','start_command','dockerfilepath','dockerfile_path',
+              'rootdirectory','root_directory','repo','repository','branch',
+              'status','builder','source','source_type','servicename','service_name'
+          }
+          rows=[]
+          def walk(obj, path='root'):
+              if isinstance(obj, dict):
+                  for k,v in obj.items():
+                      key=str(k).lower()
+                      pth=f'{path}.{k}'
+                      if key in safe_keys and isinstance(v,(str,int,float,bool)):
+                          rows.append((pth,str(v)))
+                      walk(v,pth)
+              elif isinstance(obj, list):
+                  for i,v in enumerate(obj[:3]):
+                      walk(v,f'{path}[{i}]')
+          walk(data)
+          if not rows:
+              print(f"DI_DEPLOYMENT_META={os.environ['SERVICE_NAME']}|NO_SAFE_FIELDS")
+          for path,value in rows[:40]:
+              print(f"DI_DEPLOYMENT_META={os.environ['SERVICE_NAME']}|{path}={value}")
+          PY
           done
 
           echo 'DI_RUNTIME_PLACEMENT_INSPECTION=PASS'
