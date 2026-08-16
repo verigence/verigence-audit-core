@@ -1,4 +1,4 @@
-name: Inspect consolidated Railway project
+name: Inspect Railway workspace and deployed topology
 
 on:
   push:
@@ -14,53 +14,64 @@ permissions:
 jobs:
   inspect:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
-      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
     steps:
+      - name: Require workspace/account Railway token
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${RAILWAY_API_TOKEN:-}" || { echo 'RAILWAY_API_TOKEN missing' >&2; exit 1; }
+
       - name: Install Railway CLI
         run: npm install --global @railway/cli
 
-      - name: Inspect project, services and CLI capabilities
+      - name: List workspace projects
         shell: bash
         run: |
           set -euo pipefail
-          railway status --json > /tmp/status.json
-          railway service list --json > /tmp/services.json
-          echo '--- PROJECT ---'
+          railway list --json > /tmp/projects.json
           python - <<'PY'
           import json
           from pathlib import Path
-          data = json.loads(Path('/tmp/status.json').read_text())
-          for key in ('id','name','environment','environmentId'):
-              if key in data:
-                  print(f'{key}={data[key]}')
+          rows=json.loads(Path('/tmp/projects.json').read_text())
+          for row in rows:
+              print(f"RAILWAY_PROJECT={row.get('name')}|{row.get('id')}")
           PY
-          echo '--- SERVICES ---'
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          data = json.loads(Path('/tmp/services.json').read_text())
-          for row in data:
-              print(f"{row.get('name')}|{row.get('id')}")
-          PY
-          echo '--- RAILWAY ADD HELP ---'
-          railway add --help
 
-      - name: List Audit Core variable names only
+      - name: Inspect production service topology for every project
         shell: bash
         run: |
           set -euo pipefail
-          railway variable list --service verigence-audit-core --json > /tmp/vars.json
-          python - <<'PY'
+          python - <<'PY' > /tmp/project-ids.txt
           import json
           from pathlib import Path
-          data=json.loads(Path('/tmp/vars.json').read_text())
-          if isinstance(data, dict):
-              keys=sorted(data.keys())
-          elif isinstance(data, list):
-              keys=sorted(str(row.get('name') or row.get('key')) for row in data if isinstance(row, dict))
-          else:
-              keys=[]
-          print('AUDIT_CORE_VARIABLE_NAMES=' + ','.join(keys))
+          rows=json.loads(Path('/tmp/projects.json').read_text())
+          for row in rows:
+              if row.get('id'):
+                  print(f"{row.get('id')}|{row.get('name','')}")
           PY
+
+          while IFS='|' read -r project_id project_name; do
+            rm -rf .railway
+            echo "--- PROJECT ${project_name}|${project_id} ---"
+            if railway link --project "$project_id" --environment production --json >/tmp/link.json 2>/tmp/link.err; then
+              railway service list --json >/tmp/services.json
+              PROJECT_NAME="$project_name" python - <<'PY'
+          import json, os
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/services.json').read_text())
+          if not rows:
+              print(f"RAILWAY_TOPOLOGY={os.environ['PROJECT_NAME']}|NO_SERVICES")
+          for row in rows:
+              print(f"RAILWAY_SERVICE={os.environ['PROJECT_NAME']}|{row.get('name')}|{row.get('id')}")
+          PY
+            else
+              echo "RAILWAY_PROJECT_INSPECT_SKIPPED=${project_name}|production-link-failed"
+              cat /tmp/link.err || true
+            fi
+          done < /tmp/project-ids.txt
+
+      - name: State inspection result
+        run: echo 'RAILWAY_WORKSPACE_TOPOLOGY_INSPECTION=PASS'
