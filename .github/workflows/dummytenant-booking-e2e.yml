@@ -1,0 +1,114 @@
+name: DummyTenant Booking Form E2E
+
+on:
+  push:
+    branches:
+      - test/dummytenant-booking-e2e
+    paths:
+      - .github/workflows/dummytenant-booking-e2e.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dummytenant-booking-e2e-dev
+  cancel-in-progress: false
+
+jobs:
+  inspect-di-prerequisites:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      DI_API_SERVICE: di-api
+      DI_WORKER_SERVICE: di-worker
+
+    steps:
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Verify unified Railway project
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway status --json >/tmp/status.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          status=json.loads(Path('/tmp/status.json').read_text())
+          if status.get('id') != os.environ['PLATFORM_PROJECT_ID']:
+              raise SystemExit('RAILWAY_TOKEN points to the wrong Railway project')
+          print('DUMMYTENANT_PLATFORM_PROJECT=PASS')
+          PY
+
+      - name: Inspect DI variables without exposing values
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway variable list --service "$DI_API_SERVICE" --json >/tmp/di-api-vars.json
+          railway variable list --service "$DI_WORKER_SERVICE" --json >/tmp/di-worker-vars.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          api=json.loads(Path('/tmp/di-api-vars.json').read_text())
+          worker=json.loads(Path('/tmp/di-worker-vars.json').read_text())
+
+          required_common = [
+              'DI_ENV',
+              'DI_SECRET_KEY',
+              'DI_DATABASE_URL',
+              'DI_STORAGE_PROVIDER',
+              'DI_STORAGE_ENDPOINT',
+              'DI_STORAGE_ACCESS_KEY_ID',
+              'DI_STORAGE_SECRET_ACCESS_KEY',
+              'DI_STORAGE_BUCKET',
+              'DI_SECURITY_JWKS_URL',
+          ]
+          optional_common = ['DI_STORAGE_REGION']
+
+          for service_name, data in [('di-api', api), ('di-worker', worker)]:
+              missing=[name for name in required_common if not data.get(name)]
+              if missing:
+                  raise SystemExit(f'{service_name} missing required runtime variables: '+','.join(missing))
+              print(f'DI_BASE_RUNTIME_VARIABLES=PASS|{service_name}')
+              for name in optional_common:
+                  print(f'DI_OPTIONAL_VARIABLE_PRESENT|{service_name}|{name}={"YES" if bool(data.get(name)) else "NO"}')
+
+          parity_keys = [
+              'DI_SECRET_KEY',
+              'DI_DATABASE_URL',
+              'DI_STORAGE_PROVIDER',
+              'DI_STORAGE_ENDPOINT',
+              'DI_STORAGE_ACCESS_KEY_ID',
+              'DI_STORAGE_SECRET_ACCESS_KEY',
+              'DI_STORAGE_BUCKET',
+              'DI_STORAGE_REGION',
+              'DI_SECURITY_JWKS_URL',
+              'DI_DOCAI_MOCK',
+              'DI_DOCAI_GEMINI_API_KEY',
+          ]
+          drift=[name for name in parity_keys if (api.get(name) or '') != (worker.get(name) or '')]
+          if drift:
+              raise SystemExit('DI API/worker configuration drift: '+','.join(drift))
+          print('DI_API_WORKER_VARIABLE_PARITY=PASS')
+
+          gemini_api=bool(api.get('DI_DOCAI_GEMINI_API_KEY'))
+          gemini_worker=bool(worker.get('DI_DOCAI_GEMINI_API_KEY'))
+          mock_api=str(api.get('DI_DOCAI_MOCK','')).strip().lower()
+          mock_worker=str(worker.get('DI_DOCAI_MOCK','')).strip().lower()
+
+          print(f'DI_GEMINI_KEY_PRESENT|di-api={"YES" if gemini_api else "NO"}')
+          print(f'DI_GEMINI_KEY_PRESENT|di-worker={"YES" if gemini_worker else "NO"}')
+          print(f'DI_DOCAI_MOCK_FLAG|di-api={mock_api or "UNSET"}')
+          print(f'DI_DOCAI_MOCK_FLAG|di-worker={mock_worker or "UNSET"}')
+
+          if not gemini_api or not gemini_worker:
+              raise SystemExit('Real DI extraction prerequisite missing: DI_DOCAI_GEMINI_API_KEY')
+          if mock_api not in {'false','0','no','off'} or mock_worker not in {'false','0','no','off'}:
+              raise SystemExit('Real DI extraction is not enabled: DI_DOCAI_MOCK must be false on API and worker')
+
+          print('DI_REAL_EXTRACTION_VARIABLES=PASS')
+          PY
