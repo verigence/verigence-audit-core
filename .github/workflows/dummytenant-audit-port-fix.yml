@@ -1,0 +1,64 @@
+name: Pin Audit Core DEV private port
+
+on:
+  push:
+    branches:
+      - test/dummytenant-booking-e2e
+    paths:
+      - .github/workflows/dummytenant-audit-port-fix.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pin-port:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      AUDIT_SERVICE: verigence-audit-core
+      AUDIT_PORT: "8000"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Pin Audit Core port and redeploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$AUDIT_PORT" | railway variable set PORT --service "$AUDIT_SERVICE" --stdin --skip-deploys >/dev/null
+          railway up . --path-as-root --service "$AUDIT_SERVICE" --detach --yes \
+            --message "Pin Audit Core private port ${GITHUB_SHA}" >/dev/null
+          echo 'AUDIT_DEV_PORT_CONFIGURED=PASS'
+
+      - name: Verify listener
+        shell: bash
+        run: |
+          set -euo pipefail
+          sleep 45
+          railway deployment list --service "$AUDIT_SERVICE" --limit 1 --json >/tmp/deployment.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/deployment.json').read_text())
+          if not rows or rows[0].get('status') != 'SUCCESS':
+              raise SystemExit(f"Audit Core deployment is not SUCCESS: {rows[0].get('status') if rows else 'NONE'}")
+          PY
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/vars.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/vars.json').read_text())
+          if data.get('PORT') != '8000':
+              raise SystemExit(f"Audit Core PORT is {data.get('PORT')!r}, expected '8000'")
+          PY
+          railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 160 >/tmp/audit.log || true
+          grep -q 'Uvicorn running on http://0.0.0.0:8000' /tmp/audit.log || {
+            tail -n 120 /tmp/audit.log >&2
+            exit 1
+          }
+          echo 'AUDIT_DEV_PORT_LISTENER=PASS'
