@@ -20,8 +20,10 @@ jobs:
       AUDIT_SERVICE: verigence-audit-core
 
     steps:
-      - name: Install Railway CLI
-        run: npm install --global @railway/cli
+      - name: Install diagnostic tools
+        run: |
+          npm install --global @railway/cli
+          python -m pip install -q 'psycopg[binary]'
 
       - name: Inspect database role membership
         shell: bash
