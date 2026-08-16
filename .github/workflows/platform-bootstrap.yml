@@ -1,0 +1,119 @@
+name: Bootstrap unified Railway platform DEV
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unified-railway-platform-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      PLATFORM_ENVIRONMENT_ID: 398c3cfb-d7c7-4aaf-b5a4-3b44d3087451
+    steps:
+      - name: Require workspace/account Railway token
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${RAILWAY_API_TOKEN:-}" ]]; then
+            echo 'RAILWAY_API_TOKEN is required for one-time service/database creation.' >&2
+            echo 'Use a Railway workspace or account token; the project token remains the normal deployment token.' >&2
+            exit 1
+          fi
+
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Link target project and environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment "$PLATFORM_ENVIRONMENT_ID" --json > /tmp/link.json
+          railway status --json > /tmp/status.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          data=json.loads(Path('/tmp/status.json').read_text())
+          if data.get('id') != os.environ['PLATFORM_PROJECT_ID']:
+              raise SystemExit('Railway bootstrap linked to the wrong project')
+          print('Railway project/environment link established for bootstrap')
+          PY
+
+      - name: Create proven platform services
+        shell: bash
+        run: |
+          set -euo pipefail
+          ensure_service() {
+            local name="$1"
+            railway service list --json > /tmp/services.json
+            if SERVICE_NAME="$name" python - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/services.json').read_text())
+          sys.exit(0 if any(row.get('name') == os.environ['SERVICE_NAME'] for row in rows) else 1)
+          PY
+            then
+              echo "Service exists: $name"
+            else
+              railway add --service "$name" --json > "/tmp/add-${name}.json"
+              echo "Created service: $name"
+            fi
+          }
+          ensure_service security
+          ensure_service di-api
+          ensure_service di-worker
+          ensure_service platform-smoke
+
+      - name: Create PostgreSQL if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway service list --json > /tmp/services.json
+          db_service="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/services.json').read_text())
+          names=[r.get('name','') for r in rows if 'postgres' in r.get('name','').lower()]
+          print(names[0] if names else '')
+          PY
+          )"
+          if [[ -z "$db_service" ]]; then
+            railway add --database postgres --json > /tmp/add-postgres.json
+            echo 'Created PostgreSQL service'
+          else
+            echo "PostgreSQL exists: $db_service"
+          fi
+
+      - name: Verify resource inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway service list --json > /tmp/final-services.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/final-services.json').read_text())
+          names={r.get('name') for r in rows}
+          required={'verigence-audit-core','security','di-api','di-worker','platform-smoke'}
+          missing=required-names
+          if missing:
+              raise SystemExit('Missing services: '+','.join(sorted(missing)))
+          db=[name for name in names if name and 'postgres' in name.lower()]
+          if not db:
+              raise SystemExit('PostgreSQL service is missing')
+          if 'di-scheduler' in names:
+              raise SystemExit('Unexpected di-scheduler service; scheduler belongs inside di-worker')
+          print('PLATFORM_BOOTSTRAP=PASS')
+          print('APPLICATION_SERVICES=' + ','.join(sorted(required)))
+          print('DATABASE_SERVICE=' + db[0])
+          print('DI_PROCESS_TOPOLOGY=API_PLUS_WORKER')
+          print('DI_SCHEDULER_SERVICE=NONE')
+          PY
