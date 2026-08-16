@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import secrets
@@ -277,11 +276,11 @@ def seed_audit_core() -> None:
                 tenant_id, dealer_id, outlet_id, customer_id, journey_id,
                 journey_reference, observed_status_code, observed_status_source,
                 created_by_actor_id
-            ) VALUES (%s, %s, %s, %s, %s, 'DUMMY-JOURNEY-001', 'BOOKING', 'EVIDENCE', %s)
+            ) VALUES (%s, %s, %s, %s, %s, 'DUMMY-JOURNEY-001', NULL, NULL, %s)
             ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
                 journey_reference=EXCLUDED.journey_reference,
-                observed_status_code=EXCLUDED.observed_status_code,
-                observed_status_source=EXCLUDED.observed_status_source
+                observed_status_code=NULL,
+                observed_status_source=NULL
             """,
             (TENANT_ID, DEALER_ID, OUTLET_ID, CUSTOMER_ID, JOURNEY_ID, USER_ID),
         )
@@ -585,9 +584,9 @@ def validate_and_print(fact_rows: list[dict]) -> None:
 
 def main() -> None:
     print(f"DummyTenant Booking Form E2E tenant={TENANT_ID} user={USER_ID} role={ROLE}", flush=True)
+    user_token = seed_security()
     seed_audit_core()
     seed_di_profile()
-    user_token = seed_security()
     facts = run_booking_upload(user_token)
     validate_and_print(facts)
     marker("DUMMYTENANT_BOOKING_E2E")
