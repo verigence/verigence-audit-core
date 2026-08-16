@@ -1,0 +1,224 @@
+name: Deploy DI worker and scheduler DEV
+
+on:
+  workflow_dispatch:
+    inputs:
+      di_ref:
+        description: DI Git ref
+        required: true
+        default: main
+  workflow_run:
+    workflows:
+      - Deploy unified Railway platform DEV
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unified-railway-di-processes-dev
+  cancel-in-progress: false
+
+jobs:
+  deploy-di-processes:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      DI_API_SERVICE: di-api
+      DI_WORKER_SERVICE: di-worker
+      DI_SCHEDULER_SERVICE: di-scheduler
+
+    steps:
+      - name: Checkout DI
+        uses: actions/checkout@v6
+        with:
+          repository: verigence/verigence-di
+          ref: ${{ inputs.di_ref || 'main' }}
+          path: _src/di
+
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Verify target project and DI services
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway status --json > /tmp/status.json
+          railway service list --json > /tmp/services.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          project=json.loads(Path('/tmp/status.json').read_text())
+          if project.get('id') != os.environ['PLATFORM_PROJECT_ID']:
+              raise SystemExit('Wrong Railway project for DI process deployment')
+          services=json.loads(Path('/tmp/services.json').read_text())
+          names={row.get('name') for row in services}
+          required={os.environ['DI_API_SERVICE'], os.environ['DI_WORKER_SERVICE'], os.environ['DI_SCHEDULER_SERVICE']}
+          missing=required-names
+          if missing:
+              raise SystemExit('Bootstrap required; missing services: '+','.join(sorted(missing)))
+          print('DI_PROCESS_SERVICES_PRESENT=PASS')
+          PY
+
+      - name: Clone DI runtime variables from API to worker and scheduler
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway variable list --service "$DI_API_SERVICE" --json > /tmp/di-api-vars.json
+          python - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+
+          data=json.loads(Path('/tmp/di-api-vars.json').read_text())
+          if not isinstance(data, dict):
+              raise SystemExit('Unable to read DI API variables')
+
+          required={'DI_ENV','DI_SECRET_KEY','DI_DATABASE_URL'}
+          missing=[key for key in required if not data.get(key)]
+          if missing:
+              raise SystemExit('DI API is missing required runtime variables: '+','.join(sorted(missing)))
+
+          names=[key for key in data if key.startswith('DI_')]
+          for service in (os.environ['DI_WORKER_SERVICE'], os.environ['DI_SCHEDULER_SERVICE']):
+              for name in names:
+                  value=str(data[name])
+                  subprocess.run(
+                      ['railway','variable','set',name,'--service',service,'--stdin','--skip-deploys'],
+                      input=value,
+                      text=True,
+                      stdout=subprocess.DEVNULL,
+                      check=True,
+                  )
+              subprocess.run(
+                  ['railway','variable','set','DI_WORKER_ENABLED','--service',service,'--stdin','--skip-deploys'],
+                  input='false',
+                  text=True,
+                  stdout=subprocess.DEVNULL,
+                  check=True,
+              )
+          print('DI_PROCESS_VARIABLE_SYNC=PASS')
+          PY
+
+      - name: Build standalone worker and scheduler process definitions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > _src/di/backend/railway_worker.py <<'PY'
+          import asyncio
+          import signal
+
+          from verigence.di.workers.processor import get_worker
+
+          async def main() -> None:
+              stopped = asyncio.Event()
+              loop = asyncio.get_running_loop()
+              for sig in (signal.SIGTERM, signal.SIGINT):
+                  try:
+                      loop.add_signal_handler(sig, stopped.set)
+                  except NotImplementedError:
+                      pass
+              worker = get_worker()
+              worker.start()
+              print('DI_WORKER_STARTED=PASS', flush=True)
+              await stopped.wait()
+              await worker.stop()
+
+          if __name__ == '__main__':
+              asyncio.run(main())
+          PY
+
+          cat > _src/di/backend/railway_scheduler.py <<'PY'
+          import asyncio
+          import signal
+
+          from verigence.di.scheduler.beat import get_eod_scheduler
+
+          async def main() -> None:
+              stopped = asyncio.Event()
+              loop = asyncio.get_running_loop()
+              for sig in (signal.SIGTERM, signal.SIGINT):
+                  try:
+                      loop.add_signal_handler(sig, stopped.set)
+                  except NotImplementedError:
+                      pass
+              scheduler = get_eod_scheduler()
+              scheduler.start()
+              print('DI_SCHEDULER_STARTED=PASS', flush=True)
+              await stopped.wait()
+              scheduler.stop()
+
+          if __name__ == '__main__':
+              asyncio.run(main())
+          PY
+
+          cat > _src/di/backend/Dockerfile.worker <<'EOF'
+          FROM python:3.12-slim
+          WORKDIR /app
+          RUN apt-get update && apt-get install -y --no-install-recommends libmagic1 libgl1 libglib2.0-0 curl && rm -rf /var/lib/apt/lists/*
+          RUN pip install --no-cache-dir uv
+          COPY pyproject.toml .
+          RUN uv pip install --system .
+          COPY src/ ./src/
+          COPY railway_worker.py ./railway_worker.py
+          CMD ["python", "railway_worker.py"]
+          EOF
+
+          cat > _src/di/backend/Dockerfile.scheduler <<'EOF'
+          FROM python:3.12-slim
+          WORKDIR /app
+          RUN apt-get update && apt-get install -y --no-install-recommends libmagic1 libgl1 libglib2.0-0 curl && rm -rf /var/lib/apt/lists/*
+          RUN pip install --no-cache-dir uv
+          COPY pyproject.toml .
+          RUN uv pip install --system .
+          COPY src/ ./src/
+          COPY railway_scheduler.py ./railway_scheduler.py
+          CMD ["python", "railway_scheduler.py"]
+          EOF
+
+      - name: Configure service-specific Dockerfiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' 'Dockerfile.worker' | railway variable set RAILWAY_DOCKERFILE_PATH --service "$DI_WORKER_SERVICE" --stdin --skip-deploys >/dev/null
+          printf '%s' 'Dockerfile.scheduler' | railway variable set RAILWAY_DOCKERFILE_PATH --service "$DI_SCHEDULER_SERVICE" --stdin --skip-deploys >/dev/null
+
+      - name: Deploy DI worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway up _src/di/backend --path-as-root --service "$DI_WORKER_SERVICE" --ci --message "Unified DEV DI worker ${GITHUB_SHA}"
+
+      - name: Deploy DI scheduler
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway up _src/di/backend --path-as-root --service "$DI_SCHEDULER_SERVICE" --ci --message "Unified DEV DI scheduler ${GITHUB_SHA}"
+
+      - name: Verify worker and scheduler startup
+        shell: bash
+        run: |
+          set -euo pipefail
+          for pair in "$DI_WORKER_SERVICE:DI_WORKER_STARTED=PASS" "$DI_SCHEDULER_SERVICE:DI_SCHEDULER_STARTED=PASS"; do
+            service="${pair%%:*}"
+            marker="${pair#*:}"
+            found=0
+            for attempt in $(seq 1 30); do
+              railway logs --service "$service" --latest --lines 200 > "/tmp/${service}.log" || true
+              if grep -q "$marker" "/tmp/${service}.log"; then
+                found=1
+                break
+              fi
+              sleep 2
+            done
+            if [[ "$found" != "1" ]]; then
+              echo "Missing startup marker $marker for $service" >&2
+              cat "/tmp/${service}.log" >&2 || true
+              exit 1
+            fi
+            echo "$marker"
+          done
+          echo 'DI_PROCESS_SEPARATION=PASS'
