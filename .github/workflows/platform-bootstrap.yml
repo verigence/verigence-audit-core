@@ -1,0 +1,114 @@
+name: Bootstrap unified Railway platform DEV
+
+on:
+  push:
+    branches:
+      - agent/unified-railway-platform
+    paths:
+      - .github/workflows/platform-bootstrap.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unified-railway-platform-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Resolve and link target environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway variable list --service "$AUDIT_SERVICE" --json > /tmp/audit-vars.json
+          environment_id="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/audit-vars.json').read_text())
+          print(data.get('RAILWAY_ENVIRONMENT_ID',''))
+          PY
+          )"
+          if [[ -z "$environment_id" ]]; then
+            echo 'Unable to resolve Audit Core Railway environment ID' >&2
+            exit 1
+          fi
+          railway link --project "$PLATFORM_PROJECT_ID" --environment "$environment_id" --json > /tmp/link.json
+          echo "PLATFORM_ENVIRONMENT_ID=$environment_id" >> "$GITHUB_ENV"
+          echo 'Railway project/environment link established for CI'
+
+      - name: Create missing application services
+        shell: bash
+        run: |
+          set -euo pipefail
+          ensure_service() {
+            local name="$1"
+            railway service list --json > /tmp/services.json
+            if SERVICE_NAME="$name" python - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/services.json').read_text())
+          sys.exit(0 if any(row.get('name') == os.environ['SERVICE_NAME'] for row in rows) else 1)
+          PY
+            then
+              echo "Service exists: $name"
+            else
+              railway add --service "$name" --json > "/tmp/add-${name}.json"
+              echo "Created service: $name"
+            fi
+          }
+          ensure_service security
+          ensure_service di-api
+          ensure_service platform-smoke
+
+      - name: Create PostgreSQL if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway service list --json > /tmp/services.json
+          db_service="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/services.json').read_text())
+          names=[r.get('name','') for r in rows if 'postgres' in r.get('name','').lower()]
+          print(names[0] if names else '')
+          PY
+          )"
+          if [[ -z "$db_service" ]]; then
+            railway add --database postgres --json > /tmp/add-postgres.json
+            echo 'Created PostgreSQL service'
+          else
+            echo "PostgreSQL exists: $db_service"
+          fi
+
+      - name: Verify resource inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway service list --json > /tmp/final-services.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/final-services.json').read_text())
+          names={r.get('name') for r in rows}
+          required={'verigence-audit-core','security','di-api','platform-smoke'}
+          missing=required-names
+          if missing:
+              raise SystemExit('Missing services: '+','.join(sorted(missing)))
+          db=[name for name in names if name and 'postgres' in name.lower()]
+          if not db:
+              raise SystemExit('PostgreSQL service is missing')
+          print('PLATFORM_BOOTSTRAP=PASS')
+          print('APPLICATION_SERVICES=' + ','.join(sorted(required)))
+          print('DATABASE_SERVICE=' + db[0])
+          PY
