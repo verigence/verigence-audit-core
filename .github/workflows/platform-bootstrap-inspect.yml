@@ -17,6 +17,7 @@ jobs:
     timeout-minutes: 15
     env:
       RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      DI_PROJECT_ID: 62c22163-78d0-4a86-a2f7-dbf39e64aa4d
     steps:
       - name: Require workspace/account Railway token
         shell: bash
@@ -72,6 +73,45 @@ jobs:
               cat /tmp/link.err || true
             fi
           done < /tmp/project-ids.txt
+
+      - name: Identify DI worker and scheduler placement
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .railway
+          railway link --project "$DI_PROJECT_ID" --environment production --json >/tmp/di-link.json
+
+          for service in di-api verigence-di; do
+            railway variable list --service "$service" --json > "/tmp/${service}-vars.json"
+            SERVICE_NAME="$service" VAR_FILE="/tmp/${service}-vars.json" python - <<'PY'
+          import json, os
+          from pathlib import Path
+          data=json.loads(Path(os.environ['VAR_FILE']).read_text())
+          if not isinstance(data, dict):
+              data={}
+          print(f"DI_SERVICE_CONFIG={os.environ['SERVICE_NAME']}|DI_WORKER_ENABLED={data.get('DI_WORKER_ENABLED','<unset>')}")
+          for key in ('RAILWAY_DOCKERFILE_PATH','PORT'):
+              if key in data:
+                  print(f"DI_SERVICE_CONFIG={os.environ['SERVICE_NAME']}|{key}={data[key]}")
+          PY
+
+            railway logs --service "$service" --latest --lines 500 > "/tmp/${service}.log" || true
+            SERVICE_NAME="$service" LOG_FILE="/tmp/${service}.log" python - <<'PY'
+          import os
+          from pathlib import Path
+          text=Path(os.environ['LOG_FILE']).read_text(errors='replace') if Path(os.environ['LOG_FILE']).exists() else ''
+          markers={
+              'WORKER_STARTED': ('processing_worker_started','processing_worker_loop_started','job_claimed'),
+              'SCHEDULER_STARTED': ('eod_retry_scheduler_started','eod_window_matched','eod_retry_jobs_inserted'),
+              'API_STARTED': ('Uvicorn running','Application startup complete','Started server process'),
+          }
+          for label, needles in markers.items():
+              present=any(needle in text for needle in needles)
+              print(f"DI_RUNTIME_MARKER={os.environ['SERVICE_NAME']}|{label}={'YES' if present else 'NO'}")
+          PY
+          done
+
+          echo 'DI_RUNTIME_PLACEMENT_INSPECTION=PASS'
 
       - name: State inspection result
         run: echo 'RAILWAY_WORKSPACE_TOPOLOGY_INSPECTION=PASS'
