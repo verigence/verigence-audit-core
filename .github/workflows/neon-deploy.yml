@@ -1,0 +1,97 @@
+name: Deploy Audit Core schema to Neon DEV
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/neon-deploy.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-neon-dev-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy-neon:
+    name: Apply Audit Core migrations to Neon DEV
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      DEV_DATABASE_URL: ${{ secrets.DEV_DATABASE_URL }}
+      MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Audit Core
+        run: python -m pip install -e .
+
+      - name: Resolve Neon migration connection
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw="${MIGRATION_DATABASE_URL:-${DEV_DATABASE_URL:-}}"
+          if [ -z "$raw" ]; then
+            echo "::error::Neither MIGRATION_DATABASE_URL nor DEV_DATABASE_URL is configured for this repository."
+            exit 1
+          fi
+
+          case "$raw" in
+          postgresql+psycopg://*)
+            sqlalchemy_url="$raw"
+            ;;
+          postgresql+asyncpg://*)
+            sqlalchemy_url="postgresql+psycopg://${raw#postgresql+asyncpg://}"
+            ;;
+          postgresql://*)
+            sqlalchemy_url="postgresql+psycopg://${raw#postgresql://}"
+            ;;
+          postgres://*)
+            sqlalchemy_url="postgresql+psycopg://${raw#postgres://}"
+            ;;
+          *)
+            echo "::error::Configured Neon database secret is not a PostgreSQL URL."
+            exit 1
+            ;;
+          esac
+
+          echo "::add-mask::$sqlalchemy_url"
+          echo "DATABASE_URL=$sqlalchemy_url" >> "$GITHUB_ENV"
+
+      - name: Apply Audit Core migrations
+        run: alembic upgrade head
+
+      - name: Verify Audit Core schema
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+
+          engine = create_engine(os.environ["DATABASE_URL"])
+          with engine.connect() as connection:
+              schema = connection.execute(text("select to_regnamespace('auditcore')::text")).scalar_one()
+              if schema != "auditcore":
+                  raise SystemExit("auditcore schema not found after migration")
+              version = connection.execute(text("select version_num from alembic_version")).scalar_one()
+              if version != "0002_runtime_role_rls":
+                  raise SystemExit(f"unexpected Audit Core migration version: {version}")
+              tables = connection.execute(text("select count(*) from pg_tables where schemaname='auditcore'" )).scalar_one()
+              if tables <= 0:
+                  raise SystemExit("auditcore schema contains no tables")
+              role = connection.execute(text("select rolname from pg_roles where rolname='audit_core_runtime'" )).scalar_one_or_none()
+              if role != "audit_core_runtime":
+                  raise SystemExit("audit_core_runtime role not found")
+          engine.dispose()
+          print("Audit Core Neon schema verification passed")
+          PY
