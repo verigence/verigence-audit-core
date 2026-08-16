@@ -16,99 +16,351 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  inspect-di-prerequisites:
+  booking-e2e:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 45
     env:
       RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      SECURITY_SERVICE: security
       DI_API_SERVICE: di-api
       DI_WORKER_SERVICE: di-worker
+      SMOKE_SERVICE: platform-smoke
+      SECURITY_PORT: "8001"
+      DI_PORT: "8000"
+      DUMMY_TENANT_ID: DummyTenant
+      TEST_CLIENT_ID: dummytenant-e2e
+      TEST_REDIRECT_URI: https://example.invalid/dummytenant/callback
+      DI_TEST_REF: test/dummytenant-booking-e2e
 
     steps:
+      - name: Checkout Audit Core test branch
+        uses: actions/checkout@v6
+        with:
+          path: _src/audit-core
+
+      - name: Checkout Security main
+        uses: actions/checkout@v6
+        with:
+          repository: verigence/verigence-security
+          ref: main
+          path: _src/security
+
+      - name: Checkout DI Booking Form test revision
+        uses: actions/checkout@v6
+        with:
+          repository: verigence/verigence-di
+          ref: ${{ env.DI_TEST_REF }}
+          path: _src/di
+
+      - name: Validate Audit Core DI compatibility change
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -q -e './_src/audit-core[test]'
+          python -m pytest -q \
+            _src/audit-core/tests/test_di_client.py \
+            _src/audit-core/tests/test_di_client_envelope.py
+          echo 'DUMMYTENANT_AUDIT_DI_CLIENT_TESTS=PASS'
+
       - name: Install Railway CLI
         run: npm install --global @railway/cli
 
-      - name: Verify unified Railway project
+      - name: Verify platform and capture non-public runtime inputs
         shell: bash
         run: |
           set -euo pipefail
           railway status --json >/tmp/status.json
+          railway service list --json >/tmp/services.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          railway variable list --service "$DI_API_SERVICE" --json >/tmp/di-api-vars.json
+          railway variable list --service "$DI_WORKER_SERVICE" --json >/tmp/di-worker-vars.json
+
           python - <<'PY'
           import json, os
           from pathlib import Path
           status=json.loads(Path('/tmp/status.json').read_text())
+          services=json.loads(Path('/tmp/services.json').read_text())
           if status.get('id') != os.environ['PLATFORM_PROJECT_ID']:
               raise SystemExit('RAILWAY_TOKEN points to the wrong Railway project')
-          print('DUMMYTENANT_PLATFORM_PROJECT=PASS')
-          PY
-
-      - name: Inspect DI variables without exposing values
-        shell: bash
-        run: |
-          set -euo pipefail
-          railway variable list --service "$DI_API_SERVICE" --json >/tmp/di-api-vars.json
-          railway variable list --service "$DI_WORKER_SERVICE" --json >/tmp/di-worker-vars.json
-          python - <<'PY'
-          import json
-          from pathlib import Path
+          names={row.get('name') for row in services}
+          required={
+              os.environ['AUDIT_SERVICE'], os.environ['SECURITY_SERVICE'],
+              os.environ['DI_API_SERVICE'], os.environ['DI_WORKER_SERVICE'],
+              os.environ['SMOKE_SERVICE'], 'Postgres'
+          }
+          missing=required-names
+          if missing:
+              raise SystemExit('Unified DEV bootstrap is incomplete: '+','.join(sorted(missing)))
+          if 'di-scheduler' in names:
+              raise SystemExit('Unexpected di-scheduler service')
 
           api=json.loads(Path('/tmp/di-api-vars.json').read_text())
           worker=json.loads(Path('/tmp/di-worker-vars.json').read_text())
-
-          required_common = [
-              'DI_ENV',
-              'DI_SECRET_KEY',
-              'DI_DATABASE_URL',
-              'DI_STORAGE_PROVIDER',
-              'DI_STORAGE_ENDPOINT',
-              'DI_STORAGE_ACCESS_KEY_ID',
-              'DI_STORAGE_SECRET_ACCESS_KEY',
-              'DI_STORAGE_BUCKET',
-              'DI_SECURITY_JWKS_URL',
+          required_di=[
+              'DI_SECRET_KEY','DI_DATABASE_URL','DI_STORAGE_PROVIDER','DI_STORAGE_ENDPOINT',
+              'DI_STORAGE_ACCESS_KEY_ID','DI_STORAGE_SECRET_ACCESS_KEY','DI_STORAGE_BUCKET',
+              'DI_SECURITY_JWKS_URL','DI_DOCAI_GEMINI_API_KEY'
           ]
-          optional_common = ['DI_STORAGE_REGION']
-
-          for service_name, data in [('di-api', api), ('di-worker', worker)]:
-              missing=[name for name in required_common if not data.get(name)]
+          for service_name, data in [('di-api',api),('di-worker',worker)]:
+              missing=[key for key in required_di if not data.get(key)]
               if missing:
-                  raise SystemExit(f'{service_name} missing required runtime variables: '+','.join(missing))
-              print(f'DI_BASE_RUNTIME_VARIABLES=PASS|{service_name}')
-              for name in optional_common:
-                  print(f'DI_OPTIONAL_VARIABLE_PRESENT|{service_name}|{name}={"YES" if bool(data.get(name)) else "NO"}')
-
-          parity_keys = [
-              'DI_SECRET_KEY',
-              'DI_DATABASE_URL',
-              'DI_STORAGE_PROVIDER',
-              'DI_STORAGE_ENDPOINT',
-              'DI_STORAGE_ACCESS_KEY_ID',
-              'DI_STORAGE_SECRET_ACCESS_KEY',
-              'DI_STORAGE_BUCKET',
-              'DI_STORAGE_REGION',
-              'DI_SECURITY_JWKS_URL',
-              'DI_DOCAI_MOCK',
-              'DI_DOCAI_GEMINI_API_KEY',
+                  raise SystemExit(service_name+' missing DI variables: '+','.join(missing))
+              if str(data.get('DI_DOCAI_MOCK','')).strip().lower() not in {'false','0','no','off'}:
+                  raise SystemExit(service_name+' is not configured for real Gemini extraction')
+          parity=[
+              'DI_SECRET_KEY','DI_DATABASE_URL','DI_STORAGE_PROVIDER','DI_STORAGE_ENDPOINT',
+              'DI_STORAGE_ACCESS_KEY_ID','DI_STORAGE_SECRET_ACCESS_KEY','DI_STORAGE_BUCKET',
+              'DI_STORAGE_REGION','DI_SECURITY_JWKS_URL','DI_DOCAI_MOCK','DI_DOCAI_GEMINI_API_KEY'
           ]
-          drift=[name for name in parity_keys if (api.get(name) or '') != (worker.get(name) or '')]
+          drift=[key for key in parity if (api.get(key) or '') != (worker.get(key) or '')]
           if drift:
               raise SystemExit('DI API/worker configuration drift: '+','.join(drift))
-          print('DI_API_WORKER_VARIABLE_PARITY=PASS')
-
-          gemini_api=bool(api.get('DI_DOCAI_GEMINI_API_KEY'))
-          gemini_worker=bool(worker.get('DI_DOCAI_GEMINI_API_KEY'))
-          mock_api=str(api.get('DI_DOCAI_MOCK','')).strip().lower()
-          mock_worker=str(worker.get('DI_DOCAI_MOCK','')).strip().lower()
-
-          print(f'DI_GEMINI_KEY_PRESENT|di-api={"YES" if gemini_api else "NO"}')
-          print(f'DI_GEMINI_KEY_PRESENT|di-worker={"YES" if gemini_worker else "NO"}')
-          print(f'DI_DOCAI_MOCK_FLAG|di-api={mock_api or "UNSET"}')
-          print(f'DI_DOCAI_MOCK_FLAG|di-worker={mock_worker or "UNSET"}')
-
-          if not gemini_api or not gemini_worker:
-              raise SystemExit('Real DI extraction prerequisite missing: DI_DOCAI_GEMINI_API_KEY')
-          if mock_api not in {'false','0','no','off'} or mock_worker not in {'false','0','no','off'}:
-              raise SystemExit('Real DI extraction is not enabled: DI_DOCAI_MOCK must be false on API and worker')
-
+          print('DUMMYTENANT_PLATFORM_PROJECT=PASS')
           print('DI_REAL_EXTRACTION_VARIABLES=PASS')
+          print('DI_API_WORKER_VARIABLE_PARITY=PASS')
           PY
+
+          audit_secret="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/audit-vars.json').read_text())
+          print(data.get('SECURITY_CLIENT_SECRET',''))
+          PY
+          )"
+          test -n "$audit_secret" || { echo 'Audit Core SECURITY_CLIENT_SECRET missing' >&2; exit 1; }
+          echo "::add-mask::$audit_secret"
+          echo "AUDIT_CLIENT_SECRET=$audit_secret" >> "$GITHUB_ENV"
+          audit_hash="$(AUDIT_SECRET="$audit_secret" python -c 'import hashlib,os; print(hashlib.sha256(os.environ["AUDIT_SECRET"].encode()).hexdigest())')"
+          echo "AUDIT_CLIENT_SECRET_SHA256=$audit_hash" >> "$GITHUB_ENV"
+
+          audit_port="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/audit-vars.json').read_text())
+          print(data.get('PORT') or '8000')
+          PY
+          )"
+          echo "AUDIT_PORT=$audit_port" >> "$GITHUB_ENV"
+          echo "Audit Core internal port resolved: $audit_port"
+
+          test_secret="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
+          echo "::add-mask::$test_secret"
+          echo "TEST_CLIENT_SECRET=$test_secret" >> "$GITHUB_ENV"
+          test_hash="$(TEST_SECRET="$test_secret" python -c 'import hashlib,os; print(hashlib.sha256(os.environ["TEST_SECRET"].encode()).hexdigest())')"
+          echo "TEST_CLIENT_SECRET_SHA256=$test_hash" >> "$GITHUB_ENV"
+
+      - name: Configure least-privilege Security clients for the E2E
+        shell: bash
+        run: |
+          set -euo pipefail
+          clients_json="$(python - <<'PY'
+          import json, os
+          print(json.dumps({
+              'audit-core': {
+                  'secret_sha256': os.environ['AUDIT_CLIENT_SECRET_SHA256'],
+                  'permissions': [
+                      'di.subject.create',
+                      'di.document.upload',
+                      'di.document.read',
+                      'di.document.fields.read',
+                  ],
+                  'redirect_uris': [],
+                  'public': False,
+              },
+              os.environ['TEST_CLIENT_ID']: {
+                  'secret_sha256': os.environ['TEST_CLIENT_SECRET_SHA256'],
+                  'permissions': [],
+                  'redirect_uris': [os.environ['TEST_REDIRECT_URI']],
+                  'public': False,
+              },
+          }, separators=(',', ':')))
+          PY
+          )"
+          printf '%s' "$clients_json" | railway variable set SECURITY_INTEGRATION_CLIENTS_JSON \
+            --service "$SECURITY_SERVICE" --stdin --skip-deploys >/dev/null
+          echo 'DUMMYTENANT_SECURITY_CLIENT_CONFIG=PASS'
+
+      - name: Redeploy Security with E2E client configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > _src/security/railway.toml <<'TOML'
+          [build]
+          builder = "RAILPACK"
+
+          [deploy]
+          startCommand = "PYTHONPATH=src uvicorn verigence_security.app:create_app --factory --host 0.0.0.0 --port $PORT"
+          restartPolicyType = "ON_FAILURE"
+          restartPolicyMaxRetries = 3
+          TOML
+          railway up _src/security --path-as-root --service "$SECURITY_SERVICE" \
+            --detach --yes --message "DummyTenant Security E2E ${GITHUB_SHA}" >/dev/null
+
+      - name: Deploy DI Booking Form revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/di-api-railway.toml <<'TOML'
+          [build]
+          builder = "DOCKERFILE"
+          dockerfilePath = "Dockerfile"
+
+          [deploy]
+          preDeployCommand = ["alembic upgrade head"]
+          startCommand = "sh -c 'uvicorn verigence.di.main:create_app --factory --host 0.0.0.0 --port ${PORT:-8000}'"
+          restartPolicyType = "ON_FAILURE"
+          restartPolicyMaxRetries = 3
+          TOML
+          cat > /tmp/di-worker-railway.toml <<'TOML'
+          [build]
+          builder = "DOCKERFILE"
+          dockerfilePath = "Dockerfile.worker"
+
+          [deploy]
+          startCommand = "python -m verigence.di.workers"
+          restartPolicyType = "ON_FAILURE"
+          restartPolicyMaxRetries = 5
+          TOML
+
+          cp /tmp/di-api-railway.toml _src/di/backend/railway.toml
+          railway up _src/di/backend --path-as-root --service "$DI_API_SERVICE" \
+            --detach --yes --message "DummyTenant DI API ${GITHUB_SHA}" >/dev/null
+          cp /tmp/di-worker-railway.toml _src/di/backend/railway.toml
+          railway up _src/di/backend --path-as-root --service "$DI_WORKER_SERVICE" \
+            --detach --yes --message "DummyTenant DI worker ${GITHUB_SHA}" >/dev/null
+
+      - name: Deploy Audit Core compatibility revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway up _src/audit-core --path-as-root --service "$AUDIT_SERVICE" \
+            --detach --yes --message "DummyTenant Audit Core ${GITHUB_SHA}" >/dev/null
+
+      - name: Wait for persistent services
+        shell: bash
+        run: |
+          set -euo pipefail
+          sleep 55
+          latest_status() {
+            local service="$1"
+            railway deployment list --service "$service" --limit 1 --json > "/tmp/${service}-deployment.json"
+            SERVICE_FILE="/tmp/${service}-deployment.json" python - <<'PY'
+          import json, os
+          from pathlib import Path
+          rows=json.loads(Path(os.environ['SERVICE_FILE']).read_text())
+          print(rows[0].get('status','') if rows else '')
+          PY
+          }
+
+          for service in "$SECURITY_SERVICE" "$DI_API_SERVICE" "$DI_WORKER_SERVICE" "$AUDIT_SERVICE"; do
+            status="$(latest_status "$service")"
+            if [[ "$status" != "SUCCESS" ]]; then
+              sleep 35
+              status="$(latest_status "$service")"
+            fi
+            if [[ "$status" != "SUCCESS" ]]; then
+              echo "$service latest deployment is $status" >&2
+              railway logs --service "$service" --latest --deployment --lines 240 || true
+              exit 1
+            fi
+            echo "DUMMYTENANT_SERVICE_READY=PASS|$service"
+          done
+
+      - name: Build private DummyTenant smoke image
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf smoke
+          mkdir -p smoke
+          cp _src/audit-core/tests/e2e/dummytenant_booking_e2e.py smoke/e2e.py
+          cp -R _src/security smoke/security
+          cat > smoke/Dockerfile <<'DOCKER'
+          FROM python:3.12-slim
+          WORKDIR /app
+          COPY security /opt/verigence-security
+          RUN pip install --no-cache-dir /opt/verigence-security reportlab==4.4.3
+          COPY e2e.py /app/e2e.py
+          CMD ["python", "/app/e2e.py"]
+          DOCKER
+          cat > smoke/railway.toml <<'TOML'
+          [build]
+          builder = "DOCKERFILE"
+          dockerfilePath = "Dockerfile"
+
+          [deploy]
+          startCommand = "python /app/e2e.py"
+          restartPolicyType = "ON_FAILURE"
+          restartPolicyMaxRetries = 1
+          TOML
+
+      - name: Configure private smoke runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          set_var() {
+            local name="$1" value="$2"
+            printf '%s' "$value" | railway variable set "$name" --service "$SMOKE_SERVICE" \
+              --stdin --skip-deploys >/dev/null
+          }
+
+          audit_db_ref="$(python -c 'print(chr(36)+chr(123)+chr(123)+"verigence-audit-core.DATABASE_URL"+chr(125)+chr(125))')"
+          security_db_ref="$(python -c 'print(chr(36)+chr(123)+chr(123)+"security.SECURITY_ROLE_DATABASE_URL"+chr(125)+chr(125))')"
+          di_db_ref="$(python -c 'print(chr(36)+chr(123)+chr(123)+"di-api.DI_DATABASE_URL"+chr(125)+chr(125))')"
+
+          set_var DUMMY_TENANT_ID "$DUMMY_TENANT_ID"
+          set_var TEST_CLIENT_ID "$TEST_CLIENT_ID"
+          set_var TEST_CLIENT_SECRET "$TEST_CLIENT_SECRET"
+          set_var TEST_REDIRECT_URI "$TEST_REDIRECT_URI"
+          set_var SECURITY_BASE_URL "http://security.railway.internal:${SECURITY_PORT}"
+          set_var AUDIT_BASE_URL "http://verigence-audit-core.railway.internal:${AUDIT_PORT}"
+          set_var SECURITY_DATABASE_URL "$security_db_ref"
+          set_var AUDIT_DATABASE_URL "$audit_db_ref"
+          set_var DI_DATABASE_URL "$di_db_ref"
+          echo 'DUMMYTENANT_SMOKE_CONFIG=PASS'
+
+      - name: Run private PC Booking Form E2E
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway up smoke --path-as-root --service "$SMOKE_SERVICE" \
+            --detach --yes --message "DummyTenant Booking Form E2E ${GITHUB_SHA}" >/dev/null
+
+          : > /tmp/dummytenant-e2e.log
+          for attempt in $(seq 1 9); do
+            sleep 30
+            railway logs --service "$SMOKE_SERVICE" --latest --deployment --lines 700 \
+              > /tmp/dummytenant-e2e.log 2>&1 || true
+            if grep -q 'DUMMYTENANT_BOOKING_E2E=PASS' /tmp/dummytenant-e2e.log; then
+              break
+            fi
+            if grep -q 'Traceback (most recent call last)' /tmp/dummytenant-e2e.log; then
+              break
+            fi
+          done
+
+          cat /tmp/dummytenant-e2e.log
+          for marker in \
+            DUMMYTENANT_ROLE_TEMPLATES=PASS \
+            DUMMYTENANT_PC_USER=PASS \
+            DUMMYTENANT_AUDIT_FIXTURE=PASS \
+            DUMMYTENANT_BOOKING_PROFILE=PASS \
+            DUMMYTENANT_BOOKING_UPLOAD=PASS \
+            DUMMYTENANT_AUDIT_SECURITY_DI_PATH=PASS \
+            DUMMYTENANT_BOOKING_EXTRACTION=PASS \
+            DUMMYTENANT_BOOKING_CORE_FIELDS=PASS \
+            DUMMYTENANT_BOOKING_E2E=PASS; do
+            grep -q "$marker" /tmp/dummytenant-e2e.log || {
+              echo "Missing E2E marker: $marker" >&2
+              exit 1
+            }
+          done
+
+      - name: Stop smoke compute
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          railway down --service "$SMOKE_SERVICE" --yes >/dev/null 2>&1
+          exit 0
