@@ -5,7 +5,7 @@ from typing import Annotated
 
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import Connection, Engine, create_engine
+from sqlalchemy import Connection, Engine, create_engine, text
 
 from audit_core.security import Principal, SecurityTokenError, SecurityTokenValidator
 
@@ -26,6 +26,7 @@ def get_engine() -> Engine:
 
 def get_connection() -> Iterator[Connection]:
     with get_engine().begin() as connection:
+        connection.execute(text("SET LOCAL ROLE audit_core_runtime"))
         yield connection
 
 
