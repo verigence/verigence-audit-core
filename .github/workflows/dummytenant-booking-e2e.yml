@@ -6,6 +6,10 @@ on:
       - test/dummytenant-booking-e2e
     paths:
       - .github/workflows/dummytenant-booking-e2e.yml
+      - tests/e2e/dummytenant_booking_e2e.py
+      - src/audit_core/di_client.py
+      - tests/test_di_client.py
+      - tests/test_di_client_envelope.py
   workflow_dispatch:
 
 permissions:
