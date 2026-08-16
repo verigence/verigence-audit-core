@@ -7,11 +7,13 @@
 
 ## 1. Purpose
 
-This runbook consolidates the three backend modules into one Railway project so they can use Railway private networking:
+This runbook consolidates the three backend modules into one Railway project so they can use Railway private networking while preserving DI process separation:
 
 - `verigence-audit-core` — existing Audit Core service;
 - `security` — source: `verigence/verigence-security`;
-- `di-api` — source: `verigence/verigence-di`;
+- `di-api` — HTTP Document Intelligence API, source: `verigence/verigence-di`;
+- `di-worker` — long-running DI processing worker, source: the same DI commit;
+- `di-scheduler` — long-running DI EOD retry scheduler, source: the same DI commit;
 - `platform-smoke` — operational verification service only;
 - one Railway-managed PostgreSQL service used by consolidated DEV Security and DI.
 
@@ -25,14 +27,14 @@ Do not use the Railway UI or a local Railway CLI for normal service creation, da
 
 ## 3. Why there are two Railway tokens
 
-Railway project tokens are intentionally environment/deployment scoped. They are appropriate for normal deployments and service-specific automation, but the live bootstrap test confirmed they cannot link/create new project resources.
+Railway project tokens are environment/deployment scoped. They are appropriate for normal deployments and service-specific automation, but the live bootstrap test confirmed the existing project token cannot link/create new project resources.
 
 Therefore the GitHub Actions design separates privileges:
 
 | GitHub secret | Scope | Used by | Purpose |
 |---|---|---|---|
-| `RAILWAY_API_TOKEN` | Railway workspace or account token | `.github/workflows/platform-bootstrap.yml` | One-time/exceptional creation of `security`, `di-api`, `platform-smoke`, and PostgreSQL. |
-| `RAILWAY_TOKEN` | Project token for `cf00a1cd-623e-4c72-8836-db95652c63db` | `.github/workflows/platform-deploy.yml` | Normal variable management, migrations/deployments, logs and redeploy operations inside the already-created project environment. |
+| `RAILWAY_API_TOKEN` | Railway workspace or account token | `.github/workflows/platform-bootstrap.yml` | One-time/exceptional creation of `security`, `di-api`, `di-worker`, `di-scheduler`, `platform-smoke`, and PostgreSQL. |
+| `RAILWAY_TOKEN` | Project token for `cf00a1cd-623e-4c72-8836-db95652c63db` | deployment workflows | Normal variable management, migrations, deployments, logs and redeploy operations inside the already-created project environment. |
 
 `RAILWAY_API_TOKEN` is required only for bootstrap/recreation of project resources. Keep the narrower project token as the day-to-day deployment credential.
 
@@ -50,11 +52,22 @@ security
    `-- PostgreSQL
 
 di-api
+   |-- HTTP API only
    |-- JWKS ------------> http://security.railway.internal:8001/.well-known/jwks.json
    `-- PostgreSQL
 
+di-worker
+   |-- claims PENDING processing jobs
+   |-- performs document processing
+   `-- same DI PostgreSQL/runtime configuration
+
+di-scheduler
+   |-- APScheduler EOD retry check every 60 seconds
+   |-- inserts EOD_RETRY processing jobs
+   `-- same DI PostgreSQL/runtime configuration
+
 platform-smoke
-   `-- temporary deployment used to prove private routing/auth; the service object remains available for future smoke runs
+   `-- private-network verification deployment
 ```
 
 Canonical private endpoints:
@@ -62,11 +75,26 @@ Canonical private endpoints:
 - Security: `http://security.railway.internal:8001`
 - Token: `http://security.railway.internal:8001/oauth/token`
 - JWKS: `http://security.railway.internal:8001/.well-known/jwks.json`
-- DI: `http://di-api.railway.internal:8000`
+- DI API: `http://di-api.railway.internal:8000`
 - DI liveness: `http://di-api.railway.internal:8000/health`
 - DI readiness: `http://di-api.railway.internal:8000/ready`
 
-## 5. Bootstrap procedure
+`di-worker` and `di-scheduler` are private long-running process services and do not expose application HTTP endpoints.
+
+## 5. Why DI is three Railway services
+
+The DI repository contains two independent background responsibilities:
+
+1. **Processing Worker** — polls `docintel.processing_jobs`, claims jobs with `FOR UPDATE SKIP LOCKED`, and performs document processing.
+2. **EOD Retry Scheduler** — runs every 60 seconds, evaluates each Tenant's configured EOD window, and inserts `EOD_RETRY` jobs.
+
+The DI production Dockerfile explicitly anticipates Railway command overrides for worker/scheduler process types. The unified deployment therefore does not run those processes inside `di-api`.
+
+The API service must keep `DI_WORKER_ENABLED=false`. The separate process workflow starts exactly one worker process per `di-worker` replica and exactly one scheduler process per `di-scheduler` replica. Keep the scheduler at one replica unless the scheduler implementation is changed to use distributed leader election/advisory locking.
+
+This avoids duplicate EOD schedulers when the API is scaled horizontally.
+
+## 6. Bootstrap procedure
 
 Bootstrap is required only when the consolidated services/database do not exist.
 
@@ -77,13 +105,15 @@ Bootstrap is required only when the consolidated services/database do not exist.
    - `verigence-audit-core` (already present);
    - `security`;
    - `di-api`;
+   - `di-worker`;
+   - `di-scheduler`;
    - `platform-smoke`;
    - one PostgreSQL service.
 5. Accept bootstrap only when the log contains `PLATFORM_BOOTSTRAP=PASS`.
 
 The bootstrap workflow creates empty application services. It does not connect them to Railway GitHub auto-deploy sources.
 
-## 6. Normal deployment procedure
+## 7. Core platform deployment
 
 Normal deployment uses only the project-scoped `RAILWAY_TOKEN`.
 
@@ -92,21 +122,46 @@ Normal deployment uses only the project-scoped `RAILWAY_TOKEN`.
 3. The workflow records the Audit Core, Security and DI Git SHAs.
 4. It verifies the target Railway project and required pre-created services.
 5. It retrieves the existing Audit Core `SECURITY_CLIENT_SECRET` without printing it and derives only its SHA-256 verifier for Security.
-6. It creates a stable Security RSA signing key only if the consolidated Security service does not already have one.
-7. It configures Security with issuer `verigence-security`, audience `verigence-platform`, the shared DEV PostgreSQL service and least-privilege `audit-core` scopes:
+6. It configures Security with issuer `verigence-security`, audience `verigence-platform`, the shared DEV PostgreSQL service and least-privilege `audit-core` scopes:
    - `di.document.read`
    - `di.document.upload`
-8. It applies Security schema SQL and ensures tenant `dev-auth-test` exists.
-9. It configures DI with the shared PostgreSQL service and the private Security JWKS URL. The API worker is disabled in the API service and Document AI stays in DEV mock mode until a real provider is deliberately configured.
-10. It runs DI Alembic migrations.
-11. It rewires Audit Core to private Security/DI URLs.
-12. It deploys Security, DI and Audit Core explicitly with `railway up` from the three checked-out repositories.
-13. It deploys a smoke image to the pre-created `platform-smoke` service to prove actual private networking and authentication.
-14. It removes the smoke deployment after verification while retaining the service object for the next run.
+7. It applies Security schema SQL and ensures tenant `dev-auth-test` exists.
+8. It configures `di-api` with the shared PostgreSQL service and the private Security JWKS URL. `DI_WORKER_ENABLED=false` is mandatory on the API service.
+9. It runs DI Alembic migrations.
+10. It rewires Audit Core to private Security/DI URLs.
+11. It deploys Security, DI API and Audit Core explicitly with `railway up`.
+12. It runs the private Security → DI smoke from Railway networking.
 
-## 7. Expected acceptance markers
+## 8. DI worker and scheduler deployment
 
-A deployment is accepted only when the GitHub Actions log contains:
+Workflow: `.github/workflows/platform-di-processes.yml` — **Deploy DI worker and scheduler DEV**.
+
+It can be run manually and is also configured to follow a successful core platform deployment after these workflows are on the default branch.
+
+The workflow:
+
+1. verifies `di-api`, `di-worker` and `di-scheduler` exist in the consolidated project;
+2. reads `DI_*` runtime variables from `di-api` inside GitHub Actions without printing secret values;
+3. synchronizes those DI variables to `di-worker` and `di-scheduler`, so database, storage, Security JWKS and future DI runtime settings stay aligned;
+4. forces `DI_WORKER_ENABLED=false` on the background process services so accidentally launching the FastAPI app cannot create duplicate in-process workers/schedulers;
+5. builds a standalone worker command that calls `ProcessingWorker.start()` and owns only the worker lifecycle;
+6. builds a standalone scheduler command that calls `EODRetryScheduler.start()` and owns only the scheduler lifecycle;
+7. deploys both services from the same DI repository revision;
+8. verifies runtime startup markers from Railway logs.
+
+Required success markers:
+
+```text
+DI_PROCESS_SERVICES_PRESENT=PASS
+DI_PROCESS_VARIABLE_SYNC=PASS
+DI_WORKER_STARTED=PASS
+DI_SCHEDULER_STARTED=PASS
+DI_PROCESS_SEPARATION=PASS
+```
+
+## 9. Expected core-platform acceptance markers
+
+A core platform deployment is accepted only when the GitHub Actions log contains:
 
 ```text
 PLATFORM_PROJECT_VERIFIED=PASS
@@ -119,13 +174,25 @@ PLATFORM_PRIVATE_E2E=PASS
 PLATFORM_AUDIT_CORE_REBOUND=PASS
 ```
 
-## 8. Secret handling
+A complete DI runtime acceptance additionally requires all five DI process markers in section 8.
 
-No Security client secret, JWT private key, DI secret key, or database password is committed to GitHub.
+## 10. Secret handling
 
-The workflow writes secret values to Railway through stdin, masks temporary values immediately in GitHub Actions, and never prints raw variable JSON containing secret values. The raw Audit Core client secret remains stored in the Audit Core Railway service; Security stores only its SHA-256 verifier.
+No Security client secret, JWT private key, DI secret key, storage credential, or database password is committed to GitHub.
 
-## 9. Database model
+Workflows write secret values to Railway through stdin and do not print raw DI variable JSON. The DI process workflow uses a runner-local temporary variable snapshot solely to synchronize the already-configured `di-api` runtime into `di-worker` and `di-scheduler`.
+
+The raw Audit Core client secret remains stored in the Audit Core Railway service; Security stores only its SHA-256 verifier.
+
+## 11. DI storage/config prerequisite
+
+The worker is the process that actually reads uploaded content and invokes the document-processing adapter. Therefore the consolidated `di-api` must contain the correct DEV object-storage configuration before a real document-upload/processing E2E can be declared complete (`DI_STORAGE_PROVIDER`, endpoint, access credentials, bucket and region as applicable).
+
+The process workflow deliberately clones these values from `di-api`; it does not invent separate worker/scheduler storage credentials.
+
+Document AI remains in DEV mock mode until the real provider is deliberately enabled.
+
+## 12. Database model
 
 Audit Core keeps its existing `DATABASE_URL` and database boundary.
 
@@ -133,11 +200,11 @@ The consolidated DEV Security and DI services share one Railway-managed PostgreS
 
 Destructive automatic down-migrations are not part of rollback.
 
-## 10. What the private smoke proves
+## 13. What the private smoke proves
 
-GitHub-hosted runners cannot directly resolve Railway private DNS, so a deployment inside the pre-created `platform-smoke` service performs verification from the Railway private network.
+GitHub-hosted runners cannot directly resolve Railway private DNS, so a deployment inside `platform-smoke` performs verification from the Railway private network.
 
-The smoke proves:
+The core smoke proves:
 
 1. Security private liveness;
 2. DI private liveness and DB readiness;
@@ -145,38 +212,41 @@ The smoke proves:
 4. DI retrieves Security JWKS through the private network;
 5. DI accepts the Security-issued token on a tenant-scoped API request.
 
-This is a backend SERVICE-path verification. Interactive USER OAuth/Clerk migration is intentionally separate because legacy Security secret values are outside this project token's scope. Do not claim positive end-to-end USER delegation until Clerk/user state is provisioned into the consolidated Security service and tested.
+The DI process verification separately proves the worker and scheduler processes start as independent services. A later full document E2E must prove upload → job creation → worker processing → resulting DI document state.
 
-## 11. Rollback
+Interactive USER OAuth/Clerk migration remains separate until Clerk/user state is provisioned into the consolidated Security service and tested.
+
+## 14. Rollback
 
 During stabilization, keep the legacy standalone Security and DI Railway projects intact.
 
-Rollback must also be executed through GitHub Actions. Re-run a known-good platform workflow revision or a controlled rollback revision that restores previously recorded dependency endpoints and redeploys Audit Core. Do not patch Railway variables manually.
+Rollback must also be executed through GitHub Actions. Re-run a known-good platform workflow revision or a controlled rollback revision that restores previously recorded dependency endpoints and redeploys Audit Core. `di-worker` and `di-scheduler` must roll back to the same DI source revision as `di-api`.
 
 Database rollback is forward-compatible only; do not automatically execute destructive down-migrations.
 
-## 12. Legacy deployment retirement
+## 15. Legacy deployment retirement
 
-Only after the consolidated run is green:
+Only after the consolidated API, worker, scheduler and Security/Audit Core path are green:
 
 - retire Railway mutation workflows in `verigence/verigence-security` that deploy to the old Security project;
-- retire `.github/workflows/deploy-dev.yml` in `verigence/verigence-di` as a direct Railway deployer;
+- retire direct DEV Railway deployment ownership in `verigence/verigence-di`;
 - remove temporary inspection workflows;
 - retain CI/test workflows in each source repository;
 - point each repository's deployment documentation to this runbook.
 
-## 13. DEV limitations before production
+## 16. DEV limitations before production
 
-This setup is DEV only. Production requires a separate Railway project/environment, production tokens, production databases/storage, real Document AI configuration, Clerk/interactive auth provisioning, approval gates, and production secret management. DEV-generated credentials and mock Document AI settings must not be promoted.
+This setup is DEV only. Production requires a separate Railway project/environment, production tokens, production databases/storage, real Document AI configuration, Clerk/interactive auth provisioning, approval gates, production secret management, and an HA-safe scheduler strategy before more than one scheduler replica is allowed.
 
-## 14. Evidence to retain
+## 17. Evidence to retain
 
 For each accepted deployment retain:
 
 - bootstrap run ID when resources are created/recreated;
-- platform deployment run ID;
+- core platform deployment run ID;
+- DI process deployment run ID;
 - Audit Core, Security and DI commit SHAs;
-- Railway project/environment IDs and service IDs;
+- Railway project/environment IDs and all service IDs;
 - migration completion evidence without secret values;
-- all acceptance markers;
+- core-platform and DI-process acceptance markers;
 - any rollback or exception record.
