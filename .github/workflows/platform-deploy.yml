@@ -11,11 +11,6 @@ on:
         description: DI Git ref
         required: true
         default: main
-  push:
-    branches:
-      - agent/unified-railway-platform
-    paths:
-      - .github/workflows/platform-deploy.yml
 
 permissions:
   contents: read
@@ -39,8 +34,8 @@ jobs:
       SECURITY_PORT: "8001"
       DI_PORT: "8000"
       DEV_TENANT_ID: dev-auth-test
-      SECURITY_REF: ${{ inputs.security_ref || 'main' }}
-      DI_REF: ${{ inputs.di_ref || 'agent/railway-two-service-runtime' }}
+      SECURITY_REF: ${{ inputs.security_ref }}
+      DI_REF: ${{ inputs.di_ref }}
 
     steps:
       - name: Checkout Audit Core
