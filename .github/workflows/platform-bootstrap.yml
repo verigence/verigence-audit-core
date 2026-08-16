@@ -2,11 +2,6 @@ name: Bootstrap unified Railway platform DEV
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - agent/unified-railway-platform
-    paths:
-      - .github/workflows/platform-bootstrap.yml
 
 permissions:
   contents: read
@@ -114,6 +109,8 @@ jobs:
           db=[name for name in names if name and 'postgres' in name.lower()]
           if not db:
               raise SystemExit('PostgreSQL service is missing')
+          if 'di-scheduler' in names:
+              raise SystemExit('Unexpected di-scheduler service; scheduler belongs inside di-worker')
           print('PLATFORM_BOOTSTRAP=PASS')
           print('APPLICATION_SERVICES=' + ','.join(sorted(required)))
           print('DATABASE_SERVICE=' + db[0])
