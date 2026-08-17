@@ -1,0 +1,36 @@
+name: DummyTenant exact document transfer key
+
+on:
+  push:
+    branches:
+      - test/dummytenant-booking-e2e
+    paths:
+      - .github/workflows/dummytenant-doc-key.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-key:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      SMOKE_SERVICE: platform-smoke
+    steps:
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Generate ephemeral transfer key
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out /tmp/e2e-doc-private.pem >/dev/null 2>&1
+          openssl pkey -in /tmp/e2e-doc-private.pem -pubout -outform DER -out /tmp/e2e-doc-public.der
+          private_b64="$(base64 -w0 /tmp/e2e-doc-private.pem)"
+          printf '%s' "$private_b64" | railway variable set DUMMY_E2E_DOC_PRIVATE_KEY_B64 \
+            --service "$SMOKE_SERVICE" --stdin --skip-deploys >/dev/null
+          public_b64="$(base64 -w0 /tmp/e2e-doc-public.der)"
+          echo "DUMMY_E2E_DOC_PUBLIC_KEY_DER_B64=$public_b64"
+          echo 'DUMMY_E2E_DOC_PRIVATE_KEY_STORED=PASS'
