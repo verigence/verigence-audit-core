@@ -71,6 +71,14 @@ PATCH  /v1/tenants/{tenantId}/dealers/{dealerId}/outlets/{outletId}
 
 Records may be inactivated/retired through PATCH where applicable. No DELETE endpoint is part of baseline.
 
+### 4.1 Product SKU reference
+
+```text
+GET /v1/tenants/{tenantId}/reference/product-skus
+```
+
+The Product SKU reference lookup requires `audit.master.read` and returns active SKU references only for the OEM configured on the requested Tenant/Project. The existing query contract supports optional `q` search and `limit` from 1 to 100, default 50.
+
 ## 5. Customer / Journey
 
 ```text
