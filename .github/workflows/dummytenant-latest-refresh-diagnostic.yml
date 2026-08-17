@@ -1,0 +1,31 @@
+name: Diagnose exact Booking Form refresh
+
+on:
+  push:
+    branches:
+      - test/dummytenant-booking-e2e
+    paths:
+      - .github/workflows/dummytenant-latest-refresh-diagnostic.yml
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      AUDIT_SERVICE: verigence-audit-core
+      CORRELATION_ID: 80f6571d-16a2-4677-878c-2c47e3778ab7
+    steps:
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      - name: Read exact refresh exception
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 1400 >/tmp/audit.log || true
+          echo '--- EXACT REFRESH DIAGNOSTIC ---'
+          grep -E -B 25 -A 80 "$CORRELATION_ID|DI_E008|Traceback|ERROR|Exception|permission denied|AdminShutdown" /tmp/audit.log | tail -n 500 || true
+          echo '--- END EXACT REFRESH DIAGNOSTIC ---'
