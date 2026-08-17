@@ -23,6 +23,29 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Project'}
         default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/reference/product-skus:
+    get:
+      operationId: listProductSkus
+      description: Returns active Product SKU references for the OEM configured on the requested Tenant/Project. Requires audit.master.read.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - name: q
+          in: query
+          required: false
+          schema: {type: string, maxLength: 120}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 100, default: 50}
+      responses:
+        '200':
+          description: Project/OEM-scoped active Product SKU references
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/ProductSkuReference'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
   /tenants/{tenantId}/customers/{customerId}/journeys:
     post:
       operationId: createJourney
@@ -198,6 +221,30 @@ components:
         tenantId: {type: string}
         projectCode: {type: string}
         projectName: {type: string}
+    ProductSkuReference:
+      type: object
+      required:
+        - productSkuId
+        - skuCode
+        - oemCode
+        - oemName
+        - modelCode
+        - modelName
+        - variantCode
+        - variantName
+        - colourCode
+        - colourName
+      properties:
+        productSkuId: {type: string, format: uuid}
+        skuCode: {type: string}
+        oemCode: {type: string}
+        oemName: {type: string}
+        modelCode: {type: string}
+        modelName: {type: string}
+        variantCode: {type: string}
+        variantName: {type: string}
+        colourCode: {type: [string, 'null']}
+        colourName: {type: [string, 'null']}
     Journey:
       type: object
       required: [journeyId, tenantId, customerId, auditState, auditOutcome]
