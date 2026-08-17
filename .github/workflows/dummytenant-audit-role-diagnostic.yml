@@ -29,23 +29,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Read-only check. Normalize SQLAlchemy-style URLs before handing them to psycopg.
           railway run --service "$AUDIT_SERVICE" --no-local python - <<'PY'
           import os
           from urllib.parse import urlsplit, urlunsplit
-
           import psycopg
 
           raw = os.environ['DATABASE_URL'].strip()
           url = raw.replace('postgresql+psycopg://', 'postgresql://', 1).replace('postgresql+psycopg2://', 'postgresql://', 1)
           parts = urlsplit(url)
           if parts.query:
-              items=[]
-              for item in parts.query.split('&'):
-                  if item == 'ssl=require':
-                      items.append('sslmode=require')
-                  else:
-                      items.append(item)
+              items=['sslmode=require' if item == 'ssl=require' else item for item in parts.query.split('&')]
               url = urlunsplit((parts.scheme, parts.netloc, parts.path, '&'.join(items), parts.fragment))
 
           with psycopg.connect(url) as conn, conn.cursor() as cur:
@@ -53,25 +46,26 @@ jobs:
               current_user, session_user = cur.fetchone()
               print('AUDIT_DB_USER=' + current_user)
               print('AUDIT_DB_SESSION_USER=' + session_user)
-              cur.execute('''
-                  SELECT rolname, rolsuper, rolcreaterole, rolcreatedb, rolcanlogin
-                  FROM pg_roles
-                  WHERE rolname IN (current_user, 'audit_core_runtime')
-                  ORDER BY rolname
-              ''')
-              for row in cur.fetchall():
-                  print('AUDIT_DB_ROLE=' + repr(row))
               cur.execute("SELECT pg_has_role(current_user, 'audit_core_runtime', 'MEMBER')")
               print('AUDIT_RUNTIME_ROLE_MEMBER=' + str(cur.fetchone()[0]))
               cur.execute("SELECT pg_has_role(current_user, 'audit_core_runtime', 'USAGE')")
               print('AUDIT_RUNTIME_ROLE_USAGE=' + str(cur.fetchone()[0]))
               cur.execute('''
-                  SELECT parent.rolname, member.rolname, m.admin_option
+                  SELECT parent.rolname, member.rolname, m.admin_option,
+                         COALESCE(m.inherit_option, true), COALESCE(m.set_option, true)
                   FROM pg_auth_members m
                   JOIN pg_roles parent ON parent.oid=m.roleid
                   JOIN pg_roles member ON member.oid=m.member
                   WHERE parent.rolname='audit_core_runtime'
               ''')
-              rows=cur.fetchall()
-              print('AUDIT_RUNTIME_ROLE_MEMBERS=' + repr(rows))
+              for row in cur.fetchall():
+                  print('AUDIT_RUNTIME_ROLE_GRANT=' + repr(row))
+              try:
+                  cur.execute('SET LOCAL ROLE audit_core_runtime')
+              except Exception as exc:
+                  print('AUDIT_SET_ROLE=FAIL|' + str(exc).splitlines()[0])
+                  conn.rollback()
+              else:
+                  print('AUDIT_SET_ROLE=PASS')
+                  cur.execute('RESET ROLE')
           PY
