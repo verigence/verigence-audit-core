@@ -1,0 +1,117 @@
+name: DummyTenant Exact Booking Form Final E2E
+
+on:
+  push:
+    branches:
+      - test/dummytenant-booking-e2e
+    paths:
+      - .github/workflows/dummytenant-exact-booking-final.yml
+      - tests/e2e/dummytenant_exact_booking_runner.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      SMOKE_SERVICE: platform-smoke
+      BOOKING_FORM_SHA256: 9e0e23075b5b9038f79fc85f4c5918a011192b6d5af7c4da9b1991fd44ba8f75
+
+    steps:
+      - name: Checkout Audit Core test branch
+        uses: actions/checkout@v6
+        with:
+          path: _src/audit-core
+
+      - name: Checkout Security main
+        uses: actions/checkout@v6
+        with:
+          repository: verigence/verigence-security
+          ref: main
+          path: _src/security
+
+      - name: Checkout DI exact Booking Form asset
+        uses: actions/checkout@v6
+        with:
+          repository: verigence/verigence-di
+          ref: test/dummytenant-booking-e2e
+          path: _src/di
+
+      - name: Verify exact uploaded PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          file='_src/di/backend/scripts/booking_form_test.pdf'
+          actual="$(sha256sum "$file" | awk '{print $1}')"
+          test "$actual" = "$BOOKING_FORM_SHA256"
+          echo "DUMMYTENANT_EXACT_BOOKING_FORM_SHA256=$actual"
+          echo 'DUMMYTENANT_EXACT_BOOKING_FORM_SOURCE=PASS'
+
+      - name: Build exact E2E smoke image
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf smoke
+          mkdir smoke
+          cp _src/audit-core/tests/e2e/dummytenant_booking_e2e.py smoke/base_e2e.py
+          cp _src/audit-core/tests/e2e/dummytenant_exact_booking_runner.py smoke/runner.py
+          cp _src/di/backend/scripts/booking_form_test.pdf smoke/booking_form_test.pdf
+          cp -R _src/security smoke/security
+          cat > smoke/Dockerfile <<'DOCKER'
+          FROM python:3.12-slim
+          WORKDIR /app
+          COPY security /opt/verigence-security
+          RUN pip install --no-cache-dir /opt/verigence-security reportlab==4.4.3
+          COPY base_e2e.py /app/base_e2e.py
+          COPY runner.py /app/runner.py
+          COPY booking_form_test.pdf /app/booking_form_test.pdf
+          CMD ["python", "/app/runner.py"]
+          DOCKER
+          cat > smoke/railway.toml <<'TOML'
+          [build]
+          builder = "DOCKERFILE"
+          dockerfilePath = "Dockerfile"
+
+          [deploy]
+          startCommand = "python /app/runner.py"
+          restartPolicyType = "ON_FAILURE"
+          restartPolicyMaxRetries = 1
+          TOML
+
+      - name: Run exact PC Booking Form E2E
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global @railway/cli
+          railway up smoke --path-as-root --service "$SMOKE_SERVICE" --detach --yes \
+            --message "DummyTenant exact Booking Form final ${GITHUB_SHA}" >/dev/null
+
+          : > /tmp/e2e.log
+          for attempt in $(seq 1 14); do
+            sleep 25
+            railway logs --service "$SMOKE_SERVICE" --latest --deployment --lines 1200 > /tmp/e2e.log 2>&1 || true
+            if grep -q 'DUMMYTENANT_BOOKING_E2E=PASS' /tmp/e2e.log; then break; fi
+            if grep -q 'Traceback (most recent call last)' /tmp/e2e.log; then break; fi
+          done
+          cat /tmp/e2e.log
+          for marker in \
+            DUMMYTENANT_EXACT_BOOKING_FORM=PASS \
+            DUMMYTENANT_ROLE_TEMPLATES=PASS \
+            DUMMYTENANT_PC_USER=PASS \
+            DUMMYTENANT_BOOKING_UPLOAD=PASS \
+            DUMMYTENANT_AUDIT_SECURITY_DI_PATH=PASS \
+            DUMMYTENANT_BOOKING_EXTRACTION=PASS \
+            DUMMYTENANT_BOOKING_CORE_FIELDS=PASS \
+            DUMMYTENANT_BOOKING_E2E=PASS; do
+            grep -q "$marker" /tmp/e2e.log || { echo "Missing E2E marker: $marker" >&2; exit 1; }
+          done
+
+      - name: Stop smoke compute
+        if: always()
+        run: |
+          npm install --global @railway/cli >/dev/null 2>&1 || true
+          railway down --service "$SMOKE_SERVICE" --yes >/dev/null 2>&1 || true
