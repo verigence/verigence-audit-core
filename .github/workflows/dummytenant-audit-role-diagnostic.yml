@@ -29,6 +29,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Read-only check. Normalize SQLAlchemy-style URLs before handing them to psycopg.
           railway run --service "$AUDIT_SERVICE" --no-local python - <<'PY'
           import os
           from urllib.parse import urlsplit, urlunsplit
