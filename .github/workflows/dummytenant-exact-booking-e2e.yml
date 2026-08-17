@@ -206,9 +206,9 @@ jobs:
             printf '%s' "$value" | railway variable set "$name" --service "$SMOKE_SERVICE" --stdin --skip-deploys >/dev/null
           }
 
-          audit_db_ref='${{verigence-audit-core.DATABASE_URL}}'
-          security_db_ref='${{security.SECURITY_ROLE_DATABASE_URL}}'
-          di_db_ref='${{di-api.DI_DATABASE_URL}}'
+          audit_db_ref="$(python -c 'print(chr(36)+chr(123)+chr(123)+"verigence-audit-core.DATABASE_URL"+chr(125)+chr(125))')"
+          security_db_ref="$(python -c 'print(chr(36)+chr(123)+chr(123)+"security.SECURITY_ROLE_DATABASE_URL"+chr(125)+chr(125))')"
+          di_db_ref="$(python -c 'print(chr(36)+chr(123)+chr(123)+"di-api.DI_DATABASE_URL"+chr(125)+chr(125))')"
 
           set_var DUMMY_TENANT_ID "$DUMMY_TENANT_ID"
           set_var TEST_CLIENT_ID "$TEST_CLIENT_ID"
