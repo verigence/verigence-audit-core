@@ -19,6 +19,7 @@ from audit_core.journeys import router as journey_router
 from audit_core.observability import install_observability
 from audit_core.payments_finance import router as payments_finance_router
 from audit_core.projects import router as project_router
+from audit_core.reference_data import router as reference_data_router
 from audit_core.tasks_api import router as task_router
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
@@ -51,6 +52,7 @@ def create_app() -> FastAPI:
     application.include_router(daily_operations_router)
     application.include_router(crm_router)
     application.include_router(escalation_router)
+    application.include_router(reference_data_router)
 
     @application.get("/health")
     def health() -> dict[str, str]:
