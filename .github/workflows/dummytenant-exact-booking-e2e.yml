@@ -1,0 +1,269 @@
+name: DummyTenant Exact Booking Form E2E
+
+on:
+  push:
+    branches:
+      - test/dummytenant-booking-e2e
+    paths:
+      - .github/workflows/dummytenant-exact-booking-e2e.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dummytenant-exact-booking-e2e-dev
+  cancel-in-progress: false
+
+jobs:
+  exact-booking-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      AUDIT_SERVICE: verigence-audit-core
+      SECURITY_SERVICE: security
+      DI_API_SERVICE: di-api
+      SMOKE_SERVICE: platform-smoke
+      DUMMY_TENANT_ID: DummyTenant
+      TEST_CLIENT_ID: dummytenant-e2e
+      TEST_REDIRECT_URI: https://example.invalid/dummytenant/callback
+      SECURITY_PORT: "8001"
+      BOOKING_FORM_SHA256: 9e0e23075b5b9038f79fc85f4c5918a011192b6d5af7c4da9b1991fd44ba8f75
+
+    steps:
+      - name: Checkout Audit Core test branch
+        uses: actions/checkout@v6
+        with:
+          path: _src/audit-core
+
+      - name: Checkout Security main
+        uses: actions/checkout@v6
+        with:
+          repository: verigence/verigence-security
+          ref: main
+          path: _src/security
+
+      - name: Checkout DI test revision containing exact uploaded PDF
+        uses: actions/checkout@v6
+        with:
+          repository: verigence/verigence-di
+          ref: test/dummytenant-booking-e2e
+          path: _src/di
+
+      - name: Verify exact Booking Form bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          file='_src/di/backend/scripts/booking_form_test.pdf'
+          test -f "$file"
+          actual="$(sha256sum "$file" | awk '{print $1}')"
+          test "$actual" = "$BOOKING_FORM_SHA256" || {
+            echo "Exact Booking Form hash mismatch: $actual" >&2
+            exit 1
+          }
+          echo "DUMMYTENANT_EXACT_BOOKING_FORM_SHA256=$actual"
+          echo 'DUMMYTENANT_EXACT_BOOKING_FORM_SOURCE=PASS'
+
+      - name: Install Railway and DB diagnostic tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global @railway/cli
+          python -m pip install -q 'psycopg[binary]'
+
+      - name: Validate existing E2E client and system DI permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway variable list --service "$SMOKE_SERVICE" --json >/tmp/smoke-vars.json
+          railway variable list --service "$SECURITY_SERVICE" --json >/tmp/security-vars.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+
+          smoke=json.loads(Path('/tmp/smoke-vars.json').read_text())
+          security=json.loads(Path('/tmp/security-vars.json').read_text())
+          audit=json.loads(Path('/tmp/audit-vars.json').read_text())
+
+          secret=smoke.get('TEST_CLIENT_SECRET','')
+          if not secret:
+              raise SystemExit('platform-smoke TEST_CLIENT_SECRET is missing')
+          clients=json.loads(security.get('SECURITY_INTEGRATION_CLIENTS_JSON') or '{}')
+          test_client=clients.get(os.environ['TEST_CLIENT_ID']) or {}
+          actual_hash=hashlib.sha256(secret.encode()).hexdigest()
+          if actual_hash != test_client.get('secret_sha256'):
+              raise SystemExit('DummyTenant E2E client secret no longer matches Security configuration')
+
+          audit_client=clients.get('audit-core') or {}
+          required={
+              'di.subject.create',
+              'di.document.upload',
+              'di.document.read',
+              'di.document.fields.read',
+          }
+          configured=set(audit_client.get('permissions') or [])
+          missing=required-configured
+          if missing:
+              raise SystemExit('audit-core delegated DI permissions missing: '+','.join(sorted(missing)))
+
+          port=str(audit.get('PORT') or '8000')
+          Path('/tmp/test-secret').write_text(secret)
+          Path('/tmp/audit-port').write_text(port)
+          print('AUDIT_CORE_SYSTEM_DI_PERMISSIONS=PASS')
+          print('DUMMYTENANT_E2E_CLIENT=PASS')
+          PY
+
+          test_secret="$(cat /tmp/test-secret)"
+          echo "::add-mask::$test_secret"
+          echo "TEST_CLIENT_SECRET=$test_secret" >> "$GITHUB_ENV"
+          echo "AUDIT_PORT=$(cat /tmp/audit-port)" >> "$GITHUB_ENV"
+
+      - name: Correct proven Audit Core runtime-role membership option
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway run --service "$AUDIT_SERVICE" --no-local python - <<'PY'
+          import os
+          from urllib.parse import urlsplit, urlunsplit
+          import psycopg
+          from psycopg import sql
+
+          raw=os.environ['DATABASE_URL'].strip()
+          url=raw.replace('postgresql+psycopg://','postgresql://',1).replace('postgresql+psycopg2://','postgresql://',1)
+          parts=urlsplit(url)
+          if parts.query:
+              query='&'.join('sslmode=require' if item == 'ssl=require' else item for item in parts.query.split('&'))
+              url=urlunsplit((parts.scheme,parts.netloc,parts.path,query,parts.fragment))
+
+          with psycopg.connect(url) as conn, conn.cursor() as cur:
+              cur.execute('SELECT current_user')
+              login_role=cur.fetchone()[0]
+              cur.execute('''
+                  SELECT m.set_option
+                  FROM pg_auth_members m
+                  JOIN pg_roles parent ON parent.oid=m.roleid
+                  JOIN pg_roles member ON member.oid=m.member
+                  WHERE parent.rolname='audit_core_runtime' AND member.rolname=%s
+              ''', (login_role,))
+              row=cur.fetchone()
+              if row is None:
+                  raise RuntimeError(f'{login_role} is not a member of audit_core_runtime')
+              if not row[0]:
+                  cur.execute(
+                      sql.SQL('GRANT audit_core_runtime TO {} WITH SET TRUE').format(sql.Identifier(login_role))
+                  )
+                  conn.commit()
+              cur.execute('SET LOCAL ROLE audit_core_runtime')
+              cur.execute('SELECT current_user')
+              current=cur.fetchone()[0]
+              if current != 'audit_core_runtime':
+                  raise RuntimeError(f'Unexpected role after SET ROLE: {current}')
+              print('AUDIT_CORE_RUNTIME_ROLE_SET=PASS')
+          PY
+
+      - name: Build exact-document private smoke image
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf smoke
+          mkdir -p smoke
+          cp _src/audit-core/tests/e2e/dummytenant_booking_e2e.py smoke/e2e.py
+          cp _src/di/backend/scripts/booking_form_test.pdf smoke/booking_form_test.pdf
+          cp -R _src/security smoke/security
+          actual="$(sha256sum smoke/booking_form_test.pdf | awk '{print $1}')"
+          test "$actual" = "$BOOKING_FORM_SHA256"
+
+          cat > smoke/Dockerfile <<'DOCKER'
+          FROM python:3.12-slim
+          WORKDIR /app
+          COPY security /opt/verigence-security
+          RUN pip install --no-cache-dir /opt/verigence-security reportlab==4.4.3
+          COPY e2e.py /app/e2e.py
+          COPY booking_form_test.pdf /app/booking_form_test.pdf
+          CMD ["python", "/app/e2e.py"]
+          DOCKER
+
+          cat > smoke/railway.toml <<'TOML'
+          [build]
+          builder = "DOCKERFILE"
+          dockerfilePath = "Dockerfile"
+
+          [deploy]
+          startCommand = "python /app/e2e.py"
+          restartPolicyType = "ON_FAILURE"
+          restartPolicyMaxRetries = 1
+          TOML
+
+      - name: Configure smoke against existing unified DEV services
+        shell: bash
+        run: |
+          set -euo pipefail
+          set_var() {
+            local name="$1" value="$2"
+            printf '%s' "$value" | railway variable set "$name" --service "$SMOKE_SERVICE" --stdin --skip-deploys >/dev/null
+          }
+
+          audit_db_ref='${{verigence-audit-core.DATABASE_URL}}'
+          security_db_ref='${{security.SECURITY_ROLE_DATABASE_URL}}'
+          di_db_ref='${{di-api.DI_DATABASE_URL}}'
+
+          set_var DUMMY_TENANT_ID "$DUMMY_TENANT_ID"
+          set_var TEST_CLIENT_ID "$TEST_CLIENT_ID"
+          set_var TEST_CLIENT_SECRET "$TEST_CLIENT_SECRET"
+          set_var TEST_REDIRECT_URI "$TEST_REDIRECT_URI"
+          set_var SECURITY_BASE_URL "http://security.railway.internal:${SECURITY_PORT}"
+          set_var AUDIT_BASE_URL "http://verigence-audit-core.railway.internal:${AUDIT_PORT}"
+          set_var SECURITY_DATABASE_URL "$security_db_ref"
+          set_var AUDIT_DATABASE_URL "$audit_db_ref"
+          set_var DI_DATABASE_URL "$di_db_ref"
+          set_var BOOKING_FORM_PATH '/app/booking_form_test.pdf'
+          set_var BOOKING_FORM_SHA256 "$BOOKING_FORM_SHA256"
+          echo 'DUMMYTENANT_EXACT_SMOKE_CONFIG=PASS'
+
+      - name: Run exact Booking Form E2E
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway up smoke --path-as-root --service "$SMOKE_SERVICE" --detach --yes \
+            --message "DummyTenant exact Booking Form E2E ${GITHUB_SHA}" >/dev/null
+
+          : > /tmp/e2e.log
+          for attempt in $(seq 1 12); do
+            sleep 25
+            railway logs --service "$SMOKE_SERVICE" --latest --deployment --lines 1000 > /tmp/e2e.log 2>&1 || true
+            if grep -q 'DUMMYTENANT_BOOKING_E2E=PASS' /tmp/e2e.log; then
+              break
+            fi
+            if grep -q 'Traceback (most recent call last)' /tmp/e2e.log; then
+              break
+            fi
+          done
+
+          cat /tmp/e2e.log
+          for marker in \
+            DUMMYTENANT_EXACT_BOOKING_FORM=PASS \
+            DUMMYTENANT_ROLE_TEMPLATES=PASS \
+            DUMMYTENANT_PC_USER=PASS \
+            DUMMYTENANT_AUDIT_FIXTURE=PASS \
+            DUMMYTENANT_BOOKING_PROFILE=PASS \
+            DUMMYTENANT_BOOKING_UPLOAD=PASS \
+            DUMMYTENANT_AUDIT_SECURITY_DI_PATH=PASS \
+            DUMMYTENANT_BOOKING_EXTRACTION=PASS \
+            DUMMYTENANT_BOOKING_CORE_FIELDS=PASS \
+            DUMMYTENANT_BOOKING_E2E=PASS; do
+            grep -q "$marker" /tmp/e2e.log || {
+              echo "Missing E2E marker: $marker" >&2
+              exit 1
+            }
+          done
+
+      - name: Stop smoke compute
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          railway down --service "$SMOKE_SERVICE" --yes >/dev/null 2>&1
+          exit 0
