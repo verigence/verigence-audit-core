@@ -55,7 +55,9 @@ def test_client_accepts_new_di_envelope_and_slim_document_contract() -> None:
                         "uploadStatus": "ACCEPTED",
                         "processingStatus": "PROCESSED",
                         "confirmationStatus": "CONFIRMED",
-                        "confidenceScore": 96.0,
+                        # DI DocumentData declares Decimal; Pydantic JSON emits
+                        # this as a numeric string in the live API response.
+                        "confidenceScore": "96.00",
                         "registeredAtUtc": "2026-08-16T10:00:00Z",
                     }
                 ),
@@ -118,6 +120,7 @@ def test_client_accepts_new_di_envelope_and_slim_document_contract() -> None:
     assert uploaded.verification_state is None
     assert document.processing_status == "PROCESSED"
     assert document.confirmation_status == "CONFIRMED"
+    assert document.confidence_score == 96.0
     assert document.correlation_id is None
     assert facts[0].field_key == "customer_name"
     assert facts[0].value == "Dummy Customer"
