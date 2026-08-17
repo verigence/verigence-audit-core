@@ -1,40 +1,29 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
-from typing import Any, Iterable
-from urllib.parse import quote
+from typing import Any, Self
 
 import httpx
 
-
-@dataclass(frozen=True)
-class DiClientError(Exception):
-    status_code: int
-    code: str
-    retryable: bool
-
-    def __str__(self) -> str:
-        return f"DI request failed: {self.code}"
+from audit_core.telemetry import record_metric, trace_span
 
 
 @dataclass(frozen=True)
 class DiSubject:
-    tenant_id: str
     subject_id: str
-    subject_type: str
-    display_name: str | None
     status: str
 
 
 @dataclass(frozen=True)
 class DiDocument:
-    tenant_id: str
-    subject_id: str
     document_id: str
+    subject_id: str | None
     upload_status: str
     processing_status: str
     confirmation_status: str | None
     verification_state: str | None
+    human_verification_status: str | None
     confidence_score: float | None
     correlation_id: str | None
 
@@ -44,10 +33,37 @@ class DiFact:
     canonical_field_id: str
     field_key: str
     value: Any
+    value_source: str
     confidence_score: float | None
+    version_no: int
+
+
+@dataclass(frozen=True)
+class DiVerification:
+    verification_id: str
+    document_id: str
+    verified_at: str
+    verified_by_actor_id: str
+    field_correction_count: int
+
+
+class DiClientError(RuntimeError):
+    def __init__(self, *, status_code: int, code: str, retryable: bool) -> None:
+        super().__init__(f"DI request failed: {code}")
+        self.status_code = status_code
+        self.code = code
+        self.retryable = retryable
 
 
 class DiClient:
+    """Maps DI HTTP contracts into stable Audit Core integration objects.
+
+    DI currently has two compatible wire generations in DEV: the original flat
+    resource responses and the newer ``ApiResponse`` envelope.  Audit Core keeps
+    that wire-format difference inside this client so business routes do not
+    need to care which DI revision is deployed.
+    """
+
     def __init__(
         self,
         *,
@@ -55,6 +71,8 @@ class DiClient:
         timeout_seconds: float = 15.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
+        if not base_url.strip():
+            raise ValueError("DI base URL is required")
         self._client = httpx.Client(
             base_url=base_url.rstrip("/"),
             timeout=timeout_seconds,
@@ -64,10 +82,10 @@ class DiClient:
     def close(self) -> None:
         self._client.close()
 
-    def __enter__(self) -> DiClient:
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *_: object) -> None:
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
 
     def create_subject(
@@ -76,15 +94,19 @@ class DiClient:
         token: str,
         tenant_id: str,
         subject_type: str,
-        display_name: str | None,
+        display_name: str | None = None,
     ) -> DiSubject:
-        response = self._client.post(
-            f"/v1/tenants/{quote(tenant_id, safe='')}/subjects",
-            headers=_headers(token),
+        payload = self._request_json(
+            "POST",
+            f"/v1/tenants/{tenant_id}/subjects",
+            operation="create_subject",
+            token=token,
             json={"subjectType": subject_type, "displayName": display_name},
         )
-        payload = self._request_json(response)
-        return _subject(payload, tenant_id=tenant_id)
+        return DiSubject(
+            subject_id=_required_str(payload, "subjectId"),
+            status=_required_str(payload, "status"),
+        )
 
     def upload_document(
         self,
@@ -97,23 +119,26 @@ class DiClient:
         content_type: str,
         source_channel: str,
         document_type_key: str | None = None,
+        captured_at: str | None = None,
+        source_reference: str | None = None,
+        replaces_document_id: str | None = None,
     ) -> DiDocument:
-        data: dict[str, str] = {}
-        if source_channel:
-            data["sourceChannel"] = source_channel
-        if document_type_key:
-            data["documentTypeKey"] = document_type_key
-        response = self._client.post(
-            (
-                f"/v1/tenants/{quote(tenant_id, safe='')}/subjects/"
-                f"{quote(subject_id, safe='')}/documents"
-            ),
-            headers=_headers(token),
+        form = {
+            "sourceChannel": source_channel,
+            "documentTypeKey": document_type_key,
+            "capturedAt": captured_at,
+            "sourceReference": source_reference,
+            "replacesDocumentId": replaces_document_id,
+        }
+        response = self._request_json(
+            "POST",
+            f"/v1/tenants/{tenant_id}/subjects/{subject_id}/documents",
+            operation="upload_document",
+            token=token,
+            data={key: value for key, value in form.items() if value is not None},
             files={"file": (filename, content, content_type)},
-            data=data,
         )
-        payload = self._request_json(response)
-        return _document(payload, tenant_id=tenant_id, subject_id=subject_id)
+        return _document(response, subject_id=subject_id)
 
     def get_document(
         self,
@@ -123,15 +148,13 @@ class DiClient:
         subject_id: str,
         document_id: str,
     ) -> DiDocument:
-        response = self._client.get(
-            (
-                f"/v1/tenants/{quote(tenant_id, safe='')}/subjects/"
-                f"{quote(subject_id, safe='')}/documents/{quote(document_id, safe='')}"
-            ),
-            headers=_headers(token),
+        payload = self._request_json(
+            "GET",
+            f"/v1/tenants/{tenant_id}/subjects/{subject_id}/documents/{document_id}",
+            operation="get_document",
+            token=token,
         )
-        payload = self._request_json(response)
-        return _document(payload, tenant_id=tenant_id, subject_id=subject_id)
+        return _document(payload, subject_id=subject_id)
 
     def get_document_facts(
         self,
@@ -141,123 +164,175 @@ class DiClient:
         subject_id: str,
         document_id: str,
     ) -> tuple[DiFact, ...]:
-        response = self._client.get(
-            (
-                f"/v1/tenants/{quote(tenant_id, safe='')}/subjects/"
-                f"{quote(subject_id, safe='')}/documents/{quote(document_id, safe='')}/fields"
-            ),
-            headers=_headers(token),
+        payload = self._request_json(
+            "GET",
+            f"/v1/tenants/{tenant_id}/subjects/{subject_id}/documents/{document_id}/fields",
+            operation="get_document_facts",
+            token=token,
         )
-        payload = self._request_json(response)
-        return _facts(payload)
+        fields = payload.get("fields")
+        if not isinstance(fields, list):
+            raise _contract_error()
+        return tuple(_fact(item) for item in fields)
 
-    def _request_json(self, response: httpx.Response) -> dict[str, Any]:
+    def verify_document(
+        self,
+        *,
+        token: str,
+        tenant_id: str,
+        subject_id: str,
+        document_id: str,
+        remarks: str | None = None,
+        field_corrections: list[dict[str, Any]] | None = None,
+    ) -> DiVerification:
+        payload = self._request_json(
+            "POST",
+            f"/v1/tenants/{tenant_id}/subjects/{subject_id}/documents/{document_id}/verification",
+            operation="verify_document",
+            token=token,
+            json={
+                "remarks": remarks,
+                "fieldCorrections": field_corrections or [],
+            },
+        )
+        return DiVerification(
+            verification_id=_required_str(payload, "verificationId"),
+            document_id=_required_str(payload, "documentId"),
+            verified_at=_required_str(payload, "verifiedAt"),
+            verified_by_actor_id=_required_str(payload, "verifiedByActorId"),
+            field_correction_count=_required_int(payload, "fieldCorrectionCount"),
+        )
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        operation: str,
+        token: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if not token:
+            raise ValueError("DI bearer token is required")
+        headers = dict(kwargs.pop("headers", {}))
+        headers["Authorization"] = f"Bearer {token}"
+        started = time.perf_counter()
+        result = "SUCCESS"
         try:
-            payload = response.json()
-        except ValueError as exc:
-            raise DiClientError(
-                status_code=response.status_code,
-                code="DI_INVALID_JSON",
-                retryable=response.status_code >= 500,
-            ) from exc
+            with trace_span(
+                "audit_core.dependency.di",
+                attributes={
+                    "dependency": "di",
+                    "operation": operation,
+                    "method": method,
+                },
+            ):
+                try:
+                    response = self._client.request(method, path, headers=headers, **kwargs)
+                except httpx.HTTPError as exc:
+                    result = "UNAVAILABLE"
+                    raise DiClientError(
+                        status_code=503,
+                        code="DI_UNAVAILABLE",
+                        retryable=True,
+                    ) from exc
 
-        if not isinstance(payload, dict):
-            raise DiClientError(
-                status_code=response.status_code,
-                code="DI_CONTRACT_ERROR",
-                retryable=False,
+                if response.status_code < 200 or response.status_code >= 300:
+                    result = "FAILURE"
+                    raise _http_error(response)
+                try:
+                    payload = response.json()
+                except ValueError as exc:
+                    result = "CONTRACT_ERROR"
+                    raise _contract_error() from exc
+                if not isinstance(payload, dict):
+                    result = "CONTRACT_ERROR"
+                    raise _contract_error()
+
+                # Newer DI revisions use {errorCode,errorMessage,data}.  Keep
+                # original flat responses supported for backward compatibility.
+                if "errorCode" in payload:
+                    error_code = payload.get("errorCode")
+                    if not isinstance(error_code, str):
+                        result = "CONTRACT_ERROR"
+                        raise _contract_error()
+                    if error_code != "000":
+                        result = "FAILURE"
+                        raise DiClientError(
+                            status_code=409,
+                            code=f"DI_{error_code}",
+                            retryable=False,
+                        )
+                    data = payload.get("data")
+                    if not isinstance(data, dict):
+                        result = "CONTRACT_ERROR"
+                        raise _contract_error()
+                    return data
+
+                return payload
+        finally:
+            duration_ms = (time.perf_counter() - started) * 1000.0
+            labels = {
+                "dependency": "di",
+                "operation": operation,
+                "method": method,
+                "result": result,
+            }
+            record_metric("audit_core.dependency.calls", labels=labels)
+            record_metric(
+                "audit_core.dependency.duration_ms",
+                duration_ms,
+                kind="histogram",
+                labels=labels,
             )
-
-        # D8 DI APIs wrap both success and business errors in the same envelope.
-        if "errorCode" in payload and "data" in payload:
-            error_code = payload.get("errorCode")
-            if error_code != "000":
-                code = f"DI_{error_code}" if isinstance(error_code, str) and error_code else "DI_ERROR"
-                status_code = 409 if response.status_code < 400 else response.status_code
-                raise DiClientError(status_code=status_code, code=code, retryable=status_code >= 500)
-            data = payload.get("data")
-            if not isinstance(data, dict):
-                raise _contract_error()
-            payload = data
-
-        if response.status_code >= 400:
-            raise _response_error(response, payload)
-        return payload
+            if result != "SUCCESS":
+                record_metric("audit_core.dependency.errors", labels=labels)
 
 
-def _headers(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
-
-
-def _subject(payload: dict[str, Any], *, tenant_id: str) -> DiSubject:
-    return DiSubject(
-        tenant_id=_optional_str(payload, "tenantId") or tenant_id,
-        subject_id=_required_str(payload, "subjectId"),
-        subject_type=_required_str(payload, "subjectType"),
-        display_name=_optional_str(payload, "displayName"),
-        status=_required_str(payload, "status"),
-    )
-
-
-def _document(
-    payload: dict[str, Any],
-    *,
-    subject_id: str,
-    tenant_id: str | None = None,
-) -> DiDocument:
-    # New public DI responses are intentionally slim.  Preserve compatibility
-    # with older full responses while leaving removed fields unset.
+def _document(payload: dict[str, Any], *, subject_id: str | None = None) -> DiDocument:
+    processing_status = _optional_str(payload, "processingStatus")
+    if processing_status is None:
+        raise _contract_error()
     return DiDocument(
-        tenant_id=_optional_str(payload, "tenantId") or tenant_id or "",
-        subject_id=_optional_str(payload, "subjectId") or subject_id,
         document_id=_required_str(payload, "documentId"),
+        subject_id=_optional_str(payload, "subjectId") or subject_id,
         upload_status=_required_str(payload, "uploadStatus"),
-        processing_status=_optional_str(payload, "processingStatus") or "UNKNOWN",
+        processing_status=processing_status,
         confirmation_status=_optional_str(payload, "confirmationStatus"),
-        verification_state=(
-            _optional_str(payload, "verificationState")
-            or _optional_str(payload, "humanVerificationStatus")
-        ),
+        verification_state=_optional_str(payload, "verificationState"),
+        human_verification_status=_optional_str(payload, "humanVerificationStatus"),
         confidence_score=_optional_float(payload, "confidenceScore"),
         correlation_id=_optional_str(payload, "correlationId"),
     )
 
 
-def _facts(payload: dict[str, Any]) -> tuple[DiFact, ...]:
-    rows = payload.get("facts")
-    if rows is None:
-        rows = payload.get("fields")
-    if not isinstance(rows, list):
+def _fact(payload: Any) -> DiFact:
+    if not isinstance(payload, dict):
         raise _contract_error()
-    facts: list[DiFact] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            raise _contract_error()
-        value = row.get("value") if "value" in row else row.get("currentValue")
-        facts.append(
-            DiFact(
-                canonical_field_id=(
-                    _optional_str(row, "canonicalFieldId")
-                    or _optional_str(row, "fieldId")
-                    or _required_str(row, "fieldKey")
-                ),
-                field_key=_required_str(row, "fieldKey"),
-                value=value,
-                confidence_score=_optional_float(row, "confidenceScore"),
-            )
-        )
-    return tuple(facts)
+    return DiFact(
+        canonical_field_id=_required_str(payload, "canonicalFieldId"),
+        field_key=_required_str(payload, "fieldKey"),
+        value=payload.get("currentValue"),
+        value_source=_required_str(payload, "valueSource"),
+        confidence_score=_optional_float(payload, "confidenceScore"),
+        version_no=_required_int(payload, "versionNo"),
+    )
 
 
-def _response_error(response: httpx.Response, payload: dict[str, Any]) -> DiClientError:
-    code = "DI_ERROR"
+def _http_error(response: httpx.Response) -> DiClientError:
+    code = f"DI_HTTP_{response.status_code}"
     retryable = response.status_code >= 500
-    candidate = payload.get("code") or payload.get("errorCode")
-    if isinstance(candidate, str) and candidate:
-        code = candidate
-    retryable_value = payload.get("retryable")
-    if isinstance(retryable_value, bool):
-        retryable = retryable_value
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        candidate = payload.get("code") or payload.get("errorCode")
+        if isinstance(candidate, str) and candidate:
+            code = candidate
+        retryable_value = payload.get("retryable")
+        if isinstance(retryable_value, bool):
+            retryable = retryable_value
     return DiClientError(status_code=response.status_code, code=code, retryable=retryable)
 
 
@@ -296,9 +371,6 @@ def _optional_float(payload: dict[str, Any], key: str) -> float | None:
         raise _contract_error()
     if isinstance(value, int | float):
         return float(value)
-    # DI's public document schema uses Decimal for document-level confidence.
-    # JSON serialization represents Decimal values as numeric strings, while
-    # field-level confidence is already emitted as a JSON number.
     if isinstance(value, str) and value.strip():
         try:
             return float(value)
