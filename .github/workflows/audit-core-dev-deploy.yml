@@ -1,0 +1,141 @@
+name: Deploy Audit Core DEV
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-dev-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      DEV_DATABASE_URL: ${{ secrets.DEV_DATABASE_URL }}
+      MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
+      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+    steps:
+      - name: Check out tested Audit Core revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Audit Core
+        run: python -m pip install -e .
+
+      - name: Apply Audit Core Neon migrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw="${MIGRATION_DATABASE_URL:-${DEV_DATABASE_URL:-}}"
+          if [[ -z "$raw" ]]; then
+            echo '::error::Neither MIGRATION_DATABASE_URL nor DEV_DATABASE_URL is configured.'
+            exit 1
+          fi
+          case "$raw" in
+            postgresql+psycopg://*) sqlalchemy_url="$raw" ;;
+            postgresql+asyncpg://*) sqlalchemy_url="postgresql+psycopg://${raw#postgresql+asyncpg://}" ;;
+            postgresql://*) sqlalchemy_url="postgresql+psycopg://${raw#postgresql://}" ;;
+            postgres://*) sqlalchemy_url="postgresql+psycopg://${raw#postgres://}" ;;
+            *) echo '::error::Configured Audit Core database secret is not a PostgreSQL URL.'; exit 1 ;;
+          esac
+          echo "::add-mask::$sqlalchemy_url"
+          DATABASE_URL="$sqlalchemy_url" alembic upgrade head
+
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Verify Audit Core Railway target
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway status --json >/tmp/status.json
+          railway service list --json >/tmp/services.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          project = json.loads(Path('/tmp/status.json').read_text())
+          services = json.loads(Path('/tmp/services.json').read_text())
+          if project.get('id') != os.environ['PLATFORM_PROJECT_ID']:
+              raise SystemExit('RAILWAY_TOKEN does not target the approved shared DEV project')
+          if not any(row.get('name') == os.environ['AUDIT_SERVICE'] for row in services):
+              raise SystemExit('Audit Core Railway service is missing from the approved shared DEV project')
+          print('AUDIT_CORE_RAILWAY_TARGET=PASS')
+          PY
+
+      - name: Deploy Audit Core only
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway up . --path-as-root --service "$AUDIT_SERVICE" --detach --yes \
+            --message "Audit Core DEV ${DEPLOY_SHA}" >/dev/null
+
+      - name: Verify Audit Core deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 10); do
+            railway deployment list --service "$AUDIT_SERVICE" --limit 1 --json >/tmp/audit-deployment.json
+            status="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/audit-deployment.json').read_text())
+          print(rows[0].get('status','') if rows else '')
+          PY
+          )"
+            case "$status" in
+              SUCCESS) echo 'AUDIT_CORE_DEPLOYMENT=PASS'; break ;;
+              FAILED|CRASHED|REMOVED)
+                railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 220 || true
+                echo "Audit Core deployment failed: $status" >&2
+                exit 1
+                ;;
+            esac
+            if [[ "$attempt" == "10" ]]; then
+              railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 220 || true
+              echo "Audit Core deployment did not reach SUCCESS: $status" >&2
+              exit 1
+            fi
+            sleep 15
+          done
+
+      - name: Smoke test Audit Core health when public domain exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          domain="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/audit-vars.json').read_text())
+          print(data.get('RAILWAY_PUBLIC_DOMAIN') or data.get('RAILWAY_STATIC_URL') or '')
+          PY
+          )"
+          if [[ -z "$domain" ]]; then
+            echo 'AUDIT_CORE_PUBLIC_HEALTH=SKIPPED|no public domain configured'
+            exit 0
+          fi
+          case "$domain" in
+            http://*|https://*) base="${domain%/}" ;;
+            *) base="https://${domain%/}" ;;
+          esac
+          curl --fail --silent --show-error "$base/health" >/tmp/audit-health.json
+          echo 'AUDIT_CORE_PUBLIC_HEALTH=PASS'
