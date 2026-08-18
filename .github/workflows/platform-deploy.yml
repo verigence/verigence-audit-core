@@ -1,338 +1,38 @@
-name: Deploy unified Railway platform DEV
+name: "DEPRECATED — Unified Railway platform DEV (DO NOT USE)"
+
+# DEPRECATED — DO NOT USE FOR NORMAL DEPLOYMENTS.
+#
+# This unified cross-module deployment workflow is obsolete and intentionally blocked.
+# Verigence now uses three independent CI/CD pipelines from each module's `main` branch:
+#
+#   Audit Core: verigence-audit-core/.github/workflows/audit-core-dev-deploy.yml
+#   Security:    verigence-security/.github/workflows/security-dev-deploy.yml
+#   DI:          verigence-di/.github/workflows/deploy-dev.yml
+#
+# Each module must be built, tested and deployed independently. Do not use this workflow
+# to redeploy unchanged modules together.
+#
+# The previous unified deployment implementation remains available in Git history if it
+# is ever needed for forensic/reference purposes. Re-enabling it requires an explicit
+# architecture/operations decision; do not remove this deprecation guard casually.
 
 on:
   workflow_dispatch:
-    inputs:
-      security_ref:
-        description: Security Git ref
-        required: true
-        default: main
-      di_ref:
-        description: DI Git ref
-        required: true
-        default: main
 
 permissions:
   contents: read
 
-concurrency:
-  group: unified-railway-platform-dev
-  cancel-in-progress: false
-
 jobs:
-  deploy:
+  deprecated:
+    name: "BLOCKED — use module-specific deployment pipelines"
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    env:
-      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
-      AUDIT_SERVICE: verigence-audit-core
-      SECURITY_SERVICE: security
-      DI_API_SERVICE: di-api
-      DI_WORKER_SERVICE: di-worker
-      DB_SERVICE: Postgres
-      SECURITY_PORT: "8001"
-      DI_PORT: "8000"
-      DEV_TENANT_ID: dev-auth-test
-      SECURITY_REF: ${{ inputs.security_ref }}
-      DI_REF: ${{ inputs.di_ref }}
-
     steps:
-      - name: Checkout Audit Core
-        uses: actions/checkout@v6
-        with:
-          path: _src/audit-core
-
-      - name: Checkout Security
-        uses: actions/checkout@v6
-        with:
-          repository: verigence/verigence-security
-          ref: ${{ env.SECURITY_REF }}
-          path: _src/security
-
-      - name: Checkout DI
-        uses: actions/checkout@v6
-        with:
-          repository: verigence/verigence-di
-          ref: ${{ env.DI_REF }}
-          path: _src/di
-
-      - name: Install Railway CLI
-        run: npm install --global @railway/cli
-
-      - name: Verify project, topology and source revisions
+      - name: Stop obsolete unified deployment
         shell: bash
         run: |
-          set -euo pipefail
-          railway status --json >/tmp/status.json
-          railway service list --json >/tmp/services.json
-          python - <<'PY'
-          import json, os
-          from pathlib import Path
-          status=json.loads(Path('/tmp/status.json').read_text())
-          if status.get('id') != os.environ['PLATFORM_PROJECT_ID']:
-              raise SystemExit('RAILWAY_TOKEN points to the wrong Railway project')
-          names={row.get('name') for row in json.loads(Path('/tmp/services.json').read_text())}
-          required={'verigence-audit-core','security','di-api','di-worker','Postgres','platform-smoke'}
-          missing=required-names
-          if missing:
-              raise SystemExit('bootstrap required; missing services: '+','.join(sorted(missing)))
-          if 'di-scheduler' in names:
-              raise SystemExit('unexpected di-scheduler service; scheduler must run inside di-worker')
-          print('PLATFORM_PROJECT_VERIFIED=PASS')
-          print('PLATFORM_SERVICE_INVENTORY=PASS')
-          PY
-          echo "AUDIT_CORE_SHA=$(git -C _src/audit-core rev-parse HEAD)"
-          echo "SECURITY_SHA=$(git -C _src/security rev-parse HEAD)"
-          echo "DI_SHA=$(git -C _src/di rev-parse HEAD)"
-
-      - name: Validate persisted secrets and runtime configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
-          railway variable list --service "$SECURITY_SERVICE" --json >/tmp/security-vars.json
-          railway variable list --service "$DI_API_SERVICE" --json >/tmp/di-api-vars.json
-          railway variable list --service "$DI_WORKER_SERVICE" --json >/tmp/di-worker-vars.json
-
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          audit=json.loads(Path('/tmp/audit-vars.json').read_text())
-          security=json.loads(Path('/tmp/security-vars.json').read_text())
-          api=json.loads(Path('/tmp/di-api-vars.json').read_text())
-          worker=json.loads(Path('/tmp/di-worker-vars.json').read_text())
-
-          if not audit.get('SECURITY_CLIENT_SECRET'):
-              raise SystemExit('Audit Core SECURITY_CLIENT_SECRET is missing')
-          if not (security.get('SECURITY_PRIVATE_KEY_PEM') or security.get('SECURITY_JWT_PRIVATE_KEY_PEM')):
-              raise SystemExit('Security signing key is missing; refusing implicit key rotation')
-
-          required_di=[
-              'DI_SECRET_KEY',
-              'DI_STORAGE_PROVIDER',
-              'DI_STORAGE_BUCKET',
-              'DI_STORAGE_ENDPOINT',
-              'DI_STORAGE_ACCESS_KEY_ID',
-              'DI_STORAGE_SECRET_ACCESS_KEY',
-          ]
-          for service_name, data in [('di-api', api), ('di-worker', worker)]:
-              missing=[key for key in required_di if not data.get(key)]
-              if missing:
-                  raise SystemExit(f'{service_name} missing persisted DI configuration: '+','.join(missing))
-
-          shared=[
-              'DI_SECRET_KEY','DI_STORAGE_PROVIDER','DI_STORAGE_BUCKET','DI_STORAGE_ENDPOINT',
-              'DI_STORAGE_REGION','DI_STORAGE_ACCESS_KEY_ID','DI_STORAGE_SECRET_ACCESS_KEY',
-              'DI_DOCAI_MOCK','DI_DOCAI_GEMINI_API_KEY',
-          ]
-          drift=[key for key in shared if (api.get(key) or '') != (worker.get(key) or '')]
-          if drift:
-              raise SystemExit('DI API/worker configuration drift: '+','.join(drift))
-          print('PLATFORM_PERSISTED_CONFIG=PASS')
-          print('PLATFORM_DI_CONFIG_PARITY=PASS')
-          PY
-
-          client_secret="$(python - <<'PY'
-          import json
-          from pathlib import Path
-          print(json.loads(Path('/tmp/audit-vars.json').read_text()).get('SECURITY_CLIENT_SECRET',''))
-          PY
-          )"
-          echo "::add-mask::$client_secret"
-          echo "AUDIT_CLIENT_SECRET=$client_secret" >> "$GITHUB_ENV"
-          digest="$(CLIENT_SECRET="$client_secret" python -c 'import hashlib,os; print(hashlib.sha256(os.environ["CLIENT_SECRET"].encode()).hexdigest())')"
-          echo "AUDIT_CLIENT_SECRET_SHA256=$digest" >> "$GITHUB_ENV"
-
-      - name: Configure stable private runtime wiring
-        shell: bash
-        run: |
-          set -euo pipefail
-          set_var() {
-            local service="$1" name="$2" value="$3"
-            printf '%s' "$value" | railway variable set "$name" --service "$service" --stdin --skip-deploys >/dev/null
-          }
-
-          db_ref="$(python -c 'print(chr(36)+chr(123)+chr(123)+"Postgres.DATABASE_URL"+chr(125)+chr(125))')"
-          clients_json="$(AUDIT_HASH="$AUDIT_CLIENT_SECRET_SHA256" python - <<'PY'
-          import json, os
-          print(json.dumps({
-              'audit-core': {
-                  'secret_sha256': os.environ['AUDIT_HASH'],
-                  'permissions': ['di.document.read','di.document.upload'],
-                  'redirect_uris': [],
-                  'public': False,
-              }
-          }, separators=(',', ':')))
-          PY
-          )"
-
-          set_var "$SECURITY_SERVICE" PORT "$SECURITY_PORT"
-          set_var "$SECURITY_SERVICE" SECURITY_KEY_ID security-unified-dev-1
-          set_var "$SECURITY_SERVICE" SECURITY_TOKEN_ISSUER verigence-security
-          set_var "$SECURITY_SERVICE" SECURITY_TOKEN_AUDIENCE verigence-platform
-          set_var "$SECURITY_SERVICE" SECURITY_ROLE_DATABASE_URL "$db_ref"
-          set_var "$SECURITY_SERVICE" SECURITY_INTEGRATION_CLIENTS_JSON "$clients_json"
-          set_var "$SECURITY_SERVICE" SECURITY_SESSION_COOKIE_SECURE true
-          set_var "$SECURITY_SERVICE" DEV_TENANT_ID "$DEV_TENANT_ID"
-
-          for service in "$DI_API_SERVICE" "$DI_WORKER_SERVICE"; do
-            set_var "$service" DI_ENV dev
-            set_var "$service" DI_DATABASE_URL "$db_ref"
-            set_var "$service" DI_SECURITY_JWKS_URL "http://security.railway.internal:${SECURITY_PORT}/.well-known/jwks.json"
-            set_var "$service" DI_LOG_LEVEL INFO
-          done
-          set_var "$DI_API_SERVICE" PORT "$DI_PORT"
-          set_var "$DI_API_SERVICE" DI_WORKER_ENABLED false
-          set_var "$DI_WORKER_SERVICE" DI_WORKER_ENABLED true
-          set_var "$DI_WORKER_SERVICE" DI_WORKER_ID unified-dev-worker
-
-          set_var "$AUDIT_SERVICE" SECURITY_BASE_URL "http://security.railway.internal:${SECURITY_PORT}"
-          set_var "$AUDIT_SERVICE" SECURITY_TOKEN_URL "http://security.railway.internal:${SECURITY_PORT}/oauth/token"
-          set_var "$AUDIT_SERVICE" SECURITY_JWKS_URL "http://security.railway.internal:${SECURITY_PORT}/.well-known/jwks.json"
-          set_var "$AUDIT_SERVICE" SECURITY_CLIENT_ID audit-core
-          set_var "$AUDIT_SERVICE" DI_BASE_URL "http://di-api.railway.internal:${DI_PORT}"
-          echo 'PLATFORM_PRIVATE_WIRING=PASS'
-
-      - name: Prepare Security private pre-deploy migration
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > _src/security/scripts/platform_predeploy.py <<'PY'
-          import os
-          from pathlib import Path
-          import psycopg
-          from verigence_security.auth_store import PostgresAuthStore
-          from verigence_security.role_templates import PostgresRoleTemplateStore, RoleTemplateService
-          from verigence_security.settings import normalize_database_url
-
-          db = normalize_database_url(os.environ['SECURITY_ROLE_DATABASE_URL'])
-          with psycopg.connect(db) as conn, conn.cursor() as cur:
-              for path in sorted(Path('database').glob('*.sql')):
-                  cur.execute(path.read_text(encoding='utf-8'))
-              conn.commit()
-          roles = RoleTemplateService(PostgresRoleTemplateStore(db))
-          roles.seed_platform_defaults()
-          roles.seed_tenant(
-              tenant_id=os.environ['DEV_TENANT_ID'],
-              actor_sub='PLATFORM_DEPLOY',
-              correlation_id=None,
-              replace=False,
-          )
-          PostgresAuthStore(db).ensure_tenant(os.environ['DEV_TENANT_ID'])
-          print('SECURITY_PRIVATE_MIGRATION=PASS', flush=True)
-          PY
-          cat > _src/security/railway.toml <<'TOML'
-          [build]
-          builder = "RAILPACK"
-
-          [deploy]
-          preDeployCommand = ["PYTHONPATH=src python scripts/platform_predeploy.py"]
-          startCommand = "PYTHONPATH=src uvicorn verigence_security.app:create_app --factory --host 0.0.0.0 --port $PORT"
-          restartPolicyType = "ON_FAILURE"
-          restartPolicyMaxRetries = 3
-          TOML
-
-      - name: Prepare DI Railway configs
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > /tmp/di-api-railway.toml <<'TOML'
-          [build]
-          builder = "DOCKERFILE"
-          dockerfilePath = "Dockerfile"
-
-          [deploy]
-          preDeployCommand = ["alembic upgrade head"]
-          startCommand = "sh -c 'uvicorn verigence.di.main:create_app --factory --host 0.0.0.0 --port ${PORT:-8000}'"
-          restartPolicyType = "ON_FAILURE"
-          restartPolicyMaxRetries = 3
-          TOML
-          cat > /tmp/di-worker-railway.toml <<'TOML'
-          [build]
-          builder = "DOCKERFILE"
-          dockerfilePath = "Dockerfile.worker"
-
-          [deploy]
-          startCommand = "python -m verigence.di.workers"
-          restartPolicyType = "ON_FAILURE"
-          restartPolicyMaxRetries = 10
-          TOML
-
-      - name: Deploy Security
-        shell: bash
-        run: |
-          set -euo pipefail
-          railway up _src/security --path-as-root --service "$SECURITY_SERVICE" --detach --yes --message "Stable DEV Security ${GITHUB_SHA}" >/dev/null
-
-      - name: Deploy DI API
-        shell: bash
-        run: |
-          set -euo pipefail
-          cp /tmp/di-api-railway.toml _src/di/backend/railway.toml
-          railway up _src/di/backend --path-as-root --service "$DI_API_SERVICE" --detach --yes --message "Stable DEV DI API ${GITHUB_SHA}" >/dev/null
-
-      - name: Deploy DI worker
-        shell: bash
-        run: |
-          set -euo pipefail
-          cp /tmp/di-worker-railway.toml _src/di/backend/railway.toml
-          railway up _src/di/backend --path-as-root --service "$DI_WORKER_SERVICE" --detach --yes --message "Stable DEV DI worker ${GITHUB_SHA}" >/dev/null
-
-      - name: Deploy Audit Core
-        shell: bash
-        run: |
-          set -euo pipefail
-          railway up _src/audit-core --path-as-root --service "$AUDIT_SERVICE" --detach --yes --message "Stable DEV Audit Core ${GITHUB_SHA}" >/dev/null
-
-      - name: Verify deployments with sparse polling
-        shell: bash
-        run: |
-          set -euo pipefail
-          sleep 45
-          get_status() {
-            local service="$1"
-            railway deployment list --service "$service" --limit 1 --json > "/tmp/${service}-deployment.json"
-            SERVICE_FILE="/tmp/${service}-deployment.json" python - <<'PY'
-          import json, os
-          from pathlib import Path
-          rows=json.loads(Path(os.environ['SERVICE_FILE']).read_text())
-          print(rows[0].get('status','') if rows else '')
-          PY
-          }
-
-          for service in "$SECURITY_SERVICE" "$DI_API_SERVICE" "$DI_WORKER_SERVICE" "$AUDIT_SERVICE"; do
-            status="$(get_status "$service")"
-            case "$status" in
-              SUCCESS) ;;
-              FAILED|CRASHED|REMOVED)
-                railway logs --service "$service" --latest --deployment --lines 220 || true
-                echo "$service deployment failed: $status" >&2
-                exit 1
-                ;;
-              *)
-                sleep 30
-                status="$(get_status "$service")"
-                if [[ "$status" != "SUCCESS" ]]; then
-                  railway logs --service "$service" --latest --deployment --lines 220 || true
-                  echo "$service did not become healthy: $status" >&2
-                  exit 1
-                fi
-                ;;
-            esac
-            echo "PLATFORM_DEPLOYMENT=PASS|$service"
-          done
-
-          railway logs --service "$SECURITY_SERVICE" --latest --deployment --lines 220 >/tmp/security.log || true
-          grep -q 'SECURITY_PRIVATE_MIGRATION=PASS' /tmp/security.log || {
-            echo 'Security private migration marker missing' >&2
-            tail -n 160 /tmp/security.log >&2
-            exit 1
-          }
-          railway logs --service "$DI_WORKER_SERVICE" --latest --deployment --lines 260 >/tmp/worker.log
-          grep -q 'DI_WORKER_STARTED=PASS' /tmp/worker.log || { tail -n 180 /tmp/worker.log >&2; exit 1; }
-          grep -q 'DI_EOD_SCHEDULER_STARTED=PASS' /tmp/worker.log || { tail -n 180 /tmp/worker.log >&2; exit 1; }
-          echo 'PLATFORM_SECURITY_PRIVATE_MIGRATION=PASS'
-          echo 'PLATFORM_DI_WORKER=PASS'
-          echo 'PLATFORM_DI_EOD_SCHEDULER=PASS'
-          echo 'PLATFORM_DEPLOY=PASS'
+          echo "::error::DEPRECATED: platform-deploy.yml must not be used for normal deployments."
+          echo "Audit Core deploy: .github/workflows/audit-core-dev-deploy.yml"
+          echo "Security deploy: verigence-security/.github/workflows/security-dev-deploy.yml"
+          echo "DI deploy: verigence-di/.github/workflows/deploy-dev.yml"
+          echo "Each module now has an independent CI/CD pipeline from main."
+          exit 1
