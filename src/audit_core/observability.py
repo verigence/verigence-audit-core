@@ -1,14 +1,14 @@
-import logging
 import time
 from uuid import uuid4
 
+import structlog
 from fastapi import FastAPI, Request, Response
 
 from audit_core.telemetry import record_metric, trace_span
 
 CORRELATION_HEADER = "X-Correlation-ID"
 TRACE_HEADER = "X-Trace-ID"
-logger = logging.getLogger("audit_core")
+logger = structlog.get_logger(__name__)
 
 
 def get_correlation_id(request: Request) -> str:
@@ -21,9 +21,11 @@ def get_correlation_id(request: Request) -> str:
 def install_observability(app: FastAPI) -> None:
     @app.middleware("http")
     async def correlation_and_request_log(request: Request, call_next) -> Response:
+        structlog.contextvars.clear_contextvars()
         correlation_id = request.headers.get(CORRELATION_HEADER) or str(uuid4())
         incoming_trace_id = request.headers.get(TRACE_HEADER)
         request.state.correlation_id = correlation_id
+        structlog.contextvars.bind_contextvars(correlation_id=correlation_id)
         status_code = 500
         started = time.perf_counter()
         with trace_span(
@@ -40,6 +42,14 @@ def install_observability(app: FastAPI) -> None:
                 response.headers[CORRELATION_HEADER] = correlation_id
                 response.headers[TRACE_HEADER] = trace_id
                 return response
+            except Exception:
+                logger.error(
+                    "unhandled_exception",
+                    method=request.method,
+                    path=request.url.path,
+                    exc_info=True,
+                )
+                raise
             finally:
                 duration_ms = (time.perf_counter() - started) * 1000.0
                 status_class = f"{status_code // 100}xx"
@@ -68,16 +78,13 @@ def install_observability(app: FastAPI) -> None:
                         },
                     )
                 logger.info(
-                    "request_complete",
-                    extra={
-                        "correlation_id": correlation_id,
-                        "trace_id": trace_id,
-                        "span_id": span_id,
-                        "method": request.method,
-                        "path": request.url.path,
-                        "status_code": status_code,
-                        "duration_ms": duration_ms,
-                    },
+                    "http_request",
+                    method=request.method,
+                    path=request.url.path,
+                    status_code=status_code,
+                    duration_ms=round(duration_ms, 2),
+                    trace_id=trace_id,
+                    span_id=span_id,
                 )
 
 
@@ -106,11 +113,9 @@ def log_dependency(
         record_metric("audit_core.dependency.errors", labels=labels)
     logger.info(
         "dependency_call",
-        extra={
-            "correlation_id": correlation_id,
-            "dependency": dependency,
-            "operation": operation,
-            "result": result,
-            "duration_ms": duration_ms,
-        },
+        correlation_id=correlation_id,
+        dependency=dependency,
+        operation=operation,
+        result=result,
+        duration_ms=duration_ms,
     )

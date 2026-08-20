@@ -1,6 +1,6 @@
-import logging
 from dataclasses import dataclass
 
+import structlog
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -9,7 +9,7 @@ from audit_core.authorization import AuthorizationError
 from audit_core.observability import CORRELATION_HEADER, get_correlation_id
 from audit_core.security import SecurityTokenError
 
-logger = logging.getLogger("audit_core")
+logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -44,11 +44,10 @@ def _problem(
     correlation_id = get_correlation_id(request)
     logger.warning(
         "api_error",
-        extra={
-            "correlation_id": correlation_id,
-            "error_code": error_code,
-            "status_code": status_code,
-        },
+        correlation_id=correlation_id,
+        error_code=error_code,
+        status_code=status_code,
+        title=title,
     )
     return JSONResponse(
         status_code=status_code,
@@ -108,6 +107,11 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def system_error(request: Request, exc: Exception) -> JSONResponse:
+        logger.error(
+            "system_error",
+            exc_type=type(exc).__name__,
+            exc_msg=str(exc),
+        )
         return _problem(
             request,
             error_code="VAC-SYS-001",

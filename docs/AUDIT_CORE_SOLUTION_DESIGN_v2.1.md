@@ -304,6 +304,16 @@ Human tasks use optimistic concurrency/version checks. Completion/cancellation r
 
 Audit Core verifies Security-issued JWTs via Security JWKS and authorizes using effective `permissions[]`. Token Tenant must match the Audit Project/Tenant context.
 
+### 10.1 Global USER and role-classification rule
+
+A human USER is a company employee represented by one global Security USER identity. Human onboarding is independent of Tenant, Project, Dealer, Outlet and operating role.
+
+Audit roles are USER classifications. They are not created as business identities owned by an individual Tenant. Tenant context is used for assigning/applying a USER role and resolving the functional permission bundle applicable in that Tenant.
+
+The same global USER may have a different Audit operating role in different Tenants, but within one Tenant a USER may have exactly one active Audit operating role.
+
+Approved Audit operating roles are:
+
 | Role | Baseline intent |
 |---|---|
 | PC | receive handoff, capture/upload evidence through Audit Core, record permitted operational/audit facts, field checks, remarks, daily operations, submit audit work |
@@ -312,7 +322,73 @@ Audit Core verifies Security-issued JWTs via Security JWKS and authorizes using 
 | CRM | execute durable CRM tasks and record outcomes |
 | Executive | **tenant-wide super privileges across Audit Core**, including read/oversight/admin/operational actions, **except delete/purge/destructive-delete privileges** |
 
-### 10.1 Executive no-delete rule
+Conceptually:
+
+```text
+GLOBAL USER U100
+  Tenant A -> PC
+  Tenant B -> TL
+  Tenant C -> PM
+```
+
+The same USER SHALL NOT hold more than one of `PC`, `TL`, `PM/PMO`, `CRM`, `Executive` in the same Tenant.
+
+### 10.2 Tenant-specific functional permission bundle
+
+The role classification is stable, while the functional permission bundle associated with that role is resolved in Tenant context.
+
+For example, `PC` remains the same role classification across the platform, but Tenant A and Tenant B may have separately approved `PC` permission mappings.
+
+Role-to-permission mapping may include capabilities from Audit Core and other approved modules where required by the end-to-end function. Security remains authoritative for the resulting effective permissions in the Tenant-scoped access context.
+
+Audit Core SHALL authorize runtime functionality from effective `permissions[]`; it SHALL NOT infer permission merely from the role name.
+
+### 10.3 Administrative roles and mutual exclusivity
+
+The currently approved administrative roles for this design are:
+
+- `ModuleAdmin`
+- `TenantAdmin`
+
+Administrative roles are USER-level administrative personas and are distinct from Audit operating roles.
+
+A USER holding `ModuleAdmin` or `TenantAdmin` SHALL NOT hold any Audit operating role (`PC`, `TL`, `PM/PMO`, `CRM`, `Executive`) in any Tenant. This is a USER-level exclusivity rule, not merely a per-Tenant restriction.
+
+Administrative roles may coexist with other administrative roles. Therefore a USER may simultaneously be both `ModuleAdmin` and `TenantAdmin` where authorized.
+
+`SuperAdmin` is a separate superior administrative role whose detailed authority and permission model are intentionally deferred. For the limited purpose of role coexistence, `SuperAdmin` may coexist with `ModuleAdmin` and/or `TenantAdmin`. No other `SuperAdmin` privilege semantics are defined by this section.
+
+Conceptually:
+
+```text
+VALID
+USER A -> ModuleAdmin + TenantAdmin
+USER B -> SuperAdmin + ModuleAdmin + TenantAdmin
+USER C -> Tenant A: PC, Tenant B: TL
+
+INVALID
+USER D -> ModuleAdmin + PC
+USER E -> TenantAdmin + Executive
+USER F -> SuperAdmin + TL
+```
+
+### 10.4 Dealer/Outlet is independent business assignment
+
+Dealer and Outlet are not part of role definition and are not encoded into the role permission bundle.
+
+Audit Core owns Dealer/Outlet business assignment separately from Security functional authorization.
+
+For Dealer/Outlet-scoped operations the runtime decision is two-dimensional:
+
+```text
+ALLOW = required Security functional permission
+        AND
+        required Audit Core Dealer/Outlet business assignment
+```
+
+Changing a USER's Dealer/Outlet assignment SHALL NOT change the USER's role. Changing the USER's role SHALL NOT automatically change Dealer/Outlet assignments.
+
+### 10.5 Executive no-delete rule
 
 For the current baseline:
 
@@ -321,7 +397,7 @@ For the current baseline:
 - corrections use auditable `retire`, `inactivate`, `supersede`, `void` or task `cancel` semantics where appropriate;
 - future destructive-delete capability requires explicit owner approval and separate permission/retention design.
 
-### 10.2 PC verification rule
+### 10.6 PC verification rule
 
 PC baseline permissions SHALL NOT include final `audit.*.verify` or DI verification-write capabilities merely because PC captured evidence. Formal validation/verification belongs to TL/PM according to approved process policy.
 
@@ -416,7 +492,9 @@ The next physical schema (`VAC-DB-002`) must reflect:
 - structured authoritative audit history;
 - idempotency/outbox/inbox;
 - immutable published master versions;
-- no dependency on destructive user-facing delete lifecycle.
+- no dependency on destructive user-facing delete lifecycle;
+- Dealer/Outlet business assignment independent of USER role and Security permission mapping;
+- no Audit Core duplication of Security role-to-permission authority.
 
 The previous `VAC-DB-001 v1.0` remains on implementation hold and SHALL NOT be deployed unchanged.
 
@@ -437,6 +515,7 @@ The previous `VAC-DB-001 v1.0` remains on implementation hold and SHALL NOT be d
 11. Repeat-customer reuse/link policy.
 12. Dealer Outlet <-> Security Location cardinality.
 13. Canonical actual dealership delivery-status vocabulary/code set.
+14. Detailed `SuperAdmin` authority, privilege boundaries and permission bundle.
 
 ---
 
@@ -450,3 +529,5 @@ The previous `VAC-DB-001 v1.0` remains on implementation hold and SHALL NOT be d
 6. Executive becomes tenant-wide super privileged except delete/purge/destructive operations.
 7. DELETE operations are excluded from the baseline public API.
 8. A human-readable API contract and machine-readable OpenAPI contract are introduced.
+9. USER role classification is separated from Tenant-specific functional permission mapping and Dealer/Outlet business assignment.
+10. Administrative and operating role classes are made mutually exclusive at USER level, while administrative roles may coexist with one another.

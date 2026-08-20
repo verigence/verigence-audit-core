@@ -5,8 +5,11 @@ from dataclasses import dataclass
 from typing import Any, Self
 
 import httpx
+import structlog
 
 from audit_core.telemetry import record_metric, trace_span
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -212,6 +215,7 @@ class DiClient:
         headers["Authorization"] = f"Bearer {token}"
         started = time.perf_counter()
         result = "SUCCESS"
+        logger.debug("di_call_start", operation=operation, method=method)
         try:
             with trace_span(
                 "audit_core.dependency.di",
@@ -260,6 +264,20 @@ class DiClient:
             )
             if result != "SUCCESS":
                 record_metric("audit_core.dependency.errors", labels=labels)
+                logger.warning(
+                    "di_call_failed",
+                    operation=operation,
+                    error_code=result,
+                    duration_ms=round(duration_ms, 2),
+                )
+            else:
+                logger.info(
+                    "di_call_complete",
+                    operation=operation,
+                    method=method,
+                    duration_ms=round(duration_ms, 2),
+                    result=result,
+                )
 
 
 def _document(payload: dict[str, Any]) -> DiDocument:

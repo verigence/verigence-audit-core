@@ -16,6 +16,7 @@ from audit_core.evidence_read import router as evidence_read_router
 from audit_core.findings import router as findings_router
 from audit_core.insurance_tradein import router as insurance_tradein_router
 from audit_core.journeys import router as journey_router
+from audit_core.logging_config import configure_logging
 from audit_core.observability import install_observability
 from audit_core.payments_finance import router as payments_finance_router
 from audit_core.projects import router as project_router
@@ -26,6 +27,7 @@ from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
 def create_app() -> FastAPI:
     settings = load_settings()
+    configure_logging(settings)
     application = FastAPI(
         title=settings.service_name,
         docs_url=None,

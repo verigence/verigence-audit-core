@@ -3,11 +3,14 @@ from collections.abc import Iterator
 from functools import lru_cache
 from typing import Annotated
 
+import structlog
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import Connection, Engine, create_engine, text
 
 from audit_core.security import Principal, SecurityTokenError, SecurityTokenValidator
+
+logger = structlog.get_logger(__name__)
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -47,8 +50,12 @@ def get_principal(
     if not jwks_url or not issuer or not audience:
         raise RuntimeError("Security JWT verification is not configured")
 
-    return SecurityTokenValidator(
-        jwks_url=jwks_url,
-        issuer=issuer,
-        audience=audience,
-    ).validate(bearer_token)
+    try:
+        return SecurityTokenValidator(
+            jwks_url=jwks_url,
+            issuer=issuer,
+            audience=audience,
+        ).validate(bearer_token)
+    except SecurityTokenError as exc:
+        logger.warning("auth_failed", reason=str(exc))
+        raise

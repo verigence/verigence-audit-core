@@ -4,9 +4,12 @@ from collections.abc import Iterable
 from typing import Any, Self
 
 import httpx
+import structlog
 
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
 ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
+
+logger = structlog.get_logger(__name__)
 
 
 class SecurityTokenError(RuntimeError):
@@ -72,13 +75,24 @@ class SecurityOAuthClient:
         )
 
     def _request_token(self, form: dict[str, str]) -> str:
+        logger.debug(
+            "security_token_exchange_start",
+            grant_type=form.get("grant_type"),
+            scope=form.get("scope"),
+        )
         try:
             response = self._client.post("/oauth/token", data=form)
         except httpx.HTTPError as exc:
+            logger.warning("security_token_exchange_failed", reason="endpoint_unavailable")
             raise SecurityTokenError("Security token endpoint is unavailable") from exc
 
         if response.status_code != 200:
             error = _safe_oauth_error(response)
+            logger.warning(
+                "security_token_exchange_failed",
+                http_status=response.status_code,
+                error=error,
+            )
             raise SecurityTokenError(
                 f"Security token request denied with HTTP {response.status_code}: {error}"
             )
