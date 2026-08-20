@@ -15,7 +15,7 @@ import logging
 import logging.handlers
 import sys
 import threading
-from typing import Any
+from typing import Any, ClassVar
 
 import structlog
 from structlog.types import EventDict, WrappedLogger
@@ -30,7 +30,7 @@ from audit_core.config import Settings
 class _LevelFilter:
     """Drop log records below *min_level*."""
 
-    _LEVELS: dict[str, int] = {
+    _LEVELS: ClassVar[dict[str, int]] = {
         "DEBUG": 10,
         "INFO": 20,
         "WARNING": 30,
@@ -53,7 +53,7 @@ class _LevelFilter:
 class _AxiomDrain:
     """Best-effort background drain to Axiom's ingest API."""
 
-    _INGEST_URL = "https://api.axiom.co/v1/datasets/{dataset}/ingest"
+    _INGEST_URL: ClassVar[str] = "https://api.axiom.co/v1/datasets/{dataset}/ingest"
 
     def __init__(self, *, token: str, dataset: str) -> None:
         self._token = token
