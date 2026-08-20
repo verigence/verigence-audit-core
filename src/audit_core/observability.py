@@ -43,11 +43,10 @@ def install_observability(app: FastAPI) -> None:
                 response.headers[TRACE_HEADER] = trace_id
                 return response
             except Exception:
-                logger.error(
+                logger.exception(
                     "unhandled_exception",
                     method=request.method,
                     path=request.url.path,
-                    exc_info=True,
                 )
                 raise
             finally:
