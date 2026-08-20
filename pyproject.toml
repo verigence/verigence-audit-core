@@ -16,6 +16,7 @@ dependencies = [
     "PyJWT[crypto]==2.13.0",
     "httpx==0.28.1",
     "python-multipart==0.0.22",
+    "structlog>=24.1.0",
 ]
 
 [project.optional-dependencies]

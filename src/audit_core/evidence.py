@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from typing import Annotated
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, File, Form, Header, Request, UploadFile, status
 from pydantic import BaseModel
 from sqlalchemy import Connection, Engine, text
@@ -20,6 +21,8 @@ from audit_core.errors import AuditCoreError, ConflictError, NotFoundError
 from audit_core.observability import get_correlation_id
 from audit_core.security import Principal
 from audit_core.security_integration import SecurityOAuthClient, SecurityTokenError
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["evidence"])
 _OPERATION_KEY = "UPLOAD_JOURNEY_EVIDENCE"
@@ -538,6 +541,13 @@ def _link_evidence(
             verificationStatus=document.verification_state,
             createdAtUtc=row["linked_at_utc"].isoformat(),
         )
+        logger.info(
+            "evidence_linked",
+            evidence_id=str(response.evidenceId),
+            journey_id=str(journey_id),
+            tenant_id=tenant_id,
+            document_id=document.document_id,
+        )
         connection.execute(
             text(
                 """
@@ -593,6 +603,16 @@ def upload_journey_evidence(
     content = file.file.read()
     filename = file.filename or "evidence"
     content_type = file.content_type or "application/octet-stream"
+
+    logger.info(
+        "evidence_upload_started",
+        journey_id=str(journey_id),
+        tenant_id=tenant_id,
+        evidence_purpose=evidence_purpose,
+        filename=filename,
+        size_bytes=len(content),
+    )
+
     request_hash = _request_hash(
         journey_id=journey_id,
         evidence_purpose=evidence_purpose,
@@ -657,6 +677,12 @@ def upload_journey_evidence(
                 display_name=display_name,
             )
             subject_id = UUID(subject.subject_id)
+            logger.info(
+                "di_subject_created",
+                subject_id=str(subject_id),
+                tenant_id=tenant_id,
+                customer_id=str(customer_id),
+            )
             _persist_subject_mapping(
                 engine,
                 tenant_id=tenant_id,
@@ -680,6 +706,13 @@ def upload_journey_evidence(
                 error_code=code,
                 error_summary="DI subject resolution failed",
                 increment_attempt=True,
+            )
+            logger.warning(
+                "evidence_upload_failed",
+                error_code=code,
+                retryable=isinstance(exc, DiClientError) and exc.retryable,
+                journey_id=str(journey_id),
+                tenant_id=tenant_id,
             )
             raise _dependency_error(exc) from exc
 
@@ -705,6 +738,13 @@ def upload_journey_evidence(
                 error_code=code,
                 error_summary="DI recovery status refresh failed",
                 increment_attempt=True,
+            )
+            logger.warning(
+                "evidence_upload_failed",
+                error_code=code,
+                retryable=isinstance(exc, DiClientError) and exc.retryable,
+                journey_id=str(journey_id),
+                tenant_id=tenant_id,
             )
             raise _dependency_error(exc) from exc
     else:
@@ -732,6 +772,12 @@ def upload_journey_evidence(
                 document_type_key=document_type_key,
             )
             document_id = UUID(document.document_id)
+            logger.info(
+                "di_document_uploaded",
+                document_id=str(document_id),
+                subject_id=str(subject_id),
+                tenant_id=tenant_id,
+            )
             _update_operation(
                 engine,
                 tenant_id=tenant_id,
@@ -750,6 +796,13 @@ def upload_journey_evidence(
                 di_subject_id=subject_id,
                 error_code=code,
                 error_summary="DI document submission failed",
+            )
+            logger.warning(
+                "evidence_upload_failed",
+                error_code=code,
+                retryable=isinstance(exc, DiClientError) and exc.retryable,
+                journey_id=str(journey_id),
+                tenant_id=tenant_id,
             )
             raise _dependency_error(exc) from exc
 

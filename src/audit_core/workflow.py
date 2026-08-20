@@ -4,9 +4,12 @@ import json
 from typing import Any
 from uuid import UUID
 
+import structlog
 from sqlalchemy import Connection, text
 
 from audit_core.errors import AuditCoreError, NotFoundError
+
+logger = structlog.get_logger(__name__)
 
 
 def create_workflow_task(
@@ -85,6 +88,13 @@ def create_workflow_task(
         actor_id=None,
         reason=None,
         correlation_id=correlation_id,
+    )
+    logger.info(
+        "workflow_task_created",
+        task_id=str(task_id),
+        task_type=task_type,
+        journey_id=str(journey_id),
+        tenant_id=tenant_id,
     )
     return task_id
 
@@ -571,6 +581,11 @@ def recover_stale_worker_tasks(
             reason="LEASE_LOST",
             correlation_id=row["correlation_id"],
         )
+        logger.warning(
+            "workflow_task_stale_recovered",
+            task_id=str(row["workflow_task_id"]),
+            tenant_id=tenant_id,
+        )
     return [row["workflow_task_id"] for row in rows]
 
 
@@ -616,6 +631,14 @@ def _transition_task(
             workflow_task_id=workflow_task_id,
         )
         raise _transition_error(task["task_status"], next_status)
+    logger.info(
+        "workflow_task_transition",
+        task_id=str(workflow_task_id),
+        from_status=expected_status,
+        to_status=next_status,
+        actor_id=actor_id,
+        tenant_id=tenant_id,
+    )
     _append_task_event(
         connection,
         tenant_id=tenant_id,
