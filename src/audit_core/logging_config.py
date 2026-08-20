@@ -9,7 +9,7 @@ Everywhere else, obtain a logger at module level::
 Never pass the logger as a function argument.  Never use f-strings or string
 concatenation inside log calls — use keyword arguments only.
 """
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import logging
 import sys
