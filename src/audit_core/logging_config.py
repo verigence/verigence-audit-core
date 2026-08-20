@@ -12,7 +12,6 @@ concatenation inside log calls — use keyword arguments only.
 from __future__ import annotations
 
 import logging
-import logging.handlers
 import sys
 import threading
 from typing import Any, ClassVar
