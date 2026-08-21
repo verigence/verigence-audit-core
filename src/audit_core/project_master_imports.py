@@ -678,7 +678,8 @@ def _overlap_warning(
                     WHERE tenant_id=:tenant_id
                       AND lifecycle_status='PUBLISHED'
                       AND ({end_column} IS NULL OR {end_column} >= :effective_from)
-                      AND (:effective_to IS NULL OR {start_column} <= :effective_to)
+                      AND (CAST(:effective_to AS date) IS NULL
+                           OR {start_column} <= CAST(:effective_to AS date))
                 )
                 """
             ),
