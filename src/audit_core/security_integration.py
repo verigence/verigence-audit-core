@@ -18,7 +18,11 @@ class SecurityTokenError(RuntimeError):
 
 
 class SecurityAdminError(RuntimeError):
-    """Security could not provide trustworthy human administrative context."""
+    """Security could not complete a human administrative request."""
+
+    def __init__(self, message: str, *, http_status: int | None = None) -> None:
+        super().__init__(message)
+        self.http_status = http_status
 
 
 @dataclass(frozen=True)
@@ -41,6 +45,15 @@ class SecurityGlobalUser:
     display_name: str
     primary_email: str | None
     status: str
+
+
+@dataclass(frozen=True)
+class SecurityOperatingRoleMutation:
+    tenant_id: str
+    user_id: str
+    changed: bool
+    assignment_id: str | None
+    role_key: str | None
 
 
 class SecurityAdminClient:
@@ -165,6 +178,61 @@ class SecurityAdminClient:
             )
         return tuple(users)
 
+    def set_operating_role(
+        self,
+        *,
+        human_bearer_token: str,
+        tenant_id: str,
+        user_id: str,
+        role_key: str,
+    ) -> SecurityOperatingRoleMutation:
+        payload = self._request_json(
+            "PUT",
+            f"/security/v1/tenants/{tenant_id}/users/{user_id}/operating-role",
+            human_bearer_token=human_bearer_token,
+            json_body={"roleKey": role_key},
+        )
+        return self._operating_role_mutation(payload)
+
+    def remove_operating_role(
+        self,
+        *,
+        human_bearer_token: str,
+        tenant_id: str,
+        user_id: str,
+    ) -> SecurityOperatingRoleMutation:
+        payload = self._request_json(
+            "DELETE",
+            f"/security/v1/tenants/{tenant_id}/users/{user_id}/operating-role",
+            human_bearer_token=human_bearer_token,
+        )
+        return self._operating_role_mutation(payload)
+
+    @staticmethod
+    def _operating_role_mutation(payload: dict[str, Any]) -> SecurityOperatingRoleMutation:
+        tenant_id = payload.get("tenantId")
+        user_id = payload.get("userId")
+        changed = payload.get("changed")
+        assignment_id = payload.get("assignmentId")
+        role_key = payload.get("roleKey")
+        if (
+            not isinstance(tenant_id, str)
+            or not tenant_id
+            or not isinstance(user_id, str)
+            or not user_id
+            or not isinstance(changed, bool)
+            or (assignment_id is not None and not isinstance(assignment_id, str))
+            or (role_key is not None and not isinstance(role_key, str))
+        ):
+            raise SecurityAdminError("Security operating-role response has invalid shape")
+        return SecurityOperatingRoleMutation(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            changed=changed,
+            assignment_id=assignment_id,
+            role_key=role_key,
+        )
+
     def _request_json(
         self,
         method: str,
@@ -238,7 +306,8 @@ class SecurityAdminClient:
                 path=path,
             )
             raise SecurityAdminError(
-                f"Security administrative request failed with HTTP {response.status_code}"
+                f"Security administrative request failed with HTTP {response.status_code}",
+                http_status=response.status_code,
             )
         try:
             return response.json()
