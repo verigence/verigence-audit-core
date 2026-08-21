@@ -23,6 +23,16 @@ class AuditCoreError(RuntimeError):
         return self.title
 
 
+class ValidationError(AuditCoreError):
+    def __init__(self, *, detail: str) -> None:
+        super().__init__("VAC-VAL-001", 400, "Validation failed", detail)
+
+
+class BusinessValidationError(AuditCoreError):
+    def __init__(self, *, detail: str) -> None:
+        super().__init__("VAC-VAL-002", 422, "Business validation failed", detail)
+
+
 class NotFoundError(AuditCoreError):
     def __init__(self, *, error_code: str, title: str, detail: str) -> None:
         super().__init__(error_code, 404, title, detail)
