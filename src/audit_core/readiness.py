@@ -14,6 +14,7 @@ from audit_core.dependencies import (
     get_connection,
     require_super_admin_request,
 )
+from audit_core.di_client import DiClient, DiClientError
 from audit_core.errors import NotFoundError
 from audit_core.security_integration import SecurityAdminClient, SecurityAdminError
 
@@ -21,6 +22,18 @@ router = APIRouter(prefix="/v1/tenants/{tenant_id}/project", tags=["project-read
 
 ReadinessSeverity = Literal["BLOCKING", "WARNING", "INFO"]
 ReadinessStatus = Literal["PASS", "FAIL", "PENDING"]
+
+_REQUIRED_AUDIT_CORE_MASTERS = {
+    "PRODUCT_MASTER": "Product Master",
+    "PROJECT_POLICY": "Project Policy",
+    "DOCUMENT_REQUIREMENT_PROFILE": "Document Requirement Profile",
+    "AUDIT_CONTROL": "Audit Control",
+}
+_REQUIRED_DI_MASTER_STATES = {
+    "DOCUMENT_TYPES": "ACTIVE",
+    "EXTRACTION_PROFILES": "PUBLISHED",
+    "REQUIREMENT_PROFILES": "PUBLISHED",
+}
 
 
 class ReadinessCheck(BaseModel):
@@ -42,6 +55,13 @@ def _security_base_url() -> str:
     value = os.environ.get("SECURITY_BASE_URL", "").strip()
     if not value:
         raise RuntimeError("SECURITY_BASE_URL is required for UC02 administration")
+    return value
+
+
+def _di_base_url() -> str:
+    value = os.environ.get("DI_BASE_URL", "").strip()
+    if not value:
+        raise RuntimeError("DI_BASE_URL is required for UC02 administration")
     return value
 
 
@@ -203,6 +223,122 @@ def _pc_coverage_check(connection: Connection, tenant_id: str) -> ReadinessCheck
     )
 
 
+def _project_masters_check(connection: Connection, tenant_id: str) -> ReadinessCheck:
+    queries = {
+        "PRODUCT_MASTER": """
+            SELECT EXISTS (
+                SELECT 1 FROM auditcore.project_product_master_versions
+                WHERE tenant_id=:tenant_id AND lifecycle_status='PUBLISHED'
+            )
+        """,
+        "PROJECT_POLICY": """
+            SELECT EXISTS (
+                SELECT 1 FROM auditcore.project_policy_versions
+                WHERE tenant_id=:tenant_id AND lifecycle_status='PUBLISHED'
+            )
+        """,
+        "DOCUMENT_REQUIREMENT_PROFILE": """
+            SELECT EXISTS (
+                SELECT 1 FROM auditcore.document_requirement_profile_versions
+                WHERE tenant_id=:tenant_id AND lifecycle_status='PUBLISHED'
+            )
+        """,
+        "AUDIT_CONTROL": """
+            SELECT EXISTS (
+                SELECT 1 FROM auditcore.audit_control_versions
+                WHERE tenant_id=:tenant_id AND lifecycle_status='PUBLISHED'
+            )
+        """,
+    }
+    missing = [
+        _REQUIRED_AUDIT_CORE_MASTERS[key]
+        for key, query in queries.items()
+        if not bool(
+            connection.execute(text(query), {"tenant_id": tenant_id}).scalar_one()
+        )
+    ]
+    return ReadinessCheck(
+        area="PROJECT_MASTERS",
+        checkKey="PROJECT_MASTERS_READY",
+        severity="BLOCKING",
+        status="PASS" if not missing else "FAIL",
+        message=(
+            "Required Audit Core Project Masters have published versions."
+            if not missing
+            else "Publish required Project Master(s): " + ", ".join(missing) + "."
+        ),
+        targetTask="PROJECT_MASTERS",
+    )
+
+
+def _di_project_check(*, tenant_id: str, human_bearer_token: str) -> ReadinessCheck:
+    try:
+        with DiClient(base_url=_di_base_url()) as client:
+            provisioning = client.get_project_provisioning(
+                human_token=human_bearer_token,
+                tenant_id=tenant_id,
+            )
+            if provisioning.get("provisioningStatus") != "READY":
+                return ReadinessCheck(
+                    area="DI",
+                    checkKey="DI_PROJECT_READY",
+                    severity="BLOCKING",
+                    status="FAIL",
+                    message="Document Intelligence Project provisioning is incomplete.",
+                    targetTask="PROJECT_MASTERS",
+                )
+            catalogue = client.list_project_masters(
+                human_token=human_bearer_token,
+                tenant_id=tenant_id,
+            )
+            available = {
+                str(item.get("masterKey")): item
+                for item in catalogue
+                if isinstance(item.get("masterKey"), str)
+            }
+            missing_domains = [
+                key for key in _REQUIRED_DI_MASTER_STATES if key not in available
+            ]
+            wrong_states: list[str] = []
+            for master_key, expected_state in _REQUIRED_DI_MASTER_STATES.items():
+                if master_key not in available:
+                    continue
+                payload = client.list_project_master_versions(
+                    human_token=human_bearer_token,
+                    tenant_id=tenant_id,
+                    master_key=master_key,
+                )
+                versions = payload.get("versions")
+                if not isinstance(versions, list) or not any(
+                    isinstance(version, dict) and version.get("status") == expected_state
+                    for version in versions
+                ):
+                    wrong_states.append(f"{master_key} ({expected_state})")
+    except DiClientError:
+        return ReadinessCheck(
+            area="DI",
+            checkKey="DI_PROJECT_READY",
+            severity="BLOCKING",
+            status="PENDING",
+            message="Document Intelligence readiness could not be verified yet.",
+            targetTask="PROJECT_MASTERS",
+        )
+
+    failures = [*missing_domains, *wrong_states]
+    return ReadinessCheck(
+        area="DI",
+        checkKey="DI_PROJECT_READY",
+        severity="BLOCKING",
+        status="PASS" if not failures else "FAIL",
+        message=(
+            "Document Intelligence provisioning and required configuration are ready."
+            if not failures
+            else "Complete DI Project configuration: " + ", ".join(failures) + "."
+        ),
+        targetTask="PROJECT_MASTERS",
+    )
+
+
 def _optional_map_metadata_check(connection: Connection, tenant_id: str) -> ReadinessCheck:
     incomplete = connection.execute(
         text(
@@ -238,27 +374,6 @@ def _optional_map_metadata_check(connection: Connection, tenant_id: str) -> Read
     )
 
 
-def _pending_owned_dependency_checks() -> list[ReadinessCheck]:
-    return [
-        ReadinessCheck(
-            area="PROJECT_MASTERS",
-            checkKey="PROJECT_MASTERS_READY",
-            severity="BLOCKING",
-            status="PENDING",
-            message="Project Master readiness will be evaluated by the Project Masters package.",
-            targetTask="PROJECT_MASTERS",
-        ),
-        ReadinessCheck(
-            area="DI",
-            checkKey="DI_PROJECT_READY",
-            severity="BLOCKING",
-            status="PENDING",
-            message="Document Intelligence readiness will be evaluated by the DI package.",
-            targetTask="PROJECT_MASTERS",
-        ),
-    ]
-
-
 def evaluate_project_readiness(
     *,
     tenant_id: str,
@@ -275,7 +390,11 @@ def evaluate_project_readiness(
         ),
         _dealer_outlet_structure_check(connection, tenant_id),
         _pc_coverage_check(connection, tenant_id),
-        *_pending_owned_dependency_checks(),
+        _project_masters_check(connection, tenant_id),
+        _di_project_check(
+            tenant_id=tenant_id,
+            human_bearer_token=admin_request.bearer_token,
+        ),
         _optional_map_metadata_check(connection, tenant_id),
     ]
     ready = all(
