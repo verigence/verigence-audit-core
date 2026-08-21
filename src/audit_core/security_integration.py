@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any, Self
 
 import httpx
@@ -14,6 +15,138 @@ logger = structlog.get_logger(__name__)
 
 class SecurityTokenError(RuntimeError):
     """Security did not issue the requested downstream access token."""
+
+
+class SecurityAdminError(RuntimeError):
+    """Security could not provide trustworthy human administrative context."""
+
+
+@dataclass(frozen=True)
+class SecurityAdminScope:
+    role_key: str
+    scope_type: str
+    scope_id: str | None
+
+
+@dataclass(frozen=True)
+class SecurityAdminContext:
+    user_id: str
+    is_super_admin: bool
+    admin_scopes: tuple[SecurityAdminScope, ...]
+
+
+class SecurityAdminClient:
+    """Human-admin client that always forwards the initiating Security bearer token."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        timeout_seconds: float = 5.0,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        if not base_url.strip():
+            raise ValueError("Security base URL is required")
+        self._client = httpx.Client(
+            base_url=base_url.rstrip("/"),
+            timeout=timeout_seconds,
+            transport=transport,
+        )
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+    def get_admin_context(self, *, human_bearer_token: str) -> SecurityAdminContext:
+        payload = self._request_json(
+            "GET",
+            "/security/v1/platform/admin-context",
+            human_bearer_token=human_bearer_token,
+        )
+        user_id = payload.get("userId")
+        is_super_admin = payload.get("isSuperAdmin")
+        raw_scopes = payload.get("adminScopes")
+        if (
+            not isinstance(user_id, str)
+            or not user_id
+            or not isinstance(is_super_admin, bool)
+            or not isinstance(raw_scopes, list)
+        ):
+            raise SecurityAdminError("Security admin-context response has invalid shape")
+
+        scopes: list[SecurityAdminScope] = []
+        for raw in raw_scopes:
+            if not isinstance(raw, dict):
+                raise SecurityAdminError("Security admin-context scope has invalid shape")
+            role_key = raw.get("roleKey")
+            scope_type = raw.get("scopeType")
+            scope_id = raw.get("scopeId")
+            if (
+                not isinstance(role_key, str)
+                or not role_key
+                or not isinstance(scope_type, str)
+                or not scope_type
+                or (scope_id is not None and not isinstance(scope_id, str))
+            ):
+                raise SecurityAdminError("Security admin-context scope has invalid shape")
+            scopes.append(
+                SecurityAdminScope(
+                    role_key=role_key,
+                    scope_type=scope_type,
+                    scope_id=scope_id,
+                )
+            )
+        return SecurityAdminContext(
+            user_id=user_id,
+            is_super_admin=is_super_admin,
+            admin_scopes=tuple(scopes),
+        )
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        human_bearer_token: str,
+        headers: dict[str, str] | None = None,
+        json_body: dict[str, object] | None = None,
+    ) -> dict[str, Any]:
+        if not human_bearer_token:
+            raise ValueError("human_bearer_token is required")
+        request_headers = {"Authorization": f"Bearer {human_bearer_token}"}
+        if headers:
+            request_headers.update(headers)
+        try:
+            response = self._client.request(
+                method,
+                path,
+                headers=request_headers,
+                json=json_body,
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("security_admin_call_failed", reason="endpoint_unavailable", path=path)
+            raise SecurityAdminError("Security administrative endpoint is unavailable") from exc
+        if response.status_code < 200 or response.status_code >= 300:
+            logger.warning(
+                "security_admin_call_failed",
+                http_status=response.status_code,
+                path=path,
+            )
+            raise SecurityAdminError(
+                f"Security administrative request failed with HTTP {response.status_code}"
+            )
+        try:
+            payload: Any = response.json()
+        except ValueError as exc:
+            raise SecurityAdminError("Security administrative response is not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise SecurityAdminError("Security administrative response has invalid shape")
+        return payload
 
 
 class SecurityOAuthClient:
