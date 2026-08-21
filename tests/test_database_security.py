@@ -142,21 +142,54 @@ def test_runtime_role_cannot_read_or_insert_cross_tenant(database_engine) -> Non
             connection.execute(text("RESET ROLE"))
 
 
-def test_runtime_role_has_no_delete_privilege(database_engine) -> None:
+def test_runtime_role_delete_privilege_is_narrow_uc02_exception(database_engine) -> None:
     with database_engine.begin() as owner_connection:
         tenant_a, _ = _seed_projects(owner_connection)
-        can_delete = owner_connection.execute(
+        dealer_id = owner_connection.execute(
             text(
-                "SELECT has_table_privilege('audit_core_runtime', 'auditcore.projects', 'DELETE')"
-            )
+                """
+                INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name)
+                VALUES (:tenant_id, :dealer_code, 'Delete Privilege Dealer')
+                RETURNING dealer_id
+                """
+            ),
+            {"tenant_id": tenant_a, "dealer_code": f"D-{uuid4().hex}"},
         ).scalar_one()
+        privileges = owner_connection.execute(
+            text(
+                """
+                SELECT
+                    has_table_privilege(
+                        'audit_core_runtime', 'auditcore.projects', 'DELETE'
+                    ) AS projects_delete,
+                    has_table_privilege(
+                        'audit_core_runtime', 'auditcore.dealers', 'DELETE'
+                    ) AS dealers_delete,
+                    has_table_privilege(
+                        'audit_core_runtime', 'auditcore.dealer_outlets', 'DELETE'
+                    ) AS outlets_delete,
+                    has_table_privilege(
+                        'audit_core_runtime', 'auditcore.customers', 'DELETE'
+                    ) AS customers_delete
+                """
+            )
+        ).one()
 
-    assert can_delete is False
+    assert tuple(privileges) == (False, True, True, False)
 
     with database_engine.connect() as connection, connection.begin():
         connection.execute(text("SET ROLE audit_core_runtime"))
         try:
             set_tenant_context(connection, tenant_a)
+            deleted = connection.execute(
+                text(
+                    "DELETE FROM auditcore.dealers "
+                    "WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id"
+                ),
+                {"tenant_id": tenant_a, "dealer_id": dealer_id},
+            )
+            assert deleted.rowcount == 1
+
             with (
                 pytest.raises(DBAPIError, match="permission denied"),
                 connection.begin_nested(),
