@@ -10,6 +10,7 @@ from audit_core.crm_api import router as crm_router
 from audit_core.customers import router as customer_router
 from audit_core.daily_operations_api import router as daily_operations_router
 from audit_core.dealers import router as dealer_router
+from audit_core.di_project_master_proxy import router as di_project_master_proxy_router
 from audit_core.errors import install_error_handlers
 from audit_core.escalations_api import router as escalation_router
 from audit_core.evidence import router as evidence_router
@@ -51,6 +52,10 @@ def create_app() -> FastAPI:
     application.include_router(project_router)
     application.include_router(readiness_router)
     application.include_router(project_activation_router)
+    # Literal DI-owned Project Master and generic import routes must be registered
+    # before the older owner-module dynamic routes so DI requests cannot fall into
+    # the Audit-Core-only rejection branches.
+    application.include_router(di_project_master_proxy_router)
     application.include_router(project_master_router)
     application.include_router(project_master_import_router)
     application.include_router(dealer_router)
