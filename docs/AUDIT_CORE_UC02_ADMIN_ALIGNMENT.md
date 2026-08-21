@@ -6,7 +6,7 @@
 **Branch:** `dev`  
 **Related baseline:** `docs/AUDIT_CORE_SOLUTION_DESIGN_v2.1.md`, `docs/AUDIT_CORE_API_CONTRACT_v1.0.md`, `docs/AUDIT_CORE_PHYSICAL_DATA_MODEL_v2.1.md`
 
-> This is a narrow UC02 alignment amendment. It records confirmed Phase-1 Project Onboarding/Administration decisions that intentionally supersede specific v2.1 assumptions. **Owner clarification dated 2026-08-21 is authoritative: Phase 1 uses hard delete. Process-oriented purge is Phase 2 and must not be introduced in UC02 Phase 1.**
+> This is a narrow UC02 alignment amendment. It records confirmed Phase-1 Project Onboarding/Administration decisions that intentionally supersede specific v2.1 assumptions. **Owner clarification dated 2026-08-21 is authoritative: Phase 1 uses hard delete only. Process-oriented purge and persistent deletion/recreation-prevention guards are Phase-2 concepts unless separately approved.**
 
 ## 1. Human-admin routing through Audit Core
 
@@ -41,6 +41,8 @@ Direct deletion of a narrower entity may fail with a dependency/preflight respon
 
 A global Security USER is never deleted by Audit Core.
 
+Phase 1 does not require a persistent Project deletion lifecycle, deletion tombstone, recreation-prevention guard, purge receipt or purge status resource.
+
 ### 2.2 Whole-Project hard-delete orchestration
 
 Audit Core is the UC02 browser-facing orchestrator.
@@ -48,17 +50,16 @@ Audit Core is the UC02 browser-facing orchestrator.
 Required Phase-1 sequence:
 
 1. authorize the current human SuperAdmin;
-2. establish the Audit Core Project deletion state/guard so new Project-scoped writes are rejected;
-3. invoke the DI **Phase-1 hard-delete** endpoint with the same human identity;
-4. require DI zero-state verification before continuing;
-5. delete Audit Core Project-owned rows in the approved dependency-safe transaction/batched sequence;
-6. verify Audit Core zero state;
-7. invoke Security Tenant hard delete with the same human identity **last**;
-8. verify cross-module zero state before reporting completion.
+2. invoke the DI **Phase-1 hard-delete** endpoint with the same human identity;
+3. require DI zero-state verification before continuing;
+4. delete Audit Core Project-owned rows in the approved dependency-safe transaction/batched sequence;
+5. verify Audit Core zero state;
+6. invoke Security Tenant hard delete with the same human identity **last**;
+7. verify cross-module zero state before reporting completion.
 
-Phase 1 does **not** introduce a process-oriented purge resource, resumable purge operation API, retention-oriented purge state machine, or soft delete. Those are Phase-2 concerns.
+Phase 1 does **not** introduce a process-oriented purge resource, resumable purge operation API, retention-oriented purge state machine, soft delete, or persistent recreation-prevention tombstone. Those are outside UC02 Phase 1.
 
-If a technical call fails, the administrator retries the Phase-1 hard-delete operation. Each owning module must make the hard-delete endpoint idempotent and must not report success before its own zero-state check succeeds.
+Any retry/idempotency behavior implemented for a hard-delete API must come from the frozen API contract or a concrete correctness requirement found during implementation inspection; do not introduce a separate deletion lifecycle to provide it.
 
 ### 2.3 Phase-2 direction
 
