@@ -5,9 +5,15 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-from audit_core.dependencies import get_connection, get_principal
+from audit_core.dependencies import (
+    HumanAdminRequest,
+    get_connection,
+    get_principal,
+    require_super_admin_request,
+)
 from audit_core.main import app
 from audit_core.security import Principal
+from audit_core.security_integration import SecurityAdminContext
 
 
 @pytest.fixture
@@ -62,7 +68,18 @@ def dealer_setup():
         with engine.begin() as connection:
             yield connection
 
+    admin_request = HumanAdminRequest(
+        user_id="dealer-admin",
+        bearer_token="test-human-token",
+        admin_context=SecurityAdminContext(
+            user_id="dealer-admin",
+            is_super_admin=True,
+            admin_scopes=(),
+        ),
+    )
     app.dependency_overrides[get_connection] = connection_override
+    app.dependency_overrides[require_super_admin_request] = lambda: admin_request
+    # Outlet routes are converted to the UC02 human-admin boundary in the next package.
     app.dependency_overrides[get_principal] = lambda: Principal(
         subject="dealer-user",
         tenant_id=tenant_id,
