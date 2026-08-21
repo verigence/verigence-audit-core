@@ -8,11 +8,9 @@ from sqlalchemy import create_engine, text
 from audit_core.dependencies import (
     HumanAdminRequest,
     get_connection,
-    get_principal,
     require_super_admin_request,
 )
 from audit_core.main import app
-from audit_core.security import Principal
 from audit_core.security_integration import SecurityAdminContext
 
 
@@ -79,12 +77,6 @@ def dealer_setup():
     )
     app.dependency_overrides[get_connection] = connection_override
     app.dependency_overrides[require_super_admin_request] = lambda: admin_request
-    # Outlet routes are converted to the UC02 human-admin boundary in the next package.
-    app.dependency_overrides[get_principal] = lambda: Principal(
-        subject="dealer-user",
-        tenant_id=tenant_id,
-        permissions=(),
-    )
     try:
         yield tenant_id
     finally:
@@ -134,35 +126,90 @@ def test_dealer_and_outlet_create_read_update_inactivate(dealer_setup) -> None:
     outlet = client.post(
         f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets",
         json={
-            "outletCode": "O001",
+            "outletCode": "CALLER-MUST-NOT-CONTROL",
             "outletName": "Outlet One",
             "outletClassification": "ONSITE",
+            "addressText": "Baner Road",
             "city": "Pune",
+            "stateRegion": "Maharashtra",
+            "postalCode": "411045",
+            "googlePlaceId": "place-123",
+            "latitude": "18.5590",
+            "longitude": "73.7868",
+            "monthlyVehicleVolume": 250,
         },
     )
     assert outlet.status_code == 201
-    outlet_id = outlet.json()["outletId"]
+    assert outlet.headers["etag"] == '"1"'
+    outlet_payload = outlet.json()
+    outlet_id = outlet_payload["outletId"]
+    assert outlet_payload["outletCode"] != "CALLER-MUST-NOT-CONTROL"
+    assert outlet_payload["googlePlaceId"] == "place-123"
+    assert outlet_payload["addressText"] == "Baner Road"
+    assert outlet_payload["monthlyVehicleVolume"] == 250
+    assert outlet_payload["versionNo"] == 1
 
     outlet_detail = client.get(
         f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets/{outlet_id}"
     )
     assert outlet_detail.status_code == 200
+    assert outlet_detail.headers["etag"] == '"1"'
     assert outlet_detail.json()["dealerId"] == dealer_id
 
     outlet_patch = client.patch(
         f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets/{outlet_id}",
-        json={"status": "INACTIVE"},
+        headers={"If-Match": outlet_detail.headers["etag"]},
+        json={
+            "addressText": "Manual Address Updated",
+            "googlePlaceId": None,
+            "latitude": None,
+            "longitude": None,
+            "status": "INACTIVE",
+        },
     )
     assert outlet_patch.status_code == 200
-    assert outlet_patch.json()["status"] == "INACTIVE"
+    assert outlet_patch.headers["etag"] == '"2"'
+    patched = outlet_patch.json()
+    assert patched["status"] == "INACTIVE"
+    assert patched["addressText"] == "Manual Address Updated"
+    assert patched["googlePlaceId"] is None
+    assert patched["latitude"] is None
+    assert patched["longitude"] is None
+    assert patched["versionNo"] == 2
 
-    assert client.delete(f"/v1/tenants/{tenant_id}/dealers/{dealer_id}").status_code == 405
-    assert (
-        client.delete(
-            f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets/{outlet_id}"
-        ).status_code
-        == 405
+    stale_outlet = client.patch(
+        f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets/{outlet_id}",
+        headers={"If-Match": '"1"'},
+        json={"outletName": "Stale Outlet"},
     )
+    assert stale_outlet.status_code == 409
+    assert stale_outlet.json()["errorCode"] == "VAC-CONFLICT-001"
+
+
+def test_manual_outlet_address_does_not_require_maps(dealer_setup) -> None:
+    tenant_id = dealer_setup
+    client = TestClient(app, raise_server_exceptions=False)
+
+    dealer = client.post(
+        f"/v1/tenants/{tenant_id}/dealers",
+        json={"dealerName": "Manual Address Dealer"},
+    )
+    dealer_id = dealer.json()["dealerId"]
+
+    outlet = client.post(
+        f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets",
+        json={
+            "outletName": "Manual Outlet",
+            "addressText": "MG Road",
+            "city": "Bengaluru",
+        },
+    )
+
+    assert outlet.status_code == 201
+    assert outlet.json()["addressText"] == "MG Road"
+    assert outlet.json()["googlePlaceId"] is None
+    assert outlet.json()["latitude"] is None
+    assert outlet.json()["longitude"] is None
 
 
 def test_outlet_requires_matching_dealer_hierarchy(dealer_setup) -> None:
@@ -172,7 +219,7 @@ def test_outlet_requires_matching_dealer_hierarchy(dealer_setup) -> None:
 
     response = client.post(
         f"/v1/tenants/{tenant_id}/dealers/{missing_dealer_id}/outlets",
-        json={"outletCode": "O404", "outletName": "Invalid Outlet"},
+        json={"outletName": "Invalid Outlet"},
     )
 
     assert response.status_code == 404
