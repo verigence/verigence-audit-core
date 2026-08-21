@@ -7,7 +7,12 @@ from sqlalchemy import Connection, text
 
 from audit_core.authorization import require_tenant
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import get_connection, get_principal
+from audit_core.dependencies import (
+    HumanAdminRequest,
+    get_connection,
+    get_principal,
+    require_super_admin_request,
+)
 from audit_core.errors import ConflictError, NotFoundError, ValidationError
 from audit_core.security import Principal
 
@@ -125,10 +130,10 @@ def create_dealer(
     tenant_id: str,
     payload: DealerCreate,
     response: Response,
-    principal: Annotated[Principal, Depends(get_principal)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> DealerResponse:
-    _scope(connection, principal, tenant_id)
+    set_tenant_context(connection, tenant_id)
     dealer_id = uuid4()
     row = connection.execute(
         text(
@@ -149,7 +154,7 @@ def create_dealer(
             "dealer_code": dealer_id.hex,
             "dealer_name": payload.dealerName,
             "legal_name": payload.legalName,
-            "actor_id": principal.subject,
+            "actor_id": admin_request.user_id,
         },
     ).mappings().one()
     _set_etag(response, row["version_no"])
@@ -159,10 +164,10 @@ def create_dealer(
 @router.get("/dealers", response_model=list[DealerResponse])
 def list_dealers(
     tenant_id: str,
-    principal: Annotated[Principal, Depends(get_principal)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> list[DealerResponse]:
-    _scope(connection, principal, tenant_id)
+    set_tenant_context(connection, tenant_id)
     rows = connection.execute(
         text(
             """
@@ -182,10 +187,10 @@ def get_dealer(
     tenant_id: str,
     dealer_id: UUID,
     response: Response,
-    principal: Annotated[Principal, Depends(get_principal)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> DealerResponse:
-    _scope(connection, principal, tenant_id)
+    set_tenant_context(connection, tenant_id)
     row = connection.execute(
         text(
             """
@@ -209,10 +214,10 @@ def patch_dealer(
     payload: DealerPatch,
     response: Response,
     if_match: Annotated[str, Header(alias="If-Match", min_length=1)],
-    principal: Annotated[Principal, Depends(get_principal)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> DealerResponse:
-    _scope(connection, principal, tenant_id)
+    set_tenant_context(connection, tenant_id)
     supplied = payload.model_fields_set
     if not supplied:
         raise ValidationError(detail="At least one Dealer field must be supplied.")
@@ -232,7 +237,7 @@ def patch_dealer(
         "tenant_id": tenant_id,
         "dealer_id": dealer_id,
         "expected_version": expected_version,
-        "actor_id": principal.subject,
+        "actor_id": admin_request.user_id,
     }
     for field_name in supplied:
         column, value = columns[field_name]
