@@ -1,21 +1,20 @@
 from typing import Annotated, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Header, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
 from audit_core.authorization import require_tenant
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_principal
-from audit_core.errors import NotFoundError
+from audit_core.errors import ConflictError, NotFoundError, ValidationError
 from audit_core.security import Principal
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["dealers"])
 
 
 class DealerCreate(BaseModel):
-    dealerCode: str = Field(min_length=1, max_length=100)
     dealerName: str = Field(min_length=1, max_length=240)
     legalName: str | None = Field(default=None, max_length=240)
 
@@ -32,6 +31,7 @@ class DealerResponse(BaseModel):
     dealerName: str
     legalName: str | None
     status: str
+    versionNo: int
 
 
 class OutletCreate(BaseModel):
@@ -74,6 +74,27 @@ def _scope(connection: Connection, principal: Principal, tenant_id: str) -> None
     set_tenant_context(connection, tenant_id)
 
 
+def _set_etag(response: Response, version_no: int) -> None:
+    response.headers["ETag"] = f'"{version_no}"'
+
+
+def _parse_if_match(value: str) -> int:
+    candidate = value.strip()
+    if candidate.startswith('"') and candidate.endswith('"') and len(candidate) >= 2:
+        candidate = candidate[1:-1]
+    try:
+        version = int(candidate)
+    except ValueError as exc:
+        raise ValidationError(
+            detail="If-Match must contain the current positive version number."
+        ) from exc
+    if version <= 0:
+        raise ValidationError(
+            detail="If-Match must contain the current positive version number."
+        )
+    return version
+
+
 def _dealer_response(row) -> DealerResponse:
     return DealerResponse(
         dealerId=row["dealer_id"],
@@ -81,6 +102,7 @@ def _dealer_response(row) -> DealerResponse:
         dealerName=row["dealer_name"],
         legalName=row["legal_name"],
         status=row["status"],
+        versionNo=row["version_no"],
     )
 
 
@@ -102,29 +124,35 @@ def _outlet_response(row) -> OutletResponse:
 def create_dealer(
     tenant_id: str,
     payload: DealerCreate,
+    response: Response,
     principal: Annotated[Principal, Depends(get_principal)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> DealerResponse:
     _scope(connection, principal, tenant_id)
+    dealer_id = uuid4()
     row = connection.execute(
         text(
             """
             INSERT INTO auditcore.dealers (
-                tenant_id, dealer_code, dealer_name, legal_name, created_by_actor_id
+                tenant_id, dealer_id, dealer_code, dealer_name, legal_name,
+                created_by_actor_id
             ) VALUES (
-                :tenant_id, :dealer_code, :dealer_name, :legal_name, :actor_id
+                :tenant_id, :dealer_id, :dealer_code, :dealer_name, :legal_name,
+                :actor_id
             )
-            RETURNING dealer_id, dealer_code, dealer_name, legal_name, status
+            RETURNING dealer_id, dealer_code, dealer_name, legal_name, status, version_no
             """
         ),
         {
             "tenant_id": tenant_id,
-            "dealer_code": payload.dealerCode,
+            "dealer_id": dealer_id,
+            "dealer_code": dealer_id.hex,
             "dealer_name": payload.dealerName,
             "legal_name": payload.legalName,
             "actor_id": principal.subject,
         },
     ).mappings().one()
+    _set_etag(response, row["version_no"])
     return _dealer_response(row)
 
 
@@ -138,7 +166,7 @@ def list_dealers(
     rows = connection.execute(
         text(
             """
-            SELECT dealer_id, dealer_code, dealer_name, legal_name, status
+            SELECT dealer_id, dealer_code, dealer_name, legal_name, status, version_no
             FROM auditcore.dealers
             WHERE tenant_id = :tenant_id
             ORDER BY dealer_code
@@ -153,6 +181,7 @@ def list_dealers(
 def get_dealer(
     tenant_id: str,
     dealer_id: UUID,
+    response: Response,
     principal: Annotated[Principal, Depends(get_principal)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> DealerResponse:
@@ -160,7 +189,7 @@ def get_dealer(
     row = connection.execute(
         text(
             """
-            SELECT dealer_id, dealer_code, dealer_name, legal_name, status
+            SELECT dealer_id, dealer_code, dealer_name, legal_name, status, version_no
             FROM auditcore.dealers
             WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id
             """
@@ -169,6 +198,7 @@ def get_dealer(
     ).mappings().one_or_none()
     if row is None:
         raise _not_found("Dealer")
+    _set_etag(response, row["version_no"])
     return _dealer_response(row)
 
 
@@ -177,35 +207,74 @@ def patch_dealer(
     tenant_id: str,
     dealer_id: UUID,
     payload: DealerPatch,
+    response: Response,
+    if_match: Annotated[str, Header(alias="If-Match", min_length=1)],
     principal: Annotated[Principal, Depends(get_principal)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> DealerResponse:
     _scope(connection, principal, tenant_id)
+    supplied = payload.model_fields_set
+    if not supplied:
+        raise ValidationError(detail="At least one Dealer field must be supplied.")
+    if "dealerName" in supplied and payload.dealerName is None:
+        raise ValidationError(detail="Dealer Name cannot be set to null.")
+    if "status" in supplied and payload.status is None:
+        raise ValidationError(detail="Dealer status cannot be set to null.")
+
+    expected_version = _parse_if_match(if_match)
+    columns = {
+        "dealerName": ("dealer_name", payload.dealerName),
+        "legalName": ("legal_name", payload.legalName),
+        "status": ("status", payload.status),
+    }
+    assignments: list[str] = []
+    parameters: dict[str, object] = {
+        "tenant_id": tenant_id,
+        "dealer_id": dealer_id,
+        "expected_version": expected_version,
+        "actor_id": principal.subject,
+    }
+    for field_name in supplied:
+        column, value = columns[field_name]
+        parameter_name = f"value_{field_name}"
+        assignments.append(f"{column} = :{parameter_name}")
+        parameters[parameter_name] = value
+    assignments.extend(
+        [
+            "updated_by_actor_id = :actor_id",
+            "updated_at_utc = now()",
+            "version_no = version_no + 1",
+        ]
+    )
+
     row = connection.execute(
         text(
-            """
+            f"""
             UPDATE auditcore.dealers
-            SET dealer_name = COALESCE(:dealer_name, dealer_name),
-                legal_name = COALESCE(:legal_name, legal_name),
-                status = COALESCE(:status, status),
-                updated_by_actor_id = :actor_id,
-                updated_at_utc = now(),
-                version_no = version_no + 1
+            SET {', '.join(assignments)}
             WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id
-            RETURNING dealer_id, dealer_code, dealer_name, legal_name, status
+              AND version_no = :expected_version
+            RETURNING dealer_id, dealer_code, dealer_name, legal_name, status, version_no
             """
         ),
-        {
-            "tenant_id": tenant_id,
-            "dealer_id": dealer_id,
-            "dealer_name": payload.dealerName,
-            "legal_name": payload.legalName,
-            "status": payload.status,
-            "actor_id": principal.subject,
-        },
+        parameters,
     ).mappings().one_or_none()
     if row is None:
-        raise _not_found("Dealer")
+        exists = connection.execute(
+            text(
+                "SELECT 1 FROM auditcore.dealers "
+                "WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id"
+            ),
+            {"tenant_id": tenant_id, "dealer_id": dealer_id},
+        ).scalar_one_or_none()
+        if exists is None:
+            raise _not_found("Dealer")
+        raise ConflictError(
+            error_code="VAC-CONFLICT-001",
+            title="Version conflict",
+            detail="Dealer was changed by another request. Refresh and retry.",
+        )
+    _set_etag(response, row["version_no"])
     return _dealer_response(row)
 
 
