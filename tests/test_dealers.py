@@ -81,18 +81,38 @@ def test_dealer_and_outlet_create_read_update_inactivate(dealer_setup) -> None:
 
     dealer = client.post(
         f"/v1/tenants/{tenant_id}/dealers",
-        json={"dealerCode": "D001", "dealerName": "Dealer One"},
+        json={"dealerCode": "CALLER-MUST-NOT-CONTROL", "dealerName": "Dealer One"},
     )
     assert dealer.status_code == 201
-    dealer_id = dealer.json()["dealerId"]
+    assert dealer.headers["etag"] == '"1"'
+    dealer_payload = dealer.json()
+    dealer_id = dealer_payload["dealerId"]
+    assert dealer_payload["dealerCode"] != "CALLER-MUST-NOT-CONTROL"
+    assert dealer_payload["versionNo"] == 1
 
+    detail = client.get(f"/v1/tenants/{tenant_id}/dealers/{dealer_id}")
+    assert detail.status_code == 200
+    assert detail.headers["etag"] == '"1"'
+    assert detail.json()["dealerId"] == dealer_id
     assert client.get(f"/v1/tenants/{tenant_id}/dealers").json()[0]["dealerId"] == dealer_id
+
     dealer_patch = client.patch(
         f"/v1/tenants/{tenant_id}/dealers/{dealer_id}",
+        headers={"If-Match": detail.headers["etag"]},
         json={"dealerName": "Dealer One Updated", "status": "INACTIVE"},
     )
     assert dealer_patch.status_code == 200
+    assert dealer_patch.headers["etag"] == '"2"'
     assert dealer_patch.json()["status"] == "INACTIVE"
+    assert dealer_patch.json()["versionNo"] == 2
+
+    stale = client.patch(
+        f"/v1/tenants/{tenant_id}/dealers/{dealer_id}",
+        headers={"If-Match": '"1"'},
+        json={"dealerName": "Stale Dealer"},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["errorCode"] == "VAC-CONFLICT-001"
 
     outlet = client.post(
         f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets",
@@ -106,11 +126,11 @@ def test_dealer_and_outlet_create_read_update_inactivate(dealer_setup) -> None:
     assert outlet.status_code == 201
     outlet_id = outlet.json()["outletId"]
 
-    detail = client.get(
+    outlet_detail = client.get(
         f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets/{outlet_id}"
     )
-    assert detail.status_code == 200
-    assert detail.json()["dealerId"] == dealer_id
+    assert outlet_detail.status_code == 200
+    assert outlet_detail.json()["dealerId"] == dealer_id
 
     outlet_patch = client.patch(
         f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets/{outlet_id}",
