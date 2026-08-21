@@ -9,7 +9,12 @@ from sqlalchemy import Connection, text
 from audit_core.authorization import require_tenant
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_principal
-from audit_core.errors import AuditCoreError, ConflictError, NotFoundError
+from audit_core.errors import (
+    BusinessValidationError,
+    ConflictError,
+    NotFoundError,
+    ValidationError,
+)
 from audit_core.security import Principal
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/project", tags=["project"])
@@ -46,15 +51,6 @@ def _not_found() -> NotFoundError:
         error_code="VAC-NF-001",
         title="Project not found",
         detail="Project not found for the requested tenant.",
-    )
-
-
-def _validation(detail: str) -> AuditCoreError:
-    return AuditCoreError(
-        error_code="VAC-VAL-002",
-        status_code=422,
-        title="Business validation failed",
-        detail=detail,
     )
 
 
@@ -105,18 +101,12 @@ def _parse_if_match(value: str) -> int:
     try:
         version = int(candidate)
     except ValueError as exc:
-        raise AuditCoreError(
-            error_code="VAC-VAL-001",
-            status_code=400,
-            title="Validation failed",
-            detail="If-Match must contain the current positive version number.",
+        raise ValidationError(
+            detail="If-Match must contain the current positive version number."
         ) from exc
     if version <= 0:
-        raise AuditCoreError(
-            error_code="VAC-VAL-001",
-            status_code=400,
-            title="Validation failed",
-            detail="If-Match must contain the current positive version number.",
+        raise ValidationError(
+            detail="If-Match must contain the current positive version number."
         )
     return version
 
@@ -171,7 +161,9 @@ def _require_reference_exists(
         {"value": value},
     ).scalar_one_or_none()
     if exists is None:
-        raise _validation(f"{label} does not reference an existing approved value.")
+        raise BusinessValidationError(
+            detail=f"{label} does not reference an existing approved value."
+        )
 
 
 @router.get("", response_model=ProjectResponse)
@@ -202,12 +194,7 @@ def patch_project(
 
     supplied = patch.model_fields_set
     if not supplied:
-        raise AuditCoreError(
-            error_code="VAC-VAL-001",
-            status_code=400,
-            title="Validation failed",
-            detail="At least one Project field must be supplied.",
-        )
+        raise ValidationError(detail="At least one Project field must be supplied.")
 
     non_nullable = {
         "projectName": patch.projectName,
@@ -217,12 +204,7 @@ def patch_project(
         "timezoneName": patch.timezoneName,
     }
     if any(name in supplied and value is None for name, value in non_nullable.items()):
-        raise AuditCoreError(
-            error_code="VAC-VAL-001",
-            status_code=400,
-            title="Validation failed",
-            detail="Required Project fields cannot be set to null.",
-        )
+        raise ValidationError(detail="Required Project fields cannot be set to null.")
 
     current = _project_row(connection, tenant_id)
     expected_version = _parse_if_match(if_match)
@@ -262,9 +244,11 @@ def patch_project(
         )
     )
     if restricted_changed and _has_project_dependencies(connection, tenant_id):
-        raise _validation(
-            "OEM, Product Category and Effective Start Date cannot be changed after "
-            "operational Journeys or dependent published masters exist."
+        raise BusinessValidationError(
+            detail=(
+                "OEM, Product Category and Effective Start Date cannot be changed after "
+                "operational Journeys or dependent published masters exist."
+            )
         )
 
     effective_start = (
@@ -276,7 +260,9 @@ def patch_project(
         patch.effectiveEndDate if "effectiveEndDate" in supplied else current["effective_end_date"]
     )
     if effective_end is not None and effective_end < effective_start:
-        raise _validation("Effective End Date cannot be earlier than Effective Start Date.")
+        raise BusinessValidationError(
+            detail="Effective End Date cannot be earlier than Effective Start Date."
+        )
 
     columns = {
         "projectName": ("project_name", patch.projectName),
