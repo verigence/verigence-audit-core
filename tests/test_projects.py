@@ -6,9 +6,9 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-from audit_core.dependencies import get_connection, get_principal
+from audit_core.dependencies import HumanAdminRequest, get_connection, require_super_admin_request
 from audit_core.main import app
-from audit_core.security import Principal
+from audit_core.security_integration import SecurityAdminContext
 
 
 @pytest.fixture
@@ -71,12 +71,17 @@ def project_setup():
         with engine.begin() as connection:
             yield connection
 
-    app.dependency_overrides[get_connection] = connection_override
-    app.dependency_overrides[get_principal] = lambda: Principal(
-        subject="user-project",
-        tenant_id=tenant_a,
-        permissions=(),
+    admin_request = HumanAdminRequest(
+        user_id="user-project-admin",
+        bearer_token="test-human-token",
+        admin_context=SecurityAdminContext(
+            user_id="user-project-admin",
+            is_super_admin=True,
+            admin_scopes=(),
+        ),
     )
+    app.dependency_overrides[get_connection] = connection_override
+    app.dependency_overrides[require_super_admin_request] = lambda: admin_request
     try:
         yield engine, tenant_a, tenant_b
     finally:
@@ -84,7 +89,7 @@ def project_setup():
         engine.dispose()
 
 
-def test_project_get_and_patch_are_tenant_bound_and_versioned(project_setup) -> None:
+def test_project_get_and_patch_are_admin_authorized_and_versioned(project_setup) -> None:
     engine, tenant_a, tenant_b = project_setup
     client = TestClient(app, raise_server_exceptions=False)
 
@@ -99,9 +104,9 @@ def test_project_get_and_patch_are_tenant_bound_and_versioned(project_setup) -> 
     assert payload["timezoneName"] == "Asia/Kolkata"
     assert payload["versionNo"] == 1
 
-    mismatch = client.get(f"/v1/tenants/{tenant_b}/project")
-    assert mismatch.status_code == 403
-    assert mismatch.json()["errorCode"] == "VAC-AUTH-003"
+    other_project = client.get(f"/v1/tenants/{tenant_b}/project")
+    assert other_project.status_code == 200
+    assert other_project.json()["tenantId"] == tenant_b
 
     updated = client.patch(
         f"/v1/tenants/{tenant_a}/project",
