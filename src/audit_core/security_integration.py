@@ -147,6 +147,27 @@ class SecurityAdminClient:
             f"/security/v1/platform/tenants/{tenant_id}",
             human_bearer_token=human_bearer_token,
         )
+        return self._tenant_from_payload(payload, requested_tenant_id=tenant_id)
+
+    def activate_tenant(
+        self,
+        *,
+        human_bearer_token: str,
+        tenant_id: str,
+    ) -> SecurityTenant:
+        payload = self._request_json(
+            "POST",
+            f"/security/v1/platform/tenants/{tenant_id}/activate",
+            human_bearer_token=human_bearer_token,
+        )
+        return self._tenant_from_payload(payload, requested_tenant_id=tenant_id)
+
+    @staticmethod
+    def _tenant_from_payload(
+        payload: dict[str, Any],
+        *,
+        requested_tenant_id: str,
+    ) -> SecurityTenant:
         response_tenant_id = payload.get("tenantId")
         tenant_code = payload.get("tenantCode")
         tenant_name = payload.get("tenantName")
@@ -162,7 +183,7 @@ class SecurityAdminClient:
             or not tenant_status
         ):
             raise SecurityAdminError("Security Tenant response has invalid shape")
-        if response_tenant_id != tenant_id:
+        if response_tenant_id != requested_tenant_id:
             raise SecurityAdminError("Security Tenant response does not match requested Tenant")
         return SecurityTenant(
             tenant_id=response_tenant_id,
