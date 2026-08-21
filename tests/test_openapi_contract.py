@@ -10,6 +10,15 @@ from audit_core.main import create_app
 
 _HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 _DELIVERY_PUT_PATH = "/v1/tenants/{}/journeys/{}/delivery"
+_UC02_ALLOWED_DELETE_PATHS = {
+    # Phase-1 administrative hard-delete exceptions.
+    "/v1/tenants/{}/dealers/{}",
+    "/v1/tenants/{}/dealers/{}/outlets/{}",
+    # Assignment removal only: this never deletes the global Security USER.
+    "/v1/tenants/{}/role-mappings/{}",
+    # Approved Excel staging cleanup only; confirmed/published master data is preserved.
+    "/v1/tenants/{}/project-master-imports/{}",
+}
 
 
 def _normalize_path(path: str) -> str:
@@ -61,6 +70,14 @@ def _requires_idempotency(parameters: list[dict]) -> bool:
     )
 
 
+def _is_forbidden_di_boundary(path: str) -> bool:
+    """Block direct DI exposure while allowing DI as a Project-Master owner value."""
+    normalized = path.lower()
+    if "/project-masters/di/" in normalized:
+        return False
+    return "/di/" in normalized or normalized.endswith("/di")
+
+
 def test_openapi_operations_are_implemented_and_public_boundary_is_safe() -> None:
     spec = yaml.safe_load(Path("api/openapi-v1.yaml").read_text(encoding="utf-8"))
     implemented = _implemented_routes()
@@ -78,9 +95,9 @@ def test_openapi_operations_are_implemented_and_public_boundary_is_safe() -> Non
         if path.startswith("/v1/")
     ]
     assert public_routes
-    assert all(method != "DELETE" for method, _ in public_routes)
-    assert all("/di/" not in path.lower() for _, path in public_routes)
-    assert all(not path.lower().endswith("/di") for _, path in public_routes)
+    delete_paths = {path for method, path in public_routes if method == "DELETE"}
+    assert delete_paths == _UC02_ALLOWED_DELETE_PATHS
+    assert all(not _is_forbidden_di_boundary(path) for _, path in public_routes)
     assert all("/delivery/block" not in path.lower() for _, path in public_routes)
     assert all("/delivery/approve" not in path.lower() for _, path in public_routes)
     assert all("/delivery/stop" not in path.lower() for _, path in public_routes)

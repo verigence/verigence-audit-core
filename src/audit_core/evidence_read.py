@@ -11,12 +11,7 @@ from sqlalchemy import Connection, Engine, text
 from audit_core.authorization import authorize
 from audit_core.business_assignments import require_business_scope
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import (
-    get_bearer_token,
-    get_connection,
-    get_engine,
-    get_principal,
-)
+from audit_core.dependencies import get_connection, get_engine, get_principal
 from audit_core.di_client import DiClient, DiClientError, DiFact
 from audit_core.errors import NotFoundError
 from audit_core.evidence import (
@@ -29,6 +24,7 @@ from audit_core.security import Principal
 from audit_core.security_integration import SecurityOAuthClient, SecurityTokenError
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["evidence"])
+_DI_AUDIENCE = "di"
 
 
 class EvidenceFactResponse(BaseModel):
@@ -369,7 +365,6 @@ def refresh_journey_evidence(
     journey_id: UUID,
     evidence_id: UUID,
     principal: Annotated[Principal, Depends(get_principal)],
-    bearer_token: Annotated[str, Depends(get_bearer_token)],
     connection: Annotated[Connection, Depends(get_connection)],
     engine: Annotated[Engine, Depends(get_engine)],
     security_client: Annotated[
@@ -394,10 +389,7 @@ def refresh_journey_evidence(
         outlet_id=row["outlet_id"],
     )
     try:
-        token = security_client.exchange_user_token(
-            subject_token=bearer_token,
-            permissions=["di.document.read", "di.document.fields.read"],
-        )
+        token = security_client.get_service_token(audience=_DI_AUDIENCE)
         document = di_client.get_document(
             token=token,
             tenant_id=tenant_id,

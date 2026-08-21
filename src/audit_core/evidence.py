@@ -15,7 +15,7 @@ from sqlalchemy import Connection, Engine, text
 from audit_core.authorization import authorize
 from audit_core.business_assignments import require_business_scope
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import get_bearer_token, get_engine, get_principal
+from audit_core.dependencies import get_engine, get_principal
 from audit_core.di_client import DiClient, DiClientError, DiDocument
 from audit_core.errors import AuditCoreError, ConflictError, NotFoundError
 from audit_core.observability import get_correlation_id
@@ -26,6 +26,7 @@ logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["evidence"])
 _OPERATION_KEY = "UPLOAD_JOURNEY_EVIDENCE"
+_DI_AUDIENCE = "di"
 
 
 class EvidenceResponse(BaseModel):
@@ -43,7 +44,7 @@ def get_security_oauth_client() -> Iterator[SecurityOAuthClient]:
     client_id = os.environ.get("SECURITY_CLIENT_ID", "").strip()
     client_secret = os.environ.get("SECURITY_CLIENT_SECRET", "")
     if not base_url or not client_id or not client_secret:
-        raise RuntimeError("Security OAuth integration is not configured")
+        raise RuntimeError("Security ServiceIntegration is not configured")
     with SecurityOAuthClient(
         base_url=base_url,
         client_id=client_id,
@@ -64,10 +65,20 @@ def _journey_context(connection: Connection, tenant_id: str, journey_id: UUID):
     row = connection.execute(
         text(
             """
-            SELECT j.customer_id, j.dealer_id, j.outlet_id, c.display_name
+            SELECT j.customer_id, j.dealer_id, j.outlet_id,
+                   c.display_name AS customer_name,
+                   p.project_name,
+                   d.dealer_name,
+                   o.outlet_name
             FROM auditcore.journeys j
             JOIN auditcore.customers c
               ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+            JOIN auditcore.projects p
+              ON p.tenant_id = j.tenant_id
+            JOIN auditcore.dealers d
+              ON d.tenant_id = j.tenant_id AND d.dealer_id = j.dealer_id
+            JOIN auditcore.dealer_outlets o
+              ON o.tenant_id = j.tenant_id AND o.outlet_id = j.outlet_id
             WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
             """
         ),
@@ -420,35 +431,18 @@ def _dependency_error(exc: Exception) -> AuditCoreError:
         error_code="VAC-SYS-002",
         status_code=503,
         title="Dependency unavailable",
-        detail="Security could not authorize the downstream document operation.",
+        detail="Security could not issue the DI ServiceIntegration token.",
     )
 
 
 def _operation_failure_state(exc: Exception) -> tuple[str, str]:
     if isinstance(exc, DiClientError):
         return ("RETRY_WAIT" if exc.retryable else "FAILED", exc.code)
-    return "FAILED", "SECURITY_TOKEN_DENIED"
+    return "RETRY_WAIT", "SECURITY_TOKEN_DENIED"
 
 
-def _document_for_recovery(
-    *,
-    bearer_token: str,
-    security_client: SecurityOAuthClient,
-    di_client: DiClient,
-    tenant_id: str,
-    subject_id: UUID,
-    document_id: UUID,
-) -> DiDocument:
-    token = security_client.exchange_user_token(
-        subject_token=bearer_token,
-        permissions=["di.document.read"],
-    )
-    return di_client.get_document(
-        token=token,
-        tenant_id=tenant_id,
-        subject_id=str(subject_id),
-        document_id=str(document_id),
-    )
+def _external_context_ref(*, journey_id: UUID, customer_id: UUID) -> str:
+    return f"audit-{journey_id}-{customer_id}"
 
 
 def _link_evidence(
@@ -537,7 +531,7 @@ def _link_evidence(
             journeyId=journey_id,
             documentTypeKey=document_type_key,
             evidencePurpose=evidence_purpose,
-            processingStatus=document.processing_status,
+            processingStatus=document.processing_status or "PENDING",
             verificationStatus=document.verification_state,
             createdAtUtc=row["linked_at_utc"].isoformat(),
         )
@@ -587,7 +581,6 @@ def upload_journey_evidence(
     file: Annotated[UploadFile, File()],
     evidence_purpose: Annotated[str, Form(alias="evidencePurpose", min_length=1, max_length=160)],
     principal: Annotated[Principal, Depends(get_principal)],
-    bearer_token: Annotated[str, Depends(get_bearer_token)],
     engine: Annotated[Engine, Depends(get_engine)],
     security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
     di_client: Annotated[DiClient, Depends(get_di_client)],
@@ -656,33 +649,25 @@ def upload_journey_evidence(
         if operation is None:
             raise RuntimeError("Evidence ingestion operation was not created")
         customer_id = journey["customer_id"]
-        display_name = journey["display_name"]
         subject_id = operation["di_subject_id"] or _subject_mapping(
             connection,
             tenant_id=tenant_id,
             customer_id=customer_id,
         )
         document_id = operation["di_document_id"]
+        context_ref = _external_context_ref(journey_id=journey_id, customer_id=customer_id)
 
-    if subject_id is None:
-        try:
-            subject_token = security_client.exchange_user_token(
-                subject_token=bearer_token,
-                permissions=["di.subject.create"],
-            )
+    try:
+        service_token = security_client.get_service_token(audience=_DI_AUDIENCE)
+
+        if subject_id is None:
             subject = di_client.create_subject(
-                token=subject_token,
+                token=service_token,
                 tenant_id=tenant_id,
                 subject_type="OTHER",
-                display_name=display_name,
+                display_name=journey["customer_name"],
             )
             subject_id = UUID(subject.subject_id)
-            logger.info(
-                "di_subject_created",
-                subject_id=str(subject_id),
-                tenant_id=tenant_id,
-                customer_id=str(customer_id),
-            )
             _persist_subject_mapping(
                 engine,
                 tenant_id=tenant_id,
@@ -696,88 +681,54 @@ def upload_journey_evidence(
                 operation_status="RECEIVED",
                 di_subject_id=subject_id,
             )
-        except (DiClientError, SecurityTokenError) as exc:
-            state, code = _operation_failure_state(exc)
-            _update_operation(
-                engine,
-                tenant_id=tenant_id,
-                idempotency_key=idempotency_key,
-                operation_status=state,
-                error_code=code,
-                error_summary="DI subject resolution failed",
-                increment_attempt=True,
-            )
-            logger.warning(
-                "evidence_upload_failed",
-                error_code=code,
-                retryable=isinstance(exc, DiClientError) and exc.retryable,
-                journey_id=str(journey_id),
-                tenant_id=tenant_id,
-            )
-            raise _dependency_error(exc) from exc
-
-    if document_id is not None:
-        try:
-            document = _document_for_recovery(
-                bearer_token=bearer_token,
-                security_client=security_client,
-                di_client=di_client,
-                tenant_id=tenant_id,
-                subject_id=subject_id,
-                document_id=document_id,
-            )
-        except (DiClientError, SecurityTokenError) as exc:
-            state, code = _operation_failure_state(exc)
-            _update_operation(
-                engine,
-                tenant_id=tenant_id,
-                idempotency_key=idempotency_key,
-                operation_status=state,
-                di_subject_id=subject_id,
-                di_document_id=document_id,
-                error_code=code,
-                error_summary="DI recovery status refresh failed",
-                increment_attempt=True,
-            )
-            logger.warning(
-                "evidence_upload_failed",
-                error_code=code,
-                retryable=isinstance(exc, DiClientError) and exc.retryable,
-                journey_id=str(journey_id),
-                tenant_id=tenant_id,
-            )
-            raise _dependency_error(exc) from exc
-    else:
-        _update_operation(
-            engine,
-            tenant_id=tenant_id,
-            idempotency_key=idempotency_key,
-            operation_status="DI_SUBMITTING",
-            di_subject_id=subject_id,
-            increment_attempt=True,
-        )
-        try:
-            upload_token = security_client.exchange_user_token(
-                subject_token=bearer_token,
-                permissions=["di.document.upload"],
-            )
-            document = di_client.upload_document(
-                token=upload_token,
-                tenant_id=tenant_id,
+            logger.info(
+                "di_subject_created",
                 subject_id=str(subject_id),
+                tenant_id=tenant_id,
+                customer_id=str(customer_id),
+            )
+
+        di_client.ensure_audit_storage_context(
+            token=service_token,
+            tenant_id=tenant_id,
+            external_context_ref=context_ref,
+            subject_id=str(subject_id),
+            dealer_id=str(journey["dealer_id"]),
+            outlet_id=str(journey["outlet_id"]),
+            customer_id=str(customer_id),
+            project_name=journey["project_name"],
+            dealer_name=journey["dealer_name"],
+            outlet_name=journey["outlet_name"],
+            customer_name=journey["customer_name"],
+            idempotency_key=f"{idempotency_key}:context",
+        )
+
+        if document_id is not None:
+            document = di_client.get_audit_document(
+                token=service_token,
+                tenant_id=tenant_id,
+                external_context_ref=context_ref,
+                document_id=str(document_id),
+            )
+        else:
+            _update_operation(
+                engine,
+                tenant_id=tenant_id,
+                idempotency_key=idempotency_key,
+                operation_status="DI_SUBMITTING",
+                di_subject_id=subject_id,
+                increment_attempt=True,
+            )
+            document = di_client.upload_audit_document(
+                token=service_token,
+                tenant_id=tenant_id,
+                external_context_ref=context_ref,
                 filename=filename,
                 content=content,
                 content_type=content_type,
-                source_channel="API",
                 document_type_key=document_type_key,
             )
             document_id = UUID(document.document_id)
-            logger.info(
-                "di_document_uploaded",
-                document_id=str(document_id),
-                subject_id=str(subject_id),
-                tenant_id=tenant_id,
-            )
             _update_operation(
                 engine,
                 tenant_id=tenant_id,
@@ -786,25 +737,34 @@ def upload_journey_evidence(
                 di_subject_id=subject_id,
                 di_document_id=document_id,
             )
-        except (DiClientError, SecurityTokenError) as exc:
-            state, code = _operation_failure_state(exc)
-            _update_operation(
-                engine,
+            logger.info(
+                "di_document_uploaded",
+                document_id=str(document_id),
+                subject_id=str(subject_id),
                 tenant_id=tenant_id,
-                idempotency_key=idempotency_key,
-                operation_status=state,
-                di_subject_id=subject_id,
-                error_code=code,
-                error_summary="DI document submission failed",
+                external_context_ref=context_ref,
             )
-            logger.warning(
-                "evidence_upload_failed",
-                error_code=code,
-                retryable=isinstance(exc, DiClientError) and exc.retryable,
-                journey_id=str(journey_id),
-                tenant_id=tenant_id,
-            )
-            raise _dependency_error(exc) from exc
+    except (DiClientError, SecurityTokenError) as exc:
+        state, code = _operation_failure_state(exc)
+        _update_operation(
+            engine,
+            tenant_id=tenant_id,
+            idempotency_key=idempotency_key,
+            operation_status=state,
+            di_subject_id=subject_id,
+            di_document_id=document_id,
+            error_code=code,
+            error_summary="DI ServiceIntegration evidence operation failed",
+            increment_attempt=True,
+        )
+        logger.warning(
+            "evidence_upload_failed",
+            error_code=code,
+            retryable=isinstance(exc, DiClientError) and exc.retryable,
+            journey_id=str(journey_id),
+            tenant_id=tenant_id,
+        )
+        raise _dependency_error(exc) from exc
 
     return _link_evidence(
         engine,

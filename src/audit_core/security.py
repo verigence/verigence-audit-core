@@ -16,6 +16,11 @@ class Principal:
     permissions: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class HumanPrincipal:
+    subject: str
+
+
 class SecurityTokenValidator:
     def __init__(
         self,
@@ -30,20 +35,10 @@ class SecurityTokenValidator:
         self._jwks_client = jwks_client or PyJWKClient(jwks_url)
 
     def validate(self, token: str) -> Principal:
-        try:
-            signing_key = self._jwks_client.get_signing_key_from_jwt(token)
-            claims = jwt.decode(
-                token,
-                signing_key.key,
-                algorithms=[signing_key.algorithm_name],
-                issuer=self._issuer,
-                audience=self._audience,
-                options={
-                    "require": ["exp", "iss", "aud", "sub", "tenant_id", "permissions"]
-                },
-            )
-        except (PyJWTError, ValueError, TypeError) as exc:
-            raise SecurityTokenError("Invalid Security token") from exc
+        claims = self._decode(
+            token,
+            required_claims=["exp", "iss", "aud", "sub", "tenant_id", "permissions"],
+        )
 
         subject = claims.get("sub")
         tenant_id = claims.get("tenant_id")
@@ -63,3 +58,40 @@ class SecurityTokenValidator:
             tenant_id=tenant_id,
             permissions=tuple(permissions),
         )
+
+    def validate_human(self, token: str) -> HumanPrincipal:
+        claims = self._decode(
+            token,
+            required_claims=["exp", "iss", "aud", "sub", "iat", "jti", "actor_type"],
+        )
+        subject = claims.get("sub")
+        if not isinstance(subject, str) or not subject.strip():
+            raise SecurityTokenError("Invalid Security human token claims")
+        if claims.get("actor_type") != "USER":
+            raise SecurityTokenError("Security token is not a human USER token")
+
+        forbidden_authority_claims = {
+            "tenant_id",
+            "permissions",
+            "roles",
+            "device_id",
+            "location_id",
+            "act",
+        }
+        if forbidden_authority_claims.intersection(claims):
+            raise SecurityTokenError("Security human token carries unsupported authority claims")
+        return HumanPrincipal(subject=subject)
+
+    def _decode(self, token: str, *, required_claims: list[str]) -> dict:
+        try:
+            signing_key = self._jwks_client.get_signing_key_from_jwt(token)
+            return jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=[signing_key.algorithm_name],
+                issuer=self._issuer,
+                audience=self._audience,
+                options={"require": required_claims},
+            )
+        except (PyJWTError, ValueError, TypeError) as exc:
+            raise SecurityTokenError("Invalid Security token") from exc

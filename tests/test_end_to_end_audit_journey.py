@@ -17,12 +17,12 @@ from audit_core.security import Principal
 
 @dataclass
 class FakeSecurityClient:
-    calls: list[tuple[str, ...]]
+    audiences: list[str]
 
-    def exchange_user_token(self, *, subject_token: str, permissions: list[str]) -> str:
-        assert subject_token == "user-token"
-        self.calls.append(tuple(permissions))
-        return "service-token"
+    def get_service_token(self, *, audience: str) -> str:
+        assert audience == "di"
+        self.audiences.append(audience)
+        return "service-integration-di-token"
 
 
 @dataclass
@@ -31,38 +31,55 @@ class FakeDiClient:
     subject_id: str
     document_id: str
     create_calls: int = 0
+    context_calls: int = 0
     upload_calls: int = 0
 
     def _document(self) -> DiDocument:
         return DiDocument(
             document_id=self.document_id,
-            subject_id=self.subject_id,
             upload_status="ACCEPTED",
             processing_status="COMPLETED",
             confirmation_status="CONFIRMED",
             verification_state="NOT_VERIFIED",
-            human_verification_status=None,
             confidence_score=0.97,
-            correlation_id="di-e2e",
+            document_type_key="GATE_PASS",
         )
 
     def create_subject(self, **kwargs) -> DiSubject:
-        assert kwargs["token"] == "service-token"
+        assert kwargs["token"] == "service-integration-di-token"
         assert kwargs["tenant_id"] == self.tenant_id
         self.create_calls += 1
         return DiSubject(subject_id=self.subject_id, status="ACTIVE")
 
-    def upload_document(self, **kwargs) -> DiDocument:
-        assert kwargs["token"] == "service-token"
+    def ensure_audit_storage_context(self, **kwargs) -> dict:
+        assert kwargs["token"] == "service-integration-di-token"
         assert kwargs["tenant_id"] == self.tenant_id
         assert kwargs["subject_id"] == self.subject_id
+        assert kwargs["dealer_id"]
+        assert kwargs["outlet_id"]
+        assert kwargs["customer_id"]
+        assert kwargs["project_name"] == "E2E Project"
+        assert kwargs["dealer_name"] == "E2E Dealer"
+        assert kwargs["outlet_name"] == "E2E Outlet"
+        assert kwargs["customer_name"] == "E2E Customer"
+        self.context_calls += 1
+        return {
+            "tenantId": self.tenant_id,
+            "externalContextRef": kwargs["external_context_ref"],
+            "subjectId": self.subject_id,
+        }
+
+    def upload_audit_document(self, **kwargs) -> DiDocument:
+        assert kwargs["token"] == "service-integration-di-token"
+        assert kwargs["tenant_id"] == self.tenant_id
+        assert kwargs["external_context_ref"].startswith("audit-")
+        assert kwargs["document_type_key"] == "GATE_PASS"
         self.upload_calls += 1
         return self._document()
 
-    def get_document(self, **kwargs) -> DiDocument:
-        assert kwargs["token"] == "service-token"
+    def get_audit_document(self, **kwargs) -> DiDocument:
+        assert kwargs["token"] == "service-integration-di-token"
         assert kwargs["tenant_id"] == self.tenant_id
-        assert kwargs["subject_id"] == self.subject_id
         assert kwargs["document_id"] == self.document_id
         return self._document()
 
@@ -79,7 +96,9 @@ def test_critical_journey_uses_audit_core_only_and_keeps_delivery_independent() 
     tl_id = f"tl-{suffix}"
     subject_id = str(uuid4())
     document_id = str(uuid4())
-    security_client = FakeSecurityClient(calls=[])
+    dealer_id = uuid4()
+    outlet_id = uuid4()
+    security_client = FakeSecurityClient(audiences=[])
     di_client = FakeDiClient(
         tenant_id=tenant_id,
         subject_id=subject_id,
@@ -120,6 +139,42 @@ def test_critical_journey_uses_audit_core_only_and_keeps_delivery_independent() 
                 "category_id": category_id,
             },
         )
+        # Dealer/Outlet are setup data for this operating-journey test. UC02 makes
+        # their administration a human SuperAdmin boundary, so a PC must not create
+        # them through the administrative API as part of this test.
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.dealers (
+                    tenant_id, dealer_id, dealer_code, dealer_name
+                ) VALUES (
+                    :tenant_id, :dealer_id, :dealer_code, 'E2E Dealer'
+                )
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "dealer_id": dealer_id,
+                "dealer_code": f"D-{suffix}",
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.dealer_outlets (
+                    tenant_id, dealer_id, outlet_id, outlet_code, outlet_name
+                ) VALUES (
+                    :tenant_id, :dealer_id, :outlet_id, :outlet_code, 'E2E Outlet'
+                )
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "dealer_id": dealer_id,
+                "outlet_id": outlet_id,
+                "outlet_code": f"O-{suffix}",
+            },
+        )
         connection.execute(
             text(
                 """
@@ -155,20 +210,6 @@ def test_critical_journey_uses_audit_core_only_and_keeps_delivery_independent() 
     auth_headers = {"Authorization": "Bearer user-token"}
 
     try:
-        dealer = client.post(
-            f"/v1/tenants/{tenant_id}/dealers",
-            json={"dealerCode": f"D-{suffix}", "dealerName": "E2E Dealer"},
-        )
-        assert dealer.status_code == 201, dealer.text
-        dealer_id = dealer.json()["dealerId"]
-
-        outlet = client.post(
-            f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets",
-            json={"outletCode": f"O-{suffix}", "outletName": "E2E Outlet"},
-        )
-        assert outlet.status_code == 201, outlet.text
-        outlet_id = outlet.json()["outletId"]
-
         customer = client.post(
             f"/v1/tenants/{tenant_id}/outlets/{outlet_id}/customers",
             json={"customerTypeCode": "RETAIL", "displayName": "E2E Customer"},
@@ -223,7 +264,9 @@ def test_critical_journey_uses_audit_core_only_and_keeps_delivery_independent() 
         assert evidence.status_code == 201, evidence.text
         evidence_id = evidence.json()["evidenceId"]
         assert "di" not in " ".join(evidence.json().keys()).lower()
+        assert security_client.audiences == ["di"]
         assert di_client.create_calls == 1
+        assert di_client.context_calls == 1
         assert di_client.upload_calls == 1
 
         delivery = client.put(
@@ -254,7 +297,11 @@ def test_critical_journey_uses_audit_core_only_and_keeps_delivery_independent() 
         app.dependency_overrides[get_principal] = lambda: Principal(
             subject=tl_id,
             tenant_id=tenant_id,
-            permissions=("audit.review.read", "audit.review.decide", "audit.delivery.read"),
+            permissions=(
+                "audit.review.read",
+                "audit.review.decide",
+                "audit.delivery.read",
+            ),
         )
         reviewed = client.post(
             f"/v1/tenants/{tenant_id}/journeys/{journey_id}/review-decisions",
@@ -287,10 +334,7 @@ def test_critical_journey_uses_audit_core_only_and_keeps_delivery_independent() 
             ).mappings().one()
         assert final_state["audit_state"] == "REVIEW_COMPLETE"
         assert final_state["audit_outcome"] == "NO_BREACH"
-        assert security_client.calls == [
-            ("di.subject.create",),
-            ("di.document.upload",),
-        ]
+        assert security_client.audiences == ["di"]
     finally:
         app.dependency_overrides.clear()
         engine.dispose()

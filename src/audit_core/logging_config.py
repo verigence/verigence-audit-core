@@ -22,7 +22,6 @@ from structlog.types import EventDict, WrappedLogger
 
 from audit_core.config import Settings
 
-
 # ---------------------------------------------------------------------------
 # Internal processors
 # ---------------------------------------------------------------------------

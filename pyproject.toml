@@ -16,6 +16,7 @@ dependencies = [
     "PyJWT[crypto]==2.13.0",
     "httpx==0.28.1",
     "python-multipart==0.0.22",
+    "openpyxl>=3.1,<4",
     "structlog>=24.1.0",
 ]
 
@@ -36,3 +37,12 @@ pythonpath = ["src"]
 
 [tool.ruff]
 target-version = "py312"
+
+[tool.ruff.lint.per-file-ignores]
+# This catch is a deliberate composite-operation recovery boundary: once a
+# downstream Security write has occurred, any unexpected local failure must be
+# converted into a durable RECOVERY_REQUIRED state rather than losing reconciliation.
+"src/audit_core/role_mappings.py" = ["BLE001"]
+# The Project Master facade keeps imports grouped by owning master domain so the
+# adapter boundary remains reviewable beside the corresponding confirm helpers.
+"src/audit_core/project_master_imports.py" = ["I001"]

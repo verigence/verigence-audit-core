@@ -12,8 +12,16 @@ from audit_core.security import SecurityTokenError
 logger = structlog.get_logger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass
 class AuditCoreError(RuntimeError):
+    """Stable public API error.
+
+    Exceptions must remain mutable because Python/contextlib assigns traceback state
+    while an exception crosses FastAPI yield dependencies. A frozen dataclass turns
+    that normal traceback propagation into FrozenInstanceError and masks the original
+    problem response.
+    """
+
     error_code: str
     status_code: int
     title: str
@@ -21,6 +29,16 @@ class AuditCoreError(RuntimeError):
 
     def __str__(self) -> str:
         return self.title
+
+
+class ValidationError(AuditCoreError):
+    def __init__(self, *, detail: str) -> None:
+        super().__init__("VAC-VAL-001", 400, "Validation failed", detail)
+
+
+class BusinessValidationError(AuditCoreError):
+    def __init__(self, *, detail: str) -> None:
+        super().__init__("VAC-VAL-002", 422, "Business validation failed", detail)
 
 
 class NotFoundError(AuditCoreError):
@@ -107,10 +125,11 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def system_error(request: Request, exc: Exception) -> JSONResponse:
+        # Exception messages can contain bearer tokens, passwords, document values or other
+        # sensitive input. Log only the safe exception classification and correlation context.
         logger.error(
             "system_error",
             exc_type=type(exc).__name__,
-            exc_msg=str(exc),
         )
         return _problem(
             request,
