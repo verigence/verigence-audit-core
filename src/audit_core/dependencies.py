@@ -1,5 +1,6 @@
 import os
 from collections.abc import Iterator
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Annotated
 
@@ -8,11 +9,24 @@ from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import Connection, Engine, create_engine, text
 
-from audit_core.security import Principal, SecurityTokenError, SecurityTokenValidator
+from audit_core.authorization import AuthorizationError
+from audit_core.security import HumanPrincipal, Principal, SecurityTokenError, SecurityTokenValidator
+from audit_core.security_integration import (
+    SecurityAdminClient,
+    SecurityAdminContext,
+    SecurityAdminError,
+)
 
 logger = structlog.get_logger(__name__)
 
 _bearer = HTTPBearer(auto_error=False)
+
+
+@dataclass(frozen=True)
+class HumanAdminRequest:
+    user_id: str
+    bearer_token: str
+    admin_context: SecurityAdminContext
 
 
 @lru_cache
@@ -41,21 +55,68 @@ def get_bearer_token(
     return credentials.credentials
 
 
-def get_principal(
-    bearer_token: Annotated[str, Depends(get_bearer_token)],
-) -> Principal:
+def _token_validator() -> SecurityTokenValidator:
     jwks_url = os.environ.get("SECURITY_JWKS_URL", "").strip()
     issuer = os.environ.get("SECURITY_ISSUER", "").strip()
     audience = os.environ.get("SECURITY_AUDIENCE", "").strip()
     if not jwks_url or not issuer or not audience:
         raise RuntimeError("Security JWT verification is not configured")
+    return SecurityTokenValidator(
+        jwks_url=jwks_url,
+        issuer=issuer,
+        audience=audience,
+    )
 
+
+def get_principal(
+    bearer_token: Annotated[str, Depends(get_bearer_token)],
+) -> Principal:
     try:
-        return SecurityTokenValidator(
-            jwks_url=jwks_url,
-            issuer=issuer,
-            audience=audience,
-        ).validate(bearer_token)
+        return _token_validator().validate(bearer_token)
     except SecurityTokenError as exc:
         logger.warning("auth_failed", reason=str(exc))
         raise
+
+
+def get_human_principal(
+    bearer_token: Annotated[str, Depends(get_bearer_token)],
+) -> HumanPrincipal:
+    try:
+        return _token_validator().validate_human(bearer_token)
+    except SecurityTokenError as exc:
+        logger.warning("human_auth_failed", reason=str(exc))
+        raise
+
+
+def get_human_admin_request(
+    bearer_token: Annotated[str, Depends(get_bearer_token)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+) -> HumanAdminRequest:
+    security_base_url = os.environ.get("SECURITY_BASE_URL", "").strip()
+    if not security_base_url:
+        raise RuntimeError("SECURITY_BASE_URL is required for UC02 administration")
+    try:
+        with SecurityAdminClient(base_url=security_base_url) as client:
+            context = client.get_admin_context(human_bearer_token=bearer_token)
+    except SecurityAdminError as exc:
+        logger.warning("security_admin_context_failed", reason=str(exc))
+        raise SecurityTokenError("Security administrative context is unavailable") from exc
+    if context.user_id != human_principal.subject:
+        raise SecurityTokenError("Security administrative USER does not match authenticated USER")
+    return HumanAdminRequest(
+        user_id=human_principal.subject,
+        bearer_token=bearer_token,
+        admin_context=context,
+    )
+
+
+def require_super_admin_request(
+    request: Annotated[HumanAdminRequest, Depends(get_human_admin_request)],
+) -> HumanAdminRequest:
+    if not request.admin_context.is_super_admin:
+        raise AuthorizationError(
+            error_code="VAC-AUTH-002",
+            status_code=403,
+            title="Permission denied",
+        )
+    return request
