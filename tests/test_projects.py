@@ -1,5 +1,5 @@
 import os
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -108,7 +108,9 @@ def test_project_get_and_patch_are_tenant_bound_and_versioned(project_setup) -> 
         headers={"If-Match": response.headers["etag"]},
         json={
             "projectName": "Project A Updated",
-            "effectiveEndDate": (date.today() + timedelta(days=30)).isoformat(),
+            "effectiveEndDate": (
+                datetime.now(UTC).date() + timedelta(days=30)
+            ).isoformat(),
             "timezoneName": "Asia/Kolkata",
             "regionCode": "WEST",
         },
