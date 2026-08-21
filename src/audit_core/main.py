@@ -10,6 +10,7 @@ from audit_core.crm_api import router as crm_router
 from audit_core.customers import router as customer_router
 from audit_core.daily_operations_api import router as daily_operations_router
 from audit_core.dealers import router as dealer_router
+from audit_core.di_project_master_proxy import router as di_project_master_proxy_router
 from audit_core.errors import install_error_handlers
 from audit_core.escalations_api import router as escalation_router
 from audit_core.evidence import router as evidence_router
@@ -20,8 +21,10 @@ from audit_core.journeys import router as journey_router
 from audit_core.logging_config import configure_logging
 from audit_core.observability import install_observability
 from audit_core.payments_finance import router as payments_finance_router
+from audit_core.project_activation import router as project_activation_router
 from audit_core.project_master_imports import router as project_master_import_router
 from audit_core.project_masters import router as project_master_router
+from audit_core.project_provisioning import router as project_provisioning_router
 from audit_core.projects import router as project_router
 from audit_core.readiness import router as readiness_router
 from audit_core.reference_data import router as reference_data_router
@@ -45,8 +48,14 @@ def create_app() -> FastAPI:
     install_error_handlers(application)
     install_observability(application)
     install_contract_guards(application)
+    application.include_router(project_provisioning_router)
     application.include_router(project_router)
     application.include_router(readiness_router)
+    application.include_router(project_activation_router)
+    # Literal DI-owned Project Master and generic import routes must be registered
+    # before the older owner-module dynamic routes so DI requests cannot fall into
+    # the Audit-Core-only rejection branches.
+    application.include_router(di_project_master_proxy_router)
     application.include_router(project_master_router)
     application.include_router(project_master_import_router)
     application.include_router(dealer_router)

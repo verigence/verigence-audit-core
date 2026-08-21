@@ -1,20 +1,16 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Self
 
 import httpx
 import structlog
 
-TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
-ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
-
 logger = structlog.get_logger(__name__)
 
 
 class SecurityTokenError(RuntimeError):
-    """Security did not issue the requested downstream access token."""
+    """Security did not issue the requested ServiceIntegration access token."""
 
 
 class SecurityAdminError(RuntimeError):
@@ -135,6 +131,25 @@ class SecurityAdminClient:
             is_super_admin=is_super_admin,
             admin_scopes=tuple(scopes),
         )
+
+    def create_tenant(
+        self,
+        *,
+        human_bearer_token: str,
+        tenant_name: str,
+        idempotency_key: str,
+    ) -> SecurityTenant:
+        payload = self._request_json(
+            "POST",
+            "/security/v1/platform/tenants",
+            human_bearer_token=human_bearer_token,
+            headers={"Idempotency-Key": idempotency_key},
+            json_body={"tenantName": tenant_name},
+        )
+        tenant_id = payload.get("tenantId")
+        if not isinstance(tenant_id, str) or not tenant_id:
+            raise SecurityAdminError("Security Tenant create response has invalid shape")
+        return self._tenant_from_payload(payload, requested_tenant_id=tenant_id)
 
     def get_tenant(
         self,
@@ -380,7 +395,12 @@ class SecurityAdminClient:
 
 
 class SecurityOAuthClient:
-    """Minimal confidential-client wrapper for Security's internal OAuth endpoint."""
+    """Security v2 ServiceIntegration token client.
+
+    ServiceIntegration is platform-global in Phase 1. A machine caller requests a
+    target-module audience from POST /security/v1/service/token; no Tenant scope,
+    permission list, delegated human token, or legacy OAuth grant is sent.
+    """
 
     def __init__(
         self,
@@ -392,7 +412,7 @@ class SecurityOAuthClient:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         if not base_url.strip() or not client_id.strip() or not client_secret:
-            raise ValueError("Security OAuth base URL and client credentials are required")
+            raise ValueError("Security service-token base URL and client credentials are required")
         self._client = httpx.Client(
             base_url=base_url.rstrip("/"),
             auth=(client_id, client_secret),
@@ -409,88 +429,60 @@ class SecurityOAuthClient:
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
 
-    def get_service_token(self, *, tenant_id: str, permissions: Iterable[str]) -> str:
-        if not tenant_id.strip():
-            raise ValueError("tenant_id is required")
-        return self._request_token(
-            {
-                "grant_type": "client_credentials",
-                "tenant_id": tenant_id,
-                "scope": _scope(permissions),
-            }
-        )
-
-    def exchange_user_token(
-        self,
-        *,
-        subject_token: str,
-        permissions: Iterable[str],
-    ) -> str:
-        if not subject_token:
-            raise ValueError("subject_token is required")
-        return self._request_token(
-            {
-                "grant_type": TOKEN_EXCHANGE_GRANT,
-                "subject_token": subject_token,
-                "subject_token_type": ACCESS_TOKEN_TYPE,
-                "scope": _scope(permissions),
-            }
-        )
-
-    def _request_token(self, form: dict[str, str]) -> str:
+    def get_service_token(self, *, audience: str) -> str:
+        requested_audience = audience.strip()
+        if not requested_audience:
+            raise ValueError("audience is required")
         logger.debug(
-            "security_token_exchange_start",
-            grant_type=form.get("grant_type"),
-            scope=form.get("scope"),
+            "security_service_token_start",
+            audience=requested_audience,
         )
         try:
-            response = self._client.post("/oauth/token", data=form)
+            response = self._client.post(
+                "/security/v1/service/token",
+                data={"audience": requested_audience},
+            )
         except httpx.HTTPError as exc:
-            logger.warning("security_token_exchange_failed", reason="endpoint_unavailable")
-            raise SecurityTokenError("Security token endpoint is unavailable") from exc
+            logger.warning("security_service_token_failed", reason="endpoint_unavailable")
+            raise SecurityTokenError("Security service-token endpoint is unavailable") from exc
 
         if response.status_code != 200:
-            error = _safe_oauth_error(response)
+            error = _safe_service_error(response)
             logger.warning(
-                "security_token_exchange_failed",
+                "security_service_token_failed",
                 http_status=response.status_code,
                 error=error,
+                audience=requested_audience,
             )
             raise SecurityTokenError(
-                f"Security token request denied with HTTP {response.status_code}: {error}"
+                f"Security service-token request denied with HTTP {response.status_code}: {error}"
             )
 
         try:
             payload: Any = response.json()
         except ValueError as exc:
-            raise SecurityTokenError("Security token response is not valid JSON") from exc
+            raise SecurityTokenError("Security service-token response is not valid JSON") from exc
         if not isinstance(payload, dict):
-            raise SecurityTokenError("Security token response has invalid shape")
+            raise SecurityTokenError("Security service-token response has invalid shape")
 
-        access_token = payload.get("access_token")
-        token_type = payload.get("token_type")
+        access_token = payload.get("accessToken")
+        token_type = payload.get("tokenType")
+        returned_audience = payload.get("audience")
         if not isinstance(access_token, str) or not access_token:
-            raise SecurityTokenError("Security token response has no access_token")
+            raise SecurityTokenError("Security service-token response has no accessToken")
         if token_type != "Bearer":
-            raise SecurityTokenError("Security token response has invalid token_type")
+            raise SecurityTokenError("Security service-token response has invalid tokenType")
+        if returned_audience != requested_audience:
+            raise SecurityTokenError("Security service-token response audience mismatch")
         return access_token
 
 
-def _scope(permissions: Iterable[str]) -> str:
-    values = sorted({permission.strip() for permission in permissions if permission.strip()})
-    if not values:
-        raise ValueError("at least one downstream permission is required")
-    if any(" " in value for value in values):
-        raise ValueError("permission values must not contain spaces")
-    return " ".join(values)
-
-
-def _safe_oauth_error(response: httpx.Response) -> str:
+def _safe_service_error(response: httpx.Response) -> str:
     try:
         payload = response.json()
     except ValueError:
         return "request_denied"
     if not isinstance(payload, dict):
         return "request_denied"
-    value = payload.get("error")
-    return value if isinstance(value, str) and value else "request_denied"
+    value = payload.get("code") or payload.get("detail") or payload.get("error")
+    return str(value) if value else "request_denied"

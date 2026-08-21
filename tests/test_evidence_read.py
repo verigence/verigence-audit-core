@@ -7,12 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-from audit_core.dependencies import (
-    get_bearer_token,
-    get_connection,
-    get_engine,
-    get_principal,
-)
+from audit_core.dependencies import get_connection, get_engine, get_principal
 from audit_core.di_client import DiDocument, DiFact
 from audit_core.evidence import get_di_client, get_security_oauth_client
 from audit_core.main import app
@@ -21,12 +16,12 @@ from audit_core.security import Principal
 
 class FakeSecurityClient:
     def __init__(self) -> None:
-        self.requests: list[tuple[str, ...]] = []
+        self.audiences: list[str] = []
 
-    def exchange_user_token(self, *, subject_token: str, permissions: list[str]) -> str:
-        assert subject_token == "user-token"
-        self.requests.append(tuple(permissions))
-        return "delegated-read-token"
+    def get_service_token(self, *, audience: str) -> str:
+        assert audience == "di"
+        self.audiences.append(audience)
+        return "service-integration-di-token"
 
 
 class FakeDiClient:
@@ -44,20 +39,20 @@ class FakeDiClient:
         subject_id: str,
         document_id: str,
     ) -> DiDocument:
-        assert token == "delegated-read-token"
+        assert token == "service-integration-di-token"
+        assert tenant_id.startswith("tenant-evidence-read-")
         assert subject_id == str(self.subject_id)
         assert document_id == str(self.document_id)
         self.document_calls += 1
         return DiDocument(
             document_id=document_id,
-            subject_id=subject_id,
             upload_status="FIT",
             processing_status="PROCESSED",
             confirmation_status="CONFIRMED",
-            verification_state="NOT_VERIFIED",
-            human_verification_status="OPTIONAL",
             confidence_score=96.5,
-            correlation_id="di-refresh-1",
+            document_type_key="BOOKING_FORM",
+            registered_at="2026-08-21T10:00:00Z",
+            verification_state="NOT_VERIFIED",
         )
 
     def get_document_facts(
@@ -68,7 +63,8 @@ class FakeDiClient:
         subject_id: str,
         document_id: str,
     ) -> tuple[DiFact, ...]:
-        assert token == "delegated-read-token"
+        assert token == "service-integration-di-token"
+        assert tenant_id.startswith("tenant-evidence-read-")
         assert subject_id == str(self.subject_id)
         assert document_id == str(self.document_id)
         self.fact_calls += 1
@@ -268,11 +264,8 @@ def evidence_read_setup():
         permissions=(
             "audit.evidence.read",
             "audit.evidence.refresh",
-            "di.document.read",
-            "di.document.fields.read",
         ),
     )
-    app.dependency_overrides[get_bearer_token] = lambda: "user-token"
     app.dependency_overrides[get_security_oauth_client] = lambda: security_client
     app.dependency_overrides[get_di_client] = lambda: di_client
     try:
@@ -304,7 +297,10 @@ def _assert_no_di_ids(value) -> None:
 def test_evidence_read_routes_use_only_audit_core_ids(evidence_read_setup) -> None:
     setup = evidence_read_setup
     client = TestClient(app, raise_server_exceptions=False)
-    base = f"/v1/tenants/{setup['tenant_id']}/journeys/{setup['journey_id']}/evidence"
+    base = (
+        f"/v1/tenants/{setup['tenant_id']}/journeys/"
+        f"{setup['journey_id']}/evidence"
+    )
 
     listed = client.get(base)
     detail = client.get(f"{base}/{setup['evidence_id']}")
@@ -319,7 +315,7 @@ def test_evidence_read_routes_use_only_audit_core_ids(evidence_read_setup) -> No
     _assert_no_di_ids(listed.json())
     _assert_no_di_ids(detail.json())
     _assert_no_di_ids(facts.json())
-    assert setup["security"].requests == []
+    assert setup["security"].audiences == []
     assert setup["di"].document_calls == 0
     assert setup["di"].fact_calls == 0
 
@@ -339,13 +335,14 @@ def test_refresh_updates_status_and_projects_current_di_facts(evidence_read_setu
     assert body["evidenceId"] == str(setup["evidence_id"])
     assert body["processingStatus"] == "PROCESSED"
     assert body["verificationStatus"] == "NOT_VERIFIED"
-    assert {fact["fieldKey"] for fact in body["facts"]} == {"invoice_number", "amount"}
+    assert {fact["fieldKey"] for fact in body["facts"]} == {
+        "invoice_number",
+        "amount",
+    }
     amount = next(fact for fact in body["facts"] if fact["fieldKey"] == "amount")
     assert amount["valueType"] == "NUMBER"
     assert amount["value"] == 125000.5
-    assert setup["security"].requests == [
-        ("di.document.read", "di.document.fields.read"),
-    ]
+    assert setup["security"].audiences == ["di"]
     assert setup["di"].document_calls == 1
     assert setup["di"].fact_calls == 1
     _assert_no_di_ids(body)
@@ -359,7 +356,10 @@ def test_refresh_updates_status_and_projects_current_di_facts(evidence_read_setu
                 WHERE tenant_id = :tenant_id AND evidence_id = :evidence_id
                 """
             ),
-            {"tenant_id": setup["tenant_id"], "evidence_id": setup["evidence_id"]},
+            {
+                "tenant_id": setup["tenant_id"],
+                "evidence_id": setup["evidence_id"],
+            },
         ).mappings().one()
         old_fact = connection.execute(
             text(
@@ -381,7 +381,10 @@ def test_refresh_updates_status_and_projects_current_di_facts(evidence_read_setu
                   AND superseded_at_utc IS NULL
                 """
             ),
-            {"tenant_id": setup["tenant_id"], "evidence_id": setup["evidence_id"]},
+            {
+                "tenant_id": setup["tenant_id"],
+                "evidence_id": setup["evidence_id"],
+            },
         ).scalar_one()
 
     assert evidence["processing_status_cache"] == "PROCESSED"
@@ -395,7 +398,7 @@ def test_refresh_requires_audit_refresh_permission(evidence_read_setup) -> None:
     app.dependency_overrides[get_principal] = lambda: Principal(
         subject=setup["actor_id"],
         tenant_id=setup["tenant_id"],
-        permissions=("audit.evidence.read", "di.document.read", "di.document.fields.read"),
+        permissions=("audit.evidence.read",),
     )
     client = TestClient(app, raise_server_exceptions=False)
     url = (
@@ -407,6 +410,6 @@ def test_refresh_requires_audit_refresh_permission(evidence_read_setup) -> None:
 
     assert response.status_code == 403
     assert response.json()["errorCode"] == "VAC-AUTH-002"
-    assert setup["security"].requests == []
+    assert setup["security"].audiences == []
     assert setup["di"].document_calls == 0
     assert setup["di"].fact_calls == 0
