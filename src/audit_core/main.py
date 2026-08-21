@@ -20,6 +20,8 @@ from audit_core.journeys import router as journey_router
 from audit_core.logging_config import configure_logging
 from audit_core.observability import install_observability
 from audit_core.payments_finance import router as payments_finance_router
+from audit_core.project_master_imports import router as project_master_import_router
+from audit_core.project_masters import router as project_master_router
 from audit_core.projects import router as project_router
 from audit_core.readiness import router as readiness_router
 from audit_core.reference_data import router as reference_data_router
@@ -45,6 +47,8 @@ def create_app() -> FastAPI:
     install_contract_guards(application)
     application.include_router(project_router)
     application.include_router(readiness_router)
+    application.include_router(project_master_router)
+    application.include_router(project_master_import_router)
     application.include_router(dealer_router)
     application.include_router(role_mapping_router)
     application.include_router(customer_router)
