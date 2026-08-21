@@ -6,7 +6,11 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-from audit_core.dependencies import HumanAdminRequest, get_connection, require_super_admin_request
+from audit_core.dependencies import (
+    HumanAdminRequest,
+    get_connection,
+    require_super_admin_request,
+)
 from audit_core.main import app
 from audit_core.security_integration import SecurityAdminContext
 
