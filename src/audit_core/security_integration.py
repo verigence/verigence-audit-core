@@ -35,6 +35,14 @@ class SecurityAdminContext:
     admin_scopes: tuple[SecurityAdminScope, ...]
 
 
+@dataclass(frozen=True)
+class SecurityGlobalUser:
+    user_id: str
+    display_name: str
+    primary_email: str | None
+    status: str
+
+
 class SecurityAdminClient:
     """Human-admin client that always forwards the initiating Security bearer token."""
 
@@ -107,6 +115,56 @@ class SecurityAdminClient:
             admin_scopes=tuple(scopes),
         )
 
+    def list_global_users(
+        self,
+        *,
+        human_bearer_token: str,
+        search: str | None,
+        limit: int,
+    ) -> tuple[SecurityGlobalUser, ...]:
+        if limit < 1 or limit > 200:
+            raise ValueError("Security USER directory limit must be between 1 and 200")
+        params: dict[str, str | int] = {
+            "userStatus": "ACTIVE",
+            "limit": limit,
+            "offset": 0,
+        }
+        if search:
+            params["search"] = search
+        payload = self._request_json_list(
+            "GET",
+            "/security/v1/platform/users",
+            human_bearer_token=human_bearer_token,
+            params=params,
+        )
+        users: list[SecurityGlobalUser] = []
+        for raw in payload:
+            if not isinstance(raw, dict):
+                raise SecurityAdminError("Security USER directory response has invalid shape")
+            user_id = raw.get("userId")
+            display_name = raw.get("displayName")
+            primary_email = raw.get("primaryEmail")
+            status = raw.get("status")
+            if (
+                not isinstance(user_id, str)
+                or not user_id
+                or not isinstance(display_name, str)
+                or not display_name
+                or (primary_email is not None and not isinstance(primary_email, str))
+                or not isinstance(status, str)
+                or not status
+            ):
+                raise SecurityAdminError("Security USER directory response has invalid shape")
+            users.append(
+                SecurityGlobalUser(
+                    user_id=user_id,
+                    display_name=display_name,
+                    primary_email=primary_email,
+                    status=status,
+                )
+            )
+        return tuple(users)
+
     def _request_json(
         self,
         method: str,
@@ -115,7 +173,48 @@ class SecurityAdminClient:
         human_bearer_token: str,
         headers: dict[str, str] | None = None,
         json_body: dict[str, object] | None = None,
+        params: dict[str, str | int] | None = None,
     ) -> dict[str, Any]:
+        payload = self._request_payload(
+            method,
+            path,
+            human_bearer_token=human_bearer_token,
+            headers=headers,
+            json_body=json_body,
+            params=params,
+        )
+        if not isinstance(payload, dict):
+            raise SecurityAdminError("Security administrative response has invalid shape")
+        return payload
+
+    def _request_json_list(
+        self,
+        method: str,
+        path: str,
+        *,
+        human_bearer_token: str,
+        params: dict[str, str | int] | None = None,
+    ) -> list[Any]:
+        payload = self._request_payload(
+            method,
+            path,
+            human_bearer_token=human_bearer_token,
+            params=params,
+        )
+        if not isinstance(payload, list):
+            raise SecurityAdminError("Security administrative response has invalid shape")
+        return payload
+
+    def _request_payload(
+        self,
+        method: str,
+        path: str,
+        *,
+        human_bearer_token: str,
+        headers: dict[str, str] | None = None,
+        json_body: dict[str, object] | None = None,
+        params: dict[str, str | int] | None = None,
+    ) -> Any:
         if not human_bearer_token:
             raise ValueError("human_bearer_token is required")
         request_headers = {"Authorization": f"Bearer {human_bearer_token}"}
@@ -127,6 +226,7 @@ class SecurityAdminClient:
                 path,
                 headers=request_headers,
                 json=json_body,
+                params=params,
             )
         except httpx.HTTPError as exc:
             logger.warning("security_admin_call_failed", reason="endpoint_unavailable", path=path)
@@ -141,12 +241,9 @@ class SecurityAdminClient:
                 f"Security administrative request failed with HTTP {response.status_code}"
             )
         try:
-            payload: Any = response.json()
+            return response.json()
         except ValueError as exc:
             raise SecurityAdminError("Security administrative response is not valid JSON") from exc
-        if not isinstance(payload, dict):
-            raise SecurityAdminError("Security administrative response has invalid shape")
-        return payload
 
 
 class SecurityOAuthClient:
