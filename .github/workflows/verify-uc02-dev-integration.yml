@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       AUDIT_SERVICE: verigence-audit-core
       DEV_WEB_URL: https://verigence-web-dev.jbrconsulting-it.workers.dev
@@ -26,19 +26,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ -n "${RAILWAY_TOKEN:-}" ] || { echo 'RAILWAY_TOKEN is not available'; exit 1; }
-          railway status --json >/tmp/status.json
-          railway service list --json >/tmp/services.json
-          python - <<'PY'
-          import json, os
-          from pathlib import Path
-          project=json.loads(Path('/tmp/status.json').read_text())
-          services=json.loads(Path('/tmp/services.json').read_text())
-          if project.get('id') != os.environ['PLATFORM_PROJECT_ID']:
-              raise SystemExit('Railway token does not target the approved DEV project')
-          if not any(row.get('name') == os.environ['AUDIT_SERVICE'] for row in services):
-              raise SystemExit('Audit Core service is missing from the approved DEV project')
-          PY
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo 'RAILWAY_API_TOKEN secret is not configured'; exit 1; }
+          linked=''
+          for environment in production dev development; do
+            if railway link --project "$PLATFORM_PROJECT_ID" --environment "$environment" --service "$AUDIT_SERVICE" --json >/tmp/link.json 2>/tmp/link.err; then
+              linked="$environment"
+              echo "RAILWAY_ENVIRONMENT=$environment"
+              break
+            fi
+          done
+          if [ -z "$linked" ]; then
+            cat /tmp/link.err >&2 || true
+            echo 'Could not link approved Railway project/service to a known DEV environment' >&2
+            exit 1
+          fi
           railway deployment list --service "$AUDIT_SERVICE" --limit 1 --json >/tmp/deployment.json
           python - <<'PY'
           import json
