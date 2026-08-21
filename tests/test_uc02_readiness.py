@@ -11,7 +11,11 @@ from sqlalchemy import create_engine, text
 from audit_core import readiness
 from audit_core.dependencies import HumanAdminRequest, require_super_admin_request
 from audit_core.main import app
-from audit_core.security_integration import SecurityAdminContext, SecurityAdminError, SecurityTenant
+from audit_core.security_integration import (
+    SecurityAdminContext,
+    SecurityAdminError,
+    SecurityTenant,
+)
 
 
 @dataclass
