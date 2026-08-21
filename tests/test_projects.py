@@ -1,4 +1,5 @@
 import os
+from datetime import date, timedelta
 from uuid import uuid4
 
 import pytest
@@ -50,10 +51,10 @@ def project_setup():
                     """
                     INSERT INTO auditcore.projects (
                         tenant_id, project_code, project_name, oem_id,
-                        product_category_id, effective_start_date
+                        product_category_id, effective_start_date, project_status
                     ) VALUES (
                         :tenant_id, :project_code, :project_name, :oem_id,
-                        :category_id, CURRENT_DATE
+                        :category_id, CURRENT_DATE, 'CONFIGURING'
                     )
                     """
                 ),
@@ -83,17 +84,20 @@ def project_setup():
         engine.dispose()
 
 
-def test_project_get_and_patch_are_tenant_bound(project_setup) -> None:
+def test_project_get_and_patch_are_tenant_bound_and_versioned(project_setup) -> None:
     engine, tenant_a, tenant_b = project_setup
     client = TestClient(app, raise_server_exceptions=False)
 
     response = client.get(f"/v1/tenants/{tenant_a}/project")
     assert response.status_code == 200
-    assert response.json() == {
-        "tenantId": tenant_a,
-        "projectCode": f"P-{tenant_a}",
-        "projectName": "Project A",
-    }
+    assert response.headers["etag"] == '"1"'
+    payload = response.json()
+    assert payload["tenantId"] == tenant_a
+    assert payload["projectCode"] == f"P-{tenant_a}"
+    assert payload["projectName"] == "Project A"
+    assert payload["projectStatus"] == "CONFIGURING"
+    assert payload["timezoneName"] == "Asia/Kolkata"
+    assert payload["versionNo"] == 1
 
     mismatch = client.get(f"/v1/tenants/{tenant_b}/project")
     assert mismatch.status_code == 403
@@ -101,10 +105,27 @@ def test_project_get_and_patch_are_tenant_bound(project_setup) -> None:
 
     updated = client.patch(
         f"/v1/tenants/{tenant_a}/project",
-        json={"projectName": "Project A Updated"},
+        headers={"If-Match": response.headers["etag"]},
+        json={
+            "projectName": "Project A Updated",
+            "effectiveEndDate": (date.today() + timedelta(days=30)).isoformat(),
+            "timezoneName": "Asia/Kolkata",
+            "regionCode": "WEST",
+        },
     )
     assert updated.status_code == 200
+    assert updated.headers["etag"] == '"2"'
     assert updated.json()["projectName"] == "Project A Updated"
+    assert updated.json()["regionCode"] == "WEST"
+    assert updated.json()["versionNo"] == 2
+
+    stale = client.patch(
+        f"/v1/tenants/{tenant_a}/project",
+        headers={"If-Match": '"1"'},
+        json={"projectName": "Stale Update"},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["errorCode"] == "VAC-CONFLICT-001"
 
     with engine.connect() as connection:
         names = dict(
@@ -120,16 +141,46 @@ def test_project_get_and_patch_are_tenant_bound(project_setup) -> None:
     assert names[tenant_b] == "Project B"
 
 
-def test_uc02_project_status_accepts_configuring(project_setup) -> None:
+def test_project_restricted_fields_lock_after_published_master_exists(project_setup) -> None:
     engine, tenant_a, _ = project_setup
+    client = TestClient(app, raise_server_exceptions=False)
+
     with engine.begin() as connection:
         connection.execute(
             text(
-                "UPDATE auditcore.projects SET project_status='CONFIGURING' "
-                "WHERE tenant_id=:tenant_id"
+                """
+                INSERT INTO auditcore.project_policy_versions (
+                    tenant_id, version_no, lifecycle_status, effective_from
+                ) VALUES (:tenant_id, 1, 'PUBLISHED', CURRENT_DATE)
+                """
             ),
             {"tenant_id": tenant_a},
         )
+
+    current = client.get(f"/v1/tenants/{tenant_a}/project")
+    assert current.status_code == 200
+    original_start = date.fromisoformat(current.json()["effectiveStartDate"])
+
+    blocked = client.patch(
+        f"/v1/tenants/{tenant_a}/project",
+        headers={"If-Match": current.headers["etag"]},
+        json={"effectiveStartDate": (original_start + timedelta(days=1)).isoformat()},
+    )
+    assert blocked.status_code == 422
+    assert blocked.json()["errorCode"] == "VAC-VAL-002"
+
+    allowed = client.patch(
+        f"/v1/tenants/{tenant_a}/project",
+        headers={"If-Match": current.headers["etag"]},
+        json={"projectName": "Still Editable"},
+    )
+    assert allowed.status_code == 200
+    assert allowed.json()["projectName"] == "Still Editable"
+
+
+def test_uc02_project_status_accepts_configuring(project_setup) -> None:
+    engine, tenant_a, _ = project_setup
+    with engine.connect() as connection:
         status = connection.execute(
             text(
                 "SELECT project_status FROM auditcore.projects "
