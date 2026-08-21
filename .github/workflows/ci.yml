@@ -58,7 +58,8 @@ jobs:
           engine = create_engine(os.environ["DATABASE_URL"])
           with engine.connect() as connection:
               assert connection.execute(text("select to_regclass('auditcore.projects')::text")).scalar_one() == "auditcore.projects"
-              assert connection.execute(text("select version_num from alembic_version")).scalar_one() == "0005_uc02_admin_row_delete"
+              assert connection.execute(text("select version_num from alembic_version")).scalar_one() == "0006_uc02_role_mapping_ops"
+              assert connection.execute(text("select to_regclass('auditcore.administrative_operations')::text")).scalar_one() == "auditcore.administrative_operations"
               assert connection.execute(text("""
                   select count(*) from information_schema.columns
                   where table_schema='auditcore'
@@ -78,6 +79,11 @@ jobs:
               assert connection.execute(text("""
                   select has_table_privilege(
                       'audit_core_runtime', 'auditcore.projects', 'DELETE'
+                  )
+              """)).scalar_one() is False
+              assert connection.execute(text("""
+                  select has_table_privilege(
+                      'audit_core_runtime', 'auditcore.administrative_operations', 'DELETE'
                   )
               """)).scalar_one() is False
           PY

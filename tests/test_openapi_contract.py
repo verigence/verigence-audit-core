@@ -10,9 +10,12 @@ from audit_core.main import create_app
 
 _HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 _DELIVERY_PUT_PATH = "/v1/tenants/{}/journeys/{}/delivery"
-_UC02_ADMIN_DELETE_PATHS = {
+_UC02_ALLOWED_DELETE_PATHS = {
+    # Phase-1 administrative hard-delete exceptions.
     "/v1/tenants/{}/dealers/{}",
     "/v1/tenants/{}/dealers/{}/outlets/{}",
+    # Assignment removal only: this never deletes the global Security USER.
+    "/v1/tenants/{}/role-mappings/{}",
 }
 
 
@@ -83,7 +86,7 @@ def test_openapi_operations_are_implemented_and_public_boundary_is_safe() -> Non
     ]
     assert public_routes
     delete_paths = {path for method, path in public_routes if method == "DELETE"}
-    assert delete_paths == _UC02_ADMIN_DELETE_PATHS
+    assert delete_paths == _UC02_ALLOWED_DELETE_PATHS
     assert all("/di/" not in path.lower() for _, path in public_routes)
     assert all(not path.lower().endswith("/di") for _, path in public_routes)
     assert all("/delivery/block" not in path.lower() for _, path in public_routes)

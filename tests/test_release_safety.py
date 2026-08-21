@@ -9,9 +9,12 @@ from audit_core.main import create_app
 from audit_core.security import Principal
 
 _HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
-_UC02_ADMIN_DELETE_PATHS = {
+_UC02_ALLOWED_DELETE_PATHS = {
+    # Phase-1 administrative hard-delete exceptions.
     "/v1/tenants/{}/dealers/{}",
     "/v1/tenants/{}/dealers/{}/outlets/{}",
+    # Project assignment removal only; the global Security USER is preserved.
+    "/v1/tenants/{}/role-mappings/{}",
 }
 
 
@@ -32,7 +35,7 @@ def _public_delete_routes() -> set[str]:
     }
 
 
-def test_security_catalog_and_public_api_expose_only_uc02_admin_delete_exception() -> None:
+def test_security_catalog_and_public_api_expose_only_approved_uc02_delete_routes() -> None:
     catalogue = json.loads(
         Path("design/AUDIT_CORE_SECURITY_CATALOG_v2.1.json").read_text(encoding="utf-8")
     )
@@ -40,7 +43,7 @@ def test_security_catalog_and_public_api_expose_only_uc02_admin_delete_exception
     assert all("delete" not in key.lower() for key in permission_keys)
     assert all("purge" not in key.lower() for key in permission_keys)
 
-    assert _public_delete_routes() == _UC02_ADMIN_DELETE_PATHS
+    assert _public_delete_routes() == _UC02_ALLOWED_DELETE_PATHS
 
 
 def test_permission_and_tenant_denials_remain_fail_closed() -> None:

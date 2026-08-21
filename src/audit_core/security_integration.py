@@ -18,7 +18,11 @@ class SecurityTokenError(RuntimeError):
 
 
 class SecurityAdminError(RuntimeError):
-    """Security could not provide trustworthy human administrative context."""
+    """Security could not complete a human administrative request."""
+
+    def __init__(self, message: str, *, http_status: int | None = None) -> None:
+        super().__init__(message)
+        self.http_status = http_status
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,23 @@ class SecurityAdminContext:
     user_id: str
     is_super_admin: bool
     admin_scopes: tuple[SecurityAdminScope, ...]
+
+
+@dataclass(frozen=True)
+class SecurityGlobalUser:
+    user_id: str
+    display_name: str
+    primary_email: str | None
+    status: str
+
+
+@dataclass(frozen=True)
+class SecurityOperatingRoleMutation:
+    tenant_id: str
+    user_id: str
+    changed: bool
+    assignment_id: str | None
+    role_key: str | None
 
 
 class SecurityAdminClient:
@@ -107,6 +128,111 @@ class SecurityAdminClient:
             admin_scopes=tuple(scopes),
         )
 
+    def list_global_users(
+        self,
+        *,
+        human_bearer_token: str,
+        search: str | None,
+        limit: int,
+    ) -> tuple[SecurityGlobalUser, ...]:
+        if limit < 1 or limit > 200:
+            raise ValueError("Security USER directory limit must be between 1 and 200")
+        params: dict[str, str | int] = {
+            "userStatus": "ACTIVE",
+            "limit": limit,
+            "offset": 0,
+        }
+        if search:
+            params["search"] = search
+        payload = self._request_json_list(
+            "GET",
+            "/security/v1/platform/users",
+            human_bearer_token=human_bearer_token,
+            params=params,
+        )
+        users: list[SecurityGlobalUser] = []
+        for raw in payload:
+            if not isinstance(raw, dict):
+                raise SecurityAdminError("Security USER directory response has invalid shape")
+            user_id = raw.get("userId")
+            display_name = raw.get("displayName")
+            primary_email = raw.get("primaryEmail")
+            status = raw.get("status")
+            if (
+                not isinstance(user_id, str)
+                or not user_id
+                or not isinstance(display_name, str)
+                or not display_name
+                or (primary_email is not None and not isinstance(primary_email, str))
+                or not isinstance(status, str)
+                or not status
+            ):
+                raise SecurityAdminError("Security USER directory response has invalid shape")
+            users.append(
+                SecurityGlobalUser(
+                    user_id=user_id,
+                    display_name=display_name,
+                    primary_email=primary_email,
+                    status=status,
+                )
+            )
+        return tuple(users)
+
+    def set_operating_role(
+        self,
+        *,
+        human_bearer_token: str,
+        tenant_id: str,
+        user_id: str,
+        role_key: str,
+    ) -> SecurityOperatingRoleMutation:
+        payload = self._request_json(
+            "PUT",
+            f"/security/v1/tenants/{tenant_id}/users/{user_id}/operating-role",
+            human_bearer_token=human_bearer_token,
+            json_body={"roleKey": role_key},
+        )
+        return self._operating_role_mutation(payload)
+
+    def remove_operating_role(
+        self,
+        *,
+        human_bearer_token: str,
+        tenant_id: str,
+        user_id: str,
+    ) -> SecurityOperatingRoleMutation:
+        payload = self._request_json(
+            "DELETE",
+            f"/security/v1/tenants/{tenant_id}/users/{user_id}/operating-role",
+            human_bearer_token=human_bearer_token,
+        )
+        return self._operating_role_mutation(payload)
+
+    @staticmethod
+    def _operating_role_mutation(payload: dict[str, Any]) -> SecurityOperatingRoleMutation:
+        tenant_id = payload.get("tenantId")
+        user_id = payload.get("userId")
+        changed = payload.get("changed")
+        assignment_id = payload.get("assignmentId")
+        role_key = payload.get("roleKey")
+        if (
+            not isinstance(tenant_id, str)
+            or not tenant_id
+            or not isinstance(user_id, str)
+            or not user_id
+            or not isinstance(changed, bool)
+            or (assignment_id is not None and not isinstance(assignment_id, str))
+            or (role_key is not None and not isinstance(role_key, str))
+        ):
+            raise SecurityAdminError("Security operating-role response has invalid shape")
+        return SecurityOperatingRoleMutation(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            changed=changed,
+            assignment_id=assignment_id,
+            role_key=role_key,
+        )
+
     def _request_json(
         self,
         method: str,
@@ -115,7 +241,48 @@ class SecurityAdminClient:
         human_bearer_token: str,
         headers: dict[str, str] | None = None,
         json_body: dict[str, object] | None = None,
+        params: dict[str, str | int] | None = None,
     ) -> dict[str, Any]:
+        payload = self._request_payload(
+            method,
+            path,
+            human_bearer_token=human_bearer_token,
+            headers=headers,
+            json_body=json_body,
+            params=params,
+        )
+        if not isinstance(payload, dict):
+            raise SecurityAdminError("Security administrative response has invalid shape")
+        return payload
+
+    def _request_json_list(
+        self,
+        method: str,
+        path: str,
+        *,
+        human_bearer_token: str,
+        params: dict[str, str | int] | None = None,
+    ) -> list[Any]:
+        payload = self._request_payload(
+            method,
+            path,
+            human_bearer_token=human_bearer_token,
+            params=params,
+        )
+        if not isinstance(payload, list):
+            raise SecurityAdminError("Security administrative response has invalid shape")
+        return payload
+
+    def _request_payload(
+        self,
+        method: str,
+        path: str,
+        *,
+        human_bearer_token: str,
+        headers: dict[str, str] | None = None,
+        json_body: dict[str, object] | None = None,
+        params: dict[str, str | int] | None = None,
+    ) -> Any:
         if not human_bearer_token:
             raise ValueError("human_bearer_token is required")
         request_headers = {"Authorization": f"Bearer {human_bearer_token}"}
@@ -127,6 +294,7 @@ class SecurityAdminClient:
                 path,
                 headers=request_headers,
                 json=json_body,
+                params=params,
             )
         except httpx.HTTPError as exc:
             logger.warning("security_admin_call_failed", reason="endpoint_unavailable", path=path)
@@ -138,15 +306,13 @@ class SecurityAdminClient:
                 path=path,
             )
             raise SecurityAdminError(
-                f"Security administrative request failed with HTTP {response.status_code}"
+                f"Security administrative request failed with HTTP {response.status_code}",
+                http_status=response.status_code,
             )
         try:
-            payload: Any = response.json()
+            return response.json()
         except ValueError as exc:
             raise SecurityAdminError("Security administrative response is not valid JSON") from exc
-        if not isinstance(payload, dict):
-            raise SecurityAdminError("Security administrative response has invalid shape")
-        return payload
 
 
 class SecurityOAuthClient:

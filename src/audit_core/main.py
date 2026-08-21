@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+from audit_core import role_mappings
 from audit_core.audit_review import router as audit_review_router
 from audit_core.bookings import router as booking_router
 from audit_core.commercials import router as commercials_router
@@ -21,8 +22,12 @@ from audit_core.observability import install_observability
 from audit_core.payments_finance import router as payments_finance_router
 from audit_core.projects import router as project_router
 from audit_core.reference_data import router as reference_data_router
+from audit_core.role_mapping_policy import install_role_mapping_policy
 from audit_core.tasks_api import router as task_router
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
+
+install_role_mapping_policy(role_mappings)
+role_mapping_router = role_mappings.router
 
 
 def create_app() -> FastAPI:
@@ -39,6 +44,7 @@ def create_app() -> FastAPI:
     install_contract_guards(application)
     application.include_router(project_router)
     application.include_router(dealer_router)
+    application.include_router(role_mapping_router)
     application.include_router(customer_router)
     application.include_router(journey_router)
     application.include_router(evidence_router)
