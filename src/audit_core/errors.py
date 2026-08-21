@@ -12,8 +12,16 @@ from audit_core.security import SecurityTokenError
 logger = structlog.get_logger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass
 class AuditCoreError(RuntimeError):
+    """Stable public API error.
+
+    Exceptions must remain mutable because Python/contextlib assigns traceback state
+    while an exception crosses FastAPI yield dependencies. A frozen dataclass turns
+    that normal traceback propagation into FrozenInstanceError and masks the original
+    problem response.
+    """
+
     error_code: str
     status_code: int
     title: str
