@@ -5,7 +5,7 @@
 **Repository:** `verigence/verigence-audit-core`  
 **Branch:** `dev`  
 **Applies to:** `docs/AUDIT_CORE_SOLUTION_DESIGN_v2.2.md`, `docs/AUDIT_CORE_API_CONTRACT_v1.1.md`, `docs/AUDIT_CORE_PHYSICAL_DATA_MODEL_v2.2.md`  
-**Related:** `docs/AUDIT_CORE_UC02_PRODUCT_MASTER_PHASE1_ALIGNMENT.md`, DI `DI_DECISIONS.md` D31/D32
+**Related:** `docs/AUDIT_CORE_UC02_PRODUCT_MASTER_PHASE1_ALIGNMENT.md`, DI `DI_DECISIONS.md` D31, DI `docs/UC02_EXCEL_MASTER_ALIGNMENT.md`
 
 > This amendment records the owner decisions made after the UC02 v2.2 design review. It does not authorize code, SQL, migration, OpenAPI YAML or permission-catalogue changes.
 
