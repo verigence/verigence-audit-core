@@ -118,3 +118,23 @@ def test_project_get_and_patch_are_tenant_bound(project_setup) -> None:
         )
     assert names[tenant_a] == "Project A Updated"
     assert names[tenant_b] == "Project B"
+
+
+def test_uc02_project_status_accepts_configuring(project_setup) -> None:
+    engine, tenant_a, _ = project_setup
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE auditcore.projects SET project_status='CONFIGURING' "
+                "WHERE tenant_id=:tenant_id"
+            ),
+            {"tenant_id": tenant_a},
+        )
+        status = connection.execute(
+            text(
+                "SELECT project_status FROM auditcore.projects "
+                "WHERE tenant_id=:tenant_id"
+            ),
+            {"tenant_id": tenant_a},
+        ).scalar_one()
+    assert status == "CONFIGURING"
