@@ -48,6 +48,14 @@ class SecurityGlobalUser:
 
 
 @dataclass(frozen=True)
+class SecurityTenant:
+    tenant_id: str
+    tenant_code: str
+    tenant_name: str
+    status: str
+
+
+@dataclass(frozen=True)
 class SecurityOperatingRoleMutation:
     tenant_id: str
     user_id: str
@@ -126,6 +134,41 @@ class SecurityAdminClient:
             user_id=user_id,
             is_super_admin=is_super_admin,
             admin_scopes=tuple(scopes),
+        )
+
+    def get_tenant(
+        self,
+        *,
+        human_bearer_token: str,
+        tenant_id: str,
+    ) -> SecurityTenant:
+        payload = self._request_json(
+            "GET",
+            f"/security/v1/platform/tenants/{tenant_id}",
+            human_bearer_token=human_bearer_token,
+        )
+        response_tenant_id = payload.get("tenantId")
+        tenant_code = payload.get("tenantCode")
+        tenant_name = payload.get("tenantName")
+        tenant_status = payload.get("status")
+        if (
+            not isinstance(response_tenant_id, str)
+            or not response_tenant_id
+            or not isinstance(tenant_code, str)
+            or not tenant_code
+            or not isinstance(tenant_name, str)
+            or not tenant_name
+            or not isinstance(tenant_status, str)
+            or not tenant_status
+        ):
+            raise SecurityAdminError("Security Tenant response has invalid shape")
+        if response_tenant_id != tenant_id:
+            raise SecurityAdminError("Security Tenant response does not match requested Tenant")
+        return SecurityTenant(
+            tenant_id=response_tenant_id,
+            tenant_code=tenant_code,
+            tenant_name=tenant_name,
+            status=tenant_status,
         )
 
     def list_global_users(
