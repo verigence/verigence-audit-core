@@ -58,7 +58,7 @@ jobs:
           engine = create_engine(os.environ["DATABASE_URL"])
           with engine.connect() as connection:
               assert connection.execute(text("select to_regclass('auditcore.projects')::text")).scalar_one() == "auditcore.projects"
-              assert connection.execute(text("select version_num from alembic_version")).scalar_one() == "0003_uc02_project_configuring_status"
+              assert connection.execute(text("select version_num from alembic_version")).scalar_one() == "0003_uc02_project_configuring"
           PY
 
       - name: Unit tests
