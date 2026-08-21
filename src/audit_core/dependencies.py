@@ -10,7 +10,12 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import Connection, Engine, create_engine, text
 
 from audit_core.authorization import AuthorizationError
-from audit_core.security import HumanPrincipal, Principal, SecurityTokenError, SecurityTokenValidator
+from audit_core.security import (
+    HumanPrincipal,
+    Principal,
+    SecurityTokenError,
+    SecurityTokenValidator,
+)
 from audit_core.security_integration import (
     SecurityAdminClient,
     SecurityAdminContext,
