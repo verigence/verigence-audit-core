@@ -1,6 +1,6 @@
 from alembic import op
 
-revision = "0003_uc02_project_configuring_status"
+revision = "0003_uc02_project_configuring"
 down_revision = "0002_runtime_role_rls"
 branch_labels = None
 depends_on = None
