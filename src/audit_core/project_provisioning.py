@@ -17,10 +17,18 @@ from audit_core.admin_operations import (
     update_administrative_operation,
 )
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import HumanAdminRequest, get_engine, require_super_admin_request
+from audit_core.dependencies import (
+    HumanAdminRequest,
+    get_engine,
+    require_super_admin_request,
+)
 from audit_core.di_client import DiClient, DiClientError
 from audit_core.errors import BusinessValidationError, ConflictError, NotFoundError
-from audit_core.security_integration import SecurityAdminClient, SecurityAdminError, SecurityTenant
+from audit_core.security_integration import (
+    SecurityAdminClient,
+    SecurityAdminError,
+    SecurityTenant,
+)
 
 router = APIRouter(prefix="/v1", tags=["project-provisioning"])
 
