@@ -37,30 +37,41 @@ _ALLOWED_IMPORT_STATES = {
 }
 
 
-def get_di_admin_client() -> Iterator[DiClient]:
+def get_di_admin_client() -> Iterator[DiClient | None]:
+    """Yield DI when configured without making local-master reads depend on DI config.
+
+    Generic Project Master import routes serve both Audit Core and DI-owned imports.
+    FastAPI resolves dependencies before the route body, so raising here when DI is
+    unconfigured would incorrectly break an Audit Core-owned import before ownership
+    can be inspected. DI-specific paths call _require_di_client and fail closed.
+    """
     base_url = os.environ.get("DI_BASE_URL", "").strip()
     if not base_url:
-        raise RuntimeError("DI_BASE_URL is required for UC02 administration")
+        yield None
+        return
     with DiClient(base_url=base_url) as client:
         yield client
 
 
+def _require_di_client(di_client: DiClient | None) -> DiClient:
+    if di_client is None:
+        raise AuditCoreError(
+            error_code="VAC-DI-001",
+            status_code=503,
+            title="Document Intelligence unavailable",
+            detail="Document Intelligence administration is not configured.",
+        )
+    return di_client
+
+
 def _raise_di_proxy_error(exc: DiClientError) -> None:
+    del exc
     raise AuditCoreError(
         error_code="VAC-SYS-001",
-        status_code=503 if exc.retryable else 422,
+        status_code=503,
         title="Document Intelligence administration failed",
         detail="Document Intelligence could not complete the Project Master operation.",
-    ) from exc
-
-
-def _uuid_or_none(value: Any) -> UUID | None:
-    if value is None:
-        return None
-    try:
-        return UUID(str(value))
-    except (TypeError, ValueError):
-        return None
+    )
 
 
 def _di_version_payload(raw: dict[str, Any]) -> dict[str, Any]:
@@ -235,7 +246,7 @@ def _mirror_di_import(
 
 def _di_import_identity(connection: Connection, *, tenant_id: str, import_id: UUID):
     set_tenant_context(connection, tenant_id)
-    row = connection.execute(
+    return connection.execute(
         text(
             """
             SELECT owner_module, master_key
@@ -245,7 +256,6 @@ def _di_import_identity(connection: Connection, *, tenant_id: str, import_id: UU
         ),
         {"tenant_id": tenant_id, "import_id": import_id},
     ).mappings().one_or_none()
-    return row
 
 
 @router.get("/v1/tenants/{tenant_id}/project-masters")
@@ -253,18 +263,22 @@ def get_project_master_catalogue_proxy(
     tenant_id: str,
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
-    di_client: Annotated[DiClient, Depends(get_di_admin_client)],
+    di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
 ) -> list[dict[str, Any]]:
     set_tenant_context(connection, tenant_id)
-    result = [item.model_dump(mode="json") for item in audit_core_catalogue(connection, tenant_id=tenant_id)]
+    result = [
+        item.model_dump(mode="json")
+        for item in audit_core_catalogue(connection, tenant_id=tenant_id)
+    ]
+    client = _require_di_client(di_client)
     try:
-        di_catalogue = di_client.list_project_masters(
+        di_catalogue = client.list_project_masters(
             human_token=admin_request.bearer_token,
             tenant_id=tenant_id,
         )
         for descriptor in di_catalogue:
             master_key = str(descriptor.get("masterKey") or "")
-            versions_payload = di_client.list_project_master_versions(
+            versions_payload = client.list_project_master_versions(
                 human_token=admin_request.bearer_token,
                 tenant_id=tenant_id,
                 master_key=master_key,
@@ -287,7 +301,9 @@ def get_project_master_catalogue_proxy(
                     "masterKey": master_key,
                     "displayName": str(descriptor.get("displayName") or master_key),
                     "uploadMode": "EXCEL",
-                    "administrationModes": list(descriptor.get("administrationModes") or ["EXCEL"]),
+                    "administrationModes": list(
+                        descriptor.get("administrationModes") or ["EXCEL"]
+                    ),
                     "requiresWef": bool(descriptor.get("requiresWEF", False)),
                     "templateVersion": None,
                     "currentVersionId": current.get("versionId") if current else None,
@@ -305,10 +321,11 @@ def download_di_master_template(
     tenant_id: str,
     master_key: str,
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
-    di_client: Annotated[DiClient, Depends(get_di_admin_client)],
+    di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
 ) -> StreamingResponse:
+    client = _require_di_client(di_client)
     try:
-        content, content_type = di_client.get_project_master_template(
+        content, content_type = client.get_project_master_template(
             human_token=admin_request.bearer_token,
             tenant_id=tenant_id,
             master_key=master_key,
@@ -336,7 +353,7 @@ async def upload_di_master_import(
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1)],
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
-    di_client: Annotated[DiClient, Depends(get_di_admin_client)],
+    di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
     effective_from: Annotated[date | None, Form(alias="effectiveFrom")] = None,
 ) -> local_imports.ProjectMasterImportResponse:
     if effective_from is not None:
@@ -346,8 +363,9 @@ async def upload_di_master_import(
     content = await file.read()
     if not content:
         raise ValidationError(detail="Project Master import workbook is empty.")
+    client = _require_di_client(di_client)
     try:
-        payload = di_client.upload_project_master_import(
+        payload = client.upload_project_master_import(
             human_token=admin_request.bearer_token,
             tenant_id=tenant_id,
             master_key=master_key,
@@ -376,10 +394,11 @@ def get_di_master_versions(
     tenant_id: str,
     master_key: str,
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
-    di_client: Annotated[DiClient, Depends(get_di_admin_client)],
+    di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
 ) -> list[dict[str, Any]]:
+    client = _require_di_client(di_client)
     try:
-        payload = di_client.list_project_master_versions(
+        payload = client.list_project_master_versions(
             human_token=admin_request.bearer_token,
             tenant_id=tenant_id,
             master_key=master_key,
@@ -397,16 +416,19 @@ def get_di_master_versions(
     return [_di_version_payload(item) for item in versions if isinstance(item, dict)]
 
 
-@router.post("/v1/tenants/{tenant_id}/project-masters/DI/{master_key}/versions/{version_id}/publish")
+@router.post(
+    "/v1/tenants/{tenant_id}/project-masters/DI/{master_key}/versions/{version_id}/publish"
+)
 def publish_di_master_version(
     tenant_id: str,
     master_key: str,
     version_id: UUID,
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
-    di_client: Annotated[DiClient, Depends(get_di_admin_client)],
+    di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
 ) -> dict[str, Any]:
+    client = _require_di_client(di_client)
     try:
-        payload = di_client.publish_project_master_version(
+        payload = client.publish_project_master_version(
             human_token=admin_request.bearer_token,
             tenant_id=tenant_id,
             master_key=master_key,
@@ -434,7 +456,7 @@ def get_project_master_import_proxy(
     import_id: UUID,
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
-    di_client: Annotated[DiClient, Depends(get_di_admin_client)],
+    di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
 ) -> local_imports.ProjectMasterImportResponse:
     identity = _di_import_identity(connection, tenant_id=tenant_id, import_id=import_id)
     if identity is None or identity["owner_module"] != "DI":
@@ -444,9 +466,10 @@ def get_project_master_import_proxy(
             admin_request=admin_request,
             connection=connection,
         )
+    client = _require_di_client(di_client)
     master_key = str(identity["master_key"])
     try:
-        payload = di_client.get_project_master_import(
+        payload = client.get_project_master_import(
             human_token=admin_request.bearer_token,
             tenant_id=tenant_id,
             master_key=master_key,
@@ -472,7 +495,7 @@ def get_project_master_import_rows_proxy(
     import_id: UUID,
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
-    di_client: Annotated[DiClient, Depends(get_di_admin_client)],
+    di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
     validation_status: Annotated[
@@ -482,9 +505,10 @@ def get_project_master_import_rows_proxy(
 ) -> local_imports.ImportRowsPage:
     identity = _di_import_identity(connection, tenant_id=tenant_id, import_id=import_id)
     if identity is not None and identity["owner_module"] == "DI":
+        client = _require_di_client(di_client)
         master_key = str(identity["master_key"])
         try:
-            payload = di_client.get_project_master_import(
+            payload = client.get_project_master_import(
                 human_token=admin_request.bearer_token,
                 tenant_id=tenant_id,
                 master_key=master_key,
@@ -516,7 +540,7 @@ def download_project_master_error_report_proxy(
     import_id: UUID,
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
-    di_client: Annotated[DiClient, Depends(get_di_admin_client)],
+    di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
 ) -> StreamingResponse:
     identity = _di_import_identity(connection, tenant_id=tenant_id, import_id=import_id)
     if identity is None or identity["owner_module"] != "DI":
@@ -526,9 +550,10 @@ def download_project_master_error_report_proxy(
             admin_request=admin_request,
             connection=connection,
         )
+    client = _require_di_client(di_client)
     master_key = str(identity["master_key"])
     try:
-        response = di_client._request_raw(
+        response = client._request_raw(
             "GET",
             f"/v1/tenants/{tenant_id}/project-masters/{master_key}/imports/{import_id}/error-report",
             operation="get_project_master_error_report",
@@ -557,7 +582,7 @@ def confirm_project_master_import_proxy(
     import_id: UUID,
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
-    di_client: Annotated[DiClient, Depends(get_di_admin_client)],
+    di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
 ) -> local_imports.ProjectMasterImportResponse:
     identity = _di_import_identity(connection, tenant_id=tenant_id, import_id=import_id)
     if identity is None or identity["owner_module"] != "DI":
@@ -567,9 +592,10 @@ def confirm_project_master_import_proxy(
             admin_request=admin_request,
             connection=connection,
         )
+    client = _require_di_client(di_client)
     master_key = str(identity["master_key"])
     try:
-        payload = di_client.confirm_project_master_import(
+        payload = client.confirm_project_master_import(
             human_token=admin_request.bearer_token,
             tenant_id=tenant_id,
             master_key=master_key,
@@ -595,7 +621,7 @@ def delete_project_master_import_proxy(
     import_id: UUID,
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
-    di_client: Annotated[DiClient, Depends(get_di_admin_client)],
+    di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
 ) -> None:
     identity = _di_import_identity(connection, tenant_id=tenant_id, import_id=import_id)
     if identity is None or identity["owner_module"] != "DI":
@@ -605,9 +631,10 @@ def delete_project_master_import_proxy(
             admin_request=admin_request,
             connection=connection,
         )
+    client = _require_di_client(di_client)
     master_key = str(identity["master_key"])
     try:
-        di_client._request_data(
+        client._request_data(
             "POST",
             f"/v1/tenants/{tenant_id}/project-masters/{master_key}/imports/{import_id}/cancel",
             operation="cancel_project_master_import",
