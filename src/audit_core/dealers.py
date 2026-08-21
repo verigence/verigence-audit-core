@@ -12,7 +12,13 @@ from audit_core.dependencies import (
     get_connection,
     require_super_admin_request,
 )
-from audit_core.errors import ConflictError, NotFoundError, ValidationError
+from audit_core.errors import (
+    BusinessValidationError,
+    ConflictError,
+    NotFoundError,
+    ValidationError,
+)
+from audit_core.idempotency import execute_idempotent_json_command
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["dealers"])
 
@@ -82,6 +88,11 @@ class OutletResponse(BaseModel):
     versionNo: int
 
 
+class DeletionImpactResponse(BaseModel):
+    canDelete: bool
+    dependencies: dict[str, int]
+
+
 def _not_found(resource: str) -> NotFoundError:
     return NotFoundError(
         error_code="VAC-NF-002" if resource == "Dealer" else "VAC-NF-003",
@@ -140,6 +151,128 @@ def _outlet_response(row) -> OutletResponse:
         status=row["status"],
         versionNo=row["version_no"],
     )
+
+
+def _dealer_exists(connection: Connection, tenant_id: str, dealer_id: UUID) -> bool:
+    return (
+        connection.execute(
+            text(
+                "SELECT 1 FROM auditcore.dealers "
+                "WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id"
+            ),
+            {"tenant_id": tenant_id, "dealer_id": dealer_id},
+        ).scalar_one_or_none()
+        is not None
+    )
+
+
+def _outlet_exists(
+    connection: Connection,
+    tenant_id: str,
+    dealer_id: UUID,
+    outlet_id: UUID,
+) -> bool:
+    return (
+        connection.execute(
+            text(
+                """
+                SELECT 1 FROM auditcore.dealer_outlets
+                WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id
+                  AND outlet_id = :outlet_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "dealer_id": dealer_id,
+                "outlet_id": outlet_id,
+            },
+        ).scalar_one_or_none()
+        is not None
+    )
+
+
+def _dealer_impact(connection: Connection, tenant_id: str, dealer_id: UUID) -> dict[str, int]:
+    row = connection.execute(
+        text(
+            """
+            SELECT
+                (SELECT count(*) FROM auditcore.dealer_outlets
+                 WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id) AS outlets,
+                (SELECT count(*) FROM auditcore.business_assignments
+                 WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id) AS business_assignments,
+                (SELECT count(*) FROM auditcore.discount_scheme_eligibility
+                 WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id) AS discount_eligibility,
+                (SELECT count(*) FROM auditcore.workflow_tasks
+                 WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id) AS workflow_tasks
+            """
+        ),
+        {"tenant_id": tenant_id, "dealer_id": dealer_id},
+    ).mappings().one()
+    return {
+        "outlets": row["outlets"],
+        "businessAssignments": row["business_assignments"],
+        "discountEligibility": row["discount_eligibility"],
+        "workflowTasks": row["workflow_tasks"],
+    }
+
+
+def _outlet_impact(
+    connection: Connection,
+    tenant_id: str,
+    dealer_id: UUID,
+    outlet_id: UUID,
+) -> dict[str, int]:
+    row = connection.execute(
+        text(
+            """
+            SELECT
+                (SELECT count(*) FROM auditcore.dealership_staff
+                 WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id
+                   AND outlet_id = :outlet_id) AS dealership_staff,
+                (SELECT count(*) FROM auditcore.business_assignments
+                 WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id
+                   AND outlet_id = :outlet_id) AS business_assignments,
+                (SELECT count(*) FROM auditcore.discount_scheme_eligibility
+                 WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id
+                   AND outlet_id = :outlet_id) AS discount_eligibility,
+                (SELECT count(*) FROM auditcore.customers
+                 WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id
+                   AND outlet_id = :outlet_id) AS customers,
+                (SELECT count(*) FROM auditcore.journeys
+                 WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id
+                   AND outlet_id = :outlet_id) AS journeys,
+                (SELECT count(*) FROM auditcore.workflow_tasks
+                 WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id
+                   AND outlet_id = :outlet_id) AS workflow_tasks,
+                (SELECT count(*) FROM auditcore.daily_ops_runs
+                 WHERE tenant_id = :tenant_id AND outlet_id = :outlet_id) AS daily_ops_runs,
+                (SELECT count(*) FROM auditcore.activity_records
+                 WHERE tenant_id = :tenant_id AND outlet_id = :outlet_id) AS activity_records,
+                (SELECT count(*) FROM auditcore.pc_daily_notes
+                 WHERE tenant_id = :tenant_id AND outlet_id = :outlet_id) AS pc_daily_notes
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "dealer_id": dealer_id,
+            "outlet_id": outlet_id,
+        },
+    ).mappings().one()
+    return {
+        "dealershipStaff": row["dealership_staff"],
+        "businessAssignments": row["business_assignments"],
+        "discountEligibility": row["discount_eligibility"],
+        "customers": row["customers"],
+        "journeys": row["journeys"],
+        "workflowTasks": row["workflow_tasks"],
+        "dailyOpsRuns": row["daily_ops_runs"],
+        "activityRecords": row["activity_records"],
+        "pcDailyNotes": row["pc_daily_notes"],
+    }
+
+
+def _can_delete(dependencies: dict[str, int]) -> bool:
+    return not any(dependencies.values())
 
 
 @router.post("/dealers", response_model=DealerResponse, status_code=status.HTTP_201_CREATED)
@@ -282,14 +415,7 @@ def patch_dealer(
         parameters,
     ).mappings().one_or_none()
     if row is None:
-        exists = connection.execute(
-            text(
-                "SELECT 1 FROM auditcore.dealers "
-                "WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id"
-            ),
-            {"tenant_id": tenant_id, "dealer_id": dealer_id},
-        ).scalar_one_or_none()
-        if exists is None:
+        if not _dealer_exists(connection, tenant_id, dealer_id):
             raise _not_found("Dealer")
         raise ConflictError(
             error_code="VAC-CONFLICT-001",
@@ -298,6 +424,70 @@ def patch_dealer(
         )
     _set_etag(response, row["version_no"])
     return _dealer_response(row)
+
+
+@router.get(
+    "/dealers/{dealer_id}/deletion-impact",
+    response_model=DeletionImpactResponse,
+)
+def dealer_deletion_impact(
+    tenant_id: str,
+    dealer_id: UUID,
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> DeletionImpactResponse:
+    set_tenant_context(connection, tenant_id)
+    if not _dealer_exists(connection, tenant_id, dealer_id):
+        raise _not_found("Dealer")
+    dependencies = _dealer_impact(connection, tenant_id, dealer_id)
+    return DeletionImpactResponse(
+        canDelete=_can_delete(dependencies),
+        dependencies=dependencies,
+    )
+
+
+@router.delete("/dealers/{dealer_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_dealer(
+    tenant_id: str,
+    dealer_id: UUID,
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> Response:
+    set_tenant_context(connection, tenant_id)
+
+    def perform_delete() -> dict[str, object]:
+        if not _dealer_exists(connection, tenant_id, dealer_id):
+            raise _not_found("Dealer")
+        dependencies = _dealer_impact(connection, tenant_id, dealer_id)
+        if not _can_delete(dependencies):
+            raise BusinessValidationError(
+                detail=(
+                    "Dealer has dependent Project data and cannot be deleted directly. "
+                    "Use the dependency impact to remove safe dependencies or use whole-Project "
+                    "hard delete where applicable."
+                )
+            )
+        connection.execute(
+            text(
+                "DELETE FROM auditcore.dealers "
+                "WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id"
+            ),
+            {"tenant_id": tenant_id, "dealer_id": dealer_id},
+        )
+        return {}
+
+    execute_idempotent_json_command(
+        connection,
+        tenant_id=tenant_id,
+        operation_key="UC02_DEALER_DELETE",
+        idempotency_key=idempotency_key,
+        request_payload={"dealerId": str(dealer_id)},
+        execute=perform_delete,
+        response_status=status.HTTP_204_NO_CONTENT,
+        logical_result_id=str(dealer_id),
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post(
@@ -314,14 +504,7 @@ def create_outlet(
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> OutletResponse:
     set_tenant_context(connection, tenant_id)
-    dealer_exists = connection.execute(
-        text(
-            "SELECT 1 FROM auditcore.dealers "
-            "WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id"
-        ),
-        {"tenant_id": tenant_id, "dealer_id": dealer_id},
-    ).scalar_one_or_none()
-    if dealer_exists is None:
+    if not _dealer_exists(connection, tenant_id, dealer_id):
         raise _not_found("Dealer")
 
     outlet_id = uuid4()
@@ -495,10 +678,68 @@ def patch_outlet(
         parameters,
     ).mappings().one_or_none()
     if row is None:
-        exists = connection.execute(
+        if not _outlet_exists(connection, tenant_id, dealer_id, outlet_id):
+            raise _not_found("Outlet")
+        raise ConflictError(
+            error_code="VAC-CONFLICT-001",
+            title="Version conflict",
+            detail="Outlet was changed by another request. Refresh and retry.",
+        )
+    _set_etag(response, row["version_no"])
+    return _outlet_response(row)
+
+
+@router.get(
+    "/dealers/{dealer_id}/outlets/{outlet_id}/deletion-impact",
+    response_model=DeletionImpactResponse,
+)
+def outlet_deletion_impact(
+    tenant_id: str,
+    dealer_id: UUID,
+    outlet_id: UUID,
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> DeletionImpactResponse:
+    set_tenant_context(connection, tenant_id)
+    if not _outlet_exists(connection, tenant_id, dealer_id, outlet_id):
+        raise _not_found("Outlet")
+    dependencies = _outlet_impact(connection, tenant_id, dealer_id, outlet_id)
+    return DeletionImpactResponse(
+        canDelete=_can_delete(dependencies),
+        dependencies=dependencies,
+    )
+
+
+@router.delete(
+    "/dealers/{dealer_id}/outlets/{outlet_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_outlet(
+    tenant_id: str,
+    dealer_id: UUID,
+    outlet_id: UUID,
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> Response:
+    set_tenant_context(connection, tenant_id)
+
+    def perform_delete() -> dict[str, object]:
+        if not _outlet_exists(connection, tenant_id, dealer_id, outlet_id):
+            raise _not_found("Outlet")
+        dependencies = _outlet_impact(connection, tenant_id, dealer_id, outlet_id)
+        if not _can_delete(dependencies):
+            raise BusinessValidationError(
+                detail=(
+                    "Dealer Outlet has dependent Project data and cannot be deleted directly. "
+                    "Use the dependency impact to remove safe dependencies or use whole-Project "
+                    "hard delete where applicable."
+                )
+            )
+        connection.execute(
             text(
                 """
-                SELECT 1 FROM auditcore.dealer_outlets
+                DELETE FROM auditcore.dealer_outlets
                 WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id
                   AND outlet_id = :outlet_id
                 """
@@ -508,13 +749,17 @@ def patch_outlet(
                 "dealer_id": dealer_id,
                 "outlet_id": outlet_id,
             },
-        ).scalar_one_or_none()
-        if exists is None:
-            raise _not_found("Outlet")
-        raise ConflictError(
-            error_code="VAC-CONFLICT-001",
-            title="Version conflict",
-            detail="Outlet was changed by another request. Refresh and retry.",
         )
-    _set_etag(response, row["version_no"])
-    return _outlet_response(row)
+        return {}
+
+    execute_idempotent_json_command(
+        connection,
+        tenant_id=tenant_id,
+        operation_key="UC02_OUTLET_DELETE",
+        idempotency_key=idempotency_key,
+        request_payload={"dealerId": str(dealer_id), "outletId": str(outlet_id)},
+        execute=perform_delete,
+        response_status=status.HTTP_204_NO_CONTENT,
+        logical_result_id=str(outlet_id),
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
