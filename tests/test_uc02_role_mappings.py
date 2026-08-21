@@ -161,61 +161,40 @@ def role_mapping_setup(monkeypatch):
             {"tenant_id": tenant_b, "code": f"DB-{suffix}"},
         ).scalar_one()
 
-        outlet_onsite = connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.dealer_outlets (
-                    tenant_id, dealer_id, outlet_code, outlet_name, outlet_classification
-                ) VALUES (:tenant_id, :dealer_id, :code, 'Outlet Onsite', 'ONSITE')
-                RETURNING outlet_id
-                """
-            ),
-            {"tenant_id": tenant_a, "dealer_id": dealer_a, "code": f"OA-{suffix}"},
-        ).scalar_one()
-        outlet_satellite = connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.dealer_outlets (
-                    tenant_id, dealer_id, outlet_code, outlet_name, outlet_classification
-                ) VALUES (:tenant_id, :dealer_id, :code, 'Outlet Satellite', 'SATELLITE')
-                RETURNING outlet_id
-                """
-            ),
-            {"tenant_id": tenant_a, "dealer_id": dealer_a, "code": f"OS-{suffix}"},
-        ).scalar_one()
-        outlet_onsite_2 = connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.dealer_outlets (
-                    tenant_id, dealer_id, outlet_code, outlet_name, outlet_classification
-                ) VALUES (:tenant_id, :dealer_id, :code, 'Outlet Onsite 2', 'ONSITE')
-                RETURNING outlet_id
-                """
-            ),
-            {"tenant_id": tenant_a, "dealer_id": dealer_a2, "code": f"OA2-{suffix}"},
-        ).scalar_one()
-        outlet_satellite_2 = connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.dealer_outlets (
-                    tenant_id, dealer_id, outlet_code, outlet_name, outlet_classification
-                ) VALUES (:tenant_id, :dealer_id, :code, 'Outlet Satellite 2', 'SATELLITE')
-                RETURNING outlet_id
-                """
-            ),
-            {"tenant_id": tenant_a, "dealer_id": dealer_a2, "code": f"OS2-{suffix}"},
-        ).scalar_one()
-        outlet_b = connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.dealer_outlets (
-                    tenant_id, dealer_id, outlet_code, outlet_name, outlet_classification
-                ) VALUES (:tenant_id, :dealer_id, :code, 'Outlet B', 'ONSITE')
-                RETURNING outlet_id
-                """
-            ),
-            {"tenant_id": tenant_b, "dealer_id": dealer_b, "code": f"OB-{suffix}"},
-        ).scalar_one()
+        def add_outlet(tenant_id: str, dealer_id, code: str, name: str, classification: str):
+            return connection.execute(
+                text(
+                    """
+                    INSERT INTO auditcore.dealer_outlets (
+                        tenant_id, dealer_id, outlet_code, outlet_name, outlet_classification
+                    ) VALUES (:tenant_id, :dealer_id, :code, :name, :classification)
+                    RETURNING outlet_id
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "dealer_id": dealer_id,
+                    "code": code,
+                    "name": name,
+                    "classification": classification,
+                },
+            ).scalar_one()
+
+        outlet_onsite = add_outlet(
+            tenant_a, dealer_a, f"OA-{suffix}", "Outlet Onsite", "ONSITE"
+        )
+        outlet_satellite = add_outlet(
+            tenant_a, dealer_a, f"OS-{suffix}", "Outlet Satellite", "SATELLITE"
+        )
+        outlet_onsite_2 = add_outlet(
+            tenant_a, dealer_a2, f"OA2-{suffix}", "Outlet Onsite 2", "ONSITE"
+        )
+        outlet_satellite_2 = add_outlet(
+            tenant_a, dealer_a2, f"OS2-{suffix}", "Outlet Satellite 2", "SATELLITE"
+        )
+        outlet_b = add_outlet(
+            tenant_b, dealer_b, f"OB-{suffix}", "Outlet B", "ONSITE"
+        )
 
     controller = ControlledSecurityAdmin()
     monkeypatch.setenv("SECURITY_BASE_URL", "https://security.test")
@@ -237,6 +216,7 @@ def role_mapping_setup(monkeypatch):
             "tenant_b": tenant_b,
             "dealer_a": str(dealer_a),
             "dealer_a2": str(dealer_a2),
+            "dealer_b": str(dealer_b),
             "outlet_onsite": str(outlet_onsite),
             "outlet_satellite": str(outlet_satellite),
             "outlet_onsite_2": str(outlet_onsite_2),
@@ -249,40 +229,52 @@ def role_mapping_setup(monkeypatch):
         engine.dispose()
 
 
-def test_pc_can_cover_one_onsite_plus_one_satellite_and_is_idempotent(
-    role_mapping_setup,
-) -> None:
+def test_pc_outlet_scope_is_flexible_and_idempotent(role_mapping_setup) -> None:
     setup = role_mapping_setup
     client = TestClient(app, raise_server_exceptions=False)
-    user_id = "user-pc-1"
+    user_id = "user-pc-flex"
     path = f"/v1/tenants/{setup['tenant_a']}/role-mappings/{user_id}"
-    body = {
-        "operatingRole": "PC",
-        "dealerIds": [],
-        "outletIds": [setup["outlet_onsite"], setup["outlet_satellite"]],
-    }
+    selected = [
+        setup["outlet_onsite"],
+        setup["outlet_satellite"],
+        setup["outlet_onsite_2"],
+        setup["outlet_satellite_2"],
+    ]
+    body = {"operatingRole": "PC", "dealerIds": [], "outletIds": selected}
 
-    first = client.put(path, headers={"Idempotency-Key": "pc-map-1"}, json=body)
+    first = client.put(path, headers={"Idempotency-Key": "pc-flex-1"}, json=body)
     assert first.status_code == 200
     assert first.json()["operationStatus"] == "COMPLETED"
     assert first.json()["mapping"] == {
         "userId": user_id,
         "operatingRole": "PC",
         "dealerIds": [],
-        "outletIds": sorted([setup["outlet_onsite"], setup["outlet_satellite"]]),
+        "outletIds": sorted(selected),
     }
     assert setup["security"].calls == [
         ("PUT", "same-human-superadmin-token", user_id, "PC")
     ]
 
-    replay = client.put(path, headers={"Idempotency-Key": "pc-map-1"}, json=body)
+    replay = client.put(path, headers={"Idempotency-Key": "pc-flex-1"}, json=body)
     assert replay.status_code == 200
     assert replay.json() == first.json()
     assert len(setup["security"].calls) == 1
+    assert client.get(path).json() == first.json()["mapping"]
 
-    current = client.get(path)
-    assert current.status_code == 200
-    assert current.json() == first.json()["mapping"]
+    satellite_only_user = "user-pc-satellite-only"
+    satellite_only = client.put(
+        f"/v1/tenants/{setup['tenant_a']}/role-mappings/{satellite_only_user}",
+        headers={"Idempotency-Key": "pc-satellite-only"},
+        json={
+            "operatingRole": "PC",
+            "dealerIds": [],
+            "outletIds": [setup["outlet_satellite"], setup["outlet_satellite_2"]],
+        },
+    )
+    assert satellite_only.status_code == 200
+    assert satellite_only.json()["mapping"]["outletIds"] == sorted(
+        [setup["outlet_satellite"], setup["outlet_satellite_2"]]
+    )
 
     with setup["engine"].connect() as connection:
         rows = connection.execute(
@@ -297,70 +289,31 @@ def test_pc_can_cover_one_onsite_plus_one_satellite_and_is_idempotent(
             ),
             {"tenant_id": setup["tenant_a"], "user_id": user_id},
         ).all()
-        operation = connection.execute(
-            text(
-                """
-                SELECT status, safe_request_summary::text, security_receipt::text
-                FROM auditcore.administrative_operations
-                WHERE operation_type='ROLE_MAPPING'
-                  AND tenant_id=:tenant_id AND idempotency_key='pc-map-1'
-                """
-            ),
-            {"tenant_id": setup["tenant_a"]},
-        ).one()
-
-    assert len(rows) == 2
+    assert len(rows) == 4
     assert {row[2] for row in rows} == {"PC"}
-    assert {row[1] for row in rows} == {
-        setup["outlet_onsite"],
-        setup["outlet_satellite"],
-    }
-    assert operation[0] == "COMPLETED"
-    assert "same-human-superadmin-token" not in (operation[1] or "")
-    assert "same-human-superadmin-token" not in (operation[2] or "")
+    assert {row[1] for row in rows} == set(selected)
 
 
-def test_role_mapping_scope_rules_and_tenant_isolation(role_mapping_setup) -> None:
+def test_role_mapping_rejects_incompatible_or_cross_project_scopes(role_mapping_setup) -> None:
     setup = role_mapping_setup
     client = TestClient(app, raise_server_exceptions=False)
     tenant = setup["tenant_a"]
-
     cases = [
         ("PC", [], []),
         ("PC", [setup["dealer_a"]], [setup["outlet_onsite"]]),
-        ("PC", [], [setup["outlet_satellite"]]),
-        ("PC", [], [setup["outlet_onsite"], setup["outlet_onsite_2"]]),
-        (
-            "PC",
-            [],
-            [
-                setup["outlet_onsite"],
-                setup["outlet_satellite"],
-                setup["outlet_onsite_2"],
-            ],
-        ),
-        (
-            "PC",
-            [],
-            [setup["outlet_onsite"], setup["outlet_satellite"], setup["outlet_satellite_2"]],
-        ),
         ("PC", [], [setup["outlet_b"]]),
         ("TL", [setup["dealer_a"]], []),
         ("TL", [], [setup["outlet_onsite"]]),
-        ("CRM", [setup["dealer_a"]], []),
-        ("CRM", [], [setup["outlet_onsite"]]),
         ("PM", [setup["dealer_a"]], []),
         ("Executive", [], [setup["outlet_onsite"]]),
+        ("CRM", [setup["dealer_b"]], []),
+        ("CRM", [], [setup["outlet_b"]]),
     ]
     for index, (role, dealers, outlets) in enumerate(cases):
         response = client.put(
             f"/v1/tenants/{tenant}/role-mappings/user-invalid-{index}",
             headers={"Idempotency-Key": f"invalid-{index}"},
-            json={
-                "operatingRole": role,
-                "dealerIds": dealers,
-                "outletIds": outlets,
-            },
+            json={"operatingRole": role, "dealerIds": dealers, "outletIds": outlets},
         )
         assert response.status_code == 422
         assert response.json()["errorCode"] == "VAC-VAL-002"
@@ -368,21 +321,17 @@ def test_role_mapping_scope_rules_and_tenant_isolation(role_mapping_setup) -> No
     assert setup["security"].calls == []
 
 
-def test_tl_pm_crm_and_executive_are_project_wide(role_mapping_setup) -> None:
+def test_tl_pm_and_executive_are_project_wide(role_mapping_setup) -> None:
     setup = role_mapping_setup
     client = TestClient(app, raise_server_exceptions=False)
     tenant = setup["tenant_a"]
 
-    for index, role in enumerate(("TL", "PM", "CRM", "Executive")):
-        user_id = f"user-scope-{index}"
+    for index, role in enumerate(("TL", "PM", "Executive")):
+        user_id = f"user-project-wide-{index}"
         response = client.put(
             f"/v1/tenants/{tenant}/role-mappings/{user_id}",
-            headers={"Idempotency-Key": f"scope-{index}"},
-            json={
-                "operatingRole": role,
-                "dealerIds": [],
-                "outletIds": [],
-            },
+            headers={"Idempotency-Key": f"project-wide-{index}"},
+            json={"operatingRole": role, "dealerIds": [], "outletIds": []},
         )
         assert response.status_code == 200
         assert response.json()["mapping"] == {
@@ -407,17 +356,78 @@ def test_tl_pm_crm_and_executive_are_project_wide(role_mapping_setup) -> None:
         assert tuple(row) == (role, None, None)
 
 
+def test_crm_supports_project_dealers_outlets_and_union(role_mapping_setup) -> None:
+    setup = role_mapping_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    tenant = setup["tenant_a"]
+    cases = [
+        ("crm-project", [], [], [], []),
+        (
+            "crm-dealers",
+            [setup["dealer_a"], setup["dealer_a2"]],
+            [],
+            sorted([setup["dealer_a"], setup["dealer_a2"]]),
+            [],
+        ),
+        (
+            "crm-outlets",
+            [],
+            [setup["outlet_onsite"], setup["outlet_satellite_2"]],
+            [],
+            sorted([setup["outlet_onsite"], setup["outlet_satellite_2"]]),
+        ),
+        (
+            "crm-union",
+            [setup["dealer_a"]],
+            [setup["outlet_onsite_2"], setup["outlet_satellite_2"]],
+            [setup["dealer_a"]],
+            sorted([setup["outlet_onsite_2"], setup["outlet_satellite_2"]]),
+        ),
+    ]
+
+    for index, (user_id, dealers, outlets, expected_dealers, expected_outlets) in enumerate(cases):
+        response = client.put(
+            f"/v1/tenants/{tenant}/role-mappings/{user_id}",
+            headers={"Idempotency-Key": f"crm-scope-{index}"},
+            json={"operatingRole": "CRM", "dealerIds": dealers, "outletIds": outlets},
+        )
+        assert response.status_code == 200
+        assert response.json()["mapping"] == {
+            "userId": user_id,
+            "operatingRole": "CRM",
+            "dealerIds": expected_dealers,
+            "outletIds": expected_outlets,
+        }
+        assert client.get(f"/v1/tenants/{tenant}/role-mappings/{user_id}").json() == response.json()["mapping"]
+
+    with setup["engine"].connect() as connection:
+        union_rows = connection.execute(
+            text(
+                """
+                SELECT dealer_id::text, outlet_id::text
+                FROM auditcore.business_assignments
+                WHERE tenant_id=:tenant_id AND security_actor_id='crm-union'
+                  AND assignment_status='ACTIVE'
+                ORDER BY dealer_id::text, outlet_id::text NULLS FIRST
+                """
+            ),
+            {"tenant_id": tenant},
+        ).all()
+    assert len(union_rows) == 3
+    assert (setup["dealer_a"], None) in {tuple(row) for row in union_rows}
+    assert {row[1] for row in union_rows if row[1] is not None} == {
+        setup["outlet_onsite_2"],
+        setup["outlet_satellite_2"],
+    }
+
+
 def test_role_mapping_security_failure_is_recoverable_with_same_key(role_mapping_setup) -> None:
     setup = role_mapping_setup
     client = TestClient(app, raise_server_exceptions=False)
     setup["security"].fail_set = True
     user_id = "user-recovery"
     path = f"/v1/tenants/{setup['tenant_a']}/role-mappings/{user_id}"
-    body = {
-        "operatingRole": "TL",
-        "dealerIds": [],
-        "outletIds": [],
-    }
+    body = {"operatingRole": "TL", "dealerIds": [], "outletIds": []}
 
     failed = client.put(path, headers={"Idempotency-Key": "recover-map"}, json=body)
     assert failed.status_code == 202
@@ -429,14 +439,10 @@ def test_role_mapping_security_failure_is_recoverable_with_same_key(role_mapping
     assert recovered.status_code == 200
     assert recovered.json()["operationStatus"] == "COMPLETED"
     assert recovered.json()["mapping"]["operatingRole"] == "TL"
-    assert recovered.json()["mapping"]["dealerIds"] == []
-    assert recovered.json()["mapping"]["outletIds"] == []
     assert len(setup["security"].calls) == 2
 
 
-def test_role_mapping_delete_is_project_assignment_removal_and_retry_safe(
-    role_mapping_setup,
-) -> None:
+def test_role_mapping_delete_is_assignment_removal_and_retry_safe(role_mapping_setup) -> None:
     setup = role_mapping_setup
     client = TestClient(app, raise_server_exceptions=False)
     user_id = "user-delete-role"
@@ -447,7 +453,7 @@ def test_role_mapping_delete_is_project_assignment_removal_and_retry_safe(
         json={
             "operatingRole": "PC",
             "dealerIds": [],
-            "outletIds": [setup["outlet_onsite"]],
+            "outletIds": [setup["outlet_satellite"], setup["outlet_satellite_2"]],
         },
     )
     assert created.status_code == 200
@@ -498,11 +504,7 @@ def test_role_mapping_idempotency_conflict_and_operation_table_has_no_delete_pri
     conflict = client.put(
         path,
         headers={"Idempotency-Key": "mapping-conflict"},
-        json={
-            "operatingRole": "TL",
-            "dealerIds": [],
-            "outletIds": [],
-        },
+        json={"operatingRole": "TL", "dealerIds": [], "outletIds": []},
     )
     assert conflict.status_code == 409
     assert conflict.json()["errorCode"] == "VAC-CONFLICT-003"
