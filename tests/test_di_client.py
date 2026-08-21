@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -73,9 +75,10 @@ def test_client_maps_subject_context_upload_status_facts_and_verification() -> N
             == f"/v1/tenants/{TENANT}/audit-storage-contexts/{CONTEXT}"
         ):
             assert request.headers["Idempotency-Key"] == "context-key-1"
-            assert request.json()["dealerId"] == "dealer-1"
-            assert request.json()["dealerOutletId"] == "outlet-1"
-            assert request.json()["customerId"] == "customer-1"
+            body = json.loads(request.content)
+            assert body["dealerId"] == "dealer-1"
+            assert body["dealerOutletId"] == "outlet-1"
+            assert body["customerId"] == "customer-1"
             return httpx.Response(
                 200,
                 json=_success(
@@ -246,7 +249,9 @@ def test_client_translates_di_problem_without_exposing_wire_body() -> None:
 
 
 def test_client_rejects_malformed_di_success_contract() -> None:
-    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"unexpected": True}))
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"unexpected": True})
+    )
 
     with (
         DiClient(base_url="https://di.test", transport=transport) as client,
