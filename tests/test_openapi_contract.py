@@ -16,6 +16,8 @@ _UC02_ALLOWED_DELETE_PATHS = {
     "/v1/tenants/{}/dealers/{}/outlets/{}",
     # Assignment removal only: this never deletes the global Security USER.
     "/v1/tenants/{}/role-mappings/{}",
+    # Approved Excel staging cleanup only; confirmed/published master data is preserved.
+    "/v1/tenants/{}/project-master-imports/{}",
 }
 
 
