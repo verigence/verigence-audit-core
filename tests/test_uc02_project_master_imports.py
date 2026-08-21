@@ -209,12 +209,17 @@ def test_product_master_upload_preview_confirm_publish_and_catalogue(master_setu
     assert published.status_code == 200, published.text
     assert published.json()["lifecycleStatus"] == "PUBLISHED"
 
+    versions = client.get(
+        f"/v1/tenants/{setup['tenant_id']}/project-masters/AUDIT_CORE/PRODUCT_MASTER/versions"
+    )
+    assert versions.status_code == 200
+    assert versions.json()[0]["lifecycleStatus"] == "PUBLISHED"
+
+    # The unqualified catalogue is the cross-module UC02 facade. It must not silently
+    # hide the three DI-owned master domains when DI administration is unconfigured.
     catalogue = client.get(f"/v1/tenants/{setup['tenant_id']}/project-masters")
-    assert catalogue.status_code == 200
-    product = next(item for item in catalogue.json() if item["masterKey"] == "PRODUCT_MASTER")
-    assert product["uploadMode"] == "EXCEL"
-    assert product["requiresWef"] is True
-    assert product["currentVersionId"] == confirmed_body["confirmedVersionId"]
+    assert catalogue.status_code == 503
+    assert catalogue.json()["errorCode"] == "VAC-DI-001"
 
 
 def test_price_list_requires_effective_product_master_context(master_setup) -> None:
