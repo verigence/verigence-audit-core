@@ -10,6 +10,7 @@ from sqlalchemy import create_engine, text
 
 from audit_core import readiness
 from audit_core.dependencies import HumanAdminRequest, require_super_admin_request
+from audit_core.di_client import DiClientError
 from audit_core.main import app
 from audit_core.security_integration import (
     SecurityAdminContext,
@@ -37,7 +38,12 @@ class ControlledSecurityReadiness:
             def __exit__(self, exc_type, exc, traceback) -> None:
                 return None
 
-            def get_tenant(self, *, human_bearer_token: str, tenant_id: str) -> SecurityTenant:
+            def get_tenant(
+                self,
+                *,
+                human_bearer_token: str,
+                tenant_id: str,
+            ) -> SecurityTenant:
                 controller.calls.append((human_bearer_token, tenant_id))
                 if controller.fail_http_status is not None:
                     raise SecurityAdminError(
@@ -50,6 +56,89 @@ class ControlledSecurityReadiness:
                     tenant_name="Readiness Project",
                     status=controller.status,
                 )
+
+        return Client
+
+
+@dataclass
+class ControlledDiReadiness:
+    fail: bool = False
+    provisioning_status: str = "READY"
+    version_states: dict[str, str] = field(
+        default_factory=lambda: {
+            "DOCUMENT_TYPES": "ACTIVE",
+            "EXTRACTION_PROFILES": "PUBLISHED",
+            "REQUIREMENT_PROFILES": "PUBLISHED",
+        }
+    )
+    calls: list[tuple[str, str, str]] = field(default_factory=list)
+
+    def client_class(self):
+        controller = self
+
+        class Client:
+            def __init__(self, *, base_url: str) -> None:
+                assert base_url == "https://di.test"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback) -> None:
+                return None
+
+            def _maybe_fail(self) -> None:
+                if controller.fail:
+                    raise DiClientError(
+                        status_code=503,
+                        code="DI_UNAVAILABLE",
+                        retryable=True,
+                    )
+
+            def get_project_provisioning(
+                self,
+                *,
+                human_token: str,
+                tenant_id: str,
+            ) -> dict:
+                self._maybe_fail()
+                controller.calls.append(("provisioning", human_token, tenant_id))
+                return {
+                    "tenantId": tenant_id,
+                    "provisioningStatus": controller.provisioning_status,
+                    "checks": [],
+                }
+
+            def list_project_masters(
+                self,
+                *,
+                human_token: str,
+                tenant_id: str,
+            ) -> list[dict]:
+                self._maybe_fail()
+                controller.calls.append(("catalogue", human_token, tenant_id))
+                return [
+                    {"masterKey": master_key}
+                    for master_key in controller.version_states
+                ]
+
+            def list_project_master_versions(
+                self,
+                *,
+                human_token: str,
+                tenant_id: str,
+                master_key: str,
+            ) -> dict:
+                self._maybe_fail()
+                controller.calls.append((master_key, human_token, tenant_id))
+                return {
+                    "masterKey": master_key,
+                    "versions": [
+                        {
+                            "versionId": str(uuid4()),
+                            "status": controller.version_states[master_key],
+                        }
+                    ],
+                }
 
         return Client
 
@@ -160,8 +249,11 @@ def readiness_setup(monkeypatch):
             )
 
     security = ControlledSecurityReadiness()
+    di = ControlledDiReadiness()
     monkeypatch.setenv("SECURITY_BASE_URL", "https://security.test")
+    monkeypatch.setenv("DI_BASE_URL", "https://di.test")
     monkeypatch.setattr(readiness, "SecurityAdminClient", security.client_class())
+    monkeypatch.setattr(readiness, "DiClient", di.client_class())
     admin_request = HumanAdminRequest(
         user_id="superadmin-ready",
         bearer_token="same-human-superadmin-token",
@@ -178,6 +270,7 @@ def readiness_setup(monkeypatch):
             "tenant_id": tenant_id,
             "outlet_ids": [str(value) for value in outlet_ids],
             "security": security,
+            "di": di,
         }
     finally:
         app.dependency_overrides.clear()
@@ -188,7 +281,7 @@ def _checks(payload: dict) -> dict[str, dict]:
     return {check["checkKey"]: check for check in payload["checks"]}
 
 
-def test_readiness_evaluates_frozen_local_rules_and_forwards_human_token(
+def test_readiness_uses_real_di_states_and_reports_missing_audit_core_masters(
     readiness_setup,
 ) -> None:
     setup = readiness_setup
@@ -196,7 +289,7 @@ def test_readiness_evaluates_frozen_local_rules_and_forwards_human_token(
 
     response = client.get(f"/v1/tenants/{setup['tenant_id']}/project/readiness")
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     payload = response.json()
     checks = _checks(payload)
     assert payload["readyToActivate"] is False
@@ -204,13 +297,15 @@ def test_readiness_evaluates_frozen_local_rules_and_forwards_human_token(
     assert checks["SECURITY_TENANT_LIFECYCLE"]["status"] == "PASS"
     assert checks["DEALER_OUTLET_STRUCTURE"]["status"] == "PASS"
     assert checks["ACTIVE_OUTLET_PC_COVERAGE"]["status"] == "PASS"
-    assert checks["PROJECT_MASTERS_READY"]["status"] == "PENDING"
-    assert checks["DI_PROJECT_READY"]["status"] == "PENDING"
+    assert checks["PROJECT_MASTERS_READY"]["status"] == "FAIL"
+    assert "Product Master" in checks["PROJECT_MASTERS_READY"]["message"]
+    assert checks["DI_PROJECT_READY"]["status"] == "PASS"
     assert checks["OPTIONAL_OUTLET_MAP_METADATA"]["severity"] == "WARNING"
     assert checks["OPTIONAL_OUTLET_MAP_METADATA"]["status"] == "FAIL"
     assert setup["security"].calls == [
         ("same-human-superadmin-token", setup["tenant_id"])
     ]
+    assert all(call[1] == "same-human-superadmin-token" for call in setup["di"].calls)
 
 
 def test_missing_pc_coverage_is_blocking_but_satellite_classification_is_not(
@@ -267,3 +362,32 @@ def test_missing_security_tenant_is_blocking(readiness_setup) -> None:
     check = _checks(response.json())["SECURITY_TENANT_LIFECYCLE"]
     assert check["status"] == "FAIL"
     assert "missing" in check["message"].lower()
+
+
+def test_di_dependency_failure_is_pending_and_never_ready(readiness_setup) -> None:
+    setup = readiness_setup
+    setup["di"].fail = True
+
+    response = TestClient(app, raise_server_exceptions=False).get(
+        f"/v1/tenants/{setup['tenant_id']}/project/readiness"
+    )
+
+    assert response.status_code == 200
+    check = _checks(response.json())["DI_PROJECT_READY"]
+    assert check["severity"] == "BLOCKING"
+    assert check["status"] == "PENDING"
+    assert response.json()["readyToActivate"] is False
+
+
+def test_di_missing_required_published_state_is_blocking(readiness_setup) -> None:
+    setup = readiness_setup
+    setup["di"].version_states["EXTRACTION_PROFILES"] = "DRAFT"
+
+    response = TestClient(app, raise_server_exceptions=False).get(
+        f"/v1/tenants/{setup['tenant_id']}/project/readiness"
+    )
+
+    assert response.status_code == 200
+    check = _checks(response.json())["DI_PROJECT_READY"]
+    assert check["status"] == "FAIL"
+    assert "EXTRACTION_PROFILES (PUBLISHED)" in check["message"]
