@@ -79,6 +79,8 @@ def test_critical_journey_uses_audit_core_only_and_keeps_delivery_independent() 
     tl_id = f"tl-{suffix}"
     subject_id = str(uuid4())
     document_id = str(uuid4())
+    dealer_id = uuid4()
+    outlet_id = uuid4()
     security_client = FakeSecurityClient(calls=[])
     di_client = FakeDiClient(
         tenant_id=tenant_id,
@@ -120,6 +122,42 @@ def test_critical_journey_uses_audit_core_only_and_keeps_delivery_independent() 
                 "category_id": category_id,
             },
         )
+        # Dealer/Outlet are setup data for this operating-journey test. UC02 makes
+        # their administration a human SuperAdmin boundary, so a PC must not create
+        # them through the administrative API as part of this test.
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.dealers (
+                    tenant_id, dealer_id, dealer_code, dealer_name
+                ) VALUES (
+                    :tenant_id, :dealer_id, :dealer_code, 'E2E Dealer'
+                )
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "dealer_id": dealer_id,
+                "dealer_code": f"D-{suffix}",
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.dealer_outlets (
+                    tenant_id, dealer_id, outlet_id, outlet_code, outlet_name
+                ) VALUES (
+                    :tenant_id, :dealer_id, :outlet_id, :outlet_code, 'E2E Outlet'
+                )
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "dealer_id": dealer_id,
+                "outlet_id": outlet_id,
+                "outlet_code": f"O-{suffix}",
+            },
+        )
         connection.execute(
             text(
                 """
@@ -155,20 +193,6 @@ def test_critical_journey_uses_audit_core_only_and_keeps_delivery_independent() 
     auth_headers = {"Authorization": "Bearer user-token"}
 
     try:
-        dealer = client.post(
-            f"/v1/tenants/{tenant_id}/dealers",
-            json={"dealerCode": f"D-{suffix}", "dealerName": "E2E Dealer"},
-        )
-        assert dealer.status_code == 201, dealer.text
-        dealer_id = dealer.json()["dealerId"]
-
-        outlet = client.post(
-            f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets",
-            json={"outletCode": f"O-{suffix}", "outletName": "E2E Outlet"},
-        )
-        assert outlet.status_code == 201, outlet.text
-        outlet_id = outlet.json()["outletId"]
-
         customer = client.post(
             f"/v1/tenants/{tenant_id}/outlets/{outlet_id}/customers",
             json={"customerTypeCode": "RETAIL", "displayName": "E2E Customer"},
