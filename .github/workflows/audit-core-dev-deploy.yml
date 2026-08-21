@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       AUDIT_SERVICE: verigence-audit-core
       DEV_DATABASE_URL: ${{ secrets.DEV_DATABASE_URL }}
@@ -59,10 +59,24 @@ jobs:
       - name: Install Railway CLI
         run: npm install --global @railway/cli
 
-      - name: Verify Audit Core Railway target
+      - name: Link and verify Audit Core Railway target
         shell: bash
         run: |
           set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN secret is not configured.'; exit 1; }
+          linked=''
+          for environment in production dev development; do
+            if railway link --project "$PLATFORM_PROJECT_ID" --environment "$environment" --service "$AUDIT_SERVICE" --json >/tmp/link.json 2>/tmp/link.err; then
+              echo "RAILWAY_ENVIRONMENT=$environment"
+              linked="$environment"
+              break
+            fi
+          done
+          if [[ -z "$linked" ]]; then
+            cat /tmp/link.err >&2 || true
+            echo '::error::Could not link the approved Railway project/service to a known DEV environment.'
+            exit 1
+          fi
           railway status --json >/tmp/status.json
           railway service list --json >/tmp/services.json
           python - <<'PY'
@@ -71,7 +85,7 @@ jobs:
           project = json.loads(Path('/tmp/status.json').read_text())
           services = json.loads(Path('/tmp/services.json').read_text())
           if project.get('id') != os.environ['PLATFORM_PROJECT_ID']:
-              raise SystemExit('RAILWAY_TOKEN does not target the approved shared DEV project')
+              raise SystemExit('Railway API token does not target the approved shared DEV project')
           if not any(row.get('name') == os.environ['AUDIT_SERVICE'] for row in services):
               raise SystemExit('Audit Core Railway service is missing from the approved shared DEV project')
           print('AUDIT_CORE_RAILWAY_TARGET=PASS')
@@ -126,12 +140,14 @@ jobs:
           PY
           )"
           if [[ -z "$domain" ]]; then
-            echo 'AUDIT_CORE_PUBLIC_HEALTH=SKIPPED|no public domain configured'
-            exit 0
+            echo '::error::Audit Core Railway service has no public domain configured.'
+            exit 1
           fi
           case "$domain" in
             http://*|https://*) base="${domain%/}" ;;
             *) base="https://${domain%/}" ;;
           esac
           curl --fail --silent --show-error "$base/health" >/tmp/audit-health.json
+          curl --fail --silent --show-error "$base/openapi.json" >/tmp/audit-openapi.json
+          echo "AUDIT_CORE_PUBLIC_BASE=$base"
           echo 'AUDIT_CORE_PUBLIC_HEALTH=PASS'
