@@ -13,7 +13,7 @@ _SUPPORTED_ROLES = frozenset({"PC", "TL", "PM", "CRM", "Executive"})
 
 
 def install_role_mapping_policy(role_mappings: Any) -> None:
-    """Install the owner-approved UC02 business-scope policy.
+    """Install the owner-approved flexible UC02 business-scope policy.
 
     Owner clarification (21-Aug-2026):
     - PC is Outlet-scoped with no artificial ONSITE/SATELLITE cardinality rule.
