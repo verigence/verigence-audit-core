@@ -25,9 +25,8 @@ jobs:
       RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       AUDIT_SERVICE: verigence-audit-core
-      DEV_DATABASE_URL: ${{ secrets.DEV_DATABASE_URL }}
-      MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
       DEPLOY_SHA: ${{ github.sha }}
+      APP_ENV: ci
 
     steps:
       - name: Check out repository
@@ -63,25 +62,6 @@ jobs:
           print("AUDIT_CORE_UC02_ROUTE_CONTRACT=PASS")
           PY
 
-      - name: Apply Audit Core Neon migrations
-        shell: bash
-        run: |
-          set -euo pipefail
-          raw="${MIGRATION_DATABASE_URL:-${DEV_DATABASE_URL:-}}"
-          if [[ -z "$raw" ]]; then
-            echo '::error::Neither MIGRATION_DATABASE_URL nor DEV_DATABASE_URL is configured.'
-            exit 1
-          fi
-          case "$raw" in
-            postgresql+psycopg://*) sqlalchemy_url="$raw" ;;
-            postgresql+asyncpg://*) sqlalchemy_url="postgresql+psycopg://${raw#postgresql+asyncpg://}" ;;
-            postgresql://*) sqlalchemy_url="postgresql+psycopg://${raw#postgresql://}" ;;
-            postgres://*) sqlalchemy_url="postgresql+psycopg://${raw#postgres://}" ;;
-            *) echo '::error::Configured Audit Core database secret is not a PostgreSQL URL.'; exit 1 ;;
-          esac
-          echo "::add-mask::$sqlalchemy_url"
-          DATABASE_URL="$sqlalchemy_url" alembic upgrade head
-
       - name: Install Railway CLI
         run: npm install --global @railway/cli
 
@@ -98,16 +78,23 @@ jobs:
           echo 'RAILWAY_ENVIRONMENT=dev'
           railway status --json >/tmp/status.json
           railway service list --json >/tmp/services.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
           python - <<'PY'
           import json, os
           from pathlib import Path
           project = json.loads(Path('/tmp/status.json').read_text())
           services = json.loads(Path('/tmp/services.json').read_text())
+          variables = json.loads(Path('/tmp/audit-vars.json').read_text())
           if project.get('id') != os.environ['PLATFORM_PROJECT_ID']:
               raise SystemExit('Railway API token does not target the approved shared DEV project')
           if not any(row.get('name') == os.environ['AUDIT_SERVICE'] for row in services):
               raise SystemExit('Audit Core Railway service is missing from the approved shared DEV project')
+          required = ['DATABASE_URL', 'APP_ENV']
+          missing = [name for name in required if not str(variables.get(name, '')).strip()]
+          if missing:
+              raise SystemExit('Audit Core Railway DEV is missing required service variable(s): ' + ', '.join(missing))
           print('AUDIT_CORE_RAILWAY_TARGET=PASS')
+          print('AUDIT_CORE_RAILWAY_RUNTIME_CONFIG=PASS')
           PY
 
       - name: Deploy Audit Core
