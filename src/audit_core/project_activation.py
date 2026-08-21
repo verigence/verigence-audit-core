@@ -92,13 +92,16 @@ def activate_project(
                 human_bearer_token=admin_request.bearer_token,
                 tenant_id=tenant_id,
             )
-    except SecurityAdminError as exc:
+    except SecurityAdminError:
+        # Do not retain/chains the downstream exception. Administrative dependency
+        # details may contain implementation context and Audit Core's public problem
+        # response intentionally exposes only the stable dependency failure contract.
         raise AuditCoreError(
             error_code="VAC-SYS-001",
             status_code=503,
             title="Security activation unavailable",
             detail="Security could not activate the Project Tenant. Audit Core remains unchanged.",
-        ) from exc
+        )
 
     if tenant.status != "ACTIVE":
         raise ConflictError(
