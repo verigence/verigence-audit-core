@@ -1,7 +1,6 @@
-import logging
-
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from structlog.testing import capture_logs
 
 from audit_core.errors import install_error_handlers
 from audit_core.observability import (
@@ -39,36 +38,35 @@ def test_correlation_id_is_propagated_and_generated() -> None:
     assert generated.json()["correlationId"] == generated_id
 
 
-def test_request_and_error_logs_exclude_sensitive_payloads(caplog) -> None:
-    caplog.set_level(logging.INFO, logger="audit_core")
+def test_request_and_error_logs_exclude_sensitive_payloads() -> None:
     client = TestClient(_app(), raise_server_exceptions=False)
 
-    client.post(
-        "/fail?raw_id=ABCDE1234F",
-        headers={"Authorization": "Bearer top-secret"},
-        json={"pan": "ABCDE1234F"},
-    )
+    with capture_logs() as logs:
+        client.post(
+            "/fail?raw_id=ABCDE1234F",
+            headers={"Authorization": "Bearer top-secret"},
+            json={"pan": "ABCDE1234F"},
+        )
 
-    recorded = " ".join(repr(record.__dict__) for record in caplog.records)
+    recorded = repr(logs)
     assert "ABCDE1234F" not in recorded
     assert "top-secret" not in recorded
-    assert any(record.getMessage() == "api_error" for record in caplog.records)
-    assert any(record.getMessage() == "request_complete" for record in caplog.records)
+    assert any(event.get("event") == "api_error" for event in logs)
+    assert any(event.get("event") == "http_request" for event in logs)
 
 
-def test_dependency_log_uses_safe_structured_fields(caplog) -> None:
-    caplog.set_level(logging.INFO, logger="audit_core")
+def test_dependency_log_uses_safe_structured_fields() -> None:
+    with capture_logs() as logs:
+        log_dependency(
+            correlation_id="c-dependency",
+            dependency="DI",
+            operation="status",
+            result="success",
+        )
 
-    log_dependency(
-        correlation_id="c-dependency",
-        dependency="DI",
-        operation="status",
-        result="success",
-    )
-
-    record = caplog.records[-1]
-    assert record.getMessage() == "dependency_call"
-    assert record.correlation_id == "c-dependency"
-    assert record.dependency == "DI"
-    assert record.operation == "status"
-    assert record.result == "success"
+    record = logs[-1]
+    assert record["event"] == "dependency_call"
+    assert record["correlation_id"] == "c-dependency"
+    assert record["dependency"] == "DI"
+    assert record["operation"] == "status"
+    assert record["result"] == "success"
