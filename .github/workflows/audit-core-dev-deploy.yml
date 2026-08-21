@@ -37,6 +37,28 @@ jobs:
       - name: Install Audit Core
         run: python -m pip install -e .
 
+      - name: Verify UC02 route contract before deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python - <<'PY'
+          from audit_core.main import app
+
+          paths = app.openapi().get("paths", {})
+          required = [
+              "/v1/projects",
+              "/v1/tenants/{tenant_id}/project/readiness",
+              "/v1/tenants/{tenant_id}/project/activate",
+              "/v1/tenants/{tenant_id}/project-masters",
+              "/v1/tenants/{tenant_id}/role-mapping-candidates",
+              "/v1/tenants/{tenant_id}/role-mappings",
+          ]
+          missing = [path for path in required if path not in paths]
+          if missing:
+              raise SystemExit("Missing UC02 API path(s) before deploy: " + ", ".join(missing))
+          print("AUDIT_CORE_UC02_ROUTE_CONTRACT=PASS")
+          PY
+
       - name: Apply Audit Core Neon migrations
         shell: bash
         run: |
@@ -59,24 +81,17 @@ jobs:
       - name: Install Railway CLI
         run: npm install --global @railway/cli
 
-      - name: Link and verify Audit Core Railway target
+      - name: Link and verify Audit Core Railway DEV target
         shell: bash
         run: |
           set -euo pipefail
           [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN secret is not configured.'; exit 1; }
-          linked=''
-          for environment in production dev development; do
-            if railway link --project "$PLATFORM_PROJECT_ID" --environment "$environment" --service "$AUDIT_SERVICE" --json >/tmp/link.json 2>/tmp/link.err; then
-              echo "RAILWAY_ENVIRONMENT=$environment"
-              linked="$environment"
-              break
-            fi
-          done
-          if [[ -z "$linked" ]]; then
+          if ! railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json 2>/tmp/link.err; then
             cat /tmp/link.err >&2 || true
-            echo '::error::Could not link the approved Railway project/service to a known DEV environment.'
+            echo '::error::Could not link the approved Railway project/service to environment dev.'
             exit 1
           fi
+          echo 'RAILWAY_ENVIRONMENT=dev'
           railway status --json >/tmp/status.json
           railway service list --json >/tmp/services.json
           python - <<'PY'
@@ -95,39 +110,67 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          railway deployment list --service "$AUDIT_SERVICE" --limit 1 --json >/tmp/audit-before.json
+          previous_id="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows = json.loads(Path('/tmp/audit-before.json').read_text())
+          print(rows[0].get('id', '') if rows else '')
+          PY
+          )"
+          echo "AUDIT_PREVIOUS_DEPLOYMENT_ID=$previous_id" >> "$GITHUB_ENV"
+          echo "AUDIT_CORE_PREVIOUS_DEPLOYMENT_ID=${previous_id:-NONE}"
           railway up . --path-as-root --service "$AUDIT_SERVICE" --detach --yes \
             --message "Audit Core DEV ${DEPLOY_SHA}" >/dev/null
 
-      - name: Verify Audit Core deployment
+      - name: Verify fresh Audit Core deployment
         shell: bash
         run: |
           set -euo pipefail
-          for attempt in $(seq 1 10); do
+          for attempt in $(seq 1 30); do
             railway deployment list --service "$AUDIT_SERVICE" --limit 1 --json >/tmp/audit-deployment.json
-            status="$(python - <<'PY'
+            read -r deployment_id status <<<"$(python - <<'PY'
           import json
           from pathlib import Path
-          rows=json.loads(Path('/tmp/audit-deployment.json').read_text())
-          print(rows[0].get('status','') if rows else '')
+          rows = json.loads(Path('/tmp/audit-deployment.json').read_text())
+          if not rows:
+              print(' ')
+          else:
+              print(rows[0].get('id', ''), rows[0].get('status', ''))
           PY
           )"
+
+            if [[ -z "$deployment_id" || "$deployment_id" == "${AUDIT_PREVIOUS_DEPLOYMENT_ID:-}" ]]; then
+              echo "Waiting for a new Audit Core deployment to appear (attempt $attempt/30)"
+              sleep 10
+              continue
+            fi
+
             case "$status" in
-              SUCCESS) echo 'AUDIT_CORE_DEPLOYMENT=PASS'; break ;;
+              SUCCESS)
+                echo "AUDIT_CORE_DEPLOYMENT=PASS"
+                echo "AUDIT_CORE_DEPLOYMENT_ID=$deployment_id"
+                break
+                ;;
               FAILED|CRASHED|REMOVED)
                 railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 220 || true
-                echo "Audit Core deployment failed: $status" >&2
+                echo "Audit Core deployment $deployment_id failed: $status" >&2
                 exit 1
                 ;;
+              *)
+                echo "New deployment $deployment_id is $status (attempt $attempt/30)"
+                ;;
             esac
-            if [[ "$attempt" == "10" ]]; then
+
+            if [[ "$attempt" == "30" ]]; then
               railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 220 || true
-              echo "Audit Core deployment did not reach SUCCESS: $status" >&2
+              echo "Audit Core deployment did not reach SUCCESS for a new deployment ID." >&2
               exit 1
             fi
-            sleep 15
+            sleep 10
           done
 
-      - name: Smoke test health endpoint
+      - name: Smoke test deployed UC02 service
         shell: bash
         run: |
           set -euo pipefail
@@ -140,14 +183,35 @@ jobs:
           PY
           )"
           if [[ -z "$domain" ]]; then
-            echo '::error::Audit Core Railway service has no public domain configured.'
+            echo '::error::Audit Core Railway DEV service has no public domain configured.'
             exit 1
           fi
           case "$domain" in
             http://*|https://*) base="${domain%/}" ;;
             *) base="https://${domain%/}" ;;
           esac
+
           curl --fail --silent --show-error "$base/health" >/tmp/audit-health.json
-          curl --fail --silent --show-error "$base/openapi.json" >/tmp/audit-openapi.json
           echo "AUDIT_CORE_PUBLIC_BASE=$base"
           echo 'AUDIT_CORE_PUBLIC_HEALTH=PASS'
+
+          probe_route() {
+            local path="$1"
+            local code
+            code="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --request OPTIONS "$base$path" || true)"
+            case "$code" in
+              000|404|5??)
+                echo "::error::Deployed UC02 route probe failed: $path returned HTTP $code"
+                exit 1
+                ;;
+              *) echo "UC02_ROUTE_PRESENT|$path|HTTP_$code" ;;
+            esac
+          }
+
+          probe_route '/v1/projects'
+          probe_route '/v1/tenants/uc02-smoke/project/readiness'
+          probe_route '/v1/tenants/uc02-smoke/project/activate'
+          probe_route '/v1/tenants/uc02-smoke/project-masters'
+          probe_route '/v1/tenants/uc02-smoke/role-mapping-candidates'
+          probe_route '/v1/tenants/uc02-smoke/role-mappings'
+          echo 'AUDIT_CORE_UC02_DEV=PASS'
