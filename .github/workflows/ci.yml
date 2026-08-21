@@ -58,13 +58,28 @@ jobs:
           engine = create_engine(os.environ["DATABASE_URL"])
           with engine.connect() as connection:
               assert connection.execute(text("select to_regclass('auditcore.projects')::text")).scalar_one() == "auditcore.projects"
-              assert connection.execute(text("select version_num from alembic_version")).scalar_one() == "0004_uc02_outlet_google_place"
+              assert connection.execute(text("select version_num from alembic_version")).scalar_one() == "0005_uc02_admin_row_delete"
               assert connection.execute(text("""
                   select count(*) from information_schema.columns
                   where table_schema='auditcore'
                     and table_name='dealer_outlets'
                     and column_name='google_place_id'
               """)).scalar_one() == 1
+              assert connection.execute(text("""
+                  select has_table_privilege(
+                      'audit_core_runtime', 'auditcore.dealers', 'DELETE'
+                  )
+              """)).scalar_one() is True
+              assert connection.execute(text("""
+                  select has_table_privilege(
+                      'audit_core_runtime', 'auditcore.dealer_outlets', 'DELETE'
+                  )
+              """)).scalar_one() is True
+              assert connection.execute(text("""
+                  select has_table_privilege(
+                      'audit_core_runtime', 'auditcore.projects', 'DELETE'
+                  )
+              """)).scalar_one() is False
           PY
 
       - name: Unit tests

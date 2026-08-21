@@ -224,3 +224,132 @@ def test_outlet_requires_matching_dealer_hierarchy(dealer_setup) -> None:
 
     assert response.status_code == 404
     assert response.json()["errorCode"] == "VAC-NF-002"
+
+
+def test_outlet_hard_delete_is_preflighted_and_idempotent(dealer_setup) -> None:
+    tenant_id = dealer_setup
+    client = TestClient(app, raise_server_exceptions=False)
+
+    dealer = client.post(
+        f"/v1/tenants/{tenant_id}/dealers",
+        json={"dealerName": "Delete Outlet Dealer"},
+    )
+    dealer_id = dealer.json()["dealerId"]
+    outlet = client.post(
+        f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets",
+        json={"outletName": "Delete Me"},
+    )
+    outlet_id = outlet.json()["outletId"]
+    path = f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets/{outlet_id}"
+
+    impact = client.get(f"{path}/deletion-impact")
+    assert impact.status_code == 200
+    assert impact.json()["canDelete"] is True
+    assert all(count == 0 for count in impact.json()["dependencies"].values())
+
+    headers = {"Idempotency-Key": f"outlet-delete-{uuid4().hex}"}
+    deleted = client.delete(path, headers=headers)
+    assert deleted.status_code == 204
+    replay = client.delete(path, headers=headers)
+    assert replay.status_code == 204
+    assert client.get(path).status_code == 404
+
+
+def test_outlet_hard_delete_rejects_business_assignment_dependency(dealer_setup) -> None:
+    tenant_id = dealer_setup
+    client = TestClient(app, raise_server_exceptions=False)
+
+    dealer = client.post(
+        f"/v1/tenants/{tenant_id}/dealers",
+        json={"dealerName": "Assigned Dealer"},
+    )
+    dealer_id = dealer.json()["dealerId"]
+    outlet = client.post(
+        f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets",
+        json={"outletName": "Assigned Outlet"},
+    )
+    outlet_id = outlet.json()["outletId"]
+
+    engine = create_engine(os.environ["DATABASE_URL"])
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO auditcore.business_assignments (
+                        tenant_id, security_actor_id, business_role_code,
+                        dealer_id, outlet_id
+                    ) VALUES (
+                        :tenant_id, 'pc-delete-test', 'PC', :dealer_id, :outlet_id
+                    )
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "dealer_id": dealer_id,
+                    "outlet_id": outlet_id,
+                },
+            )
+    finally:
+        engine.dispose()
+
+    path = f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets/{outlet_id}"
+    impact = client.get(f"{path}/deletion-impact")
+    assert impact.status_code == 200
+    assert impact.json()["canDelete"] is False
+    assert impact.json()["dependencies"]["businessAssignments"] == 1
+
+    deleted = client.delete(
+        path,
+        headers={"Idempotency-Key": f"blocked-outlet-delete-{uuid4().hex}"},
+    )
+    assert deleted.status_code == 422
+    assert deleted.json()["errorCode"] == "VAC-VAL-002"
+    assert client.get(path).status_code == 200
+
+
+def test_dealer_hard_delete_rejects_outlet_then_deletes_when_empty(dealer_setup) -> None:
+    tenant_id = dealer_setup
+    client = TestClient(app, raise_server_exceptions=False)
+
+    dealer = client.post(
+        f"/v1/tenants/{tenant_id}/dealers",
+        json={"dealerName": "Dealer Delete Test"},
+    )
+    dealer_id = dealer.json()["dealerId"]
+    outlet = client.post(
+        f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets",
+        json={"outletName": "Temporary Outlet"},
+    )
+    outlet_id = outlet.json()["outletId"]
+
+    dealer_path = f"/v1/tenants/{tenant_id}/dealers/{dealer_id}"
+    impact = client.get(f"{dealer_path}/deletion-impact")
+    assert impact.status_code == 200
+    assert impact.json()["canDelete"] is False
+    assert impact.json()["dependencies"]["outlets"] == 1
+
+    blocked = client.delete(
+        dealer_path,
+        headers={"Idempotency-Key": f"blocked-dealer-{uuid4().hex}"},
+    )
+    assert blocked.status_code == 422
+    assert blocked.json()["errorCode"] == "VAC-VAL-002"
+
+    outlet_path = f"{dealer_path}/outlets/{outlet_id}"
+    assert (
+        client.delete(
+            outlet_path,
+            headers={"Idempotency-Key": f"clear-outlet-{uuid4().hex}"},
+        ).status_code
+        == 204
+    )
+
+    impact_after = client.get(f"{dealer_path}/deletion-impact")
+    assert impact_after.status_code == 200
+    assert impact_after.json()["canDelete"] is True
+
+    headers = {"Idempotency-Key": f"dealer-delete-{uuid4().hex}"}
+    assert client.delete(dealer_path, headers=headers).status_code == 204
+    assert client.delete(dealer_path, headers=headers).status_code == 204
+    assert client.get(dealer_path).status_code == 404

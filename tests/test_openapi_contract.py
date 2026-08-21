@@ -10,6 +10,10 @@ from audit_core.main import create_app
 
 _HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 _DELIVERY_PUT_PATH = "/v1/tenants/{}/journeys/{}/delivery"
+_UC02_ADMIN_DELETE_PATHS = {
+    "/v1/tenants/{}/dealers/{}",
+    "/v1/tenants/{}/dealers/{}/outlets/{}",
+}
 
 
 def _normalize_path(path: str) -> str:
@@ -78,7 +82,8 @@ def test_openapi_operations_are_implemented_and_public_boundary_is_safe() -> Non
         if path.startswith("/v1/")
     ]
     assert public_routes
-    assert all(method != "DELETE" for method, _ in public_routes)
+    delete_paths = {path for method, path in public_routes if method == "DELETE"}
+    assert delete_paths == _UC02_ADMIN_DELETE_PATHS
     assert all("/di/" not in path.lower() for _, path in public_routes)
     assert all(not path.lower().endswith("/di") for _, path in public_routes)
     assert all("/delivery/block" not in path.lower() for _, path in public_routes)
