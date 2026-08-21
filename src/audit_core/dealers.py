@@ -1,3 +1,4 @@
+from decimal import Decimal
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
@@ -5,16 +6,13 @@ from fastapi import APIRouter, Depends, Header, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
-from audit_core.authorization import require_tenant
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import (
     HumanAdminRequest,
     get_connection,
-    get_principal,
     require_super_admin_request,
 )
 from audit_core.errors import ConflictError, NotFoundError, ValidationError
-from audit_core.security import Principal
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["dealers"])
 
@@ -40,17 +38,29 @@ class DealerResponse(BaseModel):
 
 
 class OutletCreate(BaseModel):
-    outletCode: str = Field(min_length=1, max_length=100)
     outletName: str = Field(min_length=1, max_length=240)
     outletClassification: Literal["ONSITE", "SATELLITE"] = "ONSITE"
+    addressText: str | None = None
     city: str | None = Field(default=None, max_length=160)
     stateRegion: str | None = Field(default=None, max_length=160)
     postalCode: str | None = Field(default=None, max_length=40)
+    googlePlaceId: str | None = None
+    latitude: Decimal | None = None
+    longitude: Decimal | None = None
+    monthlyVehicleVolume: int | None = Field(default=None, ge=0)
 
 
 class OutletPatch(BaseModel):
     outletName: str | None = Field(default=None, min_length=1, max_length=240)
     outletClassification: Literal["ONSITE", "SATELLITE"] | None = None
+    addressText: str | None = None
+    city: str | None = Field(default=None, max_length=160)
+    stateRegion: str | None = Field(default=None, max_length=160)
+    postalCode: str | None = Field(default=None, max_length=40)
+    googlePlaceId: str | None = None
+    latitude: Decimal | None = None
+    longitude: Decimal | None = None
+    monthlyVehicleVolume: int | None = Field(default=None, ge=0)
     status: Literal["ACTIVE", "INACTIVE"] | None = None
 
 
@@ -60,10 +70,16 @@ class OutletResponse(BaseModel):
     outletCode: str
     outletName: str
     outletClassification: str
+    addressText: str | None
     city: str | None
     stateRegion: str | None
     postalCode: str | None
+    googlePlaceId: str | None
+    latitude: Decimal | None
+    longitude: Decimal | None
+    monthlyVehicleVolume: int | None
     status: str
+    versionNo: int
 
 
 def _not_found(resource: str) -> NotFoundError:
@@ -72,11 +88,6 @@ def _not_found(resource: str) -> NotFoundError:
         title=f"{resource} not found",
         detail=f"{resource} not found for the requested tenant hierarchy.",
     )
-
-
-def _scope(connection: Connection, principal: Principal, tenant_id: str) -> None:
-    require_tenant(principal, tenant_id)
-    set_tenant_context(connection, tenant_id)
 
 
 def _set_etag(response: Response, version_no: int) -> None:
@@ -118,10 +129,16 @@ def _outlet_response(row) -> OutletResponse:
         outletCode=row["outlet_code"],
         outletName=row["outlet_name"],
         outletClassification=row["outlet_classification"],
+        addressText=row["address_text"],
         city=row["city"],
         stateRegion=row["state_region"],
         postalCode=row["postal_code"],
+        googlePlaceId=row["google_place_id"],
+        latitude=row["latitude"],
+        longitude=row["longitude"],
+        monthlyVehicleVolume=row["monthly_vehicle_volume"],
         status=row["status"],
+        versionNo=row["version_no"],
     )
 
 
@@ -292,10 +309,11 @@ def create_outlet(
     tenant_id: str,
     dealer_id: UUID,
     payload: OutletCreate,
-    principal: Annotated[Principal, Depends(get_principal)],
+    response: Response,
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> OutletResponse:
-    _scope(connection, principal, tenant_id)
+    set_tenant_context(connection, tenant_id)
     dealer_exists = connection.execute(
         text(
             "SELECT 1 FROM auditcore.dealers "
@@ -306,33 +324,46 @@ def create_outlet(
     if dealer_exists is None:
         raise _not_found("Dealer")
 
+    outlet_id = uuid4()
     row = connection.execute(
         text(
             """
             INSERT INTO auditcore.dealer_outlets (
-                tenant_id, dealer_id, outlet_code, outlet_name,
-                outlet_classification, city, state_region, postal_code,
+                tenant_id, dealer_id, outlet_id, outlet_code, outlet_name,
+                outlet_classification, address_text, city, state_region, postal_code,
+                google_place_id, latitude, longitude, monthly_vehicle_volume,
                 created_by_actor_id
             ) VALUES (
-                :tenant_id, :dealer_id, :outlet_code, :outlet_name,
-                :classification, :city, :state_region, :postal_code, :actor_id
+                :tenant_id, :dealer_id, :outlet_id, :outlet_code, :outlet_name,
+                :classification, :address_text, :city, :state_region, :postal_code,
+                :google_place_id, :latitude, :longitude, :monthly_vehicle_volume,
+                :actor_id
             )
             RETURNING outlet_id, dealer_id, outlet_code, outlet_name,
-                      outlet_classification, city, state_region, postal_code, status
+                      outlet_classification, address_text, city, state_region, postal_code,
+                      google_place_id, latitude, longitude, monthly_vehicle_volume,
+                      status, version_no
             """
         ),
         {
             "tenant_id": tenant_id,
             "dealer_id": dealer_id,
-            "outlet_code": payload.outletCode,
+            "outlet_id": outlet_id,
+            "outlet_code": outlet_id.hex,
             "outlet_name": payload.outletName,
             "classification": payload.outletClassification,
+            "address_text": payload.addressText,
             "city": payload.city,
             "state_region": payload.stateRegion,
             "postal_code": payload.postalCode,
-            "actor_id": principal.subject,
+            "google_place_id": payload.googlePlaceId,
+            "latitude": payload.latitude,
+            "longitude": payload.longitude,
+            "monthly_vehicle_volume": payload.monthlyVehicleVolume,
+            "actor_id": admin_request.user_id,
         },
     ).mappings().one()
+    _set_etag(response, row["version_no"])
     return _outlet_response(row)
 
 
@@ -340,15 +371,17 @@ def create_outlet(
 def list_outlets(
     tenant_id: str,
     dealer_id: UUID,
-    principal: Annotated[Principal, Depends(get_principal)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> list[OutletResponse]:
-    _scope(connection, principal, tenant_id)
+    set_tenant_context(connection, tenant_id)
     rows = connection.execute(
         text(
             """
             SELECT outlet_id, dealer_id, outlet_code, outlet_name,
-                   outlet_classification, city, state_region, postal_code, status
+                   outlet_classification, address_text, city, state_region, postal_code,
+                   google_place_id, latitude, longitude, monthly_vehicle_volume,
+                   status, version_no
             FROM auditcore.dealer_outlets
             WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id
             ORDER BY outlet_code
@@ -364,15 +397,18 @@ def get_outlet(
     tenant_id: str,
     dealer_id: UUID,
     outlet_id: UUID,
-    principal: Annotated[Principal, Depends(get_principal)],
+    response: Response,
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> OutletResponse:
-    _scope(connection, principal, tenant_id)
+    set_tenant_context(connection, tenant_id)
     row = connection.execute(
         text(
             """
             SELECT outlet_id, dealer_id, outlet_code, outlet_name,
-                   outlet_classification, city, state_region, postal_code, status
+                   outlet_classification, address_text, city, state_region, postal_code,
+                   google_place_id, latitude, longitude, monthly_vehicle_volume,
+                   status, version_no
             FROM auditcore.dealer_outlets
             WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id
               AND outlet_id = :outlet_id
@@ -382,6 +418,7 @@ def get_outlet(
     ).mappings().one_or_none()
     if row is None:
         raise _not_found("Outlet")
+    _set_etag(response, row["version_no"])
     return _outlet_response(row)
 
 
@@ -391,36 +428,93 @@ def patch_outlet(
     dealer_id: UUID,
     outlet_id: UUID,
     payload: OutletPatch,
-    principal: Annotated[Principal, Depends(get_principal)],
+    response: Response,
+    if_match: Annotated[str, Header(alias="If-Match", min_length=1)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> OutletResponse:
-    _scope(connection, principal, tenant_id)
+    set_tenant_context(connection, tenant_id)
+    supplied = payload.model_fields_set
+    if not supplied:
+        raise ValidationError(detail="At least one Outlet field must be supplied.")
+    if "outletName" in supplied and payload.outletName is None:
+        raise ValidationError(detail="Outlet Name cannot be set to null.")
+    if "outletClassification" in supplied and payload.outletClassification is None:
+        raise ValidationError(detail="Outlet classification cannot be set to null.")
+    if "status" in supplied and payload.status is None:
+        raise ValidationError(detail="Outlet status cannot be set to null.")
+
+    expected_version = _parse_if_match(if_match)
+    columns = {
+        "outletName": ("outlet_name", payload.outletName),
+        "outletClassification": ("outlet_classification", payload.outletClassification),
+        "addressText": ("address_text", payload.addressText),
+        "city": ("city", payload.city),
+        "stateRegion": ("state_region", payload.stateRegion),
+        "postalCode": ("postal_code", payload.postalCode),
+        "googlePlaceId": ("google_place_id", payload.googlePlaceId),
+        "latitude": ("latitude", payload.latitude),
+        "longitude": ("longitude", payload.longitude),
+        "monthlyVehicleVolume": ("monthly_vehicle_volume", payload.monthlyVehicleVolume),
+        "status": ("status", payload.status),
+    }
+    assignments: list[str] = []
+    parameters: dict[str, object] = {
+        "tenant_id": tenant_id,
+        "dealer_id": dealer_id,
+        "outlet_id": outlet_id,
+        "expected_version": expected_version,
+        "actor_id": admin_request.user_id,
+    }
+    for field_name in supplied:
+        column, value = columns[field_name]
+        parameter_name = f"value_{field_name}"
+        assignments.append(f"{column} = :{parameter_name}")
+        parameters[parameter_name] = value
+    assignments.extend(
+        [
+            "updated_by_actor_id = :actor_id",
+            "updated_at_utc = now()",
+            "version_no = version_no + 1",
+        ]
+    )
+
     row = connection.execute(
         text(
-            """
+            f"""
             UPDATE auditcore.dealer_outlets
-            SET outlet_name = COALESCE(:outlet_name, outlet_name),
-                outlet_classification = COALESCE(:classification, outlet_classification),
-                status = COALESCE(:status, status),
-                updated_by_actor_id = :actor_id,
-                updated_at_utc = now(),
-                version_no = version_no + 1
+            SET {', '.join(assignments)}
             WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id
-              AND outlet_id = :outlet_id
+              AND outlet_id = :outlet_id AND version_no = :expected_version
             RETURNING outlet_id, dealer_id, outlet_code, outlet_name,
-                      outlet_classification, city, state_region, postal_code, status
+                      outlet_classification, address_text, city, state_region, postal_code,
+                      google_place_id, latitude, longitude, monthly_vehicle_volume,
+                      status, version_no
             """
         ),
-        {
-            "tenant_id": tenant_id,
-            "dealer_id": dealer_id,
-            "outlet_id": outlet_id,
-            "outlet_name": payload.outletName,
-            "classification": payload.outletClassification,
-            "status": payload.status,
-            "actor_id": principal.subject,
-        },
+        parameters,
     ).mappings().one_or_none()
     if row is None:
-        raise _not_found("Outlet")
+        exists = connection.execute(
+            text(
+                """
+                SELECT 1 FROM auditcore.dealer_outlets
+                WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id
+                  AND outlet_id = :outlet_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "dealer_id": dealer_id,
+                "outlet_id": outlet_id,
+            },
+        ).scalar_one_or_none()
+        if exists is None:
+            raise _not_found("Outlet")
+        raise ConflictError(
+            error_code="VAC-CONFLICT-001",
+            title="Version conflict",
+            detail="Outlet was changed by another request. Refresh and retry.",
+        )
+    _set_etag(response, row["version_no"])
     return _outlet_response(row)
