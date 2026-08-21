@@ -9,7 +9,11 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
 from audit_core import project_provisioning
-from audit_core.dependencies import HumanAdminRequest, get_engine, require_super_admin_request
+from audit_core.dependencies import (
+    HumanAdminRequest,
+    get_engine,
+    require_super_admin_request,
+)
 from audit_core.di_client import DiClientError
 from audit_core.main import app
 from audit_core.security_integration import SecurityAdminContext, SecurityTenant
