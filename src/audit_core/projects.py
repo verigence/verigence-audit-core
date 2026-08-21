@@ -6,16 +6,18 @@ from fastapi import APIRouter, Depends, Header, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
-from audit_core.authorization import require_tenant
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import get_connection, get_principal
+from audit_core.dependencies import (
+    HumanAdminRequest,
+    get_connection,
+    require_super_admin_request,
+)
 from audit_core.errors import (
     BusinessValidationError,
     ConflictError,
     NotFoundError,
     ValidationError,
 )
-from audit_core.security import Principal
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/project", tags=["project"])
 
@@ -170,10 +172,9 @@ def _require_reference_exists(
 def get_project(
     tenant_id: str,
     response: Response,
-    principal: Annotated[Principal, Depends(get_principal)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> ProjectResponse:
-    require_tenant(principal, tenant_id)
     set_tenant_context(connection, tenant_id)
     row = _project_row(connection, tenant_id)
     _set_etag(response, row["version_no"])
@@ -186,10 +187,9 @@ def patch_project(
     patch: ProjectPatch,
     response: Response,
     if_match: Annotated[str, Header(alias="If-Match", min_length=1)],
-    principal: Annotated[Principal, Depends(get_principal)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> ProjectResponse:
-    require_tenant(principal, tenant_id)
     set_tenant_context(connection, tenant_id)
 
     supplied = patch.model_fields_set
@@ -277,7 +277,7 @@ def patch_project(
     parameters: dict[str, object] = {
         "tenant_id": tenant_id,
         "expected_version": expected_version,
-        "actor_id": principal.subject,
+        "actor_id": admin_request.user_id,
     }
     for field_name in supplied:
         column, value = columns[field_name]
