@@ -6,6 +6,19 @@ branch_labels = None
 depends_on = None
 
 
+_OEM_IDS = (
+    "10000000-0000-4000-8000-000000000001",
+    "10000000-0000-4000-8000-000000000002",
+    "10000000-0000-4000-8000-000000000003",
+    "10000000-0000-4000-8000-000000000004",
+    "10000000-0000-4000-8000-000000000005",
+    "10000000-0000-4000-8000-000000000006",
+    "10000000-0000-4000-8000-000000000007",
+    "10000000-0000-4000-8000-000000000008",
+)
+_PRODUCT_CATEGORY_ID = "20000000-0000-4000-8000-000000000001"
+
+
 def upgrade() -> None:
     op.execute(
         """
@@ -45,22 +58,23 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute(
-        """
-        DELETE FROM auditcore.oems o
-        WHERE o.oem_code IN (
-            'MAHINDRA', 'HYUNDAI', 'MARUTI', 'MERCEDES_BENZ',
-            'BMW', 'SKODA', 'VOLKSWAGEN', 'TATA_MOTORS'
+    # Do not delete or deactivate a pre-existing reference row that was matched by
+    # business code during upgrade. Only remove rows created with this migration's
+    # deterministic identifiers, and only when no Project references them.
+    for oem_id in _OEM_IDS:
+        op.execute(
+            f"""
+            DELETE FROM auditcore.oems o
+            WHERE o.oem_id = '{oem_id}'::uuid
+              AND NOT EXISTS (
+                  SELECT 1 FROM auditcore.projects p WHERE p.oem_id = o.oem_id
+              )
+            """
         )
-          AND NOT EXISTS (
-              SELECT 1 FROM auditcore.projects p WHERE p.oem_id = o.oem_id
-          )
-        """
-    )
     op.execute(
-        """
+        f"""
         DELETE FROM auditcore.product_categories c
-        WHERE c.category_code = 'FOUR_WHEELERS'
+        WHERE c.product_category_id = '{_PRODUCT_CATEGORY_ID}'::uuid
           AND NOT EXISTS (
               SELECT 1 FROM auditcore.projects p
               WHERE p.product_category_id = c.product_category_id
