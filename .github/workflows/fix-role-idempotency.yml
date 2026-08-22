@@ -1,0 +1,407 @@
+name: Apply role mapping idempotency fix
+
+on:
+  push:
+    branches: [fix/admin-atomic-compensation]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/admin-atomic-compensation
+      - name: Restore idempotency without recovery workflow
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/audit_core/role_mappings.py')
+          text = path.read_text()
+
+          text = text.replace(
+              'from fastapi import APIRouter, Depends, Header, Query',
+              'from fastapi import APIRouter, Depends, Header, Query, Request',
+              1,
+          )
+          auth_import = 'from audit_core.authorization import AuthorizationError\n'
+          admin_import = '''from audit_core.admin_operations import (\n    AdministrativeOperation,\n    administrative_operation_lock,\n    claim_administrative_operation,\n    update_administrative_operation,\n)\n'''
+          if admin_import not in text:
+              text = text.replace(auth_import, admin_import + auth_import, 1)
+          obs_import = 'from audit_core.observability import get_correlation_id\n'
+          sec_import = 'from audit_core.security_integration import SecurityAdminClient, SecurityAdminError\n'
+          if obs_import not in text:
+              text = text.replace(sec_import, obs_import + sec_import, 1)
+
+          text = text.replace(
+              'OperatingRole = Literal["PC", "TL", "PM", "CRM", "Executive"]\n_RUNTIME_ROLE = "audit_core_runtime"',
+              'OperatingRole = Literal["PC", "TL", "PM", "CRM", "Executive"]\n_OPERATION_TYPE = "ROLE_MAPPING"\n_RUNTIME_ROLE = "audit_core_runtime"',
+              1,
+          )
+          text = text.replace(
+              'operationStatus: Literal["COMPLETED", "RECOVERY_REQUIRED"]',
+              'operationStatus: Literal["COMPLETED"]',
+              1,
+          )
+
+          start = text.index('@router.put("/role-mappings/{user_id}"')
+          new_tail = r'''def _operation_response(
+    operation: AdministrativeOperation,
+    *,
+    mapping: RoleMappingResponse | None,
+) -> RoleMappingMutationResponse:
+    return RoleMappingMutationResponse(
+        operationId=UUID(operation.operation_id),
+        operationStatus="COMPLETED",
+        mapping=mapping,
+    )
+
+
+def _mark_operation_failed(
+    engine: Engine,
+    *,
+    operation: AdministrativeOperation,
+    current_step: str,
+    summary: str,
+) -> None:
+    try:
+        update_administrative_operation(
+            engine,
+            operation_id=operation.operation_id,
+            status="FAILED",
+            current_step=current_step,
+            last_error_summary=summary,
+        )
+    except Exception as exc:
+        logger.error(
+            "role_mapping_failure_receipt_write_failed",
+            operation_id=operation.operation_id,
+            exc_type=type(exc).__name__,
+        )
+
+
+@router.put("/role-mappings/{user_id}", response_model=RoleMappingMutationResponse)
+def put_role_mapping(
+    tenant_id: str,
+    user_id: str,
+    body: RoleMappingPutRequest,
+    request: Request,
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    engine: Annotated[Engine, Depends(get_engine)],
+) -> RoleMappingMutationResponse:
+    dealer_ids, outlet_ids, scopes = _resolve_scope(engine, tenant_id=tenant_id, body=body)
+    previous = _read_mapping(engine, tenant_id, user_id)
+    mapping = RoleMappingResponse(
+        userId=user_id,
+        operatingRole=body.operatingRole,
+        dealerIds=dealer_ids,
+        outletIds=outlet_ids,
+    )
+    semantic_payload = {
+        "userId": user_id,
+        "operatingRole": body.operatingRole,
+        "dealerIds": [str(value) for value in dealer_ids],
+        "outletIds": [str(value) for value in outlet_ids],
+    }
+
+    with administrative_operation_lock(
+        engine,
+        operation_type=_OPERATION_TYPE,
+        tenant_id=tenant_id,
+        idempotency_key=idempotency_key,
+    ):
+        operation = claim_administrative_operation(
+            engine,
+            operation_type=_OPERATION_TYPE,
+            tenant_id=tenant_id,
+            idempotency_key=idempotency_key,
+            semantic_payload=semantic_payload,
+            safe_request_summary=semantic_payload,
+            initiated_by_user_id=admin_request.user_id,
+            correlation_id=get_correlation_id(request),
+        )
+        if operation.status == "COMPLETED":
+            return _operation_response(operation, mapping=mapping)
+
+        try:
+            with SecurityAdminClient(base_url=_security_base_url()) as client:
+                result = client.set_operating_role(
+                    human_bearer_token=admin_request.bearer_token,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    role_key=body.operatingRole,
+                )
+        except SecurityAdminError as exc:
+            _mark_operation_failed(
+                engine,
+                operation=operation,
+                current_step="SECURITY",
+                summary="Operating-role update failed before local business-scope change.",
+            )
+            _raise_security_error(exc)
+
+        if result.tenant_id != tenant_id or result.user_id != user_id or result.role_key != body.operatingRole:
+            try:
+                _restore_security_role(
+                    admin_request=admin_request,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    previous=previous,
+                )
+            except Exception as compensation_exc:
+                _mark_operation_failed(
+                    engine,
+                    operation=operation,
+                    current_step="COMPENSATION",
+                    summary="Operating-role compensation failed.",
+                )
+                logger.critical(
+                    "role_mapping_compensation_failed",
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    exc_type=type(compensation_exc).__name__,
+                )
+                raise _dependency_unavailable(
+                    "Role mapping could not be completed cleanly. Please contact support."
+                ) from compensation_exc
+            _mark_operation_failed(
+                engine,
+                operation=operation,
+                current_step="SECURITY",
+                summary="Operating-role receipt did not match the requested mapping.",
+            )
+            raise _dependency_unavailable("Role mapping could not be completed. Please try again.")
+
+        try:
+            local_changed = _replace_assignments(
+                engine,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                role=body.operatingRole,
+                scopes=scopes,
+                actor_user_id=admin_request.user_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "role_mapping_local_write_failed",
+                tenant_id=tenant_id,
+                user_id=user_id,
+                exc_type=type(exc).__name__,
+            )
+            try:
+                _restore_security_role(
+                    admin_request=admin_request,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    previous=previous,
+                )
+            except Exception as compensation_exc:
+                _mark_operation_failed(
+                    engine,
+                    operation=operation,
+                    current_step="COMPENSATION",
+                    summary="Operating-role compensation failed after local write failure.",
+                )
+                logger.critical(
+                    "role_mapping_compensation_failed",
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    exc_type=type(compensation_exc).__name__,
+                )
+                raise _dependency_unavailable(
+                    "Role mapping could not be completed cleanly. Please contact support."
+                ) from compensation_exc
+            _mark_operation_failed(
+                engine,
+                operation=operation,
+                current_step="AUDIT_CORE",
+                summary="Business-scope update failed and was compensated.",
+            )
+            raise _dependency_unavailable("Role mapping could not be completed. Please try again.") from exc
+
+        update_administrative_operation(
+            engine,
+            operation_id=operation.operation_id,
+            status="COMPLETED",
+            current_step="COMPLETE",
+            security_receipt={
+                "tenantId": result.tenant_id,
+                "userId": result.user_id,
+                "changed": result.changed,
+                "assignmentId": result.assignment_id,
+                "roleKey": result.role_key,
+            },
+            audit_core_receipt={
+                "userId": user_id,
+                "roleKey": body.operatingRole,
+                "scopeCount": len(scopes),
+                "changed": local_changed,
+            },
+            last_error_summary=None,
+            completed=True,
+        )
+        return _operation_response(operation, mapping=mapping)
+
+
+@router.delete("/role-mappings/{user_id}", response_model=RoleMappingMutationResponse)
+def delete_role_mapping(
+    tenant_id: str,
+    user_id: str,
+    request: Request,
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    engine: Annotated[Engine, Depends(get_engine)],
+) -> RoleMappingMutationResponse:
+    semantic_payload = {"userId": user_id, "action": "REMOVE"}
+
+    with administrative_operation_lock(
+        engine,
+        operation_type=_OPERATION_TYPE,
+        tenant_id=tenant_id,
+        idempotency_key=idempotency_key,
+    ):
+        operation = claim_administrative_operation(
+            engine,
+            operation_type=_OPERATION_TYPE,
+            tenant_id=tenant_id,
+            idempotency_key=idempotency_key,
+            semantic_payload=semantic_payload,
+            safe_request_summary=semantic_payload,
+            initiated_by_user_id=admin_request.user_id,
+            correlation_id=get_correlation_id(request),
+        )
+        if operation.status == "COMPLETED":
+            return _operation_response(operation, mapping=None)
+
+        previous = _read_mapping(engine, tenant_id, user_id)
+        try:
+            with SecurityAdminClient(base_url=_security_base_url()) as client:
+                result = client.remove_operating_role(
+                    human_bearer_token=admin_request.bearer_token,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                )
+        except SecurityAdminError as exc:
+            _mark_operation_failed(
+                engine,
+                operation=operation,
+                current_step="SECURITY",
+                summary="Operating-role removal failed before local assignment removal.",
+            )
+            _raise_security_error(exc)
+
+        if result.tenant_id != tenant_id or result.user_id != user_id:
+            if previous is not None:
+                try:
+                    _restore_security_role(
+                        admin_request=admin_request,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        previous=previous,
+                    )
+                except Exception as compensation_exc:
+                    _mark_operation_failed(
+                        engine,
+                        operation=operation,
+                        current_step="COMPENSATION",
+                        summary="Operating-role removal compensation failed.",
+                    )
+                    logger.critical(
+                        "role_mapping_remove_compensation_failed",
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        exc_type=type(compensation_exc).__name__,
+                    )
+                    raise _dependency_unavailable(
+                        "Role mapping removal could not be completed cleanly. Please contact support."
+                    ) from compensation_exc
+            _mark_operation_failed(
+                engine,
+                operation=operation,
+                current_step="SECURITY",
+                summary="Operating-role removal receipt did not match the request.",
+            )
+            raise _dependency_unavailable("Role mapping removal could not be completed. Please try again.")
+
+        try:
+            deactivated = _deactivate_assignments(engine, tenant_id=tenant_id, user_id=user_id)
+        except Exception as exc:
+            logger.error(
+                "role_mapping_local_remove_failed",
+                tenant_id=tenant_id,
+                user_id=user_id,
+                exc_type=type(exc).__name__,
+            )
+            if previous is not None:
+                try:
+                    _restore_security_role(
+                        admin_request=admin_request,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        previous=previous,
+                    )
+                except Exception as compensation_exc:
+                    _mark_operation_failed(
+                        engine,
+                        operation=operation,
+                        current_step="COMPENSATION",
+                        summary="Operating-role removal compensation failed after local write failure.",
+                    )
+                    logger.critical(
+                        "role_mapping_remove_compensation_failed",
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        exc_type=type(compensation_exc).__name__,
+                    )
+                    raise _dependency_unavailable(
+                        "Role mapping removal could not be completed cleanly. Please contact support."
+                    ) from compensation_exc
+            _mark_operation_failed(
+                engine,
+                operation=operation,
+                current_step="AUDIT_CORE",
+                summary="Business-assignment removal failed and was compensated.",
+            )
+            raise _dependency_unavailable("Role mapping removal could not be completed. Please try again.") from exc
+
+        update_administrative_operation(
+            engine,
+            operation_id=operation.operation_id,
+            status="COMPLETED",
+            current_step="COMPLETE",
+            security_receipt={
+                "tenantId": result.tenant_id,
+                "userId": result.user_id,
+                "changed": result.changed,
+                "assignmentId": result.assignment_id,
+                "roleKey": result.role_key,
+            },
+            audit_core_receipt={
+                "userId": user_id,
+                "deactivatedAssignments": deactivated,
+            },
+            last_error_summary=None,
+            completed=True,
+        )
+        return _operation_response(operation, mapping=None)
+'''
+          text = text[:start] + new_tail
+          path.write_text(text)
+          PY
+          git rm .github/workflows/fix-role-idempotency.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/audit_core/role_mappings.py
+          git commit -m 'fix: preserve role mapping idempotency without recovery'
+          git push origin HEAD:fix/admin-atomic-compensation
