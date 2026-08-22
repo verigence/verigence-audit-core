@@ -1,0 +1,161 @@
+name: Diagnose UC02 Security tenant create
+
+on:
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    if: github.head_ref == 'verify/uc02-dev-e2e'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      SECURITY_SERVICE: security
+      AUDIT_SERVICE: verigence-audit-core
+      OPERATION_ID: c3cba519-88b5-48c9-874d-14383a4137d2
+      PROJECT_TAG: UC02-E2E-32565795640
+      BROWSER_CORRELATION_ID: uc02-e2e-32565795640
+    steps:
+      - name: Install diagnostic tooling
+        run: |
+          npm install --global @railway/cli
+          python -m pip install --disable-pip-version-check 'sqlalchemy>=2,<3' 'psycopg[binary]>=3,<4'
+
+      - name: Inspect durable recovery record and Security catalogue readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          railway variable list --service "$SECURITY_SERVICE" --json >/tmp/security-vars.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from sqlalchemy import create_engine, text
+
+          def url(value):
+              value=str(value or '').strip()
+              if value.startswith('postgres://'):
+                  return 'postgresql+psycopg://' + value[len('postgres://'):]
+              if value.startswith('postgresql://'):
+                  return 'postgresql+psycopg://' + value[len('postgresql://'):]
+              return value
+
+          audit=json.loads(Path('/tmp/audit-vars.json').read_text())
+          security=json.loads(Path('/tmp/security-vars.json').read_text())
+          audit_db=url(audit.get('DATABASE_URL'))
+          security_db=url(security.get('DATABASE_URL'))
+          if not audit_db or not security_db:
+              raise SystemExit('Required DEV database URL missing')
+
+          with create_engine(audit_db).connect() as conn:
+              row=conn.execute(text('''
+                  SELECT operation_id,operation_type,tenant_id,status,current_step,
+                         last_error_code,last_error_summary,correlation_id,
+                         safe_request_summary,security_receipt,audit_core_receipt,di_receipt,
+                         created_at_utc,updated_at_utc
+                  FROM auditcore.administrative_operations
+                  WHERE operation_id=:operation_id
+              '''), {'operation_id': os.environ['OPERATION_ID']}).mappings().one_or_none()
+          if row is None:
+              raise SystemExit('UC02 diagnostic operation row not found')
+          print('UC02_OPERATION_STATUS=' + str(row['status']))
+          print('UC02_OPERATION_STEP=' + str(row['current_step']))
+          print('UC02_OPERATION_TENANT=' + str(row['tenant_id']))
+          print('UC02_OPERATION_ERROR_CODE=' + str(row['last_error_code']))
+          print('UC02_OPERATION_ERROR_SUMMARY=' + str(row['last_error_summary']))
+          print('UC02_OPERATION_CORRELATION=' + str(row['correlation_id']))
+          print('UC02_OPERATION_SECURITY_RECEIPT=' + ('PRESENT' if row['security_receipt'] is not None else 'ABSENT'))
+          print('UC02_OPERATION_AUDIT_RECEIPT=' + ('PRESENT' if row['audit_core_receipt'] is not None else 'ABSENT'))
+          print('UC02_OPERATION_DI_RECEIPT=' + ('PRESENT' if row['di_receipt'] is not None else 'ABSENT'))
+          print('UC02_OPERATION_CREATED_AT=' + str(row['created_at_utc']))
+          print('UC02_OPERATION_UPDATED_AT=' + str(row['updated_at_utc']))
+
+          with create_engine(security_db).connect() as conn:
+              defaults=conn.execute(text('''
+                  SELECT d.role_key, count(*) AS active_permission_count
+                  FROM security.platform_role_permission_defaults d
+                  JOIN security.permissions p
+                    ON p.permission_key=d.permission_key AND p.status='ACTIVE'
+                  WHERE d.status='ACTIVE'
+                    AND d.role_key IN ('PC','TL','PM','CRM','Executive')
+                  GROUP BY d.role_key
+                  ORDER BY d.role_key
+              ''' )).mappings().all()
+              tenants=conn.execute(text('''
+                  SELECT tenant_id,tenant_name,status
+                  FROM security.tenants
+                  WHERE tenant_name=:project_name
+                  ORDER BY created_at_utc
+              '''), {'project_name': os.environ['PROJECT_TAG']}).mappings().all()
+              security_active=conn.execute(text('''
+                  SELECT permission_key
+                  FROM security.permissions
+                  WHERE module_key='security' AND status='ACTIVE'
+              ''' )).scalars().all()
+          print('UC02_SECURITY_V2_DEFAULT_ROLES=' + json.dumps([dict(r) for r in defaults], sort_keys=True, default=str))
+          print('UC02_SECURITY_MATCHING_TENANTS=' + json.dumps([dict(r) for r in tenants], sort_keys=True, default=str))
+          required={
+              'security.platform_admin.read','security.platform_admin.manage',
+              'security.security_config.read','security.security_config.manage',
+              'security.tenant.create','security.tenant.read','security.tenant.update',
+              'security.tenant.suspend','security.tenant.activate','security.tenant.bootstrap_admin',
+              'security.module.read','security.module.manage','security.permission.read','security.audit.read',
+              'security.member.read','security.member.invite','security.member.update','security.member.suspend',
+              'security.member.end','security.member.approve','security.group.read','security.group.create',
+              'security.group.update','security.group.assign','security.role.read','security.role.create',
+              'security.role.update','security.role.assign','security.location.read','security.location.create',
+              'security.location.update','security.location.assign','security.schedule.read','security.schedule.create',
+              'security.schedule.update','security.device.read','security.device.approve','security.device.block',
+              'security.device.revoke','security.policy.read','security.policy.update','security.retention.read',
+              'security.retention.update','security.privileged_access.approve',
+          }
+          missing=sorted(required-set(map(str,security_active)))
+          print('UC02_SECURITY_ADMIN_PERMISSION_MISSING=' + json.dumps(missing))
+          observed={str(r['role_key']) for r in defaults}
+          print('UC02_SECURITY_V2_DEFAULT_ROLE_SET=' + json.dumps(sorted(observed)))
+          PY
+
+      - name: Inspect sanitized current deployment logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 3500 >/tmp/audit.log
+          railway logs --service "$SECURITY_SERVICE" --latest --deployment --lines 3500 >/tmp/security.log
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          audit_patterns=(
+              os.environ['OPERATION_ID'],
+              os.environ['PROJECT_TAG'],
+              os.environ['BROWSER_CORRELATION_ID'],
+              'security_admin_call_failed',
+          )
+          security_patterns=(
+              os.environ['PROJECT_TAG'],
+              '/security/v1/platform/tenants',
+              'Approved v2 operating-role platform defaults are not ready',
+              'Security Admin permission catalogue is incomplete',
+              'platform.tenant.create',
+          )
+          def emit(label,path,patterns):
+              lines=Path(path).read_text(errors='replace').splitlines()
+              matches=[]
+              for line in lines:
+                  if any(p in line for p in patterns):
+                      matches.append(line)
+              print(label + '_MATCH_COUNT=' + str(len(matches)))
+              print(label + '_MATCHES_BEGIN')
+              for line in matches[-80:]:
+                  # All match keys are operational IDs/paths/event names; trim defensively.
+                  print(line[:1600])
+              print(label + '_MATCHES_END')
+          emit('UC02_AUDIT_LOG','/tmp/audit.log',audit_patterns)
+          emit('UC02_SECURITY_LOG','/tmp/security.log',security_patterns)
+          PY
