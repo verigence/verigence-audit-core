@@ -1,12 +1,10 @@
 name: Deploy Audit Core DEV
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [dev]
   workflow_dispatch:
 
 permissions:
@@ -18,19 +16,23 @@ concurrency:
 
 jobs:
   deploy:
-    if: github.event_name != 'pull_request' || github.head_ref == 'deploy/uc02-audit-core-dev'
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/dev')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       AUDIT_SERVICE: verigence-audit-core
-      DEPLOY_SHA: ${{ github.sha }}
+      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
       APP_ENV: ci
 
     steps:
-      - name: Check out repository
+      - name: Check out exact tested Audit Core revision
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -206,3 +208,4 @@ jobs:
           probe_route '/v1/tenants/uc02-smoke/role-mapping-candidates'
           probe_route '/v1/tenants/uc02-smoke/role-mappings'
           echo 'AUDIT_CORE_UC02_DEV=PASS'
+          echo "AUDIT_CORE_DEPLOYED_SHA=${DEPLOY_SHA}"
