@@ -122,3 +122,13 @@ jobs:
             echo "::error title=Pytest failure summary::$summary"
             exit "$status"
           fi
+
+  deploy-dev:
+    name: Deploy tested Audit Core SHA to Railway DEV
+    needs: quality
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/dev' &&
+      needs.quality.result == 'success'
+    uses: ./.github/workflows/audit-core-dev-deploy.yml
+    secrets: inherit
