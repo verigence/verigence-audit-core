@@ -1,5 +1,4 @@
 from fastapi.testclient import TestClient
-
 from audit_core.config import DEV_WEB_ORIGIN
 from audit_core.main import create_app
 
