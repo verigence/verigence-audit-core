@@ -152,7 +152,22 @@ def _project_selection(
             ),
             {"tenant_id": tenant.tenant_id},
         ).mappings().one_or_none()
+        provisioning_status = connection.execute(
+            text(
+                """
+                SELECT status
+                FROM auditcore.administrative_operations
+                WHERE operation_type=:operation_type
+                  AND tenant_id=:tenant_id
+                ORDER BY created_at_utc DESC
+                LIMIT 1
+                """
+            ),
+            {"operation_type": _OPERATION_TYPE, "tenant_id": tenant.tenant_id},
+        ).scalar_one_or_none()
     if row is None:
+        return None
+    if provisioning_status is not None and provisioning_status != "COMPLETED":
         return None
     return ProjectSelectionResponse(
         tenantId=str(row["tenant_id"]),
