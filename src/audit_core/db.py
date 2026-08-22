@@ -13,3 +13,17 @@ def set_tenant_context(connection: Connection, tenant_id: str) -> None:
         text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
         {"tenant_id": normalized},
     )
+
+
+def set_security_actor_context(connection: Connection, security_actor_id: str) -> None:
+    """Set the validated global USER actor for narrow C0 Project discovery reads."""
+    normalized = security_actor_id.strip()
+    if not normalized:
+        raise ValueError("security_actor_id is required")
+    if len(normalized) > 160:
+        raise ValueError("security_actor_id exceeds 160 characters")
+
+    connection.execute(
+        text("SELECT set_config('app.security_actor_id', :actor_id, true)"),
+        {"actor_id": normalized},
+    )
