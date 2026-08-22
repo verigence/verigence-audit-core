@@ -1,12 +1,12 @@
 # Audit Core UC02 — Administrative Alignment
 
 **Status:** UC02 DESIGN ALIGNMENT — OWNER DECISIONS CONFIRMED  
-**Date:** 2026-08-21  
+**Date:** 2026-08-22  
 **Repository:** `verigence/verigence-audit-core`  
 **Branch:** `dev`  
 **Related baseline:** `docs/AUDIT_CORE_SOLUTION_DESIGN_v2.1.md`, `docs/AUDIT_CORE_API_CONTRACT_v1.0.md`, `docs/AUDIT_CORE_PHYSICAL_DATA_MODEL_v2.1.md`
 
-> This is a narrow UC02 alignment amendment. It records confirmed Phase-1 Project Onboarding/Administration decisions that intentionally supersede specific v2.1 assumptions. **Owner clarification dated 2026-08-21 is authoritative: Phase 1 uses hard delete only. Process-oriented purge and persistent deletion/recreation-prevention guards are Phase-2 concepts unless separately approved.**
+> This is a narrow UC02 alignment amendment. It records confirmed Phase-1 Project Onboarding/Administration decisions that intentionally supersede specific v2.1 assumptions. **Owner clarification dated 2026-08-21 is authoritative: Phase 1 uses hard delete only. Process-oriented purge and persistent deletion/recreation-prevention guards are Phase-2 concepts unless separately approved. Owner clarification dated 2026-08-22 additionally requires durable existing-Project selection/resume and visible safe provisioning errors in Web.**
 
 ## 1. Human-admin routing through Audit Core
 
@@ -144,3 +144,45 @@ One design point remains deliberately unresolved:
 > If two Projects use the same OEM, may they maintain different Product Master versions / active sellable SKU sets?
 
 Do not implement the Product Master physical model until this owner decision is confirmed.
+
+## 9. Existing Project selection and resume
+
+A SuperAdmin must be able to leave Project Administration at any UC02 step and later reopen the same Project without relying on browser-memory Tenant context.
+
+Phase-1 behavior is therefore:
+
+1. Audit Core exposes a SuperAdmin-only platform Project list/read API at the browser boundary.
+2. Audit Core obtains Security Tenant metadata through the existing Security human-admin API using the same authenticated human Bearer token; Web does not call Security directly for Project selection.
+3. Selecting a Project establishes its `tenantId` as the current Web business context and loads `GET /v1/tenants/{tenantId}/project`.
+4. The existing tenant-scoped administration APIs remain authoritative for child data. Web must reload persisted data rather than reconstructing prior UI state:
+   - Step 2 Dealers — `GET /v1/tenants/{tenantId}/dealers`;
+   - Step 3 Dealer Outlets — `GET /v1/tenants/{tenantId}/dealers/{dealerId}/outlets` for the selected persisted Dealer;
+   - Step 4 Employees — existing Security-backed role-mapping candidate API through Audit Core;
+   - Step 5 Role Mapping — existing tenant role-mapping read API;
+   - Step 6 Project Masters — existing Project master/version APIs;
+   - Steps 7-8 Readiness/Activation — existing readiness/project APIs.
+5. If Dealers, Dealer Outlets, role mappings, masters or readiness state already exist for the Project, reopening the Project must display those persisted mappings/state from their owning APIs.
+6. Logout may clear the current browser business context, but after login the SuperAdmin must be able to discover and select the Project again from the Project list.
+
+The Project selector is a navigation/resume capability only; it does not duplicate child-domain state into a new aggregate persistence model.
+
+## 10. Project provisioning outcome and Web-visible errors
+
+`POST /v1/projects` is a distributed administrative operation across Security, Audit Core and DI. A `2xx` transport response does not by itself mean the Project is ready.
+
+Phase-1 response semantics are:
+
+- `201` + `provisioningStatus=READY`: Project provisioning completed;
+- `202` + `provisioningStatus=IN_PROGRESS`: provisioning has not completed yet;
+- `202` + `provisioningStatus=RECOVERY_REQUIRED`: provisioning failed at a durable recovery boundary and requires retry/correction.
+
+For `RECOVERY_REQUIRED`, the provisioning response must expose a **safe** `errorCode` and `errorMessage` derived from the durable administrative-operation failure state. These fields must not contain credentials, tokens, raw uploaded content or other secrets.
+
+Web requirements:
+
+- distinguish `READY`, `IN_PROGRESS` and `RECOVERY_REQUIRED`;
+- do not present `RECOVERY_REQUIRED` as “setup in progress”;
+- show the backend `errorCode` and safe `errorMessage` when supplied;
+- do not display correlation IDs in the UI;
+- retain the provisioning `operationId` so the existing retry operation can be invoked while the page remains open;
+- HTTP/problem responses continue to display their backend error code/detail through the common Audit Core error formatter.
