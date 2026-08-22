@@ -51,6 +51,16 @@ class ConflictError(AuditCoreError):
         super().__init__(error_code, 409, title, detail)
 
 
+class DependencyUnavailableError(AuditCoreError):
+    def __init__(self, *, detail: str) -> None:
+        super().__init__(
+            "VAC-SYS-002",
+            503,
+            "Service temporarily unavailable",
+            detail,
+        )
+
+
 def _problem(
     request: Request,
     *,

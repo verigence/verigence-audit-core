@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, Header, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import Engine, text
@@ -23,16 +25,23 @@ from audit_core.dependencies import (
     require_super_admin_request,
 )
 from audit_core.di_client import DiClient, DiClientError
-from audit_core.errors import BusinessValidationError, ConflictError, NotFoundError
+from audit_core.errors import (
+    BusinessValidationError,
+    ConflictError,
+    DependencyUnavailableError,
+    NotFoundError,
+)
 from audit_core.security_integration import (
     SecurityAdminClient,
     SecurityAdminError,
     SecurityTenant,
 )
 
+logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/v1", tags=["project-provisioning"])
 
 _OPERATION_TYPE = "PROJECT_PROVISION"
+_SECURITY_ADMIN_PROVISIONING_TIMEOUT_SECONDS = 20.0
 
 
 class ProjectCreateRequest(BaseModel):
@@ -244,7 +253,7 @@ def _ensure_project_projection(
             raise ConflictError(
                 error_code="VAC-CONFLICT-003",
                 title="Project provisioning conflict",
-                detail="The provisioned Security Tenant is already linked to different Project details.",
+                detail="The provisioned Project context is already linked to different Project details.",
             )
         return {
             "tenantId": str(current["tenant_id"]),
@@ -253,8 +262,43 @@ def _ensure_project_projection(
         }
 
 
+def _public_recovery_error(
+    operation: AdministrativeOperation,
+    *,
+    project_name: str,
+) -> tuple[str, str]:
+    internal_code = operation.last_error_code or ""
+    step = operation.current_step or "SECURITY"
+    display_name = project_name.strip() or "Project"
+    if step == "SECURITY":
+        return (
+            "VAC-SYS-002",
+            f"{display_name} setup could not be completed. Please try again.",
+        )
+    if step == "AUDIT_CORE":
+        return (
+            "VAC-SYS-001",
+            f"{display_name} setup could not be completed. Please try again.",
+        )
+    if step == "DI":
+        if internal_code in {"DI_UNAVAILABLE", "DI_CONFIGURATION_FAILED"}:
+            return (
+                "VAC-DI-001",
+                f"{display_name} setup is temporarily unavailable. Please try again.",
+            )
+        return (
+            "VAC-DI-004",
+            f"{display_name} setup could not be completed. Please try again.",
+        )
+    return (
+        "VAC-SYS-001",
+        f"{display_name} setup could not be completed. Please try again.",
+    )
+
+
 def _response(operation: AdministrativeOperation) -> ProjectProvisioningResponse:
     summary = operation.safe_request_summary or {}
+    project_name = str(summary.get("projectName") or "")
     tenant_id = operation.tenant_id
     if tenant_id is None and operation.security_receipt is not None:
         value = operation.security_receipt.get("tenantId")
@@ -275,15 +319,22 @@ def _response(operation: AdministrativeOperation) -> ProjectProvisioningResponse
     project_status = "CONFIGURING"
     if operation.audit_core_receipt is not None:
         project_status = str(operation.audit_core_receipt.get("projectStatus") or "CONFIGURING")
+    error_code: str | None = None
+    error_message: str | None = None
+    if status == "RECOVERY_REQUIRED":
+        error_code, error_message = _public_recovery_error(
+            operation,
+            project_name=project_name,
+        )
     return ProjectProvisioningResponse(
         operationId=UUID(operation.operation_id),
         tenantId=tenant_id,
-        projectName=str(summary.get("projectName") or ""),
+        projectName=project_name,
         projectStatus=project_status,
         provisioningStatus=status,
         currentStep=step,
-        errorCode=operation.last_error_code if status == "RECOVERY_REQUIRED" else None,
-        errorMessage=operation.last_error_summary if status == "RECOVERY_REQUIRED" else None,
+        errorCode=error_code,
+        errorMessage=error_message,
     )
 
 
@@ -295,6 +346,14 @@ def _mark_recovery(
     code: str,
     summary: str,
 ) -> AdministrativeOperation:
+    logger.warning(
+        "project_provisioning_recovery_required",
+        operation_id=operation.operation_id,
+        tenant_id=operation.tenant_id,
+        step=step,
+        internal_error_code=code,
+        technical_summary=summary[:500],
+    )
     update_administrative_operation(
         engine,
         operation_id=operation.operation_id,
@@ -334,18 +393,26 @@ def _resume(
             current_step="SECURITY",
         )
         try:
-            with SecurityAdminClient(base_url=_security_base_url()) as client:
+            with SecurityAdminClient(
+                base_url=_security_base_url(),
+                timeout_seconds=_SECURITY_ADMIN_PROVISIONING_TIMEOUT_SECONDS,
+            ) as client:
                 tenant = client.create_tenant(
                     human_bearer_token=admin_request.bearer_token,
                     tenant_name=request.projectName.strip(),
                     idempotency_key=current.idempotency_key,
                 )
-        except SecurityAdminError as exc:
+        except (SecurityAdminError, RuntimeError) as exc:
+            internal_code = (
+                "SECURITY_ADMIN_FAILED"
+                if isinstance(exc, SecurityAdminError)
+                else "SECURITY_ADMIN_CONFIGURATION_FAILED"
+            )
             return _mark_recovery(
                 engine,
                 operation=current,
                 step="SECURITY",
-                code="SECURITY_ADMIN_FAILED",
+                code=internal_code,
                 summary=str(exc),
             )
         update_administrative_operation(
@@ -370,51 +437,118 @@ def _resume(
             status=str(receipt["status"]),
         )
 
-    if current.audit_core_receipt is None:
+    audit_receipt = current.audit_core_receipt
+    existing_di_receipt = current.di_receipt
+    di_receipt = (
+        existing_di_receipt
+        if existing_di_receipt is not None
+        and existing_di_receipt.get("provisioningStatus") == "READY"
+        else None
+    )
+    need_audit_core = audit_receipt is None
+    need_di = di_receipt is None
+    audit_error: Exception | None = None
+    di_error: Exception | None = None
+
+    def run_audit_core_projection() -> dict[str, Any]:
+        return _ensure_project_projection(
+            engine,
+            tenant=tenant,
+            request=request,
+            actor_id=admin_request.user_id,
+        )
+
+    def run_di_provisioning() -> dict[str, Any]:
+        with DiClient(base_url=_di_base_url()) as client:
+            return client.ensure_project_provisioning(
+                human_token=admin_request.bearer_token,
+                tenant_id=tenant.tenant_id,
+                idempotency_key=current.idempotency_key,
+            )
+
+    if need_audit_core and need_di:
+        with ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="uc02-project-provision",
+        ) as pool:
+            audit_future = pool.submit(run_audit_core_projection)
+            di_future = pool.submit(run_di_provisioning)
+            try:
+                audit_receipt = audit_future.result()
+            except Exception as exc:  # noqa: BLE001 - durable distributed recovery boundary
+                audit_error = exc
+            try:
+                di_receipt = di_future.result()
+            except Exception as exc:  # noqa: BLE001 - durable distributed recovery boundary
+                di_error = exc
+    elif need_audit_core:
         try:
-            audit_receipt = _ensure_project_projection(
-                engine,
-                tenant=tenant,
-                request=request,
-                actor_id=admin_request.user_id,
-            )
+            audit_receipt = run_audit_core_projection()
         except Exception as exc:  # noqa: BLE001 - durable distributed recovery boundary
-            return _mark_recovery(
-                engine,
-                operation=current,
-                step="AUDIT_CORE",
-                code="AUDIT_CORE_PROJECTION_FAILED",
-                summary=str(exc),
-            )
+            audit_error = exc
+    elif need_di:
+        try:
+            di_receipt = run_di_provisioning()
+        except Exception as exc:  # noqa: BLE001 - durable distributed recovery boundary
+            di_error = exc
+
+    if audit_receipt is not None or di_receipt is not None:
         update_administrative_operation(
             engine,
             operation_id=current.operation_id,
             tenant_id=tenant.tenant_id,
             status="RUNNING",
-            current_step="DI",
+            current_step="AUDIT_CORE" if audit_error is not None else "DI",
             audit_core_receipt=audit_receipt,
+            di_receipt=di_receipt,
+            last_error_code=None,
+            last_error_summary=None,
         )
         current = get_administrative_operation(
             engine, operation_id=current.operation_id, operation_type=_OPERATION_TYPE
         )
         if current is None:
-            raise RuntimeError("Provisioning operation disappeared after Audit Core step")
+            raise RuntimeError("Provisioning operation disappeared after parallel branch update")
 
-    try:
-        with DiClient(base_url=_di_base_url()) as client:
-            di_receipt = client.ensure_project_provisioning(
-                human_token=admin_request.bearer_token,
-                tenant_id=tenant.tenant_id,
-                idempotency_key=current.idempotency_key,
-            )
-    except DiClientError as exc:
+    if audit_error is not None:
+        return _mark_recovery(
+            engine,
+            operation=current,
+            step="AUDIT_CORE",
+            code="AUDIT_CORE_PROJECTION_FAILED",
+            summary=str(audit_error),
+        )
+
+    if di_error is not None:
+        internal_code = (
+            di_error.code if isinstance(di_error, DiClientError) else "DI_CONFIGURATION_FAILED"
+        )
         return _mark_recovery(
             engine,
             operation=current,
             step="DI",
-            code=exc.code,
-            summary=str(exc),
+            code=internal_code,
+            summary=str(di_error),
         )
+
+    if audit_receipt is None:
+        return _mark_recovery(
+            engine,
+            operation=current,
+            step="AUDIT_CORE",
+            code="AUDIT_CORE_PROJECTION_FAILED",
+            summary="Audit Core Project projection did not produce a durable receipt.",
+        )
+
+    if di_receipt is None:
+        return _mark_recovery(
+            engine,
+            operation=current,
+            step="DI",
+            code="DI_CONFIGURATION_FAILED",
+            summary="DI provisioning did not produce a durable receipt.",
+        )
+
     di_ready = di_receipt.get("provisioningStatus") == "READY"
     update_administrative_operation(
         engine,
@@ -422,6 +556,7 @@ def _resume(
         tenant_id=tenant.tenant_id,
         status="COMPLETED" if di_ready else "RECOVERY_REQUIRED",
         current_step="COMPLETE" if di_ready else "DI",
+        audit_core_receipt=audit_receipt,
         di_receipt=di_receipt,
         last_error_code=None if di_ready else "DI_PROVISIONING_INCOMPLETE",
         last_error_summary=None if di_ready else "DI provisioning is not ready yet.",
@@ -431,7 +566,7 @@ def _resume(
         engine, operation_id=current.operation_id, operation_type=_OPERATION_TYPE
     )
     if refreshed is None:
-        raise RuntimeError("Provisioning operation disappeared after DI step")
+        raise RuntimeError("Provisioning operation disappeared after parallel completion update")
     return refreshed
 
 
@@ -440,8 +575,18 @@ def list_projects(
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     engine: Annotated[Engine, Depends(get_engine)],
 ) -> list[ProjectSelectionResponse]:
-    with SecurityAdminClient(base_url=_security_base_url()) as client:
-        tenants = client.list_tenants(human_bearer_token=admin_request.bearer_token)
+    try:
+        with SecurityAdminClient(base_url=_security_base_url()) as client:
+            tenants = client.list_tenants(human_bearer_token=admin_request.bearer_token)
+    except (SecurityAdminError, RuntimeError) as exc:
+        logger.warning(
+            "project_directory_security_failed",
+            reason=str(exc),
+            downstream_http_status=(exc.http_status if isinstance(exc, SecurityAdminError) else None),
+        )
+        raise DependencyUnavailableError(
+            detail="Project administration is temporarily unavailable. Please try again."
+        ) from exc
     projects = [
         project
         for tenant in tenants

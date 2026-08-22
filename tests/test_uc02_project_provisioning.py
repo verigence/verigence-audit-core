@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from threading import Barrier
 from uuid import uuid4
 
 import pytest
@@ -16,7 +17,11 @@ from audit_core.dependencies import (
 )
 from audit_core.di_client import DiClientError
 from audit_core.main import app
-from audit_core.security_integration import SecurityAdminContext, SecurityTenant
+from audit_core.security_integration import (
+    SecurityAdminContext,
+    SecurityAdminError,
+    SecurityTenant,
+)
 
 
 @dataclass
@@ -24,15 +29,19 @@ class ControlledSecurityProvisioning:
     tenant_id: str
     tenant_code: str
     tenant_name: str = "UC02 Provisioned Project"
+    fail_create: bool = False
+    fail_list: bool = False
     create_calls: list[tuple[str, str, str]] = field(default_factory=list)
     list_calls: list[str] = field(default_factory=list)
+    timeout_seconds: list[float] = field(default_factory=list)
 
     def client_class(self):
         controller = self
 
         class Client:
-            def __init__(self, *, base_url: str) -> None:
+            def __init__(self, *, base_url: str, timeout_seconds: float = 5.0) -> None:
                 assert base_url == "https://security.test"
+                controller.timeout_seconds.append(timeout_seconds)
 
             def __enter__(self):
                 return self
@@ -50,6 +59,11 @@ class ControlledSecurityProvisioning:
                 controller.create_calls.append(
                     (human_bearer_token, tenant_name, idempotency_key)
                 )
+                if controller.fail_create:
+                    raise SecurityAdminError(
+                        "Security administrative endpoint is unavailable",
+                        http_status=503,
+                    )
                 controller.tenant_name = tenant_name
                 return SecurityTenant(
                     tenant_id=controller.tenant_id,
@@ -60,6 +74,11 @@ class ControlledSecurityProvisioning:
 
             def list_tenants(self, *, human_bearer_token: str) -> tuple[SecurityTenant, ...]:
                 controller.list_calls.append(human_bearer_token)
+                if controller.fail_list:
+                    raise SecurityAdminError(
+                        "Security administrative request failed with HTTP 503",
+                        http_status=503,
+                    )
                 return (
                     SecurityTenant(
                         tenant_id=controller.tenant_id,
@@ -76,6 +95,7 @@ class ControlledSecurityProvisioning:
 class ControlledDiProvisioning:
     fail: bool = False
     calls: list[tuple[str, str, str]] = field(default_factory=list)
+    barrier: Barrier | None = None
 
     def client_class(self):
         controller = self
@@ -98,6 +118,8 @@ class ControlledDiProvisioning:
                 idempotency_key: str,
             ) -> dict:
                 controller.calls.append((human_token, tenant_id, idempotency_key))
+                if controller.barrier is not None:
+                    controller.barrier.wait(timeout=3)
                 if controller.fail:
                     raise DiClientError(
                         status_code=503,
@@ -208,6 +230,7 @@ def test_create_project_runs_security_audit_core_di_once_and_replays_same_operat
     assert body["errorCode"] is None
     assert body["errorMessage"] is None
     operation_id = body["operationId"]
+    assert setup["security"].timeout_seconds == [20.0]
 
     second = client.post(
         "/v1/projects",
@@ -276,6 +299,148 @@ def test_create_project_runs_security_audit_core_di_once_and_replays_same_operat
     assert operation["di_receipt"]["provisioningStatus"] == "READY"
 
 
+def test_post_security_audit_core_and_di_branches_run_concurrently(
+    provisioning_setup,
+    monkeypatch,
+) -> None:
+    setup = provisioning_setup
+    barrier = Barrier(2)
+    setup["di"].barrier = barrier
+    original_projection = project_provisioning._ensure_project_projection
+
+    def synchronized_projection(*args, **kwargs):
+        barrier.wait(timeout=3)
+        return original_projection(*args, **kwargs)
+
+    monkeypatch.setattr(
+        project_provisioning,
+        "_ensure_project_projection",
+        synchronized_projection,
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post(
+        "/v1/projects",
+        headers={"Idempotency-Key": "project-create-parallel-0001"},
+        json=_payload(setup),
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["provisioningStatus"] == "READY"
+    assert len(setup["security"].create_calls) == 1
+    assert len(setup["di"].calls) == 1
+
+
+def test_retry_after_audit_core_failure_keeps_successful_di_receipt(
+    provisioning_setup,
+    monkeypatch,
+) -> None:
+    setup = provisioning_setup
+    original_projection = project_provisioning._ensure_project_projection
+    attempts = {"count": 0}
+
+    def flaky_projection(*args, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("controlled Audit Core projection failure")
+        return original_projection(*args, **kwargs)
+
+    monkeypatch.setattr(project_provisioning, "_ensure_project_projection", flaky_projection)
+    client = TestClient(app, raise_server_exceptions=False)
+    first = client.post(
+        "/v1/projects",
+        headers={"Idempotency-Key": "project-create-audit-recovery-0001"},
+        json=_payload(setup),
+    )
+
+    assert first.status_code == 202, first.text
+    body = first.json()
+    assert body["provisioningStatus"] == "RECOVERY_REQUIRED"
+    assert body["currentStep"] == "AUDIT_CORE"
+    assert len(setup["security"].create_calls) == 1
+    assert len(setup["di"].calls) == 1
+
+    with setup["engine"].begin() as connection:
+        receipts = connection.execute(
+            text(
+                """
+                SELECT audit_core_receipt, di_receipt
+                FROM auditcore.administrative_operations
+                WHERE operation_id=:operation_id
+                """
+            ),
+            {"operation_id": body["operationId"]},
+        ).mappings().one()
+    assert receipts["audit_core_receipt"] is None
+    assert receipts["di_receipt"]["provisioningStatus"] == "READY"
+
+    recovered = client.post(
+        f"/v1/project-provisioning-operations/{body['operationId']}/retry"
+    )
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["provisioningStatus"] == "READY"
+    assert attempts["count"] == 2
+    assert len(setup["security"].create_calls) == 1
+    assert len(setup["di"].calls) == 1
+
+
+def test_security_failure_returns_business_error_but_keeps_technical_diagnostic(
+    provisioning_setup,
+) -> None:
+    setup = provisioning_setup
+    setup["security"].fail_create = True
+    client = TestClient(app, raise_server_exceptions=False)
+
+    failed = client.post(
+        "/v1/projects",
+        headers={"Idempotency-Key": "project-create-security-failure-0001"},
+        json=_payload(setup),
+    )
+    assert failed.status_code == 202, failed.text
+    body = failed.json()
+    assert body["provisioningStatus"] == "RECOVERY_REQUIRED"
+    assert body["currentStep"] == "SECURITY"
+    assert body["errorCode"] == "VAC-SYS-002"
+    assert body["errorMessage"] == (
+        "UC02 Provisioned Project setup could not be completed. Please try again."
+    )
+    assert "security" not in body["errorMessage"].lower()
+    assert "endpoint" not in body["errorMessage"].lower()
+    assert "503" not in body["errorMessage"]
+
+    with setup["engine"].begin() as connection:
+        operation = connection.execute(
+            text(
+                """
+                SELECT last_error_code, last_error_summary
+                FROM auditcore.administrative_operations
+                WHERE operation_id=:operation_id
+                """
+            ),
+            {"operation_id": body["operationId"]},
+        ).mappings().one()
+
+    assert operation["last_error_code"] == "SECURITY_ADMIN_FAILED"
+    assert operation["last_error_summary"] == "Security administrative endpoint is unavailable"
+
+
+def test_project_directory_security_failure_returns_business_safe_problem(
+    provisioning_setup,
+) -> None:
+    setup = provisioning_setup
+    setup["security"].fail_list = True
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.get("/v1/projects")
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["errorCode"] == "VAC-SYS-002"
+    assert body["detail"] == (
+        "Project administration is temporarily unavailable. Please try again."
+    )
+    assert "HTTP" not in body["detail"]
+    assert "Security" not in body["detail"]
+
+
 def test_retry_after_di_failure_resumes_without_second_security_tenant(
     provisioning_setup,
 ) -> None:
@@ -292,14 +457,31 @@ def test_retry_after_di_failure_resumes_without_second_security_tenant(
     body = failed.json()
     assert body["provisioningStatus"] == "RECOVERY_REQUIRED"
     assert body["currentStep"] == "DI"
-    assert body["errorCode"] == "DI_UNAVAILABLE"
-    assert body["errorMessage"]
+    assert body["errorCode"] == "VAC-DI-001"
+    assert body["errorMessage"] == (
+        "UC02 Provisioned Project setup is temporarily unavailable. Please try again."
+    )
+    assert "di" not in body["errorMessage"].lower()
+    assert "processing" not in body["errorMessage"].lower()
     operation_id = body["operationId"]
     assert len(setup["security"].create_calls) == 1
 
+    with setup["engine"].begin() as connection:
+        technical = connection.execute(
+            text(
+                """
+                SELECT last_error_code
+                FROM auditcore.administrative_operations
+                WHERE operation_id=:operation_id
+                """
+            ),
+            {"operation_id": operation_id},
+        ).scalar_one()
+    assert technical == "DI_UNAVAILABLE"
+
     status = client.get(f"/v1/project-provisioning-operations/{operation_id}")
     assert status.status_code == 200
-    assert status.json()["errorCode"] == "DI_UNAVAILABLE"
+    assert status.json()["errorCode"] == "VAC-DI-001"
 
     setup["di"].fail = False
     recovered = client.post(
