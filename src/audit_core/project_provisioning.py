@@ -45,6 +45,14 @@ class ProjectCreateRequest(BaseModel):
     regionCode: str | None = Field(default=None, max_length=100)
 
 
+class ProjectSelectionResponse(BaseModel):
+    tenantId: str
+    projectCode: str
+    projectName: str
+    projectStatus: str
+    securityTenantStatus: str
+
+
 class ProjectProvisioningResponse(BaseModel):
     operationId: UUID
     tenantId: str | None
@@ -52,6 +60,8 @@ class ProjectProvisioningResponse(BaseModel):
     projectStatus: str
     provisioningStatus: Literal["READY", "IN_PROGRESS", "RECOVERY_REQUIRED"]
     currentStep: Literal["SECURITY", "AUDIT_CORE", "DI", "COMPLETE"]
+    errorCode: str | None = None
+    errorMessage: str | None = None
 
 
 def _security_base_url() -> str:
@@ -122,6 +132,35 @@ def _security_receipt(tenant: SecurityTenant) -> dict[str, Any]:
         "tenantName": tenant.tenant_name,
         "status": tenant.status,
     }
+
+
+def _project_selection(
+    engine: Engine,
+    *,
+    tenant: SecurityTenant,
+) -> ProjectSelectionResponse | None:
+    with engine.begin() as connection:
+        connection.execute(text("SET LOCAL ROLE audit_core_runtime"))
+        set_tenant_context(connection, tenant.tenant_id)
+        row = connection.execute(
+            text(
+                """
+                SELECT tenant_id, project_code, project_name, project_status
+                FROM auditcore.projects
+                WHERE tenant_id=:tenant_id
+                """
+            ),
+            {"tenant_id": tenant.tenant_id},
+        ).mappings().one_or_none()
+    if row is None:
+        return None
+    return ProjectSelectionResponse(
+        tenantId=str(row["tenant_id"]),
+        projectCode=str(row["project_code"]),
+        projectName=str(row["project_name"]),
+        projectStatus=str(row["project_status"]),
+        securityTenantStatus=tenant.status,
+    )
 
 
 def _ensure_project_projection(
@@ -228,6 +267,8 @@ def _response(operation: AdministrativeOperation) -> ProjectProvisioningResponse
         projectStatus=project_status,
         provisioningStatus=status,
         currentStep=step,
+        errorCode=operation.last_error_code if status == "RECOVERY_REQUIRED" else None,
+        errorMessage=operation.last_error_summary if status == "RECOVERY_REQUIRED" else None,
     )
 
 
@@ -377,6 +418,21 @@ def _resume(
     if refreshed is None:
         raise RuntimeError("Provisioning operation disappeared after DI step")
     return refreshed
+
+
+@router.get("/projects", response_model=list[ProjectSelectionResponse])
+def list_projects(
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    engine: Annotated[Engine, Depends(get_engine)],
+) -> list[ProjectSelectionResponse]:
+    with SecurityAdminClient(base_url=_security_base_url()) as client:
+        tenants = client.list_tenants(human_bearer_token=admin_request.bearer_token)
+    projects = [
+        project
+        for tenant in tenants
+        if (project := _project_selection(engine, tenant=tenant)) is not None
+    ]
+    return sorted(projects, key=lambda item: (item.projectName.casefold(), item.projectCode))
 
 
 @router.post("/projects", response_model=ProjectProvisioningResponse)
