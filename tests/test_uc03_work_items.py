@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -132,7 +132,7 @@ def uc03_work_items_setup():
             },
         )
 
-        base_activity = datetime(2026, 8, 23, 4, 0, tzinfo=timezone.utc)
+        base_activity = datetime(2026, 8, 23, 4, 0, tzinfo=UTC)
         for index in range(12):
             customer_id = connection.execute(
                 text(
@@ -203,12 +203,12 @@ def uc03_work_items_setup():
                 {
                     "tenant_id": tenant_id,
                     "journey_id": journey_id,
-                    "started_at": datetime(2026, 8, 20, 6, 0, tzinfo=timezone.utc),
+                    "started_at": datetime(2026, 8, 20, 6, 0, tzinfo=UTC),
                     "activity": activity,
                 },
             )
             if index < 2:
-                delivered_at = datetime(2026, 8, 22, 19, index, tzinfo=timezone.utc)
+                delivered_at = datetime(2026, 8, 22, 19, index, tzinfo=UTC)
                 connection.execute(
                     text(
                         """
