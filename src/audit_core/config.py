@@ -2,7 +2,6 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-
 DEV_WEB_ORIGIN = "https://verigence-web-dev.jbrconsulting-it.workers.dev"
 _DEV_ENVIRONMENTS = {"dev", "development"}
 
