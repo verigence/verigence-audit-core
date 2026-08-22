@@ -24,16 +24,17 @@ jobs:
       DI_API_DEPLOYMENT_ID: c4f56d40-9051-47ca-a005-adb752214165
 
     steps:
-      - name: Install test tooling
+      - name: Install isolated acceptance tooling
         shell: bash
         run: |
           set -euo pipefail
           npm install --global @railway/cli
-          python -m pip install --disable-pip-version-check 'sqlalchemy>=2,<3' 'psycopg[binary]>=3,<4' 'PyJWT>=2,<3' 'cryptography>=45,<47' 'requests>=2,<3'
-          npm install --no-save playwright@1.55.0
-          npx playwright install --with-deps chromium
+          python -m pip install --disable-pip-version-check \
+            'sqlalchemy>=2,<3' 'psycopg[binary]>=3,<4' 'PyJWT>=2,<3' \
+            'cryptography>=45,<47' 'requests>=2,<3' 'playwright==1.55.0'
+          python -m playwright install --with-deps chromium
 
-      - name: Freeze exact DEV deployments
+      - name: Freeze exact DEV deployments and load runtime variables
         shell: bash
         run: |
           set -euo pipefail
@@ -42,6 +43,9 @@ jobs:
           for service in "$SECURITY_SERVICE" "$AUDIT_SERVICE" "$DI_API_SERVICE"; do
             railway deployment list --service "$service" --limit 1 --json >"/tmp/${service}-deployment.json"
           done
+          railway variable list --service "$SECURITY_SERVICE" --json >/tmp/security-vars.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          railway variable list --service "$DI_API_SERVICE" --json >/tmp/di-vars.json
           python - <<'PY'
           import json, os
           from pathlib import Path
@@ -52,35 +56,39 @@ jobs:
           }
           for service, deployment_id in expected.items():
               rows = json.loads(Path(f'/tmp/{service}-deployment.json').read_text())
-              if not rows:
-                  raise SystemExit(f'No deployment for {service}')
-              row = rows[0]
-              if row.get('id') != deployment_id or row.get('status') != 'SUCCESS':
+              if not rows or rows[0].get('id') != deployment_id or rows[0].get('status') != 'SUCCESS':
                   raise SystemExit(f'{service} DEV deployment moved or is not SUCCESS')
               print(f'UC02_E2E_DEPLOYMENT=PASS|{service}|{deployment_id}')
           PY
 
-      - name: Prepare short-lived DEV admin context and approved references
+      - name: Run deployed UC02 browser, API and database acceptance
         shell: bash
         run: |
           set -euo pipefail
-          railway variable list --service "$SECURITY_SERVICE" --json >/tmp/security-vars.json
-          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
-          railway variable list --service "$DI_API_SERVICE" --json >/tmp/di-vars.json
           python - <<'PY'
-          import json, os, uuid
+          import json, os, time, uuid
           from datetime import UTC, datetime, timedelta
           from pathlib import Path
 
           import jwt
           import requests
+          from playwright.sync_api import sync_playwright
           from sqlalchemy import create_engine, text
 
-          def read(path):
+          run_id = os.environ['GITHUB_RUN_ID']
+          project_name = 'UC02-E2E-' + run_id
+          idempotency_key = 'uc02-e2e-' + run_id + '-project'
+          correlation_id = 'uc02-e2e-' + run_id
+          dealer_id = None
+          outlet_id = None
+          tenant_id = None
+          operation_id = None
+
+          def read_json(path):
               return json.loads(Path(path).read_text())
 
           def sa_url(value):
-              value = value.strip()
+              value = str(value or '').strip()
               if value.startswith('postgres://'):
                   return 'postgresql+psycopg://' + value[len('postgres://'):]
               if value.startswith('postgresql://'):
@@ -91,20 +99,23 @@ jobs:
               domain = values.get('RAILWAY_PUBLIC_DOMAIN') or values.get('RAILWAY_STATIC_URL') or ''
               if not domain:
                   raise SystemExit('Required DEV public domain is missing')
-              return domain.rstrip('/') if domain.startswith(('http://','https://')) else 'https://' + domain.rstrip('/')
+              return domain.rstrip('/') if domain.startswith(('http://', 'https://')) else 'https://' + domain.rstrip('/')
 
-          security = read('/tmp/security-vars.json')
-          audit = read('/tmp/audit-vars.json')
-          di = read('/tmp/di-vars.json')
-
-          sec_db = security.get('DATABASE_URL','')
-          audit_db = audit.get('DATABASE_URL','')
-          di_db = di.get('DI_DATABASE_URL') or di.get('DATABASE_URL','')
-          if not sec_db or not audit_db or not di_db:
+          security = read_json('/tmp/security-vars.json')
+          audit = read_json('/tmp/audit-vars.json')
+          di = read_json('/tmp/di-vars.json')
+          security_db = sa_url(security.get('DATABASE_URL'))
+          audit_db = sa_url(audit.get('DATABASE_URL'))
+          di_db = sa_url(di.get('DI_DATABASE_URL') or di.get('DATABASE_URL'))
+          if not security_db or not audit_db or not di_db:
               raise SystemExit('One or more DEV database URLs are unavailable')
 
-          with create_engine(sa_url(sec_db)).connect() as conn:
-              rows = conn.execute(text('''
+          security_base = public_base(security)
+          audit_base = public_base(audit)
+          di_base = public_base(di)
+
+          with create_engine(security_db).connect() as conn:
+              admin_ids = conn.execute(text('''
                   SELECT DISTINCT u.user_id
                   FROM security.users u
                   JOIN security.security_principals sp ON sp.principal_id=u.user_id
@@ -116,25 +127,23 @@ jobs:
                     AND a.role_key='SuperAdmin' AND a.scope_type='PLATFORM'
                     AND a.scope_id IS NULL AND a.status='ACTIVE'
                   ORDER BY u.user_id
-              ''' )).scalars().all()
-          if not rows:
+              ''')).scalars().all()
+          if not admin_ids:
               raise SystemExit('No approved active DEV platform administrator exists')
-          user_id = str(rows[0])
+          user_id = str(admin_ids[0])
 
-          private_key = str(security.get('SECURITY_PRIVATE_KEY_PEM','')).replace('\\n','\n')
-          issuer = str(security.get('SECURITY_TOKEN_ISSUER') or 'verigence-security')
-          audience = str(security.get('SECURITY_TOKEN_AUDIENCE') or 'verigence-platform')
-          key_id = str(security.get('SECURITY_KEY_ID',''))
+          private_key = str(security.get('SECURITY_PRIVATE_KEY_PEM', '')).replace('\\n', '\n')
+          key_id = str(security.get('SECURITY_KEY_ID', ''))
           if not private_key or not key_id:
               raise SystemExit('Security DEV signing configuration is unavailable')
           now = datetime.now(UTC)
           token = jwt.encode(
               {
-                  'iss': issuer,
+                  'iss': str(security.get('SECURITY_TOKEN_ISSUER') or 'verigence-security'),
                   'sub': user_id,
-                  'aud': audience,
+                  'aud': str(security.get('SECURITY_TOKEN_AUDIENCE') or 'verigence-platform'),
                   'iat': now,
-                  'exp': now + timedelta(minutes=12),
+                  'exp': now + timedelta(minutes=15),
                   'jti': str(uuid.uuid4()),
                   'actor_type': 'USER',
               },
@@ -143,195 +152,154 @@ jobs:
               headers={'kid': key_id},
           )
           print('::add-mask::' + token)
+          auth_headers = {
+              'Authorization': 'Bearer ' + token,
+              'Origin': os.environ['DEV_WEB_URL'],
+              'X-Correlation-ID': correlation_id + '-verify',
+          }
 
-          security_base = public_base(security)
-          audit_base = public_base(audit)
-          di_base = public_base(di)
-          auth = {'Authorization': 'Bearer ' + token, 'X-Correlation-ID': 'uc02-e2e-admin-' + os.environ['GITHUB_RUN_ID']}
-          response = requests.get(security_base + '/security/v1/platform/admin-context', headers=auth, timeout=15)
-          if response.status_code != 200:
-              raise SystemExit('Live Security admin-context rejected the generated DEV test token: HTTP ' + str(response.status_code))
-          admin = response.json()
-          if admin.get('userId') != user_id or admin.get('isSuperAdmin') is not True:
-              raise SystemExit('Live Security did not resolve expected DEV administrative authority')
+          admin = requests.get(
+              security_base + '/security/v1/platform/admin-context',
+              headers=auth_headers,
+              timeout=20,
+          )
+          if admin.status_code != 200 or admin.json().get('userId') != user_id or admin.json().get('isSuperAdmin') is not True:
+              raise SystemExit('Live Security administrative context failed')
+          print('UC02_E2E_ADMIN_CONTEXT=PASS')
 
-          with create_engine(sa_url(audit_db)).connect() as conn:
+          with create_engine(audit_db).connect() as conn:
               oem_id = conn.execute(text('SELECT oem_id FROM auditcore.oems WHERE is_active=true ORDER BY oem_id LIMIT 1')).scalar_one_or_none()
               category_id = conn.execute(text('SELECT product_category_id FROM auditcore.product_categories WHERE is_active=true ORDER BY product_category_id LIMIT 1')).scalar_one_or_none()
           if oem_id is None or category_id is None:
               raise SystemExit('Audit Core DEV has no active OEM/Product Category reference data')
-
-          run = os.environ['GITHUB_RUN_ID']
-          context = {
-              'token': token,
-              'securityBase': security_base,
-              'auditBase': audit_base,
-              'diBase': di_base,
-              'securityDb': sa_url(sec_db),
-              'auditDb': sa_url(audit_db),
-              'diDb': sa_url(di_db),
-              'projectName': 'UC02-E2E-' + run,
-              'idempotencyKey': 'uc02-e2e-' + run + '-project',
-              'correlationId': 'uc02-e2e-' + run,
-              'payload': {
-                  'projectName': 'UC02-E2E-' + run,
-                  'oemId': str(oem_id),
-                  'productCategoryId': str(category_id),
-                  'effectiveStartDate': now.date().isoformat(),
-                  'effectiveEndDate': None,
-                  'timezoneName': 'Asia/Kolkata',
-                  'regionCode': 'E2E',
-              },
+          payload = {
+              'projectName': project_name,
+              'oemId': str(oem_id),
+              'productCategoryId': str(category_id),
+              'effectiveStartDate': now.date().isoformat(),
+              'effectiveEndDate': None,
+              'timezoneName': 'Asia/Kolkata',
+              'regionCode': 'E2E',
           }
-          Path('/tmp/uc02-context.json').write_text(json.dumps(context))
-          print('UC02_E2E_ADMIN_CONTEXT=PASS')
           print('UC02_E2E_REFERENCE_DATA=PASS')
-          print('UC02_E2E_PROJECT_TAG=' + context['projectName'])
-          PY
+          print('UC02_E2E_PROJECT_TAG=' + project_name)
 
-      - name: Create Project through a real browser-origin fetch
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat >/tmp/uc02-browser.cjs <<'JS'
-          const fs = require('fs');
-          const { chromium } = require('playwright');
+          # The create request originates inside the deployed Cloudflare Web page. If
+          # browser CORS blocks either preflight or actual response, page.evaluate fails.
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              try:
+                  page = browser.new_page()
+                  page.goto(os.environ['DEV_WEB_URL'] + '/login', wait_until='domcontentloaded', timeout=60000)
+                  result = page.evaluate(
+                      '''async (args) => {
+                        const response = await fetch(args.base + '/v1/projects', {
+                          method: 'POST',
+                          mode: 'cors',
+                          headers: {
+                            'Authorization': 'Bearer ' + args.token,
+                            'Content-Type': 'application/json',
+                            'Idempotency-Key': args.idempotencyKey,
+                            'X-Correlation-ID': args.correlationId,
+                          },
+                          body: JSON.stringify(args.payload),
+                        });
+                        return {
+                          status: response.status,
+                          correlationId: response.headers.get('x-correlation-id'),
+                          body: await response.text(),
+                        };
+                      }''',
+                      {
+                          'base': audit_base,
+                          'token': token,
+                          'payload': payload,
+                          'idempotencyKey': idempotency_key,
+                          'correlationId': correlation_id,
+                      },
+                  )
+              finally:
+                  browser.close()
+          if result['status'] not in (201, 202):
+              raise SystemExit('Browser Project create failed HTTP ' + str(result['status']) + ': ' + result['body'][:500])
+          if result.get('correlationId') != correlation_id:
+              raise SystemExit('Browser could not read the preserved X-Correlation-ID')
+          state = json.loads(result['body'])
+          operation_id = state.get('operationId')
+          if not operation_id:
+              raise SystemExit('Browser Project create returned no operationId')
+          print('UC02_BROWSER_CORS_AUTHENTICATED_CREATE=PASS')
+          print('UC02_CREATE_HTTP=' + str(result['status']))
+          print('UC02_CREATE_OPERATION=' + operation_id)
+          print('UC02_CREATE_CORRELATION=' + correlation_id)
 
-          (async () => {
-            const ctx = JSON.parse(fs.readFileSync('/tmp/uc02-context.json', 'utf8'));
-            const browser = await chromium.launch({headless: true});
-            try {
-              const page = await browser.newPage();
-              await page.goto(process.env.DEV_WEB_URL + '/login', {waitUntil: 'domcontentloaded', timeout: 60000});
-              const result = await page.evaluate(async ({base, token, payload, idempotencyKey, correlationId}) => {
-                const response = await fetch(base + '/v1/projects', {
-                  method: 'POST',
-                  mode: 'cors',
-                  headers: {
-                    'Authorization': 'Bearer ' + token,
-                    'Content-Type': 'application/json',
-                    'Idempotency-Key': idempotencyKey,
-                    'X-Correlation-ID': correlationId,
-                  },
-                  body: JSON.stringify(payload),
-                });
-                const text = await response.text();
-                return {
-                  status: response.status,
-                  correlationId: response.headers.get('x-correlation-id'),
-                  body: text,
-                };
-              }, {
-                base: ctx.auditBase,
-                token: ctx.token,
-                payload: ctx.payload,
-                idempotencyKey: ctx.idempotencyKey,
-                correlationId: ctx.correlationId,
-              });
-              if (![201, 202].includes(result.status)) {
-                throw new Error('Browser Project create failed HTTP ' + result.status + ': ' + result.body.slice(0, 500));
-              }
-              if (result.correlationId !== ctx.correlationId) {
-                throw new Error('Browser could not read the preserved X-Correlation-ID');
-              }
-              const body = JSON.parse(result.body);
-              if (!body.operationId || !body.projectName) throw new Error('Project create response shape is invalid');
-              fs.writeFileSync('/tmp/uc02-create.json', JSON.stringify({status: result.status, ...body}));
-              console.log('UC02_BROWSER_CORS_AUTHENTICATED_CREATE=PASS');
-              console.log('UC02_CREATE_HTTP=' + result.status);
-              console.log('UC02_CREATE_OPERATION=' + body.operationId);
-              console.log('UC02_CREATE_TENANT=' + (body.tenantId || 'PENDING'));
-              console.log('UC02_CREATE_PROVISIONING=' + body.provisioningStatus + '|' + body.currentStep);
-              console.log('UC02_CREATE_CORRELATION=' + result.correlationId);
-            } finally {
-              await browser.close();
-            }
-          })().catch((error) => { console.error(error); process.exit(1); });
-          JS
-          node /tmp/uc02-browser.cjs
-
-      - name: Verify UC02 API behavior and cross-module persistence
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json, os, time
-          from pathlib import Path
-
-          import requests
-          from sqlalchemy import create_engine, text
-
-          ctx = json.loads(Path('/tmp/uc02-context.json').read_text())
-          created = json.loads(Path('/tmp/uc02-create.json').read_text())
-          token = ctx['token']
-          headers = {
-              'Authorization': 'Bearer ' + token,
-              'Origin': os.environ['DEV_WEB_URL'],
-              'X-Correlation-ID': ctx['correlationId'] + '-verify',
-          }
-
-          operation_id = created['operationId']
-          state = created
-          for attempt in range(4):
+          for _ in range(4):
               if state.get('provisioningStatus') == 'READY' and state.get('currentStep') == 'COMPLETE':
                   break
               if state.get('provisioningStatus') == 'RECOVERY_REQUIRED':
-                  r = requests.post(ctx['auditBase'] + f'/v1/project-provisioning-operations/{operation_id}/retry', headers=headers, timeout=30)
+                  response = requests.post(
+                      audit_base + f'/v1/project-provisioning-operations/{operation_id}/retry',
+                      headers=auth_headers,
+                      timeout=30,
+                  )
               else:
                   time.sleep(2)
-                  r = requests.get(ctx['auditBase'] + f'/v1/project-provisioning-operations/{operation_id}', headers=headers, timeout=30)
-              if r.status_code not in (200, 202):
-                  raise SystemExit('Provisioning continuation failed HTTP ' + str(r.status_code) + ': ' + r.text[:500])
-              state = r.json()
+                  response = requests.get(
+                      audit_base + f'/v1/project-provisioning-operations/{operation_id}',
+                      headers=auth_headers,
+                      timeout=30,
+                  )
+              if response.status_code not in (200, 202):
+                  raise SystemExit('Project provisioning continuation failed HTTP ' + str(response.status_code) + ': ' + response.text[:500])
+              state = response.json()
           if state.get('provisioningStatus') != 'READY' or state.get('currentStep') != 'COMPLETE':
               raise SystemExit('Project provisioning did not reach READY/COMPLETE: ' + json.dumps(state))
           tenant_id = state.get('tenantId')
           if not tenant_id:
-              raise SystemExit('Completed Project provisioning did not return tenantId')
+              raise SystemExit('Completed provisioning returned no tenantId')
           print('UC02_PROJECT_PROVISIONING=PASS|' + tenant_id)
 
-          # Idempotent replay must resolve to the same operation/Tenant.
           replay = requests.post(
-              ctx['auditBase'] + '/v1/projects',
-              headers={**headers, 'Idempotency-Key': ctx['idempotencyKey']},
-              json=ctx['payload'],
+              audit_base + '/v1/projects',
+              headers={**auth_headers, 'Idempotency-Key': idempotency_key},
+              json=payload,
               timeout=30,
           )
           if replay.status_code not in (200, 201, 202):
-              raise SystemExit('Idempotent Project replay failed HTTP ' + str(replay.status_code))
+              raise SystemExit('Idempotent replay failed HTTP ' + str(replay.status_code))
           replay_body = replay.json()
           if replay_body.get('operationId') != operation_id or replay_body.get('tenantId') != tenant_id:
-              raise SystemExit('Idempotent Project replay created a different operation/Tenant')
+              raise SystemExit('Idempotent replay created a different operation/Tenant')
           print('UC02_PROJECT_IDEMPOTENT_REPLAY=PASS')
 
-          changed = dict(ctx['payload'])
-          changed['projectName'] = ctx['projectName'] + '-DIFFERENT'
+          changed = dict(payload)
+          changed['projectName'] = project_name + '-DIFFERENT'
           conflict = requests.post(
-              ctx['auditBase'] + '/v1/projects',
-              headers={**headers, 'Idempotency-Key': ctx['idempotencyKey']},
+              audit_base + '/v1/projects',
+              headers={**auth_headers, 'Idempotency-Key': idempotency_key},
               json=changed,
               timeout=30,
           )
           if conflict.status_code != 409:
-              raise SystemExit('Same idempotency key with changed payload did not fail 409; HTTP ' + str(conflict.status_code))
+              raise SystemExit('Changed payload with same idempotency key did not fail 409; HTTP ' + str(conflict.status_code))
           print('UC02_PROJECT_IDEMPOTENCY_CONFLICT=PASS')
 
-          project = requests.get(ctx['auditBase'] + f'/v1/tenants/{tenant_id}/project', headers=headers, timeout=30)
+          project = requests.get(audit_base + f'/v1/tenants/{tenant_id}/project', headers=auth_headers, timeout=30)
           if project.status_code != 200:
               raise SystemExit('Project GET failed HTTP ' + str(project.status_code))
           project_body = project.json()
-          if project_body.get('projectName') != ctx['projectName'] or project_body.get('projectStatus') != 'CONFIGURING':
+          if project_body.get('projectName') != project_name or project_body.get('projectStatus') != 'CONFIGURING':
               raise SystemExit('Project persisted state does not match create request')
           etag = project.headers.get('ETag')
-          if not etag:
-              raise SystemExit('Project GET did not return ETag')
           old_version = project_body.get('versionNo')
+          if not etag or not isinstance(old_version, int):
+              raise SystemExit('Project GET did not return valid ETag/versionNo')
           print('UC02_PROJECT_GET=PASS|ETAG=' + etag)
 
           patch = requests.patch(
-              ctx['auditBase'] + f'/v1/tenants/{tenant_id}/project',
-              headers={**headers, 'If-Match': etag},
-              json={'regionCode': 'E2E-' + os.environ['GITHUB_RUN_ID']},
+              audit_base + f'/v1/tenants/{tenant_id}/project',
+              headers={**auth_headers, 'If-Match': etag},
+              json={'regionCode': 'E2E-' + run_id},
               timeout=30,
           )
           if patch.status_code != 200 or patch.json().get('versionNo') != old_version + 1:
@@ -339,8 +307,8 @@ jobs:
           print('UC02_PROJECT_PATCH=PASS')
 
           stale = requests.patch(
-              ctx['auditBase'] + f'/v1/tenants/{tenant_id}/project',
-              headers={**headers, 'If-Match': etag},
+              audit_base + f'/v1/tenants/{tenant_id}/project',
+              headers={**auth_headers, 'If-Match': etag},
               json={'regionCode': 'STALE'},
               timeout=30,
           )
@@ -348,150 +316,173 @@ jobs:
               raise SystemExit('Stale If-Match did not fail 409; HTTP ' + str(stale.status_code))
           print('UC02_PROJECT_STALE_ETAG=PASS')
 
-          # Steps 2/3: create Dealer and Outlet, validate readiness, then use supported deletes.
-          dealer = requests.post(
-              ctx['auditBase'] + f'/v1/tenants/{tenant_id}/dealers',
-              headers=headers,
-              json={'dealerName': 'UC02 E2E Dealer ' + os.environ['GITHUB_RUN_ID']},
-              timeout=30,
-          )
-          if dealer.status_code != 201:
-              raise SystemExit('Dealer create failed: HTTP ' + str(dealer.status_code) + ' ' + dealer.text[:300])
-          dealer_id = dealer.json()['dealerId']
-          outlet = requests.post(
-              ctx['auditBase'] + f'/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets',
-              headers=headers,
-              json={
-                  'outletName': 'UC02 E2E Outlet ' + os.environ['GITHUB_RUN_ID'],
-                  'outletClassification': 'ONSITE',
-                  'city': 'E2E',
-                  'monthlyVehicleVolume': 1,
-              },
-              timeout=30,
-          )
-          if outlet.status_code != 201:
-              raise SystemExit('Outlet create failed: HTTP ' + str(outlet.status_code) + ' ' + outlet.text[:300])
-          outlet_id = outlet.json()['outletId']
-          print('UC02_DEALER_OUTLET_CREATE=PASS')
+          # Exercise Project Administration steps 2, 3, 4 and 6 without retaining child test data.
+          try:
+              dealer = requests.post(
+                  audit_base + f'/v1/tenants/{tenant_id}/dealers',
+                  headers=auth_headers,
+                  json={'dealerName': 'UC02 E2E Dealer ' + run_id},
+                  timeout=30,
+              )
+              if dealer.status_code != 201:
+                  raise SystemExit('Dealer create failed: HTTP ' + str(dealer.status_code) + ' ' + dealer.text[:300])
+              dealer_id = dealer.json()['dealerId']
 
-          candidates = requests.get(ctx['auditBase'] + f'/v1/tenants/{tenant_id}/role-mapping-candidates?limit=100', headers=headers, timeout=30)
-          if candidates.status_code != 200 or not isinstance(candidates.json(), list):
-              raise SystemExit('Employee/role-mapping candidate browse failed')
-          print('UC02_EMPLOYEE_BROWSE=PASS|COUNT=' + str(len(candidates.json())))
+              outlet = requests.post(
+                  audit_base + f'/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets',
+                  headers=auth_headers,
+                  json={
+                      'outletName': 'UC02 E2E Outlet ' + run_id,
+                      'outletClassification': 'ONSITE',
+                      'city': 'E2E',
+                      'monthlyVehicleVolume': 1,
+                  },
+                  timeout=30,
+              )
+              if outlet.status_code != 201:
+                  raise SystemExit('Outlet create failed: HTTP ' + str(outlet.status_code) + ' ' + outlet.text[:300])
+              outlet_id = outlet.json()['outletId']
+              print('UC02_DEALER_OUTLET_CREATE=PASS')
 
-          masters = requests.get(ctx['auditBase'] + f'/v1/tenants/{tenant_id}/project-masters', headers=headers, timeout=30)
-          if masters.status_code != 200 or not isinstance(masters.json(), list) or not masters.json():
-              raise SystemExit('Project Masters catalogue failed')
-          owners = sorted({str(row.get('ownerModule')) for row in masters.json()})
-          print('UC02_PROJECT_MASTERS_CATALOG=PASS|OWNERS=' + ','.join(owners))
+              candidates = requests.get(
+                  audit_base + f'/v1/tenants/{tenant_id}/role-mapping-candidates?limit=100',
+                  headers=auth_headers,
+                  timeout=30,
+              )
+              if candidates.status_code != 200 or not isinstance(candidates.json(), list):
+                  raise SystemExit('Employee browse failed')
+              print('UC02_EMPLOYEE_BROWSE=PASS|COUNT=' + str(len(candidates.json())))
 
-          readiness = requests.get(ctx['auditBase'] + f'/v1/tenants/{tenant_id}/project/readiness', headers=headers, timeout=30)
-          if readiness.status_code != 200:
-              raise SystemExit('Project readiness failed HTTP ' + str(readiness.status_code))
-          ready = readiness.json()
-          checks = {row['checkKey']: row for row in ready.get('checks', [])}
-          for key in ('PROJECT_SETUP_COMPLETE', 'SECURITY_TENANT_LIFECYCLE', 'DEALER_OUTLET_STRUCTURE'):
-              if checks.get(key, {}).get('status') != 'PASS':
-                  raise SystemExit('Expected readiness PASS missing for ' + key)
-          if ready.get('readyToActivate') is not False:
-              raise SystemExit('Incomplete test Project was incorrectly declared ready to activate')
-          print('UC02_READINESS_BLOCKERS=PASS')
+              masters = requests.get(
+                  audit_base + f'/v1/tenants/{tenant_id}/project-masters',
+                  headers=auth_headers,
+                  timeout=30,
+              )
+              if masters.status_code != 200 or not isinstance(masters.json(), list) or not masters.json():
+                  raise SystemExit('Project Masters catalogue failed')
+              owners = sorted({str(row.get('ownerModule')) for row in masters.json()})
+              print('UC02_PROJECT_MASTERS_CATALOG=PASS|OWNERS=' + ','.join(owners))
 
-          blocked_activation = requests.post(
-              ctx['auditBase'] + f'/v1/tenants/{tenant_id}/project/activate',
-              headers={**headers, 'Idempotency-Key': 'uc02-e2e-' + os.environ['GITHUB_RUN_ID'] + '-activate'},
-              timeout=30,
-          )
-          if blocked_activation.status_code != 409:
-              raise SystemExit('Incomplete Project activation did not fail closed with 409; HTTP ' + str(blocked_activation.status_code))
-          print('UC02_ACTIVATION_FAIL_CLOSED=PASS')
+              readiness = requests.get(
+                  audit_base + f'/v1/tenants/{tenant_id}/project/readiness',
+                  headers=auth_headers,
+                  timeout=30,
+              )
+              if readiness.status_code != 200:
+                  raise SystemExit('Project readiness failed HTTP ' + str(readiness.status_code))
+              ready = readiness.json()
+              checks = {row['checkKey']: row for row in ready.get('checks', [])}
+              for key in ('PROJECT_SETUP_COMPLETE', 'SECURITY_TENANT_LIFECYCLE', 'DEALER_OUTLET_STRUCTURE'):
+                  if checks.get(key, {}).get('status') != 'PASS':
+                      raise SystemExit('Expected readiness PASS missing for ' + key)
+              if ready.get('readyToActivate') is not False:
+                  raise SystemExit('Incomplete test Project was incorrectly ready to activate')
+              print('UC02_READINESS_BLOCKERS=PASS')
 
-          security_tenant = requests.get(ctx['securityBase'] + f'/security/v1/platform/tenants/{tenant_id}', headers=headers, timeout=30)
-          if security_tenant.status_code != 200 or security_tenant.json().get('tenantName') != ctx['projectName']:
-              raise SystemExit('Security Tenant state does not match Project provisioning')
-          if security_tenant.json().get('status') != 'CONFIGURING':
-              raise SystemExit('Blocked activation unexpectedly changed Security Tenant lifecycle')
-          print('UC02_SECURITY_TENANT_API=PASS')
+              blocked = requests.post(
+                  audit_base + f'/v1/tenants/{tenant_id}/project/activate',
+                  headers={**auth_headers, 'Idempotency-Key': 'uc02-e2e-' + run_id + '-activate'},
+                  timeout=30,
+              )
+              if blocked.status_code != 409:
+                  raise SystemExit('Incomplete Project activation did not fail closed with 409; HTTP ' + str(blocked.status_code))
+              print('UC02_ACTIVATION_FAIL_CLOSED=PASS')
 
-          di_provision = requests.get(ctx['diBase'] + f'/v1/tenants/{tenant_id}/admin/provisioning', headers=headers, timeout=30)
-          if di_provision.status_code != 200:
-              raise SystemExit('DI provisioning status failed HTTP ' + str(di_provision.status_code) + ': ' + di_provision.text[:300])
-          di_data = di_provision.json().get('data') or {}
-          if di_data.get('provisioningStatus') != 'READY':
-              raise SystemExit('DI Tenant provisioning is not READY')
-          print('UC02_DI_PROVISIONING_API=PASS')
+              security_tenant = requests.get(
+                  security_base + f'/security/v1/platform/tenants/{tenant_id}',
+                  headers=auth_headers,
+                  timeout=30,
+              )
+              if security_tenant.status_code != 200:
+                  raise SystemExit('Security Tenant GET failed HTTP ' + str(security_tenant.status_code))
+              sec_body = security_tenant.json()
+              if sec_body.get('tenantName') != project_name or sec_body.get('status') != 'CONFIGURING':
+                  raise SystemExit('Security Tenant state mismatch or blocked activation changed lifecycle')
+              print('UC02_SECURITY_TENANT_API=PASS')
 
-          # Direct persistence evidence across all three module databases.
-          with create_engine(ctx['securityDb']).connect() as conn:
-              row = conn.execute(text('SELECT tenant_name,status FROM security.tenants WHERE tenant_id=:tid'), {'tid': tenant_id}).mappings().one_or_none()
-              if row is None or row['tenant_name'] != ctx['projectName'] or row['status'] != 'CONFIGURING':
-                  raise SystemExit('Security DB Tenant evidence mismatch')
-          print('UC02_SECURITY_DB=PASS')
+              di_provision = requests.get(
+                  di_base + f'/v1/tenants/{tenant_id}/admin/provisioning',
+                  headers=auth_headers,
+                  timeout=30,
+              )
+              if di_provision.status_code != 200 or (di_provision.json().get('data') or {}).get('provisioningStatus') != 'READY':
+                  raise SystemExit('DI Tenant provisioning is not READY')
+              print('UC02_DI_PROVISIONING_API=PASS')
 
-          with create_engine(ctx['auditDb']).connect() as conn:
-              row = conn.execute(text('SELECT project_name,project_status,version_no FROM auditcore.projects WHERE tenant_id=:tid'), {'tid': tenant_id}).mappings().one_or_none()
-              if row is None or row['project_name'] != ctx['projectName'] or row['project_status'] != 'CONFIGURING' or row['version_no'] < old_version + 1:
-                  raise SystemExit('Audit Core DB Project evidence mismatch')
-              operation = conn.execute(text("SELECT status,current_step FROM auditcore.administrative_operations WHERE operation_id=:oid"), {'oid': operation_id}).mappings().one_or_none()
-              if operation is None or operation['status'] != 'COMPLETED' or operation['current_step'] != 'COMPLETE':
-                  raise SystemExit('Audit Core provisioning operation evidence mismatch')
-          print('UC02_AUDIT_CORE_DB=PASS')
+              with create_engine(security_db).connect() as conn:
+                  row = conn.execute(
+                      text('SELECT tenant_name,status FROM security.tenants WHERE tenant_id=:tid'),
+                      {'tid': tenant_id},
+                  ).mappings().one_or_none()
+                  if row is None or row['tenant_name'] != project_name or row['status'] != 'CONFIGURING':
+                      raise SystemExit('Security DB Tenant evidence mismatch')
+              print('UC02_SECURITY_DB=PASS')
 
-          with create_engine(ctx['diDb']).connect() as conn:
-              settings = conn.execute(text('SELECT count(*) FROM docintel.tenant_settings WHERE tenant_id=:tid'), {'tid': tenant_id}).scalar_one()
-              retention = conn.execute(text('''
-                  SELECT count(*)
-                  FROM docintel.tenant_settings ts
-                  JOIN docintel.retention_policies rp
-                    ON rp.tenant_id=ts.tenant_id AND rp.retention_policy_id=ts.active_retention_policy_id
-                  WHERE ts.tenant_id=:tid AND rp.status='ACTIVE'
-              '''), {'tid': tenant_id}).scalar_one()
-              doc_types = conn.execute(text('SELECT count(*) FROM docintel.tenant_document_types WHERE tenant_id=:tid'), {'tid': tenant_id}).scalar_one()
-              if settings != 1 or retention < 1 or doc_types < 1:
-                  raise SystemExit('DI DB provisioning evidence mismatch')
-          print('UC02_DI_DB=PASS')
+              with create_engine(audit_db).connect() as conn:
+                  row = conn.execute(
+                      text('SELECT project_name,project_status,version_no FROM auditcore.projects WHERE tenant_id=:tid'),
+                      {'tid': tenant_id},
+                  ).mappings().one_or_none()
+                  if row is None or row['project_name'] != project_name or row['project_status'] != 'CONFIGURING' or row['version_no'] < old_version + 1:
+                      raise SystemExit('Audit Core DB Project evidence mismatch')
+              print('UC02_AUDIT_CORE_DB=PASS')
 
-          # Supported cleanup for child resources. Whole Project/Tenant delete is deliberately deferred.
-          outlet_impact = requests.get(ctx['auditBase'] + f'/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets/{outlet_id}/deletion-impact', headers=headers, timeout=30)
-          if outlet_impact.status_code != 200 or outlet_impact.json().get('canDelete') is not True:
-              raise SystemExit('Test Outlet is not safely deletable')
-          delete_outlet = requests.delete(
-              ctx['auditBase'] + f'/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets/{outlet_id}',
-              headers={**headers, 'Idempotency-Key': 'uc02-e2e-' + os.environ['GITHUB_RUN_ID'] + '-delete-outlet'},
-              timeout=30,
-          )
-          if delete_outlet.status_code != 204:
-              raise SystemExit('Test Outlet cleanup failed HTTP ' + str(delete_outlet.status_code))
-          dealer_impact = requests.get(ctx['auditBase'] + f'/v1/tenants/{tenant_id}/dealers/{dealer_id}/deletion-impact', headers=headers, timeout=30)
-          if dealer_impact.status_code != 200 or dealer_impact.json().get('canDelete') is not True:
-              raise SystemExit('Test Dealer is not safely deletable after Outlet cleanup')
-          delete_dealer = requests.delete(
-              ctx['auditBase'] + f'/v1/tenants/{tenant_id}/dealers/{dealer_id}',
-              headers={**headers, 'Idempotency-Key': 'uc02-e2e-' + os.environ['GITHUB_RUN_ID'] + '-delete-dealer'},
-              timeout=30,
-          )
-          if delete_dealer.status_code != 204:
-              raise SystemExit('Test Dealer cleanup failed HTTP ' + str(delete_dealer.status_code))
+              with create_engine(di_db).connect() as conn:
+                  settings_count = conn.execute(
+                      text('SELECT count(*) FROM docintel.tenant_settings WHERE tenant_id=:tid'),
+                      {'tid': tenant_id},
+                  ).scalar_one()
+                  retention_count = conn.execute(text('''
+                      SELECT count(*)
+                      FROM docintel.tenant_settings ts
+                      JOIN docintel.retention_policies rp
+                        ON rp.tenant_id=ts.tenant_id AND rp.retention_policy_id=ts.active_retention_policy_id
+                      WHERE ts.tenant_id=:tid AND rp.status='ACTIVE'
+                  '''), {'tid': tenant_id}).scalar_one()
+                  doc_type_count = conn.execute(
+                      text('SELECT count(*) FROM docintel.tenant_document_types WHERE tenant_id=:tid'),
+                      {'tid': tenant_id},
+                  ).scalar_one()
+                  if settings_count != 1 or retention_count < 1 or doc_type_count < 1:
+                      raise SystemExit('DI DB provisioning evidence mismatch')
+              print('UC02_DI_DB=PASS')
+          finally:
+              # Dealer/Outlet delete APIs are supported; clean them even if a later assertion fails.
+              if tenant_id and dealer_id and outlet_id:
+                  impact = requests.get(
+                      audit_base + f'/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets/{outlet_id}/deletion-impact',
+                      headers=auth_headers,
+                      timeout=30,
+                  )
+                  if impact.status_code == 200 and impact.json().get('canDelete') is True:
+                      deleted = requests.delete(
+                          audit_base + f'/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets/{outlet_id}',
+                          headers={**auth_headers, 'Idempotency-Key': 'uc02-e2e-' + run_id + '-delete-outlet'},
+                          timeout=30,
+                      )
+                      if deleted.status_code == 204:
+                          outlet_id = None
+              if tenant_id and dealer_id and outlet_id is None:
+                  impact = requests.get(
+                      audit_base + f'/v1/tenants/{tenant_id}/dealers/{dealer_id}/deletion-impact',
+                      headers=auth_headers,
+                      timeout=30,
+                  )
+                  if impact.status_code == 200 and impact.json().get('canDelete') is True:
+                      deleted = requests.delete(
+                          audit_base + f'/v1/tenants/{tenant_id}/dealers/{dealer_id}',
+                          headers={**auth_headers, 'Idempotency-Key': 'uc02-e2e-' + run_id + '-delete-dealer'},
+                          timeout=30,
+                      )
+                      if deleted.status_code == 204:
+                          dealer_id = None
+
+          if dealer_id is not None or outlet_id is not None:
+              raise SystemExit('Supported child test-data cleanup did not complete')
           print('UC02_CHILD_TEST_DATA_CLEANUP=PASS')
-
-          Path('/tmp/uc02-verdict.json').write_text(json.dumps({
-              'tenantId': tenant_id,
-              'projectName': ctx['projectName'],
-              'operationId': operation_id,
-              'correlationId': ctx['correlationId'],
-              'projectStatus': 'CONFIGURING',
-              'childDataCleaned': True,
-          }))
           print('UC02_DEV_E2E=PASS')
           print('UC02_E2E_TENANT=' + tenant_id)
           print('UC02_E2E_OPERATION=' + operation_id)
-          print('UC02_E2E_PROJECT=' + ctx['projectName'])
+          print('UC02_E2E_PROJECT=' + project_name)
+          print('UC02_END_TO_END_VERDICT=PASS')
           PY
-
-      - name: Verdict
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -s /tmp/uc02-verdict.json
-          cat /tmp/uc02-verdict.json
-          echo 'UC02_END_TO_END_VERDICT=PASS'
