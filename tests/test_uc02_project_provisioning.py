@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from threading import Barrier
 from uuid import uuid4
 
 import pytest
@@ -95,7 +94,6 @@ class ControlledSecurityProvisioning:
 class ControlledDiProvisioning:
     fail: bool = False
     calls: list[tuple[str, str, str]] = field(default_factory=list)
-    barrier: Barrier | None = None
 
     def client_class(self):
         controller = self
@@ -118,13 +116,11 @@ class ControlledDiProvisioning:
                 idempotency_key: str,
             ) -> dict:
                 controller.calls.append((human_token, tenant_id, idempotency_key))
-                if controller.barrier is not None:
-                    controller.barrier.wait(timeout=3)
                 if controller.fail:
                     raise DiClientError(
                         status_code=503,
                         code="DI_UNAVAILABLE",
-                        retryable=True,
+                        retryable=False,
                     )
                 return {
                     "tenantId": tenant_id,
@@ -133,6 +129,20 @@ class ControlledDiProvisioning:
                 }
 
         return Client
+
+
+@dataclass
+class ControlledCompensation:
+    calls: list[tuple[str, str, bool]] = field(default_factory=list)
+
+    def __call__(
+        self,
+        *,
+        tenant_id: str,
+        human_token: str,
+        di_committed: bool,
+    ) -> None:
+        self.calls.append((tenant_id, human_token, di_committed))
 
 
 @pytest.fixture
@@ -171,10 +181,12 @@ def provisioning_setup(monkeypatch):
         tenant_code=f"PROJ-{suffix[:12]}",
     )
     di = ControlledDiProvisioning()
+    compensation = ControlledCompensation()
     monkeypatch.setenv("SECURITY_BASE_URL", "https://security.test")
     monkeypatch.setenv("DI_BASE_URL", "https://di.test")
     monkeypatch.setattr(project_provisioning, "SecurityAdminClient", security.client_class())
     monkeypatch.setattr(project_provisioning, "DiClient", di.client_class())
+    monkeypatch.setattr(project_provisioning, "_compensate_new_project", compensation)
     app.dependency_overrides[get_engine] = lambda: engine
     app.dependency_overrides[require_super_admin_request] = lambda: HumanAdminRequest(
         user_id="superadmin-provision",
@@ -193,6 +205,7 @@ def provisioning_setup(monkeypatch):
             "oem_id": str(oem_id),
             "security": security,
             "di": di,
+            "compensation": compensation,
         }
     finally:
         app.dependency_overrides.clear()
@@ -210,35 +223,37 @@ def _payload(setup: dict) -> dict:
     }
 
 
-def test_create_project_runs_security_audit_core_di_once_and_replays_same_operation(
+def _project_count(setup: dict) -> int:
+    with setup["engine"].begin() as connection:
+        return int(
+            connection.execute(
+                text("SELECT count(*) FROM auditcore.projects WHERE tenant_id=:tenant_id"),
+                {"tenant_id": setup["tenant_id"]},
+            ).scalar_one()
+        )
+
+
+def test_create_project_is_synchronous_and_persists_only_ready_state(
     provisioning_setup,
 ) -> None:
     setup = provisioning_setup
     client = TestClient(app, raise_server_exceptions=False)
 
-    first = client.post(
+    response = client.post(
         "/v1/projects",
         headers={"Idempotency-Key": "project-create-0001"},
         json=_payload(setup),
     )
-    assert first.status_code == 201, first.text
-    body = first.json()
+
+    assert response.status_code == 201, response.text
+    body = response.json()
     assert body["tenantId"] == setup["tenant_id"]
     assert body["projectStatus"] == "CONFIGURING"
     assert body["provisioningStatus"] == "READY"
     assert body["currentStep"] == "COMPLETE"
     assert body["errorCode"] is None
     assert body["errorMessage"] is None
-    operation_id = body["operationId"]
     assert setup["security"].timeout_seconds == [20.0]
-
-    second = client.post(
-        "/v1/projects",
-        headers={"Idempotency-Key": "project-create-0001"},
-        json=_payload(setup),
-    )
-    assert second.status_code == 201
-    assert second.json()["operationId"] == operation_id
     assert setup["security"].create_calls == [
         (
             "same-human-superadmin-token",
@@ -247,16 +262,158 @@ def test_create_project_runs_security_audit_core_di_once_and_replays_same_operat
         )
     ]
     assert setup["di"].calls == [
-        ("same-human-superadmin-token", setup["tenant_id"], "project-create-0001")
+        (
+            "same-human-superadmin-token",
+            setup["tenant_id"],
+            "project-create-0001",
+        )
     ]
+    assert setup["compensation"].calls == []
+    assert _project_count(setup) == 1
 
-    status = client.get(f"/v1/project-provisioning-operations/{operation_id}")
-    assert status.status_code == 200
-    assert status.json()["provisioningStatus"] == "READY"
 
-    projects = client.get("/v1/projects")
-    assert projects.status_code == 200, projects.text
-    assert projects.json() == [
+def test_same_idempotency_key_does_not_duplicate_project_projection(provisioning_setup) -> None:
+    setup = provisioning_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    headers = {"Idempotency-Key": "project-create-idempotent-0001"}
+
+    first = client.post("/v1/projects", headers=headers, json=_payload(setup))
+    second = client.post("/v1/projects", headers=headers, json=_payload(setup))
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert second.json()["operationId"] == first.json()["operationId"]
+    assert _project_count(setup) == 1
+    assert setup["compensation"].calls == []
+
+
+def test_validation_failure_happens_before_security_write(provisioning_setup) -> None:
+    setup = provisioning_setup
+    payload = _payload(setup)
+    payload["effectiveStartDate"] = "2026-08-22"
+    payload["effectiveEndDate"] = "2026-08-21"
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/v1/projects",
+        headers={"Idempotency-Key": "project-create-invalid-0001"},
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert setup["security"].create_calls == []
+    assert setup["di"].calls == []
+    assert setup["compensation"].calls == []
+    assert _project_count(setup) == 0
+
+
+def test_security_failure_returns_error_without_project_or_compensation(
+    provisioning_setup,
+) -> None:
+    setup = provisioning_setup
+    setup["security"].fail_create = True
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/v1/projects",
+        headers={"Idempotency-Key": "project-create-security-failure-0001"},
+        json=_payload(setup),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["errorCode"] == "VAC-SYS-002"
+    assert "Security" not in response.json()["detail"]
+    assert setup["di"].calls == []
+    assert setup["compensation"].calls == []
+    assert _project_count(setup) == 0
+
+
+def test_audit_core_failure_rolls_back_and_compensates_security(
+    provisioning_setup,
+    monkeypatch,
+) -> None:
+    setup = provisioning_setup
+
+    def fail_projection(*args, **kwargs):
+        raise RuntimeError("controlled local projection failure")
+
+    monkeypatch.setattr(project_provisioning, "_ensure_project_projection", fail_projection)
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/v1/projects",
+        headers={"Idempotency-Key": "project-create-local-failure-0001"},
+        json=_payload(setup),
+    )
+
+    assert response.status_code == 503
+    assert setup["di"].calls == []
+    assert setup["compensation"].calls == [
+        (setup["tenant_id"], "same-human-superadmin-token", False)
+    ]
+    assert _project_count(setup) == 0
+
+
+def test_di_failure_rolls_back_project_and_compensates_security(
+    provisioning_setup,
+) -> None:
+    setup = provisioning_setup
+    setup["di"].fail = True
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/v1/projects",
+        headers={"Idempotency-Key": "project-create-di-failure-0001"},
+        json=_payload(setup),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["errorCode"] == "VAC-SYS-002"
+    assert setup["compensation"].calls == [
+        (setup["tenant_id"], "same-human-superadmin-token", False)
+    ]
+    assert _project_count(setup) == 0
+
+
+def test_compensation_removes_di_before_security(monkeypatch) -> None:
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        project_provisioning,
+        "_delete_di_provisioning",
+        lambda **kwargs: calls.append("DI"),
+    )
+    monkeypatch.setattr(
+        project_provisioning,
+        "_delete_security_tenant",
+        lambda **kwargs: calls.append("SECURITY"),
+    )
+
+    project_provisioning._compensate_new_project(
+        tenant_id="tenant-atomic-test",
+        human_token="token",
+        di_committed=True,
+    )
+    assert calls == ["DI", "SECURITY"]
+
+    calls.clear()
+    project_provisioning._compensate_new_project(
+        tenant_id="tenant-atomic-test",
+        human_token="token",
+        di_committed=False,
+    )
+    assert calls == ["SECURITY"]
+
+
+def test_project_directory_returns_only_persisted_project(provisioning_setup) -> None:
+    setup = provisioning_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    created = client.post(
+        "/v1/projects",
+        headers={"Idempotency-Key": "project-create-directory-0001"},
+        json=_payload(setup),
+    )
+    assert created.status_code == 201
+
+    response = client.get("/v1/projects")
+    assert response.status_code == 200
+    assert response.json() == [
         {
             "tenantId": setup["tenant_id"],
             "projectCode": setup["security"].tenant_code,
@@ -265,233 +422,21 @@ def test_create_project_runs_security_audit_core_di_once_and_replays_same_operat
             "securityTenantStatus": "CONFIGURING",
         }
     ]
-    assert setup["security"].list_calls == ["same-human-superadmin-token"]
-
-    with setup["engine"].begin() as connection:
-        project = connection.execute(
-            text(
-                """
-                SELECT project_code, project_name, project_status
-                FROM auditcore.projects WHERE tenant_id=:tenant_id
-                """
-            ),
-            {"tenant_id": setup["tenant_id"]},
-        ).mappings().one()
-        operation = connection.execute(
-            text(
-                """
-                SELECT status, current_step, security_receipt,
-                       audit_core_receipt, di_receipt
-                FROM auditcore.administrative_operations
-                WHERE operation_id=:operation_id
-                """
-            ),
-            {"operation_id": operation_id},
-        ).mappings().one()
-
-    assert project["project_code"] == setup["security"].tenant_code
-    assert project["project_name"] == "UC02 Provisioned Project"
-    assert project["project_status"] == "CONFIGURING"
-    assert operation["status"] == "COMPLETED"
-    assert operation["current_step"] == "COMPLETE"
-    assert operation["security_receipt"]["tenantId"] == setup["tenant_id"]
-    assert operation["audit_core_receipt"]["tenantId"] == setup["tenant_id"]
-    assert operation["di_receipt"]["provisioningStatus"] == "READY"
 
 
-def test_post_security_audit_core_and_di_branches_run_concurrently(
-    provisioning_setup,
-    monkeypatch,
-) -> None:
-    setup = provisioning_setup
-    barrier = Barrier(2)
-    setup["di"].barrier = barrier
-    original_projection = project_provisioning._ensure_project_projection
-
-    def synchronized_projection(*args, **kwargs):
-        barrier.wait(timeout=3)
-        return original_projection(*args, **kwargs)
-
-    monkeypatch.setattr(
-        project_provisioning,
-        "_ensure_project_projection",
-        synchronized_projection,
-    )
-    client = TestClient(app, raise_server_exceptions=False)
-    response = client.post(
-        "/v1/projects",
-        headers={"Idempotency-Key": "project-create-parallel-0001"},
-        json=_payload(setup),
-    )
-
-    assert response.status_code == 201, response.text
-    assert response.json()["provisioningStatus"] == "READY"
-    assert len(setup["security"].create_calls) == 1
-    assert len(setup["di"].calls) == 1
-
-
-def test_retry_after_audit_core_failure_keeps_successful_di_receipt(
-    provisioning_setup,
-    monkeypatch,
-) -> None:
-    setup = provisioning_setup
-    original_projection = project_provisioning._ensure_project_projection
-    attempts = {"count": 0}
-
-    def flaky_projection(*args, **kwargs):
-        attempts["count"] += 1
-        if attempts["count"] == 1:
-            raise RuntimeError("controlled Audit Core projection failure")
-        return original_projection(*args, **kwargs)
-
-    monkeypatch.setattr(project_provisioning, "_ensure_project_projection", flaky_projection)
-    client = TestClient(app, raise_server_exceptions=False)
-    first = client.post(
-        "/v1/projects",
-        headers={"Idempotency-Key": "project-create-audit-recovery-0001"},
-        json=_payload(setup),
-    )
-
-    assert first.status_code == 202, first.text
-    body = first.json()
-    assert body["provisioningStatus"] == "RECOVERY_REQUIRED"
-    assert body["currentStep"] == "AUDIT_CORE"
-    assert len(setup["security"].create_calls) == 1
-    assert len(setup["di"].calls) == 1
-
-    with setup["engine"].begin() as connection:
-        receipts = connection.execute(
-            text(
-                """
-                SELECT audit_core_receipt, di_receipt
-                FROM auditcore.administrative_operations
-                WHERE operation_id=:operation_id
-                """
-            ),
-            {"operation_id": body["operationId"]},
-        ).mappings().one()
-    assert receipts["audit_core_receipt"] is None
-    assert receipts["di_receipt"]["provisioningStatus"] == "READY"
-
-    recovered = client.post(
-        f"/v1/project-provisioning-operations/{body['operationId']}/retry"
-    )
-    assert recovered.status_code == 200, recovered.text
-    assert recovered.json()["provisioningStatus"] == "READY"
-    assert attempts["count"] == 2
-    assert len(setup["security"].create_calls) == 1
-    assert len(setup["di"].calls) == 1
-
-
-def test_security_failure_returns_business_error_but_keeps_technical_diagnostic(
-    provisioning_setup,
-) -> None:
-    setup = provisioning_setup
-    setup["security"].fail_create = True
-    client = TestClient(app, raise_server_exceptions=False)
-
-    failed = client.post(
-        "/v1/projects",
-        headers={"Idempotency-Key": "project-create-security-failure-0001"},
-        json=_payload(setup),
-    )
-    assert failed.status_code == 202, failed.text
-    body = failed.json()
-    assert body["provisioningStatus"] == "RECOVERY_REQUIRED"
-    assert body["currentStep"] == "SECURITY"
-    assert body["errorCode"] == "VAC-SYS-002"
-    assert body["errorMessage"] == (
-        "UC02 Provisioned Project setup could not be completed. Please try again."
-    )
-    assert "security" not in body["errorMessage"].lower()
-    assert "endpoint" not in body["errorMessage"].lower()
-    assert "503" not in body["errorMessage"]
-
-    with setup["engine"].begin() as connection:
-        operation = connection.execute(
-            text(
-                """
-                SELECT last_error_code, last_error_summary
-                FROM auditcore.administrative_operations
-                WHERE operation_id=:operation_id
-                """
-            ),
-            {"operation_id": body["operationId"]},
-        ).mappings().one()
-
-    assert operation["last_error_code"] == "SECURITY_ADMIN_FAILED"
-    assert operation["last_error_summary"] == "Security administrative endpoint is unavailable"
-
-
-def test_project_directory_security_failure_returns_business_safe_problem(
-    provisioning_setup,
-) -> None:
+def test_project_directory_dependency_failure_is_business_safe(provisioning_setup) -> None:
     setup = provisioning_setup
     setup["security"].fail_list = True
-    client = TestClient(app, raise_server_exceptions=False)
 
-    response = client.get("/v1/projects")
-    assert response.status_code == 503, response.text
-    body = response.json()
-    assert body["errorCode"] == "VAC-SYS-002"
-    assert body["detail"] == (
-        "Project administration is temporarily unavailable. Please try again."
+    response = TestClient(app, raise_server_exceptions=False).get("/v1/projects")
+
+    assert response.status_code == 503
+    assert response.json()["errorCode"] == "VAC-SYS-002"
+    assert "Security" not in response.json()["detail"]
+
+
+def test_project_provisioning_retry_endpoint_is_not_exposed() -> None:
+    response = TestClient(app, raise_server_exceptions=False).post(
+        f"/v1/project-provisioning-operations/{uuid4()}/retry"
     )
-    assert "HTTP" not in body["detail"]
-    assert "Security" not in body["detail"]
-
-
-def test_retry_after_di_failure_resumes_without_second_security_tenant(
-    provisioning_setup,
-) -> None:
-    setup = provisioning_setup
-    setup["di"].fail = True
-    client = TestClient(app, raise_server_exceptions=False)
-
-    failed = client.post(
-        "/v1/projects",
-        headers={"Idempotency-Key": "project-create-recovery-0001"},
-        json=_payload(setup),
-    )
-    assert failed.status_code == 202, failed.text
-    body = failed.json()
-    assert body["provisioningStatus"] == "RECOVERY_REQUIRED"
-    assert body["currentStep"] == "DI"
-    assert body["errorCode"] == "VAC-DI-001"
-    assert body["errorMessage"] == (
-        "UC02 Provisioned Project setup is temporarily unavailable. Please try again."
-    )
-    assert "di" not in body["errorMessage"].lower()
-    assert "processing" not in body["errorMessage"].lower()
-    operation_id = body["operationId"]
-    assert len(setup["security"].create_calls) == 1
-
-    with setup["engine"].begin() as connection:
-        technical = connection.execute(
-            text(
-                """
-                SELECT last_error_code
-                FROM auditcore.administrative_operations
-                WHERE operation_id=:operation_id
-                """
-            ),
-            {"operation_id": operation_id},
-        ).scalar_one()
-    assert technical == "DI_UNAVAILABLE"
-
-    status = client.get(f"/v1/project-provisioning-operations/{operation_id}")
-    assert status.status_code == 200
-    assert status.json()["errorCode"] == "VAC-DI-001"
-
-    setup["di"].fail = False
-    recovered = client.post(
-        f"/v1/project-provisioning-operations/{operation_id}/retry"
-    )
-    assert recovered.status_code == 200, recovered.text
-    assert recovered.json()["provisioningStatus"] == "READY"
-    assert recovered.json()["currentStep"] == "COMPLETE"
-    assert recovered.json()["errorCode"] is None
-    assert recovered.json()["errorMessage"] is None
-    assert len(setup["security"].create_calls) == 1
-    assert len(setup["di"].calls) == 2
-    assert all(call[0] == "same-human-superadmin-token" for call in setup["di"].calls)
+    assert response.status_code == 404
