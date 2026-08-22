@@ -1,0 +1,121 @@
+name: Cleanup UC02 MahindraWest duplicate Audit Core operations
+
+on:
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    if: github.head_ref == 'cleanup/uc02-mahindrawest-duplicates'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Audit Core and Railway CLI
+        run: |
+          python -m pip install -e .
+          npm install --global @railway/cli
+      - name: Resolve DEV database without exposing credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo 'RAILWAY_API_TOKEN is not configured'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/audit-vars.json').read_text())
+          url=str(data.get('DATABASE_URL') or '').strip()
+          if not url:
+              raise SystemExit('Audit Core DEV DATABASE_URL is missing')
+          Path('/tmp/database-url').write_text(url)
+          print('AUDIT_CORE_DEV_DATABASE_RESOLVED=PASS')
+          PY
+      - name: Guard and delete exactly six failed duplicate provisioning operations
+        shell: bash
+        run: |
+          set -euo pipefail
+          DATABASE_URL="$(cat /tmp/database-url)"
+          echo "::add-mask::$DATABASE_URL"
+          export DATABASE_URL
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+
+          engine = create_engine(os.environ['DATABASE_URL'])
+          with engine.begin() as connection:
+              targets = connection.execute(
+                  text(
+                      """
+                      SELECT operation_id, status, current_step,
+                             security_receipt, audit_core_receipt, di_receipt
+                      FROM auditcore.administrative_operations
+                      WHERE operation_type='PROJECT_PROVISION'
+                        AND safe_request_summary->>'projectName'=:project_name
+                      ORDER BY created_at_utc, operation_id
+                      """
+                  ),
+                  {'project_name': 'MahindraWest'},
+              ).mappings().all()
+              if len(targets) != 6:
+                  raise SystemExit(f'Cleanup guard failed: expected exactly 6 MahindraWest provisioning operations, found {len(targets)}')
+              for row in targets:
+                  if str(row['status']) != 'RECOVERY_REQUIRED' or str(row['current_step']) != 'SECURITY':
+                      raise SystemExit('Cleanup guard failed: every target must be a Security-step RECOVERY_REQUIRED operation')
+                  if row['audit_core_receipt'] is not None or row['di_receipt'] is not None:
+                      raise SystemExit('Cleanup guard failed: a target already contains downstream durable state')
+
+              project_count = int(
+                  connection.execute(
+                      text("SELECT count(*) FROM auditcore.projects WHERE project_name=:project_name"),
+                      {'project_name': 'MahindraWest'},
+                  ).scalar_one()
+              )
+              if project_count != 0:
+                  raise SystemExit(f'Cleanup guard failed: found {project_count} persisted MahindraWest Project row(s); refusing direct operation cleanup')
+
+              ids = [str(row['operation_id']) for row in targets]
+              deleted = int(
+                  connection.execute(
+                      text(
+                          """
+                          DELETE FROM auditcore.administrative_operations
+                          WHERE operation_id = ANY(CAST(:operation_ids AS uuid[]))
+                          """
+                      ),
+                      {'operation_ids': ids},
+                  ).rowcount
+              )
+              if deleted != 6:
+                  raise SystemExit(f'Cleanup verification failed: expected to delete 6 operations, deleted {deleted}')
+
+          with engine.connect() as connection:
+              remaining = int(
+                  connection.execute(
+                      text(
+                          """
+                          SELECT count(*) FROM auditcore.administrative_operations
+                          WHERE operation_type='PROJECT_PROVISION'
+                            AND safe_request_summary->>'projectName'=:project_name
+                          """
+                      ),
+                      {'project_name': 'MahindraWest'},
+                  ).scalar_one()
+              )
+              if remaining != 0:
+                  raise SystemExit(f'Cleanup verification failed: {remaining} MahindraWest provisioning operations remain')
+          engine.dispose()
+          print('AUDIT_CORE_UC02_DUPLICATE_OPERATIONS_DELETED=6')
+          print('AUDIT_CORE_UC02_DUPLICATE_OPERATIONS_REMAINING=0')
+          PY
