@@ -151,6 +151,22 @@ class SecurityAdminClient:
             raise SecurityAdminError("Security Tenant create response has invalid shape")
         return self._tenant_from_payload(payload, requested_tenant_id=tenant_id)
 
+    def list_tenants(self, *, human_bearer_token: str) -> tuple[SecurityTenant, ...]:
+        payload = self._request_json_list(
+            "GET",
+            "/security/v1/platform/tenants",
+            human_bearer_token=human_bearer_token,
+        )
+        tenants: list[SecurityTenant] = []
+        for raw in payload:
+            if not isinstance(raw, dict):
+                raise SecurityAdminError("Security Tenant directory response has invalid shape")
+            tenant_id = raw.get("tenantId")
+            if not isinstance(tenant_id, str) or not tenant_id:
+                raise SecurityAdminError("Security Tenant directory response has invalid shape")
+            tenants.append(self._tenant_from_payload(raw, requested_tenant_id=tenant_id))
+        return tuple(tenants)
+
     def get_tenant(
         self,
         *,
