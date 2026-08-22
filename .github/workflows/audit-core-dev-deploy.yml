@@ -22,6 +22,7 @@ jobs:
       AUDIT_SERVICE: verigence-audit-core
       DEPLOY_SHA: ${{ github.sha }}
       APP_ENV: ci
+      DEV_WEB_ORIGIN: https://verigence-web-dev.jbrconsulting-it.workers.dev
 
     steps:
       - name: Check out exact tested Audit Core revision
@@ -90,8 +91,12 @@ jobs:
           missing = [name for name in required if not str(variables.get(name, '')).strip()]
           if missing:
               raise SystemExit('Audit Core Railway DEV is missing required service variable(s): ' + ', '.join(missing))
+          app_env = str(variables.get('APP_ENV', '')).strip().lower()
+          if app_env not in {'dev', 'development'}:
+              raise SystemExit('Audit Core Railway DEV APP_ENV must be dev or development for the DEV CORS allowlist')
           print('AUDIT_CORE_RAILWAY_TARGET=PASS')
           print('AUDIT_CORE_RAILWAY_RUNTIME_CONFIG=PASS')
+          print('AUDIT_CORE_APP_ENV=' + app_env)
           PY
 
       - name: Deploy Audit Core
@@ -202,5 +207,108 @@ jobs:
           probe_route '/v1/tenants/uc02-smoke/project-masters'
           probe_route '/v1/tenants/uc02-smoke/role-mapping-candidates'
           probe_route '/v1/tenants/uc02-smoke/role-mappings'
+
+          cors_status="$(curl --silent --show-error \
+            --dump-header /tmp/audit-cors.headers \
+            --output /tmp/audit-cors.body \
+            --write-out '%{http_code}' \
+            --request OPTIONS \
+            --header "Origin: $DEV_WEB_ORIGIN" \
+            --header 'Access-Control-Request-Method: POST' \
+            --header 'Access-Control-Request-Headers: authorization,content-type,idempotency-key,if-match,x-correlation-id,x-trace-id' \
+            "$base/v1/projects" || true)"
+          if [[ "$cors_status" != "200" ]]; then
+            cat /tmp/audit-cors.headers >&2 || true
+            cat /tmp/audit-cors.body >&2 || true
+            echo "::error::Audit Core browser CORS preflight returned HTTP $cors_status"
+            exit 1
+          fi
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          headers = {}
+          for raw in Path('/tmp/audit-cors.headers').read_text().splitlines():
+              if ':' not in raw:
+                  continue
+              name, value = raw.split(':', 1)
+              headers[name.strip().lower()] = value.strip()
+
+          origin = os.environ['DEV_WEB_ORIGIN']
+          if headers.get('access-control-allow-origin') != origin:
+              raise SystemExit('Audit Core CORS did not allow the approved DEV Web origin')
+          if headers.get('access-control-allow-credentials', '').lower() != 'true':
+              raise SystemExit('Audit Core CORS did not allow browser credentials')
+
+          methods = {
+              value.strip().upper()
+              for value in headers.get('access-control-allow-methods', '').split(',')
+              if value.strip()
+          }
+          if 'POST' not in methods:
+              raise SystemExit('Audit Core CORS did not allow POST')
+
+          allowed_headers = {
+              value.strip().lower()
+              for value in headers.get('access-control-allow-headers', '').split(',')
+              if value.strip()
+          }
+          required_headers = {
+              'authorization',
+              'content-type',
+              'idempotency-key',
+              'if-match',
+              'x-correlation-id',
+              'x-trace-id',
+          }
+          missing = sorted(required_headers - allowed_headers)
+          if missing:
+              raise SystemExit('Audit Core CORS missing allowed header(s): ' + ', '.join(missing))
+          print('AUDIT_CORE_WEB_CORS_PREFLIGHT=PASS')
+          PY
+
+          unauthorized_status="$(curl --silent --show-error \
+            --dump-header /tmp/audit-cors-actual.headers \
+            --output /tmp/audit-cors-actual.body \
+            --write-out '%{http_code}' \
+            --header "Origin: $DEV_WEB_ORIGIN" \
+            "$base/v1/tenants/uc02-cors-smoke/project/readiness" || true)"
+          case "$unauthorized_status" in
+            401|403) ;;
+            *)
+              cat /tmp/audit-cors-actual.headers >&2 || true
+              cat /tmp/audit-cors-actual.body >&2 || true
+              echo "::error::Expected unauthenticated readiness probe to fail closed; got HTTP $unauthorized_status"
+              exit 1
+              ;;
+          esac
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          headers = {}
+          for raw in Path('/tmp/audit-cors-actual.headers').read_text().splitlines():
+              if ':' not in raw:
+                  continue
+              name, value = raw.split(':', 1)
+              headers[name.strip().lower()] = value.strip()
+
+          origin = os.environ['DEV_WEB_ORIGIN']
+          if headers.get('access-control-allow-origin') != origin:
+              raise SystemExit('Audit Core actual browser response is missing the approved CORS origin')
+          exposed = {
+              value.strip().lower()
+              for value in headers.get('access-control-expose-headers', '').split(',')
+              if value.strip()
+          }
+          if 'x-correlation-id' not in exposed:
+              raise SystemExit('Audit Core browser response does not expose X-Correlation-ID')
+          correlation_id = headers.get('x-correlation-id', '')
+          if not correlation_id:
+              raise SystemExit('Audit Core browser response did not preserve X-Correlation-ID')
+          print('AUDIT_CORE_WEB_CORS_ACTUAL_RESPONSE=PASS')
+          print('AUDIT_CORE_CORS_CORRELATION_ID=' + correlation_id)
+          PY
+
           echo 'AUDIT_CORE_UC02_DEV=PASS'
           echo "AUDIT_CORE_DEPLOYED_SHA=${DEPLOY_SHA}"
