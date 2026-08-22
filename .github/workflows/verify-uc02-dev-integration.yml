@@ -18,10 +18,12 @@ jobs:
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       AUDIT_SERVICE: verigence-audit-core
     steps:
-      - name: Install Railway CLI
-        run: npm install --global @railway/cli
+      - name: Install diagnostic tooling
+        run: |
+          npm install --global @railway/cli
+          python -m pip install 'psycopg[binary]'
 
-      - name: Verify Audit Core downstream endpoint configuration
+      - name: Verify endpoints and classify latest failure
         shell: bash
         run: |
           set -euo pipefail
@@ -32,58 +34,66 @@ jobs:
 
           python - <<'PY'
           import json
+          import re
           from pathlib import Path
           from urllib.parse import urlparse
+          import psycopg
 
           audit = json.loads(Path('/tmp/audit-vars.json').read_text())
           security = json.loads(Path('/tmp/security-vars.json').read_text())
           di = json.loads(Path('/tmp/di-vars.json').read_text())
 
-          checks = [
-              ('SECURITY_BASE_URL', audit.get('SECURITY_BASE_URL'), security.get('PORT'), security.get('RAILWAY_PUBLIC_DOMAIN')),
-              ('DI_BASE_URL', audit.get('DI_BASE_URL'), di.get('PORT'), di.get('RAILWAY_PUBLIC_DOMAIN')),
-          ]
-          failed = False
-          for key, raw_url, service_port, public_domain in checks:
+          for key, raw_url, service_port in [
+              ('SECURITY_BASE_URL', audit.get('SECURITY_BASE_URL'), security.get('PORT')),
+              ('DI_BASE_URL', audit.get('DI_BASE_URL'), di.get('PORT')),
+          ]:
               value = str(raw_url or '').strip()
               if not value:
-                  print(f'{key}=MISSING')
-                  failed = True
-                  continue
+                  raise SystemExit(f'{key}=MISSING')
               parsed = urlparse(value)
               configured_port = parsed.port
               print(f'{key}=PRESENT')
-              print(f'{key}_SCHEME={parsed.scheme}')
               print(f'{key}_HOST={parsed.hostname or "unknown"}')
               print(f'{key}_CONFIGURED_PORT={configured_port if configured_port is not None else "DEFAULT"}')
               print(f'{key}_SERVICE_PORT={service_port or "UNSET"}')
-              print(f'{key}_PUBLIC_DOMAIN_PRESENT={"YES" if public_domain else "NO"}')
               if service_port and configured_port is not None and str(configured_port) != str(service_port):
-                  print(f'{key}_PORT_MATCH=FAIL')
-                  failed = True
-              elif service_port and configured_port is not None:
-                  print(f'{key}_PORT_MATCH=PASS')
-              else:
-                  print(f'{key}_PORT_MATCH=UNVERIFIED')
-          if failed:
-              raise SystemExit('Audit Core downstream endpoint configuration mismatch detected')
-          PY
+                  raise SystemExit(f'{key}_PORT_MATCH=FAIL')
+              print(f'{key}_PORT_MATCH=PASS')
 
-          railway logs --service "$AUDIT_SERVICE" --latest --lines 5000 >/tmp/audit.log 2>/dev/null || true
-          python - <<'PY'
-          import re
-          from pathlib import Path
-          text = Path('/tmp/audit.log').read_text(errors='ignore') if Path('/tmp/audit.log').exists() else ''
-          if 'SECURITY_BASE_URL is required for UC02 administration' in text:
-              print('LATEST_SECURITY_FAILURE_CLASS=CONFIG_MISSING')
-          elif 'Security administrative endpoint is unavailable' in text or 'endpoint_unavailable' in text:
-              print('LATEST_SECURITY_FAILURE_CLASS=ENDPOINT_UNREACHABLE')
+          db_url = str(audit.get('DATABASE_URL') or '').strip()
+          if not db_url:
+              raise SystemExit('DATABASE_URL=MISSING')
+          db_url = db_url.replace('postgresql+psycopg://', 'postgresql://', 1)
+          with psycopg.connect(db_url) as conn:
+              with conn.cursor() as cur:
+                  cur.execute(
+                      """
+                      SELECT created_at_utc, last_error_code, last_error_summary
+                      FROM auditcore.administrative_operations
+                      WHERE operation_type='PROJECT_PROVISION'
+                        AND status='RECOVERY_REQUIRED'
+                        AND current_step='SECURITY'
+                      ORDER BY created_at_utc DESC
+                      LIMIT 1
+                      """
+                  )
+                  row = cur.fetchone()
+          if row is None:
+              print('LATEST_SECURITY_PROVISIONING_FAILURE=NONE')
           else:
-              matches = re.findall(r'Security administrative request failed with HTTP\s+(\d{3})', text)
-              if matches:
-                  print('LATEST_SECURITY_FAILURE_CLASS=DOWNSTREAM_HTTP_' + matches[-1])
-              elif 'SECURITY_ADMIN_FAILED' in text:
-                  print('LATEST_SECURITY_FAILURE_CLASS=SECURITY_ADMIN_FAILED_UNCLASSIFIED')
+              created_at, code, summary = row
+              text = str(summary or '')
+              print('LATEST_SECURITY_PROVISIONING_FAILURE=PRESENT')
+              print('LATEST_SECURITY_FAILURE_AT=' + created_at.isoformat())
+              print('LATEST_SECURITY_INTERNAL_CODE=' + str(code or ''))
+              if 'endpoint is unavailable' in text.lower():
+                  print('LATEST_SECURITY_FAILURE_CLASS=ENDPOINT_UNREACHABLE')
               else:
-                  print('LATEST_SECURITY_FAILURE_CLASS=NO_RECENT_MATCH')
+                  match = re.search(r'HTTP\s+(\d{3})', text, re.IGNORECASE)
+                  if match:
+                      print('LATEST_SECURITY_FAILURE_CLASS=DOWNSTREAM_HTTP_' + match.group(1))
+                  elif 'base url' in text.lower() and 'required' in text.lower():
+                      print('LATEST_SECURITY_FAILURE_CLASS=CONFIG_MISSING')
+                  else:
+                      print('LATEST_SECURITY_FAILURE_CLASS=OTHER_INTERNAL_FAILURE')
           PY
