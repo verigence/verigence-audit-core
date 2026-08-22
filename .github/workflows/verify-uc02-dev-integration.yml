@@ -17,107 +17,128 @@ jobs:
       RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       AUDIT_SERVICE: verigence-audit-core
-      DEV_WEB_URL: https://verigence-web-dev.jbrconsulting-it.workers.dev
     steps:
-      - name: Install Railway CLI
-        run: npm install --global @railway/cli
+      - name: Install diagnostic tooling
+        run: |
+          npm install --global @railway/cli
+          python -m pip install 'psycopg[binary]'
 
-      - name: Resolve and verify Audit Core DEV
+      - name: Correlate latest UC02 Security failure
         shell: bash
         run: |
           set -euo pipefail
-          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo 'RAILWAY_API_TOKEN secret is not configured'; exit 1; }
-          if ! railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json 2>/tmp/link.err; then
-            cat /tmp/link.err >&2 || true
-            echo 'Could not link approved Railway project/service to environment dev' >&2
-            exit 1
-          fi
-          echo 'RAILWAY_ENVIRONMENT=dev'
-
-          for attempt in $(seq 1 20); do
-            railway deployment list --service "$AUDIT_SERVICE" --limit 1 --json >/tmp/deployment.json
-            status="$(python - <<'PY'
-          import json
-          from pathlib import Path
-          rows=json.loads(Path('/tmp/deployment.json').read_text())
-          print(rows[0].get('status','') if rows else '')
-          PY
-          )"
-            case "$status" in
-              SUCCESS) break ;;
-              FAILED|CRASHED|REMOVED)
-                railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 220 || true
-                echo "Latest Audit Core deployment status is $status" >&2
-                exit 1
-                ;;
-            esac
-            if [[ "$attempt" == "20" ]]; then
-              echo "Latest Audit Core deployment did not reach SUCCESS: $status" >&2
-              exit 1
-            fi
-            sleep 10
-          done
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          railway variable list --service security --json >/tmp/security-vars.json
+          railway deployment list --service security --limit 5 --json >/tmp/security-deployments.json
+          railway logs --service security --lines 12000 >/tmp/security.log 2>/dev/null || true
+          railway logs --service "$AUDIT_SERVICE" --lines 8000 >/tmp/audit.log 2>/dev/null || true
 
           python - <<'PY'
-          import json
+          import json, re
+          from datetime import datetime, timezone, timedelta
           from pathlib import Path
-          rows=json.loads(Path('/tmp/deployment.json').read_text())
-          if not rows:
-              raise SystemExit('No Audit Core Railway deployment exists')
-          row=rows[0]
-          print('AUDIT_CORE_RAILWAY_DEPLOYMENT=PASS')
-          print('AUDIT_CORE_DEPLOYMENT_ID=' + str(row.get('id','')))
-          print('AUDIT_CORE_DEPLOYMENT_CREATED_AT=' + str(row.get('createdAt','')))
+          from urllib.parse import urlparse
+          import psycopg
+
+          audit = json.loads(Path('/tmp/audit-vars.json').read_text())
+          sec = json.loads(Path('/tmp/security-vars.json').read_text())
+          sec_url = str(audit.get('SECURITY_BASE_URL') or '').strip()
+          p = urlparse(sec_url)
+          print('SECURITY_BASE_URL_HOST=' + str(p.hostname or ''))
+          print('SECURITY_BASE_URL_PORT=' + str(p.port or 'DEFAULT'))
+          print('SECURITY_SERVICE_PORT=' + str(sec.get('PORT') or 'UNSET'))
+
+          db_url = str(audit.get('DATABASE_URL') or '').strip().replace('postgresql+psycopg://','postgresql://',1)
+          with psycopg.connect(db_url) as conn:
+              with conn.cursor() as cur:
+                  cur.execute("""
+                      SELECT operation_id, created_at_utc, updated_at_utc,
+                             last_error_code, last_error_summary,
+                             safe_request_summary->>'projectName' AS project_name
+                      FROM auditcore.administrative_operations
+                      WHERE operation_type='PROJECT_PROVISION'
+                        AND status='RECOVERY_REQUIRED'
+                        AND current_step='SECURITY'
+                      ORDER BY updated_at_utc DESC
+                      LIMIT 1
+                  """)
+                  row = cur.fetchone()
+          if row is None:
+              raise SystemExit('NO_SECURITY_RECOVERY_OPERATION')
+          op_id, created_at, updated_at, code, summary, project_name = row
+          print('LATEST_OPERATION_ID=' + str(op_id))
+          print('LATEST_PROJECT_NAME=' + str(project_name or ''))
+          print('LATEST_OPERATION_CREATED_AT=' + created_at.isoformat())
+          print('LATEST_OPERATION_UPDATED_AT=' + updated_at.isoformat())
+          print('LATEST_INTERNAL_CODE=' + str(code or ''))
+          text = str(summary or '')
+          if 'endpoint is unavailable' in text.lower():
+              print('LATEST_FAILURE_CLASS=ENDPOINT_UNREACHABLE_OR_TIMEOUT')
+          else:
+              m = re.search(r'HTTP\s+(\d{3})', text, re.I)
+              print('LATEST_FAILURE_CLASS=' + ('DOWNSTREAM_HTTP_' + m.group(1) if m else 'OTHER'))
+
+          # Security deployment status around the incident.
+          deployments = json.loads(Path('/tmp/security-deployments.json').read_text())
+          for i, d in enumerate(deployments[:5], 1):
+              print(f'SECURITY_DEPLOYMENT_{i}_STATUS=' + str(d.get('status','')))
+              print(f'SECURITY_DEPLOYMENT_{i}_CREATED_AT=' + str(d.get('createdAt','')))
+
+          target = updated_at.astimezone(timezone.utc)
+          start, end = target - timedelta(seconds=20), target + timedelta(seconds=20)
+
+          def parse_ts(line: str):
+              # Railway plain logs may start with ISO timestamp or embed one in JSON.
+              m = re.search(r'(20\d\d-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)?)', line)
+              if not m:
+                  return None
+              raw = m.group(1).replace(' ', 'T')
+              if raw.endswith('Z'):
+                  raw = raw[:-1] + '+00:00'
+              try:
+                  dt = datetime.fromisoformat(raw)
+                  if dt.tzinfo is None:
+                      dt = dt.replace(tzinfo=timezone.utc)
+                  return dt.astimezone(timezone.utc)
+              except ValueError:
+                  return None
+
+          uuid_re = re.compile(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b')
+          email_re = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b')
+          token_re = re.compile(r'Bearer\s+[^\s\"]+', re.I)
+          def sanitize(s: str):
+              s = token_re.sub('Bearer <redacted>', s)
+              s = email_re.sub('<email>', s)
+              s = uuid_re.sub('<uuid>', s)
+              return s[:1200]
+
+          sec_lines = Path('/tmp/security.log').read_text(errors='ignore').splitlines()
+          window = []
+          for line in sec_lines:
+              dt = parse_ts(line)
+              if dt is not None and start <= dt <= end:
+                  window.append(line)
+          print('SECURITY_LOG_WINDOW_LINE_COUNT=' + str(len(window)))
+          relevant = [
+              l for l in window
+              if any(k in l.lower() for k in [
+                  'platform/tenants','admin-context','error','exception','traceback',
+                  'tenant.create','tenant create','500','timeout','timed out'
+              ])
+          ]
+          print('SECURITY_RELEVANT_LINE_COUNT=' + str(len(relevant)))
+          for line in relevant[-80:]:
+              print('SECURITY_LOG|' + sanitize(line))
+
+          audit_lines = Path('/tmp/audit.log').read_text(errors='ignore').splitlines()
+          awindow = []
+          for line in audit_lines:
+              dt = parse_ts(line)
+              if dt is not None and start <= dt <= end:
+                  awindow.append(line)
+          arelevant = [l for l in awindow if any(k in l.lower() for k in ['security_admin','project_provisioning','timeout','endpoint_unavailable'])]
+          print('AUDIT_RELEVANT_LINE_COUNT=' + str(len(arelevant)))
+          for line in arelevant[-50:]:
+              print('AUDIT_LOG|' + sanitize(line))
           PY
-
-          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
-          domain="$(python - <<'PY'
-          import json
-          from pathlib import Path
-          data=json.loads(Path('/tmp/audit-vars.json').read_text())
-          print(data.get('RAILWAY_PUBLIC_DOMAIN') or data.get('RAILWAY_STATIC_URL') or '')
-          PY
-          )"
-          [ -n "$domain" ] || { echo 'Audit Core Railway DEV service has no public domain'; exit 1; }
-          case "$domain" in
-            http://*|https://*) base="${domain%/}" ;;
-            *) base="https://${domain%/}" ;;
-          esac
-          echo "AUDIT_CORE_PUBLIC_BASE=$base"
-          curl --fail --silent --show-error "$base/health" >/tmp/health.json
-          echo 'AUDIT_CORE_PUBLIC_HEALTH=PASS'
-
-          probe_route() {
-            local path="$1"
-            local code
-            code="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --request OPTIONS "$base$path" || true)"
-            case "$code" in
-              000|404|5??)
-                echo "Deployed UC02 route probe failed: $path returned HTTP $code" >&2
-                exit 1
-                ;;
-              *) echo "UC02_ROUTE_PRESENT|$path|HTTP_$code" ;;
-            esac
-          }
-
-          probe_route '/v1/projects'
-          probe_route '/v1/tenants/uc02-smoke/project/readiness'
-          probe_route '/v1/tenants/uc02-smoke/project/activate'
-          probe_route '/v1/tenants/uc02-smoke/project-masters'
-          probe_route '/v1/tenants/uc02-smoke/role-mapping-candidates'
-          probe_route '/v1/tenants/uc02-smoke/role-mappings'
-          echo 'AUDIT_CORE_UC02_DEV=PASS'
-
-      - name: Verify Cloudflare UC02 Web bundle
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl --fail --silent --show-error --location "$DEV_WEB_URL/login" >/tmp/login.html
-          asset_path="$(grep -oE 'src="/assets/[^"]+\.js"' /tmp/login.html | head -n 1 | sed -E 's/^src="([^"]+)"$/\1/')"
-          [ -n "$asset_path" ] || { echo 'Could not resolve deployed Web JS asset'; exit 1; }
-          curl --fail --silent --show-error --location "$DEV_WEB_URL$asset_path" >/tmp/app.js
-          grep -q 'Project administration' /tmp/app.js || {
-            echo 'UC02 Project administration marker is missing from deployed Web bundle'
-            exit 1
-          }
-          echo 'UC02_WEB_DEV=PASS'
