@@ -2,7 +2,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from audit_core.errors import ConflictError, NotFoundError, install_error_handlers
+from audit_core.errors import (
+    ConflictError,
+    DependencyUnavailableError,
+    NotFoundError,
+    install_error_handlers,
+)
 from audit_core.security import SecurityTokenError
 
 
@@ -34,6 +39,12 @@ def _app() -> FastAPI:
             detail="The resource version changed.",
         )
 
+    @app.get("/dependency")
+    def dependency() -> None:
+        raise DependencyUnavailableError(
+            detail="Project administration is temporarily unavailable. Please try again."
+        )
+
     @app.get("/system")
     def system() -> None:
         raise RuntimeError("sensitive internal failure")
@@ -48,6 +59,7 @@ def _app() -> FastAPI:
         ("/auth", 401, "VAC-AUTH-001"),
         ("/not-found", 404, "VAC-NF-001"),
         ("/conflict", 409, "VAC-CONFLICT-001"),
+        ("/dependency", 503, "VAC-SYS-002"),
         ("/system", 500, "VAC-SYS-001"),
     ],
 )
