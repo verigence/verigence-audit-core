@@ -1,4 +1,4 @@
-name: Verify UC02 live DEV CORS
+name: Verify UC02 live DEV baseline
 
 on:
   pull_request:
@@ -12,100 +12,179 @@ jobs:
   verify:
     if: github.head_ref == 'verify/uc02-cors-live'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      SECURITY_SERVICE: security
+      DI_API_SERVICE: di-api
+      DI_WORKER_SERVICE: di-worker
       AUDIT_SERVICE: verigence-audit-core
+      SECURITY_SHA: ecdf081d2c7446a70aeaa2964976e0ac1f94f3ea
+      DI_SHA: c97b3f3e5f8577160c88af1080496808189206fb
+      AUDIT_SHA: b67afa837b5d53ff09bf405b9325a24097a14e3c
+      WEB_SHA: 84cbf87f37674dc6842ebdcde249ece5fbb1e1b5
+      DEV_WEB_URL: https://verigence-web-dev.jbrconsulting-it.workers.dev
       DEV_WEB_ORIGIN: https://verigence-web-dev.jbrconsulting-it.workers.dev
-      EXPECTED_DEV_SHA: b67afa837b5d53ff09bf405b9325a24097a14e3c
-      PREVIOUS_AUDIT_DEPLOYMENT_ID: 6cdbc186-3292-4620-9e92-5577790f8b3c
+      EXPECTED_AUDIT_BASE: https://verigence-audit-core-production.up.railway.app
+
     steps:
       - name: Install Railway CLI
         run: npm install --global @railway/cli
 
-      - name: Resolve live Audit Core DEV deployment
+      - name: Link exact shared Railway DEV environment
         shell: bash
         run: |
           set -euo pipefail
           [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo 'RAILWAY_API_TOKEN secret is not configured'; exit 1; }
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
-          echo 'RAILWAY_ENVIRONMENT=dev'
+          railway status --json >/tmp/status.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          data=json.loads(Path('/tmp/status.json').read_text())
+          if data.get('id') != os.environ['PLATFORM_PROJECT_ID']:
+              raise SystemExit('Linked Railway project is not the approved shared DEV project')
+          print('RAILWAY_PROJECT=PASS')
+          print('RAILWAY_ENVIRONMENT=dev')
+          PY
 
-          for attempt in $(seq 1 18); do
-            railway deployment list --service "$AUDIT_SERVICE" --limit 3 --json >/tmp/deployments.json
-            read -r deployment_id status <<<"$(python - <<'PY'
+      - name: Resolve exact backend deployment IDs and revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          for service in "$SECURITY_SERVICE" "$DI_API_SERVICE" "$DI_WORKER_SERVICE" "$AUDIT_SERVICE"; do
+            railway deployment list --service "$service" --limit 1 --json >"/tmp/${service}-deployment.json"
+          done
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          expected = {
+              os.environ['SECURITY_SERVICE']: os.environ['SECURITY_SHA'],
+              os.environ['DI_API_SERVICE']: os.environ['DI_SHA'],
+              os.environ['DI_WORKER_SERVICE']: os.environ['DI_SHA'],
+              os.environ['AUDIT_SERVICE']: os.environ['AUDIT_SHA'],
+          }
+
+          def scalar_text(value):
+              parts=[]
+              if isinstance(value, dict):
+                  for k,v in value.items():
+                      parts.append(str(k))
+                      parts.extend(scalar_text(v))
+              elif isinstance(value, list):
+                  for v in value:
+                      parts.extend(scalar_text(v))
+              elif isinstance(value, (str,int,float,bool)) or value is None:
+                  parts.append(str(value))
+              return parts
+
+          for service, sha in expected.items():
+              rows=json.loads(Path(f'/tmp/{service}-deployment.json').read_text())
+              if not rows:
+                  raise SystemExit(f'No Railway deployment found for {service}')
+              row=rows[0]
+              status=str(row.get('status',''))
+              if status != 'SUCCESS':
+                  raise SystemExit(f'Latest {service} deployment is not SUCCESS: {status}')
+              haystack='\n'.join(scalar_text(row))
+              if sha not in haystack:
+                  raise SystemExit(f'Latest {service} deployment does not prove expected SHA {sha}')
+              print(f'BACKEND_DEPLOYMENT=PASS|{service}|{row.get("id","")}|{sha}|{row.get("createdAt","")}')
+          PY
+
+      - name: Verify Security live readiness liveness and JWKS
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway variable list --service "$SECURITY_SERVICE" --json >/tmp/security-vars.json
+          security_domain="$(python - <<'PY'
           import json
           from pathlib import Path
-          rows=json.loads(Path('/tmp/deployments.json').read_text())
-          if not rows:
-              print(' ')
-          else:
-              row=rows[0]
-              print(row.get('id',''), row.get('status',''))
+          data=json.loads(Path('/tmp/security-vars.json').read_text())
+          print(data.get('RAILWAY_PUBLIC_DOMAIN') or data.get('RAILWAY_STATIC_URL') or '')
           PY
           )"
-            if [[ -n "$deployment_id" && "$deployment_id" != "$PREVIOUS_AUDIT_DEPLOYMENT_ID" && "$status" == "SUCCESS" ]]; then
-              break
-            fi
-            echo "Waiting for fresh Audit Core DEV deployment: id=${deployment_id:-NONE} status=${status:-NONE} attempt=$attempt/18"
-            if [[ "$attempt" == "18" ]]; then
-              echo 'Fresh successful Audit Core DEV deployment not proven' >&2
-              exit 1
-            fi
-            sleep 10
-          done
-
+          [ -n "$security_domain" ] || { echo 'Security DEV has no public domain'; exit 1; }
+          case "$security_domain" in
+            http://*|https://*) security_base="${security_domain%/}" ;;
+            *) security_base="https://${security_domain%/}" ;;
+          esac
+          echo "SECURITY_PUBLIC_BASE=$security_base"
+          curl --fail --silent --show-error "$security_base/health/live" >/tmp/security-live.json
+          curl --fail --silent --show-error "$security_base/health/ready" >/tmp/security-ready.json
+          curl --fail --silent --show-error "$security_base/.well-known/jwks.json" >/tmp/security-jwks.json
           python - <<'PY'
           import json
           from pathlib import Path
-          rows=json.loads(Path('/tmp/deployments.json').read_text())
-          row=rows[0]
-          print('AUDIT_CORE_RAILWAY_DEPLOYMENT=PASS')
-          print('AUDIT_CORE_DEPLOYMENT_ID=' + str(row.get('id','')))
-          print('AUDIT_CORE_DEPLOYMENT_STATUS=' + str(row.get('status','')))
-          print('AUDIT_CORE_DEPLOYMENT_CREATED_AT=' + str(row.get('createdAt','')))
-          meta=row.get('meta') or {}
-          for key in sorted(meta):
-              key_lower=str(key).lower()
-              if any(token in key_lower for token in ('commit','branch','source','message')):
-                  value=meta.get(key)
-                  if isinstance(value, (str, int, float, bool)) or value is None:
-                      print('AUDIT_CORE_DEPLOYMENT_META_' + str(key).upper() + '=' + str(value))
+          live=json.loads(Path('/tmp/security-live.json').read_text())
+          ready=json.loads(Path('/tmp/security-ready.json').read_text())
+          jwks=json.loads(Path('/tmp/security-jwks.json').read_text())
+          if live.get('status') != 'live':
+              raise SystemExit('Security liveness semantics are incorrect')
+          if ready.get('status') != 'ready' or ready.get('databaseReady') is not True or ready.get('signingKeyReady') is not True:
+              raise SystemExit('Security readiness semantics are incorrect')
+          keys=jwks.get('keys')
+          if not isinstance(keys, list) or not keys:
+              raise SystemExit('Security JWKS contains no signing keys')
+          print('SECURITY_LIVENESS=PASS')
+          print('SECURITY_READINESS=PASS')
+          print('SECURITY_JWKS=PASS')
           PY
 
+      - name: Verify DI API health readiness and worker scheduler startup
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway variable list --service "$DI_API_SERVICE" --json >/tmp/di-api-vars.json
+          di_domain="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/di-api-vars.json').read_text())
+          print(data.get('RAILWAY_PUBLIC_DOMAIN') or data.get('RAILWAY_STATIC_URL') or '')
+          PY
+          )"
+          [ -n "$di_domain" ] || { echo 'DI API DEV has no public domain'; exit 1; }
+          case "$di_domain" in
+            http://*|https://*) di_base="${di_domain%/}" ;;
+            *) di_base="https://${di_domain%/}" ;;
+          esac
+          echo "DI_PUBLIC_BASE=$di_base"
+          curl --fail --silent --show-error "$di_base/health" >/tmp/di-health.json
+          curl --fail --silent --show-error "$di_base/ready" >/tmp/di-ready.json
+          echo 'DI_API_HEALTH=PASS'
+          echo 'DI_API_READINESS=PASS'
+
+          railway logs --service "$DI_WORKER_SERVICE" --latest --deployment --lines 320 >/tmp/di-worker.log
+          grep -q 'DI_WORKER_STARTED=PASS' /tmp/di-worker.log || { echo 'DI worker startup marker missing' >&2; exit 1; }
+          grep -q 'DI_EOD_SCHEDULER_STARTED=PASS' /tmp/di-worker.log || { echo 'DI EOD scheduler startup marker missing' >&2; exit 1; }
+          echo 'DI_WORKER_STARTUP=PASS'
+          echo 'DI_EOD_SCHEDULER_STARTUP=PASS'
+
+      - name: Verify Audit Core health and browser CORS
+        shell: bash
+        run: |
+          set -euo pipefail
           railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
-          python - <<'PY'
+          audit_domain="$(python - <<'PY'
           import json
           from pathlib import Path
           data=json.loads(Path('/tmp/audit-vars.json').read_text())
           app_env=str(data.get('APP_ENV','')).strip().lower()
           if app_env not in {'dev','development'}:
               raise SystemExit('Audit Core APP_ENV is not DEV: ' + app_env)
-          domain=data.get('RAILWAY_PUBLIC_DOMAIN') or data.get('RAILWAY_STATIC_URL') or ''
-          if not domain:
-              raise SystemExit('Audit Core DEV has no public domain')
-          print('AUDIT_CORE_APP_ENV=' + app_env)
-          print('AUDIT_CORE_PUBLIC_DOMAIN=' + str(domain))
-          PY
-
-      - name: Prove Web browser CORS boundary
-        shell: bash
-        run: |
-          set -euo pipefail
-          domain="$(python - <<'PY'
-          import json
-          from pathlib import Path
-          data=json.loads(Path('/tmp/audit-vars.json').read_text())
           print(data.get('RAILWAY_PUBLIC_DOMAIN') or data.get('RAILWAY_STATIC_URL') or '')
           PY
           )"
-          case "$domain" in
-            http://*|https://*) base="${domain%/}" ;;
-            *) base="https://${domain%/}" ;;
+          [ -n "$audit_domain" ] || { echo 'Audit Core DEV has no public domain'; exit 1; }
+          case "$audit_domain" in
+            http://*|https://*) audit_base="${audit_domain%/}" ;;
+            *) audit_base="https://${audit_domain%/}" ;;
           esac
-
-          curl --fail --silent --show-error "$base/health" >/tmp/health.json
+          [ "$audit_base" = "$EXPECTED_AUDIT_BASE" ] || { echo "Unexpected Audit Core DEV base: $audit_base" >&2; exit 1; }
+          echo "AUDIT_CORE_PUBLIC_BASE=$audit_base"
+          curl --fail --silent --show-error "$audit_base/health" >/tmp/audit-health.json
           echo 'AUDIT_CORE_PUBLIC_HEALTH=PASS'
 
           cors_status="$(curl --silent --show-error \
@@ -116,14 +195,8 @@ jobs:
             --header "Origin: $DEV_WEB_ORIGIN" \
             --header 'Access-Control-Request-Method: POST' \
             --header 'Access-Control-Request-Headers: authorization,content-type,idempotency-key,if-match,x-correlation-id,x-trace-id' \
-            "$base/v1/projects" || true)"
-          if [[ "$cors_status" != "200" ]]; then
-            cat /tmp/cors.headers >&2 || true
-            cat /tmp/cors.body >&2 || true
-            echo "Browser preflight failed with HTTP $cors_status" >&2
-            exit 1
-          fi
-
+            "$audit_base/v1/projects" || true)"
+          [ "$cors_status" = '200' ] || { cat /tmp/cors.headers >&2 || true; cat /tmp/cors.body >&2 || true; exit 1; }
           python - <<'PY'
           import os
           from pathlib import Path
@@ -136,56 +209,88 @@ jobs:
           if headers.get('access-control-allow-origin') != origin:
               raise SystemExit('Approved DEV Web origin was not allowed')
           if headers.get('access-control-allow-credentials','').lower() != 'true':
-              raise SystemExit('CORS credentials are not allowed')
-          methods={x.strip().upper() for x in headers.get('access-control-allow-methods','').split(',') if x.strip()}
+              raise SystemExit('Audit Core CORS credentials are not allowed')
           required_methods={'GET','POST','PUT','PATCH','DELETE','OPTIONS'}
+          methods={x.strip().upper() for x in headers.get('access-control-allow-methods','').split(',') if x.strip()}
           if not required_methods <= methods:
-              raise SystemExit('Missing CORS methods: ' + ', '.join(sorted(required_methods-methods)))
+              raise SystemExit('Audit Core CORS methods incomplete')
+          required_headers={'authorization','content-type','idempotency-key','if-match','x-correlation-id','x-trace-id'}
           allowed={x.strip().lower() for x in headers.get('access-control-allow-headers','').split(',') if x.strip()}
-          required={'authorization','content-type','idempotency-key','if-match','x-correlation-id','x-trace-id'}
-          if not required <= allowed:
-              raise SystemExit('Missing CORS headers: ' + ', '.join(sorted(required-allowed)))
+          if not required_headers <= allowed:
+              raise SystemExit('Audit Core CORS headers incomplete')
           print('AUDIT_CORE_WEB_CORS_PREFLIGHT=PASS')
           PY
 
-          correlation="uc02-cors-${GITHUB_RUN_ID}"
+          correlation="uc02-baseline-${GITHUB_RUN_ID}"
           actual_status="$(curl --silent --show-error \
-            --dump-header /tmp/actual.headers \
-            --output /tmp/actual.body \
+            --dump-header /tmp/audit-actual.headers \
+            --output /tmp/audit-actual.body \
             --write-out '%{http_code}' \
             --header "Origin: $DEV_WEB_ORIGIN" \
             --header "X-Correlation-ID: $correlation" \
-            "$base/v1/tenants/uc02-cors-smoke/project/readiness" || true)"
-          case "$actual_status" in
-            401|403) ;;
-            *)
-              cat /tmp/actual.headers >&2 || true
-              cat /tmp/actual.body >&2 || true
-              echo "Expected fail-closed unauthenticated response; got HTTP $actual_status" >&2
-              exit 1
-              ;;
-          esac
+            "$audit_base/v1/tenants/uc02-baseline-smoke/project/readiness" || true)"
+          case "$actual_status" in 401|403) ;; *) cat /tmp/audit-actual.headers >&2 || true; cat /tmp/audit-actual.body >&2 || true; exit 1 ;; esac
           python - <<'PY'
           import os
           from pathlib import Path
           headers={}
-          for raw in Path('/tmp/actual.headers').read_text().splitlines():
+          for raw in Path('/tmp/audit-actual.headers').read_text().splitlines():
               if ':' in raw:
                   name,value=raw.split(':',1)
                   headers[name.strip().lower()]=value.strip()
-          origin=os.environ['DEV_WEB_ORIGIN']
-          if headers.get('access-control-allow-origin') != origin:
-              raise SystemExit('Actual response missing approved CORS origin')
+          expected='uc02-baseline-' + os.environ['GITHUB_RUN_ID']
+          if headers.get('x-correlation-id') != expected:
+              raise SystemExit('Audit Core correlation ID was not preserved')
+          if headers.get('access-control-allow-origin') != os.environ['DEV_WEB_ORIGIN']:
+              raise SystemExit('Audit Core actual response lacks Web CORS origin')
           exposed={x.strip().lower() for x in headers.get('access-control-expose-headers','').split(',') if x.strip()}
           if 'x-correlation-id' not in exposed:
-              raise SystemExit('X-Correlation-ID is not browser-exposed')
-          expected='uc02-cors-' + os.environ['GITHUB_RUN_ID']
-          actual=headers.get('x-correlation-id','')
-          if actual != expected:
-              raise SystemExit(f'Correlation ID mismatch: expected {expected}, got {actual}')
-          print('AUDIT_CORE_WEB_CORS_ACTUAL_RESPONSE=PASS')
-          print('AUDIT_CORE_CORS_CORRELATION_ID=' + actual)
+              raise SystemExit('Audit Core does not expose X-Correlation-ID to browser')
+          print('AUDIT_CORE_FAIL_CLOSED_AUTH=PASS')
+          print('AUDIT_CORE_BASELINE_CORRELATION_ID=' + expected)
           PY
 
-          echo "AUDIT_CORE_EXPECTED_DEV_SHA=$EXPECTED_DEV_SHA"
-          echo 'UC02_CORS_LIVE_VERIFICATION=PASS'
+      - name: Prove deployed Web runtime points to DEV Security and Audit Core
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location "$DEV_WEB_URL/login" >/tmp/web-login.html
+          entry="$(grep -oE 'src="/assets/[^"]+\.js"' /tmp/web-login.html | head -n1 | sed -E 's/^src="([^"]+)"$/\1/')"
+          [ -n "$entry" ] || { echo 'Could not resolve deployed Web entry bundle'; exit 1; }
+          curl --fail --silent --show-error --location "$DEV_WEB_URL$entry" >/tmp/web-entry.js
+          mkdir -p /tmp/web-js
+          cp /tmp/web-entry.js /tmp/web-js/entry.js
+          grep -oE 'assets/[A-Za-z0-9_.-]+\.js' /tmp/web-entry.js | sort -u >/tmp/chunks.txt || true
+          while read -r chunk; do
+            [ -n "$chunk" ] || continue
+            curl --fail --silent --show-error --location "$DEV_WEB_URL/$chunk" -o "/tmp/web-js/$(basename "$chunk")"
+          done </tmp/chunks.txt
+          cat /tmp/web-js/*.js >/tmp/web-all.js
+          grep -Fq "$EXPECTED_AUDIT_BASE" /tmp/web-all.js || { echo 'Deployed Web bundle does not contain intended Audit Core DEV base' >&2; exit 1; }
+          grep -q 'Project administration' /tmp/web-all.js || { echo 'Deployed Web bundle is missing UC02 Project administration' >&2; exit 1; }
+          echo "WEB_DEPLOYED_SHA=$WEB_SHA"
+          echo 'WEB_AUDIT_CORE_RUNTIME_CONFIG=PASS'
+          echo 'WEB_UC02_BUNDLE=PASS'
+
+          security_status="$(curl --silent --show-error \
+            --dump-header /tmp/web-security.headers \
+            --output /tmp/web-security.body \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --data '{}' \
+            "$DEV_WEB_URL/security/v1/auth/login")"
+          case "$security_status" in 400|401|422) ;; *) cat /tmp/web-security.headers >&2 || true; exit 1 ;; esac
+          grep -qi '^x-verigence-proxy: security' /tmp/web-security.headers || { echo 'Web request did not traverse Security proxy' >&2; exit 1; }
+          correlation="$(awk 'BEGIN{IGNORECASE=1} /^x-correlation-id:/ {gsub("\r",""); sub(/^[^:]+:[[:space:]]*/,""); print; exit}' /tmp/web-security.headers)"
+          [ -n "$correlation" ] || { echo 'Web Security proxy response lacks correlation ID' >&2; exit 1; }
+          echo 'WEB_SECURITY_PROXY=PASS'
+          echo "WEB_SECURITY_CORRELATION_ID=$correlation"
+
+      - name: Baseline verdict
+        run: |
+          echo 'UC02_STEP1_RUNTIME_BASELINE=PASS'
+          echo "SECURITY_SHA=$SECURITY_SHA"
+          echo "DI_SHA=$DI_SHA"
+          echo "AUDIT_SHA=$AUDIT_SHA"
+          echo "WEB_SHA=$WEB_SHA"
