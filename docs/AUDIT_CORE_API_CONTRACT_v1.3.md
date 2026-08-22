@@ -36,7 +36,7 @@ Response:
 ]
 ```
 
-Only persisted Projects are returned. Ordering is deterministic by Project Name then Project Code.
+Only persisted Projects whose tracked initial `PROJECT_PROVISION` operation is completed are selectable. A legacy/pre-existing Project with no tracked initial provisioning operation may also be returned. A Project whose initial provisioning is `IN_PROGRESS` or `RECOVERY_REQUIRED` must not become selectable as a way to bypass its provisioning/retry path. Ordering is deterministic by Project Name then Project Code.
 
 Selecting one item does not create or copy state. Web sets the returned `tenantId` as its current business context and loads the existing tenant-scoped administration APIs.
 
