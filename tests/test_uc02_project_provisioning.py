@@ -32,13 +32,15 @@ class ControlledSecurityProvisioning:
     fail_list: bool = False
     create_calls: list[tuple[str, str, str]] = field(default_factory=list)
     list_calls: list[str] = field(default_factory=list)
+    timeout_seconds: list[float] = field(default_factory=list)
 
     def client_class(self):
         controller = self
 
         class Client:
-            def __init__(self, *, base_url: str) -> None:
+            def __init__(self, *, base_url: str, timeout_seconds: float = 5.0) -> None:
                 assert base_url == "https://security.test"
+                controller.timeout_seconds.append(timeout_seconds)
 
             def __enter__(self):
                 return self
@@ -224,6 +226,7 @@ def test_create_project_runs_security_audit_core_di_once_and_replays_same_operat
     assert body["errorCode"] is None
     assert body["errorMessage"] is None
     operation_id = body["operationId"]
+    assert setup["security"].timeout_seconds == [20.0]
 
     second = client.post(
         "/v1/projects",
