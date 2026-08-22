@@ -12,7 +12,12 @@ from sqlalchemy import Connection, text
 from audit_core.authorization import AuthorizationError
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_human_principal
-from audit_core.errors import AuditCoreError, ConflictError, DependencyUnavailableError, NotFoundError
+from audit_core.errors import (
+    AuditCoreError,
+    ConflictError,
+    DependencyUnavailableError,
+    NotFoundError,
+)
 from audit_core.idempotency import execute_idempotent_json_command
 from audit_core.observability import get_correlation_id
 from audit_core.security import HumanPrincipal
