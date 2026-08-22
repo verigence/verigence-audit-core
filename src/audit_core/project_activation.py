@@ -58,12 +58,41 @@ def activate_project(
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> ProjectActivationResponse:
-    # The lifecycle operation is naturally idempotent; the required key is retained at
-    # the browser contract boundary and Security activation is itself retried against
-    # the same canonical Tenant rather than creating a second resource.
+    # Idempotency is natural for the final ACTIVE state; no recovery workflow is used.
     del idempotency_key
     set_tenant_context(connection, tenant_id)
-    _project_status(connection, tenant_id)
+    current_status = _project_status(connection, tenant_id)
+    if current_status == "ACTIVE":
+        try:
+            with SecurityAdminClient(base_url=_security_base_url()) as client:
+                tenant = client.get_tenant(
+                    human_bearer_token=admin_request.bearer_token,
+                    tenant_id=tenant_id,
+                )
+        except SecurityAdminError as exc:
+            raise AuditCoreError(
+                error_code="VAC-SYS-001",
+                status_code=503,
+                title="Project activation unavailable",
+                detail="Project activation could not be verified. Please try again.",
+            ) from exc
+        if tenant.status != "ACTIVE":
+            raise ConflictError(
+                error_code="VAC-CONFLICT-001",
+                title="Project activation state is inconsistent",
+                detail="Project activation could not be verified. Please contact support.",
+            )
+        readiness = evaluate_project_readiness(
+            tenant_id=tenant_id,
+            admin_request=admin_request,
+            connection=connection,
+        )
+        return ProjectActivationResponse(
+            tenantId=tenant_id,
+            projectStatus="ACTIVE",
+            securityTenantStatus=tenant.status,
+            readiness=readiness,
+        )
 
     readiness = evaluate_project_readiness(
         tenant_id=tenant_id,
@@ -86,33 +115,8 @@ def activate_project(
             ),
         )
 
-    try:
-        with SecurityAdminClient(base_url=_security_base_url()) as client:
-            tenant = client.activate_tenant(
-                human_bearer_token=admin_request.bearer_token,
-                tenant_id=tenant_id,
-            )
-    except SecurityAdminError:
-        # Do not retain/chains the downstream exception. Administrative dependency
-        # details may contain implementation context and Audit Core's public problem
-        # response intentionally exposes only the stable dependency failure contract.
-        raise AuditCoreError(
-            error_code="VAC-SYS-001",
-            status_code=503,
-            title="Security activation unavailable",
-            detail="Security could not activate the Project Tenant. Audit Core remains unchanged.",
-        )
-
-    if tenant.status != "ACTIVE":
-        raise ConflictError(
-            error_code="VAC-CONFLICT-001",
-            title="Security Tenant is not active",
-            detail=(
-                "Security did not confirm ACTIVE Tenant state. "
-                "Audit Core remains unchanged."
-            ),
-        )
-
+    # Stage the Audit Core state in the request transaction first. The dependency
+    # transaction remains uncommitted until this function returns successfully.
     connection.execute(
         text(
             """
@@ -120,15 +124,35 @@ def activate_project(
             SET project_status='ACTIVE',
                 updated_by_actor_id=:actor_id,
                 updated_at_utc=now(),
-                version_no=CASE
-                    WHEN project_status='ACTIVE' THEN version_no
-                    ELSE version_no + 1
-                END
-            WHERE tenant_id=:tenant_id
+                version_no=version_no + 1
+            WHERE tenant_id=:tenant_id AND project_status<>'ACTIVE'
             """
         ),
         {"tenant_id": tenant_id, "actor_id": admin_request.user_id},
     )
+
+    try:
+        with SecurityAdminClient(base_url=_security_base_url()) as client:
+            tenant = client.activate_tenant(
+                human_bearer_token=admin_request.bearer_token,
+                tenant_id=tenant_id,
+            )
+    except SecurityAdminError as exc:
+        # Raising here causes get_connection()'s transaction context to rollback the
+        # staged Audit Core ACTIVE update. No RECOVERY_REQUIRED state is persisted.
+        raise AuditCoreError(
+            error_code="VAC-SYS-001",
+            status_code=503,
+            title="Project activation unavailable",
+            detail="Project activation could not be completed. Please try again.",
+        ) from exc
+
+    if tenant.status != "ACTIVE":
+        raise ConflictError(
+            error_code="VAC-CONFLICT-001",
+            title="Project activation was not completed",
+            detail="Project activation could not be completed. Please try again.",
+        )
 
     return ProjectActivationResponse(
         tenantId=tenant_id,
