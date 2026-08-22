@@ -7,7 +7,11 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import Engine, text
 
-from audit_core.dependencies import HumanAdminRequest, get_engine, require_super_admin_request
+from audit_core.dependencies import (
+    HumanAdminRequest,
+    get_engine,
+    require_super_admin_request,
+)
 
 router = APIRouter(prefix="/v1", tags=["project-reference-data"])
 
