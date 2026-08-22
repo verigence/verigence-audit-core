@@ -34,6 +34,7 @@ from audit_core.role_mapping_policy import install_role_mapping_policy
 from audit_core.tasks_api import router as task_router
 from audit_core.uc03_authorized_work_items import router as uc03_work_items_router
 from audit_core.uc03_booking_commands import router as uc03_booking_router
+from audit_core.uc03_document_assessments import router as uc03_document_assessments_router
 from audit_core.uc03_project_context import router as uc03_project_context_router
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
@@ -79,6 +80,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_project_context_router)
     application.include_router(uc03_work_items_router)
     application.include_router(uc03_booking_router)
+    application.include_router(uc03_document_assessments_router)
     application.include_router(readiness_router)
     application.include_router(project_activation_router)
     # Literal DI-owned Project Master and generic import routes must be registered
