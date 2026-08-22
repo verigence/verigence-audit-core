@@ -2,8 +2,8 @@
 
 **Document ID:** `VUC03-HO-002`  
 **Version:** `1.1`  
-**Status:** APPROVED EXECUTION STRUCTURE / SINGLE-BRANCH SEQUENTIAL IMPLEMENTATION  
-**Date:** 2026-08-22  
+**Status:** APPROVED EXECUTION STRUCTURE / C0 AUTOMATED + DEV EVIDENCE COMPLETE / HUMAN UAT PENDING  
+**Date:** 2026-08-23  
 **Supersedes:** `UC03_IMPLEMENTATION_HANDOFF_v1.0.md`  
 **Canonical implementation design:** `UC03_IMPLEMENTATION_DESIGN_v0.1.md`
 
@@ -249,10 +249,10 @@ New UC03-focused files are allowed where repository conventions justify them, bu
 
 Current migration series reaches `0009` on the frozen UC03 branch.
 
-Proposed C0 migration:
+Implemented C0 migration:
 
 ```text
-0010_uc03_workflow_foundation.py
+0010_uc03_c0_foundation.py
 ```
 
 Expected semantic scope:
@@ -311,6 +311,8 @@ Verify that existing UC02 role-mapping synchronization makes Audit Core `busines
 
 Do not change Security if that verification passes.
 
+C0 implementation/testing did not expose a missing Security backend capability. No UC03 Security branch or Security code change was introduced.
+
 ## 7.6 C0 acceptance gate
 
 C0 is closed only when:
@@ -324,6 +326,49 @@ C0 is closed only when:
 - landing uses `Delivery In Progress`, not `Delivery Today`;
 - UI uses approved Verigence logo;
 - no Booking/Delivery mutation flow has been prematurely implemented.
+
+## 7.7 C0 execution status — 23-Aug-2026
+
+**Checkpoint status:** AUTOMATED + DEV DEPLOYMENT EVIDENCE COMPLETE; HUMAN UAT PENDING. C0 is **not formally closed** and C1 Booking is **not authorized to start** until the remaining human UAT is explicitly accepted.
+
+Validated C0 implementation heads captured immediately before this closure-evidence documentation update:
+
+| Module | Validated C0 head | Evidence |
+|---|---|---|
+| Audit Core | `71bea92822d3de836faea8eb250dacab81cf4c4c` | Final-head PR CI run `32594620868` passed package build, Ruff, fresh Postgres migration through `0010_uc03_c0_foundation`, and `141 passed` tests. |
+| DI | `c899beb03c5fcbc84ffd41ed832451674b246668` | No C0 runtime change; branch head retained. |
+| Web/Android | `0cbb5794bee4d494c9ee45229484591233a91818` | Final-head Web CI run `32594624429` passed typecheck/build; Android validation run `32594624444` passed native configuration, `lintDebug`, `assembleDebug`, APK verification and artifact upload. |
+
+Deployment evidence:
+
+- Audit Core exact deployed application SHA: `ffa334fcd0791a51e9b83221ceafc1603fd05d49`.
+  - branch-safe validation/deployment run: `32594431799`;
+  - Railway DEV deployment ID: `3614f0e0-1472-47fd-9af6-a64f795931f8`;
+  - deployed smoke passed `/health`, unauthenticated presence checks for `/v1/me/projects`, `/v1/tenants/{tenantId}/uc03/landing-metrics`, `/v1/tenants/{tenantId}/uc03/work-items`, and approved DEV Web-origin CORS.
+  - final validated Audit Core head `71bea928...` is one cleanup commit after the deployed SHA; the only difference is removal of the temporary C0 branch deployment workflow, with no application/runtime file change.
+- Web exact deployed application SHA: `771d01396caa178d721f615fb1bbd36cae653a4c`.
+  - branch-safe Web DEV validation/deployment run: `32594494424`;
+  - Cloudflare DEV version ID: `8a5d5ef0-dc46-4e84-87d1-310303c1cfc5`;
+  - deployed asset hashes/markers for Project discovery, landing metrics, work list, `Delivery In Progress` wording and approved Verigence logo passed; Security proxy smoke passed.
+  - final validated Web head `0cbb5794...` is one cleanup commit after the deployed SHA; the only difference is removal of the temporary C0 Web deployment workflow, with no application/runtime file change.
+- Android final-head artifact:
+  - workflow run `32594624444`;
+  - artifact `verigence-uc03-c0-android-debug`, artifact ID `9481252665`;
+  - APK SHA-256 `0c287c03ce28af417ea5b01f8662215d8f276cc7eb9d0eb0ef477552f6c9ef30`;
+  - artifact ZIP digest `sha256:20900a7c6101041dc21a78c577f2fcc85cc871193fba0ed0d78cbc7d7c84b09b`.
+
+Human UAT is deliberately **PENDING**, not inferred from CI. A human must still exercise the deployed C0 flow with representative accounts/data for:
+
+- zero-, one- and multiple-Project behavior;
+- different operating roles across Projects;
+- Project switching with no stale Dealer/Outlet/case/query data exposure;
+- landing metrics and latest-10 list presentation;
+- All/Bookings/Deliveries filtering, date-range behavior and Previous/Next paging;
+- phone/tablet/Desktop usability and approved Verigence identity treatment.
+
+Detailed C0 evidence is recorded in `docs/uc-003-booking-delivery-audit/status/UC03_C0_FOUNDATION.md`.
+
+The documentation commit(s) that add this evidence necessarily advance the Audit Core branch beyond the validated C0 application head above. They are documentation-only; before C1 begins, inspect the live branch head as required by Section 6.
 
 ---
 
@@ -683,6 +728,7 @@ Expected API groups:
 
 ```text
 GET /v1/me/projects
+GET /v1/tenants/{tenantId}/uc03/landing-metrics
 GET /v1/tenants/{tenantId}/uc03/work-items
 ```
 
@@ -720,7 +766,7 @@ history/timeline where separate read is needed
 Recommended sequence, all on the same UC03 branch:
 
 ```text
-0010_uc03_workflow_foundation.py
+0010_uc03_c0_foundation.py
 0011_uc03_booking_capture.py
 0012_uc03_delivery_capture.py
 0013_uc03_audit_flag_events.py
