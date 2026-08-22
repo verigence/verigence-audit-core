@@ -392,28 +392,40 @@ def list_work_items(
                             OR (:work_type = 'DELIVERY' AND has_delivery)
                         )
                         AND (
-                            (:from_date IS NULL AND :to_date IS NULL)
+                            (CAST(:from_date AS date) IS NULL AND CAST(:to_date AS date) IS NULL)
                             OR (
                                 :work_type IN ('ALL','BOOKING')
                                 AND has_booking
                                 AND booking_business_date IS NOT NULL
-                                AND (:from_date IS NULL OR booking_business_date >= :from_date)
-                                AND (:to_date IS NULL OR booking_business_date <= :to_date)
+                                AND (
+                                    CAST(:from_date AS date) IS NULL
+                                    OR booking_business_date >= CAST(:from_date AS date)
+                                )
+                                AND (
+                                    CAST(:to_date AS date) IS NULL
+                                    OR booking_business_date <= CAST(:to_date AS date)
+                                )
                             )
                             OR (
                                 :work_type IN ('ALL','DELIVERY')
                                 AND has_delivery
                                 AND delivery_business_date IS NOT NULL
-                                AND (:from_date IS NULL OR delivery_business_date >= :from_date)
-                                AND (:to_date IS NULL OR delivery_business_date <= :to_date)
+                                AND (
+                                    CAST(:from_date AS date) IS NULL
+                                    OR delivery_business_date >= CAST(:from_date AS date)
+                                )
+                                AND (
+                                    CAST(:to_date AS date) IS NULL
+                                    OR delivery_business_date <= CAST(:to_date AS date)
+                                )
                             )
                         )
                         AND (
-                            :cursor_at IS NULL
-                            OR latest_activity_at_utc < :cursor_at
+                            CAST(:cursor_at AS timestamptz) IS NULL
+                            OR latest_activity_at_utc < CAST(:cursor_at AS timestamptz)
                             OR (
-                                latest_activity_at_utc = :cursor_at
-                                AND journey_id < :cursor_journey_id
+                                latest_activity_at_utc = CAST(:cursor_at AS timestamptz)
+                                AND journey_id < CAST(:cursor_journey_id AS uuid)
                             )
                         )
                 )
