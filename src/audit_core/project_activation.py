@@ -8,6 +8,7 @@ import structlog
 from fastapi import APIRouter, Depends, Header
 from pydantic import BaseModel
 from sqlalchemy import Connection, Engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import (
@@ -220,7 +221,7 @@ def activate_project(
 
         try:
             transaction.commit()
-        except Exception as exc:
+        except SQLAlchemyError as exc:
             if transaction.is_active:
                 transaction.rollback()
             _compensate_activation_or_raise(
