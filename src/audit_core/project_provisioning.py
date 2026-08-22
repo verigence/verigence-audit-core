@@ -257,9 +257,9 @@ def _compensate_new_project(
     *,
     tenant_id: str,
     human_token: str,
-    di_committed: bool,
+    di_cleanup_required: bool,
 ) -> None:
-    if di_committed:
+    if di_cleanup_required:
         _delete_di_provisioning(
             base_url=_di_base_url(),
             token=human_token,
@@ -324,7 +324,7 @@ def create_project(
         ) from exc
 
     existing_project = _project_exists(engine, tenant.tenant_id)
-    di_committed = False
+    di_cleanup_required = False
     connection = engine.connect()
     transaction = connection.begin()
     try:
@@ -334,6 +334,10 @@ def create_project(
             request=request,
             actor_id=admin_request.user_id,
         )
+        # Once the DI request is attempted, its transaction may commit even if the
+        # HTTP response is lost. Its compensation DELETE is idempotent for zero state,
+        # so treat every attempted DI provisioning call as requiring cleanup on failure.
+        di_cleanup_required = True
         with DiClient(base_url=di_url) as client:
             di_result = client.ensure_project_provisioning(
                 human_token=admin_request.bearer_token,
@@ -342,7 +346,6 @@ def create_project(
             )
         if di_result.get("provisioningStatus") != "READY":
             raise RuntimeError("DI provisioning did not reach READY state")
-        di_committed = True
         transaction.commit()
     except Exception as exc:
         if transaction.is_active:
@@ -357,7 +360,7 @@ def create_project(
                 _compensate_new_project(
                     tenant_id=tenant.tenant_id,
                     human_token=admin_request.bearer_token,
-                    di_committed=di_committed,
+                    di_cleanup_required=di_cleanup_required,
                 )
             except Exception as compensation_exc:
                 logger.critical(
