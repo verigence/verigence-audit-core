@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from typing import Annotated, Any, Literal
 from uuid import UUID
@@ -436,52 +437,118 @@ def _resume(
             status=str(receipt["status"]),
         )
 
-    if current.audit_core_receipt is None:
+    audit_receipt = current.audit_core_receipt
+    existing_di_receipt = current.di_receipt
+    di_receipt = (
+        existing_di_receipt
+        if existing_di_receipt is not None
+        and existing_di_receipt.get("provisioningStatus") == "READY"
+        else None
+    )
+    need_audit_core = audit_receipt is None
+    need_di = di_receipt is None
+    audit_error: Exception | None = None
+    di_error: Exception | None = None
+
+    def run_audit_core_projection() -> dict[str, Any]:
+        return _ensure_project_projection(
+            engine,
+            tenant=tenant,
+            request=request,
+            actor_id=admin_request.user_id,
+        )
+
+    def run_di_provisioning() -> dict[str, Any]:
+        with DiClient(base_url=_di_base_url()) as client:
+            return client.ensure_project_provisioning(
+                human_token=admin_request.bearer_token,
+                tenant_id=tenant.tenant_id,
+                idempotency_key=current.idempotency_key,
+            )
+
+    if need_audit_core and need_di:
+        with ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="uc02-project-provision",
+        ) as pool:
+            audit_future = pool.submit(run_audit_core_projection)
+            di_future = pool.submit(run_di_provisioning)
+            try:
+                audit_receipt = audit_future.result()
+            except Exception as exc:  # noqa: BLE001 - durable distributed recovery boundary
+                audit_error = exc
+            try:
+                di_receipt = di_future.result()
+            except Exception as exc:  # noqa: BLE001 - durable distributed recovery boundary
+                di_error = exc
+    elif need_audit_core:
         try:
-            audit_receipt = _ensure_project_projection(
-                engine,
-                tenant=tenant,
-                request=request,
-                actor_id=admin_request.user_id,
-            )
+            audit_receipt = run_audit_core_projection()
         except Exception as exc:  # noqa: BLE001 - durable distributed recovery boundary
-            return _mark_recovery(
-                engine,
-                operation=current,
-                step="AUDIT_CORE",
-                code="AUDIT_CORE_PROJECTION_FAILED",
-                summary=str(exc),
-            )
+            audit_error = exc
+    elif need_di:
+        try:
+            di_receipt = run_di_provisioning()
+        except Exception as exc:  # noqa: BLE001 - durable distributed recovery boundary
+            di_error = exc
+
+    if audit_receipt is not None or di_receipt is not None:
         update_administrative_operation(
             engine,
             operation_id=current.operation_id,
             tenant_id=tenant.tenant_id,
             status="RUNNING",
-            current_step="DI",
+            current_step="AUDIT_CORE" if audit_error is not None else "DI",
             audit_core_receipt=audit_receipt,
+            di_receipt=di_receipt,
+            last_error_code=None,
+            last_error_summary=None,
         )
         current = get_administrative_operation(
             engine, operation_id=current.operation_id, operation_type=_OPERATION_TYPE
         )
         if current is None:
-            raise RuntimeError("Provisioning operation disappeared after Audit Core step")
+            raise RuntimeError("Provisioning operation disappeared after parallel branch update")
 
-    try:
-        with DiClient(base_url=_di_base_url()) as client:
-            di_receipt = client.ensure_project_provisioning(
-                human_token=admin_request.bearer_token,
-                tenant_id=tenant.tenant_id,
-                idempotency_key=current.idempotency_key,
-            )
-    except (DiClientError, RuntimeError) as exc:
-        internal_code = exc.code if isinstance(exc, DiClientError) else "DI_CONFIGURATION_FAILED"
+    if audit_error is not None:
+        return _mark_recovery(
+            engine,
+            operation=current,
+            step="AUDIT_CORE",
+            code="AUDIT_CORE_PROJECTION_FAILED",
+            summary=str(audit_error),
+        )
+
+    if di_error is not None:
+        internal_code = (
+            di_error.code if isinstance(di_error, DiClientError) else "DI_CONFIGURATION_FAILED"
+        )
         return _mark_recovery(
             engine,
             operation=current,
             step="DI",
             code=internal_code,
-            summary=str(exc),
+            summary=str(di_error),
         )
+
+    if audit_receipt is None:
+        return _mark_recovery(
+            engine,
+            operation=current,
+            step="AUDIT_CORE",
+            code="AUDIT_CORE_PROJECTION_FAILED",
+            summary="Audit Core Project projection did not produce a durable receipt.",
+        )
+
+    if di_receipt is None:
+        return _mark_recovery(
+            engine,
+            operation=current,
+            step="DI",
+            code="DI_CONFIGURATION_FAILED",
+            summary="DI provisioning did not produce a durable receipt.",
+        )
+
     di_ready = di_receipt.get("provisioningStatus") == "READY"
     update_administrative_operation(
         engine,
@@ -489,6 +556,7 @@ def _resume(
         tenant_id=tenant.tenant_id,
         status="COMPLETED" if di_ready else "RECOVERY_REQUIRED",
         current_step="COMPLETE" if di_ready else "DI",
+        audit_core_receipt=audit_receipt,
         di_receipt=di_receipt,
         last_error_code=None if di_ready else "DI_PROVISIONING_INCOMPLETE",
         last_error_summary=None if di_ready else "DI provisioning is not ready yet.",
@@ -498,7 +566,7 @@ def _resume(
         engine, operation_id=current.operation_id, operation_type=_OPERATION_TYPE
     )
     if refreshed is None:
-        raise RuntimeError("Provisioning operation disappeared after DI step")
+        raise RuntimeError("Provisioning operation disappeared after parallel completion update")
     return refreshed
 
 
