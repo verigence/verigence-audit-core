@@ -10,6 +10,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import Connection, Engine, create_engine, text
 
 from audit_core.authorization import AuthorizationError
+from audit_core.errors import DependencyUnavailableError
 from audit_core.security import (
     HumanPrincipal,
     Principal,
@@ -99,13 +100,22 @@ def get_human_admin_request(
 ) -> HumanAdminRequest:
     security_base_url = os.environ.get("SECURITY_BASE_URL", "").strip()
     if not security_base_url:
-        raise RuntimeError("SECURITY_BASE_URL is required for UC02 administration")
+        logger.error("security_admin_context_failed", reason="security_base_url_missing")
+        raise DependencyUnavailableError(
+            detail="Project administration is temporarily unavailable. Please try again."
+        )
     try:
         with SecurityAdminClient(base_url=security_base_url) as client:
             context = client.get_admin_context(human_bearer_token=bearer_token)
     except SecurityAdminError as exc:
-        logger.warning("security_admin_context_failed", reason=str(exc))
-        raise SecurityTokenError("Security administrative context is unavailable") from exc
+        logger.warning(
+            "security_admin_context_failed",
+            reason=str(exc),
+            downstream_http_status=exc.http_status,
+        )
+        raise DependencyUnavailableError(
+            detail="Project administration is temporarily unavailable. Please try again."
+        ) from exc
     if context.user_id != human_principal.subject:
         raise SecurityTokenError("Security administrative USER does not match authenticated USER")
     return HumanAdminRequest(
