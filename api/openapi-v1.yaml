@@ -119,17 +119,41 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Project'}
         default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/uc03/landing-metrics:
+    get:
+      operationId: getUc03LandingMetrics
+      description: >-
+        Returns the four C0 landing counters for the authenticated USER within the selected
+        Project and current Audit Core business-assignment scope. The Security human JWT is
+        identity-only; Audit Core obtains a synchronous Security authorization decision for
+        audit.journey.read before applying Dealer/Outlet business scope. Bookings In Progress
+        counts BOOKING_STARTED and BOOKING_IN_PROGRESS. Delivery In Progress counts
+        DELIVERY_STARTED and DELIVERY_IN_PROGRESS. Needs Attention is the distinct case count
+        with at least one OPEN or ACKNOWLEDGED finding. Audit Flags is the OPEN/ACKNOWLEDGED
+        finding count. Later UC03 checkpoints may broaden Needs Attention only through an
+        explicit contract change.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+      responses:
+        '200':
+          description: UC03 Project landing counters
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Uc03LandingMetrics'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
   /tenants/{tenantId}/uc03/work-items:
     get:
       operationId: listUc03WorkItems
       description: >-
         Returns the latest authorized UC03 Booking/Delivery work items for the selected Project.
-        Results are business-assignment scoped, ordered by latestActivityAtUtc then journeyId,
-        and limited to at most 10 rows per page. Date filters use the Project timezone. Booking
-        date precedence is source Booking date, then Booking first-start event date, then Booking
-        record date. Delivery date precedence is actual-delivered date, then Delivery first-start
-        event date, then Delivery record date. For workType=ALL a case is returned once when either
-        applicable stage falls in the requested range.
+        The Security human JWT proves global USER identity only; Audit Core obtains a synchronous
+        Security authorization decision for audit.journey.read and then enforces current
+        business_assignments Dealer/Outlet scope. Results are ordered by latestActivityAtUtc then
+        journeyId and limited to at most 10 rows per page. Date filters use the Project timezone.
+        Booking date precedence is source Booking date, then Booking first-start event date, then
+        Booking record date. Delivery date precedence is actual-delivered date, then Delivery
+        first-start event date, then Delivery record date. For workType=ALL a case is returned once
+        when either applicable stage falls in the requested range.
       parameters:
         - $ref: '#/components/parameters/TenantId'
         - name: workType
@@ -381,7 +405,9 @@ components:
         projectName: {type: string}
         projectStatus: {type: string, enum: [ACTIVE]}
         timezoneName: {type: string}
-        operatingRole: {type: string}
+        operatingRole:
+          type: string
+          enum: [PC, TL, PM, CRM, Executive]
         scope: {$ref: '#/components/schemas/ProjectScopeSummary'}
     ProjectScopeSummary:
       type: object
@@ -390,6 +416,20 @@ components:
         allDealers: {type: boolean}
         dealerCount: {type: integer, minimum: 0}
         outletCount: {type: integer, minimum: 0}
+    Uc03LandingMetrics:
+      type: object
+      required: [bookingsInProgress, deliveryInProgress, needsAttention, auditFlags]
+      properties:
+        bookingsInProgress: {type: integer, minimum: 0}
+        deliveryInProgress: {type: integer, minimum: 0}
+        needsAttention:
+          type: integer
+          minimum: 0
+          description: Distinct authorized cases with at least one OPEN or ACKNOWLEDGED finding in C0.
+        auditFlags:
+          type: integer
+          minimum: 0
+          description: OPEN and ACKNOWLEDGED finding count in the authorized Project scope.
     Uc03StageSummary:
       type: object
       required: [businessStatus, auditState, auditStatus, businessDate]
