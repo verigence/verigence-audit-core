@@ -42,40 +42,6 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ProjectProvisioning'}
-        '202':
-          description: Project provisioning is in progress or requires recovery
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/ProjectProvisioning'}
-        default: {$ref: '#/components/responses/ProblemResponse'}
-  /project-provisioning-operations/{operationId}:
-    get:
-      operationId: getProjectProvisioningOperation
-      parameters:
-        - $ref: '#/components/parameters/OperationId'
-      responses:
-        '200':
-          description: Project provisioning operation
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/ProjectProvisioning'}
-        default: {$ref: '#/components/responses/ProblemResponse'}
-  /project-provisioning-operations/{operationId}/retry:
-    post:
-      operationId: retryProjectProvisioningOperation
-      parameters:
-        - $ref: '#/components/parameters/OperationId'
-      responses:
-        '200':
-          description: Project provisioning recovered and completed
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/ProjectProvisioning'}
-        '202':
-          description: Project provisioning still requires recovery
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/ProjectProvisioning'}
         default: {$ref: '#/components/responses/ProblemResponse'}
   /project-reference-data:
     get:

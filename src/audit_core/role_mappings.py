@@ -6,7 +6,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, Depends, Header, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, Engine, text
 
@@ -24,16 +24,11 @@ from audit_core.dependencies import (
     get_engine,
     require_super_admin_request,
 )
-from audit_core.errors import (
-    AuditCoreError,
-    BusinessValidationError,
-    NotFoundError,
-)
+from audit_core.errors import AuditCoreError, BusinessValidationError, NotFoundError
 from audit_core.observability import get_correlation_id
 from audit_core.security_integration import SecurityAdminClient, SecurityAdminError
 
 logger = structlog.get_logger(__name__)
-
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["role-mapping"])
 
 OperatingRole = Literal["PC", "TL", "PM", "CRM", "Executive"]
@@ -63,7 +58,7 @@ class RoleMappingResponse(BaseModel):
 
 class RoleMappingMutationResponse(BaseModel):
     operationId: UUID
-    operationStatus: Literal["COMPLETED", "RECOVERY_REQUIRED"]
+    operationStatus: Literal["COMPLETED"]
     mapping: RoleMappingResponse | None
 
 
@@ -87,12 +82,14 @@ def _require_project(connection: Connection, tenant_id: str) -> None:
         )
 
 
-def _dependency_unavailable() -> AuditCoreError:
+def _dependency_unavailable(
+    detail: str = "Project administration is temporarily unavailable.",
+) -> AuditCoreError:
     return AuditCoreError(
         error_code="VAC-SYS-002",
         status_code=503,
         title="Dependency unavailable",
-        detail="Security administration is temporarily unavailable.",
+        detail=detail,
     )
 
 
@@ -120,8 +117,7 @@ def _active_assignment_rows(
         connection.execute(
             text(
                 "SELECT assignment_id, security_actor_id, business_role_code, "
-                "dealer_id, outlet_id "
-                "FROM auditcore.business_assignments WHERE "
+                "dealer_id, outlet_id FROM auditcore.business_assignments WHERE "
                 + " AND ".join(clauses)
                 + " ORDER BY security_actor_id, assignment_id"
             ),
@@ -198,14 +194,22 @@ def _get_mapping(
     tenant_id: str,
     user_id: str,
 ) -> RoleMappingResponse | None:
-    rows = _active_assignment_rows(
-        connection,
-        tenant_id=tenant_id,
-        user_id=user_id,
-    )
+    rows = _active_assignment_rows(connection, tenant_id=tenant_id, user_id=user_id)
     if not rows:
         return None
     return _mapping_from_rows(user_id, rows)
+
+
+def _read_mapping(
+    engine: Engine,
+    tenant_id: str,
+    user_id: str,
+) -> RoleMappingResponse | None:
+    with engine.begin() as connection:
+        connection.execute(text(f"SET LOCAL ROLE {_RUNTIME_ROLE}"))
+        set_tenant_context(connection, tenant_id)
+        _require_project(connection, tenant_id)
+        return _get_mapping(connection, tenant_id, user_id)
 
 
 def _resolve_scope(
@@ -233,11 +237,9 @@ def _resolve_scope(
                 detail=f"{body.operatingRole} Role Mapping is Project-wide."
             )
     elif outlet_ids:
-        raise BusinessValidationError(
-            detail="CRM Role Mapping does not accept Outlet IDs."
-        )
+        raise BusinessValidationError(detail="CRM Role Mapping does not accept Outlet IDs.")
 
-    with _runtime_transaction(engine) as connection:
+    with engine.begin() as connection:
         connection.execute(text(f"SET LOCAL ROLE {_RUNTIME_ROLE}"))
         set_tenant_context(connection, tenant_id)
         _require_project(connection, tenant_id)
@@ -248,7 +250,7 @@ def _resolve_scope(
                 dealer_id = connection.execute(
                     text(
                         "SELECT dealer_id FROM auditcore.dealer_outlets "
-                        "WHERE tenant_id = :tenant_id AND outlet_id = :outlet_id"
+                        "WHERE tenant_id=:tenant_id AND outlet_id=:outlet_id"
                     ),
                     {"tenant_id": tenant_id, "outlet_id": outlet_id},
                 ).scalar_one_or_none()
@@ -264,7 +266,7 @@ def _resolve_scope(
                 exists = connection.execute(
                     text(
                         "SELECT 1 FROM auditcore.dealers "
-                        "WHERE tenant_id = :tenant_id AND dealer_id = :dealer_id"
+                        "WHERE tenant_id=:tenant_id AND dealer_id=:dealer_id"
                     ),
                     {"tenant_id": tenant_id, "dealer_id": dealer_id},
                 ).scalar_one_or_none()
@@ -303,15 +305,11 @@ def _replace_assignments(
     scopes: list[tuple[UUID | None, UUID | None]],
     actor_user_id: str,
 ) -> bool:
-    with _runtime_transaction(engine) as connection:
+    with engine.begin() as connection:
         connection.execute(text(f"SET LOCAL ROLE {_RUNTIME_ROLE}"))
         set_tenant_context(connection, tenant_id)
         _require_project(connection, tenant_id)
-        current = _active_assignment_rows(
-            connection,
-            tenant_id=tenant_id,
-            user_id=user_id,
-        )
+        current = _active_assignment_rows(connection, tenant_id=tenant_id, user_id=user_id)
         current_signature = sorted(
             [
                 (
@@ -323,20 +321,16 @@ def _replace_assignments(
             ],
             key=str,
         )
-        desired_signature = _desired_signature(role, scopes)
-        if current_signature == desired_signature:
+        if current_signature == _desired_signature(role, scopes):
             return False
 
         connection.execute(
             text(
                 """
                 UPDATE auditcore.business_assignments
-                SET assignment_status = 'INACTIVE',
-                    effective_to = now(),
-                    updated_at_utc = now()
-                WHERE tenant_id = :tenant_id
-                  AND security_actor_id = :user_id
-                  AND assignment_status = 'ACTIVE'
+                SET assignment_status='INACTIVE', effective_to=now(), updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND security_actor_id=:user_id
+                  AND assignment_status='ACTIVE'
                   AND (effective_to IS NULL OR effective_to > now())
                 """
             ),
@@ -350,8 +344,7 @@ def _replace_assignments(
                         tenant_id, security_actor_id, business_role_code,
                         dealer_id, outlet_id, created_by_actor_id
                     ) VALUES (
-                        :tenant_id, :user_id, :role,
-                        :dealer_id, :outlet_id, :actor_user_id
+                        :tenant_id, :user_id, :role, :dealer_id, :outlet_id, :actor_user_id
                     )
                     """
                 ),
@@ -367,13 +360,8 @@ def _replace_assignments(
         return True
 
 
-def _deactivate_assignments(
-    engine: Engine,
-    *,
-    tenant_id: str,
-    user_id: str,
-) -> int:
-    with _runtime_transaction(engine) as connection:
+def _deactivate_assignments(engine: Engine, *, tenant_id: str, user_id: str) -> int:
+    with engine.begin() as connection:
         connection.execute(text(f"SET LOCAL ROLE {_RUNTIME_ROLE}"))
         set_tenant_context(connection, tenant_id)
         _require_project(connection, tenant_id)
@@ -381,12 +369,9 @@ def _deactivate_assignments(
             text(
                 """
                 UPDATE auditcore.business_assignments
-                SET assignment_status = 'INACTIVE',
-                    effective_to = now(),
-                    updated_at_utc = now()
-                WHERE tenant_id = :tenant_id
-                  AND security_actor_id = :user_id
-                  AND assignment_status = 'ACTIVE'
+                SET assignment_status='INACTIVE', effective_to=now(), updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND security_actor_id=:user_id
+                  AND assignment_status='ACTIVE'
                   AND (effective_to IS NULL OR effective_to > now())
                 """
             ),
@@ -395,81 +380,100 @@ def _deactivate_assignments(
         return int(result.rowcount or 0)
 
 
+def _raise_security_error(exc: SecurityAdminError) -> None:
+    if exc.http_status == 401:
+        raise AuditCoreError(
+            error_code="VAC-AUTH-001",
+            status_code=401,
+            title="Authentication required",
+            detail="Authentication is required for this administrative operation.",
+        ) from exc
+    if exc.http_status == 403:
+        raise AuthorizationError(
+            error_code="VAC-AUTH-002",
+            status_code=403,
+            title="Permission denied",
+        ) from exc
+    if exc.http_status is not None and exc.http_status < 500:
+        raise BusinessValidationError(
+            detail="The requested role mapping could not be applied."
+        ) from exc
+    raise _dependency_unavailable(
+        "Role mapping could not be completed. Please try again."
+    ) from exc
+
+
+def _restore_security_role(
+    *,
+    admin_request: HumanAdminRequest,
+    tenant_id: str,
+    user_id: str,
+    previous: RoleMappingResponse | None,
+) -> None:
+    with SecurityAdminClient(base_url=_security_base_url()) as client:
+        if previous is None:
+            result = client.remove_operating_role(
+                human_bearer_token=admin_request.bearer_token,
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+            if result.tenant_id != tenant_id or result.user_id != user_id:
+                raise RuntimeError(
+                    "Security compensation receipt does not match role removal"
+                )
+        else:
+            result = client.set_operating_role(
+                human_bearer_token=admin_request.bearer_token,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                role_key=previous.operatingRole,
+            )
+            if (
+                result.tenant_id != tenant_id
+                or result.user_id != user_id
+                or result.role_key != previous.operatingRole
+            ):
+                raise RuntimeError(
+                    "Security compensation receipt does not match prior role"
+                )
+
+
 def _operation_response(
     operation: AdministrativeOperation,
     *,
-    status: Literal["COMPLETED", "RECOVERY_REQUIRED"],
     mapping: RoleMappingResponse | None,
 ) -> RoleMappingMutationResponse:
     return RoleMappingMutationResponse(
         operationId=UUID(operation.operation_id),
-        operationStatus=status,
+        operationStatus="COMPLETED",
         mapping=mapping,
     )
 
 
-def _mark_recovery(
+def _mark_operation_failed(
     engine: Engine,
     *,
     operation: AdministrativeOperation,
     current_step: str,
     summary: str,
 ) -> None:
-    update_administrative_operation(
-        engine,
-        operation_id=operation.operation_id,
-        status="RECOVERY_REQUIRED",
-        current_step=current_step,
-        last_error_summary=summary,
-    )
-
-
-def _handle_security_put_failure(
-    engine: Engine,
-    *,
-    operation: AdministrativeOperation,
-    exc: SecurityAdminError,
-    response: Response,
-) -> RoleMappingMutationResponse:
-    if exc.http_status is None or exc.http_status >= 500:
-        _mark_recovery(
+    try:
+        update_administrative_operation(
             engine,
-            operation=operation,
-            current_step="SECURITY",
-            summary="Security operating-role update requires recovery.",
+            operation_id=operation.operation_id,
+            status="FAILED",
+            current_step=current_step,
+            last_error_summary=summary,
         )
-        response.status_code = 202
-        return _operation_response(operation, status="RECOVERY_REQUIRED", mapping=None)
-
-    update_administrative_operation(
-        engine,
-        operation_id=operation.operation_id,
-        status="FAILED",
-        current_step="SECURITY",
-        last_error_summary="Security rejected the operating-role update.",
-    )
-    if exc.http_status == 401:
-        raise AuditCoreError(
-            error_code="VAC-AUTH-001",
-            status_code=401,
-            title="Authentication required",
-            detail="Security rejected the human administrative token.",
+    except Exception as exc:
+        logger.error(
+            "role_mapping_failure_receipt_write_failed",
+            operation_id=operation.operation_id,
+            exc_type=type(exc).__name__,
         )
-    if exc.http_status == 403:
-        raise AuthorizationError(
-            error_code="VAC-AUTH-002",
-            status_code=403,
-            title="Permission denied",
-        )
-    raise BusinessValidationError(
-        detail="Security rejected the requested operating-role assignment."
-    )
 
 
-@router.get(
-    "/role-mapping-candidates",
-    response_model=list[RoleMappingCandidateResponse],
-)
+@router.get("/role-mapping-candidates", response_model=list[RoleMappingCandidateResponse])
 def list_role_mapping_candidates(
     tenant_id: str,
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
@@ -488,7 +492,6 @@ def list_role_mapping_candidates(
             )
     except SecurityAdminError as exc:
         raise _dependency_unavailable() from exc
-
     return [
         RoleMappingCandidateResponse(
             userId=user.user_id,
@@ -523,27 +526,29 @@ def get_role_mapping(
     return _get_mapping(connection, tenant_id, user_id)
 
 
-@router.put(
-    "/role-mappings/{user_id}",
-    response_model=RoleMappingMutationResponse,
-)
+@router.put("/role-mappings/{user_id}", response_model=RoleMappingMutationResponse)
 def put_role_mapping(
     tenant_id: str,
     user_id: str,
     body: RoleMappingPutRequest,
     request: Request,
-    response: Response,
     idempotency_key: Annotated[
         str,
         Header(alias="Idempotency-Key", min_length=1, max_length=200),
     ],
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    engine: Annotated[Engine, Depends(get_engine)],
 ) -> RoleMappingMutationResponse:
-    engine = get_engine()
     dealer_ids, outlet_ids, scopes = _resolve_scope(
         engine,
         tenant_id=tenant_id,
         body=body,
+    )
+    mapping = RoleMappingResponse(
+        userId=user_id,
+        operatingRole=body.operatingRole,
+        dealerIds=dealer_ids,
+        outletIds=outlet_ids,
     )
     semantic_payload = {
         "userId": user_id,
@@ -551,12 +556,6 @@ def put_role_mapping(
         "dealerIds": [str(value) for value in dealer_ids],
         "outletIds": [str(value) for value in outlet_ids],
     }
-    mapping = RoleMappingResponse(
-        userId=user_id,
-        operatingRole=body.operatingRole,
-        dealerIds=dealer_ids,
-        outletIds=outlet_ids,
-    )
 
     with administrative_operation_lock(
         engine,
@@ -575,60 +574,64 @@ def put_role_mapping(
             correlation_id=get_correlation_id(request),
         )
         if operation.status == "COMPLETED":
-            return _operation_response(operation, status="COMPLETED", mapping=mapping)
+            return _operation_response(operation, mapping=mapping)
 
-        update_administrative_operation(
-            engine,
-            operation_id=operation.operation_id,
-            status="RUNNING",
-            current_step="SECURITY",
-            last_error_summary=None,
-        )
+        previous = _read_mapping(engine, tenant_id, user_id)
         try:
             with SecurityAdminClient(base_url=_security_base_url()) as client:
-                security_result = client.set_operating_role(
+                result = client.set_operating_role(
                     human_bearer_token=admin_request.bearer_token,
                     tenant_id=tenant_id,
                     user_id=user_id,
                     role_key=body.operatingRole,
                 )
         except SecurityAdminError as exc:
-            return _handle_security_put_failure(
-                engine,
-                operation=operation,
-                exc=exc,
-                response=response,
-            )
-
-        if (
-            security_result.tenant_id != tenant_id
-            or security_result.user_id != user_id
-            or security_result.role_key != body.operatingRole
-        ):
-            _mark_recovery(
+            _mark_operation_failed(
                 engine,
                 operation=operation,
                 current_step="SECURITY",
-                summary="Security operating-role receipt did not match the requested mapping.",
+                summary="Operating-role update failed before local business-scope change.",
             )
-            response.status_code = 202
-            return _operation_response(operation, status="RECOVERY_REQUIRED", mapping=None)
+            _raise_security_error(exc)
 
-        security_receipt = {
-            "tenantId": security_result.tenant_id,
-            "userId": security_result.user_id,
-            "changed": security_result.changed,
-            "assignmentId": security_result.assignment_id,
-            "roleKey": security_result.role_key,
-        }
-        update_administrative_operation(
-            engine,
-            operation_id=operation.operation_id,
-            status="RUNNING",
-            current_step="AUDIT_CORE",
-            security_receipt=security_receipt,
-            last_error_summary=None,
-        )
+        if (
+            result.tenant_id != tenant_id
+            or result.user_id != user_id
+            or result.role_key != body.operatingRole
+        ):
+            try:
+                _restore_security_role(
+                    admin_request=admin_request,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    previous=previous,
+                )
+            except Exception as compensation_exc:
+                _mark_operation_failed(
+                    engine,
+                    operation=operation,
+                    current_step="COMPENSATION",
+                    summary="Operating-role compensation failed.",
+                )
+                logger.critical(
+                    "role_mapping_compensation_failed",
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    exc_type=type(compensation_exc).__name__,
+                )
+                raise _dependency_unavailable(
+                    "Role mapping could not be completed cleanly. Please contact support."
+                ) from compensation_exc
+            _mark_operation_failed(
+                engine,
+                operation=operation,
+                current_step="SECURITY",
+                summary="Operating-role receipt did not match the requested mapping.",
+            )
+            raise _dependency_unavailable(
+                "Role mapping could not be completed. Please try again."
+            )
+
         try:
             local_changed = _replace_assignments(
                 engine,
@@ -640,24 +643,56 @@ def put_role_mapping(
             )
         except Exception as exc:
             logger.error(
-                "role_mapping_audit_core_write_failed",
-                operation_id=operation.operation_id,
+                "role_mapping_local_write_failed",
+                tenant_id=tenant_id,
+                user_id=user_id,
                 exc_type=type(exc).__name__,
             )
-            _mark_recovery(
+            try:
+                _restore_security_role(
+                    admin_request=admin_request,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    previous=previous,
+                )
+            except Exception as compensation_exc:
+                _mark_operation_failed(
+                    engine,
+                    operation=operation,
+                    current_step="COMPENSATION",
+                    summary="Operating-role compensation failed after local write failure.",
+                )
+                logger.critical(
+                    "role_mapping_compensation_failed",
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    exc_type=type(compensation_exc).__name__,
+                )
+                raise _dependency_unavailable(
+                    "Role mapping could not be completed cleanly. Please contact support."
+                ) from compensation_exc
+            _mark_operation_failed(
                 engine,
                 operation=operation,
                 current_step="AUDIT_CORE",
-                summary="Audit Core business-scope update requires recovery.",
+                summary="Business-scope update failed and was compensated.",
             )
-            response.status_code = 202
-            return _operation_response(operation, status="RECOVERY_REQUIRED", mapping=None)
+            raise _dependency_unavailable(
+                "Role mapping could not be completed. Please try again."
+            ) from exc
 
         update_administrative_operation(
             engine,
             operation_id=operation.operation_id,
             status="COMPLETED",
             current_step="COMPLETE",
+            security_receipt={
+                "tenantId": result.tenant_id,
+                "userId": result.user_id,
+                "changed": result.changed,
+                "assignmentId": result.assignment_id,
+                "roleKey": result.role_key,
+            },
             audit_core_receipt={
                 "userId": user_id,
                 "roleKey": body.operatingRole,
@@ -667,25 +702,21 @@ def put_role_mapping(
             last_error_summary=None,
             completed=True,
         )
-        return _operation_response(operation, status="COMPLETED", mapping=mapping)
+        return _operation_response(operation, mapping=mapping)
 
 
-@router.delete(
-    "/role-mappings/{user_id}",
-    response_model=RoleMappingMutationResponse,
-)
+@router.delete("/role-mappings/{user_id}", response_model=RoleMappingMutationResponse)
 def delete_role_mapping(
     tenant_id: str,
     user_id: str,
     request: Request,
-    response: Response,
     idempotency_key: Annotated[
         str,
         Header(alias="Idempotency-Key", min_length=1, max_length=200),
     ],
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    engine: Annotated[Engine, Depends(get_engine)],
 ) -> RoleMappingMutationResponse:
-    engine = get_engine()
     semantic_payload = {"userId": user_id, "action": "REMOVE"}
 
     with administrative_operation_lock(
@@ -705,15 +736,60 @@ def delete_role_mapping(
             correlation_id=get_correlation_id(request),
         )
         if operation.status == "COMPLETED":
-            return _operation_response(operation, status="COMPLETED", mapping=None)
+            return _operation_response(operation, mapping=None)
 
-        update_administrative_operation(
-            engine,
-            operation_id=operation.operation_id,
-            status="RUNNING",
-            current_step="AUDIT_CORE",
-            last_error_summary=None,
-        )
+        previous = _read_mapping(engine, tenant_id, user_id)
+        try:
+            with SecurityAdminClient(base_url=_security_base_url()) as client:
+                result = client.remove_operating_role(
+                    human_bearer_token=admin_request.bearer_token,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                )
+        except SecurityAdminError as exc:
+            _mark_operation_failed(
+                engine,
+                operation=operation,
+                current_step="SECURITY",
+                summary="Operating-role removal failed before local assignment removal.",
+            )
+            _raise_security_error(exc)
+
+        if result.tenant_id != tenant_id or result.user_id != user_id:
+            if previous is not None:
+                try:
+                    _restore_security_role(
+                        admin_request=admin_request,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        previous=previous,
+                    )
+                except Exception as compensation_exc:
+                    _mark_operation_failed(
+                        engine,
+                        operation=operation,
+                        current_step="COMPENSATION",
+                        summary="Operating-role removal compensation failed.",
+                    )
+                    logger.critical(
+                        "role_mapping_remove_compensation_failed",
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        exc_type=type(compensation_exc).__name__,
+                    )
+                    raise _dependency_unavailable(
+                        "Role mapping removal could not be completed cleanly. Please contact support."
+                    ) from compensation_exc
+            _mark_operation_failed(
+                engine,
+                operation=operation,
+                current_step="SECURITY",
+                summary="Operating-role removal receipt did not match the request.",
+            )
+            raise _dependency_unavailable(
+                "Role mapping removal could not be completed. Please try again."
+            )
+
         try:
             deactivated = _deactivate_assignments(
                 engine,
@@ -722,56 +798,46 @@ def delete_role_mapping(
             )
         except Exception as exc:
             logger.error(
-                "role_mapping_audit_core_remove_failed",
-                operation_id=operation.operation_id,
+                "role_mapping_local_remove_failed",
+                tenant_id=tenant_id,
+                user_id=user_id,
                 exc_type=type(exc).__name__,
             )
-            _mark_recovery(
+            if previous is not None:
+                try:
+                    _restore_security_role(
+                        admin_request=admin_request,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        previous=previous,
+                    )
+                except Exception as compensation_exc:
+                    _mark_operation_failed(
+                        engine,
+                        operation=operation,
+                        current_step="COMPENSATION",
+                        summary=(
+                            "Operating-role removal compensation failed after local write failure."
+                        ),
+                    )
+                    logger.critical(
+                        "role_mapping_remove_compensation_failed",
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        exc_type=type(compensation_exc).__name__,
+                    )
+                    raise _dependency_unavailable(
+                        "Role mapping removal could not be completed cleanly. Please contact support."
+                    ) from compensation_exc
+            _mark_operation_failed(
                 engine,
                 operation=operation,
                 current_step="AUDIT_CORE",
-                summary="Audit Core business-scope removal requires recovery.",
+                summary="Business-assignment removal failed and was compensated.",
             )
-            response.status_code = 202
-            return _operation_response(operation, status="RECOVERY_REQUIRED", mapping=None)
-
-        update_administrative_operation(
-            engine,
-            operation_id=operation.operation_id,
-            status="RUNNING",
-            current_step="SECURITY",
-            audit_core_receipt={
-                "userId": user_id,
-                "deactivatedAssignments": deactivated,
-            },
-            last_error_summary=None,
-        )
-        try:
-            with SecurityAdminClient(base_url=_security_base_url()) as client:
-                security_result = client.remove_operating_role(
-                    human_bearer_token=admin_request.bearer_token,
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                )
-        except SecurityAdminError:
-            _mark_recovery(
-                engine,
-                operation=operation,
-                current_step="SECURITY",
-                summary="Security operating-role removal requires recovery.",
-            )
-            response.status_code = 202
-            return _operation_response(operation, status="RECOVERY_REQUIRED", mapping=None)
-
-        if security_result.tenant_id != tenant_id or security_result.user_id != user_id:
-            _mark_recovery(
-                engine,
-                operation=operation,
-                current_step="SECURITY",
-                summary="Security operating-role removal receipt did not match the request.",
-            )
-            response.status_code = 202
-            return _operation_response(operation, status="RECOVERY_REQUIRED", mapping=None)
+            raise _dependency_unavailable(
+                "Role mapping removal could not be completed. Please try again."
+            ) from exc
 
         update_administrative_operation(
             engine,
@@ -779,13 +845,17 @@ def delete_role_mapping(
             status="COMPLETED",
             current_step="COMPLETE",
             security_receipt={
-                "tenantId": security_result.tenant_id,
-                "userId": security_result.user_id,
-                "changed": security_result.changed,
-                "assignmentId": security_result.assignment_id,
-                "roleKey": security_result.role_key,
+                "tenantId": result.tenant_id,
+                "userId": result.user_id,
+                "changed": result.changed,
+                "assignmentId": result.assignment_id,
+                "roleKey": result.role_key,
+            },
+            audit_core_receipt={
+                "userId": user_id,
+                "deactivatedAssignments": deactivated,
             },
             last_error_summary=None,
             completed=True,
         )
-        return _operation_response(operation, status="COMPLETED", mapping=None)
+        return _operation_response(operation, mapping=None)
