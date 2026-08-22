@@ -65,7 +65,7 @@ def list_my_projects(
                 WHERE ba.security_actor_id = :actor_id
                   AND ba.assignment_status = 'ACTIVE'
                   AND ba.effective_from <= now()
-                  AND (ba.effective_to IS NULL OR ba.effective_to > now())
+                  AND (ba.effective_to IS NULL OR ba.effective_to >= now())
                   AND p.project_status = 'ACTIVE'
                 GROUP BY
                     p.tenant_id,
