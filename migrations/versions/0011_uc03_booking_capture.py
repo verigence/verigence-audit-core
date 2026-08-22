@@ -36,6 +36,82 @@ def upgrade() -> None:
 
     op.execute(
         """
+        CREATE TABLE auditcore.journey_document_assessments (
+            tenant_id                               varchar(128) NOT NULL,
+            journey_document_assessment_id          uuid NOT NULL DEFAULT gen_random_uuid(),
+            journey_id                              uuid NOT NULL,
+            stage_code                              varchar(30) NOT NULL
+                                                    CHECK (stage_code IN ('BOOKING','DELIVERY','POST_DELIVERY')),
+            journey_document_requirement_id         uuid NOT NULL,
+            requirement_key                         varchar(120) NOT NULL,
+            document_requirement_profile_version_id uuid,
+            applicability_state                     varchar(30) NOT NULL DEFAULT 'APPLICABLE'
+                                                    CHECK (applicability_state IN ('APPLICABLE','NOT_APPLICABLE')),
+            applicability_reason                    text,
+            answer                                  varchar(20) NOT NULL DEFAULT 'UNANSWERED'
+                                                    CHECK (answer IN ('YES','NO','NA','UNANSWERED')),
+            evidence_id                             uuid,
+            remarks                                 text,
+            answered_by_actor_id                    varchar(160),
+            answered_by_role                        varchar(80),
+            answered_at_utc                         timestamptz,
+            version_no                              bigint NOT NULL DEFAULT 1 CHECK (version_no > 0),
+            created_at_utc                          timestamptz NOT NULL DEFAULT now(),
+            updated_at_utc                          timestamptz NOT NULL DEFAULT now(),
+            PRIMARY KEY (tenant_id, journey_document_assessment_id),
+            UNIQUE (tenant_id, journey_id, stage_code, requirement_key),
+            FOREIGN KEY (tenant_id, journey_id)
+                REFERENCES auditcore.journeys(tenant_id, journey_id),
+            FOREIGN KEY (tenant_id, journey_document_requirement_id)
+                REFERENCES auditcore.journey_document_requirements(
+                    tenant_id, journey_document_requirement_id
+                ),
+            FOREIGN KEY (tenant_id, document_requirement_profile_version_id)
+                REFERENCES auditcore.document_requirement_profile_versions(
+                    tenant_id, document_requirement_profile_version_id
+                ),
+            FOREIGN KEY (tenant_id, evidence_id)
+                REFERENCES auditcore.evidence(tenant_id, evidence_id)
+        )
+        """
+    )
+    op.execute(
+        """
+        CREATE INDEX ix_journey_document_assessments_stage
+        ON auditcore.journey_document_assessments
+            (tenant_id, journey_id, stage_code, applicability_state, answer)
+        """
+    )
+    op.execute(
+        "ALTER TABLE auditcore.journey_document_assessments ENABLE ROW LEVEL SECURITY"
+    )
+    op.execute(
+        "ALTER TABLE auditcore.journey_document_assessments FORCE ROW LEVEL SECURITY"
+    )
+    op.execute(
+        """
+        CREATE POLICY tenant_isolation_journey_document_assessments
+        ON auditcore.journey_document_assessments
+        USING (tenant_id = auditcore.current_tenant_id())
+        WITH CHECK (tenant_id = auditcore.current_tenant_id())
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER trg_journey_document_assessments_updated
+        BEFORE UPDATE ON auditcore.journey_document_assessments
+        FOR EACH ROW EXECUTE FUNCTION auditcore.set_updated_at()
+        """
+    )
+    op.execute(
+        f"GRANT SELECT, INSERT, UPDATE ON auditcore.journey_document_assessments TO {_RUNTIME_ROLE}"
+    )
+    op.execute(
+        f"REVOKE DELETE ON auditcore.journey_document_assessments FROM {_RUNTIME_ROLE}"
+    )
+
+    op.execute(
+        """
         ALTER TABLE auditcore.audit_findings
             ADD COLUMN stage_code varchar(30),
             ADD COLUMN origin_kind varchar(20),
@@ -123,13 +199,23 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute(
-        "DROP TRIGGER IF EXISTS trg_audit_finding_events_append_only ON auditcore.audit_finding_events"
+        "DROP TRIGGER IF EXISTS trg_audit_finding_events_append_only "
+        "ON auditcore.audit_finding_events"
     )
     op.execute("DROP TABLE IF EXISTS auditcore.audit_finding_events")
 
-    op.execute("ALTER TABLE auditcore.audit_findings DROP CONSTRAINT IF EXISTS fk_audit_findings_uc03_rule_version")
-    op.execute("ALTER TABLE auditcore.audit_findings DROP CONSTRAINT IF EXISTS ck_audit_findings_uc03_origin")
-    op.execute("ALTER TABLE auditcore.audit_findings DROP CONSTRAINT IF EXISTS ck_audit_findings_uc03_stage")
+    op.execute(
+        "ALTER TABLE auditcore.audit_findings "
+        "DROP CONSTRAINT IF EXISTS fk_audit_findings_uc03_rule_version"
+    )
+    op.execute(
+        "ALTER TABLE auditcore.audit_findings "
+        "DROP CONSTRAINT IF EXISTS ck_audit_findings_uc03_origin"
+    )
+    op.execute(
+        "ALTER TABLE auditcore.audit_findings "
+        "DROP CONSTRAINT IF EXISTS ck_audit_findings_uc03_stage"
+    )
     op.execute(
         """
         ALTER TABLE auditcore.audit_findings
@@ -144,7 +230,14 @@ def downgrade() -> None:
     )
 
     op.execute(
-        "ALTER TABLE auditcore.journey_stage_states DROP CONSTRAINT IF EXISTS ck_journey_stage_states_booking_closure_fields"
+        "DROP TRIGGER IF EXISTS trg_journey_document_assessments_updated "
+        "ON auditcore.journey_document_assessments"
+    )
+    op.execute("DROP TABLE IF EXISTS auditcore.journey_document_assessments")
+
+    op.execute(
+        "ALTER TABLE auditcore.journey_stage_states "
+        "DROP CONSTRAINT IF EXISTS ck_journey_stage_states_booking_closure_fields"
     )
     op.execute(
         """
