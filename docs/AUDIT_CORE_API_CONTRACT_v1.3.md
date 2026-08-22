@@ -40,7 +40,7 @@ Only persisted Projects whose tracked initial `PROJECT_PROVISION` operation is c
 
 Selecting one item does not create or copy state. Web sets the returned `tenantId` as its current business context and loads the existing tenant-scoped administration APIs.
 
-If the Security administrative control plane required to resolve the Project directory is unavailable, Audit Core returns a normal `application/problem+json` response with public code `VAC-SYS-002` and a business-safe message. Raw endpoint names, HTTP/network causes and downstream exception text are not returned to Web.
+If the administrative control plane required to resolve the Project directory is unavailable, Audit Core returns a normal `application/problem+json` response with public code `VAC-SYS-002` and a business-safe message. Raw module names, endpoint names, HTTP/network causes and downstream exception text are not returned to Web.
 
 ## 2. Resume child administration state
 
@@ -77,14 +77,16 @@ errorMessage  string | null
 
 These fields are a business-safe translation of the durable technical failure state. Audit Core keeps the internal technical code, downstream HTTP/network cause and diagnostic summary in protected operation state/logs for support, but must not return those technical details to Web.
 
+Customer-facing error text must be expressed in business terms using the Project name supplied by the administrator. It must not expose internal module or service names such as Security, DI or Audit Core.
+
 Public mapping for UC02 Project provisioning is:
 
 | Internal failure category | Public errorCode | Public errorMessage |
 |---|---|---|
-| Security administrative/provisioning failure | `VAC-SYS-002` | `Project security setup could not be completed. Please try again.` |
-| Audit Core Project projection/persistence failure | `VAC-SYS-001` | `Project setup could not be completed. Please try again.` |
-| DI unavailable/transient failure | `VAC-DI-001` | `Project processing service is temporarily unavailable. Please try again.` |
-| Other DI integration failure | `VAC-DI-004` | `Project processing setup could not be completed. Please try again.` |
+| Administrative/provisioning dependency failure | `VAC-SYS-002` | `<ProjectName> setup could not be completed. Please try again.` |
+| Project projection/persistence failure | `VAC-SYS-001` | `<ProjectName> setup could not be completed. Please try again.` |
+| Processing dependency unavailable/transient failure | `VAC-DI-001` | `<ProjectName> setup is temporarily unavailable. Please try again.` |
+| Other processing integration failure | `VAC-DI-004` | `<ProjectName> setup could not be completed. Please try again.` |
 
 Example recovery response:
 
@@ -97,11 +99,11 @@ Example recovery response:
   "provisioningStatus": "RECOVERY_REQUIRED",
   "currentStep": "SECURITY",
   "errorCode": "VAC-SYS-002",
-  "errorMessage": "Project security setup could not be completed. Please try again."
+  "errorMessage": "MahindraWest setup could not be completed. Please try again."
 }
 ```
 
-The API must not expose downstream endpoint URLs, downstream HTTP status text, network exception text, database exception text, stack traces, credentials, tokens, OTPs, raw uploaded content or other sensitive/technical details in these fields.
+The API must not expose internal module/service names, downstream endpoint URLs, downstream HTTP status text, network exception text, database exception text, stack traces, credentials, tokens, OTPs, raw uploaded content or other sensitive/technical details in these fields.
 
 For `READY` and `IN_PROGRESS`, both fields are `null` unless a future approved contract says otherwise.
 
@@ -113,6 +115,8 @@ Web must interpret the business provisioning status independently of HTTP succes
 - `IN_PROGRESS` — show setup in progress;
 - `RECOVERY_REQUIRED` — show setup failed/recovery required, render the public `errorCode` and business-safe `errorMessage`, and offer the existing retry action.
 
-Web must not display `correlationId`, operation internals, downstream endpoint information or raw technical error text.
+A provisioning failure is contextual to the Project Setup panel and must not also be rendered as a duplicate page-wide error banner. While a Project provisioning operation is in `RECOVERY_REQUIRED`, the Project Setup panel is the single visible blocking error location.
+
+Web must not display `correlationId`, operation internals, internal module/service names, downstream endpoint information or raw technical error text.
 
 Normal non-2xx `application/problem+json` behavior remains unchanged; Web displays only the backend public `errorCode` and safe `detail`/`title` through the common Audit Core error formatter.
