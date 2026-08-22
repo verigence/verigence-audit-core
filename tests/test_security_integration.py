@@ -10,7 +10,11 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from audit_core.security_integration import SecurityOAuthClient, SecurityTokenError
+from audit_core.security_integration import (
+    SecurityAdminClient,
+    SecurityOAuthClient,
+    SecurityTokenError,
+)
 
 ISSUER = "verigence-security"
 CLIENT_ID = "audit-core"
@@ -154,3 +158,38 @@ def test_service_token_response_audience_mismatch_fails_closed() -> None:
         pytest.raises(SecurityTokenError, match="audience mismatch"),
     ):
         security_client.get_service_token(audience="di")
+
+
+def test_human_admin_client_lists_security_tenants() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/security/v1/platform/tenants"
+        assert request.headers.get("Authorization") == "Bearer human-superadmin-token"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "tenantId": "tenant-b",
+                    "tenantCode": "TENANT-B",
+                    "tenantName": "Project B",
+                    "status": "ACTIVE",
+                },
+                {
+                    "tenantId": "tenant-a",
+                    "tenantCode": "TENANT-A",
+                    "tenantName": "Project A",
+                    "status": "CONFIGURING",
+                },
+            ],
+        )
+
+    with SecurityAdminClient(
+        base_url="https://security.test",
+        transport=httpx.MockTransport(handler),
+    ) as security_client:
+        tenants = security_client.list_tenants(
+            human_bearer_token="human-superadmin-token"
+        )
+
+    assert [tenant.tenant_id for tenant in tenants] == ["tenant-b", "tenant-a"]
+    assert tenants[0].status == "ACTIVE"
+    assert tenants[1].tenant_name == "Project A"
