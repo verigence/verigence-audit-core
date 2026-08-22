@@ -251,7 +251,7 @@ def _ensure_project_projection(
             raise ConflictError(
                 error_code="VAC-CONFLICT-003",
                 title="Project provisioning conflict",
-                detail="The provisioned Security Tenant is already linked to different Project details.",
+                detail="The provisioned Project context is already linked to different Project details.",
             )
         return {
             "tenantId": str(current["tenant_id"]),
@@ -260,37 +260,43 @@ def _ensure_project_projection(
         }
 
 
-def _public_recovery_error(operation: AdministrativeOperation) -> tuple[str, str]:
+def _public_recovery_error(
+    operation: AdministrativeOperation,
+    *,
+    project_name: str,
+) -> tuple[str, str]:
     internal_code = operation.last_error_code or ""
     step = operation.current_step or "SECURITY"
+    display_name = project_name.strip() or "Project"
     if step == "SECURITY":
         return (
             "VAC-SYS-002",
-            "Project security setup could not be completed. Please try again.",
+            f"{display_name} setup could not be completed. Please try again.",
         )
     if step == "AUDIT_CORE":
         return (
             "VAC-SYS-001",
-            "Project setup could not be completed. Please try again.",
+            f"{display_name} setup could not be completed. Please try again.",
         )
     if step == "DI":
         if internal_code in {"DI_UNAVAILABLE", "DI_CONFIGURATION_FAILED"}:
             return (
                 "VAC-DI-001",
-                "Project processing service is temporarily unavailable. Please try again.",
+                f"{display_name} setup is temporarily unavailable. Please try again.",
             )
         return (
             "VAC-DI-004",
-            "Project processing setup could not be completed. Please try again.",
+            f"{display_name} setup could not be completed. Please try again.",
         )
     return (
         "VAC-SYS-001",
-        "Project setup could not be completed. Please try again.",
+        f"{display_name} setup could not be completed. Please try again.",
     )
 
 
 def _response(operation: AdministrativeOperation) -> ProjectProvisioningResponse:
     summary = operation.safe_request_summary or {}
+    project_name = str(summary.get("projectName") or "")
     tenant_id = operation.tenant_id
     if tenant_id is None and operation.security_receipt is not None:
         value = operation.security_receipt.get("tenantId")
@@ -314,11 +320,14 @@ def _response(operation: AdministrativeOperation) -> ProjectProvisioningResponse
     error_code: str | None = None
     error_message: str | None = None
     if status == "RECOVERY_REQUIRED":
-        error_code, error_message = _public_recovery_error(operation)
+        error_code, error_message = _public_recovery_error(
+            operation,
+            project_name=project_name,
+        )
     return ProjectProvisioningResponse(
         operationId=UUID(operation.operation_id),
         tenantId=tenant_id,
-        projectName=str(summary.get("projectName") or ""),
+        projectName=project_name,
         projectStatus=project_status,
         provisioningStatus=status,
         currentStep=step,
