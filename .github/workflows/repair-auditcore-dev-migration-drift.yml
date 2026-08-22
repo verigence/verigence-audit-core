@@ -1,0 +1,129 @@
+name: Repair Audit Core DEV migration drift
+
+on:
+  push:
+    branches:
+      - ops/repair-auditcore-dev-migration-drift
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-dev-migration-repair
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - name: Check out repair branch with UC03 downgrade migration
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Audit Core and Railway CLI
+        run: |
+          python -m pip install -e .
+          npm install --global @railway/cli
+
+      - name: Resolve exact Audit Core Railway DEV database safely
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is missing'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('/tmp/audit-vars.json').read_text())
+          raw = str(data.get('DATABASE_URL', '')).strip()
+          if not raw:
+              raise SystemExit('Audit Core Railway DEV DATABASE_URL is missing')
+          if raw.startswith('postgresql+psycopg://'):
+              url = raw
+          elif raw.startswith('postgresql://'):
+              url = 'postgresql+psycopg://' + raw[len('postgresql://'):]
+          elif raw.startswith('postgres://'):
+              url = 'postgresql+psycopg://' + raw[len('postgres://'):]
+          else:
+              raise SystemExit('Audit Core Railway DEV DATABASE_URL is not PostgreSQL')
+          with open('/tmp/database-url.txt', 'w') as fh:
+              fh.write(url)
+          print('AUDIT_CORE_DEV_DATABASE_RESOLVED=PASS')
+          PY
+          db_url="$(cat /tmp/database-url.txt)"
+          echo "::add-mask::$db_url"
+          echo "DATABASE_URL=$db_url" >> "$GITHUB_ENV"
+
+      - name: Guard exact drift state and zero UC03 business rows
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+          engine = create_engine(os.environ['DATABASE_URL'])
+          with engine.connect() as c:
+              version = c.execute(text('select version_num from alembic_version')).scalar_one()
+              print('CURRENT_ALEMBIC_REVISION=' + version)
+              if version != '0010_uc03_c0_foundation':
+                  raise SystemExit('Guard failed: DEV is not exactly at stray UC03 revision 0010')
+              for table in ('journey_stage_states', 'journey_workflow_events'):
+                  exists = c.execute(text("select to_regclass(:name)::text"), {'name': f'auditcore.{table}'}).scalar_one_or_none()
+                  if not exists:
+                      raise SystemExit(f'Guard failed: expected UC03 table missing: {table}')
+                  count = c.execute(text(f'select count(*) from auditcore.{table}')).scalar_one()
+                  print(f'UC03_ROW_COUNT|{table}|{count}')
+                  if count != 0:
+                      raise SystemExit(f'Guard failed: UC03 table {table} contains business rows; refusing downgrade')
+              fn = c.execute(text("select to_regprocedure('auditcore.current_security_actor_id()')::text")).scalar_one_or_none()
+              if fn != 'auditcore.current_security_actor_id()':
+                  raise SystemExit('Guard failed: expected UC03 actor function is missing')
+          engine.dispose()
+          print('AUDIT_CORE_UC03_DOWNGRADE_GUARD=PASS')
+          PY
+
+      - name: Downgrade only the stray UC03 revision
+        run: alembic downgrade 0009_uc02_project_refs
+
+      - name: Verify clean UC02 DEV migration state
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+          engine = create_engine(os.environ['DATABASE_URL'])
+          with engine.connect() as c:
+              version = c.execute(text('select version_num from alembic_version')).scalar_one()
+              if version != '0009_uc02_project_refs':
+                  raise SystemExit(f'Unexpected revision after downgrade: {version}')
+              for obj in ('auditcore.journey_stage_states', 'auditcore.journey_workflow_events'):
+                  if c.execute(text('select to_regclass(:name)::text'), {'name': obj}).scalar_one_or_none() is not None:
+                      raise SystemExit(f'UC03 object still exists after downgrade: {obj}')
+              fn = c.execute(text("select to_regprocedure('auditcore.current_security_actor_id()')::text")).scalar_one_or_none()
+              if fn is not None:
+                  raise SystemExit('UC03 actor function still exists after downgrade')
+              actor_policies = c.execute(text("""
+                  select count(*) from pg_policies
+                  where schemaname='auditcore'
+                    and policyname in (
+                      'actor_project_discovery_projects',
+                      'actor_project_discovery_business_assignments'
+                    )
+              """)).scalar_one()
+              if actor_policies != 0:
+                  raise SystemExit('UC03 actor discovery policy still exists after downgrade')
+          engine.dispose()
+          print('FINAL_ALEMBIC_REVISION=0009_uc02_project_refs')
+          print('AUDIT_CORE_DEV_MIGRATION_REPAIR=PASS')
+          PY
