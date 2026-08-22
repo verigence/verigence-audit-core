@@ -5,6 +5,7 @@ from datetime import date
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, Header, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import Engine, text
@@ -23,13 +24,19 @@ from audit_core.dependencies import (
     require_super_admin_request,
 )
 from audit_core.di_client import DiClient, DiClientError
-from audit_core.errors import BusinessValidationError, ConflictError, NotFoundError
+from audit_core.errors import (
+    BusinessValidationError,
+    ConflictError,
+    DependencyUnavailableError,
+    NotFoundError,
+)
 from audit_core.security_integration import (
     SecurityAdminClient,
     SecurityAdminError,
     SecurityTenant,
 )
 
+logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/v1", tags=["project-provisioning"])
 
 _OPERATION_TYPE = "PROJECT_PROVISION"
@@ -253,6 +260,35 @@ def _ensure_project_projection(
         }
 
 
+def _public_recovery_error(operation: AdministrativeOperation) -> tuple[str, str]:
+    internal_code = operation.last_error_code or ""
+    step = operation.current_step or "SECURITY"
+    if step == "SECURITY":
+        return (
+            "VAC-SYS-002",
+            "Project security setup could not be completed. Please try again.",
+        )
+    if step == "AUDIT_CORE":
+        return (
+            "VAC-SYS-001",
+            "Project setup could not be completed. Please try again.",
+        )
+    if step == "DI":
+        if internal_code in {"DI_UNAVAILABLE", "DI_CONFIGURATION_FAILED"}:
+            return (
+                "VAC-DI-001",
+                "Project processing service is temporarily unavailable. Please try again.",
+            )
+        return (
+            "VAC-DI-004",
+            "Project processing setup could not be completed. Please try again.",
+        )
+    return (
+        "VAC-SYS-001",
+        "Project setup could not be completed. Please try again.",
+    )
+
+
 def _response(operation: AdministrativeOperation) -> ProjectProvisioningResponse:
     summary = operation.safe_request_summary or {}
     tenant_id = operation.tenant_id
@@ -275,6 +311,10 @@ def _response(operation: AdministrativeOperation) -> ProjectProvisioningResponse
     project_status = "CONFIGURING"
     if operation.audit_core_receipt is not None:
         project_status = str(operation.audit_core_receipt.get("projectStatus") or "CONFIGURING")
+    error_code: str | None = None
+    error_message: str | None = None
+    if status == "RECOVERY_REQUIRED":
+        error_code, error_message = _public_recovery_error(operation)
     return ProjectProvisioningResponse(
         operationId=UUID(operation.operation_id),
         tenantId=tenant_id,
@@ -282,8 +322,8 @@ def _response(operation: AdministrativeOperation) -> ProjectProvisioningResponse
         projectStatus=project_status,
         provisioningStatus=status,
         currentStep=step,
-        errorCode=operation.last_error_code if status == "RECOVERY_REQUIRED" else None,
-        errorMessage=operation.last_error_summary if status == "RECOVERY_REQUIRED" else None,
+        errorCode=error_code,
+        errorMessage=error_message,
     )
 
 
@@ -295,6 +335,14 @@ def _mark_recovery(
     code: str,
     summary: str,
 ) -> AdministrativeOperation:
+    logger.warning(
+        "project_provisioning_recovery_required",
+        operation_id=operation.operation_id,
+        tenant_id=operation.tenant_id,
+        step=step,
+        internal_error_code=code,
+        technical_summary=summary[:500],
+    )
     update_administrative_operation(
         engine,
         operation_id=operation.operation_id,
@@ -340,12 +388,17 @@ def _resume(
                     tenant_name=request.projectName.strip(),
                     idempotency_key=current.idempotency_key,
                 )
-        except SecurityAdminError as exc:
+        except (SecurityAdminError, RuntimeError) as exc:
+            internal_code = (
+                "SECURITY_ADMIN_FAILED"
+                if isinstance(exc, SecurityAdminError)
+                else "SECURITY_ADMIN_CONFIGURATION_FAILED"
+            )
             return _mark_recovery(
                 engine,
                 operation=current,
                 step="SECURITY",
-                code="SECURITY_ADMIN_FAILED",
+                code=internal_code,
                 summary=str(exc),
             )
         update_administrative_operation(
@@ -407,12 +460,13 @@ def _resume(
                 tenant_id=tenant.tenant_id,
                 idempotency_key=current.idempotency_key,
             )
-    except DiClientError as exc:
+    except (DiClientError, RuntimeError) as exc:
+        internal_code = exc.code if isinstance(exc, DiClientError) else "DI_CONFIGURATION_FAILED"
         return _mark_recovery(
             engine,
             operation=current,
             step="DI",
-            code=exc.code,
+            code=internal_code,
             summary=str(exc),
         )
     di_ready = di_receipt.get("provisioningStatus") == "READY"
@@ -440,8 +494,18 @@ def list_projects(
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     engine: Annotated[Engine, Depends(get_engine)],
 ) -> list[ProjectSelectionResponse]:
-    with SecurityAdminClient(base_url=_security_base_url()) as client:
-        tenants = client.list_tenants(human_bearer_token=admin_request.bearer_token)
+    try:
+        with SecurityAdminClient(base_url=_security_base_url()) as client:
+            tenants = client.list_tenants(human_bearer_token=admin_request.bearer_token)
+    except (SecurityAdminError, RuntimeError) as exc:
+        logger.warning(
+            "project_directory_security_failed",
+            reason=str(exc),
+            downstream_http_status=(exc.http_status if isinstance(exc, SecurityAdminError) else None),
+        )
+        raise DependencyUnavailableError(
+            detail="Project administration is temporarily unavailable. Please try again."
+        ) from exc
     projects = [
         project
         for tenant in tenants
