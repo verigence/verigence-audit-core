@@ -34,6 +34,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
+      APP_ENV: ci
       DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/auditcore_test
       EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
