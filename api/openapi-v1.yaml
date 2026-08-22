@@ -11,6 +11,72 @@ servers:
 security:
   - bearerAuth: []
 paths:
+  /projects:
+    get:
+      operationId: listProjects
+      description: >-
+        Returns persisted Projects available to the authenticated human SuperAdmin for Project
+        Administration selection/resume. Audit Core remains the browser boundary and resolves
+        Security Tenant metadata with the same human identity.
+      responses:
+        '200':
+          description: Existing Projects
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/ProjectSelection'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+    post:
+      operationId: createProject
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProjectCreate'}
+      responses:
+        '201':
+          description: Project provisioning completed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProjectProvisioning'}
+        '202':
+          description: Project provisioning is in progress or requires recovery
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProjectProvisioning'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /project-provisioning-operations/{operationId}:
+    get:
+      operationId: getProjectProvisioningOperation
+      parameters:
+        - $ref: '#/components/parameters/OperationId'
+      responses:
+        '200':
+          description: Project provisioning operation
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProjectProvisioning'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /project-provisioning-operations/{operationId}/retry:
+    post:
+      operationId: retryProjectProvisioningOperation
+      parameters:
+        - $ref: '#/components/parameters/OperationId'
+      responses:
+        '200':
+          description: Project provisioning recovered and completed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProjectProvisioning'}
+        '202':
+          description: Project provisioning still requires recovery
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProjectProvisioning'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
   /project-reference-data:
     get:
       operationId: getProjectReferenceData
@@ -207,6 +273,11 @@ components:
       in: path
       required: true
       schema: {type: string, maxLength: 128}
+    OperationId:
+      name: operationId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
     CustomerId:
       name: customerId
       in: path
@@ -235,6 +306,47 @@ components:
         tenantId: {type: string}
         projectCode: {type: string}
         projectName: {type: string}
+    ProjectCreate:
+      type: object
+      required: [projectName, oemId, productCategoryId, effectiveStartDate]
+      properties:
+        projectName: {type: string, minLength: 1, maxLength: 240}
+        oemId: {type: string, format: uuid}
+        productCategoryId: {type: string, format: uuid}
+        effectiveStartDate: {type: string, format: date}
+        effectiveEndDate: {type: [string, 'null'], format: date}
+        timezoneName: {type: string}
+        regionCode: {type: [string, 'null']}
+    ProjectSelection:
+      type: object
+      required: [tenantId, projectCode, projectName, projectStatus, securityTenantStatus]
+      properties:
+        tenantId: {type: string}
+        projectCode: {type: string}
+        projectName: {type: string}
+        projectStatus: {type: string}
+        securityTenantStatus: {type: string}
+    ProjectProvisioning:
+      type: object
+      required:
+        - operationId
+        - projectName
+        - projectStatus
+        - provisioningStatus
+        - currentStep
+      properties:
+        operationId: {type: string, format: uuid}
+        tenantId: {type: [string, 'null']}
+        projectName: {type: string}
+        projectStatus: {type: string}
+        provisioningStatus:
+          type: string
+          enum: [READY, IN_PROGRESS, RECOVERY_REQUIRED]
+        currentStep:
+          type: string
+          enum: [SECURITY, AUDIT_CORE, DI, COMPLETE]
+        errorCode: {type: [string, 'null']}
+        errorMessage: {type: [string, 'null']}
     ProjectReferenceData:
       type: object
       required: [oems, productCategories]
