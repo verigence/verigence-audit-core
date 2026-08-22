@@ -1,0 +1,123 @@
+name: Verify UC02 DEV integration
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.head_ref == 'verify/uc02-dev-integration'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      DEV_WEB_URL: https://verigence-web-dev.jbrconsulting-it.workers.dev
+    steps:
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Resolve and verify Audit Core DEV
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo 'RAILWAY_API_TOKEN secret is not configured'; exit 1; }
+          if ! railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json 2>/tmp/link.err; then
+            cat /tmp/link.err >&2 || true
+            echo 'Could not link approved Railway project/service to environment dev' >&2
+            exit 1
+          fi
+          echo 'RAILWAY_ENVIRONMENT=dev'
+
+          for attempt in $(seq 1 20); do
+            railway deployment list --service "$AUDIT_SERVICE" --limit 1 --json >/tmp/deployment.json
+            status="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/deployment.json').read_text())
+          print(rows[0].get('status','') if rows else '')
+          PY
+          )"
+            case "$status" in
+              SUCCESS) break ;;
+              FAILED|CRASHED|REMOVED)
+                railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 220 || true
+                echo "Latest Audit Core deployment status is $status" >&2
+                exit 1
+                ;;
+            esac
+            if [[ "$attempt" == "20" ]]; then
+              echo "Latest Audit Core deployment did not reach SUCCESS: $status" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/deployment.json').read_text())
+          if not rows:
+              raise SystemExit('No Audit Core Railway deployment exists')
+          row=rows[0]
+          print('AUDIT_CORE_RAILWAY_DEPLOYMENT=PASS')
+          print('AUDIT_CORE_DEPLOYMENT_ID=' + str(row.get('id','')))
+          print('AUDIT_CORE_DEPLOYMENT_CREATED_AT=' + str(row.get('createdAt','')))
+          PY
+
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          domain="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/audit-vars.json').read_text())
+          print(data.get('RAILWAY_PUBLIC_DOMAIN') or data.get('RAILWAY_STATIC_URL') or '')
+          PY
+          )"
+          [ -n "$domain" ] || { echo 'Audit Core Railway DEV service has no public domain'; exit 1; }
+          case "$domain" in
+            http://*|https://*) base="${domain%/}" ;;
+            *) base="https://${domain%/}" ;;
+          esac
+          echo "AUDIT_CORE_PUBLIC_BASE=$base"
+          curl --fail --silent --show-error "$base/health" >/tmp/health.json
+          echo 'AUDIT_CORE_PUBLIC_HEALTH=PASS'
+
+          probe_route() {
+            local path="$1"
+            local code
+            code="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --request OPTIONS "$base$path" || true)"
+            case "$code" in
+              000|404|5??)
+                echo "Deployed UC02 route probe failed: $path returned HTTP $code" >&2
+                exit 1
+                ;;
+              *) echo "UC02_ROUTE_PRESENT|$path|HTTP_$code" ;;
+            esac
+          }
+
+          probe_route '/v1/projects'
+          probe_route '/v1/tenants/uc02-smoke/project/readiness'
+          probe_route '/v1/tenants/uc02-smoke/project/activate'
+          probe_route '/v1/tenants/uc02-smoke/project-masters'
+          probe_route '/v1/tenants/uc02-smoke/role-mapping-candidates'
+          probe_route '/v1/tenants/uc02-smoke/role-mappings'
+          echo 'AUDIT_CORE_UC02_DEV=PASS'
+
+      - name: Verify Cloudflare UC02 Web bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location "$DEV_WEB_URL/login" >/tmp/login.html
+          asset_path="$(grep -oE 'src="/assets/[^"]+\.js"' /tmp/login.html | head -n 1 | sed -E 's/^src="([^"]+)"$/\1/')"
+          [ -n "$asset_path" ] || { echo 'Could not resolve deployed Web JS asset'; exit 1; }
+          curl --fail --silent --show-error --location "$DEV_WEB_URL$asset_path" >/tmp/app.js
+          grep -q 'Project administration' /tmp/app.js || {
+            echo 'UC02 Project administration marker is missing from deployed Web bundle'
+            exit 1
+          }
+          echo 'UC02_WEB_DEV=PASS'
