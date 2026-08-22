@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import json
 from datetime import date, datetime
@@ -87,6 +88,7 @@ def _project_context(connection: Connection, tenant_id: str) -> tuple[str, str]:
 
 def _filter_fingerprint(
     *,
+    tenant_id: str,
     work_type: WorkType,
     from_date: date | None,
     to_date: date | None,
@@ -95,6 +97,7 @@ def _filter_fingerprint(
     canonical = json.dumps(
         {
             "v": 1,
+            "tenantId": tenant_id,
             "workType": work_type,
             "fromDate": from_date.isoformat() if from_date else None,
             "toDate": to_date.isoformat() if to_date else None,
@@ -130,7 +133,14 @@ def _decode_cursor(cursor: str, *, fingerprint: str) -> tuple[datetime, UUID]:
         if latest_activity.tzinfo is None:
             raise ValueError("cursor timestamp must be timezone-aware")
         journey_id = UUID(str(payload["journeyId"]))
-    except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        binascii.Error,
+    ) as exc:
         raise ValidationError(
             detail="Cursor is invalid or does not match the requested UC03 filters."
         ) from exc
@@ -203,6 +213,7 @@ def list_work_items(
         raise ValidationError(detail="fromDate must be on or before toDate.")
 
     fingerprint = _filter_fingerprint(
+        tenant_id=tenant_id,
         work_type=work_type,
         from_date=from_date,
         to_date=to_date,
