@@ -112,6 +112,61 @@ def upgrade() -> None:
 
     op.execute(
         """
+        CREATE OR REPLACE FUNCTION auditcore.initialize_uc03_booking_requirements()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NEW.stage_code <> 'BOOKING' THEN
+                RETURN NEW;
+            END IF;
+
+            INSERT INTO auditcore.journey_document_requirements (
+                tenant_id,
+                journey_id,
+                document_requirement_item_id,
+                requirement_key,
+                document_type_key,
+                process_area,
+                requirement_level,
+                requirement_status,
+                condition_snapshot
+            )
+            SELECT
+                j.tenant_id,
+                j.journey_id,
+                dri.document_requirement_item_id,
+                dri.requirement_key,
+                dri.document_type_key,
+                dri.process_area,
+                dri.requirement_level,
+                'PENDING',
+                dri.condition_config
+            FROM auditcore.journeys j
+            JOIN auditcore.document_requirement_items dri
+              ON dri.tenant_id = j.tenant_id
+             AND dri.document_requirement_profile_version_id =
+                    j.document_requirement_profile_version_id
+            WHERE j.tenant_id = NEW.tenant_id
+              AND j.journey_id = NEW.journey_id
+              AND upper(dri.process_area) = 'BOOKING'
+            ON CONFLICT (tenant_id, journey_id, requirement_key) DO NOTHING;
+
+            RETURN NEW;
+        END;
+        $$
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER trg_uc03_booking_initialize_requirements
+        AFTER INSERT ON auditcore.journey_stage_states
+        FOR EACH ROW EXECUTE FUNCTION auditcore.initialize_uc03_booking_requirements()
+        """
+    )
+
+    op.execute(
+        """
         ALTER TABLE auditcore.audit_findings
             ADD COLUMN stage_code varchar(30),
             ADD COLUMN origin_kind varchar(20),
@@ -229,6 +284,11 @@ def downgrade() -> None:
         """
     )
 
+    op.execute(
+        "DROP TRIGGER IF EXISTS trg_uc03_booking_initialize_requirements "
+        "ON auditcore.journey_stage_states"
+    )
+    op.execute("DROP FUNCTION IF EXISTS auditcore.initialize_uc03_booking_requirements()")
     op.execute(
         "DROP TRIGGER IF EXISTS trg_journey_document_assessments_updated "
         "ON auditcore.journey_document_assessments"
