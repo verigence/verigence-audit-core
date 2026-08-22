@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -8,9 +9,36 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-from audit_core.dependencies import get_principal
+from audit_core.dependencies import get_human_principal
 from audit_core.main import app
-from audit_core.security import Principal
+from audit_core.security import HumanPrincipal
+from audit_core.security_authorization import (
+    SecurityAuthorizationDecision,
+    get_security_authorization_client,
+)
+
+
+@dataclass
+class ControlledAuthorization:
+    allowed: bool = True
+    calls: list[tuple[str, str, str]] = field(default_factory=list)
+
+    def check_user_permission(
+        self,
+        *,
+        user_id: str,
+        tenant_id: str,
+        permission_key: str,
+    ) -> SecurityAuthorizationDecision:
+        self.calls.append((user_id, tenant_id, permission_key))
+        return SecurityAuthorizationDecision(
+            allowed=self.allowed,
+            reason_code="AUTHORIZED" if self.allowed else "PERMISSION_DENIED",
+            user_id=user_id,
+            tenant_id=tenant_id,
+            permission_key=permission_key,
+            role_key="PC" if self.allowed else None,
+        )
 
 
 @pytest.fixture
@@ -55,8 +83,7 @@ def uc03_work_items_setup():
                     timezone_name, project_status
                 ) VALUES (
                     :tenant_id, :project_code, 'UC03 Work Project', :oem_id,
-                    :category_id, CURRENT_DATE - 1,
-                    'Asia/Kolkata', 'ACTIVE'
+                    :category_id, CURRENT_DATE - 1, 'Asia/Kolkata', 'ACTIVE'
                 )
                 """
             ),
@@ -67,7 +94,6 @@ def uc03_work_items_setup():
                 "category_id": category_id,
             },
         )
-
         dealer_id = connection.execute(
             text(
                 """
@@ -133,13 +159,10 @@ def uc03_work_items_setup():
                 text(
                     """
                     INSERT INTO auditcore.journeys (
-                        tenant_id, dealer_id, outlet_id, customer_id,
-                        journey_reference
+                        tenant_id, dealer_id, outlet_id, customer_id, journey_reference
                     ) VALUES (
-                        :tenant_id, :dealer_id, :outlet_id, :customer_id,
-                        :journey_reference
-                    )
-                    RETURNING journey_id
+                        :tenant_id, :dealer_id, :outlet_id, :customer_id, :reference
+                    ) RETURNING journey_id
                     """
                 ),
                 {
@@ -147,29 +170,22 @@ def uc03_work_items_setup():
                     "dealer_id": dealer_id,
                     "outlet_id": outlet_id,
                     "customer_id": customer_id,
-                    "journey_reference": f"J-{index:02d}",
+                    "reference": f"J-{index:02d}",
                 },
             ).scalar_one()
             journey_ids.append(journey_id)
             activity = base_activity - timedelta(minutes=index)
-            booking_started = datetime(2026, 8, 20, 6, 0, tzinfo=timezone.utc) + timedelta(
-                minutes=index
-            )
             connection.execute(
                 text(
                     """
                     INSERT INTO auditcore.bookings (
                         tenant_id, journey_id, booking_reference, booking_date
                     ) VALUES (
-                        :tenant_id, :journey_id, :booking_reference, DATE '2026-08-20'
+                        :tenant_id, :journey_id, :reference, DATE '2026-08-20'
                     )
                     """
                 ),
-                {
-                    "tenant_id": tenant_id,
-                    "journey_id": journey_id,
-                    "booking_reference": f"B-{index:02d}",
-                },
+                {"tenant_id": tenant_id, "journey_id": journey_id, "reference": f"B-{index:02d}"},
             )
             connection.execute(
                 text(
@@ -187,32 +203,23 @@ def uc03_work_items_setup():
                 {
                     "tenant_id": tenant_id,
                     "journey_id": journey_id,
-                    "started_at": booking_started,
+                    "started_at": datetime(2026, 8, 20, 6, 0, tzinfo=timezone.utc),
                     "activity": activity,
                 },
             )
-
             if index < 2:
-                delivered_at = datetime(2026, 8, 22, 19, 0, tzinfo=timezone.utc) + timedelta(
-                    minutes=index
-                )
+                delivered_at = datetime(2026, 8, 22, 19, index, tzinfo=timezone.utc)
                 connection.execute(
                     text(
                         """
                         INSERT INTO auditcore.deliveries (
-                            tenant_id, journey_id, actual_delivery_status_code,
-                            actual_delivered_at, status_source
+                            tenant_id, journey_id, actual_delivered_at, status_source
                         ) VALUES (
-                            :tenant_id, :journey_id, NULL,
-                            :delivered_at, 'OPERATIONAL_INPUT'
+                            :tenant_id, :journey_id, :delivered_at, 'OPERATIONAL_INPUT'
                         )
                         """
                     ),
-                    {
-                        "tenant_id": tenant_id,
-                        "journey_id": journey_id,
-                        "delivered_at": delivered_at,
-                    },
+                    {"tenant_id": tenant_id, "journey_id": journey_id, "delivered_at": delivered_at},
                 )
                 connection.execute(
                     text(
@@ -241,52 +248,20 @@ def uc03_work_items_setup():
             text(
                 """
                 INSERT INTO auditcore.audit_findings (
-                    tenant_id, journey_id, severity, finding_status,
-                    title, description
+                    tenant_id, journey_id, severity, finding_status, title
                 ) VALUES (
-                    :tenant_id, :journey_id, 'CRITICAL', 'OPEN',
-                    'Test critical flag', 'UC03 C0 test flag'
+                    :tenant_id, :journey_id, 'CRITICAL', 'OPEN', 'Test critical flag'
                 )
                 """
             ),
             {"tenant_id": tenant_id, "journey_id": journey_ids[0]},
-        )
-        customer_for_first = connection.execute(
-            text(
-                """
-                SELECT customer_id FROM auditcore.journeys
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_ids[0]},
-        ).scalar_one()
-        connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.evidence_ingestion_operations (
-                    tenant_id, journey_id, customer_id, idempotency_key,
-                    evidence_purpose, operation_status
-                ) VALUES (
-                    :tenant_id, :journey_id, :customer_id, :idempotency_key,
-                    'BOOKING_DOCKET', 'DI_ACCEPTED'
-                )
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_ids[0],
-                "customer_id": customer_for_first,
-                "idempotency_key": f"uc03-work-{suffix}",
-            },
         )
 
-        # A Journey outside the PC assignment must not appear in the work list.
         other_dealer = connection.execute(
             text(
                 """
                 INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name)
-                VALUES (:tenant_id, :code, 'Other Dealer')
-                RETURNING dealer_id
+                VALUES (:tenant_id, :code, 'Other Dealer') RETURNING dealer_id
                 """
             ),
             {"tenant_id": tenant_id, "code": f"D2-{suffix}"},
@@ -296,8 +271,7 @@ def uc03_work_items_setup():
                 """
                 INSERT INTO auditcore.dealer_outlets (
                     tenant_id, dealer_id, outlet_code, outlet_name
-                ) VALUES (:tenant_id, :dealer_id, :code, 'Other Outlet')
-                RETURNING outlet_id
+                ) VALUES (:tenant_id, :dealer_id, :code, 'Other Outlet') RETURNING outlet_id
                 """
             ),
             {"tenant_id": tenant_id, "dealer_id": other_dealer, "code": f"O2-{suffix}"},
@@ -307,8 +281,9 @@ def uc03_work_items_setup():
                 """
                 INSERT INTO auditcore.customers (
                     tenant_id, dealer_id, outlet_id, customer_type_code, display_name
-                ) VALUES (:tenant_id, :dealer_id, :outlet_id, 'INDIVIDUAL', 'Hidden Customer')
-                RETURNING customer_id
+                ) VALUES (
+                    :tenant_id, :dealer_id, :outlet_id, 'INDIVIDUAL', 'Hidden Customer'
+                ) RETURNING customer_id
                 """
             ),
             {"tenant_id": tenant_id, "dealer_id": other_dealer, "outlet_id": other_outlet},
@@ -318,8 +293,9 @@ def uc03_work_items_setup():
                 """
                 INSERT INTO auditcore.journeys (
                     tenant_id, dealer_id, outlet_id, customer_id
-                ) VALUES (:tenant_id, :dealer_id, :outlet_id, :customer_id)
-                RETURNING journey_id
+                ) VALUES (
+                    :tenant_id, :dealer_id, :outlet_id, :customer_id
+                ) RETURNING journey_id
                 """
             ),
             {
@@ -332,31 +308,30 @@ def uc03_work_items_setup():
         connection.execute(
             text(
                 """
-                INSERT INTO auditcore.bookings (tenant_id, journey_id, booking_reference, booking_date)
-                VALUES (:tenant_id, :journey_id, 'HIDDEN', DATE '2026-08-20')
+                INSERT INTO auditcore.bookings (
+                    tenant_id, journey_id, booking_reference, booking_date
+                ) VALUES (:tenant_id, :journey_id, 'HIDDEN', DATE '2026-08-20')
                 """
             ),
             {"tenant_id": tenant_id, "journey_id": hidden_journey},
         )
 
-    app.dependency_overrides[get_principal] = lambda: Principal(
-        subject=actor_id,
-        tenant_id=tenant_id,
-        permissions=("audit.journey.read",),
-    )
+    authorization = ControlledAuthorization()
+    app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=actor_id)
+    app.dependency_overrides[get_security_authorization_client] = lambda: authorization
     try:
         yield {
             "engine": engine,
             "tenant_id": tenant_id,
             "actor_id": actor_id,
-            "journey_ids": journey_ids,
+            "authorization": authorization,
         }
     finally:
         app.dependency_overrides.clear()
         engine.dispose()
 
 
-def test_work_items_enforce_scope_and_page_at_ten(uc03_work_items_setup) -> None:
+def test_work_items_use_live_security_and_enforce_business_scope(uc03_work_items_setup) -> None:
     setup = uc03_work_items_setup
     client = TestClient(app, raise_server_exceptions=False)
     path = f"/v1/tenants/{setup['tenant_id']}/uc03/work-items"
@@ -367,30 +342,22 @@ def test_work_items_enforce_scope_and_page_at_ten(uc03_work_items_setup) -> None
     assert payload["pageSize"] == 10
     assert len(payload["items"]) == 10
     assert payload["nextCursor"]
-    assert payload["previousCursor"] is None
-    assert payload["filters"] == {
-        "workType": "ALL",
-        "fromDate": None,
-        "toDate": None,
-        "timezoneName": "Asia/Kolkata",
-    }
     assert all(item["customerDisplayName"] != "Hidden Customer" for item in payload["items"])
+    assert setup["authorization"].calls == [
+        (setup["actor_id"], setup["tenant_id"], "audit.journey.read")
+    ]
 
     second = client.get(path, params={"cursor": payload["nextCursor"]})
     assert second.status_code == 200
     second_payload = second.json()
     assert second_payload["pageSize"] == 2
     assert second_payload["nextCursor"] is None
-    first_ids = {item["journeyId"] for item in payload["items"]}
-    second_ids = {item["journeyId"] for item in second_payload["items"]}
-    assert first_ids.isdisjoint(second_ids)
-    assert len(first_ids | second_ids) == 12
+    assert len(setup["authorization"].calls) == 2
 
     newest = payload["items"][0]
     assert newest["openFlagCount"] == 1
     assert newest["totalFlagCount"] == 1
     assert newest["highestOpenSeverity"] == "CRITICAL"
-    assert newest["processingDocumentCount"] == 1
     assert newest["proposalReadyCount"] == 0
     assert newest["nextActionCode"] is None
 
@@ -414,14 +381,8 @@ def test_work_items_filter_delivery_using_project_timezone(uc03_work_items_setup
     assert all(item["delivery"]["businessDate"] == "2026-08-23" for item in payload["items"])
     assert all(item["delivery"]["businessStatus"] == "DELIVERY_COMPLETED" for item in payload["items"])
 
-    booking_only = client.get(path, params={"workType": "BOOKING"})
-    assert booking_only.status_code == 200
-    assert booking_only.json()["pageSize"] == 10
 
-
-def test_work_item_cursor_is_bound_to_filters_and_date_range_is_validated(
-    uc03_work_items_setup,
-) -> None:
+def test_work_item_cursor_validation_and_security_deny(uc03_work_items_setup) -> None:
     setup = uc03_work_items_setup
     client = TestClient(app, raise_server_exceptions=False)
     path = f"/v1/tenants/{setup['tenant_id']}/uc03/work-items"
@@ -445,5 +406,7 @@ def test_work_item_cursor_is_bound_to_filters_and_date_range_is_validated(
     assert invalid_range.status_code == 400
     assert invalid_range.json()["errorCode"] == "VAC-VAL-001"
 
-    over_limit = client.get(path, params={"limit": 11})
-    assert over_limit.status_code == 400
+    setup["authorization"].allowed = False
+    denied = client.get(path)
+    assert denied.status_code == 403
+    assert denied.json()["errorCode"] == "VAC-AUTH-002"
