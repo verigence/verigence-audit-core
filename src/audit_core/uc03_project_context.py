@@ -67,11 +67,6 @@ def list_my_projects(
                   AND ba.effective_from <= now()
                   AND (ba.effective_to IS NULL OR ba.effective_to > now())
                   AND p.project_status = 'ACTIVE'
-                  AND p.effective_start_date <= (now() AT TIME ZONE p.timezone_name)::date
-                  AND (
-                        p.effective_end_date IS NULL
-                        OR p.effective_end_date >= (now() AT TIME ZONE p.timezone_name)::date
-                  )
                 GROUP BY
                     p.tenant_id,
                     p.project_code,

@@ -94,7 +94,7 @@ def upgrade() -> None:
                                         CHECK (audit_state IN ('NOT_STARTED','IN_PROGRESS','COMPLETE')),
             audit_status                varchar(30) NOT NULL DEFAULT 'NOT_EVALUATED'
                                         CHECK (audit_status IN ('NOT_EVALUATED','NO_FLAGS','FLAGS_RAISED')),
-            business_started_at_utc     timestamptz,
+            first_started_at_utc        timestamptz,
             business_completed_at_utc   timestamptz,
             capture_completed_at_utc    timestamptz,
             latest_activity_at_utc      timestamptz NOT NULL DEFAULT now(),
@@ -106,8 +106,8 @@ def upgrade() -> None:
                 REFERENCES auditcore.journeys(tenant_id, journey_id),
             CHECK (
                 business_completed_at_utc IS NULL
-                OR business_started_at_utc IS NULL
-                OR business_completed_at_utc >= business_started_at_utc
+                OR first_started_at_utc IS NULL
+                OR business_completed_at_utc >= first_started_at_utc
             )
         )
         """
@@ -147,7 +147,7 @@ def upgrade() -> None:
             actor_id                    varchar(160),
             actor_role_snapshot         varchar(80),
             idempotency_key             varchar(200),
-            correlation_id              varchar(128) NOT NULL,
+            correlation_id              varchar(128),
             safe_payload                jsonb NOT NULL DEFAULT '{}'::jsonb,
             occurred_at_utc             timestamptz NOT NULL,
             recorded_at_utc             timestamptz NOT NULL DEFAULT now(),
