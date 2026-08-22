@@ -26,6 +26,7 @@ from audit_core.project_activation import router as project_activation_router
 from audit_core.project_master_imports import router as project_master_import_router
 from audit_core.project_masters import router as project_master_router
 from audit_core.project_provisioning import router as project_provisioning_router
+from audit_core.project_reference_data import router as project_reference_data_router
 from audit_core.projects import router as project_router
 from audit_core.readiness import router as readiness_router
 from audit_core.reference_data import router as reference_data_router
@@ -69,6 +70,7 @@ def create_app() -> FastAPI:
             allow_headers=_CORS_HEADERS,
             expose_headers=_CORS_EXPOSE_HEADERS,
         )
+    application.include_router(project_reference_data_router)
     application.include_router(project_provisioning_router)
     application.include_router(project_router)
     application.include_router(readiness_router)
