@@ -14,7 +14,6 @@ from audit_core.dependencies import (
 from audit_core.main import app
 from audit_core.security_integration import SecurityAdminContext
 
-
 _EXPECTED_OEMS = {
     "MAHINDRA": "Mahindra",
     "HYUNDAI": "Hyundai",
