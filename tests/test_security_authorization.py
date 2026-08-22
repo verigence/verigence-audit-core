@@ -98,10 +98,9 @@ def test_security_authorization_client_rejects_mismatched_decision() -> None:
         client_id="audit-core",
         client_secret="secret",
         transport=httpx.MockTransport(handler),
-    ) as client:
-        with pytest.raises(SecurityAuthorizationError):
-            client.check_user_permission(
-                user_id="user-1",
-                tenant_id="tenant-1",
-                permission_key="audit.journey.read",
-            )
+    ) as client, pytest.raises(SecurityAuthorizationError):
+        client.check_user_permission(
+            user_id="user-1",
+            tenant_id="tenant-1",
+            permission_key="audit.journey.read",
+        )
