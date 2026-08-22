@@ -17,26 +17,56 @@ jobs:
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       DB_SERVICE: Postgres
     steps:
-      - name: Install Railway CLI
-        run: npm install --global @railway/cli
-      - name: Inspect only non-secret Postgres access metadata
+      - name: Install Railway and PostgreSQL client tooling
+        run: |
+          npm install --global @railway/cli
+          python -m pip install --disable-pip-version-check 'psycopg[binary]>=3,<4'
+      - name: Verify private Postgres through Railway tunnel
         shell: bash
         run: |
           set -euo pipefail
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$DB_SERVICE" --json >/tmp/link.json
           railway variable list --service "$DB_SERVICE" --json >/tmp/postgres-vars.json
+
+          railway connect "$DB_SERVICE" --tunnel-only --port 55432 >/tmp/tunnel.out 2>/tmp/tunnel.err &
+          tunnel_pid=$!
+          trap 'kill "$tunnel_pid" >/dev/null 2>&1 || true' EXIT
+
+          ready=false
+          for attempt in $(seq 1 30); do
+            if python - <<'PY'
+          import socket
+          with socket.create_connection(('127.0.0.1', 55432), timeout=1):
+              pass
+          PY
+            then
+              ready=true
+              break
+            fi
+            if ! kill -0 "$tunnel_pid" >/dev/null 2>&1; then
+              echo 'RAILWAY_POSTGRES_TUNNEL=FAILED_TO_START'
+              exit 1
+            fi
+            sleep 1
+          done
+          [ "$ready" = true ] || { echo 'RAILWAY_POSTGRES_TUNNEL=TIMEOUT'; exit 1; }
+
           python - <<'PY'
           import json
           from pathlib import Path
+          import psycopg
           values=json.loads(Path('/tmp/postgres-vars.json').read_text())
-          keys=sorted(values)
-          print('POSTGRES_VARIABLE_KEYS=' + ','.join(keys))
-          candidates=(
-              'DATABASE_PUBLIC_URL','POSTGRES_PUBLIC_URL','RAILWAY_TCP_PROXY_DOMAIN',
-              'RAILWAY_TCP_PROXY_PORT','PGHOST','PGPORT','PGUSER','PGPASSWORD','PGDATABASE',
-              'POSTGRES_HOST','POSTGRES_PORT','POSTGRES_USER','POSTGRES_PASSWORD','POSTGRES_DB',
-              'DATABASE_URL','DATABASE_PRIVATE_URL','RAILWAY_PRIVATE_DOMAIN',
-          )
-          for key in candidates:
-              print(f'POSTGRES_KEY_PRESENT|{key}|{bool(values.get(key))}')
+          required=('PGUSER','PGPASSWORD','PGDATABASE')
+          if any(not values.get(k) for k in required):
+              raise SystemExit('Required Postgres credentials are unavailable')
+          with psycopg.connect(
+              host='127.0.0.1', port=55432,
+              user=values['PGUSER'], password=values['PGPASSWORD'], dbname=values['PGDATABASE'],
+              connect_timeout=5,
+          ) as conn:
+              with conn.cursor() as cur:
+                  cur.execute('SELECT 1')
+                  if cur.fetchone() != (1,):
+                      raise SystemExit('Postgres tunnel query did not return expected result')
+          print('RAILWAY_POSTGRES_PRIVATE_TUNNEL=PASS')
           PY
