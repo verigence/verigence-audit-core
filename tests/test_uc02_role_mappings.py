@@ -231,7 +231,7 @@ def role_mapping_setup(monkeypatch):
 
 def test_pc_outlet_scope_is_flexible_and_idempotent(role_mapping_setup) -> None:
     setup = role_mapping_setup
-    client = TestClient(app, raise_server_exceptions=False)
+    client = TestClient(app, raise_server_exceptions=True)
     user_id = "user-pc-flex"
     path = f"/v1/tenants/{setup['tenant_a']}/role-mappings/{user_id}"
     selected = [
