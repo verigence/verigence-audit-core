@@ -1,0 +1,32 @@
+name: Diagnose UC02 Project page DEV
+
+on:
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      - name: Read recent Audit Core and Security DEV logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --json >/dev/null
+          echo '--- AUDIT CORE DIAGNOSTIC ---'
+          railway logs --service verigence-audit-core --latest --deployment --lines 800 2>/dev/null \
+            | grep -E 'security_admin_context_failed|project_directory_dependency_failed|project_create_security_failed|auth_failed|human_auth_failed|api_error|system_error' \
+            | tail -n 120 || true
+          echo '--- SECURITY DIAGNOSTIC ---'
+          railway logs --service security --latest --deployment --lines 800 2>/dev/null \
+            | grep -E 'admin-context|platform/tenants|401|403|500|ERROR|WARNING|timeout|Timeout' \
+            | tail -n 120 || true
