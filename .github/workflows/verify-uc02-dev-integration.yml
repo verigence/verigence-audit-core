@@ -23,122 +23,114 @@ jobs:
           npm install --global @railway/cli
           python -m pip install 'psycopg[binary]'
 
-      - name: Correlate latest UC02 Security failure
+      - name: Prove UC02 Security failure root cause
         shell: bash
         run: |
           set -euo pipefail
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
           railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
           railway variable list --service security --json >/tmp/security-vars.json
-          railway deployment list --service security --limit 5 --json >/tmp/security-deployments.json
+          railway logs --service security --lines 12000 --json >/tmp/security-json.log 2>/dev/null || true
           railway logs --service security --lines 12000 >/tmp/security.log 2>/dev/null || true
-          railway logs --service "$AUDIT_SERVICE" --lines 8000 >/tmp/audit.log 2>/dev/null || true
+          railway logs --service "$AUDIT_SERVICE" --lines 8000 --json >/tmp/audit-json.log 2>/dev/null || true
 
           python - <<'PY'
           import json, re
-          from datetime import datetime, timezone, timedelta
+          from datetime import timezone
           from pathlib import Path
           from urllib.parse import urlparse
           import psycopg
 
           audit = json.loads(Path('/tmp/audit-vars.json').read_text())
           sec = json.loads(Path('/tmp/security-vars.json').read_text())
-          sec_url = str(audit.get('SECURITY_BASE_URL') or '').strip()
-          p = urlparse(sec_url)
-          print('SECURITY_BASE_URL_HOST=' + str(p.hostname or ''))
-          print('SECURITY_BASE_URL_PORT=' + str(p.port or 'DEFAULT'))
+          p = urlparse(str(audit.get('SECURITY_BASE_URL') or ''))
+          print('SECURITY_ENDPOINT_HOST=' + str(p.hostname or ''))
+          print('SECURITY_ENDPOINT_CONFIGURED_PORT=' + str(p.port or 'DEFAULT'))
           print('SECURITY_SERVICE_PORT=' + str(sec.get('PORT') or 'UNSET'))
 
-          db_url = str(audit.get('DATABASE_URL') or '').strip().replace('postgresql+psycopg://','postgresql://',1)
-          with psycopg.connect(db_url) as conn:
+          adb = str(audit.get('DATABASE_URL') or '').replace('postgresql+psycopg://','postgresql://',1)
+          with psycopg.connect(adb) as conn:
               with conn.cursor() as cur:
                   cur.execute("""
                       SELECT operation_id, created_at_utc, updated_at_utc,
-                             last_error_code, last_error_summary,
-                             safe_request_summary->>'projectName' AS project_name
+                             idempotency_key, last_error_code, last_error_summary,
+                             safe_request_summary->>'projectName'
                       FROM auditcore.administrative_operations
                       WHERE operation_type='PROJECT_PROVISION'
                         AND status='RECOVERY_REQUIRED'
                         AND current_step='SECURITY'
-                      ORDER BY updated_at_utc DESC
-                      LIMIT 1
+                      ORDER BY updated_at_utc DESC LIMIT 1
                   """)
-                  row = cur.fetchone()
-          if row is None:
-              raise SystemExit('NO_SECURITY_RECOVERY_OPERATION')
-          op_id, created_at, updated_at, code, summary, project_name = row
-          print('LATEST_OPERATION_ID=' + str(op_id))
-          print('LATEST_PROJECT_NAME=' + str(project_name or ''))
-          print('LATEST_OPERATION_CREATED_AT=' + created_at.isoformat())
-          print('LATEST_OPERATION_UPDATED_AT=' + updated_at.isoformat())
-          print('LATEST_INTERNAL_CODE=' + str(code or ''))
-          text = str(summary or '')
-          if 'endpoint is unavailable' in text.lower():
-              print('LATEST_FAILURE_CLASS=ENDPOINT_UNREACHABLE_OR_TIMEOUT')
-          else:
-              m = re.search(r'HTTP\s+(\d{3})', text, re.I)
-              print('LATEST_FAILURE_CLASS=' + ('DOWNSTREAM_HTTP_' + m.group(1) if m else 'OTHER'))
+                  op = cur.fetchone()
+          if op is None:
+              raise SystemExit('NO_FAILED_SECURITY_OPERATION')
+          operation_id, created_at, updated_at, idem, code, summary, project_name = op
+          print('PROJECT_NAME=' + str(project_name or ''))
+          print('OPERATION_CREATED_AT=' + created_at.isoformat())
+          print('OPERATION_UPDATED_AT=' + updated_at.isoformat())
+          print('OPERATION_ELAPSED_SECONDS=' + f'{(updated_at-created_at).total_seconds():.3f}')
+          print('OPERATION_INTERNAL_CODE=' + str(code or ''))
+          print('OPERATION_SUMMARY_CLASS=' + ('ENDPOINT_UNAVAILABLE' if 'endpoint is unavailable' in str(summary or '').lower() else 'OTHER'))
 
-          # Security deployment status around the incident.
-          deployments = json.loads(Path('/tmp/security-deployments.json').read_text())
-          for i, d in enumerate(deployments[:5], 1):
-              print(f'SECURITY_DEPLOYMENT_{i}_STATUS=' + str(d.get('status','')))
-              print(f'SECURITY_DEPLOYMENT_{i}_CREATED_AT=' + str(d.get('createdAt','')))
+          sdb = str(sec.get('DATABASE_URL') or '').replace('postgresql+psycopg://','postgresql://',1)
+          if not sdb:
+              raise SystemExit('SECURITY_DATABASE_URL_MISSING')
+          with psycopg.connect(sdb) as conn:
+              with conn.cursor() as cur:
+                  cur.execute("""
+                      SELECT count(*), min(created_at_utc), max(created_at_utc),
+                             string_agg(DISTINCT status, ',')
+                      FROM security.tenants
+                      WHERE tenant_name=%s
+                  """, (project_name,))
+                  tenant_count, first_created, last_created, statuses = cur.fetchone()
+                  cur.execute("""
+                      SELECT count(*), min(occurred_at_utc), max(occurred_at_utc)
+                      FROM security.admin_change_records
+                      WHERE operation_key='platform.tenant.create'
+                        AND outcome='SUCCESS'
+                        AND after_state_json->>'tenantName'=%s
+                  """, (project_name,))
+                  receipt_count, first_receipt, last_receipt = cur.fetchone()
+                  cur.execute("""
+                      SELECT count(*)
+                      FROM security.admin_change_records
+                      WHERE operation_key='platform.tenant.create'
+                        AND outcome='SUCCESS'
+                        AND after_state_json->>'idempotencyKey'=%s
+                  """, (idem,))
+                  idem_receipts = cur.fetchone()[0]
+          print('SECURITY_TENANT_COUNT=' + str(tenant_count))
+          print('SECURITY_TENANT_STATUSES=' + str(statuses or ''))
+          print('SECURITY_TENANT_FIRST_CREATED_AT=' + (first_created.isoformat() if first_created else 'NONE'))
+          print('SECURITY_CREATE_SUCCESS_RECEIPT_COUNT=' + str(receipt_count))
+          print('SECURITY_CREATE_SUCCESS_LAST_AT=' + (last_receipt.isoformat() if last_receipt else 'NONE'))
+          print('SECURITY_IDEMPOTENCY_RECEIPT_COUNT=' + str(idem_receipts))
 
+          # Parse Railway JSON logs if available. Do not print identities or payloads.
           target = updated_at.astimezone(timezone.utc)
-          start, end = target - timedelta(seconds=20), target + timedelta(seconds=20)
-
-          def parse_ts(line: str):
-              # Railway plain logs may start with ISO timestamp or embed one in JSON.
-              m = re.search(r'(20\d\d-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)?)', line)
-              if not m:
-                  return None
-              raw = m.group(1).replace(' ', 'T')
-              if raw.endswith('Z'):
-                  raw = raw[:-1] + '+00:00'
-              try:
-                  dt = datetime.fromisoformat(raw)
-                  if dt.tzinfo is None:
-                      dt = dt.replace(tzinfo=timezone.utc)
-                  return dt.astimezone(timezone.utc)
-              except ValueError:
-                  return None
-
-          uuid_re = re.compile(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b')
-          email_re = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b')
-          token_re = re.compile(r'Bearer\s+[^\s\"]+', re.I)
-          def sanitize(s: str):
-              s = token_re.sub('Bearer <redacted>', s)
-              s = email_re.sub('<email>', s)
-              s = uuid_re.sub('<uuid>', s)
-              return s[:1200]
-
-          sec_lines = Path('/tmp/security.log').read_text(errors='ignore').splitlines()
-          window = []
-          for line in sec_lines:
-              dt = parse_ts(line)
-              if dt is not None and start <= dt <= end:
-                  window.append(line)
-          print('SECURITY_LOG_WINDOW_LINE_COUNT=' + str(len(window)))
-          relevant = [
-              l for l in window
-              if any(k in l.lower() for k in [
-                  'platform/tenants','admin-context','error','exception','traceback',
-                  'tenant.create','tenant create','500','timeout','timed out'
-              ])
-          ]
-          print('SECURITY_RELEVANT_LINE_COUNT=' + str(len(relevant)))
-          for line in relevant[-80:]:
-              print('SECURITY_LOG|' + sanitize(line))
-
-          audit_lines = Path('/tmp/audit.log').read_text(errors='ignore').splitlines()
-          awindow = []
-          for line in audit_lines:
-              dt = parse_ts(line)
-              if dt is not None and start <= dt <= end:
-                  awindow.append(line)
-          arelevant = [l for l in awindow if any(k in l.lower() for k in ['security_admin','project_provisioning','timeout','endpoint_unavailable'])]
-          print('AUDIT_RELEVANT_LINE_COUNT=' + str(len(arelevant)))
-          for line in arelevant[-50:]:
-              print('AUDIT_LOG|' + sanitize(line))
+          def load_json_lines(path):
+              rows=[]
+              for line in Path(path).read_text(errors='ignore').splitlines():
+                  try:
+                      obj=json.loads(line)
+                  except Exception:
+                      continue
+                  rows.append(obj)
+              return rows
+          rows=load_json_lines('/tmp/security-json.log')
+          print('SECURITY_JSON_LOG_ROWS=' + str(len(rows)))
+          matched=[]
+          for obj in rows:
+              raw_ts = obj.get('timestamp') or obj.get('time') or obj.get('datetime')
+              msg = str(obj.get('message') or obj.get('msg') or obj)
+              if any(k in msg.lower() for k in ['platform/tenants','admin-context','tenant.create','exception','traceback','error']):
+                  matched.append((str(raw_ts or ''), msg))
+          print('SECURITY_MATCHED_LOG_ROWS=' + str(len(matched)))
+          uuid_re=re.compile(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}\b')
+          email_re=re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b')
+          for ts,msg in matched[-80:]:
+              safe=uuid_re.sub('<uuid>', email_re.sub('<email>', msg))
+              safe=re.sub(r'Bearer\s+\S+','Bearer <redacted>',safe,flags=re.I)
+              print('SECURITY_LOG|' + ts + '|' + safe[:1000])
           PY
