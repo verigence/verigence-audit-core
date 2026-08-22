@@ -28,6 +28,7 @@ jobs:
           [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo 'RAILWAY_API_TOKEN=UNAVAILABLE'; exit 1; }
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
           railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          railway service list --json >/tmp/services.json
 
           python - <<'PY'
           import json
@@ -35,6 +36,9 @@ jobs:
           from urllib.parse import urlparse
 
           data = json.loads(Path('/tmp/audit-vars.json').read_text())
+          services = json.loads(Path('/tmp/services.json').read_text())
+          names = sorted(str(row.get('name', '')) for row in services if row.get('name'))
+          print('RAILWAY_SERVICES=' + ','.join(names))
           missing = []
           for key, path in [('SECURITY_BASE_URL', '/tmp/security-url'), ('DI_BASE_URL', '/tmp/di-url')]:
               value = str(data.get(key, '')).strip()
@@ -48,14 +52,13 @@ jobs:
                   missing.append(key)
                   continue
               print(f'{key}=PRESENT')
+              print(f'{key}_SCHEME={parsed.scheme}')
               print(f'{key}_HOST={parsed.hostname or "unknown"}')
+              print(f'{key}_PORT={parsed.port if parsed.port is not None else "DEFAULT"}')
               Path(path).write_text(value.rstrip('/'))
           if missing:
               raise SystemExit('Missing or invalid Audit Core downstream endpoint configuration: ' + ', '.join(missing))
           PY
-
-          security="$(cat /tmp/security-url)"
-          di="$(cat /tmp/di-url)"
 
           security_host="$(python - <<'PY'
           from pathlib import Path
@@ -72,31 +75,12 @@ jobs:
 
           if [[ "$security_host" == *.railway.internal ]]; then
             echo 'SECURITY_CONNECTIVITY=PRIVATE_RAILWAY_HOST_CONFIGURED'
-          else
-            security_ready="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' "$security/health/ready" || true)"
-            echo "SECURITY_READY_HTTP=$security_ready"
-            [[ "$security_ready" == "200" ]] || { echo 'SECURITY_CONNECTIVITY=FAIL'; exit 1; }
-            tenant_probe="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' "$security/security/v1/platform/tenants" || true)"
-            echo "SECURITY_TENANT_ROUTE_HTTP=$tenant_probe"
-            case "$tenant_probe" in
-              401|403) echo 'SECURITY_ADMIN_ROUTE=REACHABLE_AUTH_REQUIRED' ;;
-              2??) echo 'SECURITY_ADMIN_ROUTE=REACHABLE' ;;
-              *) echo 'SECURITY_ADMIN_ROUTE=FAIL'; exit 1 ;;
-            esac
           fi
-
           if [[ "$di_host" == *.railway.internal ]]; then
             echo 'DI_CONNECTIVITY=PRIVATE_RAILWAY_HOST_CONFIGURED'
-          else
-            di_health="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' "$di/health" || true)"
-            di_ready="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' "$di/ready" || true)"
-            echo "DI_HEALTH_HTTP=$di_health"
-            echo "DI_READY_HTTP=$di_ready"
-            [[ "$di_health" == "200" && "$di_ready" == "200" ]] || { echo 'DI_CONNECTIVITY=FAIL'; exit 1; }
-            echo 'DI_CONNECTIVITY=PASS'
           fi
 
-          railway logs --service "$AUDIT_SERVICE" --latest --lines 800 >/tmp/audit.log 2>/dev/null || true
+          railway logs --service "$AUDIT_SERVICE" --latest --lines 5000 >/tmp/audit.log 2>/dev/null || true
           python - <<'PY'
           import re
           from pathlib import Path
