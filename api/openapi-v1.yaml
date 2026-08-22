@@ -119,6 +119,49 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Project'}
         default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/uc03/work-items:
+    get:
+      operationId: listUc03WorkItems
+      description: >-
+        Returns the latest authorized UC03 Booking/Delivery work items for the selected Project.
+        Results are business-assignment scoped, ordered by latestActivityAtUtc then journeyId,
+        and limited to at most 10 rows per page. Date filters use the Project timezone. Booking
+        date precedence is source Booking date, then Booking first-start event date, then Booking
+        record date. Delivery date precedence is actual-delivered date, then Delivery first-start
+        event date, then Delivery record date. For workType=ALL a case is returned once when either
+        applicable stage falls in the requested range.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - name: workType
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [ALL, BOOKING, DELIVERY]
+            default: ALL
+        - name: fromDate
+          in: query
+          required: false
+          schema: {type: string, format: date}
+        - name: toDate
+          in: query
+          required: false
+          schema: {type: string, format: date}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 10, default: 10}
+        - name: cursor
+          in: query
+          required: false
+          schema: {type: string, maxLength: 1024}
+      responses:
+        '200':
+          description: UC03 Project work-item page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Uc03WorkItemPage'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
   /tenants/{tenantId}/reference/product-skus:
     get:
       operationId: listProductSkus
@@ -347,6 +390,89 @@ components:
         allDealers: {type: boolean}
         dealerCount: {type: integer, minimum: 0}
         outletCount: {type: integer, minimum: 0}
+    Uc03StageSummary:
+      type: object
+      required: [businessStatus, auditState, auditStatus, businessDate]
+      properties:
+        businessStatus: {type: [string, 'null']}
+        auditState:
+          type: string
+          enum: [NOT_STARTED, IN_PROGRESS, COMPLETE]
+        auditStatus:
+          type: string
+          enum: [NOT_EVALUATED, NO_FLAGS, FLAGS_RAISED]
+        businessDate: {type: [string, 'null'], format: date}
+    Uc03WorkItem:
+      type: object
+      required:
+        - journeyId
+        - bookingReference
+        - customerDisplayName
+        - customerMobileLast4
+        - productLabel
+        - projectName
+        - dealerId
+        - dealerName
+        - outletId
+        - outletName
+        - booking
+        - delivery
+        - openFlagCount
+        - totalFlagCount
+        - highestOpenSeverity
+        - processingDocumentCount
+        - proposalReadyCount
+        - latestActivityAtUtc
+        - nextActionCode
+      properties:
+        journeyId: {type: string, format: uuid}
+        bookingReference: {type: [string, 'null']}
+        customerDisplayName: {type: string}
+        customerMobileLast4: {type: [string, 'null']}
+        productLabel: {type: [string, 'null']}
+        projectName: {type: string}
+        dealerId: {type: string, format: uuid}
+        dealerName: {type: string}
+        outletId: {type: string, format: uuid}
+        outletName: {type: string}
+        booking: {$ref: '#/components/schemas/Uc03StageSummary'}
+        delivery: {$ref: '#/components/schemas/Uc03StageSummary'}
+        openFlagCount: {type: integer, minimum: 0}
+        totalFlagCount: {type: integer, minimum: 0}
+        highestOpenSeverity:
+          type: [string, 'null']
+          description: Highest current open/acknowledged flag severity using the published severity vocabulary.
+        processingDocumentCount: {type: integer, minimum: 0}
+        proposalReadyCount:
+          type: integer
+          minimum: 0
+          description: Reserved at zero in C0; populated when C1 extraction proposal acceptance is implemented.
+        latestActivityAtUtc: {type: string, format: date-time}
+        nextActionCode:
+          type: [string, 'null']
+          description: Reserved as null in C0 until concrete Booking/Delivery command policy is implemented.
+    Uc03WorkItemFilters:
+      type: object
+      required: [workType, fromDate, toDate, timezoneName]
+      properties:
+        workType: {type: string, enum: [ALL, BOOKING, DELIVERY]}
+        fromDate: {type: [string, 'null'], format: date}
+        toDate: {type: [string, 'null'], format: date}
+        timezoneName: {type: string}
+    Uc03WorkItemPage:
+      type: object
+      required: [items, pageSize, nextCursor, previousCursor, filters]
+      properties:
+        items:
+          type: array
+          maxItems: 10
+          items: {$ref: '#/components/schemas/Uc03WorkItem'}
+        pageSize: {type: integer, minimum: 0, maximum: 10}
+        nextCursor: {type: [string, 'null']}
+        previousCursor:
+          type: [string, 'null']
+          description: C0 returns null; clients can retain prior cursor history for Previous navigation.
+        filters: {$ref: '#/components/schemas/Uc03WorkItemFilters'}
     Project:
       type: object
       required: [tenantId, projectName]
