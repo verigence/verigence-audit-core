@@ -25,60 +25,49 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo 'RAILWAY_API_TOKEN=UNAVAILABLE'; exit 1; }
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
           railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
-          railway service list --json >/tmp/services.json
+          railway variable list --service security --json >/tmp/security-vars.json
+          railway variable list --service di-api --json >/tmp/di-vars.json
 
           python - <<'PY'
           import json
           from pathlib import Path
           from urllib.parse import urlparse
 
-          data = json.loads(Path('/tmp/audit-vars.json').read_text())
-          services = json.loads(Path('/tmp/services.json').read_text())
-          names = sorted(str(row.get('name', '')) for row in services if row.get('name'))
-          print('RAILWAY_SERVICES=' + ','.join(names))
-          missing = []
-          for key, path in [('SECURITY_BASE_URL', '/tmp/security-url'), ('DI_BASE_URL', '/tmp/di-url')]:
-              value = str(data.get(key, '')).strip()
+          audit = json.loads(Path('/tmp/audit-vars.json').read_text())
+          security = json.loads(Path('/tmp/security-vars.json').read_text())
+          di = json.loads(Path('/tmp/di-vars.json').read_text())
+
+          checks = [
+              ('SECURITY_BASE_URL', audit.get('SECURITY_BASE_URL'), security.get('PORT'), security.get('RAILWAY_PUBLIC_DOMAIN')),
+              ('DI_BASE_URL', audit.get('DI_BASE_URL'), di.get('PORT'), di.get('RAILWAY_PUBLIC_DOMAIN')),
+          ]
+          failed = False
+          for key, raw_url, service_port, public_domain in checks:
+              value = str(raw_url or '').strip()
               if not value:
                   print(f'{key}=MISSING')
-                  missing.append(key)
+                  failed = True
                   continue
               parsed = urlparse(value)
-              if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
-                  print(f'{key}=INVALID')
-                  missing.append(key)
-                  continue
+              configured_port = parsed.port
               print(f'{key}=PRESENT')
               print(f'{key}_SCHEME={parsed.scheme}')
               print(f'{key}_HOST={parsed.hostname or "unknown"}')
-              print(f'{key}_PORT={parsed.port if parsed.port is not None else "DEFAULT"}')
-              Path(path).write_text(value.rstrip('/'))
-          if missing:
-              raise SystemExit('Missing or invalid Audit Core downstream endpoint configuration: ' + ', '.join(missing))
+              print(f'{key}_CONFIGURED_PORT={configured_port if configured_port is not None else "DEFAULT"}')
+              print(f'{key}_SERVICE_PORT={service_port or "UNSET"}')
+              print(f'{key}_PUBLIC_DOMAIN_PRESENT={"YES" if public_domain else "NO"}')
+              if service_port and configured_port is not None and str(configured_port) != str(service_port):
+                  print(f'{key}_PORT_MATCH=FAIL')
+                  failed = True
+              elif service_port and configured_port is not None:
+                  print(f'{key}_PORT_MATCH=PASS')
+              else:
+                  print(f'{key}_PORT_MATCH=UNVERIFIED')
+          if failed:
+              raise SystemExit('Audit Core downstream endpoint configuration mismatch detected')
           PY
-
-          security_host="$(python - <<'PY'
-          from pathlib import Path
-          from urllib.parse import urlparse
-          print(urlparse(Path('/tmp/security-url').read_text()).hostname or '')
-          PY
-          )"
-          di_host="$(python - <<'PY'
-          from pathlib import Path
-          from urllib.parse import urlparse
-          print(urlparse(Path('/tmp/di-url').read_text()).hostname or '')
-          PY
-          )"
-
-          if [[ "$security_host" == *.railway.internal ]]; then
-            echo 'SECURITY_CONNECTIVITY=PRIVATE_RAILWAY_HOST_CONFIGURED'
-          fi
-          if [[ "$di_host" == *.railway.internal ]]; then
-            echo 'DI_CONNECTIVITY=PRIVATE_RAILWAY_HOST_CONFIGURED'
-          fi
 
           railway logs --service "$AUDIT_SERVICE" --latest --lines 5000 >/tmp/audit.log 2>/dev/null || true
           python - <<'PY'
