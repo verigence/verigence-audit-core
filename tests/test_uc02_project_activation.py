@@ -12,7 +12,7 @@ from sqlalchemy import create_engine, text
 from audit_core import project_activation
 from audit_core.dependencies import (
     HumanAdminRequest,
-    get_connection,
+    get_engine,
     require_super_admin_request,
 )
 from audit_core.main import app
@@ -149,10 +149,6 @@ def activation_setup(monkeypatch):
             },
         )
 
-    def connection_override():
-        with engine.begin() as connection:
-            yield connection
-
     admin_request = HumanAdminRequest(
         user_id="superadmin-activate",
         bearer_token="same-human-superadmin-token",
@@ -165,7 +161,7 @@ def activation_setup(monkeypatch):
     security = ControlledSecurityActivation()
     monkeypatch.setenv("SECURITY_BASE_URL", "https://security.test")
     monkeypatch.setattr(project_activation, "SecurityAdminClient", security.client_class())
-    app.dependency_overrides[get_connection] = connection_override
+    app.dependency_overrides[get_engine] = lambda: engine
     app.dependency_overrides[require_super_admin_request] = lambda: admin_request
     try:
         yield {
@@ -234,13 +230,19 @@ def test_readiness_failure_blocks_security_activation_and_local_transition(
     assert _status(setup["engine"], setup["tenant_id"]) == "CONFIGURING"
 
 
-def test_security_activation_failure_leaves_audit_core_configuring(
+def test_security_activation_failure_compensates_and_leaves_audit_core_configuring(
     activation_setup,
     monkeypatch,
 ) -> None:
     setup = activation_setup
     setup["security"].fail = True
+    compensation_calls: list[str] = []
     monkeypatch.setattr(project_activation, "evaluate_project_readiness", lambda **_: _ready_response())
+    monkeypatch.setattr(
+        project_activation,
+        "_restore_security_configuring",
+        lambda **kwargs: compensation_calls.append(str(kwargs["tenant_id"])),
+    )
 
     response = TestClient(app, raise_server_exceptions=False).post(
         f"/v1/tenants/{setup['tenant_id']}/project/activate",
@@ -252,16 +254,23 @@ def test_security_activation_failure_leaves_audit_core_configuring(
     assert setup["security"].calls == [
         ("same-human-superadmin-token", setup["tenant_id"])
     ]
+    assert compensation_calls == [setup["tenant_id"]]
     assert _status(setup["engine"], setup["tenant_id"]) == "CONFIGURING"
 
 
-def test_non_active_security_response_does_not_mark_audit_core_active(
+def test_non_active_security_response_is_compensated_and_returns_conflict(
     activation_setup,
     monkeypatch,
 ) -> None:
     setup = activation_setup
     setup["security"].returned_status = "CONFIGURING"
+    compensation_calls: list[str] = []
     monkeypatch.setattr(project_activation, "evaluate_project_readiness", lambda **_: _ready_response())
+    monkeypatch.setattr(
+        project_activation,
+        "_restore_security_configuring",
+        lambda **kwargs: compensation_calls.append(str(kwargs["tenant_id"])),
+    )
 
     response = TestClient(app, raise_server_exceptions=False).post(
         f"/v1/tenants/{setup['tenant_id']}/project/activate",
@@ -269,4 +278,6 @@ def test_non_active_security_response_does_not_mark_audit_core_active(
     )
 
     assert response.status_code == 409
+    assert response.json()["errorCode"] == "VAC-CONFLICT-001"
+    assert compensation_calls == [setup["tenant_id"]]
     assert _status(setup["engine"], setup["tenant_id"]) == "CONFIGURING"
