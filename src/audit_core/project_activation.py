@@ -85,11 +85,10 @@ def _activation_error(detail: str) -> AuditCoreError:
     )
 
 
-def _compensate_activation_or_raise(
+def _compensate_activation(
     *,
     tenant_id: str,
     admin_request: HumanAdminRequest,
-    original_error: Exception,
 ) -> None:
     try:
         _restore_security_configuring(
@@ -106,7 +105,6 @@ def _compensate_activation_or_raise(
         raise _activation_error(
             "Project activation could not be completed cleanly. Please contact support."
         ) from compensation_exc
-    raise _activation_error("Project activation could not be completed. Please try again.") from original_error
 
 
 @router.post("/activate", response_model=ProjectActivationResponse)
@@ -204,19 +202,25 @@ def activate_project(
             # The activation request may have committed in Security before its response
             # was lost. The compensation endpoint is idempotent for CONFIGURING, so
             # compensate on every uncertain activation result.
-            _compensate_activation_or_raise(
+            _compensate_activation(
                 tenant_id=tenant_id,
                 admin_request=admin_request,
-                original_error=exc,
             )
+            raise _activation_error(
+                "Project activation could not be completed. Please try again."
+            ) from exc
 
         if tenant.status != "ACTIVE":
             if transaction.is_active:
                 transaction.rollback()
-            _compensate_activation_or_raise(
+            _compensate_activation(
                 tenant_id=tenant_id,
                 admin_request=admin_request,
-                original_error=RuntimeError("Security activation did not reach ACTIVE"),
+            )
+            raise ConflictError(
+                error_code="VAC-CONFLICT-001",
+                title="Project activation was not completed",
+                detail="Project activation could not be completed. Please try again.",
             )
 
         try:
@@ -224,11 +228,13 @@ def activate_project(
         except SQLAlchemyError as exc:
             if transaction.is_active:
                 transaction.rollback()
-            _compensate_activation_or_raise(
+            _compensate_activation(
                 tenant_id=tenant_id,
                 admin_request=admin_request,
-                original_error=exc,
             )
+            raise _activation_error(
+                "Project activation could not be completed. Please try again."
+            ) from exc
 
         return ProjectActivationResponse(
             tenantId=tenant_id,
