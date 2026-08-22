@@ -482,8 +482,8 @@ def put_role_mapping(
         Header(alias="Idempotency-Key", min_length=1, max_length=200),
     ],
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    engine: Annotated[Engine, Depends(get_engine)],
 ) -> RoleMappingMutationResponse:
-    engine = get_engine()
     dealer_ids, outlet_ids, scopes = _resolve_scope(engine, tenant_id=tenant_id, body=body)
     previous = _read_mapping(engine, tenant_id, user_id)
     mapping = RoleMappingResponse(
@@ -575,8 +575,8 @@ def delete_role_mapping(
         Header(alias="Idempotency-Key", min_length=1, max_length=200),
     ],
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    engine: Annotated[Engine, Depends(get_engine)],
 ) -> RoleMappingMutationResponse:
-    engine = get_engine()
     previous = _read_mapping(engine, tenant_id, user_id)
 
     try:
