@@ -11,6 +11,22 @@ servers:
 security:
   - bearerAuth: []
 paths:
+  /me/projects:
+    get:
+      operationId: listMyOperationalProjects
+      description: >-
+        Returns active operational Projects for the authenticated global human USER. This endpoint
+        is distinct from the SuperAdmin /projects control-plane list. Project role and business
+        scope are resolved from active Audit Core business assignments synchronized by UC02 Role
+        Mapping. Zero Projects returns an empty projects array; one or many Projects use the same
+        response shape.
+      responses:
+        '200':
+          description: Active Projects available to the current USER
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MyProjects'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
   /projects:
     get:
       operationId: listProjects
@@ -299,6 +315,38 @@ components:
       required: true
       schema: {type: string, minLength: 8, maxLength: 200}
   schemas:
+    MyProjects:
+      type: object
+      required: [projects]
+      properties:
+        projects:
+          type: array
+          items: {$ref: '#/components/schemas/OperationalProject'}
+    OperationalProject:
+      type: object
+      required:
+        - tenantId
+        - projectCode
+        - projectName
+        - projectStatus
+        - timezoneName
+        - operatingRole
+        - scope
+      properties:
+        tenantId: {type: string, maxLength: 128}
+        projectCode: {type: string}
+        projectName: {type: string}
+        projectStatus: {type: string, enum: [ACTIVE]}
+        timezoneName: {type: string}
+        operatingRole: {type: string}
+        scope: {$ref: '#/components/schemas/ProjectScopeSummary'}
+    ProjectScopeSummary:
+      type: object
+      required: [allDealers, dealerCount, outletCount]
+      properties:
+        allDealers: {type: boolean}
+        dealerCount: {type: integer, minimum: 0}
+        outletCount: {type: integer, minimum: 0}
     Project:
       type: object
       required: [tenantId, projectName]
