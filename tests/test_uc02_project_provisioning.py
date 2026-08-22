@@ -140,9 +140,9 @@ class ControlledCompensation:
         *,
         tenant_id: str,
         human_token: str,
-        di_committed: bool,
+        di_cleanup_required: bool,
     ) -> None:
-        self.calls.append((tenant_id, human_token, di_committed))
+        self.calls.append((tenant_id, human_token, di_cleanup_required))
 
 
 @pytest.fixture
@@ -351,7 +351,7 @@ def test_audit_core_failure_rolls_back_and_compensates_security(
     assert _project_count(setup) == 0
 
 
-def test_di_failure_rolls_back_project_and_compensates_security(
+def test_di_failure_rolls_back_project_and_cleans_uncertain_di_then_security(
     provisioning_setup,
 ) -> None:
     setup = provisioning_setup
@@ -366,7 +366,7 @@ def test_di_failure_rolls_back_project_and_compensates_security(
     assert response.status_code == 503
     assert response.json()["errorCode"] == "VAC-SYS-002"
     assert setup["compensation"].calls == [
-        (setup["tenant_id"], "same-human-superadmin-token", False)
+        (setup["tenant_id"], "same-human-superadmin-token", True)
     ]
     assert _project_count(setup) == 0
 
@@ -390,7 +390,7 @@ def test_compensation_removes_di_before_security(monkeypatch) -> None:
     project_provisioning._compensate_new_project(
         tenant_id="tenant-atomic-test",
         human_token="token",
-        di_committed=True,
+        di_cleanup_required=True,
     )
     assert calls == ["DI", "SECURITY"]
 
@@ -398,7 +398,7 @@ def test_compensation_removes_di_before_security(monkeypatch) -> None:
     project_provisioning._compensate_new_project(
         tenant_id="tenant-atomic-test",
         human_token="token",
-        di_committed=False,
+        di_cleanup_required=False,
     )
     assert calls == ["SECURITY"]
 
