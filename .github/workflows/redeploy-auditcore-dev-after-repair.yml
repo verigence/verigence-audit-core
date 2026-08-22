@@ -1,0 +1,171 @@
+name: Redeploy Audit Core DEV after migration repair
+
+on:
+  push:
+    branches:
+      - ops/repair-auditcore-dev-migration-drift
+    paths-ignore:
+      - docs/deploy-evidence/UC02_DEV_MIGRATION_REDEPLOY_PROOF.md
+      - docs/deploy-evidence/UC02_DEV_MIGRATION_REPAIR_PROOF.md
+
+permissions:
+  contents: write
+
+concurrency:
+  group: audit-core-dev-redeploy-after-repair
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      DEPLOY_SHA: 98ffc82e01c457385f17ed8341c09ccda7055d81
+      OPS_BRANCH: ops/repair-auditcore-dev-migration-drift
+    steps:
+      - name: Check out exact Audit Core DEV SHA
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Audit Core and Railway CLI
+        run: |
+          python -m pip install -e .
+          npm install --global @railway/cli
+
+      - name: Link exact Railway DEV target
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is missing'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway status --json >/tmp/status.json
+          railway service list --json >/tmp/services.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          status=json.loads(Path('/tmp/status.json').read_text())
+          services=json.loads(Path('/tmp/services.json').read_text())
+          if status.get('id') != os.environ['PLATFORM_PROJECT_ID']:
+              raise SystemExit('Wrong Railway project')
+          if not any(row.get('name') == os.environ['AUDIT_SERVICE'] for row in services):
+              raise SystemExit('Audit Core service not found in DEV project')
+          print('AUDIT_CORE_RAILWAY_TARGET=PASS')
+          PY
+
+      - name: Record current deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway deployment list --service "$AUDIT_SERVICE" --limit 1 --json >/tmp/before.json
+          previous="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/before.json').read_text())
+          print(rows[0].get('id','') if rows else '')
+          PY
+          )"
+          echo "PREVIOUS_DEPLOYMENT_ID=$previous" >> "$GITHUB_ENV"
+          echo "AUDIT_CORE_PREVIOUS_DEPLOYMENT_ID=${previous:-NONE}"
+
+      - name: Deploy exact repaired DEV SHA
+        run: |
+          set -euo pipefail
+          railway up . --path-as-root --service "$AUDIT_SERVICE" --detach --yes --message "Audit Core DEV repaired ${DEPLOY_SHA}" >/dev/null
+
+      - name: Verify fresh Railway deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            railway deployment list --service "$AUDIT_SERVICE" --limit 1 --json >/tmp/current.json
+            read -r deployment_id status <<<"$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/current.json').read_text())
+          if rows:
+              print(rows[0].get('id',''), rows[0].get('status',''))
+          else:
+              print(' ')
+          PY
+          )"
+            if [[ -z "$deployment_id" || "$deployment_id" == "${PREVIOUS_DEPLOYMENT_ID:-}" ]]; then
+              echo "Waiting for fresh deployment (attempt $attempt/30)"
+              sleep 10
+              continue
+            fi
+            case "$status" in
+              SUCCESS)
+                echo "DEPLOYMENT_ID=$deployment_id" >> "$GITHUB_ENV"
+                echo "AUDIT_CORE_DEPLOYMENT=PASS|$deployment_id"
+                break
+                ;;
+              FAILED|CRASHED|REMOVED)
+                railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 200 || true
+                echo "::error::Audit Core deployment failed with status $status"
+                exit 1
+                ;;
+            esac
+            if [[ "$attempt" == "30" ]]; then
+              railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 200 || true
+              echo '::error::Fresh Audit Core deployment did not reach SUCCESS'
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Verify public health
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/vars.json
+          domain="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/vars.json').read_text())
+          print(data.get('RAILWAY_PUBLIC_DOMAIN') or data.get('RAILWAY_STATIC_URL') or '')
+          PY
+          )"
+          [ -n "$domain" ] || { echo '::error::Audit Core public domain missing'; exit 1; }
+          case "$domain" in
+            http://*|https://*) base="${domain%/}" ;;
+            *) base="https://${domain%/}" ;;
+          esac
+          curl --fail --silent --show-error "$base/health" >/tmp/health.json
+          echo 'AUDIT_CORE_PUBLIC_HEALTH=PASS'
+          echo "AUDIT_CORE_DEPLOYED_SHA=$DEPLOY_SHA"
+
+      - name: Record non-secret redeploy proof on ops branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --branch "$OPS_BRANCH" "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" /tmp/opsproof
+          cd /tmp/opsproof
+          mkdir -p docs/deploy-evidence
+          cat > docs/deploy-evidence/UC02_DEV_MIGRATION_REDEPLOY_PROOF.md <<EOF
+          # UC02 DEV Migration Repair Redeploy Proof
+
+          - audit_core_dev_sha: ${DEPLOY_SHA}
+          - railway_deployment_id: ${DEPLOYMENT_ID}
+          - railway_status: SUCCESS
+          - public_health: PASS
+          - result: PASS
+          EOF
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/deploy-evidence/UC02_DEV_MIGRATION_REDEPLOY_PROOF.md
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m 'docs(ops): record Audit Core DEV repaired redeploy proof [skip ci]'
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
