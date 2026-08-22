@@ -21,13 +21,15 @@ jobs:
       - name: Install Railway CLI
         run: npm install --global @railway/cli
 
-      - name: Inspect Security and Audit request logs
+      - name: Inspect exact deployment logs
         shell: bash
         run: |
           set -euo pipefail
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
-          railway logs --service security --lines 12000 >/tmp/security.log 2>/dev/null || true
-          railway logs --service "$AUDIT_SERVICE" --lines 12000 >/tmp/audit.log 2>/dev/null || true
+          railway logs --service security --latest --deployment --lines 12000 >/tmp/security.log 2>/tmp/security.err || true
+          railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 12000 >/tmp/audit.log 2>/tmp/audit.err || true
+          echo "SECURITY_LOG_BYTES=$(wc -c </tmp/security.log)"
+          echo "AUDIT_LOG_BYTES=$(wc -c </tmp/audit.log)"
           python - <<'PY'
           import re
           from pathlib import Path
@@ -45,23 +47,24 @@ jobs:
           sec_keys = [
               '/security/v1/platform/tenants', '/security/v1/platform/admin-context',
               'platform.tenant.create', 'traceback', 'exception', 'error',
-              'timeout', 'timed out', 'cancelled', 'client disconnected'
+              'timeout', 'timed out', 'cancelled', 'client disconnected',
+              ' 500 ', ' 201 ', ' 200 '
           ]
           sm = [l for l in sec if any(k in l.lower() for k in sec_keys)]
           print('SECURITY_TOTAL_LINES=' + str(len(sec)))
           print('SECURITY_MATCHED_LINES=' + str(len(sm)))
-          for l in sm[-160:]:
+          for l in sm[-220:]:
               print('SECURITY_LOG|' + safe(l))
 
           aud = Path('/tmp/audit.log').read_text(errors='ignore').splitlines()
           aud_keys = [
               'security_admin_call_failed', 'project_provisioning_recovery_required',
               'endpoint_unavailable', 'security administrative endpoint is unavailable',
-              'readtimeout', 'connecttimeout', 'timeout'
+              'readtimeout', 'connecttimeout', 'timeout', 'security_admin_context_failed'
           ]
           am = [l for l in aud if any(k in l.lower() for k in aud_keys)]
           print('AUDIT_TOTAL_LINES=' + str(len(aud)))
           print('AUDIT_MATCHED_LINES=' + str(len(am)))
-          for l in am[-120:]:
+          for l in am[-180:]:
               print('AUDIT_LOG|' + safe(l))
           PY
