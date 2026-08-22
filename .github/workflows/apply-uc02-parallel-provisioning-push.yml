@@ -1,0 +1,273 @@
+name: Apply UC02 parallel provisioning on fix branch
+
+on:
+  push:
+    branches: [fix/uc02-parallel-provisioning]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.ref == 'refs/heads/fix/uc02-parallel-provisioning'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/uc02-parallel-provisioning
+          fetch-depth: 0
+      - name: Apply parallel provisioning and regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          source = Path('src/audit_core/project_provisioning.py')
+          text = source.read_text()
+          import_marker = 'from datetime import date\n'
+          if 'from concurrent.futures import ThreadPoolExecutor\n' not in text:
+              if import_marker not in text:
+                  raise SystemExit('datetime import marker missing')
+              text = text.replace(import_marker, 'from concurrent.futures import ThreadPoolExecutor\n' + import_marker, 1)
+
+          start_marker = '    if current.audit_core_receipt is None:\n'
+          end_marker = '\n\n@router.get("/projects", response_model=list[ProjectSelectionResponse])\n'
+          start = text.find(start_marker)
+          end = text.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit('project provisioning post-Security block markers missing')
+
+          replacement = '''    audit_receipt = current.audit_core_receipt
+    existing_di_receipt = current.di_receipt
+    di_receipt = (
+        existing_di_receipt
+        if existing_di_receipt is not None
+        and existing_di_receipt.get("provisioningStatus") == "READY"
+        else None
+    )
+    need_audit_core = audit_receipt is None
+    need_di = di_receipt is None
+    audit_error: Exception | None = None
+    di_error: Exception | None = None
+
+    def run_audit_core_projection() -> dict[str, Any]:
+        return _ensure_project_projection(
+            engine,
+            tenant=tenant,
+            request=request,
+            actor_id=admin_request.user_id,
+        )
+
+    def run_di_provisioning() -> dict[str, Any]:
+        with DiClient(base_url=_di_base_url()) as client:
+            return client.ensure_project_provisioning(
+                human_token=admin_request.bearer_token,
+                tenant_id=tenant.tenant_id,
+                idempotency_key=current.idempotency_key,
+            )
+
+    if need_audit_core and need_di:
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="uc02-project-provision") as pool:
+            audit_future = pool.submit(run_audit_core_projection)
+            di_future = pool.submit(run_di_provisioning)
+            try:
+                audit_receipt = audit_future.result()
+            except Exception as exc:  # noqa: BLE001 - durable distributed recovery boundary
+                audit_error = exc
+            try:
+                di_receipt = di_future.result()
+            except Exception as exc:  # noqa: BLE001 - durable distributed recovery boundary
+                di_error = exc
+    elif need_audit_core:
+        try:
+            audit_receipt = run_audit_core_projection()
+        except Exception as exc:  # noqa: BLE001 - durable distributed recovery boundary
+            audit_error = exc
+    elif need_di:
+        try:
+            di_receipt = run_di_provisioning()
+        except Exception as exc:  # noqa: BLE001 - durable distributed recovery boundary
+            di_error = exc
+
+    if audit_receipt is not None or di_receipt is not None:
+        update_administrative_operation(
+            engine,
+            operation_id=current.operation_id,
+            tenant_id=tenant.tenant_id,
+            status="RUNNING",
+            current_step=("AUDIT_CORE" if audit_error is not None else "DI"),
+            audit_core_receipt=audit_receipt,
+            di_receipt=di_receipt,
+            last_error_code=None,
+            last_error_summary=None,
+        )
+        current = get_administrative_operation(
+            engine, operation_id=current.operation_id, operation_type=_OPERATION_TYPE
+        )
+        if current is None:
+            raise RuntimeError("Provisioning operation disappeared after parallel branch update")
+
+    if audit_error is not None:
+        return _mark_recovery(
+            engine,
+            operation=current,
+            step="AUDIT_CORE",
+            code="AUDIT_CORE_PROJECTION_FAILED",
+            summary=str(audit_error),
+        )
+
+    if di_error is not None:
+        internal_code = di_error.code if isinstance(di_error, DiClientError) else "DI_CONFIGURATION_FAILED"
+        return _mark_recovery(
+            engine,
+            operation=current,
+            step="DI",
+            code=internal_code,
+            summary=str(di_error),
+        )
+
+    if audit_receipt is None:
+        return _mark_recovery(
+            engine,
+            operation=current,
+            step="AUDIT_CORE",
+            code="AUDIT_CORE_PROJECTION_FAILED",
+            summary="Audit Core Project projection did not produce a durable receipt.",
+        )
+    if di_receipt is None:
+        return _mark_recovery(
+            engine,
+            operation=current,
+            step="DI",
+            code="DI_CONFIGURATION_FAILED",
+            summary="DI provisioning did not produce a durable receipt.",
+        )
+
+    di_ready = di_receipt.get("provisioningStatus") == "READY"
+    update_administrative_operation(
+        engine,
+        operation_id=current.operation_id,
+        tenant_id=tenant.tenant_id,
+        status="COMPLETED" if di_ready else "RECOVERY_REQUIRED",
+        current_step="COMPLETE" if di_ready else "DI",
+        audit_core_receipt=audit_receipt,
+        di_receipt=di_receipt,
+        last_error_code=None if di_ready else "DI_PROVISIONING_INCOMPLETE",
+        last_error_summary=None if di_ready else "DI provisioning is not ready yet.",
+        completed=di_ready,
+    )
+    refreshed = get_administrative_operation(
+        engine, operation_id=current.operation_id, operation_type=_OPERATION_TYPE
+    )
+    if refreshed is None:
+        raise RuntimeError("Provisioning operation disappeared after parallel completion update")
+    return refreshed'''
+          text = text[:start] + replacement + text[end:]
+          source.write_text(text)
+
+          tests_path = Path('tests/test_uc02_project_provisioning.py')
+          tests = tests_path.read_text()
+          threading_marker = 'from dataclasses import dataclass, field\n'
+          if 'from threading import Barrier\n' not in tests:
+              tests = tests.replace(threading_marker, threading_marker + 'from threading import Barrier\n', 1)
+
+          di_class = tests.find('@dataclass\nclass ControlledDiProvisioning:')
+          calls_marker = '    calls: list[tuple[str, str, str]] = field(default_factory=list)\n'
+          if '    barrier: Barrier | None = None\n' not in tests:
+              calls_at = tests.find(calls_marker, di_class)
+              if di_class < 0 or calls_at < 0:
+                  raise SystemExit('ControlledDiProvisioning markers missing')
+              insert_at = calls_at + len(calls_marker)
+              tests = tests[:insert_at] + '    barrier: Barrier | None = None\n' + tests[insert_at:]
+
+          di_call_marker = '                controller.calls.append((human_token, tenant_id, idempotency_key))\n'
+          if 'controller.barrier.wait(timeout=3)' not in tests:
+              tests = tests.replace(di_call_marker, di_call_marker + '                if controller.barrier is not None:\n                    controller.barrier.wait(timeout=3)\n', 1)
+
+          insertion = '\ndef test_security_failure_returns_business_error_but_keeps_technical_diagnostic(\n'
+          if 'def test_post_security_audit_core_and_di_branches_run_concurrently(' not in tests:
+              at = tests.find(insertion)
+              if at < 0:
+                  raise SystemExit('test insertion marker missing')
+              new_tests = '''
+
+def test_post_security_audit_core_and_di_branches_run_concurrently(
+    provisioning_setup,
+    monkeypatch,
+) -> None:
+    setup = provisioning_setup
+    barrier = Barrier(2)
+    setup["di"].barrier = barrier
+    original_projection = project_provisioning._ensure_project_projection
+
+    def synchronized_projection(*args, **kwargs):
+        barrier.wait(timeout=3)
+        return original_projection(*args, **kwargs)
+
+    monkeypatch.setattr(project_provisioning, "_ensure_project_projection", synchronized_projection)
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post(
+        "/v1/projects",
+        headers={"Idempotency-Key": "project-create-parallel-0001"},
+        json=_payload(setup),
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["provisioningStatus"] == "READY"
+    assert len(setup["security"].create_calls) == 1
+    assert len(setup["di"].calls) == 1
+
+
+def test_retry_after_audit_core_failure_keeps_successful_di_receipt(
+    provisioning_setup,
+    monkeypatch,
+) -> None:
+    setup = provisioning_setup
+    original_projection = project_provisioning._ensure_project_projection
+    attempts = {"count": 0}
+
+    def flaky_projection(*args, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("controlled Audit Core projection failure")
+        return original_projection(*args, **kwargs)
+
+    monkeypatch.setattr(project_provisioning, "_ensure_project_projection", flaky_projection)
+    client = TestClient(app, raise_server_exceptions=False)
+    first = client.post(
+        "/v1/projects",
+        headers={"Idempotency-Key": "project-create-audit-recovery-0001"},
+        json=_payload(setup),
+    )
+    assert first.status_code == 202, first.text
+    body = first.json()
+    assert body["provisioningStatus"] == "RECOVERY_REQUIRED"
+    assert body["currentStep"] == "AUDIT_CORE"
+    assert len(setup["security"].create_calls) == 1
+    assert len(setup["di"].calls) == 1
+
+    with setup["engine"].begin() as connection:
+        receipts = connection.execute(
+            text("SELECT audit_core_receipt, di_receipt FROM auditcore.administrative_operations WHERE operation_id=:operation_id"),
+            {"operation_id": body["operationId"]},
+        ).mappings().one()
+    assert receipts["audit_core_receipt"] is None
+    assert receipts["di_receipt"]["provisioningStatus"] == "READY"
+
+    recovered = client.post(f"/v1/project-provisioning-operations/{body['operationId']}/retry")
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["provisioningStatus"] == "READY"
+    assert attempts["count"] == 2
+    assert len(setup["security"].create_calls) == 1
+    assert len(setup["di"].calls) == 1
+'''
+              tests = tests[:at] + new_tests + tests[at:]
+          tests_path.write_text(tests)
+          PY
+
+          git rm .github/workflows/apply-uc02-parallel-provisioning.yml .github/workflows/apply-uc02-parallel-provisioning-push.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/audit_core/project_provisioning.py tests/test_uc02_project_provisioning.py
+          git commit -m 'fix(uc02): parallelize post-Security project provisioning'
+          git push origin HEAD:fix/uc02-parallel-provisioning
