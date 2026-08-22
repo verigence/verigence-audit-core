@@ -47,6 +47,10 @@ def get_project_reference_data(
                 SELECT oem_id, oem_code, oem_name
                 FROM auditcore.oems
                 WHERE is_active = true
+                  AND oem_code IN (
+                      'MAHINDRA', 'HYUNDAI', 'MARUTI', 'MERCEDES_BENZ',
+                      'BMW', 'SKODA', 'VOLKSWAGEN', 'TATA_MOTORS'
+                  )
                 ORDER BY oem_name, oem_code
                 """
             )
@@ -57,6 +61,7 @@ def get_project_reference_data(
                 SELECT product_category_id, category_code, category_name
                 FROM auditcore.product_categories
                 WHERE is_active = true
+                  AND category_code = 'FOUR_WHEELERS'
                 ORDER BY category_name, category_code
                 """
             )
