@@ -11,6 +11,20 @@ servers:
 security:
   - bearerAuth: []
 paths:
+  /project-reference-data:
+    get:
+      operationId: getProjectReferenceData
+      description: >-
+        Returns active platform reference masters required before the first Project exists.
+        Human SuperAdmin authorization is required. Web displays business names and submits the
+        returned UUID identifiers when creating a Project.
+      responses:
+        '200':
+          description: Active OEM and Product Category reference masters
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProjectReferenceData'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
   /tenants/{tenantId}/project:
     get:
       operationId: getProject
@@ -221,6 +235,30 @@ components:
         tenantId: {type: string}
         projectCode: {type: string}
         projectName: {type: string}
+    ProjectReferenceData:
+      type: object
+      required: [oems, productCategories]
+      properties:
+        oems:
+          type: array
+          items: {$ref: '#/components/schemas/OemReference'}
+        productCategories:
+          type: array
+          items: {$ref: '#/components/schemas/ProductCategoryReference'}
+    OemReference:
+      type: object
+      required: [oemId, oemCode, oemName]
+      properties:
+        oemId: {type: string, format: uuid}
+        oemCode: {type: string}
+        oemName: {type: string}
+    ProductCategoryReference:
+      type: object
+      required: [productCategoryId, categoryCode, categoryName]
+      properties:
+        productCategoryId: {type: string, format: uuid}
+        categoryCode: {type: string}
+        categoryName: {type: string}
     ProductSkuReference:
       type: object
       required:
