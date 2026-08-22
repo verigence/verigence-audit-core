@@ -23,7 +23,9 @@ from audit_core.security_integration import SecurityAdminContext, SecurityTenant
 class ControlledSecurityProvisioning:
     tenant_id: str
     tenant_code: str
+    tenant_name: str = "UC02 Provisioned Project"
     create_calls: list[tuple[str, str, str]] = field(default_factory=list)
+    list_calls: list[str] = field(default_factory=list)
 
     def client_class(self):
         controller = self
@@ -48,11 +50,23 @@ class ControlledSecurityProvisioning:
                 controller.create_calls.append(
                     (human_bearer_token, tenant_name, idempotency_key)
                 )
+                controller.tenant_name = tenant_name
                 return SecurityTenant(
                     tenant_id=controller.tenant_id,
                     tenant_code=controller.tenant_code,
                     tenant_name=tenant_name,
                     status="CONFIGURING",
+                )
+
+            def list_tenants(self, *, human_bearer_token: str) -> tuple[SecurityTenant, ...]:
+                controller.list_calls.append(human_bearer_token)
+                return (
+                    SecurityTenant(
+                        tenant_id=controller.tenant_id,
+                        tenant_code=controller.tenant_code,
+                        tenant_name=controller.tenant_name,
+                        status="CONFIGURING",
+                    ),
                 )
 
         return Client
@@ -191,6 +205,8 @@ def test_create_project_runs_security_audit_core_di_once_and_replays_same_operat
     assert body["projectStatus"] == "CONFIGURING"
     assert body["provisioningStatus"] == "READY"
     assert body["currentStep"] == "COMPLETE"
+    assert body["errorCode"] is None
+    assert body["errorMessage"] is None
     operation_id = body["operationId"]
 
     second = client.post(
@@ -214,6 +230,19 @@ def test_create_project_runs_security_audit_core_di_once_and_replays_same_operat
     status = client.get(f"/v1/project-provisioning-operations/{operation_id}")
     assert status.status_code == 200
     assert status.json()["provisioningStatus"] == "READY"
+
+    projects = client.get("/v1/projects")
+    assert projects.status_code == 200, projects.text
+    assert projects.json() == [
+        {
+            "tenantId": setup["tenant_id"],
+            "projectCode": setup["security"].tenant_code,
+            "projectName": "UC02 Provisioned Project",
+            "projectStatus": "CONFIGURING",
+            "securityTenantStatus": "CONFIGURING",
+        }
+    ]
+    assert setup["security"].list_calls == ["same-human-superadmin-token"]
 
     with setup["engine"].begin() as connection:
         project = connection.execute(
@@ -263,8 +292,14 @@ def test_retry_after_di_failure_resumes_without_second_security_tenant(
     body = failed.json()
     assert body["provisioningStatus"] == "RECOVERY_REQUIRED"
     assert body["currentStep"] == "DI"
+    assert body["errorCode"] == "DI_UNAVAILABLE"
+    assert body["errorMessage"]
     operation_id = body["operationId"]
     assert len(setup["security"].create_calls) == 1
+
+    status = client.get(f"/v1/project-provisioning-operations/{operation_id}")
+    assert status.status_code == 200
+    assert status.json()["errorCode"] == "DI_UNAVAILABLE"
 
     setup["di"].fail = False
     recovered = client.post(
@@ -273,6 +308,8 @@ def test_retry_after_di_failure_resumes_without_second_security_tenant(
     assert recovered.status_code == 200, recovered.text
     assert recovered.json()["provisioningStatus"] == "READY"
     assert recovered.json()["currentStep"] == "COMPLETE"
+    assert recovered.json()["errorCode"] is None
+    assert recovered.json()["errorMessage"] is None
     assert len(setup["security"].create_calls) == 1
     assert len(setup["di"].calls) == 2
     assert all(call[0] == "same-human-superadmin-token" for call in setup["di"].calls)
