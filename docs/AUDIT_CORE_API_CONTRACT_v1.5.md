@@ -55,6 +55,8 @@ operationStatus = COMPLETED
 
 `RECOVERY_REQUIRED` is not a valid new mutation outcome. A downstream failure returns a normal non-2xx business-safe error.
 
+Existing `Idempotency-Key` rules remain in force for Role Mapping `PUT`/`DELETE`. Idempotency is request replay/conflict protection only; it does not create or resume a recovery workflow.
+
 If a later Audit Core local write fails after Security has changed, Audit Core restores the prior Security operating role before returning failure. Removal follows the same rule.
 
 ## 4. Project Activation
