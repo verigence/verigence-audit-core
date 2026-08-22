@@ -231,7 +231,7 @@ def role_mapping_setup(monkeypatch):
 
 def test_pc_outlet_scope_is_flexible_and_idempotent(role_mapping_setup) -> None:
     setup = role_mapping_setup
-    client = TestClient(app, raise_server_exceptions=True)
+    client = TestClient(app, raise_server_exceptions=False)
     user_id = "user-pc-flex"
     path = f"/v1/tenants/{setup['tenant_a']}/role-mappings/{user_id}"
     selected = [
@@ -421,25 +421,18 @@ def test_crm_supports_project_dealers_outlets_and_union(role_mapping_setup) -> N
     }
 
 
-def test_role_mapping_security_failure_is_recoverable_with_same_key(role_mapping_setup) -> None:
+def test_role_mapping_security_failure_returns_error_without_local_state(role_mapping_setup) -> None:
     setup = role_mapping_setup
     client = TestClient(app, raise_server_exceptions=False)
     setup["security"].fail_set = True
-    user_id = "user-recovery"
+    user_id = "user-failed-mapping"
     path = f"/v1/tenants/{setup['tenant_a']}/role-mappings/{user_id}"
     body = {"operatingRole": "TL", "dealerIds": [], "outletIds": []}
 
-    failed = client.put(path, headers={"Idempotency-Key": "recover-map"}, json=body)
-    assert failed.status_code == 202
-    assert failed.json()["operationStatus"] == "RECOVERY_REQUIRED"
-    assert failed.json()["mapping"] is None
-
-    setup["security"].fail_set = False
-    recovered = client.put(path, headers={"Idempotency-Key": "recover-map"}, json=body)
-    assert recovered.status_code == 200
-    assert recovered.json()["operationStatus"] == "COMPLETED"
-    assert recovered.json()["mapping"]["operatingRole"] == "TL"
-    assert len(setup["security"].calls) == 2
+    failed = client.put(path, headers={"Idempotency-Key": "failed-map"}, json=body)
+    assert failed.status_code == 503
+    assert failed.json()["errorCode"] == "VAC-SYS-002"
+    assert client.get(path).json() is None
 
 
 def test_role_mapping_delete_is_assignment_removal_and_retry_safe(role_mapping_setup) -> None:

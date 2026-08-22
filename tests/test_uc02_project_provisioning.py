@@ -372,6 +372,8 @@ def test_di_failure_rolls_back_project_and_compensates_security(
 
 
 def test_compensation_removes_di_before_security(monkeypatch) -> None:
+    monkeypatch.setenv("DI_BASE_URL", "https://di.test")
+    monkeypatch.setenv("SECURITY_BASE_URL", "https://security.test")
     calls: list[str] = []
 
     monkeypatch.setattr(

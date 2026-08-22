@@ -83,6 +83,10 @@ def _dependency_unavailable(detail: str = "Project administration is temporarily
     )
 
 
+def _runtime_transaction(engine: Engine):
+    return engine.begin()
+
+
 def _active_assignment_rows(
     connection: Connection,
     *,
