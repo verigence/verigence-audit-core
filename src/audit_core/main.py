@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from audit_core import role_mappings
 from audit_core.audit_review import router as audit_review_router
@@ -35,6 +36,17 @@ from audit_core.vehicle_delivery import router as vehicle_delivery_router
 install_role_mapping_policy(role_mappings)
 role_mapping_router = role_mappings.router
 
+_CORS_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+_CORS_HEADERS = [
+    "Authorization",
+    "Content-Type",
+    "Idempotency-Key",
+    "If-Match",
+    "X-Correlation-ID",
+    "X-Trace-ID",
+]
+_CORS_EXPOSE_HEADERS = ["ETag", "X-Correlation-ID", "X-Trace-ID"]
+
 
 def create_app() -> FastAPI:
     settings = load_settings()
@@ -48,6 +60,15 @@ def create_app() -> FastAPI:
     install_error_handlers(application)
     install_observability(application)
     install_contract_guards(application)
+    if settings.cors_allowed_origins:
+        application.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(settings.cors_allowed_origins),
+            allow_credentials=True,
+            allow_methods=_CORS_METHODS,
+            allow_headers=_CORS_HEADERS,
+            expose_headers=_CORS_EXPOSE_HEADERS,
+        )
     application.include_router(project_provisioning_router)
     application.include_router(project_router)
     application.include_router(readiness_router)
