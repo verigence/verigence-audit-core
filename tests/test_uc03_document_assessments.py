@@ -157,7 +157,7 @@ def booking_document_setup():
                     tenant_id, document_requirement_profile_id, version_no,
                     lifecycle_status, effective_from
                 ) VALUES (
-                    :tenant_id, :profile_id, 1, 'PUBLISHED', CURRENT_DATE - 1
+                    :tenant_id, :profile_id, 1, 'DRAFT', CURRENT_DATE - 1
                 )
                 RETURNING document_requirement_profile_version_id
                 """
@@ -183,6 +183,17 @@ def booking_document_setup():
                     'CONDITIONAL',
                     '{"conditionKey":"exchangeTaken"}'::jsonb, 20
                 )
+                """
+            ),
+            {"tenant_id": tenant_id, "profile_version_id": profile_version_id},
+        )
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.document_requirement_profile_versions
+                SET lifecycle_status = 'PUBLISHED'
+                WHERE tenant_id = :tenant_id
+                  AND document_requirement_profile_version_id = :profile_version_id
                 """
             ),
             {"tenant_id": tenant_id, "profile_version_id": profile_version_id},
