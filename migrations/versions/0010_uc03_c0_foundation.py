@@ -75,7 +75,7 @@ def upgrade() -> None:
                   AND ba.security_actor_id = auditcore.current_security_actor_id()
                   AND ba.assignment_status = 'ACTIVE'
                   AND ba.effective_from <= now()
-                  AND (ba.effective_to IS NULL OR ba.effective_to > now())
+                  AND (ba.effective_to IS NULL OR ba.effective_to >= now())
             )
         )
         """
