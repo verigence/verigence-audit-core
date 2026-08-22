@@ -1,0 +1,57 @@
+name: Apply atomic admin follow-up fixes
+
+on:
+  push:
+    branches:
+      - fix/admin-atomic-compensation
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/admin-atomic-compensation
+          fetch-depth: 0
+      - name: Apply precise follow-up edits
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          role = Path('src/audit_core/role_mappings.py')
+          text = role.read_text()
+          old = '''    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],\n) -> RoleMappingMutationResponse:\n    engine = get_engine()'''
+          new = '''    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],\n    engine: Annotated[Engine, Depends(get_engine)],\n) -> RoleMappingMutationResponse:'''
+          count = text.count(old)
+          if count != 2:
+              raise SystemExit(f'expected 2 role route wiring matches, found {count}')
+          role.write_text(text.replace(old, new))
+
+          spec = Path('api/openapi-v1.yaml')
+          text = spec.read_text()
+          response_202 = '''        '202':\n          description: Project provisioning is in progress or requires recovery\n          content:\n            application/json:\n              schema: {$ref: '#/components/schemas/ProjectProvisioning'}\n'''
+          if response_202 not in text:
+              raise SystemExit('project create 202 block not found')
+          text = text.replace(response_202, '', 1)
+          start = text.find('  /project-provisioning-operations/{operationId}:\n')
+          end = text.find('  /project-reference-data:\n', start)
+          if start < 0 or end < 0:
+              raise SystemExit('provisioning operation OpenAPI block not found')
+          text = text[:start] + text[end:]
+          spec.write_text(text)
+          PY
+      - name: Commit follow-up edits
+        run: |
+          if git diff --quiet; then
+            echo 'No follow-up changes required.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/audit_core/role_mappings.py api/openapi-v1.yaml
+          git commit -m 'fix(admin): align route wiring and OpenAPI'
+          git push origin HEAD:fix/admin-atomic-compensation
