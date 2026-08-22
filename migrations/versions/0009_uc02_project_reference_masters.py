@@ -1,6 +1,6 @@
 from alembic import op
 
-revision = "0009_uc02_project_reference_masters"
+revision = "0009_uc02_project_refs"
 down_revision = "0008_uc02_project_master_imports"
 branch_labels = None
 depends_on = None
