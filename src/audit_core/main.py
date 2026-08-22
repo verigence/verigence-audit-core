@@ -32,8 +32,8 @@ from audit_core.readiness import router as readiness_router
 from audit_core.reference_data import router as reference_data_router
 from audit_core.role_mapping_policy import install_role_mapping_policy
 from audit_core.tasks_api import router as task_router
+from audit_core.uc03_authorized_work_items import router as uc03_work_items_router
 from audit_core.uc03_project_context import router as uc03_project_context_router
-from audit_core.uc03_work_items import router as uc03_work_items_router
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
 install_role_mapping_policy(role_mappings)
