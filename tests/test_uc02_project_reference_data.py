@@ -27,7 +27,7 @@ _EXPECTED_OEMS = {
 }
 
 
-def test_project_reference_data_exposes_active_seeded_masters() -> None:
+def test_project_reference_data_exposes_only_approved_active_masters() -> None:
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         pytest.skip("DATABASE_URL is required for UC02 project reference integration tests")
@@ -50,15 +50,15 @@ def test_project_reference_data_exposes_active_seeded_masters() -> None:
         assert response.status_code == 200, response.text
         body = response.json()
 
-        oems_by_code = {item["oemCode"]: item for item in body["oems"]}
-        for code, name in _EXPECTED_OEMS.items():
-            assert oems_by_code[code]["oemName"] == name
-            assert oems_by_code[code]["oemId"]
+        assert {
+            item["oemCode"]: item["oemName"] for item in body["oems"]
+        } == _EXPECTED_OEMS
+        assert all(item["oemId"] for item in body["oems"])
 
-        categories_by_code = {
-            item["categoryCode"]: item for item in body["productCategories"]
-        }
-        four_wheelers = categories_by_code["FOUR_WHEELERS"]
+        assert [
+            item["categoryCode"] for item in body["productCategories"]
+        ] == ["FOUR_WHEELERS"]
+        four_wheelers = body["productCategories"][0]
         assert four_wheelers["categoryName"] == "Four Wheelers"
         assert four_wheelers["productCategoryId"]
     finally:
