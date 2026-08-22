@@ -40,6 +40,7 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/v1", tags=["project-provisioning"])
 
 _OPERATION_TYPE = "PROJECT_PROVISION"
+_SECURITY_ADMIN_PROVISIONING_TIMEOUT_SECONDS = 20.0
 
 
 class ProjectCreateRequest(BaseModel):
@@ -391,7 +392,10 @@ def _resume(
             current_step="SECURITY",
         )
         try:
-            with SecurityAdminClient(base_url=_security_base_url()) as client:
+            with SecurityAdminClient(
+                base_url=_security_base_url(),
+                timeout_seconds=_SECURITY_ADMIN_PROVISIONING_TIMEOUT_SECONDS,
+            ) as client:
                 tenant = client.create_tenant(
                     human_bearer_token=admin_request.bearer_token,
                     tenant_name=request.projectName.strip(),
