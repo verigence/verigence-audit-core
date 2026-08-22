@@ -310,8 +310,9 @@ def test_security_failure_returns_business_error_but_keeps_technical_diagnostic(
     assert body["currentStep"] == "SECURITY"
     assert body["errorCode"] == "VAC-SYS-002"
     assert body["errorMessage"] == (
-        "Project security setup could not be completed. Please try again."
+        "UC02 Provisioned Project setup could not be completed. Please try again."
     )
+    assert "security" not in body["errorMessage"].lower()
     assert "endpoint" not in body["errorMessage"].lower()
     assert "503" not in body["errorMessage"]
 
@@ -367,8 +368,10 @@ def test_retry_after_di_failure_resumes_without_second_security_tenant(
     assert body["currentStep"] == "DI"
     assert body["errorCode"] == "VAC-DI-001"
     assert body["errorMessage"] == (
-        "Project processing service is temporarily unavailable. Please try again."
+        "UC02 Provisioned Project setup is temporarily unavailable. Please try again."
     )
+    assert "di" not in body["errorMessage"].lower()
+    assert "processing" not in body["errorMessage"].lower()
     operation_id = body["operationId"]
     assert len(setup["security"].create_calls) == 1
 
