@@ -1,0 +1,291 @@
+name: Continue existing UC02 DEV acceptance
+
+on:
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  continue:
+    if: github.head_ref == 'verify/uc02-dev-e2e'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      SECURITY_SERVICE: security
+      AUDIT_SERVICE: verigence-audit-core
+      DI_API_SERVICE: di-api
+      DEV_WEB_URL: https://verigence-web-dev.jbrconsulting-it.workers.dev
+      OPERATION_ID: c3cba519-88b5-48c9-874d-14383a4137d2
+      PROJECT_TAG: UC02-E2E-32565795640
+      TENANT_ID: d51bc9f3-98fd-4498-8d34-469b1b545b16
+    steps:
+      - name: Install acceptance tooling
+        run: |
+          npm install --global @railway/cli
+          python -m pip install --disable-pip-version-check \
+            'sqlalchemy>=2,<3' 'psycopg[binary]>=3,<4' 'PyJWT>=2,<3' \
+            'cryptography>=45,<47' 'requests>=2,<3'
+
+      - name: Load DEV runtime configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$SECURITY_SERVICE" --json >/tmp/security-vars.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          railway variable list --service "$DI_API_SERVICE" --json >/tmp/di-vars.json
+
+      - name: Continue acceptance without creating another Project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, uuid
+          from datetime import UTC, datetime, timedelta
+          from pathlib import Path
+
+          import jwt
+          import requests
+          from sqlalchemy import create_engine, text
+
+          run_id=os.environ['GITHUB_RUN_ID']
+          tenant_id=os.environ['TENANT_ID']
+          operation_id=os.environ['OPERATION_ID']
+          project_tag=os.environ['PROJECT_TAG']
+
+          def read(path):
+              return json.loads(Path(path).read_text())
+          def db_url(value):
+              value=str(value or '').strip()
+              if value.startswith('postgres://'):
+                  return 'postgresql+psycopg://' + value[len('postgres://'):]
+              if value.startswith('postgresql://'):
+                  return 'postgresql+psycopg://' + value[len('postgresql://'):]
+              return value
+          def public_base(values):
+              domain=values.get('RAILWAY_PUBLIC_DOMAIN') or values.get('RAILWAY_STATIC_URL') or ''
+              if not domain:
+                  raise SystemExit('Required DEV public domain missing')
+              return domain.rstrip('/') if domain.startswith(('http://','https://')) else 'https://' + domain.rstrip('/')
+
+          security=read('/tmp/security-vars.json')
+          audit=read('/tmp/audit-vars.json')
+          di=read('/tmp/di-vars.json')
+          sec_db=db_url(security.get('DATABASE_URL'))
+          audit_db=db_url(audit.get('DATABASE_URL'))
+          di_db=db_url(di.get('DI_DATABASE_URL') or di.get('DATABASE_URL'))
+          security_base=public_base(security)
+          audit_base=public_base(audit)
+          di_base=public_base(di)
+
+          with create_engine(audit_db).connect() as conn:
+              op=conn.execute(text('''
+                  SELECT initiated_by_user_id,status,current_step,tenant_id,last_error_code
+                  FROM auditcore.administrative_operations WHERE operation_id=:oid
+              '''),{'oid':operation_id}).mappings().one()
+          if op['status'] != 'COMPLETED' or op['current_step'] != 'COMPLETE' or str(op['tenant_id']) != tenant_id or op['last_error_code'] is not None:
+              raise SystemExit('Recovered Project provisioning operation is not durably COMPLETE')
+          actor_id=str(op['initiated_by_user_id'])
+
+          private_key=str(security.get('SECURITY_PRIVATE_KEY_PEM','')).replace('\\n','\n')
+          key_id=str(security.get('SECURITY_KEY_ID',''))
+          now=datetime.now(UTC)
+          token=jwt.encode(
+              {
+                  'iss':str(security.get('SECURITY_TOKEN_ISSUER') or 'verigence-security'),
+                  'sub':actor_id,
+                  'aud':str(security.get('SECURITY_TOKEN_AUDIENCE') or 'verigence-platform'),
+                  'iat':now,
+                  'exp':now+timedelta(minutes=15),
+                  'jti':str(uuid.uuid4()),
+                  'actor_type':'USER',
+              },private_key,algorithm='RS256',headers={'kid':key_id},
+          )
+          print('::add-mask::'+token)
+          headers={
+              'Authorization':'Bearer '+token,
+              'Origin':os.environ['DEV_WEB_URL'],
+              'X-Correlation-ID':'uc02-continue-'+run_id,
+          }
+
+          project=requests.get(audit_base+f'/v1/tenants/{tenant_id}/project',headers=headers,timeout=30)
+          if project.status_code != 200:
+              raise SystemExit('Project GET failed HTTP '+str(project.status_code))
+          body=project.json()
+          if body.get('projectName') != project_tag or body.get('projectStatus') != 'CONFIGURING':
+              raise SystemExit('Existing Project identity/lifecycle mismatch')
+          version=body.get('versionNo')
+          etag=project.headers.get('ETag')
+          if not isinstance(version,int) or not etag:
+              raise SystemExit('Project GET missing valid version/ETag')
+          print('UC02_CONTINUE_PROJECT_GET=PASS|VERSION='+str(version)+'|ETAG='+repr(etag))
+
+          patch_payload={'regionCode':'E2E-CONTINUED'}
+          patch=requests.patch(
+              audit_base+f'/v1/tenants/{tenant_id}/project',
+              headers={**headers,'If-Match':etag},json=patch_payload,timeout=30,
+          )
+          if patch.status_code == 400:
+              print('UC02_ETAG_RETURNED_FORM_REJECTED=HTTP400|BODY='+patch.text[:700].replace('\n',' '))
+              patch=requests.patch(
+                  audit_base+f'/v1/tenants/{tenant_id}/project',
+                  headers={**headers,'If-Match':str(version)},json=patch_payload,timeout=30,
+              )
+              print('UC02_ETAG_BARE_VERSION_RETRY_HTTP='+str(patch.status_code))
+          if patch.status_code != 200:
+              raise SystemExit('Project PATCH failed HTTP '+str(patch.status_code)+': '+patch.text[:700])
+          patched=patch.json()
+          if patched.get('versionNo') != version+1 or patched.get('regionCode') != 'E2E-CONTINUED':
+              raise SystemExit('Project PATCH response did not persist expected version/value')
+          print('UC02_PROJECT_PATCH=PASS|VERSION='+str(patched['versionNo']))
+
+          stale=requests.patch(
+              audit_base+f'/v1/tenants/{tenant_id}/project',
+              headers={**headers,'If-Match':str(version)},json={'regionCode':'STALE'},timeout=30,
+          )
+          if stale.status_code != 409:
+              raise SystemExit('Stale Project version did not fail 409; HTTP '+str(stale.status_code)+': '+stale.text[:300])
+          print('UC02_PROJECT_STALE_ETAG=PASS')
+
+          dealer_id=None
+          outlet_id=None
+          try:
+              dealer=requests.post(
+                  audit_base+f'/v1/tenants/{tenant_id}/dealers',headers=headers,
+                  json={'dealerName':'UC02 E2E Dealer '+run_id},timeout=30,
+              )
+              if dealer.status_code != 201:
+                  raise SystemExit('Dealer create failed HTTP '+str(dealer.status_code)+': '+dealer.text[:500])
+              dealer_id=str(dealer.json()['dealerId'])
+              print('UC02_DEALER_CREATE=PASS|'+dealer_id)
+
+              outlet=requests.post(
+                  audit_base+f'/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets',headers=headers,
+                  json={
+                      'outletName':'UC02 E2E Outlet '+run_id,
+                      'outletClassification':'ONSITE',
+                      'city':'E2E','monthlyVehicleVolume':1,
+                  },timeout=30,
+              )
+              if outlet.status_code != 201:
+                  raise SystemExit('Outlet create failed HTTP '+str(outlet.status_code)+': '+outlet.text[:500])
+              outlet_id=str(outlet.json()['outletId'])
+              print('UC02_OUTLET_CREATE=PASS|'+outlet_id)
+
+              candidates=requests.get(
+                  audit_base+f'/v1/tenants/{tenant_id}/role-mapping-candidates?limit=100',headers=headers,timeout=30,
+              )
+              if candidates.status_code != 200 or not isinstance(candidates.json(),list):
+                  raise SystemExit('Employee candidate browse failed HTTP '+str(candidates.status_code)+': '+candidates.text[:500])
+              print('UC02_EMPLOYEE_BROWSE=PASS|COUNT='+str(len(candidates.json())))
+
+              mappings=requests.get(audit_base+f'/v1/tenants/{tenant_id}/role-mappings',headers=headers,timeout=30)
+              if mappings.status_code != 200 or not isinstance(mappings.json(),list):
+                  raise SystemExit('Role Mapping browse failed HTTP '+str(mappings.status_code))
+              print('UC02_ROLE_MAPPING_BROWSE=PASS|COUNT='+str(len(mappings.json())))
+
+              masters=requests.get(audit_base+f'/v1/tenants/{tenant_id}/project-masters',headers=headers,timeout=45)
+              if masters.status_code != 200 or not isinstance(masters.json(),list) or not masters.json():
+                  raise SystemExit('Project Masters catalogue failed HTTP '+str(masters.status_code)+': '+masters.text[:500])
+              owners=sorted({str(row.get('ownerModule')) for row in masters.json()})
+              if 'AUDIT_CORE' not in owners or 'DI' not in owners:
+                  raise SystemExit('Combined Project Masters catalogue did not contain both owners: '+','.join(owners))
+              print('UC02_PROJECT_MASTERS=PASS|COUNT='+str(len(masters.json()))+'|OWNERS='+','.join(owners))
+
+              readiness=requests.get(audit_base+f'/v1/tenants/{tenant_id}/project/readiness',headers=headers,timeout=45)
+              if readiness.status_code != 200:
+                  raise SystemExit('Readiness failed HTTP '+str(readiness.status_code)+': '+readiness.text[:500])
+              ready=readiness.json()
+              checks={row['checkKey']:row for row in ready.get('checks',[])}
+              for key in ('PROJECT_SETUP_COMPLETE','SECURITY_TENANT_LIFECYCLE','DEALER_OUTLET_STRUCTURE'):
+                  if checks.get(key,{}).get('status') != 'PASS':
+                      raise SystemExit('Expected readiness PASS missing for '+key+': '+json.dumps(checks.get(key)))
+              if ready.get('readyToActivate') is not False:
+                  raise SystemExit('Incomplete test Project was incorrectly ready to activate')
+              blocking=[key for key,row in checks.items() if row.get('severity')=='BLOCKING' and row.get('status')!='PASS']
+              if not blocking:
+                  raise SystemExit('Expected at least one activation blocker before Role Mapping/Master setup')
+              print('UC02_READINESS_FAIL_CLOSED=PASS|BLOCKERS='+','.join(sorted(blocking)))
+
+              activation=requests.post(
+                  audit_base+f'/v1/tenants/{tenant_id}/project/activate',
+                  headers={**headers,'Idempotency-Key':'uc02-continue-'+run_id+'-activate'},timeout=45,
+              )
+              if activation.status_code != 409:
+                  raise SystemExit('Incomplete Project activation did not fail 409; HTTP '+str(activation.status_code)+': '+activation.text[:500])
+              print('UC02_ACTIVATION_FAIL_CLOSED=PASS')
+
+              sec_state=requests.get(security_base+f'/security/v1/platform/tenants/{tenant_id}',headers=headers,timeout=30)
+              if sec_state.status_code != 200:
+                  raise SystemExit('Security Tenant GET failed HTTP '+str(sec_state.status_code))
+              sec_body=sec_state.json()
+              if sec_body.get('tenantName') != project_tag or sec_body.get('status') != 'CONFIGURING':
+                  raise SystemExit('Security Tenant was not preserved in CONFIGURING lifecycle')
+              print('UC02_SECURITY_TENANT_API=PASS')
+
+              di_state=requests.get(di_base+f'/v1/tenants/{tenant_id}/admin/provisioning',headers=headers,timeout=30)
+              if di_state.status_code != 200:
+                  raise SystemExit('DI provisioning GET failed HTTP '+str(di_state.status_code)+': '+di_state.text[:500])
+              di_data=di_state.json().get('data') or {}
+              if di_data.get('provisioningStatus') != 'READY':
+                  raise SystemExit('DI provisioning not READY: '+json.dumps(di_data))
+              print('UC02_DI_PROVISIONING_API=PASS')
+
+              with create_engine(sec_db).connect() as conn:
+                  row=conn.execute(text('SELECT tenant_name,status FROM security.tenants WHERE tenant_id=:tid'),{'tid':tenant_id}).mappings().one()
+                  if row['tenant_name'] != project_tag or row['status'] != 'CONFIGURING':
+                      raise SystemExit('Security DB state mismatch')
+              print('UC02_SECURITY_DB=PASS')
+
+              with create_engine(audit_db).connect() as conn:
+                  row=conn.execute(text('SELECT project_name,project_status,version_no,region_code FROM auditcore.projects WHERE tenant_id=:tid'),{'tid':tenant_id}).mappings().one()
+                  op2=conn.execute(text('SELECT status,current_step,last_error_code FROM auditcore.administrative_operations WHERE operation_id=:oid'),{'oid':operation_id}).mappings().one()
+                  if row['project_name'] != project_tag or row['project_status'] != 'CONFIGURING' or row['version_no'] != version+1 or row['region_code'] != 'E2E-CONTINUED':
+                      raise SystemExit('Audit Core Project DB state mismatch')
+                  if op2['status'] != 'COMPLETED' or op2['current_step'] != 'COMPLETE' or op2['last_error_code'] is not None:
+                      raise SystemExit('Audit Core provisioning operation DB state mismatch')
+              print('UC02_AUDIT_CORE_DB=PASS')
+
+              with create_engine(di_db).connect() as conn:
+                  settings=conn.execute(text('SELECT count(*) FROM docintel.tenant_settings WHERE tenant_id=:tid'),{'tid':tenant_id}).scalar_one()
+                  retention=conn.execute(text('''
+                      SELECT count(*) FROM docintel.tenant_settings ts
+                      JOIN docintel.retention_policies rp
+                        ON rp.tenant_id=ts.tenant_id AND rp.retention_policy_id=ts.active_retention_policy_id
+                      WHERE ts.tenant_id=:tid AND rp.status='ACTIVE'
+                  '''),{'tid':tenant_id}).scalar_one()
+                  doc_types=conn.execute(text('SELECT count(*) FROM docintel.tenant_document_types WHERE tenant_id=:tid'),{'tid':tenant_id}).scalar_one()
+                  if settings != 1 or retention < 1 or doc_types < 1:
+                      raise SystemExit('DI DB provisioning evidence mismatch')
+              print('UC02_DI_DB=PASS')
+          finally:
+              if dealer_id and outlet_id:
+                  impact=requests.get(audit_base+f'/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets/{outlet_id}/deletion-impact',headers=headers,timeout=30)
+                  if impact.status_code == 200 and impact.json().get('canDelete') is True:
+                      deleted=requests.delete(
+                          audit_base+f'/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets/{outlet_id}',
+                          headers={**headers,'Idempotency-Key':'uc02-continue-'+run_id+'-delete-outlet'},timeout=30,
+                      )
+                      if deleted.status_code == 204:
+                          outlet_id=None
+              if dealer_id and outlet_id is None:
+                  impact=requests.get(audit_base+f'/v1/tenants/{tenant_id}/dealers/{dealer_id}/deletion-impact',headers=headers,timeout=30)
+                  if impact.status_code == 200 and impact.json().get('canDelete') is True:
+                      deleted=requests.delete(
+                          audit_base+f'/v1/tenants/{tenant_id}/dealers/{dealer_id}',
+                          headers={**headers,'Idempotency-Key':'uc02-continue-'+run_id+'-delete-dealer'},timeout=30,
+                      )
+                      if deleted.status_code == 204:
+                          dealer_id=None
+          if dealer_id is not None or outlet_id is not None:
+              raise SystemExit('Supported Dealer/Outlet test cleanup did not complete')
+          print('UC02_CHILD_TEST_DATA_CLEANUP=PASS')
+          print('UC02_EXISTING_PROJECT_ACCEPTANCE=PASS')
+          print('UC02_ACCEPTED_PROJECT='+project_tag)
+          print('UC02_ACCEPTED_TENANT='+tenant_id)
+          print('UC02_ACCEPTED_OPERATION='+operation_id)
+          PY
