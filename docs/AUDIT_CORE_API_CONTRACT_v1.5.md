@@ -16,55 +16,46 @@ POST /v1/projects
 
 Request and authorization remain unchanged, including the required `Idempotency-Key` header.
 
-Success response is `201`:
+For Web compatibility the existing response shape is retained, but successful synchronous create has only one business outcome:
 
 ```json
 {
+  "operationId": "request-receipt-uuid",
   "tenantId": "tenant-id",
-  "projectCode": "tenant-owned-project-code",
   "projectName": "MahindraWest",
-  "projectStatus": "CONFIGURING"
+  "projectStatus": "CONFIGURING",
+  "provisioningStatus": "READY",
+  "currentStep": "COMPLETE",
+  "errorCode": null,
+  "errorMessage": null
 }
 ```
 
-There is no normal `202`, `IN_PROGRESS`, `RECOVERY_REQUIRED`, `operationId`, `currentStep`, provisioning operation GET, or provisioning retry endpoint for synchronous Project Create.
+There is no normal `202`, `IN_PROGRESS` or `RECOVERY_REQUIRED` outcome for a new synchronous Project Create. The `operationId` is a completed request/audit receipt only; it is not a recoverable workflow handle.
 
 Failure is returned as the existing business-safe `application/problem+json` contract. Before returning failure, Audit Core must synchronously rollback/compensate any Project-create business state already written in Audit Core, DI and Security as defined by `AUDIT_CORE_UC02_ADMIN_TRANSACTION_ALIGNMENT.md`.
 
-## 2. Project provisioning operation endpoints removed from the UC02 Web contract
+## 2. Project provisioning retry removed from the UC02 Web contract
 
-The following endpoints are no longer part of the Phase-1 Web contract:
+The following retry endpoint is no longer part of the Phase-1 Web contract:
 
 ```text
-GET  /v1/project-provisioning-operations/{operationId}
 POST /v1/project-provisioning-operations/{operationId}/retry
 ```
 
-Existing historical rows in `administrative_operations` are audit/diagnostic history only and are not required to drive new Project Create requests.
+A GET for an existing historical provisioning receipt may remain diagnostic/read-only for compatibility, but new create failures are not persisted as `RECOVERY_REQUIRED` business operations and are not resumed.
 
 ## 3. Role Mapping mutation response
 
-For:
+For Web compatibility, the existing mutation response shape is retained, but successful synchronous role-mapping mutations return only:
 
 ```text
-PUT    /v1/tenants/{tenantId}/role-mappings/{userId}
-DELETE /v1/tenants/{tenantId}/role-mappings/{userId}
+operationStatus = COMPLETED
 ```
 
-successful PUT returns the resulting mapping directly:
+`RECOVERY_REQUIRED` is not a valid new mutation outcome. A downstream failure returns a normal non-2xx business-safe error.
 
-```json
-{
-  "userId": "user-id",
-  "operatingRole": "PC",
-  "dealerIds": [],
-  "outletIds": ["outlet-id"]
-}
-```
-
-successful DELETE returns `204 No Content`.
-
-`RECOVERY_REQUIRED`, `operationId` and `operationStatus` are removed from the normal role-mapping contract. If a later local write fails after Security has changed, Audit Core restores the prior Security operating role before returning failure.
+If a later Audit Core local write fails after Security has changed, Audit Core restores the prior Security operating role before returning failure. Removal follows the same rule.
 
 ## 4. Project Activation
 
