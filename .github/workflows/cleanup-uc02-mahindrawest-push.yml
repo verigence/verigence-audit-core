@@ -1,0 +1,95 @@
+name: Run guarded UC02 MahindraWest Audit Core cleanup
+
+on:
+  push:
+    branches: [cleanup/uc02-mahindrawest-duplicates]
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: github.ref == 'refs/heads/cleanup/uc02-mahindrawest-duplicates'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cleanup/uc02-mahindrawest-duplicates
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: |
+          python -m pip install -e .
+          npm install --global @railway/cli
+      - name: Resolve Audit Core DEV database
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo 'RAILWAY_API_TOKEN is not configured'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/vars.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/vars.json').read_text())
+          url=str(data.get('DATABASE_URL') or '').strip()
+          if not url:
+              raise SystemExit('Audit Core DEV DATABASE_URL missing')
+          Path('/tmp/db').write_text(url)
+          PY
+      - name: Delete exactly six guarded failed operations
+        shell: bash
+        run: |
+          set -euo pipefail
+          DATABASE_URL="$(cat /tmp/db)"
+          echo "::add-mask::$DATABASE_URL"
+          export DATABASE_URL
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+          engine=create_engine(os.environ['DATABASE_URL'])
+          with engine.begin() as connection:
+              rows=connection.execute(text("""
+                  SELECT operation_id,status,current_step,audit_core_receipt,di_receipt
+                  FROM auditcore.administrative_operations
+                  WHERE operation_type='PROJECT_PROVISION'
+                    AND safe_request_summary->>'projectName'=:n
+                  ORDER BY created_at_utc,operation_id
+              """), {'n':'MahindraWest'}).mappings().all()
+              if len(rows)!=6:
+                  raise SystemExit(f'guard: expected 6 MahindraWest PROJECT_PROVISION operations, found {len(rows)}')
+              for row in rows:
+                  if str(row['status'])!='RECOVERY_REQUIRED' or str(row['current_step'])!='SECURITY':
+                      raise SystemExit('guard: all targets must be Security-step RECOVERY_REQUIRED operations')
+                  if row['audit_core_receipt'] is not None or row['di_receipt'] is not None:
+                      raise SystemExit('guard: a target contains downstream durable state')
+              projects=int(connection.execute(text("SELECT count(*) FROM auditcore.projects WHERE project_name=:n"), {'n':'MahindraWest'}).scalar_one())
+              if projects!=0:
+                  raise SystemExit(f'guard: found {projects} persisted MahindraWest Project rows; refusing operation-only cleanup')
+              ids=[str(r['operation_id']) for r in rows]
+              result=connection.execute(text("DELETE FROM auditcore.administrative_operations WHERE operation_id = ANY(CAST(:ids AS uuid[]))"), {'ids':ids})
+              if int(result.rowcount)!=6:
+                  raise SystemExit(f'verification: expected delete rowcount 6, got {result.rowcount}')
+          with engine.connect() as connection:
+              remaining=int(connection.execute(text("SELECT count(*) FROM auditcore.administrative_operations WHERE operation_type='PROJECT_PROVISION' AND safe_request_summary->>'projectName'=:n"), {'n':'MahindraWest'}).scalar_one())
+              if remaining!=0:
+                  raise SystemExit(f'verification: {remaining} MahindraWest provisioning operations remain')
+          engine.dispose()
+          print('AUDIT_CORE_UC02_DUPLICATE_OPERATIONS_DELETED=6')
+          print('AUDIT_CORE_UC02_DUPLICATE_OPERATIONS_REMAINING=0')
+          PY
+      - name: Record successful cleanup and remove temporary workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/cleanup-uc02-mahindrawest-duplicates.yml .github/workflows/cleanup-uc02-mahindrawest-push.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'chore(dev): completed guarded cleanup of 6 MahindraWest operations'
+          git push origin HEAD:cleanup/uc02-mahindrawest-duplicates
