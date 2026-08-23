@@ -1,10 +1,15 @@
-name: One-shot Security tenant create fast
+name: Security tenant create fast
+
 on:
+  workflow_call:
   push:
     branches: [dev]
-    paths: ['.github/workflows/one-shot-security-create-fast.yml']
+    paths:
+      - '.github/workflows/one-shot-security-create-fast.yml'
+
 permissions:
   contents: write
+
 jobs:
   diagnose:
     runs-on: ubuntu-24.04
@@ -14,9 +19,12 @@ jobs:
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
     steps:
       - uses: actions/checkout@v4
-        with: {ref: dev, fetch-depth: 0}
+        with:
+          ref: dev
+          fetch-depth: 0
       - uses: actions/setup-python@v5
-        with: {python-version: '3.12'}
+        with:
+          python-version: '3.12'
       - run: |
           pip install 'psycopg[binary]>=3.2,<4' 'PyJWT>=2.8,<3' 'cryptography>=42,<46' 'httpx>=0.27,<1'
           npm install --global @railway/cli
@@ -41,8 +49,11 @@ jobs:
               row=q.fetchone(); uid=row[0] if row else ''
               q.execute("SELECT role_key,count(*) FROM security.platform_role_permission_defaults WHERE status='ACTIVE' AND role_key IN ('PC','TL','PM','CRM','Executive') GROUP BY role_key ORDER BY role_key")
               rows=q.fetchall()
+              q.execute("SELECT count(*) FROM security.permissions WHERE module_key='security' AND status='ACTIVE'")
+              security_permission_count=int(q.fetchone()[0])
           out.append('ROLE_DEFAULT_COUNTS='+';'.join(f'{a}:{b}' for a,b in rows))
           out.append('ROLE_SET_COMPLETE='+str({a for a,_ in rows}=={'PC','TL','PM','CRM','Executive'}).lower())
+          out.append('ACTIVE_SECURITY_PERMISSION_COUNT='+str(security_permission_count))
           key=str(v.get('SECURITY_PRIVATE_KEY_PEM') or '').replace('\\n','\n'); kid=str(v.get('SECURITY_KEY_ID') or '')
           iss=str(v.get('SECURITY_TOKEN_ISSUER') or 'verigence-security'); aud=str(v.get('SECURITY_TOKEN_AUDIENCE') or 'verigence-platform')
           now=datetime.now(UTC); token=jwt.encode({'iss':iss,'sub':uid,'aud':aud,'iat':now,'exp':now+timedelta(minutes=5),'jti':str(uuid.uuid4()),'actor_type':'USER'},key,algorithm='RS256',headers={'kid':kid})
@@ -64,8 +75,13 @@ jobs:
           PY
       - shell: bash
         run: |
-          git config user.name 'github-actions[bot]'; git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add docs/runtime/security-create-fast.txt
+          if git diff --cached --quiet; then
+            exit 0
+          fi
           git commit -m 'docs(dev): record fast Security create result [skip ci]'
           git pull --rebase origin dev
           git push origin HEAD:dev
