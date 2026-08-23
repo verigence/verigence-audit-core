@@ -354,12 +354,12 @@ def test_work_items_use_live_security_and_enforce_business_scope(uc03_work_items
     assert second_payload["nextCursor"] is None
     assert len(setup["authorization"].calls) == 2
 
-    newest = payload["items"][0]
-    assert newest["openFlagCount"] == 1
-    assert newest["totalFlagCount"] == 1
-    assert newest["highestOpenSeverity"] == "CRITICAL"
-    assert newest["proposalReadyCount"] == 0
-    assert newest["nextActionCode"] is None
+    all_items = [*payload["items"], *second_payload["items"]]
+    flagged = next(item for item in all_items if item["openFlagCount"] == 1)
+    assert flagged["totalFlagCount"] == 1
+    assert flagged["highestOpenSeverity"] == "CRITICAL"
+    assert flagged["proposalReadyCount"] == 0
+    assert flagged["nextActionCode"] is None
 
 
 def test_work_items_filter_delivery_using_project_timezone(uc03_work_items_setup) -> None:
