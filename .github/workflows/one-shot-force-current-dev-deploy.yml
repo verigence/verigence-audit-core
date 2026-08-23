@@ -1,0 +1,110 @@
+name: One-shot force current Audit Core DEV source
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/one-shot-force-current-dev-deploy.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify exact source before upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e .
+          test -f migrations/versions/0012_uc03_delivery_capture.py
+          head="$(alembic heads)"
+          printf '%s\n' "$head"
+          grep -q '0012_uc03_delivery_capture' <<<"$head"
+          grep -q 'test -f migrations/versions/0012_uc03_delivery_capture.py' railway.toml
+          echo "SOURCE_SHA=${GITHUB_SHA}"
+          echo 'SOURCE_0012=PASS'
+      - run: npm install --global @railway/cli
+      - name: Upload exact DEV source to Railway
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway deployment list --service "$AUDIT_SERVICE" --limit 1 --json >/tmp/before.json
+          previous="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/before.json').read_text())
+          print(rows[0].get('id','') if rows else '')
+          PY
+          )"
+          echo "PREVIOUS_ID=$previous" >> "$GITHUB_ENV"
+          railway up . --path-as-root --service "$AUDIT_SERVICE" --detach --yes --message "FORCE exact Audit Core DEV ${GITHUB_SHA}" >/dev/null
+      - name: Wait for exact-source deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > /tmp/result.txt
+          for attempt in $(seq 1 60); do
+            railway deployment list --service "$AUDIT_SERVICE" --limit 1 --json >/tmp/after.json
+            read -r id status created <<<"$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/after.json').read_text())
+          row=rows[0] if rows else {}
+          print(row.get('id',''), row.get('status',''), row.get('createdAt',''))
+          PY
+          )"
+            if [[ -z "$id" || "$id" == "${PREVIOUS_ID:-}" ]]; then sleep 8; continue; fi
+            case "$status" in
+              SUCCESS)
+                printf 'FORCE_AUDIT_CORE_DEV_DEPLOY\nSOURCE_SHA=%s\nDEPLOYMENT_ID=%s\nDEPLOYMENT_STATUS=SUCCESS\nDEPLOYMENT_CREATED_AT=%s\nRESULT=PASS\n' "$GITHUB_SHA" "$id" "$created" > /tmp/result.txt
+                break
+                ;;
+              FAILED|CRASHED|REMOVED)
+                railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 220 > /tmp/deploy-logs.txt 2>&1 || true
+                printf 'FORCE_AUDIT_CORE_DEV_DEPLOY\nSOURCE_SHA=%s\nDEPLOYMENT_ID=%s\nDEPLOYMENT_STATUS=%s\nDEPLOYMENT_CREATED_AT=%s\nRESULT=FAIL\n' "$GITHUB_SHA" "$id" "$status" "$created" > /tmp/result.txt
+                break
+                ;;
+            esac
+            sleep 8
+          done
+          if [[ ! -s /tmp/result.txt ]]; then
+            railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 220 > /tmp/deploy-logs.txt 2>&1 || true
+            printf 'FORCE_AUDIT_CORE_DEV_DEPLOY\nSOURCE_SHA=%s\nDEPLOYMENT_STATUS=TIMEOUT\nRESULT=FAIL\n' "$GITHUB_SHA" > /tmp/result.txt
+          fi
+          mkdir -p docs/runtime
+          cp /tmp/result.txt docs/runtime/force-current-dev-deploy.txt
+          cp /tmp/deploy-logs.txt docs/runtime/force-current-dev-deploy-logs.txt 2>/dev/null || : > docs/runtime/force-current-dev-deploy-logs.txt
+          cat docs/runtime/force-current-dev-deploy.txt
+      - name: Record deployment evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs/runtime
+          if [[ ! -f docs/runtime/force-current-dev-deploy.txt ]]; then
+            printf 'FORCE_AUDIT_CORE_DEV_DEPLOY\nSOURCE_SHA=%s\nRESULT=WORKFLOW_FAILED_BEFORE_DEPLOY_RESULT\n' "$GITHUB_SHA" > docs/runtime/force-current-dev-deploy.txt
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/runtime/force-current-dev-deploy.txt docs/runtime/force-current-dev-deploy-logs.txt 2>/dev/null || true
+          git commit -m 'docs(dev): record exact-source Audit Core deployment [skip ci]' || exit 0
+          git pull --rebase origin dev
+          git push origin HEAD:dev
+      - name: Enforce deployment success
+        shell: bash
+        run: grep -q '^RESULT=PASS$' docs/runtime/force-current-dev-deploy.txt
