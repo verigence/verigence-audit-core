@@ -38,9 +38,12 @@ jobs:
     uses: ./.github/workflows/audit-core-dev-deploy.yml
     secrets: inherit
 
-  attest:
-    name: Record successful DEV deployment
-    needs: deploy
+  report:
+    name: Record DEV verification result
+    if: always()
+    needs:
+      - contract
+      - deploy
     runs-on: ubuntu-24.04
     steps:
       - name: Check out DEV
@@ -48,20 +51,32 @@ jobs:
         with:
           ref: dev
 
-      - name: Record deployed source SHA
+      - name: Record verification result
         env:
           VERIFIED_SHA: ${{ github.sha }}
+          CONTRACT_RESULT: ${{ needs.contract.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
         run: |
           set -euo pipefail
           mkdir -p docs/runtime
+          if [[ "$CONTRACT_RESULT" == "success" && "$DEPLOY_RESULT" == "success" ]]; then
+            final=PASS
+          else
+            final=FAIL
+          fi
           cat > docs/runtime/security-admin-dev-verified.txt <<EOF
-          SECURITY_ADMIN_DEV_VERIFIED=PASS
-          DEPLOYED_SOURCE_SHA=${VERIFIED_SHA}
+          SECURITY_ADMIN_DEV_VERIFIED=${final}
+          SOURCE_SHA=${VERIFIED_SHA}
+          CONTRACT_RESULT=${CONTRACT_RESULT}
+          DEPLOY_RESULT=${DEPLOY_RESULT}
           SECURITY_ADMIN_ENDPOINT=/security/v1/platform/me
           SUPER_ADMIN_ROLE=platform.super_admin
           EOF
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add docs/runtime/security-admin-dev-verified.txt
+          if git diff --cached --quiet; then
+            exit 0
+          fi
           git commit -m '[skip ci] chore: record Security admin DEV verification'
           git push origin HEAD:dev
