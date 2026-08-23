@@ -25,7 +25,6 @@ def _request(method: str, path: str) -> Request:
 
 def test_only_approved_control_plane_and_master_gets_use_lightweight_auth() -> None:
     approved = (
-        "/v1/projects",
         "/v1/project-reference-data",
         "/v1/tenants/t-1/project-masters",
         "/v1/tenants/t-1/project-masters/AUDIT_CORE/PRICE_LIST/versions",
@@ -34,6 +33,8 @@ def test_only_approved_control_plane_and_master_gets_use_lightweight_auth() -> N
     for path in approved:
         assert dependencies._is_lightweight_authenticated_read(_request("GET", path))
 
+    # Cross-Tenant UC02 Project Administration remains SuperAdmin-only.
+    assert not dependencies._is_lightweight_authenticated_read(_request("GET", "/v1/projects"))
     assert not dependencies._is_lightweight_authenticated_read(
         _request("POST", "/v1/projects")
     )
