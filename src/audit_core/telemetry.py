@@ -4,11 +4,11 @@ import logging
 import os
 import time
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
 logger = logging.getLogger("audit_core.telemetry")
@@ -64,7 +64,7 @@ class TelemetrySink(Protocol):
 
 
 class StructuredLogTelemetrySink:
-    """Provider-neutral default sink suitable for asynchronous log export."""
+    """Provider-neutral local fallback used while remote observability is disabled."""
 
     def metric(self, point: MetricPoint) -> None:
         logger.info(
@@ -97,6 +97,14 @@ class StructuredLogTelemetrySink:
         )
 
 
+class _NullTelemetrySink:
+    def metric(self, point: MetricPoint) -> None:
+        return
+
+    def span(self, record: SpanRecord) -> None:
+        return
+
+
 def _platform_context() -> dict[str, str]:
     return {
         "service_name": os.environ.get("SERVICE_NAME", "verigence-audit-core"),
@@ -106,10 +114,24 @@ def _platform_context() -> dict[str, str]:
 
 
 _sink: TelemetrySink = StructuredLogTelemetrySink()
+_default_sink = _sink
+_otel_meter: Any | None = None
+_otel_tracer: Any | None = None
+_otel_instruments: dict[tuple[str, str], Any] = {}
+
+
+def configure_otel_telemetry(meter: Any, tracer: Any) -> None:
+    """Bridge the existing Audit Core telemetry API to configured OTel providers."""
+    global _otel_meter, _otel_tracer, _sink
+    _otel_meter = meter
+    _otel_tracer = tracer
+    if _sink is _default_sink:
+        # Avoid duplicating every metric/span to stdout once OTLP owns remote telemetry.
+        _sink = _NullTelemetrySink()
 
 
 def set_telemetry_sink(sink: TelemetrySink) -> TelemetrySink:
-    """Replace the sink for tests/adapters and return the previous sink."""
+    """Replace the local sink for tests/adapters and return the previous sink."""
     global _sink
     previous = _sink
     _sink = sink
@@ -132,9 +154,36 @@ def record_metric(
         labels=safe_labels,
     )
     try:
+        _record_otel_metric(point)
+    except Exception:  # noqa: BLE001 -- telemetry must never block business processing
+        logger.warning("telemetry_metric_export_failed", exc_info=False)
+    try:
         _sink.metric(point)
     except Exception:  # noqa: BLE001 -- telemetry must never block business processing
         logger.warning("telemetry_metric_export_failed", exc_info=False)
+
+
+def _record_otel_metric(point: MetricPoint) -> None:
+    if _otel_meter is None:
+        return
+    key = (point.name, point.kind)
+    instrument = _otel_instruments.get(key)
+    if instrument is None:
+        if point.kind == "histogram":
+            instrument = _otel_meter.create_histogram(point.name)
+        elif point.kind == "gauge":
+            instrument = _otel_meter.create_gauge(point.name)
+        else:
+            instrument = _otel_meter.create_counter(point.name)
+        _otel_instruments[key] = instrument
+
+    attributes = dict(point.labels)
+    if point.kind == "histogram":
+        instrument.record(point.value, attributes)
+    elif point.kind == "gauge":
+        instrument.set(point.value, attributes)
+    else:
+        instrument.add(point.value, attributes)
 
 
 def _safe_metric_labels(labels: Mapping[str, str]) -> dict[str, str]:
@@ -161,16 +210,30 @@ def trace_span(
     trace_id: str | None = None,
     attributes: Mapping[str, str] | None = None,
 ) -> Iterator[tuple[str, str]]:
-    """Create a fail-safe local span that can be adapted to an external tracer."""
+    """Create a fail-safe span while preserving the existing local trace contract."""
     parent_span_id = _span_id.get()
     resolved_trace_id = trace_id or _trace_id.get() or uuid4().hex
     span_id = uuid4().hex[:16]
     trace_token = _trace_id.set(resolved_trace_id)
     span_token = _span_id.set(span_id)
+    safe_attributes = {str(k): str(v) for k, v in (attributes or {}).items()}
+    otel_attributes = dict(safe_attributes)
+    if correlation_id:
+        otel_attributes["verigence.correlation_id"] = correlation_id
+    if trace_id:
+        # X-Trace-ID is retained only for compatibility; W3C trace context owns OTel propagation.
+        otel_attributes["verigence.legacy_trace_id"] = trace_id
+
+    span_context = (
+        _otel_tracer.start_as_current_span(name, attributes=otel_attributes)
+        if _otel_tracer is not None
+        else nullcontext()
+    )
     started = time.perf_counter()
     outcome = "SUCCESS"
     try:
-        yield resolved_trace_id, span_id
+        with span_context:
+            yield resolved_trace_id, span_id
     except Exception:
         outcome = "FAILURE"
         raise
@@ -186,7 +249,7 @@ def trace_span(
             duration_ms=duration_ms,
             outcome=outcome,
             correlation_id=correlation_id,
-            attributes={str(k): str(v) for k, v in (attributes or {}).items()},
+            attributes=safe_attributes,
         )
         try:
             _sink.span(record)

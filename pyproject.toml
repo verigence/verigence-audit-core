@@ -18,6 +18,12 @@ dependencies = [
     "python-multipart==0.0.22",
     "openpyxl>=3.1,<4",
     "structlog>=24.1.0",
+    "opentelemetry-api==1.44.0",
+    "opentelemetry-sdk==1.44.0",
+    "opentelemetry-exporter-otlp-proto-http==1.44.0",
+    "opentelemetry-instrumentation-fastapi==0.65b0",
+    "opentelemetry-instrumentation-httpx==0.65b0",
+    "opentelemetry-instrumentation-sqlalchemy==0.65b0",
 ]
 
 [project.optional-dependencies]
@@ -43,6 +49,9 @@ target-version = "py312"
 # downstream Security write has occurred, any unexpected local failure must be
 # converted into a durable RECOVERY_REQUIRED state rather than losing reconciliation.
 "src/audit_core/role_mappings.py" = ["BLE001"]
+# Telemetry initialization/export is a deliberate fail-open third-party boundary;
+# no observability exception may prevent Audit Core business processing or startup.
+"src/audit_core/otel.py" = ["BLE001"]
 # The Project Master facade keeps imports grouped by owning master domain so the
 # adapter boundary remains reviewable beside the corresponding confirm helpers.
 "src/audit_core/project_master_imports.py" = ["I001"]

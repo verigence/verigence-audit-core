@@ -21,6 +21,7 @@ from audit_core.insurance_tradein import router as insurance_tradein_router
 from audit_core.journeys import router as journey_router
 from audit_core.logging_config import configure_logging
 from audit_core.observability import install_observability
+from audit_core.otel import configure_otlp
 from audit_core.payments_finance import router as payments_finance_router
 from audit_core.project_activation import router as project_activation_router
 from audit_core.project_master_imports import router as project_master_import_router
@@ -66,13 +67,16 @@ _CORS_EXPOSE_HEADERS = ["ETag", "X-Correlation-ID", "X-Trace-ID"]
 
 def create_app() -> FastAPI:
     settings = load_settings()
-    configure_logging(settings)
     application = FastAPI(
         title=settings.service_name,
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
     )
+    # Optional telemetry is configured before the structlog pipeline so application events can be
+    # queued to the OTel BatchLogRecordProcessor. Fail-open bootstrap can never block app startup.
+    configure_otlp(application, settings)
+    configure_logging(settings)
     install_error_handlers(application)
     install_observability(application)
     install_contract_guards(application)
