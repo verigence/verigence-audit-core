@@ -9,8 +9,8 @@ from sqlalchemy import Connection, text
 
 from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.di_client import DiClient, DiClientError
+from audit_core.errors import ConflictError, DependencyUnavailableError
 from audit_core.evidence import get_di_client, get_security_oauth_client
-from audit_core.errors import DependencyUnavailableError
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
@@ -18,12 +18,12 @@ from audit_core.security_authorization import (
 )
 from audit_core.security_integration import SecurityOAuthClient, SecurityTokenError
 from audit_core.uc03_booking_capture import (
-    ExtractionRefreshResponse,
     _TERMINAL_PROCESSING_STATUSES,
+    ExtractionRefreshResponse,
     _scope,
     _stage_state,
-    get_booking_workspace as _base_workspace,
 )
+from audit_core.uc03_booking_capture import get_booking_workspace as _base_workspace
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/journeys/{journey_id}",
@@ -84,8 +84,6 @@ def refresh_booking_extraction_strict(
     )
     state = _stage_state(connection, tenant_id=tenant_id, journey_id=journey_id)
     if not _active_booking(state):
-        from audit_core.errors import ConflictError
-
         raise ConflictError(
             error_code="VAC-CONFLICT-004",
             title="Booking state conflict",
