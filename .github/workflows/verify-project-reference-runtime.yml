@@ -1,0 +1,63 @@
+name: Verify Project reference runtime access
+
+on:
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - name: Install tooling
+        run: |
+          npm install --global @railway/cli
+          python -m pip install 'psycopg[binary]>=3.2,<4'
+
+      - name: Verify DEV reference queries as runtime role
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import psycopg
+
+          variables = json.loads(Path('/tmp/audit-vars.json').read_text())
+          database_url = str(variables.get('DATABASE_URL', '')).strip()
+          if not database_url:
+              raise SystemExit('DATABASE_URL_MISSING')
+
+          with psycopg.connect(database_url) as conn:
+              with conn.cursor() as cur:
+                  cur.execute("select current_user")
+                  login_role = cur.fetchone()[0]
+                  print('DB_CONNECTION=PASS')
+                  print('LOGIN_ROLE_PRESENT=YES' if login_role else 'LOGIN_ROLE_PRESENT=NO')
+
+                  cur.execute("select pg_has_role(current_user, 'audit_core_runtime', 'MEMBER')")
+                  print('RUNTIME_ROLE_MEMBERSHIP=' + ('PASS' if cur.fetchone()[0] else 'FAIL'))
+
+                  cur.execute("select has_table_privilege('audit_core_runtime', 'auditcore.oems', 'SELECT')")
+                  print('OEM_SELECT_PRIVILEGE=' + ('PASS' if cur.fetchone()[0] else 'FAIL'))
+                  cur.execute("select has_table_privilege('audit_core_runtime', 'auditcore.product_categories', 'SELECT')")
+                  print('CATEGORY_SELECT_PRIVILEGE=' + ('PASS' if cur.fetchone()[0] else 'FAIL'))
+
+                  cur.execute('set local role audit_core_runtime')
+                  print('SET_RUNTIME_ROLE=PASS')
+                  cur.execute("select count(*) from auditcore.oems where is_active = true and oem_code in ('MAHINDRA','HYUNDAI','MARUTI','MERCEDES_BENZ','BMW','SKODA','VOLKSWAGEN','TATA_MOTORS')")
+                  print('APPROVED_OEM_COUNT=' + str(cur.fetchone()[0]))
+                  cur.execute("select count(*) from auditcore.product_categories where is_active = true and category_code = 'FOUR_WHEELERS'")
+                  print('FOUR_WHEELER_CATEGORY_COUNT=' + str(cur.fetchone()[0]))
+                  print('REFERENCE_QUERY_RUNTIME=PASS')
+                  conn.rollback()
+          PY
