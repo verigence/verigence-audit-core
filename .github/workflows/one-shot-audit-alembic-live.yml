@@ -1,0 +1,96 @@
+name: One-shot verify Audit Core DEV Alembic source/database
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - .github/workflows/one-shot-audit-alembic-live.yml
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      DB_SERVICE: Postgres
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify repository migration graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e .
+          test -f migrations/versions/0012_uc03_delivery_capture.py
+          alembic heads | tee /tmp/heads.txt
+          grep -q '0012_uc03_delivery_capture' /tmp/heads.txt
+          echo 'AUDIT_SOURCE_ALEMBIC_HEAD=PASS'
+
+      - name: Resolve DEV database
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global @railway/cli
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$DB_SERVICE" --json >/tmp/db-vars.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/db-vars.json').read_text())
+          raw=(data.get('DATABASE_PUBLIC_URL') or data.get('DATABASE_URL') or '').strip()
+          if not raw:
+              raise SystemExit('DEV Postgres URL is unavailable')
+          if raw.startswith('postgres://'):
+              raw='postgresql+psycopg://'+raw[len('postgres://'):]
+          elif raw.startswith('postgresql://'):
+              raw='postgresql+psycopg://'+raw[len('postgresql://'):]
+          elif raw.startswith('postgresql+asyncpg://'):
+              raw='postgresql+psycopg://'+raw[len('postgresql+asyncpg://'):]
+          Path('/tmp/db-url').write_text(raw)
+          print('AUDIT_DEV_DATABASE_RESOLVED=PASS')
+          PY
+
+      - name: Verify live revision and upgrade compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DATABASE_URL="$(cat /tmp/db-url)"
+          alembic current | tee /tmp/current.txt
+          grep -q '0012_uc03_delivery_capture' /tmp/current.txt
+          echo 'AUDIT_LIVE_ALEMBIC_CURRENT=0012_uc03_delivery_capture'
+          alembic upgrade head
+          alembic current | tee /tmp/current-after.txt
+          grep -q '0012_uc03_delivery_capture' /tmp/current-after.txt
+          echo 'AUDIT_LIVE_ALEMBIC_UPGRADE_HEAD=PASS'
+
+      - name: Record result and self-clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs/runtime
+          cat > docs/runtime/audit-alembic-live.txt <<EOF
+          AUDIT_SOURCE_ALEMBIC_HEAD=0012_uc03_delivery_capture
+          AUDIT_LIVE_ALEMBIC_CURRENT=0012_uc03_delivery_capture
+          AUDIT_LIVE_ALEMBIC_UPGRADE_HEAD=PASS
+          RESULT=PASS
+          EOF
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm -f .github/workflows/one-shot-audit-alembic-live.yml
+          git add docs/runtime/audit-alembic-live.txt
+          git commit -m 'docs(dev): record Audit Core live Alembic compatibility [skip ci]'
+          git pull --rebase origin dev
+          git push origin HEAD:dev
