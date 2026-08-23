@@ -23,6 +23,7 @@ jobs:
       PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       DEV_WEB_ORIGIN: https://verigence-web-dev.jbrconsulting-it.workers.dev
       SECURITY_PUBLIC_BASE: https://security-dev.up.railway.app
+      APP_ENV: dev
 
     steps:
       - name: Check out PR head and preserve fix
