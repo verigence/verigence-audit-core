@@ -1,0 +1,126 @@
+name: One-shot Audit Core Security auth config diagnose
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/one-shot-auth-config-diagnose.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      SECURITY_SERVICE: security
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: |
+          python -m pip install 'PyJWT>=2.8,<3' 'cryptography>=42,<46' 'httpx>=0.27,<1'
+          npm install --global @railway/cli
+      - name: Diagnose live auth configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$SECURITY_SERVICE" --json >/tmp/security.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit.json
+          python - <<'PY'
+          from __future__ import annotations
+          import json, uuid
+          from datetime import UTC, datetime, timedelta
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          import httpx, jwt
+          from jwt import PyJWKClient
+
+          out = ['AUTH_CONFIG_DIAGNOSE']
+          def load(p): return json.loads(Path(p).read_text())
+          def public_base(v):
+              x=str(v.get('RAILWAY_PUBLIC_DOMAIN') or v.get('RAILWAY_STATIC_URL') or '').strip()
+              if x and not x.startswith(('http://','https://')): x='https://'+x
+              return x.rstrip('/')
+          def safe_url(u):
+              try:
+                  p=urlsplit(u)
+                  return f'{p.scheme}://{p.hostname or ""}{p.path}'
+              except Exception:
+                  return 'INVALID'
+          sv=load('/tmp/security.json'); av=load('/tmp/audit.json')
+          sec_iss=str(sv.get('SECURITY_TOKEN_ISSUER') or 'verigence-security')
+          sec_aud=str(sv.get('SECURITY_TOKEN_AUDIENCE') or 'verigence-platform')
+          aud_iss=str(av.get('SECURITY_ISSUER') or '')
+          aud_aud=str(av.get('SECURITY_AUDIENCE') or '')
+          aud_jwks=str(av.get('SECURITY_JWKS_URL') or '')
+          sec_base=public_base(sv)
+          sec_jwks=sec_base+'/.well-known/jwks.json' if sec_base else ''
+          key_id=str(sv.get('SECURITY_KEY_ID') or '')
+          private_key=str(sv.get('SECURITY_PRIVATE_KEY_PEM') or '').replace('\\n','\n')
+
+          out += [
+              f'ISSUER_MATCH={str(aud_iss==sec_iss).lower()}',
+              f'AUDIENCE_MATCH={str(aud_aud==sec_aud).lower()}',
+              f'AUDIT_ISSUER_PRESENT={str(bool(aud_iss)).lower()}',
+              f'AUDIT_AUDIENCE_PRESENT={str(bool(aud_aud)).lower()}',
+              f'AUDIT_JWKS_PRESENT={str(bool(aud_jwks)).lower()}',
+              f'AUDIT_JWKS_SAFE={safe_url(aud_jwks) if aud_jwks else "MISSING"}',
+              f'SECURITY_PUBLIC_JWKS_SAFE={safe_url(sec_jwks) if sec_jwks else "MISSING"}',
+          ]
+
+          for label,url in [('SECURITY_PUBLIC',sec_jwks),('AUDIT_CONFIGURED',aud_jwks)]:
+              if not url:
+                  out.append(f'{label}_JWKS_HTTP=MISSING')
+                  continue
+              try:
+                  r=httpx.get(url,timeout=12.0,follow_redirects=True)
+                  out.append(f'{label}_JWKS_HTTP={r.status_code}')
+                  data=r.json() if r.status_code==200 else {}
+                  kids=[str(k.get('kid')) for k in data.get('keys',[]) if isinstance(k,dict) and k.get('kid')]
+                  out.append(f'{label}_JWKS_KEY_COUNT={len(kids)}')
+                  out.append(f'{label}_JWKS_HAS_SECURITY_KID={str(key_id in kids).lower()}')
+              except Exception as exc:
+                  out.append(f'{label}_JWKS_HTTP=ERROR')
+                  out.append(f'{label}_JWKS_ERROR={type(exc).__name__}:{str(exc)[:200]}')
+
+          if private_key and key_id and sec_jwks:
+              now=datetime.now(UTC)
+              token=jwt.encode({'iss':sec_iss,'sub':str(uuid.uuid4()),'aud':sec_aud,'iat':now,'exp':now+timedelta(minutes=5),'jti':str(uuid.uuid4()),'actor_type':'USER'},private_key,algorithm='RS256',headers={'kid':key_id})
+              for label,url,iss,aud in [('SECURITY_PUBLIC',sec_jwks,sec_iss,sec_aud),('AUDIT_CONFIGURED',aud_jwks,aud_iss,aud_aud)]:
+                  if not url or not iss or not aud:
+                      out.append(f'{label}_LOCAL_VERIFY=SKIPPED')
+                      continue
+                  try:
+                      key=PyJWKClient(url).get_signing_key_from_jwt(token)
+                      claims=jwt.decode(token,key.key,algorithms=[key.algorithm_name],issuer=iss,audience=aud,options={'require':['exp','iss','aud','sub','iat','jti','actor_type']})
+                      out.append(f'{label}_LOCAL_VERIFY=PASS')
+                      out.append(f'{label}_ACTOR_TYPE={claims.get("actor_type","")}')
+                  except Exception as exc:
+                      out.append(f'{label}_LOCAL_VERIFY=FAIL')
+                      out.append(f'{label}_LOCAL_VERIFY_ERROR={type(exc).__name__}:{str(exc)[:240]}')
+
+          Path('docs/runtime').mkdir(parents=True,exist_ok=True)
+          Path('docs/runtime/auth-config-diagnose.txt').write_text('\n'.join(out)+'\n')
+          print('\n'.join(out))
+          PY
+      - name: Record evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/runtime/auth-config-diagnose.txt
+          git commit -m 'docs(dev): record auth config diagnosis [skip ci]' || exit 0
+          git pull --rebase origin dev
+          git push origin HEAD:dev
