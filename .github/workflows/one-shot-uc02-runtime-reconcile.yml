@@ -56,11 +56,8 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           from __future__ import annotations
-
           import json
           from pathlib import Path
-          from urllib.parse import urlsplit, urlunsplit
-
           import psycopg
 
           def load(path: str):
@@ -70,105 +67,48 @@ jobs:
               for key in keys:
                   value = str(values.get(key, '') or '').strip()
                   if value:
-                      value = value.replace('postgresql+psycopg://', 'postgresql://', 1)
-                      value = value.replace('postgresql+asyncpg://', 'postgresql://', 1)
-                      return value
+                      return value.replace('postgresql+psycopg://','postgresql://',1).replace('postgresql+asyncpg://','postgresql://',1)
               raise SystemExit('Required database URL is missing: ' + ','.join(keys))
 
-          def deployment(path: str) -> tuple[str, str, str]:
-              rows = load(path)
-              row = rows[0] if rows else {}
-              return (
-                  str(row.get('id', '') or ''),
-                  str(row.get('status', '') or ''),
-                  str(row.get('createdAt') or row.get('created_at') or ''),
-              )
+          def deployment(path: str):
+              rows=load(path); row=rows[0] if rows else {}
+              meta=row.get('meta') if isinstance(row.get('meta'),dict) else {}
+              return str(row.get('status','') or ''), str(row.get('createdAt') or ''), str(meta.get('commitHash') or meta.get('commit') or ''), str(meta.get('branch') or '')
 
-          security_values = load('/tmp/security-vars.json')
-          audit_values = load('/tmp/audit-vars.json')
-          di_values = load('/tmp/di-vars.json')
-          security_url = db_url(security_values, 'DATABASE_URL')
-          audit_url = db_url(audit_values, 'DATABASE_URL')
-          di_url = db_url(di_values, 'DI_DATABASE_URL', 'DATABASE_URL')
+          sv,av,dv=load('/tmp/security-vars.json'),load('/tmp/audit-vars.json'),load('/tmp/di-vars.json')
+          su,au,du=db_url(sv,'DATABASE_URL'),db_url(av,'DATABASE_URL'),db_url(dv,'DI_DATABASE_URL','DATABASE_URL')
 
-          with psycopg.connect(security_url) as security, psycopg.connect(audit_url) as audit, psycopg.connect(di_url) as di:
-              with security.cursor() as cur:
-                  cur.execute("""
-                      SELECT tenant_id::text, tenant_name, status, created_at_utc
-                      FROM security.tenants
-                      WHERE status='CONFIGURING'
-                      ORDER BY created_at_utc
-                  """)
-                  configuring = cur.fetchall()
-
-              candidates = []
-              with_docs = []
-              with_project = []
-              testhyundai_configuring = 0
-              testhyundai_candidates = 0
-
+          with psycopg.connect(su) as s, psycopg.connect(au) as a, psycopg.connect(du) as d:
+              with a.cursor() as cur:
+                  cur.execute("SELECT tenant_id::text, project_name, status, provisioning_status, created_at_utc FROM auditcore.projects ORDER BY created_at_utc")
+                  projects=cur.fetchall()
+              with s.cursor() as cur:
+                  cur.execute("SELECT tenant_id::text, tenant_name, status, created_at_utc FROM security.tenants ORDER BY created_at_utc")
+                  tenants=cur.fetchall()
+              configuring=[r for r in tenants if str(r[2])=='CONFIGURING']
+              candidates=[]; with_project=[]; with_docs=[]
               for tenant_id, tenant_name, status, created_at in configuring:
-                  if str(tenant_name).casefold() == 'testhyundai':
-                      testhyundai_configuring += 1
+                  with a.cursor() as cur:
+                      cur.execute("SELECT EXISTS (SELECT 1 FROM auditcore.projects WHERE tenant_id=%s)",(tenant_id,)); project_exists=bool(cur.fetchone()[0])
+                  with d.cursor() as cur:
+                      cur.execute("SELECT EXISTS (SELECT 1 FROM docintel.documents WHERE tenant_id=%s)",(tenant_id,)); docs=bool(cur.fetchone()[0])
+                      cur.execute("SELECT (SELECT count(*) FROM docintel.tenant_settings WHERE tenant_id=%s)+(SELECT count(*) FROM docintel.retention_policies WHERE tenant_id=%s)+(SELECT count(*) FROM docintel.tenant_document_types WHERE tenant_id=%s)",(tenant_id,tenant_id,tenant_id)); prov=int(cur.fetchone()[0])
+                  if project_exists: with_project.append((tenant_id,tenant_name))
+                  elif docs: with_docs.append((tenant_id,tenant_name))
+                  else: candidates.append((tenant_id,tenant_name,prov))
 
-                  with audit.cursor() as cur:
-                      cur.execute(
-                          "SELECT EXISTS (SELECT 1 FROM auditcore.projects WHERE tenant_id=%s)",
-                          (tenant_id,),
-                      )
-                      project_exists = bool(cur.fetchone()[0])
-
-                  with di.cursor() as cur:
-                      cur.execute(
-                          "SELECT EXISTS (SELECT 1 FROM docintel.documents WHERE tenant_id=%s)",
-                          (tenant_id,),
-                      )
-                      documents_exist = bool(cur.fetchone()[0])
-                      cur.execute(
-                          """
-                          SELECT
-                            (SELECT count(*) FROM docintel.tenant_settings WHERE tenant_id=%s) +
-                            (SELECT count(*) FROM docintel.retention_policies WHERE tenant_id=%s) +
-                            (SELECT count(*) FROM docintel.tenant_document_types WHERE tenant_id=%s)
-                          """,
-                          (tenant_id, tenant_id, tenant_id),
-                      )
-                      provisioning_rows = int(cur.fetchone()[0])
-
-                  if project_exists:
-                      with_project.append(tenant_id)
-                  elif documents_exist:
-                      with_docs.append(tenant_id)
-                  else:
-                      candidates.append((tenant_id, provisioning_rows, str(tenant_name)))
-                      if str(tenant_name).casefold() == 'testhyundai':
-                          testhyundai_candidates += 1
-
-          s_id, s_status, s_created = deployment('/tmp/security-deploy.json')
-          a_id, a_status, a_created = deployment('/tmp/audit-deploy.json')
-          d_id, d_status, d_created = deployment('/tmp/di-deploy.json')
-
-          lines = [
-              '# UC02 DEV Runtime Reconciliation',
-              '',
-              'READ_ONLY=true',
-              f'SECURITY_LATEST_STATUS={s_status or "UNKNOWN"}',
-              f'SECURITY_LATEST_CREATED_AT={s_created or "UNKNOWN"}',
-              f'AUDIT_CORE_LATEST_STATUS={a_status or "UNKNOWN"}',
-              f'AUDIT_CORE_LATEST_CREATED_AT={a_created or "UNKNOWN"}',
-              f'DI_API_LATEST_STATUS={d_status or "UNKNOWN"}',
-              f'DI_API_LATEST_CREATED_AT={d_created or "UNKNOWN"}',
-              f'SECURITY_CONFIGURING_TENANTS={len(configuring)}',
-              f'CONFIGURING_WITH_AUDIT_PROJECT={len(with_project)}',
-              f'CONFIGURING_WITH_DI_DOCUMENTS_BUT_NO_PROJECT={len(with_docs)}',
-              f'ORPHAN_CANDIDATES_NO_PROJECT_NO_DI_DOCUMENTS={len(candidates)}',
-              f'ORPHAN_CANDIDATES_WITH_DI_PROVISIONING_ROWS={sum(1 for _, rows, _ in candidates if rows > 0)}',
-              f'TESTHYUNDAI_CONFIGURING={testhyundai_configuring}',
-              f'TESTHYUNDAI_ORPHAN_CANDIDATES={testhyundai_candidates}',
-              'RESULT=PASS',
-          ]
-          Path('docs/runtime').mkdir(parents=True, exist_ok=True)
-          Path('docs/runtime/uc02-runtime-reconcile.txt').write_text('\n'.join(lines) + '\n')
+          ss,sc,sh,sb=deployment('/tmp/security-deploy.json'); aas,aac,aah,aab=deployment('/tmp/audit-deploy.json'); ds,dc,dh,db=deployment('/tmp/di-deploy.json')
+          lines=['# UC02 DEV Runtime Reconciliation','', 'READ_ONLY=true',
+                 f'SECURITY_LATEST_STATUS={ss or "UNKNOWN"}',f'SECURITY_LATEST_CREATED_AT={sc or "UNKNOWN"}',f'SECURITY_LATEST_COMMIT={sh or "UNKNOWN"}',f'SECURITY_LATEST_BRANCH={sb or "UNKNOWN"}',
+                 f'AUDIT_CORE_LATEST_STATUS={aas or "UNKNOWN"}',f'AUDIT_CORE_LATEST_CREATED_AT={aac or "UNKNOWN"}',f'AUDIT_CORE_LATEST_COMMIT={aah or "UNKNOWN"}',f'AUDIT_CORE_LATEST_BRANCH={aab or "UNKNOWN"}',
+                 f'DI_API_LATEST_STATUS={ds or "UNKNOWN"}',f'DI_API_LATEST_CREATED_AT={dc or "UNKNOWN"}',f'DI_API_LATEST_COMMIT={dh or "UNKNOWN"}',f'DI_API_LATEST_BRANCH={db or "UNKNOWN"}',
+                 f'AUDIT_PROJECT_ROWS={len(projects)}',f'SECURITY_TENANT_ROWS={len(tenants)}',f'SECURITY_CONFIGURING_TENANTS={len(configuring)}',
+                 f'CONFIGURING_WITH_AUDIT_PROJECT={len(with_project)}',f'CONFIGURING_WITH_DI_DOCUMENTS_BUT_NO_PROJECT={len(with_docs)}',f'ORPHAN_CANDIDATES_NO_PROJECT_NO_DI_DOCUMENTS={len(candidates)}',f'ORPHAN_CANDIDATES_WITH_DI_PROVISIONING_ROWS={sum(1 for _,_,rows in candidates if rows>0)}']
+          for i,(tid,name,status,prov,created) in enumerate(projects,1): lines.append(f'PROJECT_{i}={name}|{status}|{prov}|{tid}')
+          for i,(tid,name,prov) in enumerate(candidates,1): lines.append(f'ORPHAN_{i}={name}|DI_PROVISIONING_ROWS={prov}|{tid}')
+          lines.append('RESULT=PASS')
+          Path('docs/runtime').mkdir(parents=True,exist_ok=True)
+          Path('docs/runtime/uc02-runtime-reconcile.txt').write_text('\n'.join(lines)+'\n')
           print('\n'.join(lines))
           PY
 
