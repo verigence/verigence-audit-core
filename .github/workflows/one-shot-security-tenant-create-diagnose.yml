@@ -1,0 +1,134 @@
+name: One-shot Security tenant create diagnose
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/one-shot-security-tenant-create-diagnose.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      SECURITY_SERVICE: security
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: |
+          python -m pip install 'psycopg[binary]>=3.2,<4' 'PyJWT>=2.8,<3' 'cryptography>=42,<46' 'httpx>=0.27,<1'
+          npm install --global @railway/cli
+      - name: Diagnose Security tenant create
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$SECURITY_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$SECURITY_SERVICE" --environment dev --json >/tmp/security.json
+          python - <<'PY'
+          from __future__ import annotations
+          import json, uuid
+          from datetime import UTC, datetime, timedelta
+          from pathlib import Path
+          import httpx, jwt, psycopg
+
+          out=['SECURITY_TENANT_CREATE_DIAGNOSE']
+          v=json.loads(Path('/tmp/security.json').read_text())
+          def pg(x): return str(x or '').replace('postgresql+psycopg://','postgresql://',1).replace('postgresql+asyncpg://','postgresql://',1)
+          db=pg(v.get('DATABASE_URL'))
+          domain=str(v.get('RAILWAY_PUBLIC_DOMAIN') or v.get('RAILWAY_STATIC_URL') or '').strip()
+          if domain and not domain.startswith(('http://','https://')): domain='https://'+domain
+          base=domain.rstrip('/')
+
+          with psycopg.connect(db) as conn:
+              with conn.cursor() as c:
+                  c.execute("""
+                    SELECT a.user_id::text
+                    FROM security.user_admin_role_assignments a
+                    JOIN security.users u ON u.user_id=a.user_id
+                    WHERE a.role_key='SuperAdmin' AND a.scope_type='PLATFORM'
+                      AND a.scope_id IS NULL AND a.status='ACTIVE' AND u.status='ACTIVE'
+                    ORDER BY a.assigned_at_utc LIMIT 1
+                  """)
+                  row=c.fetchone(); user_id=row[0] if row else None
+                  c.execute("""
+                    SELECT role_key, count(*)
+                    FROM security.platform_role_permission_defaults
+                    WHERE status='ACTIVE' AND role_key IN ('PC','TL','PM','CRM','Executive')
+                    GROUP BY role_key ORDER BY role_key
+                  """)
+                  defaults=c.fetchall()
+                  c.execute("SELECT count(*) FROM security.permissions WHERE status='ACTIVE'")
+                  permission_count=int(c.fetchone()[0])
+          out.append('SUPERADMIN_PRESENT='+str(bool(user_id)).lower())
+          out.append('ACTIVE_PERMISSION_COUNT='+str(permission_count))
+          out.append('ROLE_DEFAULT_COUNTS='+';'.join(f'{r}:{n}' for r,n in defaults))
+          observed={r for r,_ in defaults}
+          out.append('ALL_OPERATING_ROLES_HAVE_DEFAULTS='+str(observed=={'PC','TL','PM','CRM','Executive'}).lower())
+
+          private=str(v.get('SECURITY_PRIVATE_KEY_PEM') or '').replace('\\n','\n')
+          kid=str(v.get('SECURITY_KEY_ID') or '')
+          iss=str(v.get('SECURITY_TOKEN_ISSUER') or 'verigence-security')
+          aud=str(v.get('SECURITY_TOKEN_AUDIENCE') or 'verigence-platform')
+          if not user_id or not private or not kid or not base:
+              raise SystemExit('Security diagnostic prerequisites missing')
+          now=datetime.now(UTC)
+          token=jwt.encode({'iss':iss,'sub':user_id,'aud':aud,'iat':now,'exp':now+timedelta(minutes=5),'jti':str(uuid.uuid4()),'actor_type':'USER'},private,algorithm='RS256',headers={'kid':kid})
+          h={'Authorization':'Bearer '+token}
+          name='SEC-DIAG-'+now.strftime('%Y%m%d%H%M%S')
+          idem=str(uuid.uuid4())
+          with httpx.Client(timeout=25.0,follow_redirects=True) as client:
+              r=client.get(base+'/security/v1/platform/admin-context',headers=h)
+              out.append('ADMIN_CONTEXT_HTTP='+str(r.status_code))
+              r=client.post(base+'/security/v1/platform/tenants',headers={**h,'Idempotency-Key':idem,'Content-Type':'application/json'},json={'tenantName':name})
+              out.append('CREATE_TENANT_HTTP='+str(r.status_code))
+              try: body=r.json()
+              except Exception: body={}
+              if isinstance(body,dict):
+                  if body.get('code'): out.append('CREATE_TENANT_CODE='+str(body.get('code'))[:160])
+                  if body.get('detail'): out.append('CREATE_TENANT_DETAIL='+str(body.get('detail'))[:500].replace('\n',' '))
+                  if body.get('message'): out.append('CREATE_TENANT_MESSAGE='+str(body.get('message'))[:500].replace('\n',' '))
+              tid=str(body.get('tenantId') or '') if isinstance(body,dict) else ''
+              out.append('CREATE_TENANT_RESULT='+('PASS' if r.status_code==201 else 'FAIL'))
+              if tid:
+                  d=client.delete(base+'/security/v1/platform/tenants/'+tid,headers=h)
+                  out.append('CLEANUP_TENANT_HTTP='+str(d.status_code))
+          with psycopg.connect(db) as conn:
+              with conn.cursor() as c:
+                  c.execute('SELECT count(*) FROM security.tenants WHERE tenant_name=%s',(name,))
+                  residue=int(c.fetchone()[0])
+          out.append('SYNTHETIC_TENANT_RESIDUE='+str(residue))
+          Path('docs/runtime').mkdir(parents=True,exist_ok=True)
+          Path('docs/runtime/security-tenant-create-diagnose.txt').write_text('\n'.join(out)+'\n')
+          print('\n'.join(out))
+          PY
+      - name: Capture Security errors
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p docs/runtime
+          railway logs --service "$SECURITY_SERVICE" --latest --lines 400 2>/dev/null \
+            | grep -E 'ERROR|CRITICAL|Traceback|tenant|Tenant|role defaults|platform_role|IntegrityError' \
+            | tail -n 120 > docs/runtime/security-tenant-create-diagnose-logs.txt
+          true
+      - name: Record evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/runtime/security-tenant-create-diagnose.txt docs/runtime/security-tenant-create-diagnose-logs.txt 2>/dev/null || true
+          git commit -m 'docs(dev): record Security tenant-create diagnosis [skip ci]' || exit 0
+          git pull --rebase origin dev
+          git push origin HEAD:dev
