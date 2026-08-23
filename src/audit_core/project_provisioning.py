@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Header
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, Engine, text
 
-from audit_core.db import set_tenant_context
+from audit_core.db import set_platform_super_admin_context, set_tenant_context
 from audit_core.dependencies import (
     HumanAdminRequest,
     get_engine,
@@ -119,33 +119,6 @@ def _project_exists(engine: Engine, tenant_id: str) -> bool:
             ).scalar_one_or_none()
             is not None
         )
-
-
-def _project_selection(
-    connection: Connection,
-    *,
-    tenant: SecurityTenant,
-) -> ProjectSelectionResponse | None:
-    set_tenant_context(connection, tenant.tenant_id)
-    row = connection.execute(
-        text(
-            """
-            SELECT tenant_id, project_code, project_name, project_status
-            FROM auditcore.projects
-            WHERE tenant_id=:tenant_id
-            """
-        ),
-        {"tenant_id": tenant.tenant_id},
-    ).mappings().one_or_none()
-    if row is None:
-        return None
-    return ProjectSelectionResponse(
-        tenantId=str(row["tenant_id"]),
-        projectCode=str(row["project_code"]),
-        projectName=str(row["project_name"]),
-        projectStatus=str(row["project_status"]),
-        securityTenantStatus=tenant.status,
-    )
 
 
 def _ensure_project_projection(
@@ -275,35 +248,34 @@ def list_projects(
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     engine: Annotated[Engine, Depends(get_engine)],
 ) -> list[ProjectSelectionResponse]:
-    try:
-        with SecurityAdminClient(base_url=_security_base_url()) as client:
-            tenants = client.list_tenants(human_bearer_token=admin_request.bearer_token)
-    except (SecurityAdminError, RuntimeError) as exc:
-        logger.warning(
-            "project_directory_dependency_failed",
-            downstream_http_status=(exc.http_status if isinstance(exc, SecurityAdminError) else None),
-        )
-        raise DependencyUnavailableError(
-            detail="Project administration is temporarily unavailable. Please try again."
-        ) from exc
-
-    projects: list[ProjectSelectionResponse] = []
-    missing_project_tenants: list[str] = []
+    # `require_super_admin_request` has already validated the human JWT and obtained
+    # a live/cached Security SuperAdmin attestation. Activate only the narrow
+    # cross-Tenant Project SELECT RLS policy for this transaction and read the
+    # persisted Audit Core source of truth in one query. Do not call Security's
+    # Tenant directory and do not perform one Project query per Tenant.
     with engine.begin() as connection:
         connection.execute(text("SET LOCAL ROLE audit_core_runtime"))
-        for tenant in tenants:
-            project = _project_selection(connection, tenant=tenant)
-            if project is None:
-                missing_project_tenants.append(tenant.tenant_id)
-            else:
-                projects.append(project)
+        set_platform_super_admin_context(connection)
+        rows = connection.execute(
+            text(
+                """
+                SELECT tenant_id, project_code, project_name, project_status
+                FROM auditcore.projects
+                ORDER BY lower(project_name), project_code
+                """
+            )
+        ).mappings().all()
 
-    if missing_project_tenants:
-        logger.warning(
-            "project_directory_projection_gap",
-            missing_project_count=len(missing_project_tenants),
+    return [
+        ProjectSelectionResponse(
+            tenantId=str(row["tenant_id"]),
+            projectCode=str(row["project_code"]),
+            projectName=str(row["project_name"]),
+            projectStatus=str(row["project_status"]),
+            securityTenantStatus="NOT_QUERIED",
         )
-    return sorted(projects, key=lambda item: (item.projectName.casefold(), item.projectCode))
+        for row in rows
+    ]
 
 
 @router.post("/projects", response_model=ProjectProvisioningResponse, status_code=201)
