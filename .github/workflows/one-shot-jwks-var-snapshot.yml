@@ -1,0 +1,43 @@
+name: One-shot JWKS variable snapshot
+on:
+  push:
+    branches: [dev]
+    paths: ['.github/workflows/one-shot-jwks-var-snapshot.yml']
+permissions:
+  contents: write
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: dev, fetch-depth: 0}
+      - run: npm install --global @railway/cli
+      - shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service verigence-audit-core --json >/tmp/link.json
+          railway variable list --service security --environment dev --json >/tmp/s.json
+          railway variable list --service verigence-audit-core --environment dev --json >/tmp/a.json
+          railway variable list --service di-api --environment dev --json >/tmp/d.json
+          railway variable list --service di-worker --environment dev --json >/tmp/w.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          s=json.loads(Path('/tmp/s.json').read_text()); a=json.loads(Path('/tmp/a.json').read_text()); d=json.loads(Path('/tmp/d.json').read_text()); w=json.loads(Path('/tmp/w.json').read_text())
+          domain=str(s.get('RAILWAY_PUBLIC_DOMAIN') or s.get('RAILWAY_STATIC_URL') or '').strip()
+          if domain and not domain.startswith(('http://','https://')): domain='https://'+domain
+          expected=domain.rstrip('/')+'/.well-known/jwks.json'
+          lines=['JWKS_VAR_SNAPSHOT',f'AUDIT_MATCH={str(a.get("SECURITY_JWKS_URL")==expected).lower()}',f'DI_API_MATCH={str(d.get("DI_SECURITY_JWKS_URL")==expected).lower()}',f'DI_WORKER_MATCH={str(w.get("DI_SECURITY_JWKS_URL")==expected).lower()}']
+          Path('docs/runtime').mkdir(parents=True,exist_ok=True); Path('docs/runtime/jwks-var-snapshot.txt').write_text('\n'.join(lines)+'\n'); print('\n'.join(lines))
+          PY
+      - shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'; git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/runtime/jwks-var-snapshot.txt
+          git commit -m 'docs(dev): snapshot JWKS vars [skip ci]'
+          git pull --rebase origin dev
+          git push origin HEAD:dev
