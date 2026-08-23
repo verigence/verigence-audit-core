@@ -36,6 +36,7 @@ from audit_core.uc03_authorized_work_items import router as uc03_work_items_rout
 from audit_core.uc03_booking_capture import router as uc03_booking_capture_router
 from audit_core.uc03_booking_commands import router as uc03_booking_router
 from audit_core.uc03_booking_evidence import router as uc03_booking_evidence_router
+from audit_core.uc03_booking_exchange import router as uc03_booking_exchange_router
 from audit_core.uc03_document_assessments import (
     router as uc03_document_assessments_router,
 )
@@ -84,6 +85,8 @@ def create_app() -> FastAPI:
     application.include_router(uc03_project_context_router)
     application.include_router(uc03_work_items_router)
     application.include_router(uc03_booking_router)
+    # Register exact typed fact routes before the generic /capture/{field_key} route.
+    application.include_router(uc03_booking_exchange_router)
     application.include_router(uc03_booking_capture_router)
     application.include_router(uc03_booking_evidence_router)
     application.include_router(uc03_document_assessments_router)
