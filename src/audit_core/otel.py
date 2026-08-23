@@ -118,7 +118,7 @@ def emit_otel_log(event_dict: Mapping[str, Any]) -> None:
             event_name=event_name,
             attributes=attributes,
         )
-    except Exception:  # noqa: BLE001 -- telemetry must never block application logging
+    except Exception:
         return
 
 
