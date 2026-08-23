@@ -6,7 +6,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from audit_core.authorization import AuthorizationError
-from audit_core.observability import CORRELATION_HEADER, get_correlation_id
+from audit_core.observability import (
+    CORRELATION_HEADER,
+    get_correlation_id,
+    request_business_context,
+)
+from audit_core.otel import attach_business_context
 from audit_core.security import SecurityTokenError
 
 logger = structlog.get_logger(__name__)
@@ -70,12 +75,14 @@ def _problem(
     detail: str,
 ) -> JSONResponse:
     correlation_id = get_correlation_id(request)
+    business_context = request_business_context(request)
+    if business_context:
+        attach_business_context(business_context)
     logger.warning(
         "api_error",
         correlation_id=correlation_id,
         error_code=error_code,
         status_code=status_code,
-        title=title,
     )
     return JSONResponse(
         status_code=status_code,
