@@ -1,0 +1,189 @@
+name: One-shot fix DEV Security JWKS runtime wiring
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/one-shot-fix-jwks-runtime.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      SECURITY_SERVICE: security
+      AUDIT_SERVICE: verigence-audit-core
+      DI_API_SERVICE: di-api
+      DI_WORKER_SERVICE: di-worker
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+      - run: npm install --global @railway/cli
+
+      - name: Link DEV and snapshot deployments
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          for svc in "$SECURITY_SERVICE" "$AUDIT_SERVICE" "$DI_API_SERVICE" "$DI_WORKER_SERVICE"; do
+            safe="$(echo "$svc" | tr '-' '_')"
+            railway variable list --service "$svc" --environment dev --json >"/tmp/${safe}_vars.json"
+            railway deployment list --service "$svc" --limit 1 --json >"/tmp/${safe}_before.json"
+          done
+
+      - name: Set public Security JWKS on Audit Core and DI
+        shell: bash
+        run: |
+          set -euo pipefail
+          jwks_url="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          v=json.loads(Path('/tmp/security_vars.json').read_text())
+          d=str(v.get('RAILWAY_PUBLIC_DOMAIN') or v.get('RAILWAY_STATIC_URL') or '').strip()
+          if not d:
+              raise SystemExit('Security public domain is missing')
+          if not d.startswith(('http://','https://')):
+              d='https://'+d
+          print(d.rstrip('/')+'/.well-known/jwks.json')
+          PY
+          )"
+          echo "JWKS_URL=$jwks_url" >> "$GITHUB_ENV"
+
+          curl --fail --silent --show-error "$jwks_url" >/tmp/live-jwks.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/live-jwks.json').read_text())
+          if not isinstance(data.get('keys'), list) or not data['keys']:
+              raise SystemExit('Live Security JWKS has no signing keys')
+          print('LIVE_SECURITY_JWKS=PASS')
+          PY
+
+          audit_current="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          print(str(json.loads(Path('/tmp/verigence_audit_core_vars.json').read_text()).get('SECURITY_JWKS_URL') or ''))
+          PY
+          )"
+          di_api_current="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          print(str(json.loads(Path('/tmp/di_api_vars.json').read_text()).get('DI_SECURITY_JWKS_URL') or ''))
+          PY
+          )"
+          di_worker_current="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          print(str(json.loads(Path('/tmp/di_worker_vars.json').read_text()).get('DI_SECURITY_JWKS_URL') or ''))
+          PY
+          )"
+
+          echo "AUDIT_JWKS_CHANGED=$([[ "$audit_current" != "$jwks_url" ]] && echo true || echo false)" >> "$GITHUB_ENV"
+          echo "DI_API_JWKS_CHANGED=$([[ "$di_api_current" != "$jwks_url" ]] && echo true || echo false)" >> "$GITHUB_ENV"
+          echo "DI_WORKER_JWKS_CHANGED=$([[ "$di_worker_current" != "$jwks_url" ]] && echo true || echo false)" >> "$GITHUB_ENV"
+
+          if [[ "$audit_current" != "$jwks_url" ]]; then
+            railway variable set --service "$AUDIT_SERVICE" --environment dev "SECURITY_JWKS_URL=$jwks_url" --json >/tmp/set-audit.json
+          fi
+          if [[ "$di_api_current" != "$jwks_url" ]]; then
+            railway variable set --service "$DI_API_SERVICE" --environment dev "DI_SECURITY_JWKS_URL=$jwks_url" --json >/tmp/set-di-api.json
+          fi
+          if [[ "$di_worker_current" != "$jwks_url" ]]; then
+            railway variable set --service "$DI_WORKER_SERVICE" --environment dev "DI_SECURITY_JWKS_URL=$jwks_url" --json >/tmp/set-di-worker.json
+          fi
+
+      - name: Wait for changed services to deploy successfully
+        shell: bash
+        run: |
+          set -euo pipefail
+          wait_service() {
+            local service="$1" safe="$2" changed="$3"
+            if [[ "$changed" != "true" ]]; then
+              echo "UNCHANGED|$service"
+              return 0
+            fi
+            local previous
+            previous="$(python - "$safe" <<'PY'
+          import json,sys
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/'+sys.argv[1]+'_before.json').read_text())
+          print(rows[0].get('id','') if rows else '')
+          PY
+          )"
+            for attempt in $(seq 1 45); do
+              railway deployment list --service "$service" --limit 1 --json >"/tmp/${safe}_after.json"
+              read -r id status <<<"$(python - "$safe" <<'PY'
+          import json,sys
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/'+sys.argv[1]+'_after.json').read_text())
+          row=rows[0] if rows else {}
+          print(row.get('id',''), row.get('status',''))
+          PY
+          )"
+              if [[ -n "$id" && "$id" != "$previous" ]]; then
+                case "$status" in
+                  SUCCESS) echo "DEPLOY_PASS|$service|$id"; return 0 ;;
+                  FAILED|CRASHED|REMOVED)
+                    railway logs --service "$service" --latest --deployment --lines 180 || true
+                    echo "Deployment failed for $service: $status" >&2
+                    return 1 ;;
+                esac
+              fi
+              sleep 8
+            done
+            echo "Timed out waiting for deployment: $service" >&2
+            return 1
+          }
+          wait_service "$AUDIT_SERVICE" verigence_audit_core "$AUDIT_JWKS_CHANGED"
+          wait_service "$DI_API_SERVICE" di_api "$DI_API_JWKS_CHANGED"
+          wait_service "$DI_WORKER_SERVICE" di_worker "$DI_WORKER_JWKS_CHANGED"
+
+      - name: Verify runtime health and persisted values
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway variable list --service "$AUDIT_SERVICE" --environment dev --json >/tmp/audit-final.json
+          railway variable list --service "$DI_API_SERVICE" --environment dev --json >/tmp/di-api-final.json
+          railway variable list --service "$DI_WORKER_SERVICE" --environment dev --json >/tmp/di-worker-final.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          expected=os.environ['JWKS_URL']
+          a=json.loads(Path('/tmp/audit-final.json').read_text())
+          d=json.loads(Path('/tmp/di-api-final.json').read_text())
+          w=json.loads(Path('/tmp/di-worker-final.json').read_text())
+          checks={
+            'AUDIT_JWKS_MATCH': a.get('SECURITY_JWKS_URL')==expected,
+            'DI_API_JWKS_MATCH': d.get('DI_SECURITY_JWKS_URL')==expected,
+            'DI_WORKER_JWKS_MATCH': w.get('DI_SECURITY_JWKS_URL')==expected,
+          }
+          for k,v in checks.items(): print(f'{k}={str(v).lower()}')
+          if not all(checks.values()): raise SystemExit('Persisted JWKS values do not match live Security public JWKS')
+          Path('docs/runtime').mkdir(parents=True,exist_ok=True)
+          Path('docs/runtime/jwks-runtime-fix.txt').write_text(
+            'JWKS_RUNTIME_FIX\n' +
+            '\n'.join(f'{k}=true' for k in checks) + '\n' +
+            f'AUDIT_JWKS_CHANGED={os.environ.get("AUDIT_JWKS_CHANGED")}\n' +
+            f'DI_API_JWKS_CHANGED={os.environ.get("DI_API_JWKS_CHANGED")}\n' +
+            f'DI_WORKER_JWKS_CHANGED={os.environ.get("DI_WORKER_JWKS_CHANGED")}\n' +
+            'RESULT=PASS\n'
+          )
+          PY
+
+      - name: Record evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/runtime/jwks-runtime-fix.txt
+          git commit -m 'docs(dev): record JWKS runtime wiring fix [skip ci]'
+          git pull --rebase origin dev
+          git push origin HEAD:dev
