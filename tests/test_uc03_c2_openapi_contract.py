@@ -1,11 +1,10 @@
 from pathlib import Path
 
 import yaml
+
 from audit_core.main import app
 
-
 CONTRACT_PATH = Path(__file__).resolve().parents[1] / "api" / "openapi-uc03-c2.yaml"
-
 
 FROZEN_TO_RUNTIME = {
     "/tenants/{tenantId}/journeys/{journeyId}/delivery/start": (
