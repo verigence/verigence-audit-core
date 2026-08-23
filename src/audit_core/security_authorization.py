@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+import threading
+import time
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Self
 
 import httpx
@@ -11,6 +13,11 @@ import structlog
 from audit_core.security_integration import SecurityOAuthClient, SecurityTokenError
 
 logger = structlog.get_logger(__name__)
+
+# Security currently issues ServiceIntegration tokens for four hours. A short
+# server-side reuse window removes page-burst token issuance while remaining far
+# below the authoritative token lifetime. Authorization decisions are NOT cached.
+_SERVICE_TOKEN_REUSE_SECONDS = 60.0
 
 
 class SecurityAuthorizationError(RuntimeError):
@@ -37,7 +44,10 @@ class SecurityAuthorizationClient:
     The browser-provided Security human JWT proves the USER identity at Audit Core.
     Audit Core then uses its own ServiceIntegration identity to ask Security for the
     current Tenant/permission decision. No Tenant permission claims are copied from
-    the human token and no authorization projection is cached locally.
+    the human token and no authorization decision is cached locally.
+
+    The ServiceIntegration access token itself is a backend credential and is reused
+    briefly so multiple lazy UI reads do not each issue a new machine token.
     """
 
     def __init__(
@@ -64,6 +74,9 @@ class SecurityAuthorizationClient:
             timeout=timeout_seconds,
             transport=transport,
         )
+        self._service_token: str | None = None
+        self._service_token_reuse_until = 0.0
+        self._service_token_lock = threading.Lock()
 
     def close(self) -> None:
         self._oauth.close()
@@ -75,6 +88,25 @@ class SecurityAuthorizationClient:
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
 
+    def _service_token_for_security(self) -> str:
+        now = time.monotonic()
+        if self._service_token and now < self._service_token_reuse_until:
+            return self._service_token
+
+        with self._service_token_lock:
+            now = time.monotonic()
+            if self._service_token and now < self._service_token_reuse_until:
+                return self._service_token
+            try:
+                token = self._oauth.get_service_token(audience="security")
+            except SecurityTokenError as exc:
+                raise SecurityAuthorizationError(
+                    "Security ServiceIntegration token could not be issued"
+                ) from exc
+            self._service_token = token
+            self._service_token_reuse_until = now + _SERVICE_TOKEN_REUSE_SECONDS
+            return token
+
     def check_user_permission(
         self,
         *,
@@ -85,12 +117,7 @@ class SecurityAuthorizationClient:
         if not user_id or not tenant_id or not permission_key:
             raise ValueError("user_id, tenant_id and permission_key are required")
 
-        try:
-            service_token = self._oauth.get_service_token(audience="security")
-        except SecurityTokenError as exc:
-            raise SecurityAuthorizationError(
-                "Security ServiceIntegration token could not be issued"
-            ) from exc
+        service_token = self._service_token_for_security()
 
         try:
             response = self._client.post(
@@ -163,15 +190,25 @@ class SecurityAuthorizationClient:
         )
 
 
-def get_security_authorization_client() -> Iterator[SecurityAuthorizationClient]:
+@lru_cache
+def _shared_security_authorization_client() -> SecurityAuthorizationClient:
     base_url = os.environ.get("SECURITY_BASE_URL", "").strip()
     client_id = os.environ.get("SECURITY_CLIENT_ID", "").strip()
     client_secret = os.environ.get("SECURITY_CLIENT_SECRET", "")
     if not base_url or not client_id or not client_secret:
         raise RuntimeError("Security ServiceIntegration authorization is not configured")
-    with SecurityAuthorizationClient(
+    return SecurityAuthorizationClient(
         base_url=base_url,
         client_id=client_id,
         client_secret=client_secret,
-    ) as client:
-        yield client
+    )
+
+
+def get_security_authorization_client() -> SecurityAuthorizationClient:
+    """Reuse the backend HTTP/OAuth client across requests.
+
+    This preserves HTTP connection pooling and the short ServiceIntegration token
+    cache. It does not cache live user permission decisions.
+    """
+
+    return _shared_security_authorization_client()
