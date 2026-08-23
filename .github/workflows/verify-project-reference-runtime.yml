@@ -62,3 +62,11 @@ jobs:
                   print('REFERENCE_QUERY_RUNTIME=PASS')
                   conn.rollback()
           PY
+
+      - name: Read recent startup API errors
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 4000 2>/dev/null \
+            | grep -E 'api_error|system_error|project_directory_dependency_failed|security_admin_context_failed' \
+            | tail -n 200 || true
