@@ -40,82 +40,69 @@ jobs:
           npm install --global @railway/cli
           python -m pip install 'psycopg[binary]>=3.2,<4'
 
-      - name: Resolve live DEV services
+      - name: Resolve DEV runtime and require successful deployments
         shell: bash
         run: |
           set -euo pipefail
+          test -n "${RAILWAY_API_TOKEN:-}" || { echo 'RAILWAY_API_TOKEN missing' >&2; exit 1; }
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          : >/tmp/deploy-summary
           for service in "$SECURITY_SERVICE" "$AUDIT_SERVICE" "$DI_SERVICE"; do
             railway deployment list --service "$service" --limit 1 --json >"/tmp/${service}-deployment.json"
+            SERVICE_FILE="/tmp/${service}-deployment.json" SERVICE_NAME="$service" python - <<'PY' | tee -a /tmp/deploy-summary
+          import json, os
+          from pathlib import Path
+          rows=json.loads(Path(os.environ['SERVICE_FILE']).read_text())
+          if not rows:
+              raise SystemExit(f'No deployment found for {os.environ["SERVICE_NAME"]}')
+          row=rows[0]
+          status=str(row.get('status',''))
+          print(f'{os.environ["SERVICE_NAME"]}|{row.get("id","")}|{status}|{row.get("createdAt") or row.get("created_at") or ""}')
+          if status != 'SUCCESS':
+              raise SystemExit(f'{os.environ["SERVICE_NAME"]} latest deployment is {status}, not SUCCESS')
+          PY
           done
+          echo 'DEV_DEPLOYMENTS=PASS'
+
           railway variable list --service "$DI_SERVICE" --json >/tmp/di-vars.json
           railway variable list --service "$DB_SERVICE" --json >/tmp/db-vars.json
           python - <<'PY'
           import json
           from pathlib import Path
-
           di=json.loads(Path('/tmp/di-vars.json').read_text())
           domain=(di.get('RAILWAY_PUBLIC_DOMAIN') or di.get('RAILWAY_STATIC_URL') or '').strip()
           if not domain:
-              raise SystemExit('DI API has no public domain')
+              raise SystemExit('DI API public domain is missing')
           if not domain.startswith(('http://','https://')):
               domain='https://'+domain
           Path('/tmp/di-base').write_text(domain.rstrip('/'))
-
           db=json.loads(Path('/tmp/db-vars.json').read_text())
-          public=(db.get('DATABASE_PUBLIC_URL') or db.get('DATABASE_URL') or '').strip()
-          if not public:
-              raise SystemExit('Postgres public database URL is unavailable')
-          Path('/tmp/db-url').write_text(public)
-          print('DEV_RUNTIME_METADATA=PASS')
+          url=(db.get('DATABASE_PUBLIC_URL') or db.get('DATABASE_URL') or '').strip()
+          if not url:
+              raise SystemExit('DEV Postgres URL is missing')
+          Path('/tmp/db-url').write_text(url)
           PY
 
-      - name: Wait for latest deployments to be successful
-        shell: bash
-        run: |
-          set -euo pipefail
-          for attempt in $(seq 1 30); do
-            all_success=1
-            : >/tmp/deploy-summary
-            for service in "$SECURITY_SERVICE" "$AUDIT_SERVICE" "$DI_SERVICE"; do
-              railway deployment list --service "$service" --limit 1 --json >"/tmp/${service}-deployment.json"
-              read -r id status created <<<"$(SERVICE_FILE="/tmp/${service}-deployment.json" python - <<'PY'
-          import json, os
-          from pathlib import Path
-          rows=json.loads(Path(os.environ['SERVICE_FILE']).read_text())
-          row=rows[0] if rows else {}
-          print(row.get('id',''), row.get('status',''), row.get('createdAt') or row.get('created_at') or '')
-          PY
-          )"
-              echo "$service|$id|$status|$created" | tee -a /tmp/deploy-summary
-              [[ "$status" == "SUCCESS" ]] || all_success=0
-            done
-            [[ "$all_success" == "1" ]] && break
-            [[ "$attempt" == "30" ]] && { echo 'DEV deployments did not all reach SUCCESS' >&2; exit 1; }
-            sleep 10
-          done
-          echo 'DEV_DEPLOYMENTS=PASS'
-
-      - name: Smoke live Security Audit Core and DI
+      - name: Smoke live service boundaries
         shell: bash
         run: |
           set -euo pipefail
           DI_BASE="$(cat /tmp/di-base)"
           curl --fail --silent --show-error --max-time 8 "$SECURITY_BASE/health/live" >/tmp/security-health
           curl --fail --silent --show-error --max-time 8 "$AUDIT_BASE/health" >/tmp/audit-health
-          curl --fail --silent --show-error --max-time 8 "$DI_BASE/health" >/tmp/di-health
+          curl --fail --silent --show-error --max-time 8 "$DI_BASE/health/ready" >/tmp/di-health
 
           admin_status="$(curl --silent --show-error --max-time 8 --output /tmp/security-admin.body --write-out '%{http_code}' "$SECURITY_BASE/security/v1/platform/admin-context" || true)"
-          [[ "$admin_status" == "401" ]] || { echo "Security admin-context expected 401 unauthenticated, got $admin_status" >&2; cat /tmp/security-admin.body || true; exit 1; }
+          test "$admin_status" = '401' || { echo "Security admin-context unexpected HTTP $admin_status" >&2; cat /tmp/security-admin.body || true; exit 1; }
 
           projects_status="$(curl --silent --show-error --max-time 8 --output /tmp/projects.body --write-out '%{http_code}' "$AUDIT_BASE/v1/projects" || true)"
-          case "$projects_status" in 401|403) ;; *) echo "Audit projects expected 401/403 unauthenticated, got $projects_status" >&2; cat /tmp/projects.body || true; exit 1;; esac
+          case "$projects_status" in 401|403) ;; *) echo "Audit projects unexpected HTTP $projects_status" >&2; cat /tmp/projects.body || true; exit 1;; esac
 
-          di_admin_status="$(curl --silent --show-error --max-time 8 --output /tmp/di-admin.body --write-out '%{http_code}' "$DI_BASE/v1/tenants/00000000-0000-4000-8000-000000000001/admin/provisioning" || true)"
-          case "$di_admin_status" in 401|403) ;; *) echo "DI admin provisioning expected 401/403 unauthenticated, got $di_admin_status" >&2; cat /tmp/di-admin.body || true; exit 1;; esac
+          di_status="$(curl --silent --show-error --max-time 8 --output /tmp/di-admin.body --write-out '%{http_code}' "$DI_BASE/v1/tenants/00000000-0000-4000-8000-000000000001/admin/provisioning" || true)"
+          case "$di_status" in 401|403) ;; *) echo "DI provisioning unexpected HTTP $di_status" >&2; cat /tmp/di-admin.body || true; exit 1;; esac
           echo 'LIVE_SERVICE_SMOKE=PASS'
 
-      - name: Reconcile incomplete project provisioning state
+      - name: Reconcile incomplete project state read-only
         shell: bash
         run: |
           set -euo pipefail
@@ -129,22 +116,16 @@ jobs:
           url=url.replace('postgresql+psycopg://','postgresql://',1).replace('postgresql+asyncpg://','postgresql://',1)
           with psycopg.connect(url, connect_timeout=8) as db:
               with db.cursor() as cur:
-                  for relation in ('security.tenants','auditcore.projects','docintel.documents','docintel.tenant_settings','docintel.retention_policies','docintel.tenant_document_types'):
+                  required=('security.tenants','auditcore.projects','docintel.documents','docintel.tenant_settings','docintel.retention_policies','docintel.tenant_document_types')
+                  for relation in required:
                       cur.execute('SELECT to_regclass(%s)::text', (relation,))
                       if cur.fetchone()[0] is None:
                           raise SystemExit('Missing required DEV relation: '+relation)
-
-                  cur.execute("SELECT tenant_id::text, tenant_name, created_at_utc FROM security.tenants WHERE status='CONFIGURING' ORDER BY created_at_utc")
+                  cur.execute("SELECT tenant_id::text, tenant_name FROM security.tenants WHERE status='CONFIGURING' ORDER BY created_at_utc")
                   rows=cur.fetchall()
                   orphan=[]
-                  testhyundai=0
-                  testhyundai_orphans=0
-                  with_project=0
-                  with_documents=0
-                  with_di_rows=0
-                  for tenant_id, tenant_name, created_at in rows:
-                      if str(tenant_name).casefold() == 'testhyundai':
-                          testhyundai += 1
+                  with_project=with_documents=with_di_rows=0
+                  for tenant_id, tenant_name in rows:
                       cur.execute('SELECT EXISTS (SELECT 1 FROM auditcore.projects WHERE tenant_id=%s)', (tenant_id,))
                       project=bool(cur.fetchone()[0])
                       cur.execute('SELECT EXISTS (SELECT 1 FROM docintel.documents WHERE tenant_id=%s)', (tenant_id,))
@@ -159,21 +140,16 @@ jobs:
                       with_di_rows += int(di_rows > 0)
                       if not project and not docs:
                           orphan.append((tenant_id,str(tenant_name),di_rows))
-                          if str(tenant_name).casefold() == 'testhyundai':
-                              testhyundai_orphans += 1
 
           summary=[
-              '# UC02 DEV Live Smoke',
-              '',
-              'LIVE_SERVICE_SMOKE=PASS',
+              '# UC02 DEV Live Smoke', '',
               'DEV_DEPLOYMENTS=PASS',
+              'LIVE_SERVICE_SMOKE=PASS',
               f'SECURITY_CONFIGURING_TENANTS={len(rows)}',
               f'CONFIGURING_WITH_AUDIT_PROJECT={with_project}',
               f'CONFIGURING_WITH_DI_DOCUMENTS={with_documents}',
               f'CONFIGURING_WITH_DI_PROVISIONING_ROWS={with_di_rows}',
               f'ORPHAN_CANDIDATES_NO_PROJECT_NO_DOCUMENTS={len(orphan)}',
-              f'TESTHYUNDAI_CONFIGURING={testhyundai}',
-              f'TESTHYUNDAI_ORPHAN_CANDIDATES={testhyundai_orphans}',
           ]
           for tenant_id,name,di_rows in orphan:
               summary.append(f'ORPHAN|{tenant_id}|{name}|DI_ROWS={di_rows}')
@@ -183,16 +159,13 @@ jobs:
           print('\n'.join(summary))
           PY
 
-      - name: Record result and remove one-shot diagnostics
+      - name: Record result and self-clean
         shell: bash
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git rm -f .github/workflows/one-shot-uc02-live-smoke.yml
-          if [[ -f .github/workflows/one-shot-uc02-runtime-reconcile.yml ]]; then
-            git rm -f .github/workflows/one-shot-uc02-runtime-reconcile.yml
-          fi
           git add docs/runtime/uc02-live-smoke.txt
           git commit -m 'docs(dev): record live UC02 DEV smoke [skip ci]'
           git pull --rebase origin dev
