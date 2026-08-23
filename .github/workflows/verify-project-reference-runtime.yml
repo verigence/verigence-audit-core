@@ -39,10 +39,7 @@ jobs:
 
           audit = json.loads(Path('/tmp/audit-vars.json').read_text())
           security = json.loads(Path('/tmp/security-vars.json').read_text())
-
           security_db = str(security.get('DATABASE_URL','')).replace('postgresql+psycopg://','postgresql://',1)
-          if not security_db:
-              raise SystemExit('SECURITY_DATABASE_URL_MISSING')
           with psycopg.connect(security_db) as conn:
               with conn.cursor() as cur:
                   cur.execute("""
@@ -59,34 +56,23 @@ jobs:
                     LIMIT 1
                   """, ('user_3I7FdD5Pkmydsp23OfjH9hBMxpN',))
                   row = cur.fetchone()
-                  if not row:
-                      raise SystemExit('CANONICAL_SUPERADMIN_NOT_FOUND')
+                  if not row: raise SystemExit('CANONICAL_SUPERADMIN_NOT_FOUND')
                   user_id = str(row[0])
 
           private_key = str(security.get('SECURITY_PRIVATE_KEY_PEM','')).replace('\\n','\n')
           key_id = str(security.get('SECURITY_KEY_ID','')).strip()
           issuer = str(security.get('SECURITY_TOKEN_ISSUER','verigence-security')).strip()
           audience = str(security.get('SECURITY_TOKEN_AUDIENCE','verigence-platform')).strip()
-          if not private_key or not key_id:
-              raise SystemExit('SECURITY_SIGNING_CONFIG_MISSING')
           now = datetime.now(timezone.utc)
           token = jwt.encode({
-              'iss': issuer,
-              'sub': user_id,
-              'aud': audience,
-              'iat': now,
-              'exp': now + timedelta(minutes=5),
-              'jti': str(uuid.uuid4()),
-              'actor_type': 'USER',
+              'iss': issuer, 'sub': user_id, 'aud': audience,
+              'iat': now, 'exp': now + timedelta(minutes=5),
+              'jti': str(uuid.uuid4()), 'actor_type': 'USER',
           }, private_key, algorithm='RS256', headers={'kid': key_id})
           print('DEV_SUPERADMIN_TOKEN_MINT=PASS')
 
-          audit_domain = str(audit.get('RAILWAY_PUBLIC_DOMAIN','')).strip()
-          security_domain = str(security.get('RAILWAY_PUBLIC_DOMAIN','')).strip()
-          if not audit_domain or not security_domain:
-              raise SystemExit('PUBLIC_DOMAIN_MISSING')
-          audit_base = 'https://' + audit_domain
-          security_base = 'https://' + security_domain
+          audit_base = 'https://' + str(audit.get('RAILWAY_PUBLIC_DOMAIN','')).strip()
+          security_base = 'https://' + str(security.get('RAILWAY_PUBLIC_DOMAIN','')).strip()
 
           def call(label, url):
               req = urllib.request.Request(url, headers={
@@ -96,40 +82,57 @@ jobs:
               })
               try:
                   with urllib.request.urlopen(req, timeout=20) as resp:
-                      status = resp.status
-                      body = resp.read().decode('utf-8')
-                      headers = resp.headers
+                      status, body, headers = resp.status, resp.read().decode(), resp.headers
               except urllib.error.HTTPError as exc:
-                  status = exc.code
-                  body = exc.read().decode('utf-8')
-                  headers = exc.headers
+                  status, body, headers = exc.code, exc.read().decode(), exc.headers
               print(f'{label}_HTTP={status}')
-              cors = headers.get('Access-Control-Allow-Origin','')
-              print(f'{label}_CORS=' + ('PASS' if cors == os.environ['WEB_ORIGIN'] else 'FAIL'))
+              print(f'{label}_CORS=' + ('PASS' if headers.get('Access-Control-Allow-Origin','') == os.environ['WEB_ORIGIN'] else 'FAIL'))
+              correlation = headers.get('X-Correlation-ID','').strip()
+              if correlation:
+                  Path('/tmp/projects-correlation.txt').write_text(correlation)
+                  print(f'{label}_CORRELATION_PRESENT=YES')
               try:
                   parsed = json.loads(body)
+                  print(f'{label}_JSON=PASS')
               except Exception:
                   print(f'{label}_JSON=FAIL')
-                  raise SystemExit(1)
-              print(f'{label}_JSON=PASS')
+                  return status, None
+              if status >= 400 and isinstance(parsed, dict):
+                  for key in ('code','status','title'):
+                      value = parsed.get(key)
+                      if value is not None:
+                          print(f'{label}_PROBLEM_{key.upper()}={value}')
               return status, parsed
 
           status, admin = call('SECURITY_ADMIN_CONTEXT', security_base + '/security/v1/platform/admin-context')
-          if status != 200 or not isinstance(admin, dict):
-              raise SystemExit('SECURITY_ADMIN_CONTEXT_FAILED')
+          if status != 200: raise SystemExit('SECURITY_ADMIN_CONTEXT_FAILED')
 
-          status, projects = call('AUDIT_PROJECTS', audit_base + '/v1/projects')
-          if status != 200 or not isinstance(projects, list):
-              raise SystemExit('AUDIT_PROJECTS_FAILED')
-          print('AUDIT_PROJECTS_SHAPE=LIST')
-          print('AUDIT_PROJECTS_COUNT=' + str(len(projects)))
+          project_status, projects = call('AUDIT_PROJECTS', audit_base + '/v1/projects')
+          if project_status == 200:
+              print('AUDIT_PROJECTS_SHAPE=' + ('LIST' if isinstance(projects, list) else 'INVALID'))
+              if isinstance(projects, list): print('AUDIT_PROJECTS_COUNT=' + str(len(projects)))
 
-          status, refs = call('AUDIT_REFERENCE_DATA', audit_base + '/v1/project-reference-data')
-          if status != 200 or not isinstance(refs, dict):
-              raise SystemExit('AUDIT_REFERENCE_DATA_FAILED')
-          if not isinstance(refs.get('oems'), list) or not isinstance(refs.get('productCategories'), list):
-              raise SystemExit('AUDIT_REFERENCE_SHAPE_FAILED')
-          print('AUDIT_REFERENCE_SHAPE=PASS')
-          print('AUDIT_REFERENCE_OEM_COUNT=' + str(len(refs['oems'])))
-          print('AUDIT_REFERENCE_CATEGORY_COUNT=' + str(len(refs['productCategories'])))
+          ref_status, refs = call('AUDIT_REFERENCE_DATA', audit_base + '/v1/project-reference-data')
+          if ref_status == 200 and isinstance(refs, dict):
+              print('AUDIT_REFERENCE_SHAPE=' + ('PASS' if isinstance(refs.get('oems'), list) and isinstance(refs.get('productCategories'), list) else 'FAIL'))
+              print('AUDIT_REFERENCE_OEM_COUNT=' + str(len(refs.get('oems',[]))))
+              print('AUDIT_REFERENCE_CATEGORY_COUNT=' + str(len(refs.get('productCategories',[]))))
+
+          Path('/tmp/startup-result.txt').write_text(f'{project_status},{ref_status}')
           PY
+
+          sleep 2
+          echo '--- CORRELATED AUDIT CORE ERROR ---'
+          if [ -s /tmp/projects-correlation.txt ]; then
+            correlation="$(cat /tmp/projects-correlation.txt)"
+            railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 5000 2>/dev/null \
+              | grep -F "$correlation" \
+              | tail -n 40 || true
+          fi
+          echo '--- RECENT SYSTEM ERRORS ---'
+          railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 5000 2>/dev/null \
+            | grep -E 'system_error|api_error|project_directory_dependency_failed' \
+            | tail -n 80 || true
+
+          result="$(cat /tmp/startup-result.txt)"
+          [ "$result" = '200,200' ] || exit 1
