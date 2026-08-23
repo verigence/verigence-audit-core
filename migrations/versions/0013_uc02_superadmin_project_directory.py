@@ -1,6 +1,6 @@
 from alembic import op
 
-revision = "0013_uc02_superadmin_project_directory"
+revision = "0013_uc02_project_dir"
 down_revision = "0012_uc03_delivery_capture"
 branch_labels = None
 depends_on = None
