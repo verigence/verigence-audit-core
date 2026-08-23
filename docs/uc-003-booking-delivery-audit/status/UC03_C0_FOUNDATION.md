@@ -1,17 +1,32 @@
 # UC03 C0 — Shared Foundation / Project Context — Checkpoint Status
 
 **Checkpoint:** `C0 — Shared Foundation / Project Context`  
-**Status:** `AUTOMATED + DEV DEPLOYMENT EVIDENCE COMPLETE / HUMAN UAT PENDING`  
+**Status:** `AUTOMATED + DEV DEPLOYMENT EVIDENCE COMPLETE / HUMAN UAT DEFERRED`  
 **Date:** 2026-08-23  
 **Branch:** `planning/uc-003-booking-delivery-audit`  
 **Formal checkpoint closure:** **NOT CLOSED**  
-**C1 readiness:** **BLOCKED pending human UAT**
+**C1 engineering readiness:** **AUTHORIZED TO PROCEED under explicit human-owner sequencing direction**
 
 ---
 
-## 1. SHA convention
+## 1. Sequencing decision
 
-The validated checkpoint heads below were captured immediately before the C0 closure-evidence documentation write.
+C0 human UAT has **not** been passed and no human-UAT pass is claimed in this record.
+
+On **23-Aug-2026**, the human owner explicitly directed that UC03 engineering proceed checkpoint-by-checkpoint on the unified planning branch (`C0`, then `C1`, then `C2`) while the human DEV/UAT execution is consolidated at the end of the UC03 cycle. Therefore:
+
+- C0 remains formally open because human UAT is pending;
+- pending C0 human UAT does **not** block C1/C2 engineering under this direction;
+- proceeding with C1/C2 does **not** imply that C0 human UAT passed;
+- final UC03 DEV/UAT must include the deferred C0 scenarios together with the later checkpoint scenarios before Phase-1 promotion.
+
+This sequencing statement supersedes the earlier C0 note that said C1 could not start before human UAT.
+
+---
+
+## 2. C0 validated baseline
+
+The validated C0 application heads captured before the original closure-evidence documentation write were:
 
 | Module | Validated C0 application head |
 |---|---|
@@ -19,11 +34,11 @@ The validated checkpoint heads below were captured immediately before the C0 clo
 | DI | `c899beb03c5fcbc84ffd41ed832451674b246668` |
 | Web/Android | `0cbb5794bee4d494c9ee45229484591233a91818` |
 
-The status/handoff documentation commit necessarily advances the Audit Core branch beyond its validated application head. This does **not** change the C0 runtime implementation. Before C1 starts, inspect the live branch heads and use this note as the tested C0 baseline record.
+Later C1/C2 work advances the unified planning branches; these SHAs remain the historical tested C0 baseline rather than the current branch heads.
 
 ---
 
-## 2. C0 implementation completed
+## 3. C0 implementation completed
 
 ### Audit Core
 
@@ -36,113 +51,43 @@ Implemented:
 - `ALL | BOOKING | DELIVERY` filtering;
 - maximum page size 10 and cursor/keyset paging;
 - Project-timezone date filtering;
-- C0 date precedence:
-  - Booking: source Booking date -> Booking first-start event date -> Booking record date;
-  - Delivery: actual-delivered date -> Delivery first-start event date -> Delivery record date;
-- C0 landing metrics:
-  - **Bookings In Progress** = `BOOKING_STARTED | BOOKING_IN_PROGRESS`;
-  - **Delivery In Progress** = `DELIVERY_STARTED | DELIVERY_IN_PROGRESS`;
-  - **Needs Attention** = distinct cases with at least one `OPEN | ACKNOWLEDGED` finding;
-  - **Audit Flags** = count of `OPEN | ACKNOWLEDGED` findings;
+- Booking date precedence: source Booking date -> Booking first-start event date -> Booking record date;
+- Delivery date precedence: actual-delivered date -> Delivery first-start event date -> Delivery record date;
+- C0 landing metrics for Bookings In Progress, Delivery In Progress, Needs Attention and Audit Flags;
 - `journey_stage_states` projection foundation;
 - append-only `journey_workflow_events` foundation;
 - C0 OpenAPI and integration/authorization tests.
 
-Deliberate C0 placeholders remain:
-
-- `proposalReadyCount = 0` because extraction proposal persistence is C1 scope;
-- `nextActionCode = null` because concrete Booking/Delivery command policy starts in later checkpoints.
+C0 deliberately left `proposalReadyCount = 0` and `nextActionCode = null`; concrete proposal and command behavior belongs to later UC03 checkpoints.
 
 ### Web/Android
 
 Implemented:
 
 - Project context gate after login;
-- no-assignment safe state;
-- one-Project automatic selection;
-- multiple-Project chooser;
-- Project switcher;
-- operating role bound to selected Project;
-- Project switch clearing operational Project state and tenant-scoped query state;
-- Project landing metrics;
-- `Latest Bookings & Deliveries` latest-10 list;
-- All/Bookings/Deliveries filter;
-- date/date-range filter;
+- zero-assignment safe state;
+- one-Project automatic selection and multiple-Project chooser;
+- Project switcher and selected-Project operating role;
+- clearing of operational/query state on Project switch;
+- Project landing metrics and latest-10 Booking/Delivery work list;
+- All/Bookings/Deliveries and date/date-range filters;
 - cursor Previous/Next controls;
-- mobile-first C0 layout;
-- approved Verigence lockup;
-- C0 operational route protection so legacy mutation/read flows are not exposed as UC03 Booking/Delivery functionality before C1/C2.
+- mobile-first layout and approved Verigence lockup;
+- C0 route protection so legacy mutation/read flows were not represented as UC03 Booking/Delivery functionality before later checkpoints.
 
-### DI
+### DI / Security
 
-No C0 runtime change was required.
-
-DI branch head remains `c899beb03c5fcbc84ffd41ed832451674b246668`.
-
-### Security
-
-No UC03 Security branch or Security code change was introduced.
-
-C0 automated Project-discovery and authorization tests exercise the Audit Core `business_assignments` projection and Security-v2 authorization integration. Human UAT with real assigned users is still pending and is not represented as passed.
+No C0 DI runtime change and no UC03 Security code branch were required. C0 authorization tests exercised the Audit Core business-assignment projection and Security-v2 authorization boundary. Human validation with representative assigned users remains deferred.
 
 ---
 
-## 3. Material implementation files
+## 4. Database and contract evidence
 
-### Audit Core
+C0 migration: `0010_uc03_c0_foundation.py`.
 
-- `api/openapi-v1.yaml`
-- `migrations/versions/0010_uc03_c0_foundation.py`
-- `src/audit_core/db.py`
-- `src/audit_core/main.py`
-- `src/audit_core/security_authorization.py`
-- `src/audit_core/uc03_authorized_work_items.py`
-- `src/audit_core/uc03_project_context.py`
-- `src/audit_core/uc03_work_items.py`
-- `tests/test_security_authorization.py`
-- `tests/test_uc03_landing_metrics.py`
-- `tests/test_uc03_project_context.py`
-- `tests/test_uc03_work_items.py`
+The final C0 Audit Core CI applied a fresh Postgres migration chain through `0009_uc02_project_refs -> 0010_uc03_c0_foundation` before the full test suite.
 
-### Web/Android
-
-- `.github/workflows/uc03-c0-native-validation.yml`
-- `src/App.tsx`
-- `src/components/ProjectContextGate.tsx`
-- `src/domain/models.ts`
-- `src/features/uc03/projectContext.ts`
-- `src/layout/AppShell.tsx`
-- `src/main.tsx`
-- `src/pages/DashboardPage.tsx`
-- `src/pages/LoginPage.tsx`
-- `src/services/audit-core/uc03.ts`
-- `src/store/projectContextStore.ts`
-- `src/store/sessionStore.ts`
-- `src/styles/uc03-c0.css`
-
-Temporary branch-safe DEV deployment workflows used to prove C0 were removed after successful deployment so they cannot accidentally redeploy or encode C0-only assumptions during later checkpoints. Their completed Actions runs remain the deployment evidence.
-
----
-
-## 4. Database migration evidence
-
-Implemented migration:
-
-`0010_uc03_c0_foundation.py`
-
-Final-head Audit Core CI applied a fresh Postgres migration chain through:
-
-`0009_uc02_project_refs -> 0010_uc03_c0_foundation`
-
-and verified the C0 foundation objects before running the full test suite.
-
-No historical backfill result is claimed as part of C0.
-
----
-
-## 5. API contract
-
-C0 APIs present:
+C0 API contract:
 
 ```text
 GET /v1/me/projects
@@ -150,183 +95,104 @@ GET /v1/tenants/{tenantId}/uc03/landing-metrics
 GET /v1/tenants/{tenantId}/uc03/work-items
 ```
 
-No C1 Booking mutation API is recorded as C0 completion.
+No C1 mutation is claimed as part of the C0 baseline.
 
 ---
 
-## 6. Final-head automated evidence
+## 5. C0 automated evidence
 
-### Audit Core final validated head
+### Audit Core
 
-SHA: `71bea92822d3de836faea8eb250dacab81cf4c4c`
+Validated C0 SHA: `71bea92822d3de836faea8eb250dacab81cf4c4c`
 
-GitHub Actions:
+- CI run ID `32594620868`, run `538`: **SUCCESS**;
+- package build: **PASS**;
+- Ruff: **PASS**;
+- fresh migration through `0010_uc03_c0_foundation`: **PASS**;
+- pytest: **141 passed, 1 warning**.
 
-- workflow: `CI`
-- run ID: `32594620868`
-- run number: `538`
-- result: **SUCCESS**
-- package build: **PASS**
-- Ruff: **PASS**
-- fresh Postgres/Alembic migration through `0010_uc03_c0_foundation`: **PASS**
-- pytest: **141 passed, 1 warning in 10.88s**
+The warning was a non-failing Starlette/httpx deprecation warning.
 
-The warning is a Starlette/httpx deprecation warning and did not fail the suite.
+### Web
 
-### Web final validated head
+Validated C0 SHA: `0cbb5794bee4d494c9ee45229484591233a91818`
 
-SHA: `0cbb5794bee4d494c9ee45229484591233a91818`
+- Web CI run ID `32594624429`, run `272`: **SUCCESS**;
+- TypeScript typecheck: **PASS**;
+- production build: **PASS**.
 
-GitHub Actions:
+### Android
 
-- workflow: `Web CI`
-- run ID: `32594624429`
-- run number: `272`
-- result: **SUCCESS**
-- TypeScript typecheck: **PASS**
-- production build: **PASS**
+Validated C0 Web/Android SHA: `0cbb5794bee4d494c9ee45229484591233a91818`
 
-### Android final validated head
+- Android validation run ID `32594624444`, run `4`: **SUCCESS**;
+- native Web asset build, Capacitor sync, native config, `lintDebug`, `assembleDebug`, APK verification and artifact upload: **PASS**;
+- historical C0 artifact ID `9481252665`;
+- historical artifact name `verigence-uc03-c0-android-debug`;
+- APK SHA-256 `0c287c03ce28af417ea5b01f8662215d8f276cc7eb9d0eb0ef477552f6c9ef30`.
 
-Web/Android SHA: `0cbb5794bee4d494c9ee45229484591233a91818`
-
-GitHub Actions:
-
-- workflow: `UC03 C0 Android Validation`
-- run ID: `32594624444`
-- run number: `4`
-- result: **SUCCESS**
-- native DEV Web asset build: **PASS**
-- Capacitor Android generation/sync: **PASS**
-- native configuration verification: **PASS**
-- Gradle `lintDebug`: **PASS**
-- Gradle `assembleDebug`: **PASS**
-- APK verification: **PASS**
-- artifact upload: **PASS**
-
-APK evidence:
-
-- artifact ID: `9481252665`
-- artifact name: `verigence-uc03-c0-android-debug`
-- APK SHA-256: `0c287c03ce28af417ea5b01f8662215d8f276cc7eb9d0eb0ef477552f6c9ef30`
-- artifact ZIP SHA-256: `20900a7c6101041dc21a78c577f2fcc85cc871193fba0ed0d78cbc7d7c84b09b`
+The workflow was later generalized for subsequent UC03 checkpoints; the historical Actions run remains valid C0 evidence.
 
 ---
 
-## 7. DEV deployment evidence
+## 6. C0 DEV deployment evidence
 
 ### Audit Core Railway DEV
 
-Exact deployed application SHA:
+Deployed C0 application SHA: `ffa334fcd0791a51e9b83221ceafc1603fd05d49`
 
-`ffa334fcd0791a51e9b83221ceafc1603fd05d49`
+- validation/deployment run ID `32594431799`: **SUCCESS**;
+- Railway deployment ID `3614f0e0-1472-47fd-9af6-a64f795931f8`: **SUCCESS**;
+- service health: **PASS**;
+- expected unauthenticated 401 behavior on C0 protected reads: **PASS**;
+- approved Web DEV-origin CORS preflight: **PASS**.
 
-Validation/deployment workflow:
-
-- run ID: `32594431799`
-- result: **SUCCESS**
-
-Railway deployment:
-
-- deployment ID: `3614f0e0-1472-47fd-9af6-a64f795931f8`
-- deployment status: **SUCCESS**
-
-Smoke evidence:
-
-- service health: **PASS**
-- unauthenticated `/v1/me/projects`: expected HTTP `401`
-- unauthenticated `/v1/tenants/uc03-c0-smoke/uc03/landing-metrics`: expected HTTP `401`
-- unauthenticated `/v1/tenants/uc03-c0-smoke/uc03/work-items`: expected HTTP `401`
-- approved Web DEV-origin CORS preflight: **PASS**
-
-The final validated Audit Core head `71bea928...` is exactly one cleanup commit after the deployed SHA; that commit only removed the temporary C0 DEV validation/deployment workflow. No application/runtime file changed between the deployed SHA and the final validated application head.
+The original final validated C0 Audit Core head was one cleanup-only commit after that deployed SHA.
 
 ### Web Cloudflare DEV
 
-Exact deployed application SHA:
+Deployed C0 application SHA: `771d01396caa178d721f615fb1bbd36cae653a4c`
 
-`771d01396caa178d721f615fb1bbd36cae653a4c`
+- validation/deployment run ID `32594494424`: **SUCCESS**;
+- Worker `verigence-web-dev`;
+- Cloudflare version ID `8a5d5ef0-dc46-4e84-87d1-310303c1cfc5`;
+- C0 deployed contract markers, wording, logo and Security proxy: **PASS**.
 
-Validation/deployment workflow:
-
-- run ID: `32594494424`
-- result: **SUCCESS**
-
-Cloudflare DEV:
-
-- Worker: `verigence-web-dev`
-- version ID: `8a5d5ef0-dc46-4e84-87d1-310303c1cfc5`
-- DEV endpoint: `https://verigence-web-dev.jbrconsulting-it.workers.dev`
-
-Deployed asset/hash smoke verified:
-
-- `/v1/me/projects` contract marker;
-- `/uc03/landing-metrics` contract marker;
-- `/uc03/work-items` contract marker;
-- `Delivery In Progress` wording;
-- approved Verigence logo;
-- Security DEV proxy path.
-
-The final validated Web head `0cbb5794...` is exactly one cleanup commit after the deployed SHA; that commit only removed the temporary C0 Web DEV deployment workflow. No application/runtime file changed between the deployed SHA and the final validated application head.
+The original final validated C0 Web head was one cleanup-only commit after that deployed SHA.
 
 ---
 
-## 8. Human UAT — PENDING
+## 7. Human UAT — DEFERRED / PENDING
 
-**No human UAT pass is claimed.**
+**No human UAT pass is claimed.** Under the 23-Aug-2026 sequencing direction, these scenarios are retained for the consolidated end-of-UC03 DEV/UAT cycle:
 
-The following C0 acceptance behavior still requires human verification against DEV, including representative real Project assignments:
-
-- zero-Project user-safe state;
-- one-Project automatic entry to landing;
+- zero-Project safe state;
+- one-Project automatic entry;
 - multiple-Project chooser;
 - a user whose operating role differs by Project;
-- Project switching with no stale prior-Project data visible;
-- four landing metrics displaying correctly for the selected Project/scope;
-- latest list showing at most 10 rows;
-- All/Bookings/Deliveries filtering;
-- date/date-range behavior in the Project timezone;
+- Project switching with no stale prior-Project data;
+- selected-Project landing metrics and latest-list behavior;
+- All/Bookings/Deliveries and date/date-range filtering in Project timezone;
 - Previous/Next paging;
 - `Delivery In Progress` wording;
-- approved Verigence logo;
-- Android phone, Android tablet and desktop Web usability for the C0 landing/context flow.
+- approved Verigence branding;
+- Android phone/tablet and desktop Web usability for Project context/landing.
 
-Human UAT outcome must be appended to this status note before C0 is marked formally closed.
-
----
-
-## 9. Known issues and deferred work
-
-### Known C0 defects
-
-No known automated C0 defect remains from the completed CI/deployment evidence above.
-
-### Still pending
-
-- human C0 UAT;
-- formal C0 closure/approval.
-
-### Explicitly deferred
-
-- C1 Booking mutations/capture/extraction proposal behavior;
-- C2 Delivery mutations/evidence behavior;
-- C3 audit/review hardening;
-- DI Booking/Delivery runtime profile changes;
-- VIN/chassis rule implementation;
-- Post-Delivery reconciliation;
-- final Phase-1 promotion to `dev`.
+The human outcome must be recorded before C0 is formally closed and before final Phase-1 promotion.
 
 ---
 
-## 10. Checkpoint readiness
+## 8. Checkpoint readiness
 
 Automated tests/builds: **PASS**  
 Fresh migration verification: **PASS**  
 Audit Core DEV deployment/smoke: **PASS**  
 Web DEV deployment/smoke: **PASS**  
 Android debug build/artifact: **PASS**  
-Human UAT: **PENDING**  
+Human UAT: **DEFERRED / PENDING**  
+Formal C0 closure: **NOT CLOSED**  
+C1 engineering under approved sequencing: **AUTHORIZED**  
 
 Therefore:
 
-**C0 is not formally closed. C1 must not start until the pending human UAT is completed and its outcome is recorded.**
+**C0 remains formally open because human UAT is pending. Per the explicit 23-Aug-2026 human-owner sequencing direction, C1/C2 engineering may proceed on the unified planning branch while C0 human UAT is deferred to the consolidated end-of-UC03 DEV/UAT cycle. This does not constitute a C0 UAT pass or formal C0 closure.**
