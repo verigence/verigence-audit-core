@@ -1,4 +1,5 @@
 import os
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import lru_cache
@@ -104,18 +105,29 @@ def get_human_admin_request(
         raise DependencyUnavailableError(
             detail="Project administration is temporarily unavailable. Please try again."
         )
-    try:
-        with SecurityAdminClient(base_url=security_base_url) as client:
-            context = client.get_admin_context(human_bearer_token=bearer_token)
-    except SecurityAdminError as exc:
-        logger.warning(
-            "security_admin_context_failed",
-            reason=str(exc),
-            downstream_http_status=exc.http_status,
-        )
+
+    last_error: SecurityAdminError | None = None
+    for attempt in range(2):
+        try:
+            with SecurityAdminClient(base_url=security_base_url) as client:
+                context = client.get_admin_context(human_bearer_token=bearer_token)
+            break
+        except SecurityAdminError as exc:
+            last_error = exc
+            logger.warning(
+                "security_admin_context_failed",
+                reason=str(exc),
+                downstream_http_status=exc.http_status,
+                attempt=attempt + 1,
+            )
+            if attempt == 0:
+                time.sleep(0.15)
+    else:
+        assert last_error is not None
         raise DependencyUnavailableError(
             detail="Project administration is temporarily unavailable. Please try again."
-        ) from exc
+        ) from last_error
+
     if context.user_id != human_principal.subject:
         raise SecurityTokenError("Security administrative USER does not match authenticated USER")
     return HumanAdminRequest(
