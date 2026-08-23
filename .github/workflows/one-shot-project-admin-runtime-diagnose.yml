@@ -1,4 +1,4 @@
-name: One-shot Project Admin runtime diagnose
+name: One-shot cleanup Project Admin diagnosis
 
 on:
   pull_request:
@@ -7,153 +7,41 @@ on:
       - .github/workflows/one-shot-project-admin-runtime-diagnose.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  diagnose:
-    name: Diagnose deployed Project Administration failure
+  cleanup:
+    name: Restore planning Security contract and self-clean
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    env:
-      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
-      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
-      AUDIT_SERVICE: verigence-audit-core
-      SECURITY_SERVICE: security
-      SECURITY_PUBLIC_BASE: https://security-dev.up.railway.app
-      AUDIT_PUBLIC_BASE: https://verigence-audit-core-production.up.railway.app
-      WEB_BASE: https://verigence-web-dev.jbrconsulting-it.workers.dev
-
     steps:
-      - name: Check out
+      - name: Check out planning branch with history
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
 
-      - name: Probe deployed Security admin routes
+      - name: Restore canonical admin-context files and remove diagnostics
         shell: bash
+        env:
+          C1_BASE_SHA: 647e7a95752bb65f90e9acbc9db4466dd05281b4
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
-          for path in /security/v1/platform/admin-context /security/v1/platform/me /health/live; do
-            code="$(curl --silent --show-error --output /tmp/body --write-out '%{http_code}' "$SECURITY_PUBLIC_BASE$path" || true)"
-            body="$(cat /tmp/body 2>/dev/null | head -c 300 || true)"
-            echo "SECURITY_PROBE|$path|HTTP_$code|$body"
-          done
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
 
-      - name: Inspect deployed Web headers and Audit Core target
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl --fail --silent --show-error --location \
-            --dump-header /tmp/web.headers \
-            --output /tmp/web.html \
-            "$WEB_BASE/admin/project"
-          echo '--- WEB RESPONSE SECURITY HEADERS ---'
-          grep -Ei '^(content-security-policy|content-security-policy-report-only|cross-origin|permissions-policy|referrer-policy|x-frame-options|x-content-type-options):' /tmp/web.headers || true
-          echo '--- WEB HTML CSP META ---'
-          grep -Ei 'content-security-policy|http-equiv' /tmp/web.html || true
-          entry="$(grep -oE 'src="/assets/[^"]+\.js"' /tmp/web.html | head -n 1 | sed -E 's/^src="([^"]+)"$/\1/')"
-          echo "WEB_ENTRY_ASSET=${entry:-NONE}"
-          [ -n "$entry" ] || { cat /tmp/web.html; exit 1; }
-          curl --fail --silent --show-error --location "$WEB_BASE$entry" -o /tmp/entry.js
-          grep -oE 'https://[A-Za-z0-9._-]+\.up\.railway\.app' /tmp/entry.js | sort -u | sed 's/^/WEB_ENTRY_RAILWAY_TARGET=/' || true
-          grep -oE 'assets/[A-Za-z0-9._-]+\.js' /tmp/entry.js | sort -u | head -n 80 >/tmp/chunks.txt || true
-          while IFS= read -r chunk; do
-            [ -n "$chunk" ] || continue
-            name="$(basename "$chunk")"
-            curl --fail --silent --show-error --location "$WEB_BASE/$chunk" -o "/tmp/$name" || continue
-            if grep -Eq 'up\.railway\.app|/v1/projects|/v1/project-reference-data' "/tmp/$name"; then
-              echo "WEB_RELEVANT_CHUNK=$chunk"
-              grep -oE 'https://[A-Za-z0-9._-]+\.up\.railway\.app' "/tmp/$name" | sort -u | sed 's/^/WEB_CHUNK_RAILWAY_TARGET=/' || true
-              if grep -Fq '/v1/projects' "/tmp/$name"; then echo 'WEB_CHUNK_HAS_PROJECTS_ROUTE=YES'; fi
-              if grep -Fq '/v1/project-reference-data' "/tmp/$name"; then echo 'WEB_CHUNK_HAS_REFERENCE_ROUTE=YES'; fi
-            fi
-          done </tmp/chunks.txt
+          git fetch --no-tags origin "$C1_BASE_SHA"
+          git checkout "$C1_BASE_SHA" -- \
+            src/audit_core/security_integration.py \
+            tests/test_uc02_admin_security.py
 
-      - name: Probe browser-equivalent Audit Core CORS
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo '--- PROJECTS UNAUTHENTICATED GET ---'
-          get_status="$(curl --silent --show-error --dump-header /tmp/projects-get.headers --output /tmp/projects-get.body --write-out '%{http_code}' "$AUDIT_PUBLIC_BASE/v1/projects" || true)"
-          echo "PROJECTS_GET_STATUS=HTTP_$get_status"
-          cat /tmp/projects-get.body || true
-          echo
+          grep -Fq '/security/v1/platform/admin-context' src/audit_core/security_integration.py
+          grep -Fq 'isSuperAdmin' src/audit_core/security_integration.py
+          grep -Fq '/security/v1/platform/admin-context' tests/test_uc02_admin_security.py
 
-          echo '--- PROJECTS CORS PREFLIGHT ---'
-          preflight_status="$(curl --silent --show-error \
-            --dump-header /tmp/projects-cors.headers \
-            --output /tmp/projects-cors.body \
-            --write-out '%{http_code}' \
-            --request OPTIONS \
-            --header "Origin: $WEB_BASE" \
-            --header 'Access-Control-Request-Method: GET' \
-            --header 'Access-Control-Request-Headers: authorization,content-type' \
-            "$AUDIT_PUBLIC_BASE/v1/projects" || true)"
-          echo "PROJECTS_PREFLIGHT_STATUS=HTTP_$preflight_status"
-          grep -Ei '^access-control-|^vary:' /tmp/projects-cors.headers || true
-          cat /tmp/projects-cors.body || true
-          echo
+          git rm -f .github/workflows/one-shot-project-admin-runtime-diagnose.yml
+          git add src/audit_core/security_integration.py tests/test_uc02_admin_security.py
 
-          echo '--- REFERENCE DATA CORS PREFLIGHT ---'
-          ref_status="$(curl --silent --show-error \
-            --dump-header /tmp/ref-cors.headers \
-            --output /tmp/ref-cors.body \
-            --write-out '%{http_code}' \
-            --request OPTIONS \
-            --header "Origin: $WEB_BASE" \
-            --header 'Access-Control-Request-Method: GET' \
-            --header 'Access-Control-Request-Headers: authorization,content-type' \
-            "$AUDIT_PUBLIC_BASE/v1/project-reference-data" || true)"
-          echo "REFERENCE_PREFLIGHT_STATUS=HTTP_$ref_status"
-          grep -Ei '^access-control-|^vary:' /tmp/ref-cors.headers || true
-          cat /tmp/ref-cors.body || true
-          echo
-
-      - name: Install Railway CLI and inspect DEV target
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm install --global @railway/cli
-          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
-          railway status --json >/tmp/status.json
-          railway service list --json >/tmp/services.json
-          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
-          railway deployment list --service "$AUDIT_SERVICE" --limit 10 --json >/tmp/deployments.json
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          status=json.loads(Path('/tmp/status.json').read_text())
-          services=json.loads(Path('/tmp/services.json').read_text())
-          variables=json.loads(Path('/tmp/audit-vars.json').read_text())
-          deployments=json.loads(Path('/tmp/deployments.json').read_text())
-          print('RAILWAY_PROJECT_ID=' + str(status.get('id','')))
-          print('RAILWAY_SERVICES=' + ','.join(sorted(str(row.get('name','')) for row in services if row.get('name'))))
-          for key in ('APP_ENV','SECURITY_BASE_URL','SECURITY_JWKS_URL','SECURITY_ISSUER','SECURITY_AUDIENCE','RAILWAY_PUBLIC_DOMAIN'):
-              print(f'AUDIT_CONFIG|{key}|{str(variables.get(key,"")).strip()}')
-          for row in deployments:
-              meta=row.get('meta') if isinstance(row.get('meta'), dict) else {}
-              print('AUDIT_DEPLOYMENT|' + '|'.join([
-                  str(row.get('id','')),
-                  str(row.get('status','')),
-                  str(row.get('createdAt') or row.get('created_at') or ''),
-                  str(meta.get('commitHash') or meta.get('commit_hash') or ''),
-                  str(meta.get('commitMessage') or meta.get('commit_message') or ''),
-              ]))
-          PY
-
-      - name: Read active successful Audit Core deploy logs
-        shell: bash
-        run: |
-          set -euo pipefail
-          railway logs --service "$AUDIT_SERVICE" --lines 1000 >/tmp/audit-success.log 2>&1 || true
-          echo '--- ACTIVE SUCCESSFUL AUDIT CORE RELEVANT LOGS ---'
-          grep -Ei 'security_admin|admin-context|platform/me|/v1/projects|project-reference-data|project administration|dependency|PERMISSION|AUTH|401|403|404|500|502|503' /tmp/audit-success.log | tail -n 320 || true
-          echo '--- ACTIVE SUCCESSFUL AUDIT CORE LOG TAIL ---'
-          tail -n 120 /tmp/audit-success.log || true
-
-      - name: Read Security admin-context HTTP logs
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo '--- SECURITY /admin-context HTTP LOGS ---'
-          railway logs --service "$SECURITY_SERVICE" --http --path /security/v1/platform/admin-context --since 6h --json 2>/tmp/security-http.err | tail -n 180 || true
-          cat /tmp/security-http.err >&2 || true
+          git commit -m 'chore: restore Security admin-context contract and remove diagnostics [skip ci]'
+          git push origin "HEAD:$HEAD_BRANCH"
