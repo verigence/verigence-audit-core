@@ -119,6 +119,107 @@ def test_security_authorization_reuses_service_token_for_page_burst() -> None:
     assert authorization_calls == 2
 
 
+def test_security_authorization_reuses_identical_allow_for_uc03_page_burst() -> None:
+    token_calls = 0
+    authorization_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_calls, authorization_calls
+        if request.url.path == "/security/v1/service/token":
+            token_calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "accessToken": "shared-service-token",
+                    "tokenType": "Bearer",
+                    "audience": "security",
+                },
+            )
+        if request.url.path == "/security/v1/authorization/check":
+            authorization_calls += 1
+            payload = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "allowed": True,
+                    "reasonCode": "AUTHORIZED",
+                    "userId": payload["userId"],
+                    "tenantId": payload["tenantId"],
+                    "permissionKey": payload["permissionKey"],
+                    "roleKey": "PC",
+                },
+            )
+        raise AssertionError(f"Unexpected Security request: {request.url}")
+
+    with SecurityAuthorizationClient(
+        base_url="https://security.test",
+        client_id="audit-core",
+        client_secret="secret",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        first = client.check_user_permission(
+            user_id="user-1",
+            tenant_id="tenant-1",
+            permission_key="audit.journey.read",
+        )
+        second = client.check_user_permission(
+            user_id="user-1",
+            tenant_id="tenant-1",
+            permission_key="audit.journey.read",
+        )
+
+    assert first == second
+    assert token_calls == 1
+    assert authorization_calls == 1
+
+
+def test_security_authorization_does_not_cache_denial() -> None:
+    authorization_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal authorization_calls
+        if request.url.path == "/security/v1/service/token":
+            return httpx.Response(
+                200,
+                json={
+                    "accessToken": "shared-service-token",
+                    "tokenType": "Bearer",
+                    "audience": "security",
+                },
+            )
+        if request.url.path == "/security/v1/authorization/check":
+            authorization_calls += 1
+            payload = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "allowed": False,
+                    "reasonCode": "PERMISSION_DENIED",
+                    "userId": payload["userId"],
+                    "tenantId": payload["tenantId"],
+                    "permissionKey": payload["permissionKey"],
+                    "roleKey": "PC",
+                },
+            )
+        raise AssertionError(f"Unexpected Security request: {request.url}")
+
+    with SecurityAuthorizationClient(
+        base_url="https://security.test",
+        client_id="audit-core",
+        client_secret="secret",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        for _ in range(2):
+            decision = client.check_user_permission(
+                user_id="user-1",
+                tenant_id="tenant-1",
+                permission_key="audit.journey.read",
+            )
+            assert decision.allowed is False
+
+    assert authorization_calls == 2
+
+
 def test_security_authorization_client_rejects_mismatched_decision() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/security/v1/service/token":
