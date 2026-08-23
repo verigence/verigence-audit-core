@@ -1,0 +1,191 @@
+openapi: 3.1.0
+info:
+  title: Verigence Audit Core — UC03 C3 Audit Review Contract
+  version: 1.0.0-c3-frozen
+  description: >-
+    Frozen UC03 C3 Audit/Review checkpoint surface. Booking and Delivery findings share one
+    auditable register, Audit Status remains historically sticky, lifecycle mutations are
+    idempotent and versioned, and server-side Project/role policy remains authoritative.
+    Human-created findings cannot self-declare Audit completion guards.
+servers:
+  - url: /v1
+security:
+  - bearerAuth: []
+paths:
+  /tenants/{tenantId}/journeys/{journeyId}/uc03/audit-summary:
+    get:
+      operationId: getUc03AuditSummary
+      description: >-
+        Returns cross-stage Booking/Delivery Audit State, historically correct Audit Status,
+        flag counts, severity summary and server-authorized actions for the selected Project role.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+      responses:
+        '200': {description: Cross-stage UC03 audit summary}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/journeys/{journeyId}/uc03/flags:
+    get:
+      operationId: listUc03AuditFlags
+      description: >-
+        Lists Booking/Delivery findings with MACHINE/HUMAN provenance and historical lifecycle
+        state. Optional stage filtering never changes Project authorization.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+        - name: stage
+          in: query
+          required: false
+          schema: {type: string, enum: [BOOKING, DELIVERY]}
+      responses:
+        '200': {description: UC03 Booking/Delivery audit findings}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+    post:
+      operationId: createUc03HumanAuditFlag
+      description: >-
+        Creates an auditable human observation for Booking or Delivery. Completion blocking is
+        intentionally not accepted from the human request; configured/published rule policy owns
+        Audit completion guards.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [stage, category, severity, summary]
+              properties:
+                stage: {type: string, enum: [BOOKING, DELIVERY]}
+                category: {type: string, minLength: 1, maxLength: 100}
+                severity: {type: string, enum: [INFO, LOW, MEDIUM, HIGH, CRITICAL]}
+                summary: {type: string, minLength: 1, maxLength: 500}
+                remarks: {type: [string, 'null'], maxLength: 4000}
+                evidenceIds:
+                  type: array
+                  maxItems: 20
+                  items: {type: string, format: uuid}
+      responses:
+        '200': {description: Human audit flag created or idempotently replayed}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/journeys/{journeyId}/uc03/flags/{flagId}/actions:
+    post:
+      operationId: actOnUc03AuditFlag
+      description: >-
+        Applies acknowledge, review, resolve, reopen or void under server-enforced Project role
+        policy using optimistic flag versioning and append-only finding events.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+        - $ref: '#/components/parameters/FlagId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [action]
+              properties:
+                action:
+                  type: string
+                  enum: [ACKNOWLEDGE, REVIEW, RESOLVE, REOPEN, VOID]
+                remarks: {type: [string, 'null'], maxLength: 4000}
+                resolutionReason: {type: [string, 'null'], maxLength: 4000}
+                evidenceIds:
+                  type: array
+                  maxItems: 20
+                  items: {type: string, format: uuid}
+      responses:
+        '200': {description: Finding lifecycle action recorded}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/journeys/{journeyId}/uc03/flags/{flagId}/remarks:
+    post:
+      operationId: addUc03AuditFlagRemark
+      description: Adds a versioned, auditable remark and optional evidence linkage to a finding.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+        - $ref: '#/components/parameters/FlagId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200': {description: Remark/evidence event recorded}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/journeys/{journeyId}/uc03/stages/{stageCode}/audit/complete:
+    post:
+      operationId: completeUc03StageAudit
+      description: >-
+        Completes Booking or Delivery Audit State only when configured completion guards permit.
+        Historical findings keep Audit Status FLAGS_RAISED even after resolution.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+        - $ref: '#/components/parameters/StageCode'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200': {description: Stage Audit State completed under effective policy}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/journeys/{journeyId}/uc03/timeline:
+    get:
+      operationId: getUc03AuditTimeline
+      description: >-
+        Returns a bounded user-safe cross-stage timeline of Booking/Delivery workflow, finding and
+        review events without exposing internal payloads or actor identifiers.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 200, default: 100}
+      responses:
+        '200': {description: User-safe UC03 audit timeline}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    TenantId:
+      name: tenantId
+      in: path
+      required: true
+      schema: {type: string, minLength: 1, maxLength: 128}
+    JourneyId:
+      name: journeyId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    FlagId:
+      name: flagId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    StageCode:
+      name: stageCode
+      in: path
+      required: true
+      schema: {type: string, enum: [BOOKING, DELIVERY]}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, minLength: 8, maxLength: 200}
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      schema: {type: string, minLength: 1, maxLength: 64}
+  responses:
+    ProblemResponse:
+      description: Audit Core problem response with stable public error code and correlation ID.

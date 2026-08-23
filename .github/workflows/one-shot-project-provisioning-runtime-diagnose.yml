@@ -1,0 +1,103 @@
+name: One-shot verify Security DEV project provisioning fix
+
+on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - .github/workflows/one-shot-project-provisioning-runtime-diagnose.yml
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Wait for and verify Security DEV fix
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      SECURITY_SERVICE: security
+      OLD_SECURITY_DEPLOYMENT: 9c10b90f-10de-4266-99ae-94f4cb650a5b
+      SECURITY_PUBLIC_BASE: https://security-dev.up.railway.app
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Railway CLI and link DEV
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global @railway/cli
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+
+      - name: Wait for replacement Security deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 40); do
+            railway deployment list --service "$SECURITY_SERVICE" --limit 1 --json >/tmp/security-latest.json
+            read -r deployment_id deployment_status created_at < <(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/security-latest.json').read_text())
+          row=rows[0] if rows else {}
+          print(row.get('id',''), row.get('status',''), row.get('createdAt') or row.get('created_at') or '')
+          PY
+          )
+            echo "SECURITY_WAIT|attempt=$attempt|id=$deployment_id|status=$deployment_status|created=$created_at"
+            if [[ -n "$deployment_id" && "$deployment_id" != "$OLD_SECURITY_DEPLOYMENT" ]]; then
+              case "$deployment_status" in
+                SUCCESS)
+                  echo "SECURITY_REPLACEMENT_DEPLOYMENT=PASS"
+                  echo "SECURITY_DEPLOYMENT_ID=$deployment_id"
+                  exit 0
+                  ;;
+                FAILED|CRASHED|REMOVED)
+                  railway logs --service "$SECURITY_SERVICE" --latest --deployment --lines 240 || true
+                  echo "Replacement Security deployment failed: $deployment_status" >&2
+                  exit 1
+                  ;;
+              esac
+            fi
+            sleep 10
+          done
+          echo 'Timed out waiting for replacement Security deployment.' >&2
+          exit 1
+
+      - name: Verify live Security routes respond promptly
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import time
+          import urllib.error
+          import urllib.request
+
+          base='https://security-dev.up.railway.app'
+          checks=[('/health/live',{200}),('/security/v1/platform/admin-context',{401})]
+          for path, expected in checks:
+              start=time.monotonic()
+              req=urllib.request.Request(base+path)
+              try:
+                  with urllib.request.urlopen(req, timeout=5) as response:
+                      code=response.status
+              except urllib.error.HTTPError as exc:
+                  code=exc.code
+              elapsed=time.monotonic()-start
+              print(f'SECURITY_ROUTE|{path}|HTTP_{code}|{elapsed:.3f}s')
+              if code not in expected:
+                  raise SystemExit(f'{path} returned unexpected HTTP {code}')
+              if elapsed >= 5:
+                  raise SystemExit(f'{path} exceeded prompt-response budget: {elapsed:.3f}s')
+          print('SECURITY_PUBLIC_ROUTES=PASS')
+          PY
+
+      - name: Show replacement Security application log tail
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway logs --service "$SECURITY_SERVICE" --latest --deployment --lines 180 || true

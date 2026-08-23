@@ -1,0 +1,218 @@
+from __future__ import annotations
+
+from datetime import date
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from sqlalchemy import Connection, text
+
+from audit_core.authorization import AuthorizationError
+from audit_core.db import set_tenant_context
+from audit_core.dependencies import get_connection, get_human_principal
+from audit_core.errors import DependencyUnavailableError, NotFoundError
+from audit_core.security import HumanPrincipal, Principal
+from audit_core.security_authorization import (
+    SecurityAuthorizationClient,
+    SecurityAuthorizationError,
+    get_security_authorization_client,
+)
+from audit_core.uc03_work_items import WorkItemPage, WorkType, list_work_items
+
+router = APIRouter(prefix="/v1/tenants/{tenant_id}/uc03", tags=["uc03-work-items"])
+_PERMISSION_KEY = "audit.journey.read"
+
+
+class LandingMetrics(BaseModel):
+    bookingsInProgress: int
+    deliveryInProgress: int
+    needsAttention: int
+    auditFlags: int
+
+
+def _authorize_workspace(
+    client: SecurityAuthorizationClient,
+    *,
+    human_principal: HumanPrincipal,
+    tenant_id: str,
+) -> None:
+    try:
+        decision = client.check_user_permission(
+            user_id=human_principal.subject,
+            tenant_id=tenant_id,
+            permission_key=_PERMISSION_KEY,
+        )
+    except SecurityAuthorizationError as exc:
+        raise DependencyUnavailableError(
+            detail="Project work is temporarily unavailable. Please try again."
+        ) from exc
+    if not decision.allowed:
+        raise AuthorizationError(
+            error_code="VAC-AUTH-002",
+            status_code=403,
+            title="Permission denied",
+        )
+
+
+def _delegated_principal(human_principal: HumanPrincipal, tenant_id: str) -> Principal:
+    return Principal(
+        subject=human_principal.subject,
+        tenant_id=tenant_id,
+        permissions=(_PERMISSION_KEY,),
+    )
+
+
+@router.get("/landing-metrics", response_model=LandingMetrics)
+def get_landing_metrics(
+    tenant_id: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> LandingMetrics:
+    """Return the four C0 Project landing counters for the current business scope.
+
+    C0 working semantics, frozen here for client/API consistency:
+    - Bookings In Progress: BOOKING_STARTED or BOOKING_IN_PROGRESS.
+    - Delivery In Progress: DELIVERY_STARTED or DELIVERY_IN_PROGRESS.
+    - Needs Attention: distinct cases with at least one OPEN/ACKNOWLEDGED finding.
+    - Audit Flags: OPEN/ACKNOWLEDGED finding count.
+
+    The last two definitions are intentionally simple C0 read semantics; later UC03 rule/
+    task checkpoints may broaden Needs Attention only through an explicit contract change.
+    """
+
+    _authorize_workspace(
+        authorization_client,
+        human_principal=human_principal,
+        tenant_id=tenant_id,
+    )
+    set_tenant_context(connection, tenant_id)
+    active_project = connection.execute(
+        text(
+            """
+            SELECT 1 FROM auditcore.projects
+            WHERE tenant_id = :tenant_id AND project_status = 'ACTIVE'
+            """
+        ),
+        {"tenant_id": tenant_id},
+    ).scalar_one_or_none()
+    if active_project is None:
+        raise NotFoundError(
+            error_code="VAC-NF-001",
+            title="Project not found",
+            detail="Active Project not found for the requested tenant.",
+        )
+
+    row = connection.execute(
+        text(
+            """
+            WITH scoped AS (
+                SELECT j.journey_id
+                FROM auditcore.journeys j
+                WHERE j.tenant_id = :tenant_id
+                  AND EXISTS (
+                        SELECT 1
+                        FROM auditcore.business_assignments ba
+                        WHERE ba.tenant_id = j.tenant_id
+                          AND ba.security_actor_id = :actor_id
+                          AND ba.assignment_status = 'ACTIVE'
+                          AND ba.effective_from <= now()
+                          AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+                          AND (
+                                ba.dealer_id IS NULL
+                                OR (
+                                    ba.dealer_id = j.dealer_id
+                                    AND (ba.outlet_id IS NULL OR ba.outlet_id = j.outlet_id)
+                                )
+                          )
+                  )
+            ),
+            stage_projection AS (
+                SELECT
+                    s.journey_id,
+                    COALESCE(bs.business_status, b.actual_status_code) AS booking_status,
+                    COALESCE(ds.business_status, d.actual_delivery_status_code) AS delivery_status
+                FROM scoped s
+                LEFT JOIN auditcore.bookings b
+                  ON b.tenant_id = :tenant_id AND b.journey_id = s.journey_id
+                LEFT JOIN auditcore.deliveries d
+                  ON d.tenant_id = :tenant_id AND d.journey_id = s.journey_id
+                LEFT JOIN auditcore.journey_stage_states bs
+                  ON bs.tenant_id = :tenant_id
+                 AND bs.journey_id = s.journey_id
+                 AND bs.stage_code = 'BOOKING'
+                LEFT JOIN auditcore.journey_stage_states ds
+                  ON ds.tenant_id = :tenant_id
+                 AND ds.journey_id = s.journey_id
+                 AND ds.stage_code = 'DELIVERY'
+            ),
+            active_findings AS (
+                SELECT f.journey_id, count(*) AS flag_count
+                FROM auditcore.audit_findings f
+                JOIN scoped s ON s.journey_id = f.journey_id
+                WHERE f.tenant_id = :tenant_id
+                  AND f.finding_status IN ('OPEN','ACKNOWLEDGED')
+                GROUP BY f.journey_id
+            )
+            SELECT
+                count(*) FILTER (
+                    WHERE booking_status IN ('BOOKING_STARTED','BOOKING_IN_PROGRESS')
+                ) AS bookings_in_progress,
+                count(*) FILTER (
+                    WHERE delivery_status IN ('DELIVERY_STARTED','DELIVERY_IN_PROGRESS')
+                ) AS delivery_in_progress,
+                (SELECT count(*) FROM active_findings) AS needs_attention,
+                COALESCE((SELECT sum(flag_count) FROM active_findings), 0) AS audit_flags
+            FROM stage_projection
+            """
+        ),
+        {"tenant_id": tenant_id, "actor_id": human_principal.subject},
+    ).mappings().one()
+    return LandingMetrics(
+        bookingsInProgress=int(row["bookings_in_progress"]),
+        deliveryInProgress=int(row["delivery_in_progress"]),
+        needsAttention=int(row["needs_attention"]),
+        auditFlags=int(row["audit_flags"]),
+    )
+
+
+@router.get("/work-items", response_model=WorkItemPage)
+def list_authorized_work_items(
+    tenant_id: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+    work_type: Annotated[WorkType, Query(alias="workType")] = "ALL",
+    from_date: Annotated[date | None, Query(alias="fromDate")] = None,
+    to_date: Annotated[date | None, Query(alias="toDate")] = None,
+    limit: Annotated[int, Query(ge=1, le=10)] = 10,
+    cursor: Annotated[str | None, Query(max_length=1024)] = None,
+) -> WorkItemPage:
+    """Return C0 work items after live Security v2 authorization.
+
+    The human JWT is identity-only. Security remains the live functional authorization
+    source of truth, while Audit Core continues to enforce Project Dealer/Outlet scope
+    through business_assignments inside the delegated query.
+    """
+
+    _authorize_workspace(
+        authorization_client,
+        human_principal=human_principal,
+        tenant_id=tenant_id,
+    )
+    return list_work_items(
+        tenant_id=tenant_id,
+        principal=_delegated_principal(human_principal, tenant_id),
+        connection=connection,
+        work_type=work_type,
+        from_date=from_date,
+        to_date=to_date,
+        limit=limit,
+        cursor=cursor,
+    )

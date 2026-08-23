@@ -32,6 +32,21 @@ from audit_core.readiness import router as readiness_router
 from audit_core.reference_data import router as reference_data_router
 from audit_core.role_mapping_policy import install_role_mapping_policy
 from audit_core.tasks_api import router as task_router
+from audit_core.uc03_audit_flags import router as uc03_audit_router
+from audit_core.uc03_authorized_work_items import router as uc03_work_items_router
+from audit_core.uc03_booking_capture import router as uc03_booking_capture_router
+from audit_core.uc03_booking_commands import router as uc03_booking_router
+from audit_core.uc03_booking_evidence import router as uc03_booking_evidence_router
+from audit_core.uc03_booking_exchange import router as uc03_booking_exchange_router
+from audit_core.uc03_booking_integrations import (
+    router as uc03_booking_integrations_router,
+)
+from audit_core.uc03_delivery_commands import router as uc03_delivery_router
+from audit_core.uc03_delivery_documents import router as uc03_delivery_documents_router
+from audit_core.uc03_document_assessments import (
+    router as uc03_document_assessments_router,
+)
+from audit_core.uc03_project_context import router as uc03_project_context_router
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
 install_role_mapping_policy(role_mappings)
@@ -73,6 +88,18 @@ def create_app() -> FastAPI:
     application.include_router(project_reference_data_router)
     application.include_router(project_provisioning_router)
     application.include_router(project_router)
+    application.include_router(uc03_project_context_router)
+    application.include_router(uc03_work_items_router)
+    application.include_router(uc03_booking_router)
+    # Exact C1/C2/C3 typed routes must precede generic capture/findings routes.
+    application.include_router(uc03_booking_exchange_router)
+    application.include_router(uc03_booking_integrations_router)
+    application.include_router(uc03_booking_capture_router)
+    application.include_router(uc03_booking_evidence_router)
+    application.include_router(uc03_delivery_router)
+    application.include_router(uc03_delivery_documents_router)
+    application.include_router(uc03_document_assessments_router)
+    application.include_router(uc03_audit_router)
     application.include_router(readiness_router)
     application.include_router(project_activation_router)
     # Literal DI-owned Project Master and generic import routes must be registered

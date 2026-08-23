@@ -1,0 +1,174 @@
+openapi: 3.1.0
+info:
+  title: Verigence Audit Core — UC03 C2 Delivery Contract
+  version: 1.0.0-c2-frozen
+  description: >-
+    Frozen UC03 C2 checkpoint surface. Audit Core records real dealer Delivery progression even
+    when audit work is incomplete; findings and Audit State/Audit Status remain independent of
+    physical business progression. DI remains internal-only behind Audit Core.
+servers:
+  - url: /v1
+security:
+  - bearerAuth: []
+paths:
+  /tenants/{tenantId}/journeys/{journeyId}/delivery/start:
+    post:
+      operationId: startUc03Delivery
+      description: >-
+        Records Delivery Start using idempotent optimistic concurrency. Booking audit/capture
+        incompleteness raises a machine finding and does not reject or suppress Delivery Start.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200': {description: Delivery started or idempotently replayed}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/journeys/{journeyId}/delivery/intimation:
+    put:
+      operationId: recordUc03DeliveryIntimation
+      description: >-
+        Records whether Delivery was intimated. A No answer requires a reason and raises a
+        non-blocking audit finding while Delivery continues.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [answer]
+              properties:
+                answer: {type: string, enum: [YES, NO]}
+                reason: {type: [string, 'null'], maxLength: 4000}
+                intimatedAtUtc: {type: [string, 'null'], format: date-time}
+      responses:
+        '200': {description: Delivery intimation recorded}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/journeys/{journeyId}/delivery/vehicle-observation:
+    put:
+      operationId: recordUc03DeliveryVehicleObservation
+      description: >-
+        Records observed VIN/chassis and runs Audit Core reconciliation. Only comparable complete
+        identifiers are auto-matched or mismatched; ambiguous representations require review.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                vin: {type: [string, 'null'], maxLength: 120}
+                chassisNumber: {type: [string, 'null'], maxLength: 120}
+                sourceEvidenceId: {type: [string, 'null'], format: uuid}
+      responses:
+        '200': {description: Vehicle observation and reconciliation recorded}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/journeys/{journeyId}/delivery/complete:
+    post:
+      operationId: completeUc03Delivery
+      description: >-
+        Records physical DELIVERY_COMPLETED even when configured Delivery audit work remains
+        outstanding. Audit State may remain IN_PROGRESS and Audit Status may remain FLAGS_RAISED.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200': {description: Physical Delivery completion recorded}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/journeys/{journeyId}/delivery/workspace:
+    get:
+      operationId: getUc03DeliveryWorkspace
+      description: >-
+        Returns Delivery business status, independent Audit State/Audit Status, Booking warning,
+        intimation, vehicle reconciliation, documents, payments and cross-stage flags.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+      responses:
+        '200': {description: Delivery workspace}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/journeys/{journeyId}/stages/DELIVERY/documents:
+    get:
+      operationId: listUc03DeliveryDocuments
+      description: Returns the versioned Delivery document requirement and assessment checklist.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+      responses:
+        '200': {description: Delivery document checklist}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/journeys/{journeyId}/stages/DELIVERY/documents/{requirementKey}:
+    put:
+      operationId: assessUc03DeliveryDocument
+      description: >-
+        Records Yes, No, NA or Unanswered for a configured Delivery requirement. Audit exceptions
+        never rewrite or reject real dealer business progression.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/JourneyId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+        - name: requirementKey
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [answer]
+              properties:
+                answer: {type: string, enum: [YES, NO, NA, UNANSWERED]}
+                evidenceId: {type: [string, 'null'], format: uuid}
+                remarks: {type: [string, 'null'], maxLength: 4000}
+      responses:
+        '200': {description: Delivery document assessment recorded}
+        default: {$ref: '#/components/responses/ProblemResponse'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    TenantId:
+      name: tenantId
+      in: path
+      required: true
+      schema: {type: string, minLength: 1, maxLength: 128}
+    JourneyId:
+      name: journeyId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, minLength: 8, maxLength: 200}
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      schema: {type: string, minLength: 1, maxLength: 64}
+  responses:
+    ProblemResponse:
+      description: Audit Core problem response with stable public error code and correlation ID.

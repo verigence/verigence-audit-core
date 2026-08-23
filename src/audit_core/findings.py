@@ -11,7 +11,7 @@ from audit_core.authorization import authorize
 from audit_core.business_assignments import require_business_scope
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_principal
-from audit_core.errors import AuditCoreError, NotFoundError
+from audit_core.errors import AuditCoreError, ConflictError, NotFoundError
 from audit_core.security import Principal
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["findings"])
@@ -380,10 +380,11 @@ def patch_finding(
     authorize(principal, tenant_id=tenant_id, permission=permission)
     set_tenant_context(connection, tenant_id)
     _scope(connection, principal, tenant_id=tenant_id, journey_id=journey_id)
-    exists = connection.execute(
+    finding = connection.execute(
         text(
             """
-            SELECT 1 FROM auditcore.audit_findings
+            SELECT stage_code
+            FROM auditcore.audit_findings
             WHERE tenant_id = :tenant_id
               AND journey_id = :journey_id
               AND audit_finding_id = :finding_id
@@ -394,12 +395,18 @@ def patch_finding(
             "journey_id": journey_id,
             "finding_id": finding_id,
         },
-    ).scalar_one_or_none()
-    if exists is None:
+    ).mappings().one_or_none()
+    if finding is None:
         raise NotFoundError(
             error_code="VAC-NF-014",
             title="Finding not found",
             detail="Finding not found for the requested Journey.",
+        )
+    if finding["stage_code"] in {"BOOKING", "DELIVERY"}:
+        raise ConflictError(
+            error_code="VAC-CONFLICT-010",
+            title="UC03 audit flag lifecycle required",
+            detail="Booking and Delivery audit flags must be changed through the auditable UC03 review actions.",
         )
 
     column_by_field = {
