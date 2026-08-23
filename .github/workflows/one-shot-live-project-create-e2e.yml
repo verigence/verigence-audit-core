@@ -1,0 +1,263 @@
+name: One-shot live Project Create E2E
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/one-shot-live-project-create-e2e.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      SECURITY_SERVICE: security
+      AUDIT_SERVICE: verigence-audit-core
+      DI_SERVICE: di-api
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install diagnostic tooling
+        run: |
+          python -m pip install 'psycopg[binary]>=3.2,<4' 'PyJWT>=2.8,<3' 'cryptography>=42,<46' 'httpx>=0.27,<1'
+          npm install --global @railway/cli
+
+      - name: Run live Security to Audit Core to DI create test
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${RAILWAY_API_TOKEN:-}"
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          for svc in "$SECURITY_SERVICE" "$AUDIT_SERVICE" "$DI_SERVICE"; do
+            safe="$(echo "$svc" | tr '-' '_')"
+            railway variable list --service "$svc" --json >"/tmp/${safe}_vars.json"
+            railway deployment list --service "$svc" --limit 1 --json >"/tmp/${safe}_deploy.json"
+          done
+
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import uuid
+          from datetime import UTC, datetime, timedelta
+          from pathlib import Path
+
+          import httpx
+          import jwt
+          import psycopg
+
+          def load(path: str):
+              return json.loads(Path(path).read_text())
+
+          def pg(url: str) -> str:
+              return str(url or '').replace('postgresql+psycopg://','postgresql://',1).replace('postgresql+asyncpg://','postgresql://',1)
+
+          def public_base(values: dict) -> str:
+              value = str(values.get('RAILWAY_PUBLIC_DOMAIN') or values.get('RAILWAY_STATIC_URL') or '').strip()
+              if not value:
+                  raise SystemExit('Audit Core public domain is missing')
+              if not value.startswith(('http://','https://')):
+                  value='https://'+value
+              return value.rstrip('/')
+
+          sv=load('/tmp/security_vars.json')
+          av=load('/tmp/verigence_audit_core_vars.json')
+          dv=load('/tmp/di_api_vars.json')
+          su=pg(sv.get('DATABASE_URL'))
+          au=pg(av.get('DATABASE_URL'))
+          du=pg(dv.get('DI_DATABASE_URL') or dv.get('DATABASE_URL'))
+          if not all([su,au,du]):
+              raise SystemExit('One or more DEV database URLs are missing')
+
+          with psycopg.connect(su) as s:
+              with s.cursor() as c:
+                  c.execute("""
+                      SELECT a.user_id::text
+                      FROM security.user_admin_role_assignments a
+                      JOIN security.users u ON u.user_id=a.user_id
+                      WHERE a.role_key='SuperAdmin'
+                        AND a.scope_type='PLATFORM'
+                        AND a.scope_id IS NULL
+                        AND a.status='ACTIVE'
+                        AND u.status='ACTIVE'
+                      ORDER BY a.created_at_utc
+                      LIMIT 1
+                  """)
+                  row=c.fetchone()
+                  if not row:
+                      raise SystemExit('No active PLATFORM SuperAdmin exists in Security DEV')
+                  user_id=row[0]
+
+          private_key=str(sv.get('SECURITY_PRIVATE_KEY_PEM') or '').replace('\\n','\n')
+          key_id=str(sv.get('SECURITY_KEY_ID') or '')
+          issuer=str(sv.get('SECURITY_TOKEN_ISSUER') or 'verigence-security')
+          audience=str(sv.get('SECURITY_TOKEN_AUDIENCE') or 'verigence-platform')
+          if not private_key or not key_id:
+              raise SystemExit('Security signing configuration is incomplete')
+
+          now=datetime.now(UTC)
+          token=jwt.encode({
+              'iss':issuer,
+              'sub':user_id,
+              'aud':audience,
+              'iat':now,
+              'exp':now+timedelta(minutes=5),
+              'jti':str(uuid.uuid4()),
+              'actor_type':'USER',
+          }, private_key, algorithm='RS256', headers={'kid':key_id})
+
+          with psycopg.connect(au) as a:
+              with a.cursor() as c:
+                  c.execute("SELECT oem_id::text FROM auditcore.oems WHERE is_active=true ORDER BY oem_code LIMIT 1")
+                  oem=c.fetchone()
+                  c.execute("SELECT product_category_id::text FROM auditcore.product_categories WHERE is_active=true ORDER BY category_code LIMIT 1")
+                  category=c.fetchone()
+                  if not oem or not category:
+                      raise SystemExit('Audit Core active OEM/Product Category reference data is missing')
+                  oem_id=oem[0]
+                  category_id=category[0]
+
+          base=public_base(av)
+          headers={'Authorization':f'Bearer {token}'}
+          stamp=datetime.now(UTC).strftime('%Y%m%d%H%M%S')
+          project_name=f'E2E-AUTO-{stamp}'
+          idem=str(uuid.uuid4())
+          result=[]
+          tenant_id=None
+
+          with httpx.Client(timeout=35.0, follow_redirects=True) as client:
+              r=client.get(base+'/v1/projects', headers=headers)
+              result.append(f'GET_PROJECTS_HTTP={r.status_code}')
+              if r.status_code != 200:
+                  result.append('GET_PROJECTS_RESULT=FAIL')
+                  try:
+                      body=r.json()
+                      result.append('GET_PROJECTS_ERROR_CODE='+str(body.get('errorCode') or body.get('code') or 'UNKNOWN'))
+                      result.append('GET_PROJECTS_ERROR_DETAIL='+str(body.get('detail') or body.get('errorMessage') or '')[:300].replace('\n',' '))
+                  except Exception:
+                      result.append('GET_PROJECTS_ERROR_BODY=NON_JSON')
+              else:
+                  result.append('GET_PROJECTS_RESULT=PASS')
+
+              payload={
+                  'projectName':project_name,
+                  'oemId':oem_id,
+                  'productCategoryId':category_id,
+                  'effectiveStartDate':datetime.now(UTC).date().isoformat(),
+                  'effectiveEndDate':None,
+                  'timezoneName':'Asia/Kolkata',
+                  'regionCode':'IN',
+              }
+              create_headers={**headers,'Idempotency-Key':idem,'Content-Type':'application/json'}
+              r=client.post(base+'/v1/projects', headers=create_headers, json=payload)
+              result.append(f'CREATE_PROJECT_HTTP={r.status_code}')
+              try:
+                  body=r.json()
+              except Exception:
+                  body={}
+              if r.status_code == 201:
+                  tenant_id=str(body.get('tenantId') or '')
+                  result.append('CREATE_PROJECT_RESULT=PASS')
+                  result.append('CREATE_PROJECT_PROVISIONING_STATUS='+str(body.get('provisioningStatus') or ''))
+                  result.append('CREATE_PROJECT_CURRENT_STEP='+str(body.get('currentStep') or ''))
+                  if body.get('provisioningStatus') != 'READY' or body.get('currentStep') != 'COMPLETE':
+                      result.append('CREATE_PROJECT_CONTRACT=FAIL')
+                  else:
+                      result.append('CREATE_PROJECT_CONTRACT=PASS')
+              else:
+                  result.append('CREATE_PROJECT_RESULT=FAIL')
+                  result.append('CREATE_PROJECT_ERROR_CODE='+str(body.get('errorCode') or body.get('code') or 'UNKNOWN'))
+                  result.append('CREATE_PROJECT_ERROR_DETAIL='+str(body.get('detail') or body.get('errorMessage') or '')[:300].replace('\n',' '))
+
+          # Inspect synthetic-name residue even if the POST failed before returning a tenant ID.
+          residue=[]
+          with psycopg.connect(su) as s:
+              with s.cursor() as c:
+                  c.execute("SELECT tenant_id::text, status FROM security.tenants WHERE tenant_name=%s ORDER BY created_at_utc",(project_name,))
+                  residue=c.fetchall()
+          result.append(f'SYNTHETIC_SECURITY_TENANTS={len(residue)}')
+          if not tenant_id and residue:
+              tenant_id=residue[-1][0]
+
+          if tenant_id:
+              with psycopg.connect(au) as a:
+                  with a.cursor() as c:
+                      c.execute("SELECT project_status FROM auditcore.projects WHERE tenant_id=%s",(tenant_id,))
+                      p=c.fetchone()
+              with psycopg.connect(du) as d:
+                  with d.cursor() as c:
+                      c.execute("SELECT (SELECT count(*) FROM docintel.tenant_settings WHERE tenant_id=%s)+(SELECT count(*) FROM docintel.retention_policies WHERE tenant_id=%s)+(SELECT count(*) FROM docintel.tenant_document_types WHERE tenant_id=%s)",(tenant_id,tenant_id,tenant_id))
+                      prov=int(c.fetchone()[0])
+                      c.execute("SELECT count(*) FROM docintel.documents WHERE tenant_id=%s",(tenant_id,))
+                      docs=int(c.fetchone()[0])
+              result.append('POST_STATE_SECURITY_STATUS='+str(residue[-1][1] if residue else 'MISSING'))
+              result.append('POST_STATE_AUDIT_PROJECT='+('PRESENT:'+str(p[0]) if p else 'MISSING'))
+              result.append(f'POST_STATE_DI_PROVISIONING_ROWS={prov}')
+              result.append(f'POST_STATE_DI_DOCUMENTS={docs}')
+
+              # DEV synthetic cleanup. DI first, then Audit row, then Security tenant.
+              with httpx.Client(timeout=20.0) as client:
+                  dr=client.delete(str(dv.get('RAILWAY_PUBLIC_DOMAIN') or dv.get('RAILWAY_STATIC_URL') or '').replace('http://','https://').rstrip('/')+f'/v1/tenants/{tenant_id}/admin/provisioning', headers=headers) if (dv.get('RAILWAY_PUBLIC_DOMAIN') or dv.get('RAILWAY_STATIC_URL')) else None
+                  if dr is not None:
+                      result.append(f'CLEANUP_DI_HTTP={dr.status_code}')
+              with psycopg.connect(au) as a:
+                  with a.cursor() as c:
+                      c.execute('DELETE FROM auditcore.projects WHERE tenant_id=%s',(tenant_id,))
+                  a.commit()
+              security_domain=str(sv.get('RAILWAY_PUBLIC_DOMAIN') or sv.get('RAILWAY_STATIC_URL') or '').strip()
+              if security_domain:
+                  if not security_domain.startswith(('http://','https://')):
+                      security_domain='https://'+security_domain
+                  with httpx.Client(timeout=20.0) as client:
+                      sr=client.delete(security_domain.rstrip('/')+f'/security/v1/platform/tenants/{tenant_id}',headers=headers)
+                      result.append(f'CLEANUP_SECURITY_HTTP={sr.status_code}')
+              result.append('SYNTHETIC_CLEANUP=ATTEMPTED')
+
+          dep={}
+          for name,path in [('SECURITY','/tmp/security_deploy.json'),('AUDIT_CORE','/tmp/verigence_audit_core_deploy.json'),('DI','/tmp/di_api_deploy.json')]:
+              rows=load(path); row=rows[0] if rows else {}
+              dep[name]=(row.get('status') or 'UNKNOWN', row.get('createdAt') or 'UNKNOWN')
+
+          lines=['LIVE_PROJECT_CREATE_E2E',
+                 f'SECURITY_DEPLOYMENT_STATUS={dep["SECURITY"][0]}',
+                 f'AUDIT_CORE_DEPLOYMENT_STATUS={dep["AUDIT_CORE"][0]}',
+                 f'DI_DEPLOYMENT_STATUS={dep["DI"][0]}',
+                 *result]
+          Path('docs/runtime').mkdir(parents=True,exist_ok=True)
+          Path('docs/runtime/live-project-create-e2e.txt').write_text('\n'.join(lines)+'\n')
+          print('\n'.join(lines))
+          PY
+
+      - name: Capture relevant Audit Core logs on E2E failure
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          railway logs --service "$AUDIT_SERVICE" --latest --lines 250 2>/dev/null | grep -E 'project_create|project_directory|security_admin|di_' | tail -n 80 > docs/runtime/live-project-create-e2e-logs.txt
+          true
+
+      - name: Record sanitized evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/runtime/live-project-create-e2e.txt docs/runtime/live-project-create-e2e-logs.txt 2>/dev/null || true
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'docs(dev): record live Project Create E2E [skip ci]'
+          git pull --rebase origin dev
+          git push origin HEAD:dev
