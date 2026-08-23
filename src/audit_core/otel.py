@@ -143,6 +143,25 @@ def attach_business_context(context: Mapping[str, str]) -> None:
             span.set_attribute(f"verigence.{key.replace('_', '.')}", value)
 
 
+def _current_correlation_id() -> str | None:
+    value = structlog.contextvars.get_contextvars().get("correlation_id")
+    return str(value) if value else None
+
+
+def _httpx_request_hook(span: Any, request: Any) -> None:
+    correlation_id = _current_correlation_id()
+    if not correlation_id:
+        return
+    if request.headers is not None:
+        request.headers["X-Correlation-ID"] = correlation_id
+    if span is not None and span.is_recording():
+        span.set_attribute("verigence.correlation_id", correlation_id)
+
+
+async def _httpx_async_request_hook(span: Any, request: Any) -> None:
+    _httpx_request_hook(span, request)
+
+
 def configure_otlp(app: FastAPI, settings: Settings) -> bool:
     """Configure non-blocking, fail-open Phase-1 OpenTelemetry export."""
     global _OTEL_LOGGER
@@ -213,6 +232,8 @@ def configure_otlp(app: FastAPI, settings: Settings) -> bool:
         HTTPXClientInstrumentor().instrument(
             tracer_provider=tracer_provider,
             meter_provider=meter_provider,
+            request_hook=_httpx_request_hook,
+            async_request_hook=_httpx_async_request_hook,
         )
         SQLAlchemyInstrumentor().instrument(tracer_provider=tracer_provider)
         return True
