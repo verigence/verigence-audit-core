@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -6,7 +7,7 @@ from functools import lru_cache
 from typing import Annotated
 
 import structlog
-from fastapi import Depends
+from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import Connection, Engine, create_engine, text
 
@@ -29,6 +30,16 @@ logger = structlog.get_logger(__name__)
 
 _bearer = HTTPBearer(auto_error=False)
 
+# These GETs expose read-only reference/master data. They require a valid human
+# token, but do not require a live Security SuperAdmin round-trip merely because
+# they are surfaced from Project Administration.
+_LIGHTWEIGHT_AUTHENTICATED_READS = (
+    re.compile(r"^/v1/project-reference-data/?$"),
+    re.compile(r"^/v1/tenants/[^/]+/project-masters/?$"),
+    re.compile(r"^/v1/tenants/[^/]+/project-masters/[^/]+/[^/]+/versions/?$"),
+    re.compile(r"^/v1/tenants/[^/]+/project-masters/DI/[^/]+/template/?$"),
+)
+
 
 @dataclass(frozen=True)
 class HumanAdminRequest:
@@ -37,12 +48,29 @@ class HumanAdminRequest:
     admin_context: SecurityAdminContext
 
 
+def _postgresql_url(database_url: str) -> bool:
+    normalized = database_url.lower()
+    return normalized.startswith(("postgresql://", "postgres://", "postgresql+"))
+
+
 @lru_cache
 def _engine() -> Engine:
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not database_url:
         raise RuntimeError("DATABASE_URL is required")
-    return create_engine(database_url)
+
+    # Keep DB resilience central and small: one pool, stale-connection detection,
+    # and bounded waits. API handlers do not implement their own retry loops.
+    engine_options: dict[str, object] = {"pool_pre_ping": True}
+    if _postgresql_url(database_url):
+        engine_options.update(
+            pool_timeout=5,
+            connect_args={
+                "connect_timeout": 5,
+                "options": "-c statement_timeout=10000",
+            },
+        )
+    return create_engine(database_url, **engine_options)
 
 
 def get_engine() -> Engine:
@@ -63,7 +91,15 @@ def get_bearer_token(
     return credentials.credentials
 
 
+@lru_cache
 def _token_validator() -> SecurityTokenValidator:
+    """Reuse one validator/JWKS client per Audit Core process.
+
+    Every request is still cryptographically validated. Reusing the validator lets
+    the JWKS client keep its server-side signing-key cache instead of fetching the
+    same public keys for each API call.
+    """
+
     jwks_url = os.environ.get("SECURITY_JWKS_URL", "").strip()
     issuer = os.environ.get("SECURITY_ISSUER", "").strip()
     audience = os.environ.get("SECURITY_AUDIENCE", "").strip()
@@ -98,9 +134,10 @@ def get_human_principal(
         raise
 
 
-def get_human_admin_request(
-    bearer_token: Annotated[str, Depends(get_bearer_token)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+def _security_admin_context(
+    *,
+    bearer_token: str,
+    human_principal: HumanPrincipal,
 ) -> HumanAdminRequest:
     security_base_url = os.environ.get("SECURITY_BASE_URL", "").strip()
     if not security_base_url:
@@ -140,9 +177,45 @@ def get_human_admin_request(
     )
 
 
-def require_super_admin_request(
-    request: Annotated[HumanAdminRequest, Depends(get_human_admin_request)],
+def get_human_admin_request(
+    bearer_token: Annotated[str, Depends(get_bearer_token)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
 ) -> HumanAdminRequest:
+    return _security_admin_context(
+        bearer_token=bearer_token,
+        human_principal=human_principal,
+    )
+
+
+def _is_lightweight_authenticated_read(request: Request) -> bool:
+    if request.method.upper() != "GET":
+        return False
+    path = request.url.path
+    return any(pattern.fullmatch(path) for pattern in _LIGHTWEIGHT_AUTHENTICATED_READS)
+
+
+def require_super_admin_request(
+    http_request: Request,
+    bearer_token: Annotated[str, Depends(get_bearer_token)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+) -> HumanAdminRequest:
+    if _is_lightweight_authenticated_read(http_request):
+        # The route signature historically expects HumanAdminRequest so preserve the
+        # shape, while explicitly marking that no administrative authority was used.
+        return HumanAdminRequest(
+            user_id=human_principal.subject,
+            bearer_token=bearer_token,
+            admin_context=SecurityAdminContext(
+                user_id=human_principal.subject,
+                is_super_admin=False,
+                admin_scopes=(),
+            ),
+        )
+
+    request = _security_admin_context(
+        bearer_token=bearer_token,
+        human_principal=human_principal,
+    )
     if not request.admin_context.is_super_admin:
         raise AuthorizationError(
             error_code="VAC-AUTH-002",
