@@ -50,7 +50,7 @@ class HumanAdminRequest:
 
 def _postgresql_url(database_url: str) -> bool:
     normalized = database_url.lower()
-    return normalized.startswith("postgresql://") or normalized.startswith("postgres://") or normalized.startswith("postgresql+")
+    return normalized.startswith(("postgresql://", "postgres://", "postgresql+"))
 
 
 @lru_cache
