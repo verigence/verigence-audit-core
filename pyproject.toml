@@ -46,9 +46,3 @@ target-version = "py312"
 # The Project Master facade keeps imports grouped by owning master domain so the
 # adapter boundary remains reviewable beside the corresponding confirm helpers.
 "src/audit_core/project_master_imports.py" = ["I001"]
-# UC03 C1 orchestration imports private, domain-owned helpers deliberately while
-# the checkpoint is assembled across the existing modules. Runtime/behavior is
-# fully linted; these narrow import-layout exceptions avoid changing ownership
-# boundaries solely to satisfy grouping during the C1 integration pass.
-"src/audit_core/uc03_booking_capture.py" = ["I001", "F401"]
-"src/audit_core/uc03_booking_evidence.py" = ["I001"]
