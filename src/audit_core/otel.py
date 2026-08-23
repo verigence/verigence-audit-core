@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 import structlog
 from fastapi import FastAPI
