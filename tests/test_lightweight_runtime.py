@@ -3,6 +3,7 @@ from __future__ import annotations
 from starlette.requests import Request
 
 from audit_core import dependencies
+from audit_core.security_integration import SecurityAdminContext
 
 
 def _request(method: str, path: str) -> Request:
@@ -22,8 +23,9 @@ def _request(method: str, path: str) -> Request:
     )
 
 
-def test_only_approved_master_reference_gets_use_lightweight_auth() -> None:
+def test_only_approved_control_plane_and_master_gets_use_lightweight_auth() -> None:
     approved = (
+        "/v1/projects",
         "/v1/project-reference-data",
         "/v1/tenants/t-1/project-masters",
         "/v1/tenants/t-1/project-masters/AUDIT_CORE/PRICE_LIST/versions",
@@ -33,14 +35,35 @@ def test_only_approved_master_reference_gets_use_lightweight_auth() -> None:
         assert dependencies._is_lightweight_authenticated_read(_request("GET", path))
 
     assert not dependencies._is_lightweight_authenticated_read(
-        _request("POST", "/v1/tenants/t-1/project-masters/AUDIT_CORE/PRICE_LIST/versions/v-1/publish")
+        _request("POST", "/v1/projects")
     )
     assert not dependencies._is_lightweight_authenticated_read(
-        _request("GET", "/v1/projects")
+        _request("GET", "/v1/tenants/t-1/dealers")
+    )
+    assert not dependencies._is_lightweight_authenticated_read(
+        _request("POST", "/v1/tenants/t-1/project-masters/AUDIT_CORE/PRICE_LIST/versions/v-1/publish")
     )
     assert not dependencies._is_lightweight_authenticated_read(
         _request("GET", "/v1/tenants/t-1/project-master-imports/i-1/error-report")
     )
+
+
+def test_admin_context_is_reused_for_short_page_bursts(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    dependencies._admin_context_cache.clear()
+    now = {"value": 100.0}
+    monkeypatch.setattr(dependencies.time, "monotonic", lambda: now["value"])
+    context = SecurityAdminContext(
+        user_id="user-1",
+        is_super_admin=True,
+        admin_scopes=(),
+    )
+
+    dependencies._remember_admin_context(context)
+    assert dependencies._cached_admin_context("user-1") is context
+
+    now["value"] += dependencies._ADMIN_CONTEXT_TTL_SECONDS + 0.01
+    assert dependencies._cached_admin_context("user-1") is None
+    dependencies._admin_context_cache.clear()
 
 
 def test_postgresql_engine_uses_simple_bounded_pool_configuration(monkeypatch) -> None:  # type: ignore[no-untyped-def]

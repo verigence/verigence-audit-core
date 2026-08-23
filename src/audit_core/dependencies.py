@@ -4,6 +4,7 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import lru_cache
+from threading import Lock
 from typing import Annotated
 
 import structlog
@@ -30,15 +31,25 @@ logger = structlog.get_logger(__name__)
 
 _bearer = HTTPBearer(auto_error=False)
 
-# These GETs expose read-only reference/master data. They require a valid human
-# token, but do not require a live Security SuperAdmin round-trip merely because
-# they are surfaced from Project Administration.
+# These GETs can authenticate locally without an extra /platform/admin-context
+# call. /v1/projects still calls Security /platform/tenants, which remains the
+# authoritative access filter for the Project directory. Reference/master reads
+# are intentionally authenticated-human reads per the lightweight runtime design.
 _LIGHTWEIGHT_AUTHENTICATED_READS = (
+    re.compile(r"^/v1/projects/?$"),
     re.compile(r"^/v1/project-reference-data/?$"),
     re.compile(r"^/v1/tenants/[^/]+/project-masters/?$"),
     re.compile(r"^/v1/tenants/[^/]+/project-masters/[^/]+/[^/]+/versions/?$"),
     re.compile(r"^/v1/tenants/[^/]+/project-masters/DI/[^/]+/template/?$"),
 )
+
+# Administrative reads/writes that really do need SuperAdmin keep that policy,
+# but page bursts must not call Security admin-context over and over. Cache only
+# the Security-owned attestation in Audit Core process memory for a short window.
+# Human JWT validation itself still runs on every request.
+_ADMIN_CONTEXT_TTL_SECONDS = 30.0
+_admin_context_cache: dict[str, tuple[float, SecurityAdminContext]] = {}
+_admin_context_cache_lock = Lock()
 
 
 @dataclass(frozen=True)
@@ -134,11 +145,40 @@ def get_human_principal(
         raise
 
 
+def _cached_admin_context(user_id: str) -> SecurityAdminContext | None:
+    now = time.monotonic()
+    with _admin_context_cache_lock:
+        cached = _admin_context_cache.get(user_id)
+        if cached is None:
+            return None
+        expires_at, context = cached
+        if expires_at <= now:
+            _admin_context_cache.pop(user_id, None)
+            return None
+        return context
+
+
+def _remember_admin_context(context: SecurityAdminContext) -> None:
+    with _admin_context_cache_lock:
+        _admin_context_cache[context.user_id] = (
+            time.monotonic() + _ADMIN_CONTEXT_TTL_SECONDS,
+            context,
+        )
+
+
 def _security_admin_context(
     *,
     bearer_token: str,
     human_principal: HumanPrincipal,
 ) -> HumanAdminRequest:
+    cached = _cached_admin_context(human_principal.subject)
+    if cached is not None:
+        return HumanAdminRequest(
+            user_id=human_principal.subject,
+            bearer_token=bearer_token,
+            admin_context=cached,
+        )
+
     security_base_url = os.environ.get("SECURITY_BASE_URL", "").strip()
     if not security_base_url:
         logger.error("security_admin_context_failed", reason="security_base_url_missing")
@@ -170,6 +210,7 @@ def _security_admin_context(
 
     if context.user_id != human_principal.subject:
         raise SecurityTokenError("Security administrative USER does not match authenticated USER")
+    _remember_admin_context(context)
     return HumanAdminRequest(
         user_id=human_principal.subject,
         bearer_token=bearer_token,

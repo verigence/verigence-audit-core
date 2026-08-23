@@ -122,23 +122,21 @@ def _project_exists(engine: Engine, tenant_id: str) -> bool:
 
 
 def _project_selection(
-    engine: Engine,
+    connection: Connection,
     *,
     tenant: SecurityTenant,
 ) -> ProjectSelectionResponse | None:
-    with engine.begin() as connection:
-        connection.execute(text("SET LOCAL ROLE audit_core_runtime"))
-        set_tenant_context(connection, tenant.tenant_id)
-        row = connection.execute(
-            text(
-                """
-                SELECT tenant_id, project_code, project_name, project_status
-                FROM auditcore.projects
-                WHERE tenant_id=:tenant_id
-                """
-            ),
-            {"tenant_id": tenant.tenant_id},
-        ).mappings().one_or_none()
+    set_tenant_context(connection, tenant.tenant_id)
+    row = connection.execute(
+        text(
+            """
+            SELECT tenant_id, project_code, project_name, project_status
+            FROM auditcore.projects
+            WHERE tenant_id=:tenant_id
+            """
+        ),
+        {"tenant_id": tenant.tenant_id},
+    ).mappings().one_or_none()
     if row is None:
         return None
     return ProjectSelectionResponse(
@@ -288,11 +286,23 @@ def list_projects(
         raise DependencyUnavailableError(
             detail="Project administration is temporarily unavailable. Please try again."
         ) from exc
-    projects = [
-        project
-        for tenant in tenants
-        if (project := _project_selection(engine, tenant=tenant)) is not None
-    ]
+
+    projects: list[ProjectSelectionResponse] = []
+    missing_project_tenants: list[str] = []
+    with engine.begin() as connection:
+        connection.execute(text("SET LOCAL ROLE audit_core_runtime"))
+        for tenant in tenants:
+            project = _project_selection(connection, tenant=tenant)
+            if project is None:
+                missing_project_tenants.append(tenant.tenant_id)
+            else:
+                projects.append(project)
+
+    if missing_project_tenants:
+        logger.warning(
+            "project_directory_projection_gap",
+            missing_project_count=len(missing_project_tenants),
+        )
     return sorted(projects, key=lambda item: (item.projectName.casefold(), item.projectCode))
 
 
