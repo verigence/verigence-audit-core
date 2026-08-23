@@ -85,7 +85,6 @@ class FlagCreateCommand(BaseModel):
     summary: str = Field(min_length=1, max_length=500)
     remarks: str | None = Field(default=None, max_length=4000)
     evidenceIds: list[UUID] = Field(default_factory=list, max_length=20)
-    blockingCompletion: bool = False
 
 
 class FlagLifecycleCommand(BaseModel):
@@ -576,6 +575,13 @@ def _list_flags(
     journey_id: UUID,
     stage_code: str | None,
 ) -> list[FlagView]:
+    stage_filter = " AND stage_code=:stage_code" if stage_code is not None else ""
+    parameters: dict[str, Any] = {
+        "tenant_id": tenant_id,
+        "journey_id": journey_id,
+    }
+    if stage_code is not None:
+        parameters["stage_code"] = stage_code
     rows = connection.execute(
         text(
             """
@@ -587,7 +593,9 @@ def _list_flags(
             FROM auditcore.audit_findings
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
               AND stage_code IN ('BOOKING','DELIVERY')
-              AND (:stage_code IS NULL OR stage_code=:stage_code)
+            """
+            + stage_filter
+            + """
             ORDER BY
               CASE severity
                 WHEN 'CRITICAL' THEN 5 WHEN 'HIGH' THEN 4 WHEN 'MEDIUM' THEN 3
@@ -596,7 +604,7 @@ def _list_flags(
               created_at_utc DESC, audit_finding_id DESC
             """
         ),
-        {"tenant_id": tenant_id, "journey_id": journey_id, "stage_code": stage_code},
+        parameters,
     ).mappings().all()
     return [_flag_view(connection, tenant_id=tenant_id, row=row) for row in rows]
 
@@ -897,7 +905,7 @@ def create_flag(
                     :tenant_id, :journey_id, :category, :severity,
                     'OPEN', :title, :description, :actor_id,
                     :correlation_id, :stage_code, 'HUMAN', :actor_id,
-                    :actor_role, :blocking_completion
+                    :actor_role, false
                 ) RETURNING audit_finding_id
                 """
             ),
@@ -912,7 +920,6 @@ def create_flag(
                 "correlation_id": correlation_id,
                 "stage_code": payload.stage,
                 "actor_role": context["operating_role"],
-                "blocking_completion": payload.blockingCompletion,
             },
         ).scalar_one()
         _link_evidence(
