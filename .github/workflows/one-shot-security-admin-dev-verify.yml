@@ -1,0 +1,67 @@
+name: One-shot Security Admin DEV verify
+
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - .github/workflows/one-shot-security-admin-dev-verify.yml
+
+permissions:
+  contents: write
+
+jobs:
+  contract:
+    name: Verify Security admin contract
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact revision
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: python -m pip install -e '.[test,lint]'
+
+      - name: Lint changed contract files
+        run: ruff check src/audit_core/security_integration.py tests/test_uc02_admin_security.py
+
+      - name: Run Security admin regression tests
+        run: pytest -q tests/test_uc02_admin_security.py
+
+  deploy:
+    name: Deploy verified Audit Core to Railway DEV
+    needs: contract
+    uses: ./.github/workflows/audit-core-dev-deploy.yml
+    secrets: inherit
+
+  attest:
+    name: Record successful DEV deployment
+    needs: deploy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out DEV
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+
+      - name: Record deployed source SHA
+        env:
+          VERIFIED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p docs/runtime
+          cat > docs/runtime/security-admin-dev-verified.txt <<EOF
+          SECURITY_ADMIN_DEV_VERIFIED=PASS
+          DEPLOYED_SOURCE_SHA=${VERIFIED_SHA}
+          SECURITY_ADMIN_ENDPOINT=/security/v1/platform/me
+          SUPER_ADMIN_ROLE=platform.super_admin
+          EOF
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add docs/runtime/security-admin-dev-verified.txt
+          git commit -m '[skip ci] chore: record Security admin DEV verification'
+          git push origin HEAD:dev
