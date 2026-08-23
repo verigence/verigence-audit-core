@@ -1,7 +1,12 @@
 LIVE_PROJECT_CREATE_E2E
-MODE=SECURITY_CREATE_LATENCY_VERIFY
-SECURITY_CREATE_HTTP=201
-SECURITY_CREATE_SECONDS=4.886
-SECURITY_CREATE_BODY={"createdAtUtc": "2026-08-23T14:40:26.144541Z", "status": "CONFIGURING", "tenantCode": "tenant-103ea9a25ea34748818c10bce209098b", "tenantId": "1af8aa89-9b6b-4b57-91e9-d430d40c1668", "tenantName": "SEC-LATENCY-20260823144024", "updatedAtUtc": "2026-08-23T14:40:26.144541Z"}
-SECURITY_CLEANUP_HTTP=200
+MODE=FULL_PROJECT_CREATE_AFTER_SECURITY_OPTIMIZATION
+GET_PROJECTS_HTTP=200
+CREATE_PROJECT_HTTP=201
+CREATE_PROJECT_SECONDS=15.196
+CREATE_PROJECT_BODY={"currentStep": "COMPLETE", "errorCode": null, "errorMessage": null, "operationId": "ed0bfdc5-4d5d-5b89-aba3-b9e8ff5d7153", "projectName": "E2E-FULL-20260823144148", "projectStatus": "CONFIGURING", "provisioningStatus": "READY", "tenantId": "a1d8156f-de42-4118-ade5-b6cd8d20526a"}
+TENANT_ID=a1d8156f-de42-4118-ade5-b6cd8d20526a
 RESULT=PASS
+DI_CLEANUP_HTTP=200
+AUDIT_CLEANUP_ERROR=ForeignKeyViolation:update or delete on table "projects" violates foreign key constraint "business_status_codes_tenant_id_fkey" on table "business_status_codes"
+DETAIL:  Key (tenant_id)=(a1d8156f-de42-4118-ade5-b6cd8d20526a) is still referenced from table "business_status_codes".
+SECURITY_CLEANUP_HTTP=200
