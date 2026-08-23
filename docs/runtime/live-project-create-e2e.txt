@@ -1,17 +1,7 @@
 LIVE_PROJECT_CREATE_E2E
-MODE=SECURITY_CREATE_WAIT_DIAG
-ROLE_DEFAULT_TOTAL=156
-SAMPLE_2S_ACTIVE=1
-SAMPLE_2S_0=pid:1352|state:idle in transaction|wait:Client/ClientRead|blockers:[]|query:                 INSERT INTO security.tenants                 (tenant_id,tenant_code,tenant_name,status,created_at_utc,updated_at_utc)                 VALUES ($1,$2,$3,'CONFIGURING',$4,$4)                 
-SAMPLE_5S_ACTIVE=1
-SAMPLE_5S_0=pid:1352|state:idle in transaction|wait:Client/ClientRead|blockers:[]|query:                     INSERT INTO security.tenant_role_permissions                     (tenant_id,role_key,permission_key,assigned_by_user_id,assigned_at_utc)                     VALUES ($1,$2,$3,$4,$5)                   
-SAMPLE_10S_ACTIVE=1
-SAMPLE_10S_0=pid:1352|state:idle in transaction|wait:Client/ClientRead|blockers:[]|query:                     INSERT INTO security.tenant_role_permissions                     (tenant_id,role_key,permission_key,assigned_by_user_id,assigned_at_utc)                     VALUES ($1,$2,$3,$4,$5)                   
-SAMPLE_20S_ACTIVE=1
-SAMPLE_20S_0=pid:1352|state:idle in transaction|wait:Client/ClientRead|blockers:[]|query:                     INSERT INTO security.tenant_role_permissions                     (tenant_id,role_key,permission_key,assigned_by_user_id,assigned_at_utc)                     VALUES ($1,$2,$3,$4,$5)                   
-CREATE_THREAD_ALIVE=false
-CREATE_ELAPSED=66.132
+MODE=SECURITY_CREATE_LATENCY_VERIFY
 SECURITY_CREATE_HTTP=201
-SECURITY_CREATE_BODY={"createdAtUtc": "2026-08-23T14:34:18.500383Z", "status": "CONFIGURING", "tenantCode": "tenant-963045e925634bcb9b7b722c5277b6d0", "tenantId": "b5f5f30a-9c77-4d98-a31b-b1704b8f062c", "tenantName": "SEC-WAIT-20260823143416", "updatedAtUtc": "2026-08-23T14:34:18.500383Z"}
+SECURITY_CREATE_SECONDS=4.886
+SECURITY_CREATE_BODY={"createdAtUtc": "2026-08-23T14:40:26.144541Z", "status": "CONFIGURING", "tenantCode": "tenant-103ea9a25ea34748818c10bce209098b", "tenantId": "1af8aa89-9b6b-4b57-91e9-d430d40c1668", "tenantName": "SEC-LATENCY-20260823144024", "updatedAtUtc": "2026-08-23T14:40:26.144541Z"}
 SECURITY_CLEANUP_HTTP=200
 RESULT=PASS
