@@ -1,224 +1,174 @@
 # UC03 C3 — Audit / Review / Hardening — Checkpoint Status
 
 **Checkpoint:** `C3 — Audit / Review / Hardening`  
-**Status:** `IMPLEMENTATION IN PROGRESS / AUTOMATED VALIDATION PARTIALLY GREEN / HUMAN UAT DEFERRED`  
+**Status:** `ENGINEERING + AUTOMATED VALIDATION COMPLETE / DEV + HUMAN UAT PENDING`  
 **Date:** 2026-08-23  
 **Branch:** `planning/uc-003-booking-delivery-audit`  
-**CI/CD architecture:** **FROZEN UNTIL UC03 STABLE**
+**CI/CD architecture:** **FROZEN UNTIL UC03 STABLE**  
+**Formal human-UAT closure:** **NOT CLOSED**
 
-This note is the active execution/status record for C3. It supplements `UC03_IMPLEMENTATION_HANDOFF_v1.1.md` and must be read together with `../UC03_EXECUTION_BASELINE_ADDENDUM_2026-08-23.md`.
+C3 engineering and the automated cross-module validation available under the frozen CI/CD baseline are complete. No human C3 UAT pass is claimed. Final DEV/UAT remains part of the consolidated end-of-UC03 cycle.
 
-No C3 human UAT pass is claimed. Human UAT remains deferred to the consolidated end-of-UC03 DEV/UAT cycle.
+Read together with:
 
----
+- `../UC03_EXECUTION_BASELINE_ADDENDUM_2026-08-23.md`;
+- `../UC03_C3_HARDENING_REPORT_2026-08-23.md`;
+- `UC03_PHASE1_PRODUCT_BASELINE.md`.
 
-## 1. C3 implementation currently present
+## 1. Audit Core C3 scope completed
 
-### Audit Core
+C3 reuses the existing canonical `audit_findings` + append-only `audit_finding_events` model. No second anomaly register was introduced.
 
-The C3 implementation builds on the existing canonical `audit_findings` register and append-only `audit_finding_events`; no second anomaly/flag store is introduced.
-
-Implemented/in-progress capabilities include:
+Completed capabilities:
 
 - Booking/Delivery stage attribution;
-- MACHINE/HUMAN origin and provenance;
-- actor/operating-role snapshot;
-- rule/version linkage for machine findings;
+- MACHINE/HUMAN provenance;
+- actor/operating-role snapshot and rule/version linkage;
 - append-only finding events;
 - remarks/evidence linkage;
-- list/create/read summary surfaces;
-- lifecycle actions for acknowledge/review/resolve/reopen/void according to role policy;
-- optimistic version conflict handling;
-- idempotent lifecycle commands;
-- Project/business-scope authorization through the existing Security-v2 boundary;
-- sticky historical `FLAGS_RAISED` behavior;
-- stage Audit State completion surface;
+- acknowledge/review/resolve/reopen/void lifecycle;
+- optimistic `If-Match` conflict protection;
+- command idempotency;
+- Security-v2 permission check + Project/business-assignment isolation;
+- PC/TL/PM/Executive default policy enforcement with Executive-only Void by conservative default;
+- server-returned `permittedActions` for presentation without client authority;
+- sticky historical `FLAGS_RAISED` semantics;
+- Stage Audit completion under configured completion policy;
 - cross-stage Audit summary;
-- unified Booking/Delivery/finding/review timeline;
-- server-returned permitted actions so the UI does not become the permission authority;
-- conservative Phase-1 default of Executive-only Void unless published Project policy overrides it;
-- protection against the legacy generic Finding PATCH silently bypassing the UC03 lifecycle/event path.
+- bounded user-safe Booking/Delivery/finding/review timeline;
+- prevention of legacy generic Finding PATCH from silently bypassing the UC03 lifecycle path;
+- human flags cannot self-declare completion guards.
 
-No C3 migration has been introduced merely for neatness. Existing C1/C2 structures already contain the required finding-event/provenance fields; additional migration/index work will be introduced only if the final C3 performance/backfill review proves it necessary.
+The original four C3 failures were one PostgreSQL optional-stage bind defect. `_list_flags` now emits the stage predicate only when a stage is actually provided; unfiltered listing has no ambiguous NULL bind.
 
-### Web / Android
+## 2. C3 contract hardening
 
-C3 review experience is implemented/in progress on the unified Web branch, including:
+Human `FlagCreateCommand` no longer accepts `blockingCompletion`; extra fields are rejected. Human findings persist `blocking_completion=false`.
 
-- dedicated `/audit/:journeyId` review workspace;
-- Booking and Delivery Audit State / Audit Status presentation;
-- open and historical findings;
-- machine/human provenance;
-- remarks/evidence/history presentation;
-- role/capability-driven lifecycle actions;
-- Booking/Delivery navigation from the review workspace;
-- consolidated timeline;
-- `Audit & History` entry point from applicable Project work-list items;
-- responsive phone/tablet/Desktop layout using the existing UC03 application shell.
+Configured/published policy or machine-rule findings retain the ability to act as Audit completion guards. The acceptance fixture proves this with a MACHINE `AUDIT_COMPLETION_GUARD`.
 
-Current Web branch head at status creation: `1d7a1475f6a6dd8e947c1a6aeecee7f49ec4e8b5`.
+Frozen C3 API checkpoint contract:
 
-### DI
+```text
+api/openapi-uc03-c3.yaml
+```
 
-No C3 DI runtime change is currently required. C3 must preserve/regress the existing C1/C2 DI publication boundaries. Current DI UC03 branch head at status creation: `29cdef7d1567422bd2ffdbf7f5926f6bc0f23743`.
+Runtime parity/invariant test:
 
----
+```text
+tests/test_uc03_c3_openapi_contract.py
+```
 
-## 2. Current Audit Core validation evidence
+Frozen groups cover audit summary, flag list/create, lifecycle actions, remarks/evidence, stage-audit complete and user-safe timeline.
 
-C3 runtime/application head immediately before the documentation reconciliation commits: `12aeaca8df9af39e9ca88d687dc941195ad3199d`.
+## 3. Audit Core automated evidence
 
-CI run `32622262642` (run 654): **FAIL at unit-test step**.
+C3 application + contract SHA: `1c61f995e707ed1f944f7357f11c5e146ab6c9c5`.
 
-Steps already green on that exact C3 runtime head:
+Normal CI run `32623966514` (run 662): **SUCCESS**.
 
 - package build: **PASS**;
 - Ruff: **PASS**;
 - fresh PostgreSQL/Alembic migration through `0012_uc03_delivery_capture`: **PASS**;
-- pytest completed with **169 passed / 4 failed / 1 warning**.
+- complete suite including C0/C1/C2 regressions and C2/C3 contract parity: **176 passed, 1 non-failing warning**.
 
-All four failures share one root cause. PostgreSQL cannot infer the type of a `NULL` `stage_code` bind in the unfiltered UC03 flag-list query:
+No C3 migration was created merely for checkpoint neatness. The hardening report records why existing provenance/event structures are sufficient and why no unsafe historical backfill is performed.
 
-```sql
-AND (:stage_code IS NULL OR stage_code=:stage_code)
-```
+## 4. Web / Android C3 evidence
 
-The failing scenarios are therefore currently blocked by one query implementation defect rather than four independent business-rule failures:
+C3 Web human-flag client contract SHA before workflow-baseline cleanup: `460f73f88035b930ad1565e280b9f6d5524625cd`.
 
-- historical sticky flags after resolution;
-- blocking-completion summary path;
-- machine provenance/full timeline read path;
-- role-capability audit summary path.
+The Web service no longer sends `blockingCompletion` for a human flag.
 
-Required fix: construct an unfiltered query when `stage_code` is absent, or otherwise provide an explicit safe type without relying on an ambiguous NULL bind. Do not weaken the tests.
+Current Web branch cleanup head used for final automated validation: `2c3b7fbb441d8d2dc15cd2438bf5c9f235dc26ec`.
 
----
+That cleanup commit restored `.github/workflows/deploy-uc001-dev.yml` byte-for-byte to the existing current `dev` workflow after earlier temporary C2 branch validation instrumentation. It introduces **no new CI/CD design or behavior** and restores PR mergeability.
 
-## 3. C3 contract hardening item — human flags cannot create completion guards
+Web CI run `32624219327` (run 308): **SUCCESS**.
 
-The current C3 create model still contains:
+- TypeScript typecheck: PASS;
+- production build: PASS.
 
-```text
-blockingCompletion: bool = False
-```
+Android validation run `32624219324` (run 15): **SUCCESS**.
 
-This must be removed/rejected from the human flag creation contract before C3 is considered complete.
+- native Web typecheck/build: PASS;
+- C3 `AuditReviewPage` is present in the generated native bundle (`AuditReviewPage-QUpzittm.js` in the run evidence);
+- Capacitor sync/native configuration: PASS;
+- Camera/native C2 regression contract: PASS;
+- Gradle `lintDebug` + `assembleDebug`: PASS (`BUILD SUCCESSFUL`, 357 actionable tasks);
+- APK verification: PASS;
+- APK SHA-256: `88912bfb94424a3812ec08dde2342bae47cf4e972c51ff74e5cf86d87a9dcf5d`;
+- artifact ID: `9489268035`;
+- artifact digest: `sha256:347e38b16f45022a6d15cad1ff95e6972413e4f2df687b91d367605cb284dc48`;
+- artifact size: `7,963,263` bytes.
 
-Business rule:
+The artifact name remains `verigence-uc03-c2-android-debug` because the Android workflow is frozen during UC03 stabilization. The artifact is nevertheless built from the current C3-inclusive PR merge view and the logs show the C3 Audit Review chunk. The naming mismatch is documented rather than changing CI/CD merely for labeling.
 
-- a PC/TL/PM/Executive human-created observation may raise a flag;
-- a human flag must not self-declare itself as an `AUDIT_COMPLETION_GUARD` merely through client input;
-- completion-blocking semantics belong to configured/published Project policy/rule semantics and machine/configured findings;
-- the C3 test that proves a blocking guard prevents Audit State completion must seed/use a configured or machine guard, not a manually supplied `blockingCompletion=true` value;
-- Web/Android must not expose a completion-blocking toggle.
+## 5. DI regression evidence
 
-This is a contract/authority correction, not a new business feature.
+No C3 DI runtime change was required.
 
----
+Current DI UC03 branch head: `29cdef7d1567422bd2ffdbf7f5926f6bc0f23743`.
 
-## 4. Remaining C3 engineering gates
+CI run `32620797583` (run 204): **SUCCESS**.
 
-1. Fix the unfiltered flag-list PostgreSQL query.
-2. Remove human `blockingCompletion` authority and update the completion-policy acceptance fixture appropriately.
-3. Obtain a fully green Audit Core C3 suite without weakening C0/C1/C2 regression coverage.
-4. Freeze/validate the C3 Audit/Review API contract in the checkpoint.
-5. Confirm no migration is needed; if a migration/index/backfill is genuinely required, follow the migration discipline in handoff v1.1 and record explicit counts/safety analysis.
-6. Run final Web C3 TypeScript typecheck + production build.
-7. Run final Android C3 validation/build and capture APK evidence because the shared Web/mobile review flow changed.
-8. Confirm DI C1/C2 regression remains green; do not change DI for C3 unless a concrete runtime need is proven.
-9. Update the Audit Core, Web and DI draft validation PR descriptions to the current C2/C3 state; keep them draft / DO NOT MERGE.
-10. Update this note with exact final C3 application SHAs, CI run IDs, contract evidence and Android artifact.
+- Ruff/lint: PASS;
+- mypy/typecheck: PASS;
+- tests: **220 passed, 39 skipped, 1 warning**;
+- C1 Booking and C2 Delivery publication boundaries remain intact.
 
-DEV validation, where still required, uses the current CI/CD baseline. **No CI/CD architecture redesign is permitted during UC03 stabilization.** Provider throttling/outage is recorded as an external blocker and retried later using the existing process.
+No DI architecture redesign was introduced.
 
----
+## 6. Migration / backfill / performance / operability review
 
-## 5. C3 acceptance scenarios still to prove green
+See `../UC03_C3_HARDENING_REPORT_2026-08-23.md`.
 
-Automated and later human validation must cover:
+Summary:
+
+- no 0013/0014 migration required for C3 functional correctness;
+- existing 0011 structures already own provenance and append-only finding events;
+- no fabricated historical stage/origin/timestamp backfill;
+- query/index review completed;
+- candidate Journey-specific indexes are documented for measured post-stabilization review rather than added speculatively;
+- if consolidated product/load testing proves latency unacceptable, the index work becomes a pre-promotion defect;
+- existing correlation/error/append-only observability conventions are retained.
+
+## 7. Human UAT — DEFERRED / PENDING
+
+No automated result is represented as human UAT.
+
+Consolidated end-of-UC03 UAT must exercise at minimum:
 
 - machine finding provenance;
 - PC manual finding;
-- TL review/resolve;
-- PM review/resolve;
-- Executive full permitted path including Void under the effective policy;
-- `Audit State = COMPLETE` with `Audit Status = FLAGS_RAISED` where the configured policy permits completion;
-- resolved flags remain historically visible;
-- stale version conflict never silently overwrites review state;
-- idempotency replay never duplicates a finding event;
-- Project/role isolation remains correct;
-- sensitive/internal payload data is not exposed in ordinary UI/history;
-- human-created flags cannot manufacture completion guards;
-- complete cross-stage Booking/Delivery/finding timeline remains ordered and user-safe.
+- TL acknowledge/review/resolve;
+- PM review/resolve/reopen;
+- Executive permitted lifecycle including Void;
+- `Audit State = COMPLETE` with historical `Audit Status = FLAGS_RAISED` when effective policy permits;
+- resolved findings remain historically visible;
+- stale version conflict and retry UX;
+- idempotent action behavior;
+- Project/role isolation;
+- no sensitive/internal data leakage;
+- human flags cannot manufacture completion guards;
+- complete Booking/Delivery/Audit timeline;
+- Android phone, Android tablet and desktop Web usability.
 
----
+## 8. Remaining C3 formal closure gates
 
-## 6. Human UAT — DEFERRED / PENDING
+C3 has no known open product-code defect at this point.
 
-No human C3 UAT result is recorded yet.
+Still pending before formal Phase-1 closure:
 
-The consolidated end-of-UC03 cycle must include representative PC, TL, PM and Executive accounts and exercise the review/lifecycle/history flows on Android phone, Android tablet and desktop Web as applicable.
+1. consolidated DEV validation where required under the existing frozen CI/CD baseline;
+2. Railway evidence currently blocked/pending from the C2 closure path must be retried when the external provider permits it;
+3. consolidated human UAT;
+4. genuine UAT defect fixes/revalidation, if any;
+5. final exact promotion heads after UAT.
 
-No automated result may be converted into a human-UAT pass.
+## 9. C3 decision
 
----
+**C3 ENGINEERING + AUTOMATED VALIDATION: COMPLETE.**  
+**C3 DEV/HUMAN-UAT FORMAL CLOSURE: PENDING.**
 
-## 7. Final product baseline after C3 — working shorthand “C4”
-
-There is no approved C4 business feature checkpoint. Once C3 is fully green, the next gate is the full UC03 product baseline:
-
-```text
-C0 + C1 + C2 + C3
-        ->
-full automated cross-stage regression
-        ->
-Audit Core contract + migration verification
-        ->
-DI regression
-        ->
-Web production build
-        ->
-Android native validation/APK
-        ->
-consolidated human DEV/UAT
-        ->
-defect fixes + revalidation
-        ->
-Phase-1 stable baseline / promotion decision
-```
-
-This final gate must include all deferred C0/C1/C2/C3 human-UAT scenarios and the Phase-1 Definition of Done in handoff v1.1.
-
----
-
-## 8. CI/CD freeze
-
-Per `UC03_EXECUTION_BASELINE_ADDENDUM_2026-08-23.md`, do not redesign or materially change CI/CD until UC03 is stable after the final product regression and consolidated human DEV/UAT.
-
-This applies while resolving every remaining C3 and final-baseline item in this note.
-
----
-
-## 9. Current checkpoint decision
-
-C3 implementation is **not yet closed**.
-
-The immediate engineering sequence is:
-
-```text
-fix flag-list NULL bind
-        ->
-remove human completion-guard authority
-        ->
-full Audit Core green
-        ->
-C3 contract/Web/Android/DI regression
-        ->
-freeze C3 evidence
-        ->
-full C0-C3 product baseline
-        ->
-consolidated human UAT
-```
-
-Do not claim C3 completion until the remaining gates above are actually green and recorded.
+The next activity is the full UC03 automated/product-testing baseline plus consolidated human DEV/UAT. Working shorthand “C4” does not create new functionality.
