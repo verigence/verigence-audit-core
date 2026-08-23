@@ -442,7 +442,7 @@ def test_non_intimation_raises_flag_and_delivery_continues(delivery_setup) -> No
         headers=_headers("delivery-intimation-no-invalid", 1),
         json={"answer": "NO"},
     )
-    assert invalid.status_code == 422, invalid.text
+    assert invalid.status_code == 400, invalid.text
 
     recorded = client.put(
         _delivery_url(setup, journey_id, "intimation"),
