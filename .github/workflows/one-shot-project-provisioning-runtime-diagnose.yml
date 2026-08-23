@@ -1,4 +1,4 @@
-name: One-shot Project provisioning runtime diagnose
+name: One-shot verify Security DEV project provisioning fix
 
 on:
   pull_request:
@@ -10,16 +10,18 @@ permissions:
   contents: read
 
 jobs:
-  diagnose:
-    name: Diagnose live Project provisioning failure
+  verify:
+    name: Wait for and verify Security DEV fix
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 12
     env:
       RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       AUDIT_SERVICE: verigence-audit-core
       SECURITY_SERVICE: security
+      OLD_SECURITY_DEPLOYMENT: 9c10b90f-10de-4266-99ae-94f4cb650a5b
+      SECURITY_PUBLIC_BASE: https://security-dev.up.railway.app
 
     steps:
       - name: Check out
@@ -31,50 +33,71 @@ jobs:
           set -euo pipefail
           npm install --global @railway/cli
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
-          railway status --json >/tmp/status.json
-          railway deployment list --service "$AUDIT_SERVICE" --limit 6 --json >/tmp/audit-deployments.json
-          railway deployment list --service "$SECURITY_SERVICE" --limit 6 --json >/tmp/security-deployments.json
-          python - <<'PY'
+
+      - name: Wait for replacement Security deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 40); do
+            railway deployment list --service "$SECURITY_SERVICE" --limit 1 --json >/tmp/security-latest.json
+            read -r deployment_id deployment_status created_at < <(python - <<'PY'
           import json
           from pathlib import Path
-          for label, path in [('AUDIT', '/tmp/audit-deployments.json'), ('SECURITY', '/tmp/security-deployments.json')]:
-              rows=json.loads(Path(path).read_text())
-              for row in rows:
-                  meta=row.get('meta') if isinstance(row.get('meta'), dict) else {}
-                  print(label + '_DEPLOYMENT|' + '|'.join([
-                      str(row.get('id','')),
-                      str(row.get('status','')),
-                      str(row.get('createdAt') or row.get('created_at') or ''),
-                      str(meta.get('commitHash') or meta.get('commit_hash') or ''),
-                      str(meta.get('commitMessage') or meta.get('commit_message') or ''),
-                  ]))
+          rows=json.loads(Path('/tmp/security-latest.json').read_text())
+          row=rows[0] if rows else {}
+          print(row.get('id',''), row.get('status',''), row.get('createdAt') or row.get('created_at') or '')
+          PY
+          )
+            echo "SECURITY_WAIT|attempt=$attempt|id=$deployment_id|status=$deployment_status|created=$created_at"
+            if [[ -n "$deployment_id" && "$deployment_id" != "$OLD_SECURITY_DEPLOYMENT" ]]; then
+              case "$deployment_status" in
+                SUCCESS)
+                  echo "SECURITY_REPLACEMENT_DEPLOYMENT=PASS"
+                  echo "SECURITY_DEPLOYMENT_ID=$deployment_id"
+                  exit 0
+                  ;;
+                FAILED|CRASHED|REMOVED)
+                  railway logs --service "$SECURITY_SERVICE" --latest --deployment --lines 240 || true
+                  echo "Replacement Security deployment failed: $deployment_status" >&2
+                  exit 1
+                  ;;
+              esac
+            fi
+            sleep 10
+          done
+          echo 'Timed out waiting for replacement Security deployment.' >&2
+          exit 1
+
+      - name: Verify live Security routes respond promptly
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import time
+          import urllib.error
+          import urllib.request
+
+          base='https://security-dev.up.railway.app'
+          checks=[('/health/live',{200}),('/security/v1/platform/admin-context',{401})]
+          for path, expected in checks:
+              start=time.monotonic()
+              req=urllib.request.Request(base+path)
+              try:
+                  with urllib.request.urlopen(req, timeout=5) as response:
+                      code=response.status
+              except urllib.error.HTTPError as exc:
+                  code=exc.code
+              elapsed=time.monotonic()-start
+              print(f'SECURITY_ROUTE|{path}|HTTP_{code}|{elapsed:.3f}s')
+              if code not in expected:
+                  raise SystemExit(f'{path} returned unexpected HTTP {code}')
+              if elapsed >= 5:
+                  raise SystemExit(f'{path} exceeded prompt-response budget: {elapsed:.3f}s')
+          print('SECURITY_PUBLIC_ROUTES=PASS')
           PY
 
-      - name: Read Audit Core provisioning logs
+      - name: Show replacement Security application log tail
         shell: bash
         run: |
           set -euo pipefail
-          railway logs --service "$AUDIT_SERVICE" --since 3h --lines 2500 >/tmp/audit.log 2>&1 || true
-          echo '--- AUDIT CORE PROJECT PROVISIONING EVENTS ---'
-          grep -Ei 'MahindraWest|project_provision|project_create|security_admin|administrative_operation|SECURITY_ADMIN_FAILED|RECOVERY_REQUIRED|VAC-SYS-002|/v1/projects' /tmp/audit.log | tail -n 500 || true
-          echo '--- AUDIT CORE ERROR TAIL ---'
-          grep -Ei 'error|warning|exception|traceback|failed|recovery' /tmp/audit.log | tail -n 500 || true
-
-      - name: Read Audit Core projects HTTP logs
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo '--- AUDIT CORE /v1/projects HTTP ---'
-          railway logs --service "$AUDIT_SERVICE" --http --path /v1/projects --since 3h --json 2>/tmp/audit-http.err | tail -n 300 || true
-          cat /tmp/audit-http.err >&2 || true
-
-      - name: Read Security tenant creation HTTP logs
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo '--- SECURITY TENANT CREATE HTTP ---'
-          railway logs --service "$SECURITY_SERVICE" --http --path /security/v1/platform/tenants --since 3h --json 2>/tmp/security-http.err | tail -n 400 || true
-          cat /tmp/security-http.err >&2 || true
-          echo '--- SECURITY RELEVANT APP LOGS ---'
-          railway logs --service "$SECURITY_SERVICE" --since 3h --lines 2500 >/tmp/security.log 2>&1 || true
-          grep -Ei 'platform/tenants|tenant|admin-context|AUTH_TOKEN|PERMISSION|401|403|409|422|500|exception|error' /tmp/security.log | tail -n 600 || true
+          railway logs --service "$SECURITY_SERVICE" --latest --deployment --lines 180 || true
