@@ -1,0 +1,69 @@
+name: One-shot Project Admin runtime diagnose
+
+on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - .github/workflows/one-shot-project-admin-runtime-diagnose.yml
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    name: Diagnose deployed Project Administration failure
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      SECURITY_PUBLIC_BASE: https://security-dev.up.railway.app
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Probe deployed Security admin routes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for path in /security/v1/platform/admin-context /security/v1/platform/me /health/live; do
+            code="$(curl --silent --show-error --output /tmp/body --write-out '%{http_code}' "$SECURITY_PUBLIC_BASE$path" || true)"
+            body="$(cat /tmp/body 2>/dev/null | head -c 300 || true)"
+            echo "SECURITY_PROBE|$path|HTTP_$code|$body"
+          done
+
+      - name: Install Railway CLI and inspect DEV target
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global @railway/cli
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway status --json >/tmp/status.json
+          railway service list --json >/tmp/services.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          status=json.loads(Path('/tmp/status.json').read_text())
+          services=json.loads(Path('/tmp/services.json').read_text())
+          variables=json.loads(Path('/tmp/audit-vars.json').read_text())
+          print('RAILWAY_PROJECT_ID=' + str(status.get('id','')))
+          print('RAILWAY_SERVICES=' + ','.join(sorted(str(row.get('name','')) for row in services if row.get('name'))))
+          for key in ('APP_ENV','SECURITY_BASE_URL','SECURITY_JWKS_URL','SECURITY_ISSUER','SECURITY_AUDIENCE','RAILWAY_PUBLIC_DOMAIN'):
+              value=str(variables.get(key,'')).strip()
+              if key in {'SECURITY_JWKS_URL','SECURITY_ISSUER','SECURITY_AUDIENCE','SECURITY_BASE_URL','RAILWAY_PUBLIC_DOMAIN','APP_ENV'}:
+                  print(f'AUDIT_CONFIG|{key}|{value}')
+          PY
+
+      - name: Read recent Audit Core deployment logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 600 >/tmp/audit.log 2>&1 || true
+          echo '--- PROJECT ADMIN RELEVANT AUDIT CORE LOGS ---'
+          grep -Ei 'security_admin|admin-context|platform/me|/v1/projects|project administration|dependency|PERMISSION|401|403|404|500|503' /tmp/audit.log | tail -n 180 || true
+          echo '--- AUDIT CORE LOG TAIL ---'
+          tail -n 80 /tmp/audit.log || true
