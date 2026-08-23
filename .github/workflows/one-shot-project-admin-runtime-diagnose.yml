@@ -19,6 +19,7 @@ jobs:
       RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       AUDIT_SERVICE: verigence-audit-core
+      SECURITY_SERVICE: security
       SECURITY_PUBLIC_BASE: https://security-dev.up.railway.app
 
     steps:
@@ -44,26 +45,54 @@ jobs:
           railway status --json >/tmp/status.json
           railway service list --json >/tmp/services.json
           railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          railway deployment list --service "$AUDIT_SERVICE" --limit 10 --json >/tmp/deployments.json
           python - <<'PY'
           import json
           from pathlib import Path
           status=json.loads(Path('/tmp/status.json').read_text())
           services=json.loads(Path('/tmp/services.json').read_text())
           variables=json.loads(Path('/tmp/audit-vars.json').read_text())
+          deployments=json.loads(Path('/tmp/deployments.json').read_text())
           print('RAILWAY_PROJECT_ID=' + str(status.get('id','')))
           print('RAILWAY_SERVICES=' + ','.join(sorted(str(row.get('name','')) for row in services if row.get('name'))))
           for key in ('APP_ENV','SECURITY_BASE_URL','SECURITY_JWKS_URL','SECURITY_ISSUER','SECURITY_AUDIENCE','RAILWAY_PUBLIC_DOMAIN'):
-              value=str(variables.get(key,'')).strip()
-              if key in {'SECURITY_JWKS_URL','SECURITY_ISSUER','SECURITY_AUDIENCE','SECURITY_BASE_URL','RAILWAY_PUBLIC_DOMAIN','APP_ENV'}:
-                  print(f'AUDIT_CONFIG|{key}|{value}')
+              print(f'AUDIT_CONFIG|{key}|{str(variables.get(key,"")).strip()}')
+          for row in deployments:
+              meta=row.get('meta') if isinstance(row.get('meta'), dict) else {}
+              print('AUDIT_DEPLOYMENT|' + '|'.join([
+                  str(row.get('id','')),
+                  str(row.get('status','')),
+                  str(row.get('createdAt') or row.get('created_at') or ''),
+                  str(meta.get('commitHash') or meta.get('commit_hash') or ''),
+                  str(meta.get('commitMessage') or meta.get('commit_message') or ''),
+              ]))
           PY
 
-      - name: Read recent Audit Core deployment logs
+      - name: Read active successful Audit Core deploy logs
         shell: bash
         run: |
           set -euo pipefail
-          railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 600 >/tmp/audit.log 2>&1 || true
-          echo '--- PROJECT ADMIN RELEVANT AUDIT CORE LOGS ---'
-          grep -Ei 'security_admin|admin-context|platform/me|/v1/projects|project administration|dependency|PERMISSION|401|403|404|500|503' /tmp/audit.log | tail -n 180 || true
-          echo '--- AUDIT CORE LOG TAIL ---'
-          tail -n 80 /tmp/audit.log || true
+          railway logs --service "$AUDIT_SERVICE" --lines 800 >/tmp/audit-success.log 2>&1 || true
+          echo '--- ACTIVE SUCCESSFUL AUDIT CORE RELEVANT LOGS ---'
+          grep -Ei 'security_admin|admin-context|platform/me|/v1/projects|project administration|dependency|PERMISSION|AUTH|401|403|404|500|502|503' /tmp/audit-success.log | tail -n 260 || true
+          echo '--- ACTIVE SUCCESSFUL AUDIT CORE LOG TAIL ---'
+          tail -n 100 /tmp/audit-success.log || true
+
+      - name: Read Audit Core HTTP requests for projects
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '--- AUDIT CORE /v1/projects HTTP LOGS ---'
+          railway logs --service "$AUDIT_SERVICE" --http --path /v1/projects --since 6h --json 2>/tmp/audit-http.err | tail -n 120 || true
+          cat /tmp/audit-http.err >&2 || true
+
+      - name: Read Security admin-context HTTP logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '--- SECURITY /admin-context HTTP LOGS ---'
+          railway logs --service "$SECURITY_SERVICE" --http --path /security/v1/platform/admin-context --since 6h --json 2>/tmp/security-http.err | tail -n 160 || true
+          cat /tmp/security-http.err >&2 || true
+          echo '--- SECURITY DEPLOY LOGS RELATED TO AUTH ---'
+          railway logs --service "$SECURITY_SERVICE" --lines 800 >/tmp/security.log 2>&1 || true
+          grep -Ei 'admin-context|AUTH_TOKEN|PERMISSION|401|403|500|exception|error' /tmp/security.log | tail -n 220 || true
