@@ -30,11 +30,22 @@ logger = structlog.get_logger(__name__)
 
 _bearer = HTTPBearer(auto_error=False)
 
-# These GETs expose read-only reference/master data. They require a valid human
-# token, but do not require a live Security SuperAdmin round-trip merely because
-# they are surfaced from Project Administration.
+# These GETs are read-only Project Administration paths. They still require a
+# cryptographically valid human token, but do not perform a separate live
+# /platform/admin-context SuperAdmin attestation merely to render existing state.
+# Where a downstream Security directory is involved (for example /v1/projects),
+# that downstream endpoint remains authoritative for its own access policy.
 _LIGHTWEIGHT_AUTHENTICATED_READS = (
+    re.compile(r"^/v1/projects/?$"),
     re.compile(r"^/v1/project-reference-data/?$"),
+    re.compile(r"^/v1/tenants/[^/]+/project/?$"),
+    re.compile(r"^/v1/tenants/[^/]+/project/readiness/?$"),
+    re.compile(r"^/v1/tenants/[^/]+/dealers/?$"),
+    re.compile(r"^/v1/tenants/[^/]+/dealers/[^/]+/?$"),
+    re.compile(r"^/v1/tenants/[^/]+/dealers/[^/]+/outlets/?$"),
+    re.compile(r"^/v1/tenants/[^/]+/dealers/[^/]+/outlets/[^/]+/?$"),
+    re.compile(r"^/v1/tenants/[^/]+/role-mapping-candidates/?$"),
+    re.compile(r"^/v1/tenants/[^/]+/role-mappings/?$"),
     re.compile(r"^/v1/tenants/[^/]+/project-masters/?$"),
     re.compile(r"^/v1/tenants/[^/]+/project-masters/[^/]+/[^/]+/versions/?$"),
     re.compile(r"^/v1/tenants/[^/]+/project-masters/DI/[^/]+/template/?$"),
