@@ -12,7 +12,7 @@ permissions:
 jobs:
   e2e:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 10
     env:
       RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
@@ -27,52 +27,96 @@ jobs:
       - run: |
           python -m pip install 'psycopg[binary]>=3.2,<4' 'PyJWT>=2.8,<3' 'cryptography>=42,<46' 'httpx>=0.27,<1'
           npm install --global @railway/cli
-      - name: Verify live Security create latency
+      - name: Collect live DEV variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service verigence-audit-core --json >/dev/null
+          railway variable list --service security --environment dev --json >/tmp/security.json
+          railway variable list --service verigence-audit-core --environment dev --json >/tmp/audit.json
+          railway variable list --service di-api --environment dev --json >/tmp/di.json
+      - name: Run full live Project Create
         shell: bash
         run: |
           set +e
-          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service security --json >/dev/null
-          railway variable list --service security --environment dev --json >/tmp/security.json
           python - <<'PY'
           import json,time,uuid,traceback
           from datetime import UTC,datetime,timedelta
           from pathlib import Path
           import httpx,jwt,psycopg
-          out=['LIVE_PROJECT_CREATE_E2E','MODE=SECURITY_CREATE_LATENCY_VERIFY']
+
+          def load(path): return json.loads(Path(path).read_text())
+          def pg(value): return str(value or '').replace('postgresql+psycopg://','postgresql://',1).replace('postgresql+asyncpg://','postgresql://',1)
+          def base(v):
+              d=str(v.get('RAILWAY_PUBLIC_DOMAIN') or v.get('RAILWAY_STATIC_URL') or '').strip()
+              if not d.startswith(('http://','https://')): d='https://'+d
+              return d.rstrip('/')
+
+          out=['LIVE_PROJECT_CREATE_E2E','MODE=FULL_PROJECT_CREATE_AFTER_SECURITY_OPTIMIZATION']
+          tenant_id=''
+          token=''
           try:
-              v=json.loads(Path('/tmp/security.json').read_text())
-              db=str(v.get('DATABASE_URL') or '').replace('postgresql+psycopg://','postgresql://',1).replace('postgresql+asyncpg://','postgresql://',1)
-              domain=str(v.get('RAILWAY_PUBLIC_DOMAIN') or v.get('RAILWAY_STATIC_URL') or '').strip()
-              if not domain.startswith(('http://','https://')): domain='https://'+domain
-              with psycopg.connect(db) as conn:
+              sv,av,dv=load('/tmp/security.json'),load('/tmp/audit.json'),load('/tmp/di.json')
+              sdb,adb=pg(sv.get('DATABASE_URL')),pg(av.get('DATABASE_URL'))
+              with psycopg.connect(sdb) as conn:
                   with conn.cursor() as cur:
                       cur.execute("SELECT a.user_id::text FROM security.user_admin_role_assignments a JOIN security.users u ON u.user_id=a.user_id WHERE a.role_key='SuperAdmin' AND a.scope_type='PLATFORM' AND a.scope_id IS NULL AND a.status='ACTIVE' AND u.status='ACTIVE' ORDER BY a.assigned_at_utc LIMIT 1")
                       uid=cur.fetchone()[0]
               now=datetime.now(UTC)
-              token=jwt.encode({'iss':str(v.get('SECURITY_TOKEN_ISSUER') or 'verigence-security'),'sub':uid,'aud':str(v.get('SECURITY_TOKEN_AUDIENCE') or 'verigence-platform'),'iat':now,'exp':now+timedelta(minutes=5),'jti':str(uuid.uuid4()),'actor_type':'USER'},str(v.get('SECURITY_PRIVATE_KEY_PEM') or '').replace('\\n','\n'),algorithm='RS256',headers={'kid':str(v.get('SECURITY_KEY_ID') or '')})
-              headers={'Authorization':'Bearer '+token,'Idempotency-Key':str(uuid.uuid4()),'Content-Type':'application/json'}
-              name='SEC-LATENCY-'+now.strftime('%Y%m%d%H%M%S')
-              started=time.monotonic()
+              token=jwt.encode({'iss':str(sv.get('SECURITY_TOKEN_ISSUER') or 'verigence-security'),'sub':uid,'aud':str(sv.get('SECURITY_TOKEN_AUDIENCE') or 'verigence-platform'),'iat':now,'exp':now+timedelta(minutes=8),'jti':str(uuid.uuid4()),'actor_type':'USER'},str(sv.get('SECURITY_PRIVATE_KEY_PEM') or '').replace('\\n','\n'),algorithm='RS256',headers={'kid':str(sv.get('SECURITY_KEY_ID') or '')})
+              with psycopg.connect(adb) as conn:
+                  with conn.cursor() as cur:
+                      cur.execute("SELECT oem_id::text FROM auditcore.oems WHERE is_active=true ORDER BY oem_code LIMIT 1")
+                      oem=cur.fetchone()[0]
+                      cur.execute("SELECT product_category_id::text FROM auditcore.product_categories WHERE is_active=true ORDER BY category_code LIMIT 1")
+                      cat=cur.fetchone()[0]
+              headers={'Authorization':'Bearer '+token}
+              audit=base(av)
               with httpx.Client(timeout=90,follow_redirects=True) as client:
-                  r=client.post(domain.rstrip('/')+'/security/v1/platform/tenants',headers=headers,json={'tenantName':name})
+                  g=client.get(audit+'/v1/projects',headers=headers)
+                  out.append('GET_PROJECTS_HTTP='+str(g.status_code))
+                  payload={'projectName':'E2E-FULL-'+now.strftime('%Y%m%d%H%M%S'),'oemId':oem,'productCategoryId':cat,'effectiveStartDate':now.date().isoformat(),'effectiveEndDate':None,'timezoneName':'Asia/Kolkata','regionCode':'IN'}
+                  started=time.monotonic()
+                  r=client.post(audit+'/v1/projects',headers={**headers,'Idempotency-Key':str(uuid.uuid4()),'Content-Type':'application/json'},json=payload)
                   elapsed=time.monotonic()-started
-                  out.append('SECURITY_CREATE_HTTP='+str(r.status_code))
-                  out.append('SECURITY_CREATE_SECONDS='+f'{elapsed:.3f}')
+                  out.append('CREATE_PROJECT_HTTP='+str(r.status_code))
+                  out.append('CREATE_PROJECT_SECONDS='+f'{elapsed:.3f}')
                   try: body=r.json()
                   except Exception: body={}
-                  out.append('SECURITY_CREATE_BODY='+json.dumps(body,sort_keys=True)[:1000].replace('\n',' '))
-                  tid=str(body.get('tenantId') or '') if isinstance(body,dict) else ''
-                  if tid:
-                      d=client.delete(domain.rstrip('/')+'/security/v1/platform/tenants/'+tid,headers={'Authorization':'Bearer '+token})
-                      out.append('SECURITY_CLEANUP_HTTP='+str(d.status_code))
-              out.append('RESULT='+('PASS' if r.status_code==201 and elapsed<20 else 'FAIL'))
+                  out.append('CREATE_PROJECT_BODY='+json.dumps(body,sort_keys=True)[:1600].replace('\n',' '))
+                  tenant_id=str(body.get('tenantId') or '') if isinstance(body,dict) else ''
+                  out.append('TENANT_ID='+tenant_id)
+                  success=(r.status_code==201 and body.get('provisioningStatus')=='READY' and body.get('currentStep')=='COMPLETE')
+                  out.append('RESULT='+('PASS' if success else 'FAIL'))
           except Exception as exc:
               out.append('RESULT=FATAL')
               out.append('FATAL_TYPE='+type(exc).__name__)
               out.append('FATAL_MESSAGE='+str(exc)[:800].replace('\n',' '))
               out.append('TRACE_LAST='+traceback.format_exc().splitlines()[-1][:800])
-          Path('docs/runtime/live-project-create-e2e.txt').write_text('\n'.join(out)+'\n')
-          print('\n'.join(out))
+          finally:
+              if tenant_id and token:
+                  try:
+                      with httpx.Client(timeout=30,follow_redirects=True) as client:
+                          d=client.delete(base(dv)+f'/v1/tenants/{tenant_id}/admin/provisioning',headers={'Authorization':'Bearer '+token})
+                          out.append('DI_CLEANUP_HTTP='+str(d.status_code))
+                  except Exception as exc:
+                      out.append('DI_CLEANUP_ERROR='+type(exc).__name__)
+                  try:
+                      with psycopg.connect(pg(av.get('DATABASE_URL'))) as conn:
+                          with conn.cursor() as cur:
+                              cur.execute('DELETE FROM auditcore.projects WHERE tenant_id=%s',(tenant_id,))
+                              out.append('AUDIT_CLEANUP_ROWS='+str(cur.rowcount))
+                          conn.commit()
+                  except Exception as exc:
+                      out.append('AUDIT_CLEANUP_ERROR='+type(exc).__name__+':'+str(exc)[:300])
+                  try:
+                      with httpx.Client(timeout=30,follow_redirects=True) as client:
+                          s=client.delete(base(sv)+f'/security/v1/platform/tenants/{tenant_id}',headers={'Authorization':'Bearer '+token})
+                          out.append('SECURITY_CLEANUP_HTTP='+str(s.status_code))
+                  except Exception as exc:
+                      out.append('SECURITY_CLEANUP_ERROR='+type(exc).__name__)
+              Path('docs/runtime/live-project-create-e2e.txt').write_text('\n'.join(out)+'\n')
+              print('\n'.join(out))
           PY
       - name: Record evidence
         if: always()
@@ -82,6 +126,6 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add docs/runtime/live-project-create-e2e.txt
-          git commit -m 'docs(dev): record Security create latency verification [skip ci]'
+          git commit -m 'docs(dev): record full live Project Create result [skip ci]'
           git pull --rebase origin dev
           git push origin HEAD:dev
