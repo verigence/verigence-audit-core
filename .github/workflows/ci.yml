@@ -11,7 +11,7 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   quality:
@@ -175,4 +175,14 @@ jobs:
       github.ref == 'refs/heads/dev' &&
       needs.quality.result == 'success'
     uses: ./.github/workflows/audit-core-dev-deploy.yml
+    secrets: inherit
+
+  diagnose-security-create:
+    name: Diagnose live Security tenant create
+    needs: deploy-dev
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/dev' &&
+      needs.deploy-dev.result == 'success'
+    uses: ./.github/workflows/one-shot-security-create-fast.yml
     secrets: inherit
