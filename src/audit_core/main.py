@@ -37,7 +37,9 @@ from audit_core.uc03_booking_capture import router as uc03_booking_capture_route
 from audit_core.uc03_booking_commands import router as uc03_booking_router
 from audit_core.uc03_booking_evidence import router as uc03_booking_evidence_router
 from audit_core.uc03_booking_exchange import router as uc03_booking_exchange_router
-from audit_core.uc03_booking_integrations import router as uc03_booking_integrations_router
+from audit_core.uc03_booking_integrations import (
+    router as uc03_booking_integrations_router,
+)
 from audit_core.uc03_document_assessments import (
     router as uc03_document_assessments_router,
 )

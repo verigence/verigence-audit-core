@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Request, Response
@@ -13,7 +13,12 @@ from sqlalchemy import Connection, text
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.di_client import DiClient, DiClientError
-from audit_core.errors import AuditCoreError, ConflictError, DependencyUnavailableError, NotFoundError
+from audit_core.errors import (
+    AuditCoreError,
+    ConflictError,
+    DependencyUnavailableError,
+    NotFoundError,
+)
 from audit_core.evidence import get_di_client, get_security_oauth_client
 from audit_core.idempotency import execute_idempotent_json_command
 from audit_core.observability import get_correlation_id

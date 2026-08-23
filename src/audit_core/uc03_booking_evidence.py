@@ -36,8 +36,10 @@ from audit_core.uc03_booking_commands import (
     _aggregate_lock,
     _append_workflow_event,
     _authorize_security,
-    _journey_context as _booking_journey_context,
     _stage_state,
+)
+from audit_core.uc03_booking_commands import (
+    _journey_context as _booking_journey_context,
 )
 
 router = APIRouter(
