@@ -1,5 +1,6 @@
 name: UC03 C1 Audit Core DEV Validation
 
+# Branch-safe C1 deployment evidence; this does not merge the planning branch into dev.
 on:
   pull_request:
     branches:
