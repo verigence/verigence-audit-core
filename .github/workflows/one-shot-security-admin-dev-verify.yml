@@ -1,4 +1,4 @@
-name: One-shot Security Admin DEV verify
+name: One-shot restore DEV Security admin contract
 
 on:
   push:
@@ -11,72 +11,35 @@ permissions:
   contents: write
 
 jobs:
-  contract:
-    name: Verify Security admin contract
+  restore:
+    name: Restore admin-context contract and self-clean
     runs-on: ubuntu-24.04
     steps:
-      - name: Check out exact revision
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install test dependencies
-        run: python -m pip install -e '.[test,lint]'
-
-      - name: Lint changed contract files
-        run: ruff check src/audit_core/security_integration.py tests/test_uc02_admin_security.py
-
-      - name: Run Security admin regression tests
-        run: pytest -q tests/test_uc02_admin_security.py
-
-  deploy:
-    name: Deploy verified Audit Core to Railway DEV
-    needs: contract
-    uses: ./.github/workflows/audit-core-dev-deploy.yml
-    secrets: inherit
-
-  report:
-    name: Record DEV verification result
-    if: always()
-    needs:
-      - contract
-      - deploy
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check out DEV
+      - name: Check out DEV with history
         uses: actions/checkout@v4
         with:
           ref: dev
+          fetch-depth: 0
 
-      - name: Record verification result
-        env:
-          VERIFIED_SHA: ${{ github.sha }}
-          CONTRACT_RESULT: ${{ needs.contract.result }}
-          DEPLOY_RESULT: ${{ needs.deploy.result }}
+      - name: Restore canonical DEV contract and remove temporary evidence
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p docs/runtime
-          if [[ "$CONTRACT_RESULT" == "success" && "$DEPLOY_RESULT" == "success" ]]; then
-            final=PASS
-          else
-            final=FAIL
-          fi
-          cat > docs/runtime/security-admin-dev-verified.txt <<EOF
-          SECURITY_ADMIN_DEV_VERIFIED=${final}
-          SOURCE_SHA=${VERIFIED_SHA}
-          CONTRACT_RESULT=${CONTRACT_RESULT}
-          DEPLOY_RESULT=${DEPLOY_RESULT}
-          SECURITY_ADMIN_ENDPOINT=/security/v1/platform/me
-          SUPER_ADMIN_ROLE=platform.super_admin
-          EOF
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add docs/runtime/security-admin-dev-verified.txt
-          if git diff --cached --quiet; then
-            exit 0
-          fi
-          git commit -m '[skip ci] chore: record Security admin DEV verification'
+
+          # These two commits were an investigation detour based on Security main.
+          # DEV Security's actual source-of-truth contract remains /platform/admin-context.
+          git revert --no-commit da9368bb6f140364b06e87b804d5c12f039919c3
+          git revert --no-commit d07b7642e29466dc40c61f586dc30e3f81cc9a91
+
+          git rm -f docs/runtime/security-admin-dev-verified.txt || true
+          git rm -f .github/workflows/one-shot-security-admin-dev-verify.yml
+
+          grep -Fq '/security/v1/platform/admin-context' src/audit_core/security_integration.py
+          grep -Fq 'isSuperAdmin' src/audit_core/security_integration.py
+          grep -Fq '/security/v1/platform/admin-context' tests/test_uc02_admin_security.py
+
+          git add src/audit_core/security_integration.py tests/test_uc02_admin_security.py
+          git commit -m 'fix: restore DEV Security admin-context contract [skip ci]'
           git push origin HEAD:dev
