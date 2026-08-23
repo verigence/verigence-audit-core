@@ -12,252 +12,96 @@ permissions:
 jobs:
   e2e:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
     env:
       RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       SECURITY_SERVICE: security
-      AUDIT_SERVICE: verigence-audit-core
-      DI_SERVICE: di-api
-      E2E_RUN_REASON: exact-source-audit-core-redeploy
-
     steps:
       - uses: actions/checkout@v4
         with:
           ref: dev
           fetch-depth: 0
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
       - name: Install tooling
         run: |
           python -m pip install 'psycopg[binary]>=3.2,<4' 'PyJWT>=2.8,<3' 'cryptography>=42,<46' 'httpx>=0.27,<1'
           npm install --global @railway/cli
-
-      - name: Collect live DEV service metadata
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "${RAILWAY_API_TOKEN:-}"
-          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
-          for svc in "$SECURITY_SERVICE" "$AUDIT_SERVICE" "$DI_SERVICE"; do
-            safe="$(echo "$svc" | tr '-' '_')"
-            railway variable list --service "$svc" --json >"/tmp/${safe}_vars.json"
-            railway deployment list --service "$svc" --limit 1 --json >"/tmp/${safe}_deploy.json"
-          done
-
-      - name: Run authenticated live Project Create transaction
+      - name: Direct live Security tenant-create probe
         shell: bash
         run: |
           set +e
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$SECURITY_SERVICE" --json >/dev/null
+          railway variable list --service "$SECURITY_SERVICE" --environment dev --json >/tmp/security.json
           python - <<'PY'
-          from __future__ import annotations
-
-          import json
-          import traceback
-          import uuid
+          import json, uuid, traceback
           from datetime import UTC, datetime, timedelta
           from pathlib import Path
+          import httpx, jwt, psycopg
 
-          import httpx
-          import jwt
-          import psycopg
-
-          OUT = Path('docs/runtime/live-project-create-e2e.txt')
-          OUT.parent.mkdir(parents=True, exist_ok=True)
-          lines = ['LIVE_PROJECT_CREATE_E2E']
-
-          def write() -> None:
-              OUT.write_text('\n'.join(lines) + '\n')
-              print('\n'.join(lines))
-
-          def load(path: str):
-              return json.loads(Path(path).read_text())
-
-          def pg(value: object) -> str:
-              return str(value or '').replace('postgresql+psycopg://','postgresql://',1).replace('postgresql+asyncpg://','postgresql://',1)
-
-          def base(values: dict) -> str:
-              value = str(values.get('RAILWAY_PUBLIC_DOMAIN') or values.get('RAILWAY_STATIC_URL') or '').strip()
-              if not value:
-                  raise RuntimeError('public domain missing')
-              if not value.startswith(('http://','https://')):
-                  value = 'https://' + value
-              return value.rstrip('/')
-
-          def add_http(prefix: str, response: httpx.Response) -> dict:
-              lines.append(f'{prefix}_HTTP={response.status_code}')
-              lines.append(f'{prefix}_CORRELATION_ID={response.headers.get("x-correlation-id", "") or "NONE"}')
-              try:
-                  body = response.json()
-              except Exception:
-                  body = {}
-              if isinstance(body, dict):
-                  code = body.get('errorCode') or body.get('code') or body.get('error') or ''
-                  detail = body.get('detail') or body.get('errorMessage') or body.get('message') or ''
-                  if code:
-                      lines.append(f'{prefix}_ERROR_CODE={str(code)[:160]}')
-                  if detail:
-                      lines.append(f'{prefix}_ERROR_DETAIL={str(detail)[:500].replace(chr(10), " ")}')
-              return body if isinstance(body, dict) else {}
-
+          out=['LIVE_PROJECT_CREATE_E2E','MODE=DIRECT_SECURITY_CREATE']
           try:
-              sv = load('/tmp/security_vars.json')
-              av = load('/tmp/verigence_audit_core_vars.json')
-              dv = load('/tmp/di_api_vars.json')
-
-              for name, path in [('SECURITY','/tmp/security_deploy.json'),('AUDIT_CORE','/tmp/verigence_audit_core_deploy.json'),('DI','/tmp/di_api_deploy.json')]:
-                  rows = load(path)
-                  row = rows[0] if rows else {}
-                  lines.append(f'{name}_DEPLOYMENT_STATUS={row.get("status") or "UNKNOWN"}')
-                  lines.append(f'{name}_DEPLOYMENT_CREATED_AT={row.get("createdAt") or "UNKNOWN"}')
-
-              su = pg(sv.get('DATABASE_URL'))
-              au = pg(av.get('DATABASE_URL'))
-              du = pg(dv.get('DI_DATABASE_URL') or dv.get('DATABASE_URL'))
-              if not su or not au or not du:
-                  raise RuntimeError('one or more DEV database URLs are missing')
-
-              with psycopg.connect(su) as conn:
+              v=json.loads(Path('/tmp/security.json').read_text())
+              db=str(v.get('DATABASE_URL') or '').replace('postgresql+psycopg://','postgresql://',1).replace('postgresql+asyncpg://','postgresql://',1)
+              domain=str(v.get('RAILWAY_PUBLIC_DOMAIN') or v.get('RAILWAY_STATIC_URL') or '').strip()
+              if not domain.startswith(('http://','https://')):
+                  domain='https://'+domain
+              base=domain.rstrip('/')
+              with psycopg.connect(db) as conn:
                   with conn.cursor() as cur:
-                      cur.execute("""
-                          SELECT a.user_id::text
-                          FROM security.user_admin_role_assignments a
-                          JOIN security.users u ON u.user_id=a.user_id
-                          WHERE a.role_key='SuperAdmin'
-                            AND a.scope_type='PLATFORM'
-                            AND a.scope_id IS NULL
-                            AND a.status='ACTIVE'
-                            AND u.status='ACTIVE'
-                          ORDER BY a.assigned_at_utc
-                          LIMIT 1
-                      """)
-                      row = cur.fetchone()
-              if not row:
-                  raise RuntimeError('no active PLATFORM SuperAdmin exists in Security DEV')
-              user_id = row[0]
-              lines.append('SUPERADMIN_LOOKUP=PASS')
+                      cur.execute("SELECT a.user_id::text FROM security.user_admin_role_assignments a JOIN security.users u ON u.user_id=a.user_id WHERE a.role_key='SuperAdmin' AND a.scope_type='PLATFORM' AND a.scope_id IS NULL AND a.status='ACTIVE' AND u.status='ACTIVE' ORDER BY a.assigned_at_utc LIMIT 1")
+                      row=cur.fetchone(); uid=row[0] if row else ''
+                      cur.execute("SELECT role_key,count(*) FROM security.platform_role_permission_defaults d JOIN security.permissions p ON p.permission_key=d.permission_key WHERE d.status='ACTIVE' AND p.status='ACTIVE' AND d.role_key IN ('PC','TL','PM','CRM','Executive') GROUP BY role_key ORDER BY role_key")
+                      role_counts=cur.fetchall()
+                      cur.execute("SELECT count(*) FROM security.platform_role_permission_defaults d JOIN security.permissions p ON p.permission_key=d.permission_key WHERE d.status='ACTIVE' AND p.status='ACTIVE' AND d.role_key IN ('PC','TL','PM','CRM','Executive')")
+                      total=int(cur.fetchone()[0])
+                      cur.execute("SELECT count(*) FROM security.permissions WHERE module_key='security' AND status='ACTIVE'")
+                      security_perm_count=int(cur.fetchone()[0])
+              out.append('SUPERADMIN_LOOKUP='+('PASS' if uid else 'FAIL'))
+              out.append('ROLE_DEFAULT_COUNTS='+';'.join(f'{r}:{c}' for r,c in role_counts))
+              out.append(f'ROLE_DEFAULT_TOTAL={total}')
+              out.append(f'ACTIVE_SECURITY_PERMISSION_COUNT={security_perm_count}')
 
-              private_key = str(sv.get('SECURITY_PRIVATE_KEY_PEM') or '').replace('\\n','\n')
-              key_id = str(sv.get('SECURITY_KEY_ID') or '')
-              issuer = str(sv.get('SECURITY_TOKEN_ISSUER') or 'verigence-security')
-              audience = str(sv.get('SECURITY_TOKEN_AUDIENCE') or 'verigence-platform')
-              if not private_key or not key_id:
-                  raise RuntimeError('Security signing configuration is incomplete')
-
-              now = datetime.now(UTC)
-              token = jwt.encode({
-                  'iss': issuer,
-                  'sub': user_id,
-                  'aud': audience,
-                  'iat': now,
-                  'exp': now + timedelta(minutes=10),
-                  'jti': str(uuid.uuid4()),
-                  'actor_type': 'USER',
-              }, private_key, algorithm='RS256', headers={'kid': key_id})
-              lines.append('SYNTHETIC_HUMAN_TOKEN=PASS')
-
-              with psycopg.connect(au) as conn:
-                  with conn.cursor() as cur:
-                      cur.execute("SELECT oem_id::text FROM auditcore.oems WHERE is_active=true ORDER BY oem_code LIMIT 1")
-                      oem = cur.fetchone()
-                      cur.execute("SELECT product_category_id::text FROM auditcore.product_categories WHERE is_active=true ORDER BY category_code LIMIT 1")
-                      category = cur.fetchone()
-              if not oem or not category:
-                  raise RuntimeError('Audit Core active OEM/Product Category reference data is missing')
-              lines.append('REFERENCE_DATA_LOOKUP=PASS')
-
-              audit_base = base(av)
-              headers = {'Authorization': f'Bearer {token}'}
-              with httpx.Client(timeout=35.0, follow_redirects=True) as client:
-                  response = client.get(audit_base + '/v1/projects', headers=headers)
-                  add_http('GET_PROJECTS', response)
-                  lines.append('GET_PROJECTS_RESULT=' + ('PASS' if response.status_code == 200 else 'FAIL'))
-
-                  project_name = 'E2E-AUTO-' + datetime.now(UTC).strftime('%Y%m%d%H%M%S')
-                  idem = str(uuid.uuid4())
-                  payload = {
-                      'projectName': project_name,
-                      'oemId': oem[0],
-                      'productCategoryId': category[0],
-                      'effectiveStartDate': datetime.now(UTC).date().isoformat(),
-                      'effectiveEndDate': None,
-                      'timezoneName': 'Asia/Kolkata',
-                      'regionCode': 'IN',
-                  }
-                  response = client.post(
-                      audit_base + '/v1/projects',
-                      headers={**headers, 'Idempotency-Key': idem, 'Content-Type': 'application/json'},
-                      json=payload,
-                  )
-                  body = add_http('CREATE_PROJECT', response)
-                  lines.append('CREATE_PROJECT_RESULT=' + ('PASS' if response.status_code == 201 else 'FAIL'))
-                  if response.status_code == 201:
-                      lines.append('CREATE_PROJECT_PROVISIONING_STATUS=' + str(body.get('provisioningStatus') or ''))
-                      lines.append('CREATE_PROJECT_CURRENT_STEP=' + str(body.get('currentStep') or ''))
-
-              with psycopg.connect(su) as conn:
-                  with conn.cursor() as cur:
-                      cur.execute("SELECT tenant_id::text, status FROM security.tenants WHERE tenant_name=%s ORDER BY created_at_utc", (project_name,))
-                      tenants = cur.fetchall()
-              lines.append(f'SYNTHETIC_SECURITY_TENANT_COUNT={len(tenants)}')
-
-              if tenants:
-                  tenant_id, security_status = tenants[-1]
-                  lines.append(f'POST_STATE_SECURITY_STATUS={security_status}')
-                  lines.append(f'POST_STATE_TENANT_ID={tenant_id}')
-                  with psycopg.connect(au) as conn:
-                      with conn.cursor() as cur:
-                          cur.execute("SELECT project_status FROM auditcore.projects WHERE tenant_id=%s", (tenant_id,))
-                          project = cur.fetchone()
-                  lines.append('POST_STATE_AUDIT_PROJECT=' + ('PRESENT:' + str(project[0]) if project else 'MISSING'))
-                  try:
-                      with psycopg.connect(du) as conn:
-                          with conn.cursor() as cur:
-                              cur.execute("SELECT (SELECT count(*) FROM docintel.tenant_settings WHERE tenant_id=%s)+(SELECT count(*) FROM docintel.retention_policies WHERE tenant_id=%s)+(SELECT count(*) FROM docintel.tenant_document_types WHERE tenant_id=%s)", (tenant_id, tenant_id, tenant_id))
-                              prov = int(cur.fetchone()[0])
-                              cur.execute("SELECT count(*) FROM docintel.documents WHERE tenant_id=%s", (tenant_id,))
-                              docs = int(cur.fetchone()[0])
-                      lines.append(f'POST_STATE_DI_PROVISIONING_ROWS={prov}')
-                      lines.append(f'POST_STATE_DI_DOCUMENTS={docs}')
-                  except Exception as exc:
-                      lines.append(f'POST_STATE_DI_QUERY_ERROR={type(exc).__name__}:{str(exc)[:240]}')
-
-              lines.append('E2E_COMPLETED=true')
+              private_key=str(v.get('SECURITY_PRIVATE_KEY_PEM') or '').replace('\\n','\n')
+              kid=str(v.get('SECURITY_KEY_ID') or '')
+              issuer=str(v.get('SECURITY_TOKEN_ISSUER') or 'verigence-security')
+              audience=str(v.get('SECURITY_TOKEN_AUDIENCE') or 'verigence-platform')
+              now=datetime.now(UTC)
+              token=jwt.encode({'iss':issuer,'sub':uid,'aud':audience,'iat':now,'exp':now+timedelta(minutes=5),'jti':str(uuid.uuid4()),'actor_type':'USER'}, private_key, algorithm='RS256', headers={'kid':kid})
+              name='SEC-DIRECT-'+now.strftime('%Y%m%d%H%M%S')
+              headers={'Authorization':'Bearer '+token,'Idempotency-Key':str(uuid.uuid4()),'Content-Type':'application/json'}
+              with httpx.Client(timeout=30,follow_redirects=True) as client:
+                  ctx=client.get(base+'/security/v1/platform/admin-context',headers={'Authorization':'Bearer '+token})
+                  out.append('ADMIN_CONTEXT_HTTP='+str(ctx.status_code))
+                  r=client.post(base+'/security/v1/platform/tenants',headers=headers,json={'tenantName':name})
+                  out.append('SECURITY_CREATE_HTTP='+str(r.status_code))
+                  out.append('SECURITY_CREATE_CORRELATION_ID='+str(r.headers.get('x-correlation-id') or 'NONE'))
+                  try: body=r.json()
+                  except Exception: body={}
+                  out.append('SECURITY_CREATE_BODY='+json.dumps(body,sort_keys=True)[:1200].replace('\n',' '))
+                  tid=str(body.get('tenantId') or '') if isinstance(body,dict) else ''
+                  if tid:
+                      d=client.delete(base+'/security/v1/platform/tenants/'+tid,headers={'Authorization':'Bearer '+token})
+                      out.append('SECURITY_CLEANUP_HTTP='+str(d.status_code))
+              out.append('RESULT='+('PASS' if any(x=='SECURITY_CREATE_HTTP=201' for x in out) else 'FAIL'))
           except Exception as exc:
-              lines.append('E2E_COMPLETED=false')
-              lines.append(f'E2E_FATAL_TYPE={type(exc).__name__}')
-              lines.append(f'E2E_FATAL_MESSAGE={str(exc)[:500].replace(chr(10), " ")}')
-              lines.append('E2E_TRACE_LAST=' + traceback.format_exc().splitlines()[-1][:500])
-          finally:
-              write()
+              out.append('RESULT=FATAL')
+              out.append('FATAL_TYPE='+type(exc).__name__)
+              out.append('FATAL_MESSAGE='+str(exc)[:800].replace('\n',' '))
+              out.append('TRACE_LAST='+traceback.format_exc().splitlines()[-1][:800])
+          Path('docs/runtime/live-project-create-e2e.txt').write_text('\n'.join(out)+'\n')
+          print('\n'.join(out))
           PY
-
-      - name: Capture relevant live Audit Core logs
-        if: always()
-        shell: bash
-        run: |
-          set +e
-          mkdir -p docs/runtime
-          railway logs --service "$AUDIT_SERVICE" --latest --lines 350 2>/dev/null \
-            | grep -E 'project_create|project_directory|security_admin|di_|VAC-|ERROR|CRITICAL' \
-            | tail -n 120 > docs/runtime/live-project-create-e2e-logs.txt
-          true
-
-      - name: Record E2E evidence
+      - name: Record evidence
         if: always()
         shell: bash
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add docs/runtime/live-project-create-e2e.txt docs/runtime/live-project-create-e2e-logs.txt 2>/dev/null || true
-          if git diff --cached --quiet; then
-            echo 'No evidence files were produced.'
-            exit 1
-          fi
-          git commit -m 'docs(dev): record live Project Create E2E [skip ci]'
+          git add docs/runtime/live-project-create-e2e.txt
+          git commit -m 'docs(dev): record direct Security create result [skip ci]'
           git pull --rebase origin dev
           git push origin HEAD:dev
