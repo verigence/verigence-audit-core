@@ -1,16 +1,17 @@
 name: UC03 C1 one-shot lint cleanup
 
 on:
-  push:
+  pull_request:
     branches:
-      - planning/uc-003-booking-delivery-audit
+      - dev
+    paths:
+      - '.github/workflows/uc03-c1-lint-cleanup.yml'
 
 permissions:
   contents: write
 
 jobs:
   cleanup:
-    if: ${{ github.event.head_commit.message != 'style(uc03-c1): finalize lint cleanup' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
