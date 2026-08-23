@@ -228,6 +228,7 @@ def booking_document_setup():
             "tenant_id": tenant_id,
             "actor_id": actor_id,
             "journey_id": journey_id,
+            "customer_id": customer_id,
         }
     finally:
         app.dependency_overrides.clear()
@@ -241,6 +242,13 @@ def _booking_url(setup, suffix: str) -> str:
     )
 
 
+def _journey_url(setup, suffix: str) -> str:
+    return (
+        f"/v1/tenants/{setup['tenant_id']}/journeys/{setup['journey_id']}"
+        f"/{suffix.lstrip('/')}"
+    )
+
+
 def _documents_url(setup, suffix: str = "") -> str:
     base = (
         f"/v1/tenants/{setup['tenant_id']}/journeys/{setup['journey_id']}"
@@ -251,6 +259,56 @@ def _documents_url(setup, suffix: str = "") -> str:
 
 def _headers(key: str, version: int) -> dict[str, str]:
     return {"Idempotency-Key": key, "If-Match": f'"{version}"'}
+
+
+def _insert_completed_evidence(setup, requirement_key: str = "BOOKING_DOCKET"):
+    with setup["engine"].begin() as connection:
+        requirement_id = connection.execute(
+            text(
+                """
+                SELECT journey_document_requirement_id
+                FROM auditcore.journey_document_requirements
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND requirement_key=:requirement_key
+                """
+            ),
+            {
+                "tenant_id": setup["tenant_id"],
+                "journey_id": setup["journey_id"],
+                "requirement_key": requirement_key,
+            },
+        ).scalar_one()
+        evidence_id = connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.evidence (
+                    tenant_id, journey_id, customer_id,
+                    journey_document_requirement_id,
+                    di_subject_id, di_document_id,
+                    document_type_key, evidence_purpose, process_area,
+                    processing_status_cache, cache_updated_at_utc,
+                    linked_by_actor_id
+                ) VALUES (
+                    :tenant_id, :journey_id, :customer_id,
+                    :requirement_id,
+                    :subject_id, :document_id,
+                    :document_type_key, 'UC03_TEST', 'BOOKING',
+                    'COMPLETED', now(), :actor_id
+                ) RETURNING evidence_id
+                """
+            ),
+            {
+                "tenant_id": setup["tenant_id"],
+                "journey_id": setup["journey_id"],
+                "customer_id": setup["customer_id"],
+                "requirement_id": requirement_id,
+                "subject_id": uuid4(),
+                "document_id": uuid4(),
+                "document_type_key": requirement_key,
+                "actor_id": setup["actor_id"],
+            },
+        ).scalar_one()
+    return evidence_id
 
 
 def test_booking_start_snapshots_profile_requirements(booking_document_setup) -> None:
@@ -387,3 +445,187 @@ def test_unresolved_conditional_requirement_cannot_be_assessed(
             {"tenant_id": setup["tenant_id"], "journey_id": setup["journey_id"]},
         ).scalar_one()
     assert assessment_count == 0
+
+
+def test_booking_capture_recalculates_conditional_document_applicability(
+    booking_document_setup,
+) -> None:
+    setup = booking_document_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    assert client.post(
+        _booking_url(setup, "start"),
+        headers=_headers("c1-app-start", 0),
+    ).status_code == 200
+
+    captured = client.put(
+        _journey_url(setup, "capture/EXCHANGE_TAKEN"),
+        headers=_headers("c1-app-capture", 1),
+        json={"value": True},
+    )
+    assert captured.status_code == 200, captured.text
+    assert captured.json()["aggregateVersion"] == 2
+    assert captured.json()["applicabilityChanges"][0]["requirementKey"] == "TRADE_IN_RC"
+    assert captured.json()["applicabilityChanges"][0]["applicabilityState"] == "APPLICABLE"
+
+    listed = client.get(_documents_url(setup))
+    assert listed.status_code == 200, listed.text
+    trade_in = next(item for item in listed.json() if item["requirementKey"] == "TRADE_IN_RC")
+    assert trade_in["applicabilityState"] == "APPLICABLE"
+    assert "exchangeTaken=Yes" in trade_in["applicabilityReason"]
+
+    with setup["engine"].begin() as connection:
+        status_code = connection.execute(
+            text(
+                """
+                SELECT actual_status_code
+                FROM auditcore.trade_in_cases
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                """
+            ),
+            {"tenant_id": setup["tenant_id"], "journey_id": setup["journey_id"]},
+        ).scalar_one()
+    assert status_code == "EXCHANGE_TAKEN"
+
+
+def test_corrected_extraction_proposal_preserves_machine_original(
+    booking_document_setup,
+) -> None:
+    setup = booking_document_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    assert client.post(
+        _booking_url(setup, "start"),
+        headers=_headers("c1-proposal-start", 0),
+    ).status_code == 200
+    evidence_id = _insert_completed_evidence(setup)
+    proposal_id = uuid4()
+
+    with setup["engine"].begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.journey_capture_proposals (
+                    tenant_id, capture_proposal_id, journey_id, stage_code,
+                    field_key, source_evidence_id, source_evidence_fact_id,
+                    source_fact_version, source_document_type_key, value_source,
+                    proposed_value, confidence_score
+                ) VALUES (
+                    :tenant_id, :proposal_id, :journey_id, 'BOOKING',
+                    'customer_name', :evidence_id, 'customer_name',
+                    1, 'booking_form', 'EXTRACTION',
+                    '{"value":"Machine Customer"}'::jsonb, 0.72
+                )
+                """
+            ),
+            {
+                "tenant_id": setup["tenant_id"],
+                "proposal_id": proposal_id,
+                "journey_id": setup["journey_id"],
+                "evidence_id": evidence_id,
+            },
+        )
+
+    corrected = client.post(
+        _journey_url(setup, f"extraction-proposals/{proposal_id}/correct"),
+        headers=_headers("c1-proposal-correct", 1),
+        json={"acceptedValue": "Corrected Customer"},
+    )
+    assert corrected.status_code == 200, corrected.text
+    assert corrected.json()["status"] == "CORRECTED"
+    assert corrected.json()["proposedValue"] == "Machine Customer"
+    assert corrected.json()["acceptedValue"] == "Corrected Customer"
+    assert corrected.json()["aggregateVersion"] == 2
+
+    with setup["engine"].begin() as connection:
+        proposal = connection.execute(
+            text(
+                """
+                SELECT proposed_value, accepted_value, proposal_status,
+                       owning_domain_key
+                FROM auditcore.journey_capture_proposals
+                WHERE tenant_id=:tenant_id AND capture_proposal_id=:proposal_id
+                """
+            ),
+            {"tenant_id": setup["tenant_id"], "proposal_id": proposal_id},
+        ).mappings().one()
+        customer_name = connection.execute(
+            text(
+                """
+                SELECT display_name FROM auditcore.customers
+                WHERE tenant_id=:tenant_id AND customer_id=:customer_id
+                """
+            ),
+            {"tenant_id": setup["tenant_id"], "customer_id": setup["customer_id"]},
+        ).scalar_one()
+    assert proposal["proposed_value"] == {"value": "Machine Customer"}
+    assert proposal["accepted_value"] == {"value": "Corrected Customer"}
+    assert proposal["proposal_status"] == "CORRECTED"
+    assert proposal["owning_domain_key"] == "CUSTOMER"
+    assert customer_name == "Corrected Customer"
+
+
+def test_normal_booking_close_allows_nonblocking_human_flag(
+    booking_document_setup,
+) -> None:
+    setup = booking_document_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    assert client.post(
+        _booking_url(setup, "start"),
+        headers=_headers("c1-close-start", 0),
+    ).status_code == 200
+
+    exchange = client.put(
+        _journey_url(setup, "capture/EXCHANGE_TAKEN"),
+        headers=_headers("c1-close-exchange", 1),
+        json={"value": False},
+    )
+    assert exchange.status_code == 200, exchange.text
+    assert exchange.json()["aggregateVersion"] == 2
+
+    na_response = client.put(
+        _documents_url(setup, "TRADE_IN_RC"),
+        headers=_headers("c1-close-na", 2),
+        json={"answer": "NA", "remarks": "No exchange in this Booking."},
+    )
+    assert na_response.status_code == 200, na_response.text
+    assert na_response.json()["aggregateVersion"] == 3
+
+    evidence_id = _insert_completed_evidence(setup)
+    docket = client.put(
+        _documents_url(setup, "BOOKING_DOCKET"),
+        headers=_headers("c1-close-docket", 3),
+        json={"answer": "YES", "evidenceId": str(evidence_id)},
+    )
+    assert docket.status_code == 200, docket.text
+    assert docket.json()["requirementStatus"] == "SATISFIED"
+    assert docket.json()["aggregateVersion"] == 4
+
+    flag = client.post(
+        _journey_url(setup, "flags"),
+        headers=_headers("c1-close-flag", 4),
+        json={
+            "category": "PHYSICAL_OBSERVATION",
+            "severity": "MEDIUM",
+            "summary": "Physical process observation",
+            "remarks": "Visible for review but not configured as a completion blocker.",
+            "evidenceIds": [],
+        },
+    )
+    assert flag.status_code == 200, flag.text
+    assert flag.json()["aggregateVersion"] == 5
+
+    workspace = client.get(_journey_url(setup, "uc03-workspace"))
+    assert workspace.status_code == 200, workspace.text
+    assert workspace.json()["completion"]["ready"] is True
+    assert workspace.json()["completion"]["blockingFlagCount"] == 0
+    assert workspace.json()["flagSummary"]["openCount"] == 1
+
+    closed = client.post(
+        _booking_url(setup, "close-ready"),
+        headers=_headers("c1-close-ready", 5),
+    )
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["businessStatus"] == "BOOKING_CLOSED"
+    assert closed.json()["closureDisposition"] == "PROCEED_TO_DELIVERY"
+    assert closed.json()["auditState"] == "COMPLETE"
+    assert closed.json()["auditStatus"] == "FLAGS_RAISED"
+    assert closed.json()["aggregateVersion"] == 6
