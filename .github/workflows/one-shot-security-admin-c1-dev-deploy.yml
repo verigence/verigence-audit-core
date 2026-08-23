@@ -1,0 +1,235 @@
+name: One-shot Security Admin C1 DEV deploy
+
+on:
+  pull_request:
+    branches:
+      - dev
+    paths:
+      - .github/workflows/one-shot-security-admin-c1-dev-deploy.yml
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Validate and deploy C1 plus Security admin fix
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      C1_BASE_SHA: 647e7a95752bb65f90e9acbc9db4466dd05281b4
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      DEV_WEB_ORIGIN: https://verigence-web-dev.jbrconsulting-it.workers.dev
+      APP_ENV: dev
+
+    steps:
+      - name: Check out PR head carrying the Security fix
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PR_HEAD_SHA }}
+          fetch-depth: 1
+
+      - name: Preserve Security admin fix files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp src/audit_core/security_integration.py /tmp/security_integration.py
+          cp tests/test_uc02_admin_security.py /tmp/test_uc02_admin_security.py
+          grep -Fq '/security/v1/platform/me' /tmp/security_integration.py
+          grep -Fq 'platform.super_admin' /tmp/security_integration.py
+          echo 'SECURITY_ADMIN_FIX_SOURCE=PASS'
+
+      - name: Check out exact previously validated C1 runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$C1_BASE_SHA"
+          git checkout --detach "$C1_BASE_SHA"
+          cp /tmp/security_integration.py src/audit_core/security_integration.py
+          cp /tmp/test_uc02_admin_security.py tests/test_uc02_admin_security.py
+          echo "HOTFIX_BASE_SHA=$C1_BASE_SHA"
+          echo "HOTFIX_FIX_SOURCE_SHA=$PR_HEAD_SHA"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Audit Core test dependencies
+        run: python -m pip install -e '.[test,lint]'
+
+      - name: Validate Security admin regression contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruff check src/audit_core/security_integration.py tests/test_uc02_admin_security.py
+          pytest -q tests/test_uc02_admin_security.py
+          PYTHONPATH=src python - <<'PY'
+          from audit_core.main import app
+          paths = app.openapi().get('paths', {})
+          required = [
+              '/v1/projects',
+              '/v1/tenants/{tenant_id}/journeys/{journey_id}/booking/start',
+              '/v1/tenants/{tenant_id}/journeys/{journey_id}/uc03-workspace',
+          ]
+          missing = [path for path in required if path not in paths]
+          if missing:
+              raise SystemExit('Missing required C1 route(s): ' + ', '.join(missing))
+          print('C1_SECURITY_ADMIN_CONTRACT=PASS')
+          PY
+
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Link and verify Railway DEV target
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN secret is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway status --json >/tmp/status.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          project = json.loads(Path('/tmp/status.json').read_text())
+          variables = json.loads(Path('/tmp/audit-vars.json').read_text())
+          if project.get('id') != os.environ['PLATFORM_PROJECT_ID']:
+              raise SystemExit('Railway token is linked to the wrong project')
+          required = ['DATABASE_URL', 'APP_ENV', 'SECURITY_BASE_URL']
+          missing = [name for name in required if not str(variables.get(name, '')).strip()]
+          if missing:
+              raise SystemExit('Missing Railway DEV variable(s): ' + ', '.join(missing))
+          if str(variables.get('APP_ENV', '')).strip().lower() not in {'dev', 'development'}:
+              raise SystemExit('Audit Core APP_ENV is not DEV')
+          print('AUDIT_CORE_RAILWAY_TARGET=PASS')
+          PY
+
+      - name: Verify canonical Security platform-me route exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          security_base="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/audit-vars.json').read_text())
+          print(str(data.get('SECURITY_BASE_URL','')).rstrip('/'))
+          PY
+          )"
+          status="$(curl --silent --show-error --output /tmp/security-me.body --write-out '%{http_code}' "$security_base/security/v1/platform/me" || true)"
+          case "$status" in
+            401|403) echo "SECURITY_PLATFORM_ME_ROUTE=PASS HTTP_$status" ;;
+            000|404|5??)
+              cat /tmp/security-me.body >&2 || true
+              echo "::error::Canonical Security /platform/me route unavailable: HTTP $status"
+              exit 1
+              ;;
+            *) echo "SECURITY_PLATFORM_ME_ROUTE=PASS HTTP_$status" ;;
+          esac
+
+      - name: Record previous Audit Core deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway deployment list --service "$AUDIT_SERVICE" --limit 1 --json >/tmp/audit-before.json
+          previous="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/audit-before.json').read_text())
+          print(rows[0].get('id','') if rows else '')
+          PY
+          )"
+          echo "AUDIT_PREVIOUS_DEPLOYMENT_ID=$previous" >> "$GITHUB_ENV"
+          echo "AUDIT_PREVIOUS_DEPLOYMENT_ID=${previous:-NONE}"
+
+      - name: Deploy C1 runtime with Security admin fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway up . --path-as-root --service "$AUDIT_SERVICE" --detach --yes \
+            --message "Security admin C1 DEV fix ${PR_HEAD_SHA} base ${C1_BASE_SHA}" >/dev/null
+
+      - name: Verify fresh Railway deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            railway deployment list --service "$AUDIT_SERVICE" --limit 1 --json >/tmp/audit-deployment.json
+            read -r deployment_id status <<<"$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/audit-deployment.json').read_text())
+          if rows:
+              print(rows[0].get('id',''), rows[0].get('status',''))
+          else:
+              print(' ')
+          PY
+          )"
+            if [[ -z "$deployment_id" || "$deployment_id" == "${AUDIT_PREVIOUS_DEPLOYMENT_ID:-}" ]]; then
+              echo "Waiting for fresh deployment ($attempt/30)"
+              sleep 10
+              continue
+            fi
+            case "$status" in
+              SUCCESS)
+                echo "SECURITY_ADMIN_C1_DEV_DEPLOYMENT=PASS"
+                echo "SECURITY_ADMIN_C1_DEV_DEPLOYMENT_ID=$deployment_id"
+                echo "HOTFIX_DEPLOYMENT_ID=$deployment_id" >> "$GITHUB_ENV"
+                break
+                ;;
+              FAILED|CRASHED|REMOVED)
+                railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 220 || true
+                echo "::error::Audit Core deployment $deployment_id failed: $status"
+                exit 1
+                ;;
+              *) echo "Deployment $deployment_id is $status ($attempt/30)" ;;
+            esac
+            [[ "$attempt" != 30 ]] || { railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 220 || true; exit 1; }
+            sleep 10
+          done
+
+      - name: Smoke deployed Project Administration and C1 routes
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars-after.json
+          domain="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/audit-vars-after.json').read_text())
+          print(data.get('RAILWAY_PUBLIC_DOMAIN') or data.get('RAILWAY_STATIC_URL') or '')
+          PY
+          )"
+          [ -n "$domain" ] || { echo '::error::No Audit Core public domain.'; exit 1; }
+          case "$domain" in http://*|https://*) base="${domain%/}" ;; *) base="https://${domain%/}" ;; esac
+          curl --fail --silent --show-error "$base/health" >/tmp/health.json
+          echo "AUDIT_CORE_PUBLIC_BASE=$base"
+          echo 'AUDIT_CORE_PUBLIC_HEALTH=PASS'
+
+          probe() {
+            local path="$1"
+            local code
+            code="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --request OPTIONS "$base$path" || true)"
+            case "$code" in
+              000|404|5??) echo "::error::Route probe failed $path HTTP $code"; exit 1 ;;
+              *) echo "ROUTE_PRESENT|$path|HTTP_$code" ;;
+            esac
+          }
+          probe '/v1/projects'
+          probe '/v1/tenants/uc03-smoke/journeys/00000000-0000-0000-0000-000000000001/booking/start'
+          probe '/v1/tenants/uc03-smoke/journeys/00000000-0000-0000-0000-000000000001/uc03-workspace'
+
+          cors_status="$(curl --silent --show-error --dump-header /tmp/cors.headers --output /tmp/cors.body --write-out '%{http_code}' \
+            --request OPTIONS --header "Origin: $DEV_WEB_ORIGIN" \
+            --header 'Access-Control-Request-Method: GET' \
+            --header 'Access-Control-Request-Headers: authorization,content-type,x-correlation-id,x-trace-id' \
+            "$base/v1/projects" || true)"
+          [[ "$cors_status" == 200 ]] || { cat /tmp/cors.headers >&2; cat /tmp/cors.body >&2; exit 1; }
+          grep -Fqi "access-control-allow-origin: $DEV_WEB_ORIGIN" /tmp/cors.headers || { cat /tmp/cors.headers >&2; exit 1; }
+          echo 'PROJECT_ADMIN_CORS=PASS'
+          echo "SECURITY_ADMIN_FIX_BASE_SHA=$C1_BASE_SHA"
+          echo "SECURITY_ADMIN_FIX_SOURCE_SHA=$PR_HEAD_SHA"
+          echo "SECURITY_ADMIN_FIX_DEPLOYMENT_ID=${HOTFIX_DEPLOYMENT_ID:-UNKNOWN}"
