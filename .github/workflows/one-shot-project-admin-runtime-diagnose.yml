@@ -21,6 +21,7 @@ jobs:
       AUDIT_SERVICE: verigence-audit-core
       SECURITY_SERVICE: security
       SECURITY_PUBLIC_BASE: https://security-dev.up.railway.app
+      WEB_BASE: https://verigence-web-dev.jbrconsulting-it.workers.dev
 
     steps:
       - name: Check out
@@ -35,6 +36,29 @@ jobs:
             body="$(cat /tmp/body 2>/dev/null | head -c 300 || true)"
             echo "SECURITY_PROBE|$path|HTTP_$code|$body"
           done
+
+      - name: Inspect deployed Web Audit Core target
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location "$WEB_BASE/admin/project" -o /tmp/web.html
+          entry="$(grep -oE 'src="/assets/[^"]+\.js"' /tmp/web.html | head -n 1 | sed -E 's/^src="([^"]+)"$/\1/')"
+          echo "WEB_ENTRY_ASSET=${entry:-NONE}"
+          [ -n "$entry" ] || { cat /tmp/web.html; exit 1; }
+          curl --fail --silent --show-error --location "$WEB_BASE$entry" -o /tmp/entry.js
+          grep -oE 'https://[A-Za-z0-9._-]+\.up\.railway\.app' /tmp/entry.js | sort -u | sed 's/^/WEB_ENTRY_RAILWAY_TARGET=/' || true
+          grep -oE 'assets/[A-Za-z0-9._-]+\.js' /tmp/entry.js | sort -u | head -n 80 >/tmp/chunks.txt || true
+          while IFS= read -r chunk; do
+            [ -n "$chunk" ] || continue
+            name="$(basename "$chunk")"
+            curl --fail --silent --show-error --location "$WEB_BASE/$chunk" -o "/tmp/$name" || continue
+            if grep -Eq 'up\.railway\.app|/v1/projects|/v1/project-reference-data' "/tmp/$name"; then
+              echo "WEB_RELEVANT_CHUNK=$chunk"
+              grep -oE 'https://[A-Za-z0-9._-]+\.up\.railway\.app' "/tmp/$name" | sort -u | sed 's/^/WEB_CHUNK_RAILWAY_TARGET=/' || true
+              if grep -Fq '/v1/projects' "/tmp/$name"; then echo 'WEB_CHUNK_HAS_PROJECTS_ROUTE=YES'; fi
+              if grep -Fq '/v1/project-reference-data' "/tmp/$name"; then echo 'WEB_CHUNK_HAS_REFERENCE_ROUTE=YES'; fi
+            fi
+          done </tmp/chunks.txt
 
       - name: Install Railway CLI and inspect DEV target
         shell: bash
@@ -72,27 +96,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          railway logs --service "$AUDIT_SERVICE" --lines 800 >/tmp/audit-success.log 2>&1 || true
+          railway logs --service "$AUDIT_SERVICE" --lines 1000 >/tmp/audit-success.log 2>&1 || true
           echo '--- ACTIVE SUCCESSFUL AUDIT CORE RELEVANT LOGS ---'
-          grep -Ei 'security_admin|admin-context|platform/me|/v1/projects|project administration|dependency|PERMISSION|AUTH|401|403|404|500|502|503' /tmp/audit-success.log | tail -n 260 || true
+          grep -Ei 'security_admin|admin-context|platform/me|/v1/projects|project-reference-data|project administration|dependency|PERMISSION|AUTH|401|403|404|500|502|503' /tmp/audit-success.log | tail -n 320 || true
           echo '--- ACTIVE SUCCESSFUL AUDIT CORE LOG TAIL ---'
-          tail -n 100 /tmp/audit-success.log || true
+          tail -n 120 /tmp/audit-success.log || true
 
-      - name: Read Audit Core HTTP requests for projects
+      - name: Read Audit Core HTTP requests for Project Administration
         shell: bash
         run: |
           set -euo pipefail
           echo '--- AUDIT CORE /v1/projects HTTP LOGS ---'
-          railway logs --service "$AUDIT_SERVICE" --http --path /v1/projects --since 6h --json 2>/tmp/audit-http.err | tail -n 120 || true
-          cat /tmp/audit-http.err >&2 || true
+          railway logs --service "$AUDIT_SERVICE" --http --path /v1/projects --since 6h --json 2>/tmp/audit-projects-http.err | tail -n 160 || true
+          cat /tmp/audit-projects-http.err >&2 || true
+          echo '--- AUDIT CORE /v1/project-reference-data HTTP LOGS ---'
+          railway logs --service "$AUDIT_SERVICE" --http --path /v1/project-reference-data --since 6h --json 2>/tmp/audit-ref-http.err | tail -n 160 || true
+          cat /tmp/audit-ref-http.err >&2 || true
+          echo '--- AUDIT CORE ALL ERROR HTTP LOGS ---'
+          railway logs --service "$AUDIT_SERVICE" --http --status '>=400' --since 6h --json 2>/tmp/audit-errors-http.err | tail -n 240 || true
+          cat /tmp/audit-errors-http.err >&2 || true
 
       - name: Read Security admin-context HTTP logs
         shell: bash
         run: |
           set -euo pipefail
           echo '--- SECURITY /admin-context HTTP LOGS ---'
-          railway logs --service "$SECURITY_SERVICE" --http --path /security/v1/platform/admin-context --since 6h --json 2>/tmp/security-http.err | tail -n 160 || true
+          railway logs --service "$SECURITY_SERVICE" --http --path /security/v1/platform/admin-context --since 6h --json 2>/tmp/security-http.err | tail -n 180 || true
           cat /tmp/security-http.err >&2 || true
           echo '--- SECURITY DEPLOY LOGS RELATED TO AUTH ---'
-          railway logs --service "$SECURITY_SERVICE" --lines 800 >/tmp/security.log 2>&1 || true
-          grep -Ei 'admin-context|AUTH_TOKEN|PERMISSION|401|403|500|exception|error' /tmp/security.log | tail -n 220 || true
+          railway logs --service "$SECURITY_SERVICE" --lines 1000 >/tmp/security.log 2>&1 || true
+          grep -Ei 'admin-context|AUTH_TOKEN|PERMISSION|401|403|500|exception|error' /tmp/security.log | tail -n 260 || true
