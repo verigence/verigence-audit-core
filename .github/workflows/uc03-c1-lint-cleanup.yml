@@ -1,0 +1,40 @@
+name: UC03 C1 one-shot lint cleanup
+
+on:
+  push:
+    branches:
+      - planning/uc-003-booking-delivery-audit
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: ${{ github.event.head_commit.message != 'style(uc03-c1): finalize lint cleanup' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: planning/uc-003-booking-delivery-audit
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install ruff==0.16.0
+      - name: Apply exact Ruff fixes
+        run: >-
+          ruff check
+          src/audit_core/main.py
+          src/audit_core/uc03_booking_capture.py
+          src/audit_core/uc03_booking_evidence.py
+          src/audit_core/uc03_booking_integrations.py
+          --fix
+      - name: Commit fixes and remove this workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/uc03-c1-lint-cleanup.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/audit_core/main.py src/audit_core/uc03_booking_capture.py src/audit_core/uc03_booking_evidence.py src/audit_core/uc03_booking_integrations.py
+          git commit -m "style(uc03-c1): finalize lint cleanup"
+          git push origin HEAD:planning/uc-003-booking-delivery-audit
