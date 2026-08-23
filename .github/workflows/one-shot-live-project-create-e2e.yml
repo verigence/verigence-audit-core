@@ -19,6 +19,7 @@ jobs:
       SECURITY_SERVICE: security
       AUDIT_SERVICE: verigence-audit-core
       DI_SERVICE: di-api
+      E2E_RUN_REASON: exact-source-audit-core-redeploy
 
     steps:
       - uses: actions/checkout@v4
