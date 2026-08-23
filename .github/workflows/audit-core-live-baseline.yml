@@ -21,6 +21,8 @@ jobs:
       RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       AUDIT_SERVICE: verigence-audit-core
+      SECURITY_SERVICE: security
+      DI_SERVICE: di-api
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,7 +32,7 @@ jobs:
           python-version: '3.12'
       - name: Install runtime tooling
         run: |
-          python -m pip install -e .
+          python -m pip install -e . 'psycopg[binary]>=3.2,<4'
           npm install --global @railway/cli
       - name: Capture live baseline
         shell: bash
@@ -38,45 +40,59 @@ jobs:
           set -euo pipefail
           test -n "${RAILWAY_API_TOKEN:-}"
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
-          railway deployment list --service "$AUDIT_SERVICE" --limit 3 --json >/tmp/deployments.json
-          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/vars.json
+          for svc in "$AUDIT_SERVICE" "$SECURITY_SERVICE" "$DI_SERVICE"; do
+            safe="$(echo "$svc" | tr '-' '_')"
+            railway variable list --service "$svc" --json >"/tmp/${safe}_vars.json"
+            railway deployment list --service "$svc" --limit 1 --json >"/tmp/${safe}_deploy.json"
+          done
           python - <<'PY'
           import json, os, subprocess
           from pathlib import Path
-          from sqlalchemy import create_engine, text
+          import psycopg
 
-          vars_ = json.loads(Path('/tmp/vars.json').read_text())
-          deployments = json.loads(Path('/tmp/deployments.json').read_text())
-          db = str(vars_.get('DATABASE_URL','')).strip()
-          if not db:
-              raise SystemExit('DATABASE_URL missing')
-          if db.startswith('postgres://'):
-              db='postgresql+psycopg://'+db[len('postgres://'):]
-          elif db.startswith('postgresql://'):
-              db='postgresql+psycopg://'+db[len('postgresql://'):]
+          def load(path): return json.loads(Path(path).read_text())
+          def normalize(url):
+              return str(url or '').replace('postgresql+psycopg://','postgresql://',1).replace('postgresql+asyncpg://','postgresql://',1)
+          def latest(path):
+              rows=load(path); row=rows[0] if rows else {}; meta=row.get('meta') if isinstance(row.get('meta'),dict) else {}
+              return row, meta
 
-          source_head = subprocess.check_output(['alembic','heads'], text=True).strip()
-          source_current_file = Path('migrations/versions/0012_uc03_delivery_capture.py').exists()
-          engine=create_engine(db, pool_pre_ping=True)
-          with engine.connect() as c:
-              db_rev=c.execute(text('select version_num from alembic_version')).scalar_one_or_none()
-              projects=c.execute(text("select count(*) from auditcore.projects")).scalar_one()
-          latest=deployments[0] if deployments else {}
-          meta=latest.get('meta') if isinstance(latest.get('meta'),dict) else {}
-          out=[
-              'AUDIT_CORE_LIVE_BASELINE',
-              f'CHECKED_GITHUB_SHA={os.environ.get("GITHUB_SHA","")}',
-              f'SOURCE_ALEMBIC_HEAD={source_head}',
-              f'SOURCE_0012_FILE_PRESENT={str(source_current_file).lower()}',
-              f'DB_ALEMBIC_VERSION={db_rev}',
-              f'DB_PROJECT_COUNT={projects}',
-              f'LATEST_DEPLOYMENT_ID={latest.get("id","")}',
-              f'LATEST_DEPLOYMENT_STATUS={latest.get("status","")}',
-              f'LATEST_DEPLOYMENT_CREATED_AT={latest.get("createdAt","")}',
-              f'LATEST_DEPLOYMENT_COMMIT={meta.get("commitHash", meta.get("commit", ""))}',
-              f'LATEST_DEPLOYMENT_BRANCH={meta.get("branch","")}',
-          ]
-          Path('docs/runtime').mkdir(parents=True, exist_ok=True)
+          av=load('/tmp/verigence_audit_core_vars.json'); sv=load('/tmp/security_vars.json'); dv=load('/tmp/di_api_vars.json')
+          au=normalize(av.get('DATABASE_URL')); su=normalize(sv.get('DATABASE_URL')); du=normalize(dv.get('DI_DATABASE_URL') or dv.get('DATABASE_URL'))
+          if not all([au,su,du]): raise SystemExit('One or more DEV database URLs are missing')
+
+          source_head=subprocess.check_output(['alembic','heads'],text=True).strip()
+          source_0012=Path('migrations/versions/0012_uc03_delivery_capture.py').exists()
+
+          with psycopg.connect(au) as a, psycopg.connect(su) as s, psycopg.connect(du) as d:
+              with a.cursor() as c:
+                  c.execute('select version_num from alembic_version'); db_rev=c.fetchone()[0]
+                  c.execute('select tenant_id::text, project_name, status, provisioning_status from auditcore.projects order by created_at_utc'); projects=c.fetchall()
+              with s.cursor() as c:
+                  c.execute('select tenant_id::text, tenant_name, status from security.tenants order by created_at_utc'); tenants=c.fetchall()
+              configuring=[t for t in tenants if str(t[2])=='CONFIGURING']
+              orphan=[]; cfg_with_project=[]; cfg_with_docs=[]
+              project_ids={p[0] for p in projects}
+              for tid,name,status in configuring:
+                  with d.cursor() as c:
+                      c.execute('select exists (select 1 from docintel.documents where tenant_id=%s)',(tid,)); docs=bool(c.fetchone()[0])
+                      c.execute('select (select count(*) from docintel.tenant_settings where tenant_id=%s)+(select count(*) from docintel.retention_policies where tenant_id=%s)+(select count(*) from docintel.tenant_document_types where tenant_id=%s)',(tid,tid,tid)); prov=int(c.fetchone()[0])
+                  if tid in project_ids: cfg_with_project.append((tid,name))
+                  elif docs: cfg_with_docs.append((tid,name))
+                  else: orphan.append((tid,name,prov))
+
+          ar,am=latest('/tmp/verigence_audit_core_deploy.json'); sr,sm=latest('/tmp/security_deploy.json'); dr,dm=latest('/tmp/di_api_deploy.json')
+          out=['AUDIT_CORE_LIVE_BASELINE',
+               f'CHECKED_GITHUB_SHA={os.environ.get("GITHUB_SHA","")}',
+               f'SOURCE_ALEMBIC_HEAD={source_head}',f'SOURCE_0012_FILE_PRESENT={str(source_0012).lower()}',f'DB_ALEMBIC_VERSION={db_rev}',
+               f'AUDIT_CORE_DEPLOYMENT_STATUS={ar.get("status","")}',f'AUDIT_CORE_DEPLOYMENT_CREATED_AT={ar.get("createdAt","")}',
+               f'SECURITY_DEPLOYMENT_STATUS={sr.get("status","")}',f'SECURITY_DEPLOYMENT_CREATED_AT={sr.get("createdAt","")}',
+               f'DI_DEPLOYMENT_STATUS={dr.get("status","")}',f'DI_DEPLOYMENT_CREATED_AT={dr.get("createdAt","")}',
+               f'DB_PROJECT_COUNT={len(projects)}',f'SECURITY_TENANT_COUNT={len(tenants)}',f'SECURITY_CONFIGURING_COUNT={len(configuring)}',
+               f'CONFIGURING_WITH_PROJECT={len(cfg_with_project)}',f'CONFIGURING_WITH_DI_DOCUMENTS_NO_PROJECT={len(cfg_with_docs)}',f'ORPHAN_CANDIDATE_COUNT={len(orphan)}']
+          for i,(tid,name,status,prov) in enumerate(projects,1): out.append(f'PROJECT_{i}={name}|{status}|{prov}|{tid}')
+          for i,(tid,name,prov) in enumerate(orphan,1): out.append(f'ORPHAN_{i}={name}|DI_PROVISIONING_ROWS={prov}|{tid}')
+          Path('docs/runtime').mkdir(parents=True,exist_ok=True)
           Path('docs/runtime/audit-core-live-baseline.txt').write_text('\n'.join(out)+'\n')
           print('\n'.join(out))
           PY
@@ -84,7 +100,7 @@ jobs:
           domain="$(python - <<'PY'
           import json
           from pathlib import Path
-          v=json.loads(Path('/tmp/vars.json').read_text())
+          v=json.loads(Path('/tmp/verigence_audit_core_vars.json').read_text())
           print(v.get('RAILWAY_PUBLIC_DOMAIN') or v.get('RAILWAY_STATIC_URL') or '')
           PY
           )"
@@ -104,4 +120,5 @@ jobs:
           git add docs/runtime/audit-core-live-baseline.txt
           if git diff --cached --quiet; then exit 0; fi
           git commit -m 'chore(dev): record Audit Core live baseline [skip live-baseline]'
+          git pull --rebase origin dev
           git push origin HEAD:dev
