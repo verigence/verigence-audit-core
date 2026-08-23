@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -722,7 +722,7 @@ def start_delivery(
                 detail="This Booking was closed without Delivery.",
             )
 
-        row = connection.execute(
+        connection.execute(
             text(
                 """
                 INSERT INTO auditcore.journey_stage_states (
@@ -1281,7 +1281,7 @@ def _iso(value: datetime | None) -> str | None:
     if value is None:
         return None
     if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
+        value = value.replace(tzinfo=UTC)
     return value.isoformat()
 
 
