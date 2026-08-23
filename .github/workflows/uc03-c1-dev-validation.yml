@@ -26,6 +26,7 @@ jobs:
       AUDIT_SERVICE: verigence-audit-core
       DEPLOY_SHA: ${{ github.event.pull_request.head.sha }}
       DEV_WEB_ORIGIN: https://verigence-web-dev.jbrconsulting-it.workers.dev
+      APP_ENV: dev
 
     steps:
       - name: Check out exact C1 revision
