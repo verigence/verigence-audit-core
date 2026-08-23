@@ -21,6 +21,7 @@ jobs:
       AUDIT_SERVICE: verigence-audit-core
       SECURITY_SERVICE: security
       SECURITY_PUBLIC_BASE: https://security-dev.up.railway.app
+      AUDIT_PUBLIC_BASE: https://verigence-audit-core-production.up.railway.app
       WEB_BASE: https://verigence-web-dev.jbrconsulting-it.workers.dev
 
     steps:
@@ -37,11 +38,18 @@ jobs:
             echo "SECURITY_PROBE|$path|HTTP_$code|$body"
           done
 
-      - name: Inspect deployed Web Audit Core target
+      - name: Inspect deployed Web headers and Audit Core target
         shell: bash
         run: |
           set -euo pipefail
-          curl --fail --silent --show-error --location "$WEB_BASE/admin/project" -o /tmp/web.html
+          curl --fail --silent --show-error --location \
+            --dump-header /tmp/web.headers \
+            --output /tmp/web.html \
+            "$WEB_BASE/admin/project"
+          echo '--- WEB RESPONSE SECURITY HEADERS ---'
+          grep -Ei '^(content-security-policy|content-security-policy-report-only|cross-origin|permissions-policy|referrer-policy|x-frame-options|x-content-type-options):' /tmp/web.headers || true
+          echo '--- WEB HTML CSP META ---'
+          grep -Ei 'content-security-policy|http-equiv' /tmp/web.html || true
           entry="$(grep -oE 'src="/assets/[^"]+\.js"' /tmp/web.html | head -n 1 | sed -E 's/^src="([^"]+)"$/\1/')"
           echo "WEB_ENTRY_ASSET=${entry:-NONE}"
           [ -n "$entry" ] || { cat /tmp/web.html; exit 1; }
@@ -59,6 +67,46 @@ jobs:
               if grep -Fq '/v1/project-reference-data' "/tmp/$name"; then echo 'WEB_CHUNK_HAS_REFERENCE_ROUTE=YES'; fi
             fi
           done </tmp/chunks.txt
+
+      - name: Probe browser-equivalent Audit Core CORS
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '--- PROJECTS UNAUTHENTICATED GET ---'
+          get_status="$(curl --silent --show-error --dump-header /tmp/projects-get.headers --output /tmp/projects-get.body --write-out '%{http_code}' "$AUDIT_PUBLIC_BASE/v1/projects" || true)"
+          echo "PROJECTS_GET_STATUS=HTTP_$get_status"
+          cat /tmp/projects-get.body || true
+          echo
+
+          echo '--- PROJECTS CORS PREFLIGHT ---'
+          preflight_status="$(curl --silent --show-error \
+            --dump-header /tmp/projects-cors.headers \
+            --output /tmp/projects-cors.body \
+            --write-out '%{http_code}' \
+            --request OPTIONS \
+            --header "Origin: $WEB_BASE" \
+            --header 'Access-Control-Request-Method: GET' \
+            --header 'Access-Control-Request-Headers: authorization,content-type' \
+            "$AUDIT_PUBLIC_BASE/v1/projects" || true)"
+          echo "PROJECTS_PREFLIGHT_STATUS=HTTP_$preflight_status"
+          grep -Ei '^access-control-|^vary:' /tmp/projects-cors.headers || true
+          cat /tmp/projects-cors.body || true
+          echo
+
+          echo '--- REFERENCE DATA CORS PREFLIGHT ---'
+          ref_status="$(curl --silent --show-error \
+            --dump-header /tmp/ref-cors.headers \
+            --output /tmp/ref-cors.body \
+            --write-out '%{http_code}' \
+            --request OPTIONS \
+            --header "Origin: $WEB_BASE" \
+            --header 'Access-Control-Request-Method: GET' \
+            --header 'Access-Control-Request-Headers: authorization,content-type' \
+            "$AUDIT_PUBLIC_BASE/v1/project-reference-data" || true)"
+          echo "REFERENCE_PREFLIGHT_STATUS=HTTP_$ref_status"
+          grep -Ei '^access-control-|^vary:' /tmp/ref-cors.headers || true
+          cat /tmp/ref-cors.body || true
+          echo
 
       - name: Install Railway CLI and inspect DEV target
         shell: bash
@@ -102,20 +150,6 @@ jobs:
           echo '--- ACTIVE SUCCESSFUL AUDIT CORE LOG TAIL ---'
           tail -n 120 /tmp/audit-success.log || true
 
-      - name: Read Audit Core HTTP requests for Project Administration
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo '--- AUDIT CORE /v1/projects HTTP LOGS ---'
-          railway logs --service "$AUDIT_SERVICE" --http --path /v1/projects --since 6h --json 2>/tmp/audit-projects-http.err | tail -n 160 || true
-          cat /tmp/audit-projects-http.err >&2 || true
-          echo '--- AUDIT CORE /v1/project-reference-data HTTP LOGS ---'
-          railway logs --service "$AUDIT_SERVICE" --http --path /v1/project-reference-data --since 6h --json 2>/tmp/audit-ref-http.err | tail -n 160 || true
-          cat /tmp/audit-ref-http.err >&2 || true
-          echo '--- AUDIT CORE ALL ERROR HTTP LOGS ---'
-          railway logs --service "$AUDIT_SERVICE" --http --status '>=400' --since 6h --json 2>/tmp/audit-errors-http.err | tail -n 240 || true
-          cat /tmp/audit-errors-http.err >&2 || true
-
       - name: Read Security admin-context HTTP logs
         shell: bash
         run: |
@@ -123,6 +157,3 @@ jobs:
           echo '--- SECURITY /admin-context HTTP LOGS ---'
           railway logs --service "$SECURITY_SERVICE" --http --path /security/v1/platform/admin-context --since 6h --json 2>/tmp/security-http.err | tail -n 180 || true
           cat /tmp/security-http.err >&2 || true
-          echo '--- SECURITY DEPLOY LOGS RELATED TO AUTH ---'
-          railway logs --service "$SECURITY_SERVICE" --lines 1000 >/tmp/security.log 2>&1 || true
-          grep -Ei 'admin-context|AUTH_TOKEN|PERMISSION|401|403|500|exception|error' /tmp/security.log | tail -n 260 || true
