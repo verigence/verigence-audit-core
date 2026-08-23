@@ -9,6 +9,67 @@ _RUNTIME_ROLE = "audit_core_runtime"
 
 
 def upgrade() -> None:
+    # C2's Delivery lifecycle is frozen by the UC03 handoff. The existing typed
+    # deliveries/history tables enforce their status catalogue by FK, so seed the
+    # three canonical Delivery statuses for every existing Project and for Projects
+    # created after this migration. Existing tenant labels/configuration win.
+    op.execute(
+        """
+        INSERT INTO auditcore.business_status_codes (
+            tenant_id, domain_key, status_code, status_label, description
+        )
+        SELECT
+            p.tenant_id,
+            'DELIVERY',
+            seed.status_code,
+            seed.status_label,
+            seed.description
+        FROM auditcore.projects p
+        CROSS JOIN (
+            VALUES
+                ('DELIVERY_STARTED', 'Delivery Started', 'Physical Delivery workflow has started.'),
+                ('DELIVERY_IN_PROGRESS', 'Delivery In Progress', 'Physical Delivery workflow is in progress.'),
+                ('DELIVERY_COMPLETED', 'Delivery Completed', 'Physical Delivery has been recorded as completed.')
+        ) AS seed(status_code, status_label, description)
+        ON CONFLICT (tenant_id, domain_key, status_code) DO NOTHING
+        """
+    )
+    op.execute(
+        """
+        CREATE OR REPLACE FUNCTION auditcore.seed_uc03_delivery_status_codes()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            INSERT INTO auditcore.business_status_codes (
+                tenant_id, domain_key, status_code, status_label, description
+            ) VALUES
+                (
+                    NEW.tenant_id, 'DELIVERY', 'DELIVERY_STARTED',
+                    'Delivery Started', 'Physical Delivery workflow has started.'
+                ),
+                (
+                    NEW.tenant_id, 'DELIVERY', 'DELIVERY_IN_PROGRESS',
+                    'Delivery In Progress', 'Physical Delivery workflow is in progress.'
+                ),
+                (
+                    NEW.tenant_id, 'DELIVERY', 'DELIVERY_COMPLETED',
+                    'Delivery Completed', 'Physical Delivery has been recorded as completed.'
+                )
+            ON CONFLICT (tenant_id, domain_key, status_code) DO NOTHING;
+            RETURN NEW;
+        END;
+        $$
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER trg_uc03_project_delivery_status_codes
+        AFTER INSERT ON auditcore.projects
+        FOR EACH ROW EXECUTE FUNCTION auditcore.seed_uc03_delivery_status_codes()
+        """
+    )
+
     # Delivery business status already lives in auditcore.deliveries and
     # auditcore.delivery_status_history. C2 adds only the missing audit facts
     # required for intimation and VIN/chassis reconciliation.
@@ -142,3 +203,8 @@ def downgrade() -> None:
         "ON auditcore.journey_delivery_audit_facts"
     )
     op.execute("DROP TABLE IF EXISTS auditcore.journey_delivery_audit_facts")
+    op.execute(
+        "DROP TRIGGER IF EXISTS trg_uc03_project_delivery_status_codes "
+        "ON auditcore.projects"
+    )
+    op.execute("DROP FUNCTION IF EXISTS auditcore.seed_uc03_delivery_status_codes()")
