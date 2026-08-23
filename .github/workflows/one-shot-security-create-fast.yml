@@ -1,0 +1,71 @@
+name: One-shot Security tenant create fast
+on:
+  push:
+    branches: [dev]
+    paths: ['.github/workflows/one-shot-security-create-fast.yml']
+permissions:
+  contents: write
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: dev, fetch-depth: 0}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: |
+          pip install 'psycopg[binary]>=3.2,<4' 'PyJWT>=2.8,<3' 'cryptography>=42,<46' 'httpx>=0.27,<1'
+          npm install --global @railway/cli
+      - shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service security --json >/dev/null
+          railway variable list --service security --environment dev --json >/tmp/s.json
+          python - <<'PY'
+          import json,uuid
+          from datetime import UTC,datetime,timedelta
+          from pathlib import Path
+          import httpx,jwt,psycopg
+          v=json.loads(Path('/tmp/s.json').read_text())
+          db=str(v.get('DATABASE_URL') or '').replace('postgresql+psycopg://','postgresql://',1).replace('postgresql+asyncpg://','postgresql://',1)
+          domain=str(v.get('RAILWAY_PUBLIC_DOMAIN') or v.get('RAILWAY_STATIC_URL') or '').strip()
+          if not domain.startswith(('http://','https://')): domain='https://'+domain
+          out=['SECURITY_CREATE_FAST']
+          with psycopg.connect(db) as c:
+            with c.cursor() as q:
+              q.execute("SELECT a.user_id::text FROM security.user_admin_role_assignments a JOIN security.users u ON u.user_id=a.user_id WHERE a.role_key='SuperAdmin' AND a.scope_type='PLATFORM' AND a.scope_id IS NULL AND a.status='ACTIVE' AND u.status='ACTIVE' ORDER BY a.assigned_at_utc LIMIT 1")
+              row=q.fetchone(); uid=row[0] if row else ''
+              q.execute("SELECT role_key,count(*) FROM security.platform_role_permission_defaults WHERE status='ACTIVE' AND role_key IN ('PC','TL','PM','CRM','Executive') GROUP BY role_key ORDER BY role_key")
+              rows=q.fetchall()
+          out.append('ROLE_DEFAULT_COUNTS='+';'.join(f'{a}:{b}' for a,b in rows))
+          out.append('ROLE_SET_COMPLETE='+str({a for a,_ in rows}=={'PC','TL','PM','CRM','Executive'}).lower())
+          key=str(v.get('SECURITY_PRIVATE_KEY_PEM') or '').replace('\\n','\n'); kid=str(v.get('SECURITY_KEY_ID') or '')
+          iss=str(v.get('SECURITY_TOKEN_ISSUER') or 'verigence-security'); aud=str(v.get('SECURITY_TOKEN_AUDIENCE') or 'verigence-platform')
+          now=datetime.now(UTC); token=jwt.encode({'iss':iss,'sub':uid,'aud':aud,'iat':now,'exp':now+timedelta(minutes=5),'jti':str(uuid.uuid4()),'actor_type':'USER'},key,algorithm='RS256',headers={'kid':kid})
+          name='SECFAST-'+now.strftime('%Y%m%d%H%M%S')
+          h={'Authorization':'Bearer '+token,'Idempotency-Key':str(uuid.uuid4()),'Content-Type':'application/json'}
+          with httpx.Client(timeout=25,follow_redirects=True) as x:
+            r=x.post(domain.rstrip('/')+'/security/v1/platform/tenants',headers=h,json={'tenantName':name})
+            out.append('CREATE_HTTP='+str(r.status_code))
+            try: body=r.json()
+            except Exception: body={}
+            out.append('BODY_CODE='+str(body.get('code') or body.get('errorCode') or ''))
+            out.append('BODY_DETAIL='+str(body.get('detail') or body.get('message') or '')[:500].replace('\n',' '))
+            tid=str(body.get('tenantId') or '')
+            if tid:
+              d=x.delete(domain.rstrip('/')+'/security/v1/platform/tenants/'+tid,headers={'Authorization':'Bearer '+token})
+              out.append('CLEANUP_HTTP='+str(d.status_code))
+          Path('docs/runtime/security-create-fast.txt').write_text('\n'.join(out)+'\n')
+          print('\n'.join(out))
+          PY
+      - shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'; git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/runtime/security-create-fast.txt
+          git commit -m 'docs(dev): record fast Security create result [skip ci]'
+          git pull --rebase origin dev
+          git push origin HEAD:dev
