@@ -3,11 +3,6 @@ name: Deploy Audit Core DEV
 on:
   workflow_call:
   workflow_dispatch:
-  pull_request:
-    branches:
-      - dev
-    paths:
-      - '.github/workflows/audit-core-dev-deploy.yml'
 
 permissions:
   contents: read
@@ -18,14 +13,14 @@ concurrency:
 
 jobs:
   deploy:
-    if: github.ref == 'refs/heads/dev' || (github.event_name == 'pull_request' && github.head_ref == 'planning/uc-003-booking-delivery-audit')
+    if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       AUDIT_SERVICE: verigence-audit-core
-      DEPLOY_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      DEPLOY_SHA: ${{ github.sha }}
       APP_ENV: ci
       DEV_WEB_ORIGIN: https://verigence-web-dev.jbrconsulting-it.workers.dev
 
@@ -43,7 +38,7 @@ jobs:
       - name: Install Audit Core
         run: python -m pip install -e .
 
-      - name: Verify UC03 C2 route contract before deploy
+      - name: Verify UC02 route contract before deploy
         shell: bash
         run: |
           set -euo pipefail
@@ -53,19 +48,16 @@ jobs:
           paths = app.openapi().get("paths", {})
           required = [
               "/v1/projects",
-              "/v1/tenants/{tenant_id}/uc03/work-items",
-              "/v1/tenants/{tenant_id}/journeys/{journey_id}/delivery/start",
-              "/v1/tenants/{tenant_id}/journeys/{journey_id}/delivery/intimation",
-              "/v1/tenants/{tenant_id}/journeys/{journey_id}/delivery/vehicle-observation",
-              "/v1/tenants/{tenant_id}/journeys/{journey_id}/delivery/complete",
-              "/v1/tenants/{tenant_id}/journeys/{journey_id}/delivery/workspace",
-              "/v1/tenants/{tenant_id}/journeys/{journey_id}/stages/DELIVERY/documents",
-              "/v1/tenants/{tenant_id}/journeys/{journey_id}/stages/DELIVERY/documents/{requirement_key}",
+              "/v1/tenants/{tenant_id}/project/readiness",
+              "/v1/tenants/{tenant_id}/project/activate",
+              "/v1/tenants/{tenant_id}/project-masters",
+              "/v1/tenants/{tenant_id}/role-mapping-candidates",
+              "/v1/tenants/{tenant_id}/role-mappings",
           ]
           missing = [path for path in required if path not in paths]
           if missing:
-              raise SystemExit("Missing UC03 C2 API path(s) before deploy: " + ", ".join(missing))
-          print("AUDIT_CORE_UC03_C2_ROUTE_CONTRACT=PASS")
+              raise SystemExit("Missing UC02 API path(s) before deploy: " + ", ".join(missing))
+          print("AUDIT_CORE_UC02_ROUTE_CONTRACT=PASS")
           PY
 
       - name: Install Railway CLI
@@ -122,7 +114,7 @@ jobs:
           echo "AUDIT_PREVIOUS_DEPLOYMENT_ID=$previous_id" >> "$GITHUB_ENV"
           echo "AUDIT_CORE_PREVIOUS_DEPLOYMENT_ID=${previous_id:-NONE}"
           railway up . --path-as-root --service "$AUDIT_SERVICE" --detach --yes \
-            --message "Audit Core UC03 C2 DEV ${DEPLOY_SHA}" >/dev/null
+            --message "Audit Core DEV ${DEPLOY_SHA}" >/dev/null
 
       - name: Verify fresh Audit Core deployment
         shell: bash
@@ -171,7 +163,7 @@ jobs:
             sleep 10
           done
 
-      - name: Smoke test deployed UC03 C2 service
+      - name: Smoke test deployed UC02 service
         shell: bash
         run: |
           set -euo pipefail
@@ -202,21 +194,19 @@ jobs:
             code="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --request OPTIONS "$base$path" || true)"
             case "$code" in
               000|404|5??)
-                echo "::error::Deployed UC03 C2 route probe failed: $path returned HTTP $code"
+                echo "::error::Deployed UC02 route probe failed: $path returned HTTP $code"
                 exit 1
                 ;;
-              *) echo "UC03_C2_ROUTE_PRESENT|$path|HTTP_$code" ;;
+              *) echo "UC02_ROUTE_PRESENT|$path|HTTP_$code" ;;
             esac
           }
 
-          probe_route '/v1/tenants/uc03-c2-smoke/uc03/work-items?workType=DELIVERY'
-          probe_route '/v1/tenants/uc03-c2-smoke/journeys/00000000-0000-0000-0000-000000000001/delivery/start'
-          probe_route '/v1/tenants/uc03-c2-smoke/journeys/00000000-0000-0000-0000-000000000001/delivery/intimation'
-          probe_route '/v1/tenants/uc03-c2-smoke/journeys/00000000-0000-0000-0000-000000000001/delivery/vehicle-observation'
-          probe_route '/v1/tenants/uc03-c2-smoke/journeys/00000000-0000-0000-0000-000000000001/delivery/complete'
-          probe_route '/v1/tenants/uc03-c2-smoke/journeys/00000000-0000-0000-0000-000000000001/delivery/workspace'
-          probe_route '/v1/tenants/uc03-c2-smoke/journeys/00000000-0000-0000-0000-000000000001/stages/DELIVERY/documents'
-          probe_route '/v1/tenants/uc03-c2-smoke/journeys/00000000-0000-0000-0000-000000000001/stages/DELIVERY/documents/NDC'
+          probe_route '/v1/projects'
+          probe_route '/v1/tenants/uc02-smoke/project/readiness'
+          probe_route '/v1/tenants/uc02-smoke/project/activate'
+          probe_route '/v1/tenants/uc02-smoke/project-masters'
+          probe_route '/v1/tenants/uc02-smoke/role-mapping-candidates'
+          probe_route '/v1/tenants/uc02-smoke/role-mappings'
 
           cors_status="$(curl --silent --show-error \
             --dump-header /tmp/audit-cors.headers \
@@ -226,11 +216,11 @@ jobs:
             --header "Origin: $DEV_WEB_ORIGIN" \
             --header 'Access-Control-Request-Method: POST' \
             --header 'Access-Control-Request-Headers: authorization,content-type,idempotency-key,if-match,x-correlation-id,x-trace-id' \
-            "$base/v1/tenants/uc03-c2-smoke/journeys/00000000-0000-0000-0000-000000000001/delivery/start" || true)"
+            "$base/v1/projects" || true)"
           if [[ "$cors_status" != "200" ]]; then
             cat /tmp/audit-cors.headers >&2 || true
             cat /tmp/audit-cors.body >&2 || true
-            echo "::error::Audit Core C2 browser CORS preflight returned HTTP $cors_status"
+            echo "::error::Audit Core browser CORS preflight returned HTTP $cors_status"
             exit 1
           fi
           python - <<'PY'
@@ -249,6 +239,7 @@ jobs:
               raise SystemExit('Audit Core CORS did not allow the approved DEV Web origin')
           if headers.get('access-control-allow-credentials', '').lower() != 'true':
               raise SystemExit('Audit Core CORS did not allow browser credentials')
+
           methods = {
               value.strip().upper()
               for value in headers.get('access-control-allow-methods', '').split(',')
@@ -256,14 +247,19 @@ jobs:
           }
           if 'POST' not in methods:
               raise SystemExit('Audit Core CORS did not allow POST')
+
           allowed_headers = {
               value.strip().lower()
               for value in headers.get('access-control-allow-headers', '').split(',')
               if value.strip()
           }
           required_headers = {
-              'authorization', 'content-type', 'idempotency-key', 'if-match',
-              'x-correlation-id', 'x-trace-id',
+              'authorization',
+              'content-type',
+              'idempotency-key',
+              'if-match',
+              'x-correlation-id',
+              'x-trace-id',
           }
           missing = sorted(required_headers - allowed_headers)
           if missing:
@@ -276,13 +272,13 @@ jobs:
             --output /tmp/audit-cors-actual.body \
             --write-out '%{http_code}' \
             --header "Origin: $DEV_WEB_ORIGIN" \
-            "$base/v1/tenants/uc03-c2-smoke/journeys/00000000-0000-0000-0000-000000000001/delivery/workspace" || true)"
+            "$base/v1/tenants/uc02-cors-smoke/project/readiness" || true)"
           case "$unauthorized_status" in
             401|403) ;;
             *)
               cat /tmp/audit-cors-actual.headers >&2 || true
               cat /tmp/audit-cors-actual.body >&2 || true
-              echo "::error::Expected unauthenticated Delivery workspace probe to fail closed; got HTTP $unauthorized_status"
+              echo "::error::Expected unauthenticated readiness probe to fail closed; got HTTP $unauthorized_status"
               exit 1
               ;;
           esac
@@ -296,6 +292,7 @@ jobs:
                   continue
               name, value = raw.split(':', 1)
               headers[name.strip().lower()] = value.strip()
+
           origin = os.environ['DEV_WEB_ORIGIN']
           if headers.get('access-control-allow-origin') != origin:
               raise SystemExit('Audit Core actual browser response is missing the approved CORS origin')
@@ -313,5 +310,5 @@ jobs:
           print('AUDIT_CORE_CORS_CORRELATION_ID=' + correlation_id)
           PY
 
-          echo 'AUDIT_CORE_UC03_C2_DEV=PASS'
+          echo 'AUDIT_CORE_UC02_DEV=PASS'
           echo "AUDIT_CORE_DEPLOYED_SHA=${DEPLOY_SHA}"
