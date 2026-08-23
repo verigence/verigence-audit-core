@@ -16,8 +16,14 @@ logger = structlog.get_logger(__name__)
 
 # Security currently issues ServiceIntegration tokens for four hours. A short
 # server-side reuse window removes page-burst token issuance while remaining far
-# below the authoritative token lifetime. Authorization decisions are NOT cached.
+# below the authoritative token lifetime.
 _SERVICE_TOKEN_REUSE_SECONDS = 60.0
+
+# UC03 lazy pages can issue concurrent requests that require the exact same live
+# permission decision (for example landing metrics + work items). Reuse only a
+# successful ALLOW for a very short process-local window. DENY and errors are
+# deliberately never cached. Human JWT validation still happens on every request.
+_AUTHORIZATION_ALLOW_REUSE_SECONDS = 10.0
 
 
 class SecurityAuthorizationError(RuntimeError):
@@ -39,15 +45,16 @@ class SecurityAuthorizationDecision:
 
 
 class SecurityAuthorizationClient:
-    """Live Security v2 authorization client for protected human business requests.
+    """Security v2 authorization client for protected human business requests.
 
     The browser-provided Security human JWT proves the USER identity at Audit Core.
     Audit Core then uses its own ServiceIntegration identity to ask Security for the
     current Tenant/permission decision. No Tenant permission claims are copied from
-    the human token and no authorization decision is cached locally.
+    the human token.
 
-    The ServiceIntegration access token itself is a backend credential and is reused
-    briefly so multiple lazy UI reads do not each issue a new machine token.
+    Backend credentials are reused and a successful identical authorization ALLOW may
+    be reused for only a few seconds to coalesce one UI request burst. DENY/error
+    responses are never cached and browser state never becomes authoritative.
     """
 
     def __init__(
@@ -77,6 +84,13 @@ class SecurityAuthorizationClient:
         self._service_token: str | None = None
         self._service_token_reuse_until = 0.0
         self._service_token_lock = threading.Lock()
+        self._allow_cache: dict[
+            tuple[str, str, str],
+            tuple[float, SecurityAuthorizationDecision],
+        ] = {}
+        self._allow_cache_lock = threading.Lock()
+        self._decision_locks: dict[tuple[str, str, str], threading.Lock] = {}
+        self._decision_locks_lock = threading.Lock()
 
     def close(self) -> None:
         self._oauth.close()
@@ -107,6 +121,42 @@ class SecurityAuthorizationClient:
             self._service_token_reuse_until = now + _SERVICE_TOKEN_REUSE_SECONDS
             return token
 
+    def _cached_allow(
+        self,
+        key: tuple[str, str, str],
+    ) -> SecurityAuthorizationDecision | None:
+        now = time.monotonic()
+        with self._allow_cache_lock:
+            cached = self._allow_cache.get(key)
+            if cached is None:
+                return None
+            expires_at, decision = cached
+            if expires_at <= now:
+                self._allow_cache.pop(key, None)
+                return None
+            return decision
+
+    def _remember_allow(
+        self,
+        key: tuple[str, str, str],
+        decision: SecurityAuthorizationDecision,
+    ) -> None:
+        if not decision.allowed:
+            return
+        with self._allow_cache_lock:
+            self._allow_cache[key] = (
+                time.monotonic() + _AUTHORIZATION_ALLOW_REUSE_SECONDS,
+                decision,
+            )
+
+    def _decision_lock(self, key: tuple[str, str, str]) -> threading.Lock:
+        with self._decision_locks_lock:
+            lock = self._decision_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._decision_locks[key] = lock
+            return lock
+
     def check_user_permission(
         self,
         *,
@@ -117,6 +167,32 @@ class SecurityAuthorizationClient:
         if not user_id or not tenant_id or not permission_key:
             raise ValueError("user_id, tenant_id and permission_key are required")
 
+        key = (user_id, tenant_id, permission_key)
+        cached = self._cached_allow(key)
+        if cached is not None:
+            return cached
+
+        # Concurrent requests for the same USER/Tenant/permission share one live
+        # Security decision. Different authorization keys can proceed independently.
+        with self._decision_lock(key):
+            cached = self._cached_allow(key)
+            if cached is not None:
+                return cached
+            decision = self._request_permission_decision(
+                user_id=user_id,
+                tenant_id=tenant_id,
+                permission_key=permission_key,
+            )
+            self._remember_allow(key, decision)
+            return decision
+
+    def _request_permission_decision(
+        self,
+        *,
+        user_id: str,
+        tenant_id: str,
+        permission_key: str,
+    ) -> SecurityAuthorizationDecision:
         service_token = self._service_token_for_security()
 
         try:
@@ -205,10 +281,10 @@ def _shared_security_authorization_client() -> SecurityAuthorizationClient:
 
 
 def get_security_authorization_client() -> SecurityAuthorizationClient:
-    """Reuse the backend HTTP/OAuth client across requests.
+    """Reuse backend HTTP/OAuth state across requests.
 
-    This preserves HTTP connection pooling and the short ServiceIntegration token
-    cache. It does not cache live user permission decisions.
+    This preserves HTTP connection pooling, ServiceIntegration token reuse and the
+    short successful-ALLOW coalescing window. It never caches DENY/error decisions.
     """
 
     return _shared_security_authorization_client()
