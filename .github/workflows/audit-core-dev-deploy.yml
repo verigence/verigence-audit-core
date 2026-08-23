@@ -42,10 +42,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f migrations/versions/0012_uc03_delivery_capture.py
+          test -f migrations/versions/0013_uc02_superadmin_project_directory.py
           alembic heads | tee /tmp/alembic-heads.txt
-          grep -q '0012_uc03_delivery_capture' /tmp/alembic-heads.txt
-          echo 'AUDIT_CORE_ALEMBIC_SOURCE_HEAD=0012_uc03_delivery_capture'
+          grep -q '0013_uc02_project_dir' /tmp/alembic-heads.txt
+          echo 'AUDIT_CORE_ALEMBIC_SOURCE_HEAD=0013_uc02_project_dir'
 
           PYTHONPATH=src python - <<'PY'
           from audit_core.main import app
@@ -193,9 +193,6 @@ jobs:
           echo "AUDIT_CORE_PUBLIC_BASE=$base"
           echo 'AUDIT_CORE_PUBLIC_HEALTH=PASS'
 
-          # Use a genuine browser-style CORS preflight. Bare OPTIONS requests are
-          # intentionally not used: FastAPI routes do not implement OPTIONS themselves
-          # and would correctly return 405, which only pollutes runtime logs.
           cors_status="$(curl --silent --show-error \
             --dump-header /tmp/audit-cors.headers \
             --output /tmp/audit-cors.body \
