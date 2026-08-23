@@ -1,8 +1,8 @@
 name: Diagnose UC02 Project page DEV
 
 on:
-  push:
-    branches: [ops/diagnose-uc02-project-page]
+  pull_request:
+    branches: [dev]
 
 permissions:
   contents: read
@@ -23,10 +23,10 @@ jobs:
           set -euo pipefail
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --json >/dev/null
           echo '--- AUDIT CORE PROJECT PAGE CALLS ---'
-          railway logs --service verigence-audit-core --latest --deployment --lines 1500 2>/dev/null \
+          railway logs --service verigence-audit-core --latest --deployment --lines 2000 2>/dev/null \
             | grep -E 'GET /v1/projects|GET /v1/project-reference-data|GET /v1/tenants/.*/project|api_error|system_error|project_directory_dependency_failed|security_admin_context_failed' \
-            | tail -n 200 || true
+            | tail -n 250 || true
           echo '--- SECURITY ADMIN CALLS ---'
-          railway logs --service security --latest --deployment --lines 1000 2>/dev/null \
+          railway logs --service security --latest --deployment --lines 1200 2>/dev/null \
             | grep -E 'GET /security/v1/platform/admin-context|GET /security/v1/platform/tenants' \
-            | tail -n 100 || true
+            | tail -n 120 || true
