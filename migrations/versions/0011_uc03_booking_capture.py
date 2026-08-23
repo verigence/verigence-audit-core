@@ -165,6 +165,84 @@ def upgrade() -> None:
         """
     )
 
+    # Machine values remain immutable proposals until a human accepts or corrects
+    # them into the existing typed Audit Core domain. proposed_value is never
+    # overwritten by human correction, preserving machine provenance.
+    op.execute(
+        """
+        CREATE TABLE auditcore.journey_capture_proposals (
+            tenant_id                  varchar(128) NOT NULL,
+            capture_proposal_id        uuid NOT NULL DEFAULT gen_random_uuid(),
+            journey_id                 uuid NOT NULL,
+            stage_code                 varchar(30) NOT NULL
+                                       CHECK (stage_code IN ('BOOKING','DELIVERY','POST_DELIVERY')),
+            field_key                  varchar(160) NOT NULL,
+            source_evidence_id         uuid NOT NULL,
+            source_evidence_fact_id    varchar(160) NOT NULL,
+            source_fact_version        integer NOT NULL DEFAULT 1 CHECK (source_fact_version > 0),
+            source_document_type_key   varchar(120),
+            value_source               varchar(80),
+            proposed_value             jsonb NOT NULL,
+            confidence_score           numeric(8,7)
+                                       CHECK (confidence_score IS NULL OR (confidence_score >= 0 AND confidence_score <= 1)),
+            proposal_status            varchar(20) NOT NULL DEFAULT 'PENDING'
+                                       CHECK (proposal_status IN ('PENDING','ACCEPTED','CORRECTED','REJECTED','SUPERSEDED')),
+            accepted_value             jsonb,
+            accepted_by_actor_id       varchar(160),
+            accepted_by_role           varchar(80),
+            accepted_at_utc            timestamptz,
+            owning_domain_key          varchar(100),
+            owning_record_reference    varchar(240),
+            created_at_utc             timestamptz NOT NULL DEFAULT now(),
+            updated_at_utc             timestamptz NOT NULL DEFAULT now(),
+            version_no                 bigint NOT NULL DEFAULT 1 CHECK (version_no > 0),
+            PRIMARY KEY (tenant_id, capture_proposal_id),
+            UNIQUE (
+                tenant_id, source_evidence_id, source_evidence_fact_id,
+                source_fact_version
+            ),
+            FOREIGN KEY (tenant_id, journey_id)
+                REFERENCES auditcore.journeys(tenant_id, journey_id),
+            FOREIGN KEY (tenant_id, source_evidence_id)
+                REFERENCES auditcore.evidence(tenant_id, evidence_id)
+        )
+        """
+    )
+    op.execute(
+        """
+        CREATE INDEX ix_journey_capture_proposals_stage_status
+        ON auditcore.journey_capture_proposals
+            (tenant_id, journey_id, stage_code, proposal_status, created_at_utc)
+        """
+    )
+    op.execute(
+        "ALTER TABLE auditcore.journey_capture_proposals ENABLE ROW LEVEL SECURITY"
+    )
+    op.execute(
+        "ALTER TABLE auditcore.journey_capture_proposals FORCE ROW LEVEL SECURITY"
+    )
+    op.execute(
+        """
+        CREATE POLICY tenant_isolation_journey_capture_proposals
+        ON auditcore.journey_capture_proposals
+        USING (tenant_id = auditcore.current_tenant_id())
+        WITH CHECK (tenant_id = auditcore.current_tenant_id())
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER trg_journey_capture_proposals_updated
+        BEFORE UPDATE ON auditcore.journey_capture_proposals
+        FOR EACH ROW EXECUTE FUNCTION auditcore.set_updated_at()
+        """
+    )
+    op.execute(
+        f"GRANT SELECT, INSERT, UPDATE ON auditcore.journey_capture_proposals TO {_RUNTIME_ROLE}"
+    )
+    op.execute(
+        f"REVOKE DELETE ON auditcore.journey_capture_proposals FROM {_RUNTIME_ROLE}"
+    )
+
     op.execute(
         """
         ALTER TABLE auditcore.audit_findings
@@ -248,8 +326,12 @@ def upgrade() -> None:
         FOR EACH ROW EXECUTE FUNCTION auditcore.prevent_append_only_mutation()
         """
     )
-    op.execute(f"GRANT SELECT, INSERT ON auditcore.audit_finding_events TO {_RUNTIME_ROLE}")
-    op.execute(f"REVOKE UPDATE, DELETE ON auditcore.audit_finding_events FROM {_RUNTIME_ROLE}")
+    op.execute(
+        f"GRANT SELECT, INSERT ON auditcore.audit_finding_events TO {_RUNTIME_ROLE}"
+    )
+    op.execute(
+        f"REVOKE UPDATE, DELETE ON auditcore.audit_finding_events FROM {_RUNTIME_ROLE}"
+    )
 
 
 def downgrade() -> None:
@@ -283,6 +365,12 @@ def downgrade() -> None:
             DROP COLUMN IF EXISTS stage_code
         """
     )
+
+    op.execute(
+        "DROP TRIGGER IF EXISTS trg_journey_capture_proposals_updated "
+        "ON auditcore.journey_capture_proposals"
+    )
+    op.execute("DROP TABLE IF EXISTS auditcore.journey_capture_proposals")
 
     op.execute(
         "DROP TRIGGER IF EXISTS trg_uc03_booking_initialize_requirements "
