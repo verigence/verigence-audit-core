@@ -21,6 +21,13 @@ class HumanPrincipal:
     subject: str
 
 
+# A Project Administration page can legitimately make several protected Audit Core
+# requests. They must all validate the JWT, but they must not all fetch JWKS. Keep
+# the public key set warm for five minutes; PyJWKClient still refreshes when an
+# unknown signing kid is observed, which preserves normal Security key rotation.
+_JWKS_CACHE_LIFESPAN_SECONDS = 300
+
+
 class SecurityTokenValidator:
     def __init__(
         self,
@@ -32,7 +39,12 @@ class SecurityTokenValidator:
     ) -> None:
         self._issuer = issuer
         self._audience = audience
-        self._jwks_client = jwks_client or PyJWKClient(jwks_url)
+        self._jwks_client = jwks_client or PyJWKClient(
+            jwks_url,
+            cache_keys=True,
+            cache_jwk_set=True,
+            lifespan=_JWKS_CACHE_LIFESPAN_SECONDS,
+        )
 
     def validate(self, token: str) -> Principal:
         claims = self._decode(

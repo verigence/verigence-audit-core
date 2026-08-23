@@ -32,11 +32,10 @@ logger = structlog.get_logger(__name__)
 _bearer = HTTPBearer(auto_error=False)
 
 # These GETs can authenticate locally without an extra /platform/admin-context
-# call. /v1/projects still calls Security /platform/tenants, which remains the
-# authoritative access filter for the Project directory. Reference/master reads
-# are intentionally authenticated-human reads per the lightweight runtime design.
+# call. Cross-Tenant Project Administration (`GET /v1/projects`) is deliberately
+# excluded: it requires the real SuperAdmin attestation before its one SQL directory
+# read. Reference/master reads remain authenticated-human reads per the runtime design.
 _LIGHTWEIGHT_AUTHENTICATED_READS = (
-    re.compile(r"^/v1/projects/?$"),
     re.compile(r"^/v1/project-reference-data/?$"),
     re.compile(r"^/v1/tenants/[^/]+/project-masters/?$"),
     re.compile(r"^/v1/tenants/[^/]+/project-masters/[^/]+/[^/]+/versions/?$"),

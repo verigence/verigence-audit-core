@@ -71,6 +71,8 @@ class ControlledSecurityProvisioning:
                     status="CONFIGURING",
                 )
 
+            # Retain this method only to prove the optimized Project directory never
+            # calls it. `fail_list=True` must not make persisted Projects disappear.
             def list_tenants(self, *, human_bearer_token: str) -> tuple[SecurityTenant, ...]:
                 controller.list_calls.append(human_bearer_token)
                 if controller.fail_list:
@@ -233,17 +235,21 @@ def _project_count(setup: dict) -> int:
         )
 
 
+def _create_project(client: TestClient, setup: dict, key: str):
+    return client.post(
+        "/v1/projects",
+        headers={"Idempotency-Key": key},
+        json=_payload(setup),
+    )
+
+
 def test_create_project_is_synchronous_and_persists_only_ready_state(
     provisioning_setup,
 ) -> None:
     setup = provisioning_setup
     client = TestClient(app, raise_server_exceptions=False)
 
-    response = client.post(
-        "/v1/projects",
-        headers={"Idempotency-Key": "project-create-0001"},
-        json=_payload(setup),
-    )
+    response = _create_project(client, setup, "project-create-0001")
 
     assert response.status_code == 201, response.text
     body = response.json()
@@ -312,10 +318,10 @@ def test_security_failure_returns_error_without_project_or_compensation(
     setup = provisioning_setup
     setup["security"].fail_create = True
 
-    response = TestClient(app, raise_server_exceptions=False).post(
-        "/v1/projects",
-        headers={"Idempotency-Key": "project-create-security-failure-0001"},
-        json=_payload(setup),
+    response = _create_project(
+        TestClient(app, raise_server_exceptions=False),
+        setup,
+        "project-create-security-failure-0001",
     )
 
     assert response.status_code == 503
@@ -337,10 +343,10 @@ def test_audit_core_failure_rolls_back_and_compensates_security(
 
     monkeypatch.setattr(project_provisioning, "_ensure_project_projection", fail_projection)
 
-    response = TestClient(app, raise_server_exceptions=False).post(
-        "/v1/projects",
-        headers={"Idempotency-Key": "project-create-local-failure-0001"},
-        json=_payload(setup),
+    response = _create_project(
+        TestClient(app, raise_server_exceptions=False),
+        setup,
+        "project-create-local-failure-0001",
     )
 
     assert response.status_code == 503
@@ -357,10 +363,10 @@ def test_di_failure_rolls_back_project_and_cleans_uncertain_di_then_security(
     setup = provisioning_setup
     setup["di"].fail = True
 
-    response = TestClient(app, raise_server_exceptions=False).post(
-        "/v1/projects",
-        headers={"Idempotency-Key": "project-create-di-failure-0001"},
-        json=_payload(setup),
+    response = _create_project(
+        TestClient(app, raise_server_exceptions=False),
+        setup,
+        "project-create-di-failure-0001",
     )
 
     assert response.status_code == 503
@@ -403,38 +409,44 @@ def test_compensation_removes_di_before_security(monkeypatch) -> None:
     assert calls == ["SECURITY"]
 
 
-def test_project_directory_returns_only_persisted_project(provisioning_setup) -> None:
+def test_project_directory_reads_persisted_project_without_security_tenant_listing(
+    provisioning_setup,
+) -> None:
     setup = provisioning_setup
     client = TestClient(app, raise_server_exceptions=False)
-    created = client.post(
-        "/v1/projects",
-        headers={"Idempotency-Key": "project-create-directory-0001"},
-        json=_payload(setup),
-    )
+    created = _create_project(client, setup, "project-create-directory-0001")
     assert created.status_code == 201
 
+    # Even a broken Security Tenant directory must not hide an already-persisted
+    # Audit Core Project. SuperAdmin was authorized before the route entered.
+    setup["security"].fail_list = True
     response = client.get("/v1/projects")
-    assert response.status_code == 200
-    assert response.json() == [
-        {
-            "tenantId": setup["tenant_id"],
-            "projectCode": setup["security"].tenant_code,
-            "projectName": "UC02 Provisioned Project",
-            "projectStatus": "CONFIGURING",
-            "securityTenantStatus": "CONFIGURING",
-        }
-    ]
+
+    assert response.status_code == 200, response.text
+    project = next(
+        item for item in response.json() if item["tenantId"] == setup["tenant_id"]
+    )
+    assert project == {
+        "tenantId": setup["tenant_id"],
+        "projectCode": setup["security"].tenant_code,
+        "projectName": "UC02 Provisioned Project",
+        "projectStatus": "CONFIGURING",
+        "securityTenantStatus": "NOT_QUERIED",
+    }
+    assert setup["security"].list_calls == []
 
 
-def test_project_directory_dependency_failure_is_business_safe(provisioning_setup) -> None:
+def test_project_directory_never_calls_security_tenant_listing(
+    provisioning_setup,
+) -> None:
     setup = provisioning_setup
     setup["security"].fail_list = True
 
     response = TestClient(app, raise_server_exceptions=False).get("/v1/projects")
 
-    assert response.status_code == 503
-    assert response.json()["errorCode"] == "VAC-SYS-002"
-    assert "Security" not in response.json()["detail"]
+    assert response.status_code == 200
+    assert isinstance(response.json(), list)
+    assert setup["security"].list_calls == []
 
 
 def test_project_provisioning_retry_endpoint_is_not_exposed() -> None:
