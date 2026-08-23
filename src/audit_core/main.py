@@ -33,7 +33,9 @@ from audit_core.reference_data import router as reference_data_router
 from audit_core.role_mapping_policy import install_role_mapping_policy
 from audit_core.tasks_api import router as task_router
 from audit_core.uc03_authorized_work_items import router as uc03_work_items_router
+from audit_core.uc03_booking_capture import router as uc03_booking_capture_router
 from audit_core.uc03_booking_commands import router as uc03_booking_router
+from audit_core.uc03_booking_evidence import router as uc03_booking_evidence_router
 from audit_core.uc03_document_assessments import (
     router as uc03_document_assessments_router,
 )
@@ -82,6 +84,8 @@ def create_app() -> FastAPI:
     application.include_router(uc03_project_context_router)
     application.include_router(uc03_work_items_router)
     application.include_router(uc03_booking_router)
+    application.include_router(uc03_booking_capture_router)
+    application.include_router(uc03_booking_evidence_router)
     application.include_router(uc03_document_assessments_router)
     application.include_router(readiness_router)
     application.include_router(project_activation_router)
