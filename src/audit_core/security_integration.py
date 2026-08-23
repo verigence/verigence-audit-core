@@ -88,48 +88,42 @@ class SecurityAdminClient:
         self.close()
 
     def get_admin_context(self, *, human_bearer_token: str) -> SecurityAdminContext:
+        """Resolve platform administration context from Security's canonical /me contract."""
+
         payload = self._request_json(
             "GET",
-            "/security/v1/platform/admin-context",
+            "/security/v1/platform/me",
             human_bearer_token=human_bearer_token,
         )
         user_id = payload.get("userId")
-        is_super_admin = payload.get("isSuperAdmin")
-        raw_scopes = payload.get("adminScopes")
+        raw_roles = payload.get("roles")
+        raw_permissions = payload.get("permissions")
         if (
             not isinstance(user_id, str)
             or not user_id
-            or not isinstance(is_super_admin, bool)
-            or not isinstance(raw_scopes, list)
-        ):
-            raise SecurityAdminError("Security admin-context response has invalid shape")
-
-        scopes: list[SecurityAdminScope] = []
-        for raw in raw_scopes:
-            if not isinstance(raw, dict):
-                raise SecurityAdminError("Security admin-context scope has invalid shape")
-            role_key = raw.get("roleKey")
-            scope_type = raw.get("scopeType")
-            scope_id = raw.get("scopeId")
-            if (
-                not isinstance(role_key, str)
-                or not role_key
-                or not isinstance(scope_type, str)
-                or not scope_type
-                or (scope_id is not None and not isinstance(scope_id, str))
-            ):
-                raise SecurityAdminError("Security admin-context scope has invalid shape")
-            scopes.append(
-                SecurityAdminScope(
-                    role_key=role_key,
-                    scope_type=scope_type,
-                    scope_id=scope_id,
-                )
+            or not isinstance(raw_roles, list)
+            or not all(isinstance(role, str) and role for role in raw_roles)
+            or not isinstance(raw_permissions, list)
+            or not all(
+                isinstance(permission, str) and permission
+                for permission in raw_permissions
             )
+        ):
+            raise SecurityAdminError("Security platform-me response has invalid shape")
+
+        roles = tuple(raw_roles)
+        scopes = tuple(
+            SecurityAdminScope(
+                role_key=role,
+                scope_type="PLATFORM",
+                scope_id=None,
+            )
+            for role in roles
+        )
         return SecurityAdminContext(
             user_id=user_id,
-            is_super_admin=is_super_admin,
-            admin_scopes=tuple(scopes),
+            is_super_admin="platform.super_admin" in roles,
+            admin_scopes=scopes,
         )
 
     def create_tenant(
