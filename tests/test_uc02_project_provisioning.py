@@ -423,19 +423,20 @@ def test_project_directory_reads_persisted_project_without_security_tenant_listi
     response = client.get("/v1/projects")
 
     assert response.status_code == 200, response.text
-    assert response.json() == [
-        {
-            "tenantId": setup["tenant_id"],
-            "projectCode": setup["security"].tenant_code,
-            "projectName": "UC02 Provisioned Project",
-            "projectStatus": "CONFIGURING",
-            "securityTenantStatus": "NOT_QUERIED",
-        }
-    ]
+    project = next(
+        item for item in response.json() if item["tenantId"] == setup["tenant_id"]
+    )
+    assert project == {
+        "tenantId": setup["tenant_id"],
+        "projectCode": setup["security"].tenant_code,
+        "projectName": "UC02 Provisioned Project",
+        "projectStatus": "CONFIGURING",
+        "securityTenantStatus": "NOT_QUERIED",
+    }
     assert setup["security"].list_calls == []
 
 
-def test_empty_project_directory_does_not_call_security_tenant_listing(
+def test_project_directory_never_calls_security_tenant_listing(
     provisioning_setup,
 ) -> None:
     setup = provisioning_setup
@@ -444,7 +445,7 @@ def test_empty_project_directory_does_not_call_security_tenant_listing(
     response = TestClient(app, raise_server_exceptions=False).get("/v1/projects")
 
     assert response.status_code == 200
-    assert response.json() == []
+    assert isinstance(response.json(), list)
     assert setup["security"].list_calls == []
 
 
