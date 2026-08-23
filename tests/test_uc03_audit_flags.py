@@ -211,7 +211,7 @@ def _set_role(setup, role: str) -> None:
     setup["active_actor"]["id"] = setup["actors"][role]
 
 
-def _create_flag(setup, *, key: str = "flag-create-0001", blocking: bool = False):
+def _create_flag(setup, *, key: str = "flag-create-0001"):
     response = _client().post(
         f"{_base(setup)}/flags",
         headers={"Idempotency-Key": key, "If-Match": '"1"'},
@@ -221,7 +221,6 @@ def _create_flag(setup, *, key: str = "flag-create-0001", blocking: bool = False
             "severity": "HIGH",
             "summary": "Manual audit exception",
             "remarks": "Observed during Booking review",
-            "blockingCompletion": blocking,
         },
     )
     assert response.status_code == 200, response.text
@@ -234,6 +233,7 @@ def test_pc_flag_create_is_idempotent_and_preserves_provenance(audit_setup):
     assert body["flag"]["originKind"] == "HUMAN"
     assert body["flag"]["originRole"] == "PC"
     assert body["flag"]["status"] == "OPEN"
+    assert body["flag"]["blockingCompletion"] is False
     assert response.headers["etag"] == '"1"'
 
     replay = _client().post(
@@ -245,7 +245,6 @@ def test_pc_flag_create_is_idempotent_and_preserves_provenance(audit_setup):
             "severity": "HIGH",
             "summary": "Manual audit exception",
             "remarks": "Observed during Booking review",
-            "blockingCompletion": False,
         },
     )
     assert replay.status_code == 200
@@ -281,6 +280,35 @@ def test_pc_flag_create_is_idempotent_and_preserves_provenance(audit_setup):
         ).scalar_one()
     assert finding_count == 1
     assert event_count == 1
+
+
+def test_human_flag_cannot_self_declare_completion_guard(audit_setup):
+    response = _client().post(
+        f"{_base(audit_setup)}/flags",
+        headers={"Idempotency-Key": "flag-human-guard", "If-Match": '"1"'},
+        json={
+            "stage": "BOOKING",
+            "category": "PROCESS_NON_COMPLIANCE",
+            "severity": "HIGH",
+            "summary": "Attempted manual completion guard",
+            "blockingCompletion": True,
+        },
+    )
+    assert response.status_code == 400, response.text
+    with audit_setup["engine"].begin() as connection:
+        finding_count = connection.execute(
+            text(
+                """
+                SELECT count(*) FROM auditcore.audit_findings
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                """
+            ),
+            {
+                "tenant_id": audit_setup["tenant_id"],
+                "journey_id": audit_setup["journey_id"],
+            },
+        ).scalar_one()
+    assert finding_count == 0
 
 
 def test_pc_cannot_acknowledge_but_tl_can_review_and_resolve(audit_setup):
@@ -387,9 +415,45 @@ def test_complete_audit_keeps_historical_flags_raised_after_resolution(audit_set
 
 
 def test_blocking_flag_prevents_audit_completion_until_resolved(audit_setup):
-    flag = _create_flag(audit_setup, key="flag-create-0005", blocking=True).json()["flag"]
-    summary = _client().get(f"{_base(audit_setup)}/audit-summary").json()
-    version = summary["booking"]["aggregateVersion"]
+    with audit_setup["engine"].begin() as connection:
+        flag_id = connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.audit_findings (
+                    tenant_id, journey_id, finding_type_code, severity,
+                    finding_status, title, stage_code, origin_kind,
+                    origin_role_snapshot, rule_key, blocking_completion
+                ) VALUES (
+                    :tenant_id, :journey_id, 'AUDIT_COMPLETION_GUARD', 'HIGH',
+                    'OPEN', 'Configured completion guard', 'BOOKING', 'MACHINE',
+                    'SYSTEM', 'TEST_COMPLETION_GUARD', true
+                ) RETURNING audit_finding_id
+                """
+            ),
+            {
+                "tenant_id": audit_setup["tenant_id"],
+                "journey_id": audit_setup["journey_id"],
+            },
+        ).scalar_one()
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.journey_stage_states
+                SET audit_status='FLAGS_RAISED'
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND stage_code='BOOKING'
+                """
+            ),
+            {
+                "tenant_id": audit_setup["tenant_id"],
+                "journey_id": audit_setup["journey_id"],
+            },
+        )
+
+    summary = _client().get(f"{_base(audit_setup)}/audit-summary")
+    assert summary.status_code == 200, summary.text
+    version = summary.json()["booking"]["aggregateVersion"]
+    assert summary.json()["booking"]["blockingOpenFlagCount"] == 1
     blocked = _client().post(
         f"{_base(audit_setup)}/stages/BOOKING/audit/complete",
         headers={"Idempotency-Key": "booking-audit-blocked", "If-Match": f'"{version}"'},
@@ -399,18 +463,19 @@ def test_blocking_flag_prevents_audit_completion_until_resolved(audit_setup):
 
     _set_role(audit_setup, "PM")
     resolved = _client().post(
-        f"{_base(audit_setup)}/flags/{flag['flagId']}/actions",
+        f"{_base(audit_setup)}/flags/{flag_id}/actions",
         headers={"Idempotency-Key": "flag-resolve-pm-01", "If-Match": '"1"'},
         json={"action": "RESOLVE", "resolutionReason": "Guard satisfied"},
     )
     assert resolved.status_code == 200
 
-    summary = _client().get(f"{_base(audit_setup)}/audit-summary").json()
+    summary = _client().get(f"{_base(audit_setup)}/audit-summary")
+    assert summary.status_code == 200
     completed = _client().post(
         f"{_base(audit_setup)}/stages/BOOKING/audit/complete",
         headers={
             "Idempotency-Key": "booking-audit-unblocked",
-            "If-Match": f'"{summary["booking"]["aggregateVersion"]}"',
+            "If-Match": f'"{summary.json()["booking"]["aggregateVersion"]}"',
         },
         json={},
     )
