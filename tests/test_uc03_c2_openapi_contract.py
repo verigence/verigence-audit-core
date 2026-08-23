@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import yaml
-
 from audit_core.main import app
 
 
