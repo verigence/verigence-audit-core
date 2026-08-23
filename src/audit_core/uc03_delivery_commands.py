@@ -1216,14 +1216,14 @@ def complete_delivery(
                 """
                 UPDATE auditcore.journey_stage_states
                 SET business_status='DELIVERY_COMPLETED',
-                    audit_state=:audit_state,
+                    audit_state=CAST(:audit_state AS varchar),
                     audit_status=CASE
                         WHEN audit_status='FLAGS_RAISED' THEN 'FLAGS_RAISED'
-                        ELSE :audit_status
+                        ELSE CAST(:audit_status AS varchar)
                     END,
                     business_completed_at_utc=COALESCE(business_completed_at_utc, now()),
                     capture_completed_at_utc=CASE
-                        WHEN :audit_state='COMPLETE' THEN COALESCE(capture_completed_at_utc, now())
+                        WHEN CAST(:audit_state AS varchar)='COMPLETE' THEN COALESCE(capture_completed_at_utc, now())
                         ELSE capture_completed_at_utc
                     END,
                     latest_activity_at_utc=now(), updated_at_utc=now(),
