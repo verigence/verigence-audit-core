@@ -12,6 +12,7 @@ from sqlalchemy import Connection, Engine, create_engine, text
 
 from audit_core.authorization import AuthorizationError
 from audit_core.errors import DependencyUnavailableError
+from audit_core.otel import attach_trusted_user_id
 from audit_core.security import (
     HumanPrincipal,
     Principal,
@@ -89,7 +90,9 @@ def get_human_principal(
     bearer_token: Annotated[str, Depends(get_bearer_token)],
 ) -> HumanPrincipal:
     try:
-        return _token_validator().validate_human(bearer_token)
+        principal = _token_validator().validate_human(bearer_token)
+        attach_trusted_user_id(principal.subject)
+        return principal
     except SecurityTokenError as exc:
         logger.warning("human_auth_failed", reason=str(exc))
         raise
