@@ -1,0 +1,104 @@
+name: UC03 field review live E2E
+
+on:
+  push:
+    branches:
+      - test/uc03-field-review-live-20260824
+    paths:
+      - '.github/workflows/one-shot-uc03-field-review-live.yml'
+      - 'tests/e2e/uc03_field_review_live.py'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: uc03-field-review-live-e2e
+  cancel-in-progress: false
+
+jobs:
+  live-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_DEV_SOURCE_SHA: 5c8dd04cbc573fe016380bd10fa7b3752fbbf8e6
+      WEB_BASE: https://verigence-web-dev.jbrconsulting-it.workers.dev
+      SECURITY_VARS_PATH: /tmp/security-vars.json
+      AUDIT_VARS_PATH: /tmp/audit-vars.json
+      DI_VARS_PATH: /tmp/di-vars.json
+      POLL_TIMEOUT_SECONDS: '300'
+      POLL_SECONDS: '5'
+
+    steps:
+      - name: Checkout isolated test branch
+        uses: actions/checkout@v4
+        with:
+          ref: test/uc03-field-review-live-20260824
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'psycopg[binary]>=3.2,<4' 'PyJWT>=2.8,<3' 'cryptography>=42,<46' 'httpx>=0.27,<1' 'Pillow>=10,<13'
+          npm install --global @railway/cli
+
+      - name: Read deployed DEV configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${RAILWAY_API_TOKEN:-}" || { echo '::error::RAILWAY_API_TOKEN is missing'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --json >/dev/null
+          railway variable list --service security --environment dev --json > "$SECURITY_VARS_PATH"
+          railway variable list --service verigence-audit-core --environment dev --json > "$AUDIT_VARS_PATH"
+          railway variable list --service di-api --environment dev --json > "$DI_VARS_PATH"
+          echo 'UC03_LIVE_DEV_CONFIGURATION=PASS'
+
+      - name: Exercise deployed UC03 field-review path
+        id: e2e
+        shell: bash
+        run: |
+          set +e
+          python tests/e2e/uc03_field_review_live.py
+          code=$?
+          set -e
+          echo "$code" > /tmp/uc03-e2e-exit
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          # Persist evidence even when the live test finds a product/runtime defect.
+          exit 0
+
+      - name: Record live DEV evidence on isolated branch
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f docs/runtime/uc03-field-review-live-e2e.txt || {
+            mkdir -p docs/runtime
+            printf '# UC03 Field Review Live DEV E2E\n\n- outcome: HARNESS_FAILURE\n' > docs/runtime/uc03-field-review-live-e2e.txt
+          }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/runtime/uc03-field-review-live-e2e.txt
+          if ! git diff --cached --quiet; then
+            git commit -m 'docs(test): record UC03 live field-review result [skip ci]'
+            git pull --rebase origin test/uc03-field-review-live-20260824
+            git push origin HEAD:test/uc03-field-review-live-20260824
+          fi
+
+      - name: Enforce live E2E result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          code="$(cat /tmp/uc03-e2e-exit 2>/dev/null || echo 1)"
+          if [[ "$code" != "0" ]]; then
+            echo "::error::UC03 field-review live E2E failed. See committed runtime evidence."
+            exit "$code"
+          fi
+          grep -q 'UC03_FIELD_REVIEW_LIVE_E2E=PASS' docs/runtime/uc03-field-review-live-e2e.txt
+          echo 'UC03_FIELD_REVIEW_LIVE_E2E=PASS'
