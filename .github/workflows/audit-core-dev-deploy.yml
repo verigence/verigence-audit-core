@@ -42,10 +42,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f migrations/versions/0013_uc02_superadmin_project_directory.py
+          test -f migrations/versions/0014_uc02_mahindra_segment_masters.py
           alembic heads | tee /tmp/alembic-heads.txt
-          grep -q '0013_uc02_project_dir' /tmp/alembic-heads.txt
-          echo 'AUDIT_CORE_ALEMBIC_SOURCE_HEAD=0013_uc02_project_dir'
+          grep -q '0014_uc02_mahindra_seg' /tmp/alembic-heads.txt
+          echo 'AUDIT_CORE_ALEMBIC_SOURCE_HEAD=0014_uc02_mahindra_seg'
 
           PYTHONPATH=src python - <<'PY'
           from audit_core.main import app
@@ -58,6 +58,8 @@ jobs:
               "/v1/tenants/{tenant_id}/project-masters",
               "/v1/tenants/{tenant_id}/role-mapping-candidates",
               "/v1/tenants/{tenant_id}/role-mappings",
+              "/v1/tenants/{tenant_id}/mahindra-masters/segments/{segment_id}/imports",
+              "/v1/tenants/{tenant_id}/mahindra-masters/discount-policy/imports",
           ]
           missing = [path for path in required if path not in paths]
           if missing:

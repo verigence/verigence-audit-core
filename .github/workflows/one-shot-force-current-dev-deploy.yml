@@ -30,13 +30,13 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install -e .
-          test -f migrations/versions/0013_uc02_superadmin_project_directory.py
+          test -f migrations/versions/0014_uc02_mahindra_segment_masters.py
           head="$(alembic heads)"
           printf '%s\n' "$head"
-          grep -q '0013_uc02_project_dir' <<<"$head"
-          grep -q 'test -f migrations/versions/0013_uc02_superadmin_project_directory.py' railway.toml
+          grep -q '0014_uc02_mahindra_seg' <<<"$head"
+          grep -q 'test -f migrations/versions/0014_uc02_mahindra_segment_masters.py' railway.toml
           echo "SOURCE_SHA=${GITHUB_SHA}"
-          echo 'SOURCE_0013=PASS'
+          echo 'SOURCE_0014=PASS'
       - run: npm install --global @railway/cli
       - name: Upload exact DEV source to Railway
         shell: bash

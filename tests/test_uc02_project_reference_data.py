@@ -24,6 +24,11 @@ _EXPECTED_OEMS = {
     "VOLKSWAGEN": "Volkswagen",
     "TATA_MOTORS": "Tata Motors",
 }
+_EXPECTED_MAHINDRA_SEGMENTS = {
+    "PASSENGER_VEHICLE": "Passenger Vehicle",
+    "COMMERCIAL": "Commercial",
+    "BATTERY_ELECTRIC": "Battery Electric",
+}
 
 
 def test_project_reference_data_exposes_only_approved_active_masters() -> None:
@@ -53,13 +58,17 @@ def test_project_reference_data_exposes_only_approved_active_masters() -> None:
             item["oemCode"]: item["oemName"] for item in body["oems"]
         } == _EXPECTED_OEMS
         assert all(item["oemId"] for item in body["oems"])
+        assert "productCategories" not in body
 
-        assert [
-            item["categoryCode"] for item in body["productCategories"]
-        ] == ["FOUR_WHEELERS"]
-        four_wheelers = body["productCategories"][0]
-        assert four_wheelers["categoryName"] == "Four Wheelers"
-        assert four_wheelers["productCategoryId"]
+        mahindra = next(item for item in body["oems"] if item["oemCode"] == "MAHINDRA")
+        assert {
+            item["segmentCode"]: item["segmentName"] for item in mahindra["segments"]
+        } == _EXPECTED_MAHINDRA_SEGMENTS
+        assert all(item["segmentId"] for item in mahindra["segments"])
+
+        for oem in body["oems"]:
+            if oem["oemCode"] != "MAHINDRA":
+                assert oem["segments"] == []
     finally:
         app.dependency_overrides.clear()
         engine.dispose()

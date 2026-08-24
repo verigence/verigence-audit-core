@@ -102,16 +102,28 @@ def resolve_sellable_configuration(
             """
             SELECT s.product_sku_id, s.sku_code,
                    o.oem_id, o.oem_code, o.oem_name,
-                   m.model_id, m.model_code, m.model_name,
+                   seg.segment_id, seg.segment_code, seg.segment_name,
+                   m.model_id, m.model_code, m.model_name, m.model_year,
                    v.variant_id, v.variant_code, v.variant_name,
+                   pc.configuration_id, pc.configuration_code,
+                   pc.fuel_powertrain AS configuration_fuel_powertrain,
+                   pc.transmission AS configuration_transmission,
+                   pc.drive_type, pc.seating_capacity,
+                   pc.body_type AS configuration_body_type,
+                   pc.attributes AS configuration_attributes,
                    c.colour_id, c.colour_code, c.colour_name
             FROM auditcore.product_skus s
             JOIN auditcore.oems o ON o.oem_id = s.oem_id
             JOIN auditcore.product_models m ON m.model_id = s.model_id
             JOIN auditcore.product_variants v ON v.variant_id = s.variant_id
+            LEFT JOIN auditcore.oem_segments seg ON seg.segment_id = m.segment_id
+            LEFT JOIN auditcore.product_configurations pc
+              ON pc.configuration_id = s.configuration_id
             LEFT JOIN auditcore.colours c ON c.colour_id = s.colour_id
             WHERE s.product_sku_id = :product_sku_id
               AND s.is_active AND o.is_active AND m.is_active AND v.is_active
+              AND (seg.segment_id IS NULL OR seg.is_active)
+              AND (pc.configuration_id IS NULL OR pc.is_active)
               AND (c.colour_id IS NULL OR c.is_active)
             """
         ),

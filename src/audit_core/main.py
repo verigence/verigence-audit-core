@@ -20,6 +20,7 @@ from audit_core.findings import router as findings_router
 from audit_core.insurance_tradein import router as insurance_tradein_router
 from audit_core.journeys import router as journey_router
 from audit_core.logging_config import configure_logging
+from audit_core.mahindra_masters import router as mahindra_master_router
 from audit_core.observability import install_observability
 from audit_core.otel import configure_otlp
 from audit_core.payments_finance import router as payments_finance_router
@@ -106,6 +107,10 @@ def create_app() -> FastAPI:
     application.include_router(uc03_audit_router)
     application.include_router(readiness_router)
     application.include_router(project_activation_router)
+    # Mahindra OEM-specific segment uploads are registered before the generic master
+    # routes. They normalize one segment workbook into Product + dynamic Price masters
+    # while keeping the older generic import contract available for other OEMs.
+    application.include_router(mahindra_master_router)
     # Literal DI-owned Project Master and generic import routes must be registered
     # before the older owner-module dynamic routes so DI requests cannot fall into
     # the Audit-Core-only rejection branches.

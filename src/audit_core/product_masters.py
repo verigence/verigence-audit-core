@@ -13,24 +13,27 @@ def ensure_project_product_master(
     connection: Connection,
     *,
     tenant_id: str,
+    segment_id: UUID | None = None,
 ) -> UUID:
     existing = connection.execute(
         text(
             """
             SELECT product_master_id
             FROM auditcore.project_product_masters
-            WHERE tenant_id = :tenant_id AND status = 'ACTIVE'
+            WHERE tenant_id = :tenant_id
+              AND status = 'ACTIVE'
+              AND segment_id IS NOT DISTINCT FROM :segment_id
             ORDER BY created_at_utc, product_master_id
             """
         ),
-        {"tenant_id": tenant_id},
+        {"tenant_id": tenant_id, "segment_id": segment_id},
     ).scalars().all()
     if len(existing) > 1:
         raise AuditCoreError(
             error_code="VAC-MASTER-003",
             status_code=409,
             title="Master configuration conflict",
-            detail="Project has more than one active Product Master identity.",
+            detail="Project has more than one active Product Master identity for the Segment.",
         )
     if existing:
         return existing[0]
@@ -38,12 +41,12 @@ def ensure_project_product_master(
     return connection.execute(
         text(
             """
-            INSERT INTO auditcore.project_product_masters (tenant_id)
-            VALUES (:tenant_id)
+            INSERT INTO auditcore.project_product_masters (tenant_id, segment_id)
+            VALUES (:tenant_id, :segment_id)
             RETURNING product_master_id
             """
         ),
-        {"tenant_id": tenant_id},
+        {"tenant_id": tenant_id, "segment_id": segment_id},
     ).scalar_one()
 
 
@@ -54,8 +57,13 @@ def create_project_product_master_version(
     effective_from: date,
     actor_id: str,
     source_import_id: UUID | None = None,
+    segment_id: UUID | None = None,
 ) -> UUID:
-    product_master_id = ensure_project_product_master(connection, tenant_id=tenant_id)
+    product_master_id = ensure_project_product_master(
+        connection,
+        tenant_id=tenant_id,
+        segment_id=segment_id,
+    )
     version_no = connection.execute(
         text(
             """
@@ -235,26 +243,35 @@ def resolve_effective_project_product_master_version(
     *,
     tenant_id: str,
     effective_on: date,
+    segment_id: UUID | None = None,
 ) -> UUID:
     rows = connection.execute(
         text(
             """
-            SELECT version_id, effective_from
-            FROM auditcore.project_product_master_versions
-            WHERE tenant_id = :tenant_id
-              AND lifecycle_status = 'PUBLISHED'
-              AND effective_from <= :effective_on
-            ORDER BY effective_from DESC, version_id
+            SELECT v.version_id, v.effective_from
+            FROM auditcore.project_product_master_versions v
+            JOIN auditcore.project_product_masters m
+              ON m.tenant_id = v.tenant_id
+             AND m.product_master_id = v.product_master_id
+            WHERE v.tenant_id = :tenant_id
+              AND m.segment_id IS NOT DISTINCT FROM :segment_id
+              AND v.lifecycle_status = 'PUBLISHED'
+              AND v.effective_from <= :effective_on
+            ORDER BY v.effective_from DESC, v.version_id
             """
         ),
-        {"tenant_id": tenant_id, "effective_on": effective_on},
+        {
+            "tenant_id": tenant_id,
+            "effective_on": effective_on,
+            "segment_id": segment_id,
+        },
     ).mappings().all()
     if not rows:
         raise AuditCoreError(
             error_code="VAC-MASTER-002",
             status_code=422,
             title="No effective master version",
-            detail="No published Product Master version exists for the requested date.",
+            detail="No published Product Master version exists for the requested date and Segment.",
         )
 
     latest_wef = rows[0]["effective_from"]
@@ -265,11 +282,25 @@ def resolve_effective_project_product_master_version(
             status_code=409,
             title="Master configuration conflict",
             detail=(
-                "Multiple published Product Master versions share the latest applicable WEF; "
-                "an effective version cannot be selected deterministically."
+                "Multiple published Product Master versions share the latest applicable WEF "
+                "for the Segment; an effective version cannot be selected deterministically."
             ),
         )
     return winners[0]["version_id"]
+
+
+def _sku_segment_id(connection: Connection, product_sku_id: UUID) -> UUID | None:
+    return connection.execute(
+        text(
+            """
+            SELECT m.segment_id
+            FROM auditcore.product_skus s
+            JOIN auditcore.product_models m ON m.model_id = s.model_id
+            WHERE s.product_sku_id=:product_sku_id
+            """
+        ),
+        {"product_sku_id": product_sku_id},
+    ).scalar_one_or_none()
 
 
 def product_sku_is_in_effective_master(
@@ -279,10 +310,12 @@ def product_sku_is_in_effective_master(
     product_sku_id: UUID,
     effective_on: date,
 ) -> bool:
+    segment_id = _sku_segment_id(connection, product_sku_id)
     version_id = resolve_effective_project_product_master_version(
         connection,
         tenant_id=tenant_id,
         effective_on=effective_on,
+        segment_id=segment_id,
     )
     return bool(
         connection.execute(

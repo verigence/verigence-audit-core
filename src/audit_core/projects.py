@@ -22,12 +22,20 @@ from audit_core.errors import (
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/project", tags=["project"])
 
 
+class ProjectSegmentResponse(BaseModel):
+    segmentId: UUID
+    segmentCode: str
+    segmentName: str
+
+
 class ProjectResponse(BaseModel):
     tenantId: str
     projectCode: str
     projectName: str
     oemId: UUID
-    productCategoryId: UUID
+    # Legacy compatibility only; new Project onboarding starts at OEM + Segment.
+    productCategoryId: UUID | None = None
+    segments: list[ProjectSegmentResponse]
     effectiveStartDate: date
     effectiveEndDate: date | None
     timezoneName: str
@@ -41,7 +49,7 @@ class ProjectResponse(BaseModel):
 class ProjectPatch(BaseModel):
     projectName: str | None = Field(default=None, min_length=1, max_length=240)
     oemId: UUID | None = None
-    productCategoryId: UUID | None = None
+    segmentIds: list[UUID] | None = None
     effectiveStartDate: date | None = None
     effectiveEndDate: date | None = None
     timezoneName: str | None = Field(default=None, min_length=1, max_length=100)
@@ -74,13 +82,36 @@ def _project_row(connection: Connection, tenant_id: str):
     return row
 
 
-def _project_response(row) -> ProjectResponse:
+def _segment_rows(connection: Connection, tenant_id: str):
+    return connection.execute(
+        text(
+            """
+            SELECT s.segment_id, s.segment_code, s.segment_name
+            FROM auditcore.project_segments ps
+            JOIN auditcore.oem_segments s ON s.segment_id = ps.segment_id
+            WHERE ps.tenant_id=:tenant_id
+            ORDER BY s.segment_name, s.segment_code
+            """
+        ),
+        {"tenant_id": tenant_id},
+    ).mappings().all()
+
+
+def _project_response(connection: Connection, row) -> ProjectResponse:
     return ProjectResponse(
         tenantId=row["tenant_id"],
         projectCode=row["project_code"],
         projectName=row["project_name"],
         oemId=row["oem_id"],
         productCategoryId=row["product_category_id"],
+        segments=[
+            ProjectSegmentResponse(
+                segmentId=segment["segment_id"],
+                segmentCode=segment["segment_code"],
+                segmentName=segment["segment_name"],
+            )
+            for segment in _segment_rows(connection, row["tenant_id"])
+        ],
         effectiveStartDate=row["effective_start_date"],
         effectiveEndDate=row["effective_end_date"],
         timezoneName=row["timezone_name"],
@@ -124,6 +155,10 @@ def _has_project_dependencies(connection: Connection, tenant_id: str) -> bool:
                         WHERE tenant_id = :tenant_id
                     )
                     OR EXISTS (
+                        SELECT 1 FROM auditcore.project_product_master_versions
+                        WHERE tenant_id = :tenant_id AND lifecycle_status = 'PUBLISHED'
+                    )
+                    OR EXISTS (
                         SELECT 1 FROM auditcore.project_policy_versions
                         WHERE tenant_id = :tenant_id AND lifecycle_status = 'PUBLISHED'
                     )
@@ -133,6 +168,10 @@ def _has_project_dependencies(connection: Connection, tenant_id: str) -> bool:
                     )
                     OR EXISTS (
                         SELECT 1 FROM auditcore.discount_scheme_versions
+                        WHERE tenant_id = :tenant_id AND lifecycle_status = 'PUBLISHED'
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM auditcore.discount_policy_versions
                         WHERE tenant_id = :tenant_id AND lifecycle_status = 'PUBLISHED'
                     )
                     OR EXISTS (
@@ -168,6 +207,60 @@ def _require_reference_exists(
         )
 
 
+def _validate_segment_ids(
+    connection: Connection,
+    *,
+    oem_id: UUID,
+    segment_ids: list[UUID],
+) -> None:
+    if len(set(segment_ids)) != len(segment_ids):
+        raise BusinessValidationError(detail="Project Segments cannot contain duplicates.")
+    configured = set(
+        connection.execute(
+            text(
+                """
+                SELECT segment_id FROM auditcore.oem_segments
+                WHERE oem_id=:oem_id AND is_active=true
+                """
+            ),
+            {"oem_id": oem_id},
+        ).scalars().all()
+    )
+    selected = set(segment_ids)
+    if configured and not selected:
+        raise BusinessValidationError(
+            detail="Select at least one Segment configured for the chosen OEM."
+        )
+    if not selected.issubset(configured):
+        raise BusinessValidationError(
+            detail="Every selected Segment must belong to the chosen OEM and be active."
+        )
+
+
+def _replace_segments(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    segment_ids: list[UUID],
+    actor_id: str,
+) -> None:
+    connection.execute(
+        text("DELETE FROM auditcore.project_segments WHERE tenant_id=:tenant_id"),
+        {"tenant_id": tenant_id},
+    )
+    for segment_id in segment_ids:
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.project_segments (
+                    tenant_id, segment_id, created_by_actor_id
+                ) VALUES (:tenant_id, :segment_id, :actor_id)
+                """
+            ),
+            {"tenant_id": tenant_id, "segment_id": segment_id, "actor_id": actor_id},
+        )
+
+
 @router.get("", response_model=ProjectResponse)
 def get_project(
     tenant_id: str,
@@ -175,10 +268,11 @@ def get_project(
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> ProjectResponse:
+    del admin_request
     set_tenant_context(connection, tenant_id)
     row = _project_row(connection, tenant_id)
     _set_etag(response, row["version_no"])
-    return _project_response(row)
+    return _project_response(connection, row)
 
 
 @router.patch("", response_model=ProjectResponse)
@@ -199,7 +293,7 @@ def patch_project(
     non_nullable = {
         "projectName": patch.projectName,
         "oemId": patch.oemId,
-        "productCategoryId": patch.productCategoryId,
+        "segmentIds": patch.segmentIds,
         "effectiveStartDate": patch.effectiveStartDate,
         "timezoneName": patch.timezoneName,
     }
@@ -215,6 +309,7 @@ def patch_project(
             detail="Project was changed by another request. Refresh and retry.",
         )
 
+    next_oem_id = patch.oemId if "oemId" in supplied and patch.oemId is not None else current["oem_id"]
     if "oemId" in supplied and patch.oemId is not None:
         _require_reference_exists(
             connection,
@@ -223,21 +318,19 @@ def patch_project(
             value=patch.oemId,
             label="OEM",
         )
-    if "productCategoryId" in supplied and patch.productCategoryId is not None:
-        _require_reference_exists(
-            connection,
-            table="product_categories",
-            id_column="product_category_id",
-            value=patch.productCategoryId,
-            label="Product Category",
-        )
+
+    current_segment_ids = [row["segment_id"] for row in _segment_rows(connection, tenant_id)]
+    next_segment_ids = (
+        patch.segmentIds
+        if "segmentIds" in supplied and patch.segmentIds is not None
+        else current_segment_ids
+    )
+    if "oemId" in supplied or "segmentIds" in supplied:
+        _validate_segment_ids(connection, oem_id=next_oem_id, segment_ids=next_segment_ids)
 
     restricted_changed = (
         ("oemId" in supplied and patch.oemId != current["oem_id"])
-        or (
-            "productCategoryId" in supplied
-            and patch.productCategoryId != current["product_category_id"]
-        )
+        or ("segmentIds" in supplied and set(next_segment_ids) != set(current_segment_ids))
         or (
             "effectiveStartDate" in supplied
             and patch.effectiveStartDate != current["effective_start_date"]
@@ -246,8 +339,8 @@ def patch_project(
     if restricted_changed and _has_project_dependencies(connection, tenant_id):
         raise BusinessValidationError(
             detail=(
-                "OEM, Product Category and Effective Start Date cannot be changed after "
-                "operational Journeys or dependent published masters exist."
+                "OEM, Segments and Effective Start Date cannot be changed after operational "
+                "Journeys or dependent published masters exist."
             )
         )
 
@@ -267,7 +360,6 @@ def patch_project(
     columns = {
         "projectName": ("project_name", patch.projectName),
         "oemId": ("oem_id", patch.oemId),
-        "productCategoryId": ("product_category_id", patch.productCategoryId),
         "effectiveStartDate": ("effective_start_date", patch.effectiveStartDate),
         "effectiveEndDate": ("effective_end_date", patch.effectiveEndDate),
         "timezoneName": ("timezone_name", patch.timezoneName),
@@ -280,6 +372,8 @@ def patch_project(
         "actor_id": admin_request.user_id,
     }
     for field_name in supplied:
+        if field_name == "segmentIds":
+            continue
         column, value = columns[field_name]
         parameter_name = f"value_{field_name}"
         assignments.append(f"{column} = :{parameter_name}")
@@ -312,5 +406,13 @@ def patch_project(
             detail="Project was changed by another request. Refresh and retry.",
         )
 
+    if "segmentIds" in supplied:
+        _replace_segments(
+            connection,
+            tenant_id=tenant_id,
+            segment_ids=next_segment_ids,
+            actor_id=admin_request.user_id,
+        )
+
     _set_etag(response, row["version_no"])
-    return _project_response(row)
+    return _project_response(connection, row)

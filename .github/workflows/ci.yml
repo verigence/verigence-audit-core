@@ -62,13 +62,19 @@ jobs:
           engine = create_engine(os.environ["DATABASE_URL"])
           with engine.connect() as connection:
               assert connection.execute(text("select to_regclass('auditcore.projects')::text")).scalar_one() == "auditcore.projects"
-              assert connection.execute(text("select version_num from alembic_version")).scalar_one() == "0013_uc02_project_dir"
+              assert connection.execute(text("select version_num from alembic_version")).scalar_one() == "0014_uc02_mahindra_seg"
               assert connection.execute(text("select to_regclass('auditcore.administrative_operations')::text")).scalar_one() == "auditcore.administrative_operations"
               assert connection.execute(text("select to_regclass('auditcore.project_product_masters')::text")).scalar_one() == "auditcore.project_product_masters"
               assert connection.execute(text("select to_regclass('auditcore.project_product_master_versions')::text")).scalar_one() == "auditcore.project_product_master_versions"
               assert connection.execute(text("select to_regclass('auditcore.project_product_master_items')::text")).scalar_one() == "auditcore.project_product_master_items"
               assert connection.execute(text("select to_regclass('auditcore.project_master_imports')::text")).scalar_one() == "auditcore.project_master_imports"
               assert connection.execute(text("select to_regclass('auditcore.project_master_import_rows')::text")).scalar_one() == "auditcore.project_master_import_rows"
+              assert connection.execute(text("select to_regclass('auditcore.oem_segments')::text")).scalar_one() == "auditcore.oem_segments"
+              assert connection.execute(text("select to_regclass('auditcore.project_segments')::text")).scalar_one() == "auditcore.project_segments"
+              assert connection.execute(text("select to_regclass('auditcore.product_configurations')::text")).scalar_one() == "auditcore.product_configurations"
+              assert connection.execute(text("select to_regclass('auditcore.discount_policy_versions')::text")).scalar_one() == "auditcore.discount_policy_versions"
+              assert connection.execute(text("select to_regclass('auditcore.discount_policy_parameters')::text")).scalar_one() == "auditcore.discount_policy_parameters"
+              assert connection.execute(text("select count(*) from auditcore.oem_segments s join auditcore.oems o on o.oem_id=s.oem_id where o.oem_code='MAHINDRA' and s.segment_code in ('PASSENGER_VEHICLE','COMMERCIAL','BATTERY_ELECTRIC')")).scalar_one() == 3
               assert connection.execute(text("select to_regclass('auditcore.journey_stage_states')::text")).scalar_one() == "auditcore.journey_stage_states"
               assert connection.execute(text("select to_regclass('auditcore.journey_workflow_events')::text")).scalar_one() == "auditcore.journey_workflow_events"
               assert connection.execute(text("select to_regclass('auditcore.audit_finding_events')::text")).scalar_one() == "auditcore.audit_finding_events"
