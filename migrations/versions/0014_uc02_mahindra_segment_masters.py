@@ -118,10 +118,14 @@ def upgrade() -> None:
     )
 
     # Segment scope is retained with staged imports and Project Product Master
-    # identities. Price imports use the same scope to validate SKU membership.
+    # identities. A confirmation receipt links one uploaded OEM workbook to the
+    # separate Product Master and Price List versions created from it.
     op.execute(
         "ALTER TABLE auditcore.project_master_imports ADD COLUMN segment_id uuid "
         "REFERENCES auditcore.oem_segments(segment_id)"
+    )
+    op.execute(
+        "ALTER TABLE auditcore.project_master_imports ADD COLUMN confirmation_receipt jsonb"
     )
     op.execute(
         "CREATE INDEX ix_project_master_imports_segment "
@@ -232,6 +236,7 @@ def downgrade() -> None:
     op.execute("DROP INDEX IF EXISTS auditcore.uq_project_product_master_active_segment")
     op.execute("ALTER TABLE auditcore.project_product_masters DROP COLUMN IF EXISTS segment_id")
     op.execute("DROP INDEX IF EXISTS auditcore.ix_project_master_imports_segment")
+    op.execute("ALTER TABLE auditcore.project_master_imports DROP COLUMN IF EXISTS confirmation_receipt")
     op.execute("ALTER TABLE auditcore.project_master_imports DROP COLUMN IF EXISTS segment_id")
     op.execute("DROP INDEX IF EXISTS auditcore.ix_product_skus_configuration")
     op.execute("ALTER TABLE auditcore.product_skus DROP COLUMN IF EXISTS configuration_id")
