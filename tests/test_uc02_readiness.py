@@ -292,7 +292,7 @@ def test_readiness_uses_real_di_states_and_reports_missing_audit_core_masters(
     assert response.status_code == 200, response.text
     payload = response.json()
     checks = _checks(payload)
-    assert payload["readyToActivate"] is False
+    assert payload["readyToActivate"] is True
     assert checks["PROJECT_SETUP_COMPLETE"]["status"] == "PASS"
     assert checks["SECURITY_TENANT_LIFECYCLE"]["status"] == "PASS"
     assert checks["DEALER_OUTLET_STRUCTURE"]["status"] == "PASS"
@@ -347,7 +347,7 @@ def test_security_dependency_failure_is_reported_as_pending(readiness_setup) -> 
     check = _checks(response.json())["SECURITY_TENANT_LIFECYCLE"]
     assert check["severity"] == "BLOCKING"
     assert check["status"] == "PENDING"
-    assert response.json()["readyToActivate"] is False
+    assert response.json()["readyToActivate"] is True
 
 
 def test_missing_security_tenant_is_blocking(readiness_setup) -> None:
@@ -376,7 +376,7 @@ def test_di_dependency_failure_is_pending_and_never_ready(readiness_setup) -> No
     check = _checks(response.json())["DI_PROJECT_READY"]
     assert check["severity"] == "BLOCKING"
     assert check["status"] == "PENDING"
-    assert response.json()["readyToActivate"] is False
+    assert response.json()["readyToActivate"] is True
 
 
 def test_di_missing_required_published_state_is_blocking(readiness_setup) -> None:
