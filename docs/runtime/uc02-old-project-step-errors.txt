@@ -1,0 +1,46 @@
+UC02 OLD PROJECT STEP RUNTIME DIAGNOSIS
+Window: last 75 minutes from workflow execution
+
+===== audit-deploy.jsonl =====
+total_lines=29 interesting=13 hard_errors=0
+-- hard errors (latest 120) --
+-- UC02 endpoint activity/errors (latest 220) --
+2026-08-24T07:19:02.366807153Z INFO:     100.64.0.4:30494 - "GET /v1/project-reference-data HTTP/1.1" 200 OK
+2026-08-24T07:19:11.471071558Z INFO:     100.64.0.6:33368 - "GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/project HTTP/1.1" 200 OK
+2026-08-24T07:19:14.510325609Z INFO:     100.64.0.7:29172 - "GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/dealers HTTP/1.1" 200 OK
+2026-08-24T07:19:15.823562481Z INFO:     100.64.0.8:23848 - "GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/dealers/dee5630c-9caa-4323-a893-01d6c8179696/outlets HTTP/1.1" 200 OK
+2026-08-24T07:19:16.152658052Z [2m2026-08-24T07:19:16.150746Z[0m [[33m[1mwarning  [0m] [1mapi_error                     [0m [36mcorrelation_id[0m=[35m538c3113-679a-4f14-9385-97e02ea57917[0m [36merror_code[0m=[35mVAC-AUTH-001[0m [36mstatus_code[0m=[35m401[0m [36mtenant_id[0m=[35m5fbe26ab-6ed7-444a-8488-5bfb81208588[0m
+2026-08-24T07:19:16.152661876Z [2m2026-08-24T07:19:16.152064Z[0m [[33m[1mwarning  [0m] [1mhttp_request_failed           [0m [36mcorrelation_id[0m=[35m538c3113-679a-4f14-9385-97e02ea57917[0m [36mduration_ms[0m=[35m2.73[0m [36mmethod[0m=[35mGET[0m [36mpath[0m=[35m/v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/role-mapping-candidates[0m [36mstatus_code[0m=[35m401[0m [36mtenant_id[0m=[35m5fbe26ab-6ed7-444a-8488-5bfb81208588[0m
+2026-08-24T07:19:16.154294362Z INFO:     100.64.0.7:29172 - "GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/role-mapping-candidates?limit=100 HTTP/1.1" 401 Unauthorized
+2026-08-24T07:19:20.908338257Z [2m2026-08-24T07:19:20.893585Z[0m [[33m[1mwarning  [0m] [1mapi_error                     [0m [36mcorrelation_id[0m=[35mcf81b2a4-1165-4796-be58-6198dbf560f7[0m [36merror_code[0m=[35mVAC-AUTH-001[0m [36mstatus_code[0m=[35m401[0m [36mtenant_id[0m=[35m5fbe26ab-6ed7-444a-8488-5bfb81208588[0m
+2026-08-24T07:19:20.908341544Z [2m2026-08-24T07:19:20.895103Z[0m [[33m[1mwarning  [0m] [1mhttp_request_failed           [0m [36mcorrelation_id[0m=[35mcf81b2a4-1165-4796-be58-6198dbf560f7[0m [36mduration_ms[0m=[35m2.29[0m [36mmethod[0m=[35mGET[0m [36mpath[0m=[35m/v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/role-mapping-candidates[0m [36mstatus_code[0m=[35m401[0m [36mtenant_id[0m=[35m5fbe26ab-6ed7-444a-8488-5bfb81208588[0m
+2026-08-24T07:19:20.908344442Z INFO:     100.64.0.9:44674 - "GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/role-mapping-candidates?limit=100 HTTP/1.1" 401 Unauthorized
+2026-08-24T07:19:22.748411664Z [2m2026-08-24T07:19:22.742833Z[0m [[33m[1mwarning  [0m] [1mapi_error                     [0m [36mcorrelation_id[0m=[35ma0a2a15a-f83f-4eeb-8549-be32d19086f4[0m [36merror_code[0m=[35mVAC-AUTH-001[0m [36mstatus_code[0m=[35m401[0m [36mtenant_id[0m=[35m5fbe26ab-6ed7-444a-8488-5bfb81208588[0m
+2026-08-24T07:19:22.748416477Z [2m2026-08-24T07:19:22.743905Z[0m [[33m[1mwarning  [0m] [1mhttp_request_failed           [0m [36mcorrelation_id[0m=[35ma0a2a15a-f83f-4eeb-8549-be32d19086f4[0m [36mduration_ms[0m=[35m2.06[0m [36mmethod[0m=[35mGET[0m [36mpath[0m=[35m/v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/dealers[0m [36mstatus_code[0m=[35m401[0m [36mtenant_id[0m=[35m5fbe26ab-6ed7-444a-8488-5bfb81208588[0m
+2026-08-24T07:19:22.748419959Z INFO:     100.64.0.8:23862 - "GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/dealers HTTP/1.1" 401 Unauthorized
+
+===== audit-http.jsonl =====
+total_lines=10 interesting=7 hard_errors=0
+-- hard errors (latest 120) --
+-- UC02 endpoint activity/errors (latest 220) --
+2026-08-24T07:18:59.142613735Z GET /v1/project-reference-data QSa9QLUQQd6p9fJMV7rehQ ad9b231b-c34a-41d1-b0b1-050e4c44ef5b
+2026-08-24T07:19:11.276300821Z GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/project JE2tli5eTAWsUn6KoB_USg ad9b231b-c34a-41d1-b0b1-050e4c44ef5b
+2026-08-24T07:19:14.347184335Z GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/dealers 4WWKi_l8S0Sz4wGBVOLIQQ ad9b231b-c34a-41d1-b0b1-050e4c44ef5b
+2026-08-24T07:19:15.818206298Z GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/dealers/dee5630c-9caa-4323-a893-01d6c8179696/outlets 9QpODYPUT3K573k6acI7Nw ad9b231b-c34a-41d1-b0b1-050e4c44ef5b
+2026-08-24T07:19:16.153212192Z GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/role-mapping-candidates 0F9_YfFlQGqSYfkaVOLIQQ ad9b231b-c34a-41d1-b0b1-050e4c44ef5b
+2026-08-24T07:19:20.896816626Z GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/role-mapping-candidates w-eH0mBHQ-yDDykcmrpb1w ad9b231b-c34a-41d1-b0b1-050e4c44ef5b
+2026-08-24T07:19:22.745594315Z GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/dealers v-1acHg-QVyqtUfGacI7Nw ad9b231b-c34a-41d1-b0b1-050e4c44ef5b
+
+===== security-deploy.jsonl =====
+total_lines=57 interesting=4 hard_errors=0
+-- hard errors (latest 120) --
+-- UC02 endpoint activity/errors (latest 220) --
+2026-08-24T06:10:02.377687897Z INFO:     100.64.0.7:51040 - "POST /security/v1/auth/login HTTP/1.1" 422 Unprocessable Entity
+2026-08-24T06:12:32.125131212Z INFO:     100.64.0.4:37638 - "POST /security/v1/auth/login HTTP/1.1" 422 Unprocessable Entity
+2026-08-24T06:57:00.417381392Z INFO:     100.64.0.3:50108 - "POST /security/v1/auth/login HTTP/1.1" 422 Unprocessable Entity
+2026-08-24T07:01:38.928321351Z INFO:     100.64.0.13:49264 - "POST /security/v1/auth/login HTTP/1.1" 422 Unprocessable Entity
+
+===== security-http.jsonl =====
+total_lines=53 interesting=0 hard_errors=0
+-- hard errors (latest 120) --
+-- UC02 endpoint activity/errors (latest 220) --
