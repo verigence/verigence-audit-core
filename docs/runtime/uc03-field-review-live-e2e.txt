@@ -1,0 +1,15 @@
+# UC03 Field Review Live DEV E2E
+
+- executed_at_utc: 2026-08-24T12:15:38.924360+00:00
+- audit_dev_source_sha: 5c8dd04cbc573fe016380bd10fa7b3752fbbf8e6
+- web_base: https://verigence-web-dev.jbrconsulting-it.workers.dev
+- outcome: FAIL
+- error: UndefinedColumn: column "business_assignment_id" of relation "business_assignments" does not exist LINE 3:                 tenant_id,business_assignment_id,security_ac...                                   ^
+
+## Markers
+
+- UC03_LIVE_SECURITY_TENANT=PASS
+- UC03_LIVE_TEST_TENANT=07a4d852-39b5-4374-8e7b-78239c10cddc
+- UC03_FIELD_REVIEW_LIVE_E2E=FAIL
+- UC03_LIVE_DIAGNOSTIC=no evidence
+- UC03_LIVE_SECURITY_CLEANUP_HTTP=200
