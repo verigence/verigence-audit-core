@@ -175,3 +175,7 @@ For example, a Minimum Booking Amount rule records the effective Booking/Discoun
 The existing Product Category table/column is retained temporarily for backward compatibility with older rows and tests, but the field becomes nullable and is removed from the new UC02 creation UX/API requirement. New logic starts from OEM and selected OEM Segments.
 
 Existing non-Mahindra OEMs remain valid. Segment metadata can be added for them without a code change; Mahindra is the first OEM for which a concrete segment catalogue is baselined.
+
+## 10. Validation gate
+
+This extension must pass the repository's normal lint, fresh-database migration and automated test gates before merge to `dev`; DEV deployment must use the tested merged SHA and Alembic head `0014_uc02_mahindra_seg`.
