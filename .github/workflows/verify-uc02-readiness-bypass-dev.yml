@@ -1,0 +1,151 @@
+name: Verify UC02 readiness bypass in Railway DEV
+
+on:
+  pull_request:
+    branches:
+      - dev
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-and-verify:
+    if: ${{ github.head_ref == 'verify/uc02-readiness-bypass-dev' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      TARGET_SHA: 75a1f452f7aa5dde7ed3317c2c98a334e654345b
+      DEV_WEB_ORIGIN: https://verigence-web-dev.jbrconsulting-it.workers.dev
+    steps:
+      - name: Checkout exact merged dev SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_SHA }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify readiness bypass source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e . >/dev/null
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('src/audit_core/readiness.py').read_text()
+          if 'ready = True' not in text:
+              raise SystemExit('Merged DEV SHA does not contain the temporary readiness bypass')
+          print('UC02_READINESS_BYPASS_SOURCE=PASS')
+          PY
+
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Link Railway DEV
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN secret is missing'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          echo 'RAILWAY_DEV_LINK=PASS'
+
+      - name: Capture previous deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway deployment list --service "$AUDIT_SERVICE" --limit 1 --json >/tmp/before.json
+          previous_id="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/before.json').read_text())
+          print(rows[0].get('id','') if rows else '')
+          PY
+          )"
+          echo "PREVIOUS_DEPLOYMENT_ID=$previous_id" >> "$GITHUB_ENV"
+          echo "AUDIT_CORE_PREVIOUS_DEPLOYMENT_ID=${previous_id:-NONE}"
+
+      - name: Deploy exact merged DEV SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway up . --path-as-root --service "$AUDIT_SERVICE" --detach --yes \
+            --message "Audit Core DEV readiness bypass ${TARGET_SHA}" >/dev/null
+          echo "AUDIT_CORE_DEPLOY_REQUEST_SHA=$TARGET_SHA"
+
+      - name: Wait for fresh successful deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 36); do
+            railway deployment list --service "$AUDIT_SERVICE" --limit 1 --json >/tmp/latest.json
+            read -r deployment_id status <<<"$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/latest.json').read_text())
+          if rows:
+              print(rows[0].get('id',''), rows[0].get('status',''))
+          else:
+              print(' ')
+          PY
+          )"
+            if [[ -z "$deployment_id" || "$deployment_id" == "${PREVIOUS_DEPLOYMENT_ID:-}" ]]; then
+              echo "Waiting for fresh deployment ($attempt/36)"
+              sleep 10
+              continue
+            fi
+            case "$status" in
+              SUCCESS)
+                echo "AUDIT_CORE_DEPLOYMENT=PASS"
+                echo "AUDIT_CORE_DEPLOYMENT_ID=$deployment_id"
+                break
+                ;;
+              FAILED|CRASHED|REMOVED)
+                railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 200 || true
+                echo "::error::Fresh Audit Core deployment failed: $status"
+                exit 1
+                ;;
+              *)
+                echo "Fresh deployment $deployment_id status=$status ($attempt/36)"
+                ;;
+            esac
+            if [[ "$attempt" == "36" ]]; then
+              echo '::error::Fresh Audit Core deployment did not reach SUCCESS'
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Live health and CORS smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/vars.json
+          domain="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/vars.json').read_text())
+          print(data.get('RAILWAY_PUBLIC_DOMAIN') or data.get('RAILWAY_STATIC_URL') or '')
+          PY
+          )"
+          [ -n "$domain" ] || { echo '::error::No Railway public domain'; exit 1; }
+          case "$domain" in
+            http://*|https://*) base="${domain%/}" ;;
+            *) base="https://${domain%/}" ;;
+          esac
+          curl --fail --silent --show-error "$base/health" >/tmp/health.json
+          cors_status="$(curl --silent --show-error --output /tmp/cors.body --write-out '%{http_code}' \
+            --request OPTIONS \
+            --header "Origin: $DEV_WEB_ORIGIN" \
+            --header 'Access-Control-Request-Method: GET' \
+            --header 'Access-Control-Request-Headers: authorization,content-type,x-correlation-id' \
+            "$base/v1/tenants/test/project/readiness" || true)"
+          [[ "$cors_status" == '200' ]] || { cat /tmp/cors.body || true; echo "::error::CORS smoke HTTP $cors_status"; exit 1; }
+          echo "AUDIT_CORE_PUBLIC_BASE=$base"
+          echo 'AUDIT_CORE_PUBLIC_HEALTH=PASS'
+          echo 'AUDIT_CORE_READINESS_CORS=PASS'
+          echo "AUDIT_CORE_DEPLOYED_SHA=$TARGET_SHA"
