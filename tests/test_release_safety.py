@@ -13,6 +13,10 @@ _UC02_ALLOWED_DELETE_PATHS = {
     # Phase-1 administrative hard-delete exceptions.
     "/v1/tenants/{}/dealers/{}",
     "/v1/tenants/{}/dealers/{}/outlets/{}",
+    # CONFIGURING-only removal of an unused Dealer setup and empty setup outlets.
+    "/v1/tenants/{}/dealers/{}/setup",
+    # Owner-approved Project purge: CONFIGURING or ACTIVE, but only at Journey count zero.
+    "/v1/tenants/{}/project",
     # Project assignment removal only; the global Security USER is preserved.
     "/v1/tenants/{}/role-mappings/{}",
     # Approved Excel staging cleanup only; this is not published-master hard delete.
