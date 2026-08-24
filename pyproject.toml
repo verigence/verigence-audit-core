@@ -55,3 +55,7 @@ target-version = "py312"
 # The Project Master facade keeps imports grouped by owning master domain so the
 # adapter boundary remains reviewable beside the corresponding confirm helpers.
 "src/audit_core/project_master_imports.py" = ["I001"]
+# UC02 readiness and Project-delete orchestration keep cross-module dependencies
+# together as explicit review boundaries (Security / DI / Audit Core ownership).
+"src/audit_core/readiness.py" = ["I001"]
+"src/audit_core/uc02_project_admin_stabilization.py" = ["I001"]
