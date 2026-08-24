@@ -172,6 +172,8 @@ def upgrade() -> None:
                 ('minimum_booking_payment_proof', 'minimum_booking_payment_proof', 'BOOKING', 'REQUIRED', '{}', 40),
                 ('gst_certificate', 'gst_certificate', 'BOOKING', 'CONDITIONAL', '{"conditionKey":"corporateCustomer"}', 50),
                 ('trade_in_vehicle_rc', 'vehicle_rc', 'BOOKING', 'CONDITIONAL', '{"conditionKey":"exchangeTaken"}', 60),
+                ('trade_in_transfer_letter', 'transfer_letter', 'BOOKING', 'OPTIONAL', '{}', 70),
+                ('trade_in_authorization_letter', 'authorization_letter', 'BOOKING', 'OPTIONAL', '{}', 80),
 
                 -- Delivery dossier from the approved business process.
                 ('wholesale_invoice', 'wholesale_invoice', 'DELIVERY', 'REQUIRED', '{}', 110),
@@ -187,7 +189,7 @@ def upgrade() -> None:
                 ('customer_kyc', 'customer_kyc', 'DELIVERY', 'REQUIRED', '{}', 210),
                 ('ew_invoice', 'ew_invoice', 'DELIVERY', 'REQUIRED', '{}', 220),
                 ('rsa_invoice', 'rsa_invoice', 'DELIVERY', 'REQUIRED', '{}', 230),
-                ('value_added_service_document', 'value_added_service_document', 'DELIVERY', 'REQUIRED', '{}', 240),
+                ('value_added_service_document', 'value_added_service_document', 'DELIVERY', 'OPTIONAL', '{}', 240),
                 ('no_dues_certificate', 'no_dues_certificate', 'DELIVERY', 'REQUIRED', '{}', 250),
                 ('payment_receipt', 'payment_receipt', 'DELIVERY', 'REQUIRED', '{}', 260)
             ) AS x(requirement_key, document_type_key, process_area,
@@ -260,22 +262,24 @@ def upgrade() -> None:
     # rows and have not yet accumulated any Journey document requirements.
     op.execute(
         """
-        UPDATE auditcore.journeys j
-        SET document_requirement_profile_version_id = d.default_version_id,
-            updated_at_utc=now()
-        FROM LATERAL (
-            SELECT v.document_requirement_profile_version_id AS default_version_id
+        WITH defaults AS (
+            SELECT DISTINCT ON (v.tenant_id)
+                   v.tenant_id,
+                   v.document_requirement_profile_version_id AS default_version_id
             FROM auditcore.document_requirement_profile_versions v
             JOIN auditcore.document_requirement_profiles p
               ON p.tenant_id=v.tenant_id
              AND p.document_requirement_profile_id=v.document_requirement_profile_id
-            WHERE v.tenant_id=j.tenant_id
-              AND p.profile_code='UC03_DEFAULT_VEHICLE_SALES'
+            WHERE p.profile_code='UC03_DEFAULT_VEHICLE_SALES'
               AND v.lifecycle_status='PUBLISHED'
-            ORDER BY v.effective_from DESC, v.version_no DESC
-            LIMIT 1
-        ) d
-        WHERE NOT EXISTS (
+            ORDER BY v.tenant_id, v.effective_from DESC, v.version_no DESC
+        )
+        UPDATE auditcore.journeys j
+        SET document_requirement_profile_version_id = d.default_version_id,
+            updated_at_utc=now()
+        FROM defaults d
+        WHERE d.tenant_id=j.tenant_id
+          AND NOT EXISTS (
                   SELECT 1 FROM auditcore.journey_document_requirements r
                   WHERE r.tenant_id=j.tenant_id AND r.journey_id=j.journey_id
               )
