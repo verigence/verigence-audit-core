@@ -44,9 +44,10 @@ jobs:
           set -euo pipefail
           test -f migrations/versions/0015_uc02_universal_segments.py
           test -f migrations/versions/0016_uc02_project_hard_delete.py
+          test -f migrations/versions/0017_uc03_default_document_requirements.py
           alembic heads | tee /tmp/alembic-heads.txt
-          grep -q '0016_uc02_project_delete' /tmp/alembic-heads.txt
-          echo 'AUDIT_CORE_ALEMBIC_SOURCE_HEAD=0016_uc02_project_delete'
+          grep -q '0016_uc02_project_delete_uc03' /tmp/alembic-heads.txt
+          echo 'AUDIT_CORE_ALEMBIC_SOURCE_HEAD=0016_uc02_project_delete_uc03'
 
           PYTHONPATH=src python - <<'PY'
           from audit_core.main import app
