@@ -6,7 +6,7 @@ import re
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, Header, UploadFile
@@ -16,7 +16,11 @@ from pydantic import BaseModel
 from sqlalchemy import Connection, text
 
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import HumanAdminRequest, get_connection, require_super_admin_request
+from audit_core.dependencies import (
+    HumanAdminRequest,
+    get_connection,
+    require_super_admin_request,
+)
 from audit_core.errors import ConflictError, NotFoundError, ValidationError
 from audit_core.idempotency import stable_request_hash
 from audit_core.price_lists import (
