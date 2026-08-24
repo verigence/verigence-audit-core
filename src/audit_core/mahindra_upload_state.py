@@ -15,7 +15,7 @@ from audit_core.db import set_tenant_context
 from audit_core.dependencies import (
     HumanAdminRequest,
     get_connection,
-    require_super_admin_request,
+    require_project_admin_request,
 )
 from audit_core.errors import ValidationError
 
@@ -91,7 +91,7 @@ def _lifecycle_status(connection: Connection, tenant_id: str, row) -> str | None
 @router.get("/imports", response_model=list[masters.MahindraImportResponse])
 def list_latest_imports(
     tenant_id: str,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> list[masters.MahindraImportResponse]:
     del admin_request
@@ -128,7 +128,7 @@ def list_latest_imports(
 def validation_report(
     tenant_id: str,
     import_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> StreamingResponse:
     del admin_request
@@ -190,7 +190,7 @@ async def upload_segment_master(
     segment_id: UUID,
     file: Annotated[UploadFile, File()],
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1)],
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
     effective_from: Annotated[date | None, Form(alias="effectiveFrom")] = None,
 ) -> masters.MahindraImportResponse:
@@ -230,7 +230,7 @@ async def upload_discount_policy(
     tenant_id: str,
     file: Annotated[UploadFile, File()],
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1)],
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
     effective_from: Annotated[date | None, Form(alias="effectiveFrom")] = None,
 ) -> masters.MahindraImportResponse:

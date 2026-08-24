@@ -265,3 +265,50 @@ def require_super_admin_request(
             title="Permission denied",
         )
     return request
+
+def _has_tenant_admin_scope(context: SecurityAdminContext, tenant_id: str) -> bool:
+    return any(
+        scope.role_key == "TenantAdmin"
+        and scope.scope_type == "TENANT"
+        and scope.scope_id == tenant_id
+        for scope in context.admin_scopes
+    )
+
+
+def require_project_admin_request(
+    tenant_id: str,
+    http_request: Request,
+    bearer_token: Annotated[str, Depends(get_bearer_token)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+) -> HumanAdminRequest:
+    """Authorize UC02 administration for SuperAdmin or matching TenantAdmin.
+
+    Lightweight authenticated GETs retain their existing fast path. Mutations and
+    non-lightweight reads use Security's live/cached admin-context; authority is
+    never taken from the human JWT itself.
+    """
+    if _is_lightweight_authenticated_read(http_request):
+        return HumanAdminRequest(
+            user_id=human_principal.subject,
+            bearer_token=bearer_token,
+            admin_context=SecurityAdminContext(
+                user_id=human_principal.subject,
+                is_super_admin=False,
+                admin_scopes=(),
+            ),
+        )
+
+    request = _security_admin_context(
+        bearer_token=bearer_token,
+        human_principal=human_principal,
+    )
+    if request.admin_context.is_super_admin or _has_tenant_admin_scope(
+        request.admin_context, tenant_id
+    ):
+        return request
+    raise AuthorizationError(
+        error_code="VAC-AUTH-002",
+        status_code=403,
+        title="Permission denied",
+    )
+

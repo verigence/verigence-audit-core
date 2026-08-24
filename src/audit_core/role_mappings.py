@@ -22,7 +22,7 @@ from audit_core.dependencies import (
     HumanAdminRequest,
     get_connection,
     get_engine,
-    require_super_admin_request,
+    require_project_admin_request,
 )
 from audit_core.errors import AuditCoreError, BusinessValidationError, NotFoundError
 from audit_core.observability import get_correlation_id
@@ -476,7 +476,7 @@ def _mark_operation_failed(
 @router.get("/role-mapping-candidates", response_model=list[RoleMappingCandidateResponse])
 def list_role_mapping_candidates(
     tenant_id: str,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
     q: str | None = Query(default=None, max_length=320),
     limit: int = Query(default=100, ge=1, le=200),
@@ -506,7 +506,7 @@ def list_role_mapping_candidates(
 @router.get("/role-mappings", response_model=list[RoleMappingResponse])
 def list_role_mappings(
     tenant_id: str,
-    _: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    _: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> list[RoleMappingResponse]:
     set_tenant_context(connection, tenant_id)
@@ -518,7 +518,7 @@ def list_role_mappings(
 def get_role_mapping(
     tenant_id: str,
     user_id: str,
-    _: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    _: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> RoleMappingResponse | None:
     set_tenant_context(connection, tenant_id)
@@ -536,7 +536,7 @@ def put_role_mapping(
         str,
         Header(alias="Idempotency-Key", min_length=1, max_length=200),
     ],
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     engine: Annotated[Engine, Depends(get_engine)],
 ) -> RoleMappingMutationResponse:
     dealer_ids, outlet_ids, scopes = _resolve_scope(
@@ -714,7 +714,7 @@ def delete_role_mapping(
         str,
         Header(alias="Idempotency-Key", min_length=1, max_length=200),
     ],
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     engine: Annotated[Engine, Depends(get_engine)],
 ) -> RoleMappingMutationResponse:
     semantic_payload = {"userId": user_id, "action": "REMOVE"}

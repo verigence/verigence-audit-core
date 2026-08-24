@@ -9,7 +9,7 @@ from audit_core import role_mappings
 from audit_core.dependencies import (
     HumanAdminRequest,
     get_connection,
-    require_super_admin_request,
+    require_project_admin_request,
 )
 from audit_core.main import app
 from audit_core.security_integration import (
@@ -114,7 +114,7 @@ def test_role_mapping_candidate_facade_returns_only_approved_selector_fields(
     monkeypatch.setattr(role_mappings, "set_tenant_context", lambda connection, tenant_id: None)
     monkeypatch.setattr(role_mappings, "_require_project", lambda connection, tenant_id: None)
     app.dependency_overrides[get_connection] = connection_override
-    app.dependency_overrides[require_super_admin_request] = lambda: admin_request
+    app.dependency_overrides[require_project_admin_request] = lambda: admin_request
     try:
         client = TestClient(app, raise_server_exceptions=False)
         response = client.get(

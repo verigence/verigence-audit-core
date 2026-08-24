@@ -18,7 +18,7 @@ from audit_core.db import set_tenant_context
 from audit_core.dependencies import (
     HumanAdminRequest,
     get_connection,
-    require_super_admin_request,
+    require_project_admin_request,
 )
 from audit_core.discount_schemes import (
     add_discount_benefit,
@@ -1221,7 +1221,7 @@ def download_master_template(
     tenant_id: str,
     owner_module: str,
     master_key: str,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> StreamingResponse:
     set_tenant_context(connection, tenant_id)
@@ -1255,7 +1255,7 @@ async def upload_master_import(
     file: Annotated[UploadFile, File()],
     effective_from: Annotated[date | None, Form(alias="effectiveFrom")] = None,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1)] = "",
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)] = None,  # type: ignore[assignment]
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)] = None,  # type: ignore[assignment]
     connection: Annotated[Connection, Depends(get_connection)] = None,  # type: ignore[assignment]
 ) -> ProjectMasterImportResponse:
     set_tenant_context(connection, tenant_id)
@@ -1397,7 +1397,7 @@ async def upload_master_import(
 def get_master_import(
     tenant_id: str,
     import_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> ProjectMasterImportResponse:
     set_tenant_context(connection, tenant_id)
@@ -1411,7 +1411,7 @@ def get_master_import(
 def get_master_import_rows(
     tenant_id: str,
     import_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
@@ -1463,7 +1463,7 @@ def get_master_import_rows(
 def download_import_error_report(
     tenant_id: str,
     import_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> StreamingResponse:
     set_tenant_context(connection, tenant_id)
@@ -1514,7 +1514,7 @@ def download_import_error_report(
 def confirm_master_import(
     tenant_id: str,
     import_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> ProjectMasterImportResponse:
     set_tenant_context(connection, tenant_id)
@@ -1579,7 +1579,7 @@ def confirm_master_import(
 def delete_master_import(
     tenant_id: str,
     import_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> None:
     set_tenant_context(connection, tenant_id)

@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, text
 from audit_core.dependencies import (
     HumanAdminRequest,
     get_connection,
-    require_super_admin_request,
+    require_project_admin_request,
 )
 from audit_core.main import app
 from audit_core.security_integration import SecurityAdminContext
@@ -85,7 +85,7 @@ def project_setup():
         ),
     )
     app.dependency_overrides[get_connection] = connection_override
-    app.dependency_overrides[require_super_admin_request] = lambda: admin_request
+    app.dependency_overrides[require_project_admin_request] = lambda: admin_request
     try:
         yield engine, tenant_a, tenant_b
     finally:

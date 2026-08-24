@@ -18,6 +18,9 @@ _UC02_ALLOWED_DELETE_PATHS = {
     "/v1/tenants/{}/role-mappings/{}",
     # Approved Excel staging cleanup only; confirmed/published master data is preserved.
     "/v1/tenants/{}/project-master-imports/{}",
+    # Project-owned Mahindra masters may be permanently removed only while CONFIGURING.
+    "/v1/tenants/{}/project-masters/mahindra/segments/{}",
+    "/v1/tenants/{}/project-masters/mahindra/discount-policy",
 }
 
 
