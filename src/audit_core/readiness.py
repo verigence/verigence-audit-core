@@ -24,7 +24,6 @@ ReadinessSeverity = Literal["BLOCKING", "WARNING", "INFO"]
 ReadinessStatus = Literal["PASS", "FAIL", "PENDING"]
 
 _REQUIRED_AUDIT_CORE_MASTERS = {
-    "PRODUCT_MASTER": "Product Master",
     "PROJECT_POLICY": "Project Policy",
     "DOCUMENT_REQUIREMENT_PROFILE": "Document Requirement Profile",
     "AUDIT_CONTROL": "Audit Control",
@@ -69,10 +68,15 @@ def _project_state(connection: Connection, tenant_id: str):
     row = connection.execute(
         text(
             """
-            SELECT project_name, oem_id, product_category_id, effective_start_date,
-                   timezone_name, project_status
-            FROM auditcore.projects
-            WHERE tenant_id = :tenant_id
+            SELECT p.project_name, p.oem_id, o.oem_code, p.effective_start_date,
+                   p.timezone_name, p.project_status,
+                   (SELECT count(*) FROM auditcore.oem_segments os
+                    WHERE os.oem_id=p.oem_id AND os.is_active=true) AS configured_segments,
+                   (SELECT count(*) FROM auditcore.project_segments ps
+                    WHERE ps.tenant_id=p.tenant_id) AS selected_segments
+            FROM auditcore.projects p
+            JOIN auditcore.oems o ON o.oem_id=p.oem_id
+            WHERE p.tenant_id = :tenant_id
             """
         ),
         {"tenant_id": tenant_id},
@@ -87,10 +91,13 @@ def _project_state(connection: Connection, tenant_id: str):
 
 
 def _project_setup_check(project) -> ReadinessCheck:
+    segment_selection_complete = (
+        int(project["configured_segments"]) == 0 or int(project["selected_segments"]) > 0
+    )
     complete = bool(
         str(project["project_name"]).strip()
         and project["oem_id"] is not None
-        and project["product_category_id"] is not None
+        and segment_selection_complete
         and project["effective_start_date"] is not None
         and str(project["timezone_name"]).strip()
         and project["project_status"] in {"CONFIGURING", "ACTIVE"}
@@ -103,7 +110,7 @@ def _project_setup_check(project) -> ReadinessCheck:
         message=(
             "Project setup is complete."
             if complete
-            else "Complete the required Project Details before activation."
+            else "Complete the required Project Details and OEM Segment selection before activation."
         ),
         targetTask="PROJECT_DETAILS",
     )
@@ -223,14 +230,117 @@ def _pc_coverage_check(connection: Connection, tenant_id: str) -> ReadinessCheck
     )
 
 
+def _mahindra_master_gaps(connection: Connection, tenant_id: str) -> list[str]:
+    segments = connection.execute(
+        text(
+            """
+            SELECT s.segment_id, s.segment_name, s.segment_code
+            FROM auditcore.project_segments ps
+            JOIN auditcore.oem_segments s ON s.segment_id=ps.segment_id
+            WHERE ps.tenant_id=:tenant_id
+            ORDER BY s.segment_name
+            """
+        ),
+        {"tenant_id": tenant_id},
+    ).mappings().all()
+    missing: list[str] = []
+    for segment in segments:
+        product_ready = bool(
+            connection.execute(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM auditcore.project_product_masters m
+                        JOIN auditcore.project_product_master_versions v
+                          ON v.tenant_id=m.tenant_id
+                         AND v.product_master_id=m.product_master_id
+                        WHERE m.tenant_id=:tenant_id
+                          AND m.segment_id=:segment_id
+                          AND m.status='ACTIVE'
+                          AND v.lifecycle_status='PUBLISHED'
+                    )
+                    """
+                ),
+                {"tenant_id": tenant_id, "segment_id": segment["segment_id"]},
+            ).scalar_one()
+        )
+        if not product_ready:
+            missing.append(f"{segment['segment_name']} Product Master")
+
+        price_code = f"MAHINDRA_{segment['segment_code']}"[:120]
+        price_ready = bool(
+            connection.execute(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM auditcore.price_lists pl
+                        JOIN auditcore.price_list_versions v
+                          ON v.tenant_id=pl.tenant_id
+                         AND v.price_list_id=pl.price_list_id
+                        WHERE pl.tenant_id=:tenant_id
+                          AND pl.price_list_code=:price_code
+                          AND v.lifecycle_status='PUBLISHED'
+                    )
+                    """
+                ),
+                {"tenant_id": tenant_id, "price_code": price_code},
+            ).scalar_one()
+        )
+        if not price_ready:
+            missing.append(f"{segment['segment_name']} Price Master")
+
+    policy_ready = bool(
+        connection.execute(
+            text(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM auditcore.discount_policy_versions
+                    WHERE tenant_id=:tenant_id AND lifecycle_status='PUBLISHED'
+                )
+                """
+            ),
+            {"tenant_id": tenant_id},
+        ).scalar_one()
+    )
+    if not policy_ready:
+        missing.append("Discount & Policy Master")
+    return missing
+
+
 def _project_masters_check(connection: Connection, tenant_id: str) -> ReadinessCheck:
+    oem_code = connection.execute(
+        text(
+            """
+            SELECT o.oem_code
+            FROM auditcore.projects p
+            JOIN auditcore.oems o ON o.oem_id=p.oem_id
+            WHERE p.tenant_id=:tenant_id
+            """
+        ),
+        {"tenant_id": tenant_id},
+    ).scalar_one()
+
+    missing = _mahindra_master_gaps(connection, tenant_id) if oem_code == "MAHINDRA" else []
+    if oem_code != "MAHINDRA":
+        product_ready = bool(
+            connection.execute(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM auditcore.project_product_master_versions
+                        WHERE tenant_id=:tenant_id AND lifecycle_status='PUBLISHED'
+                    )
+                    """
+                ),
+                {"tenant_id": tenant_id},
+            ).scalar_one()
+        )
+        if not product_ready:
+            missing.append("Product Master")
+
     queries = {
-        "PRODUCT_MASTER": """
-            SELECT EXISTS (
-                SELECT 1 FROM auditcore.project_product_master_versions
-                WHERE tenant_id=:tenant_id AND lifecycle_status='PUBLISHED'
-            )
-        """,
         "PROJECT_POLICY": """
             SELECT EXISTS (
                 SELECT 1 FROM auditcore.project_policy_versions
@@ -250,13 +360,11 @@ def _project_masters_check(connection: Connection, tenant_id: str) -> ReadinessC
             )
         """,
     }
-    missing = [
+    missing.extend(
         _REQUIRED_AUDIT_CORE_MASTERS[key]
         for key, query in queries.items()
-        if not bool(
-            connection.execute(text(query), {"tenant_id": tenant_id}).scalar_one()
-        )
-    ]
+        if not bool(connection.execute(text(query), {"tenant_id": tenant_id}).scalar_one())
+    )
     return ReadinessCheck(
         area="PROJECT_MASTERS",
         checkKey="PROJECT_MASTERS_READY",
