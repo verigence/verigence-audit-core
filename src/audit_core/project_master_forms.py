@@ -10,7 +10,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import HumanAdminRequest, get_connection, require_project_admin_request
+from audit_core.dependencies import (
+    HumanAdminRequest,
+    get_connection,
+    require_project_admin_request,
+)
 from audit_core.errors import NotFoundError, ValidationError
 
 router = APIRouter(
@@ -86,7 +90,7 @@ def _ensure_project(connection: Connection, tenant_id: str) -> None:
 
 def _validate_period(start: date | None, end: date | None) -> None:
     if start is not None and end is not None and end < start:
-        raise ValidationError("Effective To must be on or after Effective From.")
+        raise ValidationError(detail="Effective To must be on or after Effective From.")
 
 
 def _next_version(connection: Connection, table: str, tenant_id: str) -> int:
