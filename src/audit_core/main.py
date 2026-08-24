@@ -37,6 +37,9 @@ from audit_core.readiness import router as readiness_router
 from audit_core.reference_data import router as reference_data_router
 from audit_core.role_mapping_policy import install_role_mapping_policy
 from audit_core.tasks_api import router as task_router
+from audit_core.uc02_project_admin_stabilization import (
+    router as uc02_project_admin_stabilization_router,
+)
 from audit_core.uc03_audit_flags import router as uc03_audit_router
 from audit_core.uc03_authorized_work_items import router as uc03_work_items_router
 from audit_core.uc03_booking_capture import router as uc03_booking_capture_router
@@ -129,6 +132,8 @@ def create_app() -> FastAPI:
     application.include_router(project_master_admin_router)
     application.include_router(project_master_router)
     application.include_router(project_master_import_router)
+    # UC02 additive read/setup routes are registered before the legacy Dealer router.
+    application.include_router(uc02_project_admin_stabilization_router)
     application.include_router(dealer_router)
     application.include_router(role_mapping_router)
     application.include_router(customer_router)
