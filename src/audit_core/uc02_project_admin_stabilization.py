@@ -15,7 +15,11 @@ from audit_core.dealers import (
     _outlet_impact,
     _outlet_response,
 )
-from audit_core.dependencies import HumanAdminRequest, get_connection, require_project_admin_request
+from audit_core.dependencies import (
+    HumanAdminRequest,
+    get_connection,
+    require_project_admin_request,
+)
 from audit_core.errors import BusinessValidationError, ConflictError, NotFoundError
 from audit_core.idempotency import execute_idempotent_json_command
 
