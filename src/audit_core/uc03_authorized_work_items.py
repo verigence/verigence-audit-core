@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
@@ -71,17 +72,12 @@ def get_landing_metrics(
         Depends(get_security_authorization_client),
     ],
     connection: Annotated[Connection, Depends(get_connection)],
+    outlet_id: Annotated[UUID | None, Query(alias="outletId")] = None,
 ) -> LandingMetrics:
-    """Return the four C0 Project landing counters for the current business scope.
+    """Return landing counters for the actor's current working scope.
 
-    C0 working semantics, frozen here for client/API consistency:
-    - Bookings In Progress: BOOKING_STARTED or BOOKING_IN_PROGRESS.
-    - Delivery In Progress: DELIVERY_STARTED or DELIVERY_IN_PROGRESS.
-    - Needs Attention: distinct cases with at least one OPEN/ACKNOWLEDGED finding.
-    - Audit Flags: OPEN/ACKNOWLEDGED finding count.
-
-    The last two definitions are intentionally simple C0 read semantics; later UC03 rule/
-    task checkpoints may broaden Needs Attention only through an explicit contract change.
+    For a PC dashboard, Web supplies the Outlet selected before entering the dashboard;
+    the same existing business-assignment predicate remains the authorization boundary.
     """
 
     _authorize_workspace(
@@ -113,6 +109,10 @@ def get_landing_metrics(
                 SELECT j.journey_id
                 FROM auditcore.journeys j
                 WHERE j.tenant_id = :tenant_id
+                  AND (
+                        CAST(:outlet_id AS uuid) IS NULL
+                        OR j.outlet_id = CAST(:outlet_id AS uuid)
+                  )
                   AND EXISTS (
                         SELECT 1
                         FROM auditcore.business_assignments ba
@@ -169,7 +169,11 @@ def get_landing_metrics(
             FROM stage_projection
             """
         ),
-        {"tenant_id": tenant_id, "actor_id": human_principal.subject},
+        {
+            "tenant_id": tenant_id,
+            "actor_id": human_principal.subject,
+            "outlet_id": outlet_id,
+        },
     ).mappings().one()
     return LandingMetrics(
         bookingsInProgress=int(row["bookings_in_progress"]),
@@ -191,15 +195,11 @@ def list_authorized_work_items(
     work_type: Annotated[WorkType, Query(alias="workType")] = "ALL",
     from_date: Annotated[date | None, Query(alias="fromDate")] = None,
     to_date: Annotated[date | None, Query(alias="toDate")] = None,
+    outlet_id: Annotated[UUID | None, Query(alias="outletId")] = None,
     limit: Annotated[int, Query(ge=1, le=10)] = 10,
     cursor: Annotated[str | None, Query(max_length=1024)] = None,
 ) -> WorkItemPage:
-    """Return C0 work items after live Security v2 authorization.
-
-    The human JWT is identity-only. Security remains the live functional authorization
-    source of truth, while Audit Core continues to enforce Project Dealer/Outlet scope
-    through business_assignments inside the delegated query.
-    """
+    """Return work items after live Security authorization and business scoping."""
 
     _authorize_workspace(
         authorization_client,
@@ -213,6 +213,7 @@ def list_authorized_work_items(
         work_type=work_type,
         from_date=from_date,
         to_date=to_date,
+        outlet_id=outlet_id,
         limit=limit,
         cursor=cursor,
     )

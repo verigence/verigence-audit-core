@@ -56,6 +56,7 @@ class WorkItemFilters(BaseModel):
     fromDate: date | None
     toDate: date | None
     timezoneName: str
+    outletId: UUID | None = None
 
 
 class WorkItemPage(BaseModel):
@@ -93,15 +94,17 @@ def _filter_fingerprint(
     from_date: date | None,
     to_date: date | None,
     timezone_name: str,
+    outlet_id: UUID | None,
 ) -> str:
     canonical = json.dumps(
         {
-            "v": 1,
+            "v": 2,
             "tenantId": tenant_id,
             "workType": work_type,
             "fromDate": from_date.isoformat() if from_date else None,
             "toDate": to_date.isoformat() if to_date else None,
             "timezoneName": timezone_name,
+            "outletId": str(outlet_id) if outlet_id else None,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -175,12 +178,8 @@ def _row_to_item(row, *, project_name: str) -> WorkItem:
         totalFlagCount=int(row["total_flag_count"]),
         highestOpenSeverity=row["highest_open_severity"],
         processingDocumentCount=int(row["processing_document_count"]),
-        # Extraction proposal/acceptance persistence is a C1 concern. Keep the C0
-        # read contract stable now without inventing a parallel proposal authority.
         proposalReadyCount=0,
         latestActivityAtUtc=row["latest_activity_at_utc"],
-        # Next-action policy is introduced with concrete Booking/Delivery commands.
-        # Returning null in C0 is deliberate rather than guessing workflow semantics.
         nextActionCode=None,
     )
 
@@ -193,16 +192,14 @@ def list_work_items(
     work_type: Annotated[WorkType, Query(alias="workType")] = "ALL",
     from_date: Annotated[date | None, Query(alias="fromDate")] = None,
     to_date: Annotated[date | None, Query(alias="toDate")] = None,
+    outlet_id: Annotated[UUID | None, Query(alias="outletId")] = None,
     limit: Annotated[int, Query(ge=1, le=10)] = 10,
     cursor: Annotated[str | None, Query(max_length=1024)] = None,
 ) -> WorkItemPage:
     """Return the latest authorized UC03 Booking/Delivery work items.
 
-    Date precedence frozen for C0 contract tests:
-    - Booking: source Booking date, else Booking first-start event date, else Booking record date.
-    - Delivery: actual-delivered date when present, else Delivery first-start event date,
-      else Delivery record date.
-    All timestamp-to-date conversion uses the selected Project timezone.
+    When outletId is supplied, the result is constrained to that already-selected
+    working Outlet in addition to the actor's normal business-assignment scope.
     """
 
     authorize(principal, tenant_id=tenant_id, permission="audit.journey.read")
@@ -218,6 +215,7 @@ def list_work_items(
         from_date=from_date,
         to_date=to_date,
         timezone_name=timezone_name,
+        outlet_id=outlet_id,
     )
     cursor_at: datetime | None = None
     cursor_journey_id: UUID | None = None
@@ -363,6 +361,10 @@ def list_work_items(
                     LEFT JOIN evidence_activity ea ON ea.journey_id = j.journey_id
                     LEFT JOIN processing_counts pc ON pc.journey_id = j.journey_id
                     WHERE j.tenant_id = :tenant_id
+                      AND (
+                            CAST(:outlet_id AS uuid) IS NULL
+                            OR j.outlet_id = CAST(:outlet_id AS uuid)
+                      )
                       AND (b.booking_id IS NOT NULL OR dl.delivery_id IS NOT NULL
                            OR bs.journey_id IS NOT NULL OR ds.journey_id IS NOT NULL)
                       AND EXISTS (
@@ -442,6 +444,7 @@ def list_work_items(
                 "work_type": work_type,
                 "from_date": from_date,
                 "to_date": to_date,
+                "outlet_id": outlet_id,
                 "cursor_at": cursor_at,
                 "cursor_journey_id": cursor_journey_id,
                 "fetch_limit": limit + 1,
@@ -471,5 +474,6 @@ def list_work_items(
             fromDate=from_date,
             toDate=to_date,
             timezoneName=timezone_name,
+            outletId=outlet_id,
         ),
     )

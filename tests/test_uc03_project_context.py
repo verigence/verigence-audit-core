@@ -106,8 +106,9 @@ def uc03_project_context_setup():
             text(
                 """
                 INSERT INTO auditcore.dealer_outlets (
-                    tenant_id, dealer_id, outlet_code, outlet_name
-                ) VALUES (:tenant_id, :dealer_id, :code, 'Outlet One')
+                    tenant_id, dealer_id, outlet_code, outlet_name,
+                    outlet_classification
+                ) VALUES (:tenant_id, :dealer_id, :code, 'Outlet One', 'ONSITE')
                 RETURNING outlet_id
                 """
             ),
@@ -117,8 +118,9 @@ def uc03_project_context_setup():
             text(
                 """
                 INSERT INTO auditcore.dealer_outlets (
-                    tenant_id, dealer_id, outlet_code, outlet_name
-                ) VALUES (:tenant_id, :dealer_id, :code, 'Outlet Two')
+                    tenant_id, dealer_id, outlet_code, outlet_name,
+                    outlet_classification
+                ) VALUES (:tenant_id, :dealer_id, :code, 'Outlet Two', 'SATELLITE')
                 RETURNING outlet_id
                 """
             ),
@@ -184,6 +186,10 @@ def uc03_project_context_setup():
             "tenant_pm": tenant_pm,
             "tenant_other": tenant_other,
             "tenant_inactive": tenant_inactive,
+            "dealer_one": dealer_one,
+            "dealer_two": dealer_two,
+            "outlet_one": outlet_one,
+            "outlet_two": outlet_two,
         }
     finally:
         app.dependency_overrides.clear()
@@ -207,7 +213,27 @@ def test_me_projects_returns_only_active_projects_for_current_actor(uc03_project
         "projectStatus": "ACTIVE",
         "timezoneName": "Asia/Kolkata",
         "operatingRole": "PC",
-        "scope": {"allDealers": False, "dealerCount": 2, "outletCount": 2},
+        "scope": {
+            "allDealers": False,
+            "dealerCount": 2,
+            "outletCount": 2,
+            "outlets": [
+                {
+                    "dealerId": str(setup["dealer_one"]),
+                    "dealerName": "Dealer One",
+                    "outletId": str(setup["outlet_one"]),
+                    "outletName": "Outlet One",
+                    "outletClassification": "ONSITE",
+                },
+                {
+                    "dealerId": str(setup["dealer_two"]),
+                    "dealerName": "Dealer Two",
+                    "outletId": str(setup["outlet_two"]),
+                    "outletName": "Outlet Two",
+                    "outletClassification": "SATELLITE",
+                },
+            ],
+        },
     }
     assert payload["projects"][1] == {
         "tenantId": setup["tenant_pm"],
@@ -216,7 +242,12 @@ def test_me_projects_returns_only_active_projects_for_current_actor(uc03_project
         "projectStatus": "ACTIVE",
         "timezoneName": "Asia/Kolkata",
         "operatingRole": "PM",
-        "scope": {"allDealers": True, "dealerCount": 0, "outletCount": 0},
+        "scope": {
+            "allDealers": True,
+            "dealerCount": 0,
+            "outletCount": 0,
+            "outlets": [],
+        },
     }
 
 
