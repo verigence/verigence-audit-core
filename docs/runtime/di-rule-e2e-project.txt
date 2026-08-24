@@ -1,3 +1,5 @@
 DI_RULE_E2E_PROJECT
 ENVIRONMENT=DEV
+PROJECT_NAME=DEV-DI-RULE-E2E-20260824
 RESULT=FAIL
+FAILURE=	Is the server running locally and accepting connections on that socket? 
