@@ -1,0 +1,53 @@
+name: Diagnose auth login timestamps
+
+on:
+  push:
+    branches: [diagnose/uc02-old-project-step-errors]
+    paths: ['.github/workflows/diagnose-auth-login-timestamps.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: diagnose/uc02-old-project-step-errors
+          fetch-depth: 0
+      - run: npm install --global @railway/cli
+      - name: Capture timestamped Security auth/JWKS events
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/authdiag docs/runtime
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service security --json >/tmp/authdiag/link.json
+          railway logs --service security --environment dev --since 4h --lines 5000 --json > /tmp/authdiag/security.jsonl || true
+          python - <<'PY'
+          from pathlib import Path
+          import json,re
+          lines=[]
+          for raw in Path('/tmp/authdiag/security.jsonl').read_text(errors='replace').splitlines():
+              try:
+                  obj=json.loads(raw)
+              except Exception:
+                  continue
+              text=' '.join(str(obj.get(k,'')) for k in ('timestamp','message','severity','status','method','path','requestId','deploymentId') if obj.get(k) not in (None,''))
+              if re.search(r'(POST /security/v1/auth/login|GET /.well-known/jwks.json|Starting Container|Stopping Container|startup)',text,re.I):
+                  lines.append(text)
+          out='SECURITY AUTH/JWKS TIMESTAMPS\n'+'\n'.join(lines)+'\n'
+          Path('docs/runtime/security-auth-jwks-timestamps.txt').write_text(out)
+          print(out)
+          PY
+      - name: Record evidence
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add docs/runtime/security-auth-jwks-timestamps.txt
+          git commit -m 'docs(diag): record Security auth and JWKS timestamps' || exit 0
+          git push origin HEAD:diagnose/uc02-old-project-step-errors
