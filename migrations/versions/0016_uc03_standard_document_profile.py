@@ -13,8 +13,8 @@ _MIGRATION_ACTOR = "migration.0016.uc03-document-profile"
 
 def upgrade() -> None:
     # UC03 requires a real Project-level Document Requirement Profile before a
-    # Journey can snapshot its Booking checklist.  UC02 previously exposed the
-    # master but did not seed one.  The Phase-1 Booking baseline confirmed by the
+    # Journey can snapshot its Booking checklist. UC02 previously exposed the
+    # master but did not seed one. The Phase-1 Booking baseline confirmed by the
     # product owner is intentionally small:
     #   - Booking Docket
     #   - Aadhaar and/or PAN (at least one identity document)
@@ -22,7 +22,7 @@ def upgrade() -> None:
     # Address Proof is deliberately NOT part of the Booking baseline.
     #
     # Aadhaar/PAN are stored as two uploadable requirements because DI has
-    # distinct canonical Document Types.  Their shared condition metadata records
+    # distinct canonical Document Types. Their shared condition metadata records
     # the business rule that one of the two is sufficient; runtime completion
     # logic may consume this metadata without changing the published profile.
     op.execute(
@@ -248,21 +248,30 @@ def upgrade() -> None:
     op.execute(
         f"""
         UPDATE auditcore.journeys j
-        SET document_requirement_profile_version_id = profile.version_id,
+        SET document_requirement_profile_version_id = (
+                SELECT v.document_requirement_profile_version_id
+                FROM auditcore.document_requirement_profiles p
+                JOIN auditcore.document_requirement_profile_versions v
+                  ON v.tenant_id = p.tenant_id
+                 AND v.document_requirement_profile_id = p.document_requirement_profile_id
+                WHERE p.tenant_id = j.tenant_id
+                  AND p.profile_code = '{_PROFILE_CODE}'
+                  AND v.lifecycle_status = 'PUBLISHED'
+                ORDER BY v.version_no DESC, v.effective_from DESC
+                LIMIT 1
+            ),
             updated_at_utc = now()
-        FROM LATERAL (
-            SELECT v.document_requirement_profile_version_id AS version_id
-            FROM auditcore.document_requirement_profiles p
-            JOIN auditcore.document_requirement_profile_versions v
-              ON v.tenant_id = p.tenant_id
-             AND v.document_requirement_profile_id = p.document_requirement_profile_id
-            WHERE p.tenant_id = j.tenant_id
-              AND p.profile_code = '{_PROFILE_CODE}'
-              AND v.lifecycle_status = 'PUBLISHED'
-            ORDER BY v.version_no DESC, v.effective_from DESC
-            LIMIT 1
-        ) profile
         WHERE j.document_requirement_profile_version_id IS NULL
+          AND EXISTS (
+                SELECT 1
+                FROM auditcore.document_requirement_profiles p
+                JOIN auditcore.document_requirement_profile_versions v
+                  ON v.tenant_id = p.tenant_id
+                 AND v.document_requirement_profile_id = p.document_requirement_profile_id
+                WHERE p.tenant_id = j.tenant_id
+                  AND p.profile_code = '{_PROFILE_CODE}'
+                  AND v.lifecycle_status = 'PUBLISHED'
+            )
         """
     )
 
