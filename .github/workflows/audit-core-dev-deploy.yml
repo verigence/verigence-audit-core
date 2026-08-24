@@ -42,10 +42,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f migrations/versions/0014_uc02_mahindra_segment_masters.py
+          test -f migrations/versions/0015_uc02_universal_segments.py
           alembic heads | tee /tmp/alembic-heads.txt
-          grep -q '0014_uc02_mahindra_seg' /tmp/alembic-heads.txt
-          echo 'AUDIT_CORE_ALEMBIC_SOURCE_HEAD=0014_uc02_mahindra_seg'
+          grep -q '0015_uc02_global_segments' /tmp/alembic-heads.txt
+          echo 'AUDIT_CORE_ALEMBIC_SOURCE_HEAD=0015_uc02_global_segments'
 
           PYTHONPATH=src python - <<'PY'
           from audit_core.main import app
