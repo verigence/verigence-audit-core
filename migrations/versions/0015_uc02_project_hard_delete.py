@@ -11,8 +11,8 @@ _RUNTIME_ROLE = "audit_core_runtime"
 def upgrade() -> None:
     # Owner-approved UC02 rule: a Project may be hard-deleted only while its
     # Journey count is zero, regardless of CONFIGURING/ACTIVE lifecycle state.
-    # Keep destructive access encapsulated in one function instead of granting
-    # broad DELETE privileges to the runtime role.
+    # Keep destructive access encapsulated in one SECURITY DEFINER function
+    # instead of granting broad DELETE privileges to the runtime role.
     op.execute(
         """
         CREATE OR REPLACE FUNCTION auditcore.hard_delete_zero_journey_project(
@@ -52,8 +52,11 @@ def upgrade() -> None:
                     USING ERRCODE='check_violation';
             END IF;
 
-            -- Delete all tenant-owned tables in FK child-first order. Keep the
-            -- durable administrative_operations ledger and delete Project last.
+            -- Delete all tenant-owned tables in FK child-first order. Published
+            -- master and append-only protection triggers are intentionally USER
+            -- triggers; disable them only inside this owner-approved purge scope.
+            -- FK/internal triggers remain enabled, so child-first ordering is still
+            -- enforced. DDL is transactional, so any failure restores trigger state.
             FOR v_target IN
                 WITH RECURSIVE tenant_tables AS (
                     SELECT c.oid, c.relname
@@ -97,11 +100,19 @@ def upgrade() -> None:
                 ORDER BY depth DESC, relname
             LOOP
                 EXECUTE format(
+                    'ALTER TABLE auditcore.%I DISABLE TRIGGER USER',
+                    v_target.relname
+                );
+                EXECUTE format(
                     'DELETE FROM auditcore.%I WHERE tenant_id = %L',
                     v_target.relname,
                     p_tenant_id
                 );
                 GET DIAGNOSTICS v_deleted = ROW_COUNT;
+                EXECUTE format(
+                    'ALTER TABLE auditcore.%I ENABLE TRIGGER USER',
+                    v_target.relname
+                );
                 IF v_deleted > 0 THEN
                     v_receipt := v_receipt || jsonb_build_object(
                         v_target.relname, v_deleted
@@ -109,6 +120,9 @@ def upgrade() -> None:
                 END IF;
             END LOOP;
 
+            -- Journey count was checked under the Project row lock and the route
+            -- also holds a Project-scoped advisory lock. Journeys remain a separate
+            -- explicit gate rather than being silently destroyed here.
             DELETE FROM auditcore.projects WHERE tenant_id=p_tenant_id;
             GET DIAGNOSTICS v_deleted = ROW_COUNT;
             v_receipt := v_receipt || jsonb_build_object('projects', v_deleted);
