@@ -9,11 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy import Connection, text
 
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import (
-    HumanAdminRequest,
-    get_connection,
-    require_project_admin_request,
-)
+from audit_core.dependencies import HumanAdminRequest, get_connection, require_project_admin_request
 from audit_core.di_client import DiClient, DiClientError
 from audit_core.errors import NotFoundError
 from audit_core.security_integration import SecurityAdminClient, SecurityAdminError
@@ -28,15 +24,15 @@ _REQUIRED_AUDIT_CORE_MASTERS = {
     "DOCUMENT_REQUIREMENT_PROFILE": "Document Requirement Profile",
     "AUDIT_CONTROL": "Audit Control",
 }
+# Audit Core owns Journey evidence requirements. DI Requirement Profiles remain
+# an optional advanced DI capability and are intentionally not an activation gate.
 _REQUIRED_DI_MASTER_STATES = {
     "DOCUMENT_TYPES": "ACTIVE",
     "EXTRACTION_PROFILES": "PUBLISHED",
-    "REQUIREMENT_PROFILES": "PUBLISHED",
 }
 _DI_MASTER_LABELS = {
     "DOCUMENT_TYPES": "Document Types",
     "EXTRACTION_PROFILES": "Extraction Profiles",
-    "REQUIREMENT_PROFILES": "Requirement Profiles",
 }
 
 
@@ -73,15 +69,15 @@ def _project_state(connection: Connection, tenant_id: str):
     row = connection.execute(
         text(
             """
-            SELECT p.project_name, p.oem_id, p.product_category_id, o.oem_code, p.effective_start_date,
-                   p.timezone_name, p.project_status,
-                   (SELECT count(*) FROM auditcore.segments s
-                    WHERE s.is_active=true) AS configured_segments,
+            SELECT p.project_name, p.oem_id, p.product_category_id, o.oem_code,
+                   p.effective_start_date, p.timezone_name, p.project_status,
+                   (SELECT count(*) FROM auditcore.segments s WHERE s.is_active=true)
+                     AS configured_segments,
                    (SELECT count(*) FROM auditcore.project_segments ps
                     WHERE ps.tenant_id=p.tenant_id) AS selected_segments
             FROM auditcore.projects p
             JOIN auditcore.oems o ON o.oem_id=p.oem_id
-            WHERE p.tenant_id = :tenant_id
+            WHERE p.tenant_id=:tenant_id
             """
         ),
         {"tenant_id": tenant_id},
@@ -123,11 +119,7 @@ def _project_setup_check(project) -> ReadinessCheck:
     )
 
 
-def _security_tenant_check(
-    *,
-    tenant_id: str,
-    human_bearer_token: str,
-) -> ReadinessCheck:
+def _security_tenant_check(*, tenant_id: str, human_bearer_token: str) -> ReadinessCheck:
     try:
         with SecurityAdminClient(base_url=_security_base_url()) as client:
             tenant = client.get_tenant(
@@ -168,18 +160,15 @@ def _security_tenant_check(
     )
 
 
-def _dealer_outlet_structure_check(
-    connection: Connection,
-    tenant_id: str,
-) -> ReadinessCheck:
+def _dealer_outlet_structure_check(connection: Connection, tenant_id: str) -> ReadinessCheck:
     counts = connection.execute(
         text(
             """
             SELECT
                 (SELECT count(*) FROM auditcore.dealers
-                 WHERE tenant_id = :tenant_id AND status = 'ACTIVE') AS active_dealers,
+                 WHERE tenant_id=:tenant_id AND status='ACTIVE') AS active_dealers,
                 (SELECT count(*) FROM auditcore.dealer_outlets
-                 WHERE tenant_id = :tenant_id AND status = 'ACTIVE') AS active_outlets
+                 WHERE tenant_id=:tenant_id AND status='ACTIVE') AS active_outlets
             """
         ),
         {"tenant_id": tenant_id},
@@ -188,12 +177,12 @@ def _dealer_outlet_structure_check(
     return ReadinessCheck(
         area="PROJECT_STRUCTURE",
         checkKey="DEALER_OUTLET_STRUCTURE",
-        severity="BLOCKING",
+        severity="WARNING",
         status="PASS" if valid else "FAIL",
         message=(
             "Active Dealer and Dealer Outlet structure is present."
             if valid
-            else "Add at least one active Dealer and active Dealer Outlet before activation."
+            else "Dealer/Outlet setup is incomplete. You can activate now and complete it before operational use."
         ),
         targetTask="DEALER_OUTLETS" if counts["active_dealers"] else "DEALERS",
     )
@@ -205,15 +194,15 @@ def _pc_coverage_check(connection: Connection, tenant_id: str) -> ReadinessCheck
             """
             SELECT o.outlet_id
             FROM auditcore.dealer_outlets o
-            WHERE o.tenant_id = :tenant_id
-              AND o.status = 'ACTIVE'
+            WHERE o.tenant_id=:tenant_id
+              AND o.status='ACTIVE'
               AND NOT EXISTS (
                   SELECT 1
                   FROM auditcore.business_assignments a
-                  WHERE a.tenant_id = o.tenant_id
-                    AND a.outlet_id = o.outlet_id
-                    AND a.business_role_code = 'PC'
-                    AND a.assignment_status = 'ACTIVE'
+                  WHERE a.tenant_id=o.tenant_id
+                    AND a.outlet_id=o.outlet_id
+                    AND a.business_role_code='PC'
+                    AND a.assignment_status='ACTIVE'
                     AND a.effective_from <= now()
                     AND (a.effective_to IS NULL OR a.effective_to > now())
               )
@@ -226,12 +215,12 @@ def _pc_coverage_check(connection: Connection, tenant_id: str) -> ReadinessCheck
     return ReadinessCheck(
         area="ROLE_MAPPING",
         checkKey="ACTIVE_OUTLET_PC_COVERAGE",
-        severity="BLOCKING",
+        severity="WARNING",
         status="PASS" if covered else "FAIL",
         message=(
             "Every active Dealer Outlet has an active Process Consultant mapping."
             if covered
-            else f"{len(uncovered)} active Dealer Outlet(s) still require an active Process Consultant mapping."
+            else f"{len(uncovered)} active Dealer Outlet(s) still require an active Process Consultant mapping. This does not block activation."
         ),
         targetTask="ROLE_MAPPING",
     )
@@ -298,7 +287,7 @@ def _mahindra_master_gaps(connection: Connection, tenant_id: str) -> list[str]:
         if not price_ready:
             missing.append(f"{segment['segment_name']} Price Master")
 
-    policy_ready = bool(
+    discount_ready = bool(
         connection.execute(
             text(
                 """
@@ -311,7 +300,7 @@ def _mahindra_master_gaps(connection: Connection, tenant_id: str) -> list[str]:
             {"tenant_id": tenant_id},
         ).scalar_one()
     )
-    if not policy_ready:
+    if not discount_ready:
         missing.append("Discount & Policy Master")
     return missing
 
@@ -375,12 +364,12 @@ def _project_masters_check(connection: Connection, tenant_id: str) -> ReadinessC
     return ReadinessCheck(
         area="PROJECT_MASTERS",
         checkKey="PROJECT_MASTERS_READY",
-        severity="BLOCKING",
+        severity="WARNING",
         status="PASS" if not missing else "FAIL",
         message=(
-            "Required Audit Core Project Masters have published versions."
+            "Project business, policy, audit-control and document-requirement masters are published."
             if not missing
-            else "Publish required Project Master(s): " + ", ".join(missing) + "."
+            else "Configuration still recommended: " + ", ".join(missing) + ". This does not block activation."
         ),
         targetTask="PROJECT_MASTERS",
     )
@@ -397,11 +386,12 @@ def _di_project_check(*, tenant_id: str, human_bearer_token: str) -> ReadinessCh
                 return ReadinessCheck(
                     area="DI",
                     checkKey="DI_PROJECT_READY",
-                    severity="BLOCKING",
+                    severity="WARNING",
                     status="FAIL",
-                    message="Document Intelligence provisioning is incomplete for this Project.",
+                    message="Document Intelligence provisioning is incomplete. This does not block Project activation.",
                     targetTask="DOCUMENT_INTELLIGENCE",
                 )
+
             catalogue = client.list_project_masters(
                 human_token=human_bearer_token,
                 tenant_id=tenant_id,
@@ -411,10 +401,9 @@ def _di_project_check(*, tenant_id: str, human_bearer_token: str) -> ReadinessCh
                 for item in catalogue
                 if isinstance(item.get("masterKey"), str)
             }
-            missing_domains = [
-                key for key in _REQUIRED_DI_MASTER_STATES if key not in available
-            ]
+            missing_domains = [key for key in _REQUIRED_DI_MASTER_STATES if key not in available]
             wrong_states: list[str] = []
+            uses_verigence_default = False
             for master_key, expected_state in _REQUIRED_DI_MASTER_STATES.items():
                 if master_key not in available:
                     continue
@@ -424,34 +413,47 @@ def _di_project_check(*, tenant_id: str, human_bearer_token: str) -> ReadinessCh
                     master_key=master_key,
                 )
                 versions = payload.get("versions")
-                if not isinstance(versions, list) or not any(
-                    isinstance(version, dict) and version.get("status") == expected_state
-                    for version in versions
-                ):
+                if not isinstance(versions, list):
                     wrong_states.append(master_key)
+                    continue
+                matching = [
+                    version
+                    for version in versions
+                    if isinstance(version, dict) and version.get("status") == expected_state
+                ]
+                if not matching:
+                    wrong_states.append(master_key)
+                if any(
+                    version.get("configurationSource") == "VERIGENCE_DEFAULT"
+                    or version.get("inherited") is True
+                    for version in matching
+                ):
+                    uses_verigence_default = True
     except DiClientError:
         return ReadinessCheck(
             area="DI",
             checkKey="DI_PROJECT_READY",
-            severity="BLOCKING",
+            severity="WARNING",
             status="PENDING",
-            message="Document Intelligence readiness could not be verified. Refresh the check before activation.",
+            message="Document Intelligence readiness could not be verified. This does not block Project activation.",
             targetTask="DOCUMENT_INTELLIGENCE",
         )
 
     failures = [*missing_domains, *wrong_states]
     if failures:
         actions = [
-            f"{_DI_MASTER_LABELS.get(key, key)} must be {_REQUIRED_DI_MASTER_STATES.get(key, 'configured')}"
+            f"{_DI_MASTER_LABELS.get(key, key)} must expose an effective {_REQUIRED_DI_MASTER_STATES.get(key, 'configured')} version"
             for key in failures
         ]
-        message = "Complete Document Intelligence configuration: " + "; ".join(actions) + "."
+        message = "Review Document Intelligence configuration: " + "; ".join(actions) + ". This does not block activation."
+    elif uses_verigence_default:
+        message = "Using Verigence default Document Intelligence configuration. Customize it if this Project requires different document types or extraction fields."
     else:
-        message = "Document Intelligence provisioning and required configuration are ready."
+        message = "Document Intelligence has effective Document Types and Extraction Profiles. Requirement Profiles are optional."
     return ReadinessCheck(
         area="DI",
         checkKey="DI_PROJECT_READY",
-        severity="BLOCKING",
+        severity="WARNING",
         status="PASS" if not failures else "FAIL",
         message=message,
         targetTask="DOCUMENT_INTELLIGENCE",
@@ -464,11 +466,11 @@ def _optional_map_metadata_check(connection: Connection, tenant_id: str) -> Read
             """
             SELECT count(*)
             FROM auditcore.dealer_outlets
-            WHERE tenant_id = :tenant_id
-              AND status = 'ACTIVE'
+            WHERE tenant_id=:tenant_id
+              AND status='ACTIVE'
               AND (
                   google_place_id IS NULL
-                  OR btrim(google_place_id) = ''
+                  OR btrim(google_place_id)=''
                   OR latitude IS NULL
                   OR longitude IS NULL
               )
@@ -484,10 +486,7 @@ def _optional_map_metadata_check(connection: Connection, tenant_id: str) -> Read
         message=(
             "Optional Google Place and coordinate metadata is complete."
             if incomplete == 0
-            else (
-                f"{incomplete} active Dealer Outlet(s) use manual or incomplete map metadata; "
-                "this is optional and does not block activation."
-            )
+            else f"{incomplete} active Dealer Outlet(s) use manual or incomplete map/GPS metadata; this does not block activation."
         ),
         targetTask="DEALER_OUTLETS",
     )
@@ -517,7 +516,8 @@ def evaluate_project_readiness(
         _optional_map_metadata_check(connection, tenant_id),
     ]
     ready = not any(
-        check.severity == "BLOCKING" and check.status != "PASS" for check in checks
+        check.severity == "BLOCKING" and check.status != "PASS"
+        for check in checks
     )
     return ProjectReadinessResponse(
         readyToActivate=ready,
