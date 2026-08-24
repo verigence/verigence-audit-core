@@ -21,70 +21,49 @@ jobs:
         with:
           ref: feature/uc02-universal-segments
           fetch-depth: 0
-      - name: Apply universal Segment refactor
+      - name: Apply universal Segment source refactor
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
 
-          root = Path('.')
-          helper = Path('.github/workflows/one-shot-uc02-universal-segments-refactor.yml')
           text_files = []
-          for base in ('src', 'tests', 'docs', '.github'):
-              p = root / base
+          for base in ('src', 'tests', 'docs'):
+              p = Path(base)
               if p.exists():
                   text_files.extend(
                       x for x in p.rglob('*')
-                      if x.is_file()
-                      and x != helper
-                      and x.suffix in {'.py', '.md', '.yml', '.yaml'}
+                      if x.is_file() and x.suffix in {'.py', '.md'}
                   )
-          text_files.append(root / 'railway.toml')
+          text_files.append(Path('railway.toml'))
 
           for path in text_files:
               if not path.exists():
                   continue
               text = path.read_text()
               text = text.replace('auditcore.oem_segments', 'auditcore.segments')
-              text = text.replace('0014_uc02_mahindra_seg', '0015_uc02_global_segments')
+              if path.name == 'railway.toml':
+                  text = text.replace('0014_uc02_mahindra_seg', '0015_uc02_global_segments')
               path.write_text(text)
 
           replacements = {
               Path('src/audit_core/project_provisioning.py'): [
-                  (
-                      'FROM auditcore.segments\n                    WHERE oem_id=:oem_id AND is_active=true',
-                      'FROM auditcore.segments\n                    WHERE is_active=true',
-                  ),
+                  ('FROM auditcore.segments\n                    WHERE oem_id=:oem_id AND is_active=true', 'FROM auditcore.segments\n                    WHERE is_active=true'),
                   ('Select at least one Segment configured for the chosen OEM.', 'Select at least one active Segment.'),
                   ('Every selected Segment must belong to the chosen OEM and be active.', 'Every selected Segment must reference an active universal Segment.'),
               ],
               Path('src/audit_core/projects.py'): [
-                  (
-                      'SELECT segment_id FROM auditcore.segments\n                WHERE oem_id=:oem_id AND is_active=true',
-                      'SELECT segment_id FROM auditcore.segments\n                WHERE is_active=true',
-                  ),
+                  ('SELECT segment_id FROM auditcore.segments\n                WHERE oem_id=:oem_id AND is_active=true', 'SELECT segment_id FROM auditcore.segments\n                WHERE is_active=true'),
                   ('Select at least one Segment configured for the chosen OEM.', 'Select at least one active Segment.'),
                   ('Every selected Segment must belong to the chosen OEM and be active.', 'Every selected Segment must reference an active universal Segment.'),
               ],
               Path('src/audit_core/readiness.py'): [
-                  (
-                      '(SELECT count(*) FROM auditcore.segments os\n                    WHERE os.oem_id=p.oem_id AND os.is_active=true) AS configured_segments,',
-                      '(SELECT count(*) FROM auditcore.segments s\n                    WHERE s.is_active=true) AS configured_segments,',
-                  ),
+                  ('(SELECT count(*) FROM auditcore.segments os\n                    WHERE os.oem_id=p.oem_id AND os.is_active=true) AS configured_segments,', '(SELECT count(*) FROM auditcore.segments s\n                    WHERE s.is_active=true) AS configured_segments,'),
                   ('OEM Segment selection', 'Segment selection'),
               ],
               Path('src/audit_core/mahindra_masters.py'): [
-                  (
-                      'JOIN auditcore.projects p ON p.tenant_id=ps.tenant_id AND p.oem_id=s.oem_id',
-                      'JOIN auditcore.projects p ON p.tenant_id=ps.tenant_id',
-                  ),
-              ],
-              Path('.github/workflows/ci.yml'): [
-                  (
-                      "select count(*) from auditcore.segments s join auditcore.oems o on o.oem_id=s.oem_id where o.oem_code='MAHINDRA' and s.segment_code in ('PASSENGER_VEHICLE','COMMERCIAL','BATTERY_ELECTRIC')",
-                      "select count(*) from auditcore.segments s where s.is_active=true and s.segment_code in ('PASSENGER_VEHICLE','COMMERCIAL','BATTERY_ELECTRIC')",
-                  ),
+                  ('JOIN auditcore.projects p ON p.tenant_id=ps.tenant_id AND p.oem_id=s.oem_id', 'JOIN auditcore.projects p ON p.tenant_id=ps.tenant_id'),
               ],
           }
 
@@ -92,32 +71,29 @@ jobs:
               text = path.read_text()
               for old, new in pairs:
                   if old not in text:
-                      raise SystemExit(f'Expected refactor source not found in {path}: {old!r}')
+                      raise SystemExit(f'Expected source not found in {path}: {old!r}')
                   text = text.replace(old, new)
               path.write_text(text)
 
           doc = Path('docs/AUDIT_CORE_UC02_MAHINDRA_MASTER_MODEL.md')
           if doc.exists():
               text = doc.read_text()
-              marker = '## Universal Segment model\n'
-              section = '''\n## Universal Segment model\n\nSegment is a platform-wide reference master and is **not owned by an OEM**. All OEM Projects select from the same Phase-1 Segment set:\n\n- `PASSENGER_VEHICLE` — Passenger Vehicle\n- `COMMERCIAL` — Commercial\n- `BATTERY_ELECTRIC` — Battery Electric\n\nOEM and Segment are independent Project dimensions. Selecting or changing OEM does not change the available Segment choices. Mahindra-specific workbook ingestion remains an OEM adapter; it consumes the Project's universal Segment selections rather than defining them.\n'''
-              if marker not in text:
-                  text += section
-              doc.write_text(text)
+              if '## Universal Segment model\n' not in text:
+                  text += '''\n## Universal Segment model\n\nSegment is a platform-wide reference master and is **not owned by an OEM**. All OEM Projects select from the same Phase-1 Segment set:\n\n- `PASSENGER_VEHICLE` — Passenger Vehicle\n- `COMMERCIAL` — Commercial\n- `BATTERY_ELECTRIC` — Battery Electric\n\nOEM and Segment are independent Project dimensions. Selecting or changing OEM does not change the available Segment choices. Mahindra-specific workbook ingestion remains an OEM adapter; it consumes the Project's universal Segment selections rather than defining them.\n'''
+                  doc.write_text(text)
 
-          bad = []
-          for path in Path('src').rglob('*.py'):
-              text = path.read_text()
-              if 'auditcore.oem_segments' in text:
-                  bad.append(f'{path}: old table reference')
+          bad = [
+              str(path) for path in Path('src').rglob('*.py')
+              if 'auditcore.oem_segments' in path.read_text()
+          ]
           if bad:
-              raise SystemExit('\n'.join(bad))
+              raise SystemExit('Old OEM Segment table references remain: ' + ', '.join(bad))
           PY
 
           python -m compileall -q src tests
+          find src tests -type d -name __pycache__ -prune -exec rm -rf {} +
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git rm -f .github/workflows/one-shot-uc02-universal-segments-refactor.yml
-          git add src tests docs .github railway.toml
+          git add src tests docs railway.toml
           git commit -m 'refactor(uc02): make segments universal across OEMs'
           git push origin HEAD:feature/uc02-universal-segments
