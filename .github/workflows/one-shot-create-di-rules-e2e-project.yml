@@ -44,8 +44,8 @@ jobs:
       - name: Provision persistent E2E Project
         shell: bash
         run: |
-          set -euo pipefail
-          python - <<'PY'
+          set +e
+          python - <<'PY' 2>/tmp/di-rule-e2e-provision.err
           import json
           import os
           import time
@@ -89,8 +89,6 @@ jobs:
               'DEDICATED_TEST_USER=NOT_REQUIRED',
           ]
 
-          # Reuse the existing DEV platform SuperAdmin only for the real Project-create
-          # provisioning transaction.  The JWT is short lived and is never persisted.
           with psycopg.connect(security_db) as conn:
               with conn.cursor() as cur:
                   cur.execute(
@@ -202,8 +200,6 @@ jobs:
                           raise RuntimeError('Created Project is missing from Audit Core DB')
                       project_code, project_status = project_row
 
-          # Verify DI was provisioned for the Project tenant.  This is setup evidence,
-          # not the E2E extraction assertion itself.
           with psycopg.connect(di_db) as conn:
               with conn.cursor() as cur:
                   cur.execute("SELECT count(*) FROM docintel.tenant_settings WHERE tenant_id=%s", (tenant_id,))
@@ -244,6 +240,13 @@ jobs:
           evidence.write_text('\n'.join(out) + '\n')
           print('\n'.join(out))
           PY
+          rc=$?
+          if (( rc != 0 )); then
+            last_line="$(tail -n 1 /tmp/di-rule-e2e-provision.err | tr '\n' ' ' | cut -c1-700)"
+            printf 'DI_RULE_E2E_PROJECT\nENVIRONMENT=DEV\nPROJECT_NAME=%s\nRESULT=FAIL\nFAILURE=%s\n' "$E2E_PROJECT_NAME" "$last_line" > docs/runtime/di-rule-e2e-project.txt
+            cat docs/runtime/di-rule-e2e-project.txt
+            exit "$rc"
+          fi
 
       - name: Record non-secret provisioning evidence
         if: always()
@@ -251,7 +254,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! -f docs/runtime/di-rule-e2e-project.txt ]]; then
-            printf 'DI_RULE_E2E_PROJECT\nENVIRONMENT=DEV\nRESULT=FAIL\n' > docs/runtime/di-rule-e2e-project.txt
+            printf 'DI_RULE_E2E_PROJECT\nENVIRONMENT=DEV\nRESULT=FAIL\nFAILURE=workflow stopped before provisioning evidence was written\n' > docs/runtime/di-rule-e2e-project.txt
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
