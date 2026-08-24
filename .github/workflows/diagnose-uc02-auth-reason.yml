@@ -1,0 +1,52 @@
+name: Diagnose UC02 auth failure reason
+
+on:
+  push:
+    branches:
+      - diagnose/uc02-old-project-step-errors
+    paths:
+      - .github/workflows/diagnose-uc02-auth-reason.yml
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: diagnose/uc02-old-project-step-errors
+          fetch-depth: 0
+      - run: npm install --global @railway/cli
+      - name: Capture auth details
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs/runtime /tmp/diag
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/diag/link.json
+          railway logs --service "$AUDIT_SERVICE" --environment dev --since 45m --lines 2000 > /tmp/diag/audit.log || true
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          lines=Path('/tmp/diag/audit.log').read_text(errors='replace').splitlines()
+          rx=re.compile(r'(auth_failed|human_auth_failed|VAC-AUTH|Security token|jwt|expired|signature|audience|issuer|admin-context|role-mapping-candidates|/dealers)', re.I)
+          matches=[x for x in lines if rx.search(x)]
+          text='UC02 AUTH FAILURE DETAIL\n'+'\n'.join(matches[-300:])+'\n'
+          Path('docs/runtime/uc02-auth-reason.txt').write_text(text)
+          print(text)
+          PY
+      - name: Record
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/runtime/uc02-auth-reason.txt
+          git commit -m 'docs(diag): record UC02 auth failure reason' || exit 0
+          git push origin HEAD:diagnose/uc02-old-project-step-errors
