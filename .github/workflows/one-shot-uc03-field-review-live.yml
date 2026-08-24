@@ -48,6 +48,26 @@ jobs:
           python -m pip install 'psycopg[binary]>=3.2,<4' 'PyJWT>=2.8,<3' 'cryptography>=42,<46' 'httpx>=0.27,<1' 'Pillow>=10,<13'
           npm install --global @railway/cli
 
+      - name: Align harness with current Audit DEV schema
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('tests/e2e/uc03_field_review_live.py')
+          text = p.read_text()
+          text = text.replace('    assignment_id = uuid_value("business-assignment")\n', '')
+          text = text.replace(
+              'tenant_id,business_assignment_id,security_actor_id,business_role_code,dealer_id,outlet_id',
+              'tenant_id,security_actor_id,business_role_code,dealer_id,outlet_id',
+          )
+          text = text.replace("VALUES (%s,%s,%s,'PC',%s,%s)", "VALUES (%s,%s,'PC',%s,%s)")
+          text = text.replace(
+              '(TENANT_ID, assignment_id, SUPERADMIN_ID, dealer_id, outlet_id)',
+              '(TENANT_ID, SUPERADMIN_ID, dealer_id, outlet_id)',
+          )
+          p.write_text(text)
+          PY
+
       - name: Read deployed DEV configuration
         shell: bash
         run: |
@@ -69,7 +89,6 @@ jobs:
           set -e
           echo "$code" > /tmp/uc03-e2e-exit
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
-          # Persist evidence even when the live test finds a product/runtime defect.
           exit 0
 
       - name: Record live DEV evidence on isolated branch
@@ -81,6 +100,7 @@ jobs:
             mkdir -p docs/runtime
             printf '# UC03 Field Review Live DEV E2E\n\n- outcome: HARNESS_FAILURE\n' > docs/runtime/uc03-field-review-live-e2e.txt
           }
+          git restore tests/e2e/uc03_field_review_live.py
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add docs/runtime/uc03-field-review-live-e2e.txt
