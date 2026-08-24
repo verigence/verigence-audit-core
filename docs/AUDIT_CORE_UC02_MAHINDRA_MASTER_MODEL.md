@@ -54,16 +54,28 @@ A Project may select one, two or all three Mahindra segments. Segment selection 
 
 The UC02 Masters step is intentionally simple.
 
-For each Segment selected on the Project, the Web UI exposes segment-scoped upload options for:
+For **each Segment selected on the Project**, the Web UI exposes exactly one:
 
-1. **Product Master** — vehicle identity/configuration for that Segment.
-2. **Price Master** — effective-dated dynamic commercial price lines for the Segment.
+1. **Vehicle & Price Master upload** — one effective-dated workbook that contains the Segment's vehicle identity/configuration and dynamic commercial price lines. On confirmation Audit Core normalizes the same upload into the segment-scoped Product Master version and its Price List version; the two sources of truth remain separate internally even though the user uploads once.
 
 In addition, the Project exposes one Project-level:
 
-3. **Discount & Policy Master** — effective-dated parameters used by the audit/rule engine.
+2. **Discount & Policy Master upload** — effective-dated parameters used by the audit/rule engine, including Booking Protection, Minimum Booking Amount, agreed buffer, Insurance OD %, commercial controls and Trade-in policy values.
 
-The UI must not create Product/Price upload cards for Segments that were not selected on the Project.
+The UI must not create Vehicle & Price upload cards for Segments that were not selected on the Project.
+
+Both upload paths retain the controlled lifecycle:
+
+```text
+Download template
+ -> upload workbook + WEF
+ -> stage/parse
+ -> validate
+ -> preview errors
+ -> explicit confirm
+ -> create DRAFT master version(s)
+ -> explicit publish
+```
 
 ## 5. Price Master — dynamic line items
 
@@ -79,9 +91,11 @@ Price List Version
       -> metadata
 ```
 
+The Mahindra Segment workbook uses a long-form dynamic price contract: vehicle/configuration identity is repeated for each price component while `component_key`, optional `component_label` and `standard_amount` carry the OEM-defined line. This avoids adding columns or code whenever an OEM introduces a new commercial component.
+
 Mahindra examples such as Ex-showroom, TCS, Insurance 30%, Insurance 50%, Extended Warranty, Accessories Kit, RSA, Fastag, Registration and On-road totals are data supplied by the effective master, not mandatory schema columns.
 
-New OEM price components must therefore be loadable without a Web/API/database schema release. Validation may normalize duplicate labels/codes, but the commercial component catalogue must remain master-driven.
+New OEM price components must therefore be loadable without a Web/API/database schema release. Validation normalizes the supplied component key for stable comparison but does not maintain a hard-coded allow-list of commercial components.
 
 ## 6. Discount & Policy Master
 
