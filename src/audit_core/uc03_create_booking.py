@@ -22,22 +22,10 @@ from audit_core.uc03_booking_commands import _append_workflow_event, _authorize_
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/uc03", tags=["uc03-create-booking"])
 
 
-class CreateBookingOutlet(BaseModel):
-    outletId: UUID
-    outletName: str
-    outletClassification: str
-    dealerId: UUID
-    dealerName: str
-
-
-class CreateBookingContext(BaseModel):
-    outlets: list[CreateBookingOutlet]
-
-
 class CreateBookingCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    outletId: UUID | None = None
+    outletId: UUID
 
 
 class CreateBookingResponse(BaseModel):
@@ -49,62 +37,78 @@ class CreateBookingResponse(BaseModel):
     aggregateVersion: int
 
 
-def _authorize_pc(
+def _selected_pc_outlet(
     connection: Connection,
     *,
     tenant_id: str,
     actor_id: str,
-) -> list[dict]:
-    rows = list(
-        connection.execute(
-            text(
-                """
-                SELECT DISTINCT
-                    o.outlet_id,
-                    o.outlet_name,
-                    o.outlet_classification,
-                    d.dealer_id,
-                    d.dealer_name
-                FROM auditcore.dealer_outlets o
-                JOIN auditcore.dealers d
-                  ON d.tenant_id=o.tenant_id AND d.dealer_id=o.dealer_id
-                WHERE o.tenant_id=:tenant_id
-                  AND o.status='ACTIVE'
-                  AND d.status='ACTIVE'
-                  AND EXISTS (
-                      SELECT 1
-                      FROM auditcore.business_assignments ba
-                      WHERE ba.tenant_id=o.tenant_id
-                        AND ba.security_actor_id=:actor_id
-                        AND ba.business_role_code='PC'
-                        AND ba.assignment_status='ACTIVE'
-                        AND ba.effective_from <= now()
-                        AND (ba.effective_to IS NULL OR ba.effective_to >= now())
-                        AND (ba.dealer_id IS NULL OR ba.dealer_id=o.dealer_id)
-                        AND (ba.outlet_id IS NULL OR ba.outlet_id=o.outlet_id)
-                  )
-                ORDER BY lower(d.dealer_name), lower(o.outlet_name), o.outlet_id
-                """
-            ),
-            {"tenant_id": tenant_id, "actor_id": actor_id},
-        ).mappings()
-    )
-    if not rows:
+    outlet_id: UUID,
+) -> dict:
+    """Validate only the already-selected working Outlet for this PC.
+
+    Outlet discovery happens in /v1/me/projects before the dashboard is opened. The
+    create command receives that selected Outlet and performs only a narrow write-time
+    authorization guard so a forged browser request cannot escape the PC's assignment.
+    """
+
+    row = connection.execute(
+        text(
+            """
+            SELECT
+                o.outlet_id,
+                o.outlet_name,
+                o.outlet_classification,
+                d.dealer_id,
+                d.dealer_name
+            FROM auditcore.dealer_outlets o
+            JOIN auditcore.dealers d
+              ON d.tenant_id = o.tenant_id
+             AND d.dealer_id = o.dealer_id
+            WHERE o.tenant_id = :tenant_id
+              AND o.outlet_id = :outlet_id
+              AND o.status = 'ACTIVE'
+              AND d.status = 'ACTIVE'
+              AND EXISTS (
+                  SELECT 1
+                  FROM auditcore.business_assignments ba
+                  WHERE ba.tenant_id = o.tenant_id
+                    AND ba.security_actor_id = :actor_id
+                    AND ba.business_role_code = 'PC'
+                    AND ba.assignment_status = 'ACTIVE'
+                    AND ba.effective_from <= now()
+                    AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+                    AND ba.dealer_id = o.dealer_id
+                    AND ba.outlet_id = o.outlet_id
+              )
+            LIMIT 1
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "actor_id": actor_id,
+            "outlet_id": outlet_id,
+        },
+    ).mappings().one_or_none()
+    if row is None:
         raise AuthorizationError(
             error_code="VAC-AUTH-002",
             status_code=403,
             title="Permission denied",
         )
-    return [dict(row) for row in rows]
+    return dict(row)
 
 
-def _effective_project_versions(connection: Connection, *, tenant_id: str) -> dict[str, UUID | None]:
+def _effective_project_versions(
+    connection: Connection,
+    *,
+    tenant_id: str,
+) -> dict[str, UUID | None]:
     project = connection.execute(
         text(
             """
             SELECT timezone_name
             FROM auditcore.projects
-            WHERE tenant_id=:tenant_id AND project_status='ACTIVE'
+            WHERE tenant_id = :tenant_id AND project_status = 'ACTIVE'
             """
         ),
         {"tenant_id": tenant_id},
@@ -127,8 +131,8 @@ def _effective_project_versions(connection: Connection, *, tenant_id: str) -> di
             """
             SELECT document_requirement_profile_version_id
             FROM auditcore.document_requirement_profile_versions
-            WHERE tenant_id=:tenant_id
-              AND lifecycle_status='PUBLISHED'
+            WHERE tenant_id = :tenant_id
+              AND lifecycle_status = 'PUBLISHED'
               AND effective_from <= :business_date
             ORDER BY effective_from DESC, version_no DESC,
                      document_requirement_profile_version_id DESC
@@ -143,8 +147,8 @@ def _effective_project_versions(connection: Connection, *, tenant_id: str) -> di
             """
             SELECT policy_version_id
             FROM auditcore.project_policy_versions
-            WHERE tenant_id=:tenant_id
-              AND lifecycle_status='PUBLISHED'
+            WHERE tenant_id = :tenant_id
+              AND lifecycle_status = 'PUBLISHED'
               AND effective_from <= :business_date
             ORDER BY effective_from DESC, version_no DESC, policy_version_id DESC
             LIMIT 1
@@ -158,8 +162,8 @@ def _effective_project_versions(connection: Connection, *, tenant_id: str) -> di
             """
             SELECT price_list_version_id
             FROM auditcore.price_list_versions
-            WHERE tenant_id=:tenant_id
-              AND lifecycle_status='PUBLISHED'
+            WHERE tenant_id = :tenant_id
+              AND lifecycle_status = 'PUBLISHED'
               AND effective_from <= :business_date
               AND (effective_to IS NULL OR effective_to >= :business_date)
             ORDER BY effective_from DESC, version_no DESC, price_list_version_id DESC
@@ -176,53 +180,25 @@ def _effective_project_versions(connection: Connection, *, tenant_id: str) -> di
     }
 
 
-def _scope(
+def _authorize_create_booking(
     connection: Connection,
     *,
     tenant_id: str,
+    outlet_id: UUID,
     human_principal: HumanPrincipal,
     authorization_client: SecurityAuthorizationClient,
-) -> list[dict]:
+) -> dict:
     _authorize_security(
         authorization_client,
         human_principal=human_principal,
         tenant_id=tenant_id,
     )
     set_tenant_context(connection, tenant_id)
-    return _authorize_pc(
+    return _selected_pc_outlet(
         connection,
         tenant_id=tenant_id,
         actor_id=human_principal.subject,
-    )
-
-
-@router.get("/create-booking-context", response_model=CreateBookingContext)
-def get_create_booking_context(
-    tenant_id: str,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> CreateBookingContext:
-    outlets = _scope(
-        connection,
-        tenant_id=tenant_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    return CreateBookingContext(
-        outlets=[
-            CreateBookingOutlet(
-                outletId=row["outlet_id"],
-                outletName=row["outlet_name"],
-                outletClassification=row["outlet_classification"],
-                dealerId=row["dealer_id"],
-                dealerName=row["dealer_name"],
-            )
-            for row in outlets
-        ]
+        outlet_id=outlet_id,
     )
 
 
@@ -245,34 +221,13 @@ def create_booking(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> CreateBookingResponse:
-    outlets = _scope(
+    selected = _authorize_create_booking(
         connection,
         tenant_id=tenant_id,
+        outlet_id=payload.outletId,
         human_principal=human_principal,
         authorization_client=authorization_client,
     )
-
-    if payload.outletId is None:
-        if len(outlets) != 1:
-            raise AuditCoreError(
-                error_code="VAC-VAL-002",
-                status_code=422,
-                title="Outlet selection required",
-                detail="Select one of your authorized outlets before creating the Booking.",
-            )
-        selected = outlets[0]
-    else:
-        selected = next(
-            (row for row in outlets if row["outlet_id"] == payload.outletId),
-            None,
-        )
-        if selected is None:
-            raise AuthorizationError(
-                error_code="VAC-AUTH-002",
-                status_code=403,
-                title="Permission denied",
-            )
-
     versions = _effective_project_versions(connection, tenant_id=tenant_id)
 
     def execute() -> dict:
