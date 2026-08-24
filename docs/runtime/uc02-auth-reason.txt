@@ -1,0 +1,15 @@
+UC02 AUTH FAILURE DETAIL
+INFO:     100.64.0.7:29172 - "GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/dealers HTTP/1.1" 200 OK
+INFO:     100.64.0.8:23848 - "GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/dealers/dee5630c-9caa-4323-a893-01d6c8179696/outlets HTTP/1.1" 200 OK
+2026-08-24T07:19:16.150364Z [warning  ] human_auth_failed              correlation_id=538c3113-679a-4f14-9385-97e02ea57917 reason='Invalid Security token'
+2026-08-24T07:19:16.150746Z [warning  ] api_error                      correlation_id=538c3113-679a-4f14-9385-97e02ea57917 error_code=VAC-AUTH-001 status_code=401 tenant_id=5fbe26ab-6ed7-444a-8488-5bfb81208588
+2026-08-24T07:19:16.152064Z [warning  ] http_request_failed            correlation_id=538c3113-679a-4f14-9385-97e02ea57917 duration_ms=2.73 method=GET path=/v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/role-mapping-candidates status_code=401 tenant_id=5fbe26ab-6ed7-444a-8488-5bfb81208588
+INFO:     100.64.0.7:29172 - "GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/role-mapping-candidates?limit=100 HTTP/1.1" 401 Unauthorized
+2026-08-24T07:19:20.893248Z [warning  ] human_auth_failed              correlation_id=cf81b2a4-1165-4796-be58-6198dbf560f7 reason='Invalid Security token'
+2026-08-24T07:19:20.893585Z [warning  ] api_error                      correlation_id=cf81b2a4-1165-4796-be58-6198dbf560f7 error_code=VAC-AUTH-001 status_code=401 tenant_id=5fbe26ab-6ed7-444a-8488-5bfb81208588
+2026-08-24T07:19:20.895103Z [warning  ] http_request_failed            correlation_id=cf81b2a4-1165-4796-be58-6198dbf560f7 duration_ms=2.29 method=GET path=/v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/role-mapping-candidates status_code=401 tenant_id=5fbe26ab-6ed7-444a-8488-5bfb81208588
+INFO:     100.64.0.9:44674 - "GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/role-mapping-candidates?limit=100 HTTP/1.1" 401 Unauthorized
+2026-08-24T07:19:22.742569Z [warning  ] human_auth_failed              correlation_id=a0a2a15a-f83f-4eeb-8549-be32d19086f4 reason='Invalid Security token'
+2026-08-24T07:19:22.742833Z [warning  ] api_error                      correlation_id=a0a2a15a-f83f-4eeb-8549-be32d19086f4 error_code=VAC-AUTH-001 status_code=401 tenant_id=5fbe26ab-6ed7-444a-8488-5bfb81208588
+2026-08-24T07:19:22.743905Z [warning  ] http_request_failed            correlation_id=a0a2a15a-f83f-4eeb-8549-be32d19086f4 duration_ms=2.06 method=GET path=/v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/dealers status_code=401 tenant_id=5fbe26ab-6ed7-444a-8488-5bfb81208588
+INFO:     100.64.0.8:23862 - "GET /v1/tenants/5fbe26ab-6ed7-444a-8488-5bfb81208588/dealers HTTP/1.1" 401 Unauthorized
