@@ -77,6 +77,7 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip >/dev/null
           python -m pip install -e '.[test,lint]' >/dev/null
+          ruff check --fix src/audit_core/project_master_admin.py
           ruff check src tests migrations
           pytest -q
       - name: Commit source changes
@@ -85,7 +86,7 @@ jobs:
           set -euo pipefail
           git config user.name 'Verigence-admin'
           git config user.email 'admin@verigence.local'
-          git add src/audit_core/dependencies.py src/audit_core/projects.py src/audit_core/dealers.py src/audit_core/role_mappings.py src/audit_core/mahindra_masters.py src/audit_core/mahindra_upload_state.py src/audit_core/project_masters.py src/audit_core/project_master_imports.py src/audit_core/readiness.py src/audit_core/main.py
+          git add src/audit_core/dependencies.py src/audit_core/projects.py src/audit_core/dealers.py src/audit_core/role_mappings.py src/audit_core/mahindra_masters.py src/audit_core/mahindra_upload_state.py src/audit_core/project_masters.py src/audit_core/project_master_imports.py src/audit_core/project_master_admin.py src/audit_core/readiness.py src/audit_core/main.py
           if git diff --cached --quiet; then
             echo 'No source changes required'
             exit 0
