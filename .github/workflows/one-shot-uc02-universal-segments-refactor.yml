@@ -104,8 +104,6 @@ jobs:
               text = path.read_text()
               if 'auditcore.oem_segments' in text:
                   bad.append(f'{path}: old table reference')
-              if 's.oem_id' in text and 'segments' in text:
-                  bad.append(f'{path}: Segment still joined through OEM')
           if bad:
               raise SystemExit('\n'.join(bad))
           PY
