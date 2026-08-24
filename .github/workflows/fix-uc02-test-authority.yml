@@ -1,9 +1,9 @@
 name: Fix UC02 Test Authority Fixtures
 
 on:
-  push:
+  pull_request:
     branches:
-      - refactor/uc02-project-admin-workspace
+      - dev
 
 permissions:
   contents: write
@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   fix:
-    if: ${{ !contains(github.event.head_commit.message, '[uc02-test-authority-fixed]') }}
+    if: ${{ github.head_ref == 'refactor/uc02-project-admin-workspace' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
@@ -57,8 +57,6 @@ jobs:
           ]
           for path in files:
               text = path.read_text()
-              if 'require_super_admin_request' not in text:
-                  continue
               path.write_text(text.replace('require_super_admin_request', 'require_project_admin_request'))
           PY
       - name: Validate full Audit Core suite
