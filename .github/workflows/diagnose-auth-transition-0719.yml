@@ -1,0 +1,95 @@
+name: Diagnose 07:19 auth transition
+
+on:
+  push:
+    branches: [diagnose/uc02-old-project-step-errors]
+    paths: ['.github/workflows/diagnose-auth-transition-0719.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: diagnose/uc02-old-project-step-errors
+          fetch-depth: 0
+      - run: npm install --global @railway/cli
+      - name: Capture exact transition evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/authdiag docs/runtime
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service verigence-audit-core --json >/tmp/authdiag/link.json
+          railway logs --service verigence-audit-core --environment dev --since 3h --lines 5000 > /tmp/authdiag/audit.log || true
+          railway logs --service security --environment dev --since 3h --lines 5000 > /tmp/authdiag/security.log || true
+          railway variables --service security --environment dev --json > /tmp/authdiag/security-vars.json || echo '{}' >/tmp/authdiag/security-vars.json
+          railway variables --service verigence-audit-core --environment dev --json > /tmp/authdiag/audit-vars.json || echo '{}' >/tmp/authdiag/audit-vars.json
+
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib, json, re
+
+          def vars_(path):
+              try:
+                  x=json.loads(Path(path).read_text())
+                  return x if isinstance(x,dict) else {}
+              except Exception:
+                  return {}
+
+          sec=vars_('/tmp/authdiag/security-vars.json')
+          aud=vars_('/tmp/authdiag/audit-vars.json')
+          def safe(name, value):
+              if value is None: return '<unset>'
+              value=str(value)
+              if 'KEY' in name and name not in {'SECURITY_KEY_ID'}:
+                  return 'sha256:'+hashlib.sha256(value.encode()).hexdigest()[:16]
+              return value
+
+          out=[]
+          out.append('UC02 AUTH TRANSITION 07:19 DIAGNOSIS')
+          out.append('')
+          out.append('SAFE SECURITY CONFIG')
+          for k in ['PLATFORM_ADMIN_TOKEN_TTL_MINUTES','SECURITY_KEY_ID','SECURITY_TOKEN_ISSUER','SECURITY_TOKEN_AUDIENCE']:
+              out.append(f'{k}={safe(k,sec.get(k))}')
+          if sec.get('SECURITY_PUBLIC_KEY_PEM'):
+              out.append('SECURITY_PUBLIC_KEY_PEM='+safe('SECURITY_PUBLIC_KEY_PEM',sec.get('SECURITY_PUBLIC_KEY_PEM')))
+          out.append('')
+          out.append('SAFE AUDIT CONFIG')
+          for k in ['SECURITY_JWKS_URL','SECURITY_TOKEN_ISSUER','SECURITY_TOKEN_AUDIENCE']:
+              out.append(f'{k}={safe(k,aud.get(k))}')
+          out.append('')
+
+          for label,path in [('SECURITY','/tmp/authdiag/security.log'),('AUDIT','/tmp/authdiag/audit.log')]:
+              lines=Path(path).read_text(errors='replace').splitlines() if Path(path).exists() else []
+              out.append(f'===== {label}: exact 07:17-07:21 window =====')
+              for line in lines:
+                  if re.search(r'2026-08-24T07:(17|18|19|20|21):', line):
+                      out.append(line)
+              out.append('')
+              out.append(f'===== {label}: auth/JWKS/startup/deploy lines in 3h =====')
+              rx=re.compile(r'(auth/login|auth/refresh|jwks|invalid security token|human_auth_failed|starting|started|container|deploy|shutdown|signing|kid|token|uvicorn|application startup)',re.I)
+              for line in lines:
+                  if rx.search(line):
+                      out.append(line)
+              out.append('')
+
+          text='\n'.join(out)+'\n'
+          Path('docs/runtime/uc02-auth-transition-0719.txt').write_text(text)
+          print(text[-40000:])
+          PY
+      - name: Record evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add docs/runtime/uc02-auth-transition-0719.txt
+          git commit -m 'docs(diag): record 07:19 auth transition evidence' || exit 0
+          git push origin HEAD:diagnose/uc02-old-project-step-errors
