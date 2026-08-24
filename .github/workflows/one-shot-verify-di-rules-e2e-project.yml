@@ -1,0 +1,99 @@
+name: One-shot verify persistent DI Rules E2E project
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/one-shot-verify-di-rules-e2e-project.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      E2E_PROJECT_NAME: DEV-DI-RULE-E2E-20260824
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: |
+          python -m pip install 'psycopg[binary]>=3.2,<4' 'httpx>=0.27,<1'
+          npm install --global @railway/cli
+      - name: Collect DEV variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service verigence-audit-core --json >/dev/null
+          railway variable list --service verigence-audit-core --environment dev --json >/tmp/audit.json
+          railway variable list --service di-api --environment dev --json >/tmp/di.json
+      - name: Verify Project and DI provisioning
+        shell: bash
+        run: |
+          set +e
+          python - <<'PY' 2>/tmp/verify.err
+          import json, os
+          from pathlib import Path
+          import httpx, psycopg
+
+          def load(path): return json.loads(Path(path).read_text())
+          def pg(v): return str(v or '').replace('postgresql+psycopg://','postgresql://',1).replace('postgresql+asyncpg://','postgresql://',1)
+          def base(v):
+              d=str(v.get('RAILWAY_PUBLIC_DOMAIN') or v.get('RAILWAY_STATIC_URL') or '').strip()
+              if not d.startswith(('http://','https://')): d='https://'+d
+              return d.rstrip('/')
+
+          av,dv=load('/tmp/audit.json'),load('/tmp/di.json')
+          adb=pg(av.get('DATABASE_URL'))
+          ddb=pg(dv.get('DI_DATABASE_URL') or dv.get('DATABASE_URL'))
+          project_name=os.environ['E2E_PROJECT_NAME']
+          with psycopg.connect(adb) as conn:
+              with conn.cursor() as cur:
+                  cur.execute("SELECT tenant_id::text,project_code,project_status FROM auditcore.projects WHERE project_name=%s ORDER BY created_at_utc DESC LIMIT 1",(project_name,))
+                  row=cur.fetchone()
+                  if not row: raise RuntimeError('Persistent E2E Project not found in Audit Core')
+                  tenant_id,project_code,project_status=row
+          with psycopg.connect(ddb) as conn:
+              with conn.cursor() as cur:
+                  cur.execute("SELECT count(*) FROM docintel.tenant_settings WHERE tenant_id=%s",(tenant_id,)); settings=cur.fetchone()[0]
+                  cur.execute("SELECT count(*) FROM docintel.tenant_document_types WHERE tenant_id=%s",(tenant_id,)); doctypes=cur.fetchone()[0]
+                  cur.execute("SELECT count(*) FROM docintel.retention_policies WHERE tenant_id=%s",(tenant_id,)); policies=cur.fetchone()[0]
+          with httpx.Client(timeout=20,follow_redirects=True) as client:
+              health=client.get(base(dv)+'/health/ready')
+          if health.status_code != 200: raise RuntimeError(f'DI health HTTP {health.status_code}')
+          if settings < 1 or doctypes < 1 or policies < 1: raise RuntimeError(f'DI provisioning incomplete settings={settings} doctypes={doctypes} policies={policies}')
+          lines=[
+              'DI_RULE_E2E_PROJECT','ENVIRONMENT=DEV',f'PROJECT_NAME={project_name}',f'TENANT_ID={tenant_id}',
+              f'PROJECT_CODE={project_code}',f'PROJECT_STATUS={project_status}','PERSISTENT=true',
+              f'DI_HEALTH_HTTP={health.status_code}',f'DI_TENANT_SETTINGS={settings}',f'DI_DOCUMENT_TYPES={doctypes}',f'DI_RETENTION_POLICIES={policies}',
+              'DEDICATED_TEST_USER=NOT_REQUIRED','DI_TEST_ACTOR=e2e-di-rules',f'DI_TEST_TOKEN_FORMAT=mock.{tenant_id}.e2e-di-rules.TENANT_ADMIN',
+              'RESULT=PASS'
+          ]
+          Path('docs/runtime/di-rule-e2e-project.txt').write_text('\n'.join(lines)+'\n')
+          print('\n'.join(lines))
+          PY
+          rc=$?
+          if (( rc != 0 )); then
+            msg="$(tail -n 1 /tmp/verify.err | tr '\n' ' ' | cut -c1-700)"
+            printf 'DI_RULE_E2E_PROJECT\nENVIRONMENT=DEV\nPROJECT_NAME=%s\nRESULT=FAIL\nFAILURE=%s\n' "$E2E_PROJECT_NAME" "$msg" > docs/runtime/di-rule-e2e-project.txt
+            exit "$rc"
+          fi
+      - name: Record evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/runtime/di-rule-e2e-project.txt
+          git commit -m 'docs(dev): verify DI rules E2E project [skip ci]' || exit 0
+          git pull --rebase origin dev
+          git push origin HEAD:dev
