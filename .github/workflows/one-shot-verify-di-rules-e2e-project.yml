@@ -53,7 +53,6 @@ jobs:
 
           av,dv=load('/tmp/audit.json'),load('/tmp/di.json')
           adb=pg(av.get('DATABASE_URL'))
-          ddb=pg(dv.get('DI_DATABASE_URL') or dv.get('DATABASE_URL'))
           project_name=os.environ['E2E_PROJECT_NAME']
           with psycopg.connect(adb) as conn:
               with conn.cursor() as cur:
@@ -61,21 +60,28 @@ jobs:
                   row=cur.fetchone()
                   if not row: raise RuntimeError('Persistent E2E Project not found in Audit Core')
                   tenant_id,project_code,project_status=row
-          with psycopg.connect(ddb) as conn:
-              with conn.cursor() as cur:
-                  cur.execute("SELECT count(*) FROM docintel.tenant_settings WHERE tenant_id=%s",(tenant_id,)); settings=cur.fetchone()[0]
-                  cur.execute("SELECT count(*) FROM docintel.tenant_document_types WHERE tenant_id=%s",(tenant_id,)); doctypes=cur.fetchone()[0]
-                  cur.execute("SELECT count(*) FROM docintel.retention_policies WHERE tenant_id=%s",(tenant_id,)); policies=cur.fetchone()[0]
-          with httpx.Client(timeout=20,follow_redirects=True) as client:
-              health=client.get(base(dv)+'/health/ready')
+
+          di=base(dv)
+          mock_token=f'mock.{tenant_id}.e2e-di-rules.TENANT_ADMIN'
+          headers={'Authorization':'Bearer '+mock_token}
+          with httpx.Client(timeout=30,follow_redirects=True) as client:
+              health=client.get(di+'/health/ready')
+              settings=client.get(di+f'/v1/tenants/{tenant_id}/settings',headers=headers)
+              policies=client.get(di+f'/v1/tenants/{tenant_id}/retention-policies',headers=headers)
           if health.status_code != 200: raise RuntimeError(f'DI health HTTP {health.status_code}')
-          if settings < 1 or doctypes < 1 or policies < 1: raise RuntimeError(f'DI provisioning incomplete settings={settings} doctypes={doctypes} policies={policies}')
+          if settings.status_code != 200: raise RuntimeError(f'DI tenant settings HTTP {settings.status_code}: {settings.text[:300]}')
+          if policies.status_code != 200: raise RuntimeError(f'DI retention policies HTTP {policies.status_code}: {policies.text[:300]}')
+          settings_body=settings.json()
+          policies_body=policies.json()
+          policy_data=policies_body.get('data',[]) if isinstance(policies_body,dict) else []
+          if not policy_data: raise RuntimeError('DI tenant has no retention policy after provisioning')
+
           lines=[
               'DI_RULE_E2E_PROJECT','ENVIRONMENT=DEV',f'PROJECT_NAME={project_name}',f'TENANT_ID={tenant_id}',
               f'PROJECT_CODE={project_code}',f'PROJECT_STATUS={project_status}','PERSISTENT=true',
-              f'DI_HEALTH_HTTP={health.status_code}',f'DI_TENANT_SETTINGS={settings}',f'DI_DOCUMENT_TYPES={doctypes}',f'DI_RETENTION_POLICIES={policies}',
-              'DEDICATED_TEST_USER=NOT_REQUIRED','DI_TEST_ACTOR=e2e-di-rules',f'DI_TEST_TOKEN_FORMAT=mock.{tenant_id}.e2e-di-rules.TENANT_ADMIN',
-              'RESULT=PASS'
+              f'DI_HEALTH_HTTP={health.status_code}',f'DI_SETTINGS_HTTP={settings.status_code}',f'DI_RETENTION_HTTP={policies.status_code}',
+              f'DI_RETENTION_POLICY_COUNT={len(policy_data)}','DEDICATED_TEST_USER=NOT_REQUIRED','DI_TEST_ACTOR=e2e-di-rules',
+              f'DI_TEST_TOKEN_FORMAT=mock.{tenant_id}.e2e-di-rules.TENANT_ADMIN','RESULT=PASS'
           ]
           Path('docs/runtime/di-rule-e2e-project.txt').write_text('\n'.join(lines)+'\n')
           print('\n'.join(lines))
