@@ -1,0 +1,86 @@
+name: Fix UC02 Test Authority Fixtures
+
+on:
+  push:
+    branches:
+      - refactor/uc02-project-admin-workspace
+
+permissions:
+  contents: write
+
+concurrency:
+  group: uc02-test-authority-fix
+  cancel-in-progress: true
+
+jobs:
+  fix:
+    if: ${{ !contains(github.event.head_commit.message, '[uc02-test-authority-fixed]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: auditcore_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d auditcore_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/auditcore_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refactor/uc02-project-admin-workspace
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Update UC02 integration test dependency overrides
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          files = [
+              Path('tests/test_dealers.py'),
+              Path('tests/test_projects.py'),
+              Path('tests/test_uc02_project_master_imports.py'),
+              Path('tests/test_uc02_readiness.py'),
+              Path('tests/test_uc02_role_mappings.py'),
+          ]
+          for path in files:
+              text = path.read_text()
+              if 'require_super_admin_request' not in text:
+                  continue
+              path.write_text(text.replace('require_super_admin_request', 'require_project_admin_request'))
+          PY
+      - name: Validate full Audit Core suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip >/dev/null
+          python -m pip install -e '.[test,lint]' >/dev/null
+          ruff check tests/test_dealers.py tests/test_projects.py tests/test_uc02_project_master_imports.py tests/test_uc02_readiness.py tests/test_uc02_role_mappings.py
+          alembic upgrade head
+          pytest -q
+      - name: Commit validated test fixture changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Verigence-admin'
+          git config user.email 'admin@verigence.local'
+          git add tests/test_dealers.py tests/test_projects.py tests/test_uc02_project_master_imports.py tests/test_uc02_readiness.py tests/test_uc02_role_mappings.py
+          if git diff --cached --quiet; then
+            echo 'No test fixture changes required'
+            exit 0
+          fi
+          git commit -m 'test(uc02): align integration fixtures with project admin authority [uc02-test-authority-fixed]'
+          git pull --rebase origin refactor/uc02-project-admin-workspace
+          git push origin HEAD:refactor/uc02-project-admin-workspace
