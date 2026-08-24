@@ -79,7 +79,7 @@ def _extract_wef(workbook) -> str | None:
                         return date(year, month, day).isoformat()
                     except ValueError:
                         pass
-                match = re.search(text_pattern, text, re.I)
+                match = re.search(text_pattern, text, re.IGNORECASE)
                 if match:
                     day = int(match.group(1))
                     month = months.get(match.group(2).lower())
@@ -119,7 +119,7 @@ def _header_label(sheet, col: int) -> str:
     label = leaf or top
     if not label:
         return ""
-    if re.fullmatch(r"\([A-Z ]+\)(?:=.*)?", label, re.I):
+    if re.fullmatch(r"\([A-Z ]+\)(?:=.*)?", label, re.IGNORECASE):
         label = top
     return label
 
@@ -330,7 +330,7 @@ def parse_native_segment_workbook(content: bytes, segment_code: str | None = Non
 
 
 def _policy_number(text: str, pattern: str) -> Decimal | None:
-    match = re.search(pattern, text, re.I)
+    match = re.search(pattern, text, re.IGNORECASE)
     if not match:
         return None
     try:
@@ -395,7 +395,7 @@ def parse_native_discount_policy_workbook(content: bytes, segment_code: str | No
                 row_no_out += 1
         buffer_text = _clean(buffer)
         if buffer_text:
-            amount = Decimal("0") if buffer_text.upper() == "NIL" else _number(buffer)
+            amount = Decimal(0) if buffer_text.upper() == "NIL" else _number(buffer)
             if amount is not None:
                 rows.append(
                     (
