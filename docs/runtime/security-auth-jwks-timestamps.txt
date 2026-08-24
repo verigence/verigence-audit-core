@@ -1,0 +1,25 @@
+SECURITY AUTH/JWKS TIMESTAMPS
+2026-08-24T04:07:24.349558664Z INFO:     100.64.0.10:19978 - "GET /.well-known/jwks.json HTTP/1.1" 200 OK
+2026-08-24T04:56:51.339295952Z INFO:     100.64.0.11:14604 - "POST /security/v1/auth/login HTTP/1.1" 200 OK
+2026-08-24T04:58:55.369657894Z INFO:     100.64.0.12:12694 - "GET /.well-known/jwks.json HTTP/1.1" 200 OK
+2026-08-24T04:58:55.369670097Z INFO:     100.64.0.7:11018 - "GET /.well-known/jwks.json HTTP/1.1" 200 OK
+2026-08-24T05:03:56.187712162Z INFO:     100.64.0.7:37664 - "POST /security/v1/auth/login HTTP/1.1" 422 Unprocessable Entity
+2026-08-24T05:05:03.910349114Z INFO:     100.64.0.7:49498 - "POST /security/v1/auth/login HTTP/1.1" 422 Unprocessable Entity
+2026-08-24T05:10:02.747273118Z INFO:     100.64.0.13:20490 - "POST /security/v1/auth/login HTTP/1.1" 422 Unprocessable Entity
+2026-08-24T05:13:13.198067441Z INFO:     100.64.0.7:28566 - "POST /security/v1/auth/login HTTP/1.1" 422 Unprocessable Entity
+2026-08-24T05:15:33.532948115Z INFO:     100.64.0.11:11446 - "POST /security/v1/auth/login HTTP/1.1" 422 Unprocessable Entity
+2026-08-24T05:30:35.744031995Z INFO:     100.64.0.2:20846 - "POST /security/v1/auth/login HTTP/1.1" 422 Unprocessable Entity
+2026-08-24T05:37:49.378079338Z INFO:     100.64.0.6:23528 - "POST /security/v1/auth/login HTTP/1.1" 200 OK
+2026-08-24T06:10:02.377687897Z INFO:     100.64.0.7:51040 - "POST /security/v1/auth/login HTTP/1.1" 422 Unprocessable Entity
+2026-08-24T06:12:32.125131212Z INFO:     100.64.0.4:37638 - "POST /security/v1/auth/login HTTP/1.1" 422 Unprocessable Entity
+2026-08-24T06:18:30.947192840Z INFO:     100.64.0.12:61088 - "POST /security/v1/auth/login HTTP/1.1" 200 OK
+2026-08-24T06:18:30.947205141Z INFO:     100.64.0.13:31136 - "GET /.well-known/jwks.json HTTP/1.1" 200 OK
+2026-08-24T06:18:30.947210733Z INFO:     100.64.0.5:57704 - "GET /.well-known/jwks.json HTTP/1.1" 200 OK
+2026-08-24T06:22:42.784892280Z INFO:     100.64.0.10:51904 - "GET /.well-known/jwks.json HTTP/1.1" 200 OK
+2026-08-24T06:34:46.684128098Z INFO:     100.64.0.10:27832 - "POST /security/v1/auth/login HTTP/1.1" 200 OK
+2026-08-24T06:49:58.113795653Z INFO:     100.64.0.12:22236 - "POST /security/v1/auth/login HTTP/1.1" 200 OK
+2026-08-24T06:57:00.417381392Z INFO:     100.64.0.3:50108 - "POST /security/v1/auth/login HTTP/1.1" 422 Unprocessable Entity
+2026-08-24T07:01:38.928321351Z INFO:     100.64.0.13:49264 - "POST /security/v1/auth/login HTTP/1.1" 422 Unprocessable Entity
+2026-08-24T07:04:19.561540482Z INFO:     100.64.0.11:27382 - "POST /security/v1/auth/login HTTP/1.1" 200 OK
+2026-08-24T07:19:04.544772916Z INFO:     100.64.0.2:17952 - "GET /.well-known/jwks.json HTTP/1.1" 200 OK
+2026-08-24T07:19:04.544777795Z INFO:     100.64.0.7:21090 - "GET /.well-known/jwks.json HTTP/1.1" 200 OK
