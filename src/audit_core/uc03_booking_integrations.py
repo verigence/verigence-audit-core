@@ -4,12 +4,12 @@ import json
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from sqlalchemy import Connection, text
 
 from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.di_client import DiClient, DiClientError
-from audit_core.errors import ConflictError, DependencyUnavailableError
+from audit_core.errors import ConflictError, DependencyUnavailableError, NotFoundError
 from audit_core.evidence import get_di_client, get_security_oauth_client
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
@@ -62,6 +62,71 @@ def _active_booking(state: Any) -> bool:
     }
 
 
+def _audit_context_ref(journey_id: UUID, customer_id: object) -> str:
+    """Return the frozen DI Audit storage-context reference used at evidence intake."""
+    if customer_id is None:
+        raise ValueError("UC03 evidence is missing its customer lineage")
+    return f"audit-{journey_id}-{customer_id}"
+
+
+def _proposal_payload(fact: Any) -> dict[str, Any]:
+    """Preserve the machine value and add optional DI source localization."""
+    payload: dict[str, Any] = {"value": fact.value}
+    if fact.page_no is not None or fact.evidence_region is not None:
+        payload["sourceLocalization"] = {
+            "pageNo": fact.page_no,
+            "evidenceRegion": fact.evidence_region,
+        }
+    return payload
+
+
+def _enrich_workspace_localization(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    body: dict[str, Any],
+) -> None:
+    """Expose optional DI source localization without changing proposal persistence."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT capture_proposal_id, proposed_value
+            FROM auditcore.journey_capture_proposals
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND stage_code='BOOKING'
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    localization_by_id: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        proposed = row["proposed_value"]
+        if not isinstance(proposed, dict):
+            continue
+        localization = proposed.get("sourceLocalization")
+        if isinstance(localization, dict):
+            localization_by_id[str(row["capture_proposal_id"])] = localization
+
+    proposals = body.get("proposals")
+    if not isinstance(proposals, list):
+        return
+    for proposal in proposals:
+        if not isinstance(proposal, dict):
+            continue
+        localization = localization_by_id.get(str(proposal.get("proposalId") or ""))
+        if localization is None:
+            proposal["pageNo"] = None
+            proposal["evidenceRegion"] = None
+            continue
+        page_no = localization.get("pageNo")
+        region = localization.get("evidenceRegion")
+        proposal["pageNo"] = (
+            page_no if isinstance(page_no, int) and not isinstance(page_no, bool) else None
+        )
+        proposal["evidenceRegion"] = region if isinstance(region, dict) else None
+
+
 @router.post("/booking/extraction/refresh", response_model=ExtractionRefreshResponse)
 def refresh_booking_extraction_strict(
     tenant_id: str,
@@ -93,7 +158,7 @@ def refresh_booking_extraction_strict(
     evidence_rows = connection.execute(
         text(
             """
-            SELECT e.evidence_id, e.di_subject_id, e.di_document_id,
+            SELECT e.evidence_id, e.customer_id, e.di_subject_id, e.di_document_id,
                    e.document_type_key
             FROM auditcore.evidence e
             LEFT JOIN auditcore.journey_document_requirements jdr
@@ -119,13 +184,18 @@ def refresh_booking_extraction_strict(
         ) from exc
 
     for evidence in evidence_rows:
-        if evidence["di_subject_id"] is None or evidence["di_document_id"] is None:
+        if (
+            evidence["customer_id"] is None
+            or evidence["di_subject_id"] is None
+            or evidence["di_document_id"] is None
+        ):
             continue
+        context_ref = _audit_context_ref(journey_id, evidence["customer_id"])
         try:
-            document = di_client.get_document(
+            document = di_client.get_audit_document(
                 token=token,
                 tenant_id=tenant_id,
-                subject_id=str(evidence["di_subject_id"]),
+                external_context_ref=context_ref,
                 document_id=str(evidence["di_document_id"]),
             )
             processing = (document.processing_status or "PENDING").upper()
@@ -152,10 +222,10 @@ def refresh_booking_extraction_strict(
             if processing not in _TERMINAL_PROCESSING_STATUSES:
                 continue
 
-            facts = di_client.get_document_facts(
+            facts = di_client.get_audit_document_facts(
                 token=token,
                 tenant_id=tenant_id,
-                subject_id=str(evidence["di_subject_id"]),
+                external_context_ref=context_ref,
                 document_id=str(evidence["di_document_id"]),
             )
             document_type = (
@@ -215,7 +285,7 @@ def refresh_booking_extraction_strict(
                         "fact_version": fact.version_no,
                         "document_type": document_type,
                         "value_source": fact.value_source,
-                        "proposed_value": json.dumps({"value": fact.value}, default=str),
+                        "proposed_value": json.dumps(_proposal_payload(fact), default=str),
                         "confidence": fact.confidence_score,
                     },
                 )
@@ -241,6 +311,79 @@ def refresh_booking_extraction_strict(
         failedDocuments=failed,
         aggregateVersion=int(state["version_no"]),
     )
+
+
+@router.get("/evidence/{evidence_id}/review-content")
+def get_booking_evidence_review_content(
+    tenant_id: str,
+    journey_id: UUID,
+    evidence_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
+    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
+    di_client: Annotated[DiClient, Depends(get_di_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> Response:
+    """Stream the original DI document to an authorized UC03 human reviewer."""
+    _scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    row = connection.execute(
+        text(
+            """
+            SELECT customer_id, di_subject_id, di_document_id
+            FROM auditcore.evidence
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND evidence_id=:evidence_id AND association_status='ACTIVE'
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "evidence_id": evidence_id,
+        },
+    ).mappings().one_or_none()
+    if (
+        row is None
+        or row["customer_id"] is None
+        or row["di_subject_id"] is None
+        or row["di_document_id"] is None
+    ):
+        raise NotFoundError(
+            error_code="VAC-NF-006",
+            title="Evidence not found",
+            detail="The source document was not found for this Journey evidence.",
+        )
+
+    context_ref = _audit_context_ref(journey_id, row["customer_id"])
+    try:
+        token = security_client.get_service_token(audience=_DI_AUDIENCE)
+        content, mime_type, content_disposition = di_client.get_audit_document_content(
+            token=token,
+            tenant_id=tenant_id,
+            external_context_ref=context_ref,
+            document_id=str(row["di_document_id"]),
+        )
+    except (DiClientError, SecurityTokenError) as exc:
+        raise DependencyUnavailableError(
+            detail="The source document is temporarily unavailable. Please try again."
+        ) from exc
+
+    filename = None
+    if isinstance(content_disposition, str) and "filename=" in content_disposition:
+        filename = content_disposition.split("filename=", 1)[1].strip().strip('"')
+    headers = {
+        "Content-Disposition": f'inline; filename="{filename}"' if filename else "inline",
+        "Cache-Control": "private, no-store",
+    }
+    return Response(content=content, media_type=mime_type, headers=headers)
 
 
 @router.get("/uc03-workspace")
@@ -273,4 +416,10 @@ def get_booking_workspace_with_typed_exchange(
     ).scalar_one_or_none()
     if isinstance(details, dict) and "exchangeTaken" in details:
         body.setdefault("capture", {})["EXCHANGE_TAKEN"] = bool(details["exchangeTaken"])
+    _enrich_workspace_localization(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        body=body,
+    )
     return body
