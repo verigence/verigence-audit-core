@@ -7,9 +7,10 @@ from fastapi import APIRouter, Depends, Header, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Connection, text
 
+from audit_core.authorization import AuthorizationError
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_human_principal
-from audit_core.errors import AuditCoreError, AuthorizationError
+from audit_core.errors import AuditCoreError
 from audit_core.idempotency import execute_idempotent_json_command
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
