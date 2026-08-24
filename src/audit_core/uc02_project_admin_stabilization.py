@@ -25,6 +25,10 @@ from audit_core.idempotency import execute_idempotent_json_command
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["uc02-project-admin-stabilization"])
 
+_DEALER_LEVEL_DEPENDENCIES = frozenset(
+    {"businessAssignments", "discountEligibility", "workflowTasks"}
+)
+
 
 def _project_status(connection: Connection, tenant_id: str) -> str:
     value = connection.execute(
@@ -80,10 +84,12 @@ def _blocking_setup_dependencies(
 
     The outlet row itself is setup structure and is intentionally not a blocker while
     the Project is CONFIGURING. Everything linked to those outlets remains a blocker.
+    Dealer-level counts already include outlet-scoped role/discount/workflow rows, so
+    those three keys are not added again while inspecting individual outlets.
     """
     dealer_dependencies = _dealer_impact(connection, tenant_id, dealer_id)
     blockers = {
-        key: value
+        key: int(value)
         for key, value in dealer_dependencies.items()
         if key != "outlets" and value > 0
     }
@@ -97,6 +103,8 @@ def _blocking_setup_dependencies(
     for outlet_id in outlet_ids:
         impact = _outlet_impact(connection, tenant_id, dealer_id, UUID(str(outlet_id)))
         for key, value in impact.items():
+            if key in _DEALER_LEVEL_DEPENDENCIES:
+                continue
             if value:
                 blockers[key] = blockers.get(key, 0) + int(value)
     return blockers
