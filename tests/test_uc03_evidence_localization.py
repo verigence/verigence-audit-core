@@ -45,7 +45,7 @@ class _Rows:
     def __init__(self, rows: list[dict[str, Any]]) -> None:
         self._rows = rows
 
-    def mappings(self) -> "_Rows":
+    def mappings(self) -> _Rows:
         return self
 
     def all(self) -> list[dict[str, Any]]:
