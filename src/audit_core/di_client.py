@@ -183,6 +183,45 @@ class DiClient:
         )
         return _document(payload)
 
+    def get_audit_document_facts(
+        self,
+        *,
+        token: str,
+        tenant_id: str,
+        external_context_ref: str,
+        document_id: str,
+    ) -> tuple[DiFact, ...]:
+        payload = self._request_data(
+            "GET",
+            f"/v1/tenants/{tenant_id}/audit-storage-contexts/{external_context_ref}/documents/{document_id}/fields",
+            operation="get_audit_document_facts",
+            token=token,
+        )
+        fields = payload.get("fields")
+        if not isinstance(fields, list):
+            raise _contract_error()
+        return tuple(_fact(item) for item in fields)
+
+    def get_audit_document_content(
+        self,
+        *,
+        token: str,
+        tenant_id: str,
+        external_context_ref: str,
+        document_id: str,
+    ) -> tuple[bytes, str, str | None]:
+        response = self._request_raw(
+            "GET",
+            f"/v1/tenants/{tenant_id}/audit-storage-contexts/{external_context_ref}/documents/{document_id}/content",
+            operation="get_audit_document_content",
+            token=token,
+        )
+        return (
+            response.content,
+            response.headers.get("content-type", "application/octet-stream"),
+            response.headers.get("content-disposition"),
+        )
+
     def get_document(
         self,
         *,
@@ -226,7 +265,6 @@ class DiClient:
         subject_id: str,
         document_id: str,
     ) -> tuple[bytes, str, str | None]:
-        """Fetch original DI bytes for an authorized Audit Core review façade."""
         response = self._request_raw(
             "GET",
             f"/v1/tenants/{tenant_id}/subjects/{subject_id}/documents/{document_id}/content",
