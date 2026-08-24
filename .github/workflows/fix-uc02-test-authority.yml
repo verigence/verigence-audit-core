@@ -52,6 +52,7 @@ jobs:
               Path('src/audit_core/di_project_master_proxy.py'),
               Path('tests/test_dealers.py'),
               Path('tests/test_projects.py'),
+              Path('tests/test_uc02_di_project_master_proxy.py'),
               Path('tests/test_uc02_project_master_imports.py'),
               Path('tests/test_uc02_readiness.py'),
               Path('tests/test_uc02_role_mappings.py'),
@@ -75,7 +76,7 @@ jobs:
           set -euo pipefail
           git config user.name 'Verigence-admin'
           git config user.email 'admin@verigence.local'
-          git add src/audit_core/di_project_master_proxy.py tests/test_dealers.py tests/test_projects.py tests/test_uc02_project_master_imports.py tests/test_uc02_readiness.py tests/test_uc02_role_mappings.py
+          git add src/audit_core/di_project_master_proxy.py tests/test_dealers.py tests/test_projects.py tests/test_uc02_di_project_master_proxy.py tests/test_uc02_project_master_imports.py tests/test_uc02_readiness.py tests/test_uc02_role_mappings.py
           if git diff --cached --quiet; then
             echo 'No authority coverage changes required'
             exit 0
