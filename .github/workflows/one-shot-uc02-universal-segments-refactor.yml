@@ -29,11 +29,17 @@ jobs:
           from pathlib import Path
 
           root = Path('.')
+          helper = Path('.github/workflows/one-shot-uc02-universal-segments-refactor.yml')
           text_files = []
           for base in ('src', 'tests', 'docs', '.github'):
               p = root / base
               if p.exists():
-                  text_files.extend(x for x in p.rglob('*') if x.is_file() and x.suffix in {'.py', '.md', '.yml', '.yaml'})
+                  text_files.extend(
+                      x for x in p.rglob('*')
+                      if x.is_file()
+                      and x != helper
+                      and x.suffix in {'.py', '.md', '.yml', '.yaml'}
+                  )
           text_files.append(root / 'railway.toml')
 
           for path in text_files:
@@ -111,7 +117,7 @@ jobs:
           python -m compileall -q src tests
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git rm .github/workflows/one-shot-uc02-universal-segments-refactor.yml
+          git rm -f .github/workflows/one-shot-uc02-universal-segments-refactor.yml
           git add src tests docs .github railway.toml
           git commit -m 'refactor(uc02): make segments universal across OEMs'
           git push origin HEAD:feature/uc02-universal-segments
