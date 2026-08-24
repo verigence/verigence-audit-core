@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from datetime import date
+from io import BytesIO
 from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, Header, UploadFile
+from fastapi.responses import StreamingResponse
+from openpyxl import Workbook
 from sqlalchemy import Connection, text
 
 from audit_core import mahindra_masters as masters
@@ -115,6 +118,62 @@ def list_latest_imports(
         )
         for row in rows
     ]
+
+
+@router.get("/imports/{import_id}/validation-report")
+def validation_report(
+    tenant_id: str,
+    import_id: UUID,
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> StreamingResponse:
+    del admin_request
+    set_tenant_context(connection, tenant_id)
+    masters._project_context(connection, tenant_id)
+    record = masters._import_record(connection, tenant_id, import_id)
+    rows = connection.execute(
+        text(
+            """
+            SELECT row_number, parsed_data, validation_status, validation_messages
+            FROM auditcore.project_master_import_rows
+            WHERE tenant_id=:tenant_id AND import_id=:import_id
+            ORDER BY row_number
+            """
+        ),
+        {"tenant_id": tenant_id, "import_id": import_id},
+    ).mappings().all()
+
+    keys: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in dict(row["parsed_data"]).keys():
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Validation"
+    sheet.append(["row_number", "validation_status", "messages", *keys])
+    for row in rows:
+        parsed = dict(row["parsed_data"])
+        sheet.append(
+            [
+                row["row_number"],
+                row["validation_status"],
+                " | ".join(row["validation_messages"]),
+                *[parsed.get(key) for key in keys],
+            ]
+        )
+    buffer = BytesIO()
+    workbook.save(buffer)
+    buffer.seek(0)
+    filename = f"{str(record['master_key']).lower()}-{import_id}-validation.xlsx"
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post(
