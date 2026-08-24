@@ -1,0 +1,101 @@
+name: Diagnose UC02 old-project step errors
+
+on:
+  push:
+    branches:
+      - diagnose/uc02-old-project-step-errors
+    paths:
+      - .github/workflows/diagnose-uc02-old-project-step-errors.yml
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      SECURITY_SERVICE: security
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: diagnose/uc02-old-project-step-errors
+          fetch-depth: 0
+
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Capture recent DEV runtime logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo 'RAILWAY_API_TOKEN missing' >&2; exit 1; }
+          mkdir -p /tmp/uc02diag docs/runtime
+
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/uc02diag/link.json
+
+          railway logs --service "$AUDIT_SERVICE" --environment dev --since 75m --lines 3500 --json > /tmp/uc02diag/audit-deploy.jsonl || true
+          railway logs --service "$AUDIT_SERVICE" --environment dev --http --since 75m --lines 3500 --json > /tmp/uc02diag/audit-http.jsonl || true
+          railway logs --service "$SECURITY_SERVICE" --environment dev --since 75m --lines 2500 --json > /tmp/uc02diag/security-deploy.jsonl || true
+          railway logs --service "$SECURITY_SERVICE" --environment dev --http --since 75m --lines 2500 --json > /tmp/uc02diag/security-http.jsonl || true
+
+          python - <<'PY'
+          from pathlib import Path
+          import json
+          import re
+
+          base = Path('/tmp/uc02diag')
+          out = []
+          out.append('UC02 OLD PROJECT STEP RUNTIME DIAGNOSIS')
+          out.append('Window: last 75 minutes from workflow execution')
+          out.append('')
+
+          endpoint_re = re.compile(r'(/v1/tenants/[^\s"?]+(?:/[^\s"?]+)*)')
+          interesting = re.compile(
+              r'(unhandled_exception|traceback|exception|error|adminshutdown|/dealers|/outlets|role-mapping|project-masters|/project/readiness|/project\b|status.?[:=].?[45]\d\d|\s[45]\d\d\s)',
+              re.I,
+          )
+          hard_error = re.compile(r'(unhandled_exception|traceback|exception|adminshutdown|\berror\b|status.?[:=].?5\d\d|\s5\d\d\s)', re.I)
+
+          for filename in ['audit-deploy.jsonl','audit-http.jsonl','security-deploy.jsonl','security-http.jsonl']:
+              path = base / filename
+              lines = path.read_text(errors='replace').splitlines() if path.exists() else []
+              decoded = []
+              for raw in lines:
+                  text = raw
+                  try:
+                      obj = json.loads(raw)
+                      if isinstance(obj, dict):
+                          text = ' '.join(str(obj.get(k,'')) for k in ('timestamp','message','severity','status','method','path','requestId','deploymentId') if obj.get(k) not in (None,''))
+                          if text.strip() == '':
+                              text = raw
+                  except Exception:
+                      pass
+                  decoded.append(text)
+              matches = [line for line in decoded if interesting.search(line)]
+              errors = [line for line in decoded if hard_error.search(line)]
+              out.append(f'===== {filename} =====')
+              out.append(f'total_lines={len(decoded)} interesting={len(matches)} hard_errors={len(errors)}')
+              out.append('-- hard errors (latest 120) --')
+              out.extend(errors[-120:])
+              out.append('-- UC02 endpoint activity/errors (latest 220) --')
+              out.extend(matches[-220:])
+              out.append('')
+
+          text = '\n'.join(out)
+          Path('docs/runtime/uc02-old-project-step-errors.txt').write_text(text)
+          print(text[-30000:])
+          PY
+
+      - name: Record diagnostic evidence on branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/runtime/uc02-old-project-step-errors.txt
+          git commit -m 'docs(diag): record UC02 old-project runtime errors' || exit 0
+          git push origin HEAD:diagnose/uc02-old-project-step-errors
