@@ -38,6 +38,8 @@ _bearer = HTTPBearer(auto_error=False)
 _LIGHTWEIGHT_AUTHENTICATED_READS = (
     re.compile(r"^/v1/project-reference-data/?$"),
     re.compile(r"^/v1/tenants/[^/]+/project-masters/?$"),
+    re.compile(r"^/v1/tenants/[^/]+/mahindra-masters/imports/?$"),
+    re.compile(r"^/v1/tenants/[^/]+/mahindra-masters/imports/[^/]+/validation-report/?$"),
     re.compile(r"^/v1/tenants/[^/]+/project-masters/[^/]+/[^/]+/versions/?$"),
     re.compile(r"^/v1/tenants/[^/]+/project-masters/DI/[^/]+/template/?$"),
 )
