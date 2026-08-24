@@ -106,21 +106,22 @@ def _validate_request(engine: Engine, request: ProjectCreateRequest) -> None:
                 text(
                     """
                     SELECT segment_id
-                    FROM auditcore.oem_segments
-                    WHERE oem_id=:oem_id AND is_active=true
+                    FROM auditcore.segments
+                    WHERE is_active=true
                     """
                 ),
                 {"oem_id": request.oemId},
             ).scalars().all()
         )
         selected_segment_ids = set(request.segmentIds)
-        if configured_segment_ids and not selected_segment_ids:
+        legacy_product_category = request.productCategoryId is not None
+        if configured_segment_ids and not selected_segment_ids and not legacy_product_category:
             raise BusinessValidationError(
-                detail="Select at least one Segment configured for the chosen OEM."
+                detail="Select at least one active Segment."
             )
         if not selected_segment_ids.issubset(configured_segment_ids):
             raise BusinessValidationError(
-                detail="Every selected Segment must belong to the chosen OEM and be active."
+                detail="Every selected Segment must reference an active universal Segment."
             )
 
 

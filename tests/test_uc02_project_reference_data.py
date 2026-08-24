@@ -24,14 +24,14 @@ _EXPECTED_OEMS = {
     "VOLKSWAGEN": "Volkswagen",
     "TATA_MOTORS": "Tata Motors",
 }
-_EXPECTED_MAHINDRA_SEGMENTS = {
+_EXPECTED_SEGMENTS = {
     "PASSENGER_VEHICLE": "Passenger Vehicle",
     "COMMERCIAL": "Commercial",
     "BATTERY_ELECTRIC": "Battery Electric",
 }
 
 
-def test_project_reference_data_exposes_only_approved_active_masters() -> None:
+def test_project_reference_data_exposes_universal_segments() -> None:
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         pytest.skip("DATABASE_URL is required for UC02 project reference integration tests")
@@ -58,17 +58,13 @@ def test_project_reference_data_exposes_only_approved_active_masters() -> None:
             item["oemCode"]: item["oemName"] for item in body["oems"]
         } == _EXPECTED_OEMS
         assert all(item["oemId"] for item in body["oems"])
+        assert all("segments" not in item for item in body["oems"])
         assert "productCategories" not in body
 
-        mahindra = next(item for item in body["oems"] if item["oemCode"] == "MAHINDRA")
         assert {
-            item["segmentCode"]: item["segmentName"] for item in mahindra["segments"]
-        } == _EXPECTED_MAHINDRA_SEGMENTS
-        assert all(item["segmentId"] for item in mahindra["segments"])
-
-        for oem in body["oems"]:
-            if oem["oemCode"] != "MAHINDRA":
-                assert oem["segments"] == []
+            item["segmentCode"]: item["segmentName"] for item in body["segments"]
+        } == _EXPECTED_SEGMENTS
+        assert all(item["segmentId"] for item in body["segments"])
     finally:
         app.dependency_overrides.clear()
         engine.dispose()

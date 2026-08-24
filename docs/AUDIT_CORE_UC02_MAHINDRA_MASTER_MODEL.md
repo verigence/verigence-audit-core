@@ -179,3 +179,12 @@ Existing non-Mahindra OEMs remain valid. Segment metadata can be added for them 
 ## 10. Validation gate
 
 This extension must pass the repository's normal lint, fresh-database migration and automated test gates before merge to `dev`; DEV deployment must use the tested merged SHA and Alembic head `0014_uc02_mahindra_seg`.
+## Universal Segment model
+
+Segment is a platform-wide reference master and is **not owned by an OEM**. All OEM Projects select from the same Phase-1 Segment set:
+
+- `PASSENGER_VEHICLE` — Passenger Vehicle
+- `COMMERCIAL` — Commercial
+- `BATTERY_ELECTRIC` — Battery Electric
+
+OEM and Segment are independent Project dimensions. Selecting or changing OEM does not change the available Segment choices. Mahindra-specific workbook ingestion remains an OEM adapter; it consumes the Project's universal Segment selections rather than defining them.
