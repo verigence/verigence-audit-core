@@ -10,6 +10,7 @@ from audit_core.dependencies import get_connection, get_principal
 from audit_core.main import app
 from audit_core.security import Principal
 from audit_core.versioned_masters import (
+    add_document_requirement,
     create_document_profile,
     create_document_profile_version,
     create_project_policy_version,
@@ -125,6 +126,24 @@ def journey_setup():
             version_no=1,
             effective_from=date(2026, 8, 1),
             actor_id="admin",
+        )
+        add_document_requirement(
+            connection,
+            tenant_id=tenant_id,
+            profile_version_id=profile_version_id,
+            requirement_key="BOOKING_DOCKET",
+            document_type_key="BOOKING_DOCKET",
+            process_area="BOOKING",
+            requirement_level="OPTIONAL",
+        )
+        add_document_requirement(
+            connection,
+            tenant_id=tenant_id,
+            profile_version_id=profile_version_id,
+            requirement_key="NDC",
+            document_type_key="NO_DUES_CERTIFICATE",
+            process_area="DELIVERY",
+            requirement_level="OPTIONAL",
         )
         publish_master_version(
             connection,
