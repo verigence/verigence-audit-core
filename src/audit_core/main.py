@@ -20,6 +20,7 @@ from audit_core.findings import router as findings_router
 from audit_core.insurance_tradein import router as insurance_tradein_router
 from audit_core.journeys import router as journey_router
 from audit_core.logging_config import configure_logging
+from audit_core.mahindra_native_effective_date import install_native_effective_date
 from audit_core.mahindra_native_workbooks import install_native_workbook_parser
 from audit_core.observability import install_observability
 from audit_core.otel import configure_otlp
@@ -53,6 +54,7 @@ from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
 install_role_mapping_policy(role_mappings)
 install_native_workbook_parser(mahindra_masters)
+install_native_effective_date(mahindra_masters)
 role_mapping_router = role_mappings.router
 mahindra_master_router = mahindra_masters.router
 
