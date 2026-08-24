@@ -7,7 +7,7 @@ Journeys created against an empty profile are repaired without recreating them.
 """
 from alembic import op
 
-revision = "0017_uc03_default_documents"
+revision = "0016_uc02_project_delete_uc03"
 down_revision = "0016_uc02_project_delete"
 branch_labels = None
 depends_on = None
@@ -18,7 +18,7 @@ def upgrade() -> None:
         """
         UPDATE auditcore.document_requirement_profile_versions v
         SET lifecycle_status='RETIRED',
-            retired_by_actor_id='migration.0017.uc03-default-documents',
+            retired_by_actor_id='migration.uc03-default-documents',
             retired_at_utc=now(),
             updated_at_utc=now()
         WHERE v.lifecycle_status='PUBLISHED'
