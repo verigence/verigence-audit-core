@@ -1,4 +1,4 @@
-name: Fix UC02 Test Authority Fixtures
+name: Fix UC02 Project Admin Authority Coverage
 
 on:
   pull_request:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: uc02-test-authority-fix
+  group: uc02-project-admin-authority-coverage
   cancel-in-progress: true
 
 jobs:
@@ -41,7 +41,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Update UC02 integration test dependency overrides
+      - name: Align UC02 authority across DI facade and integration fixtures
         shell: bash
         run: |
           set -euo pipefail
@@ -49,6 +49,7 @@ jobs:
           from pathlib import Path
 
           files = [
+              Path('src/audit_core/di_project_master_proxy.py'),
               Path('tests/test_dealers.py'),
               Path('tests/test_projects.py'),
               Path('tests/test_uc02_project_master_imports.py'),
@@ -65,20 +66,20 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip >/dev/null
           python -m pip install -e '.[test,lint]' >/dev/null
-          ruff check tests/test_dealers.py tests/test_projects.py tests/test_uc02_project_master_imports.py tests/test_uc02_readiness.py tests/test_uc02_role_mappings.py
+          ruff check src tests migrations
           alembic upgrade head
           pytest -q
-      - name: Commit validated test fixture changes
+      - name: Commit validated authority coverage
         shell: bash
         run: |
           set -euo pipefail
           git config user.name 'Verigence-admin'
           git config user.email 'admin@verigence.local'
-          git add tests/test_dealers.py tests/test_projects.py tests/test_uc02_project_master_imports.py tests/test_uc02_readiness.py tests/test_uc02_role_mappings.py
+          git add src/audit_core/di_project_master_proxy.py tests/test_dealers.py tests/test_projects.py tests/test_uc02_project_master_imports.py tests/test_uc02_readiness.py tests/test_uc02_role_mappings.py
           if git diff --cached --quiet; then
-            echo 'No test fixture changes required'
+            echo 'No authority coverage changes required'
             exit 0
           fi
-          git commit -m 'test(uc02): align integration fixtures with project admin authority [uc02-test-authority-fixed]'
+          git commit -m 'fix(uc02): complete tenant-scoped project admin authority [uc02-authority-covered]'
           git pull --rebase origin refactor/uc02-project-admin-workspace
           git push origin HEAD:refactor/uc02-project-admin-workspace
