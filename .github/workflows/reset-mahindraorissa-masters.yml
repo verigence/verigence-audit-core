@@ -1,0 +1,96 @@
+name: Reset MahindraOrissa Project Masters
+
+on:
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  reset:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Reset tenant-scoped master data
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install 'sqlalchemy>=2.0' 'psycopg[binary]' >/dev/null
+          npm install --global @railway/cli >/dev/null
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/vars.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from sqlalchemy import create_engine, text
+
+          variables=json.loads(Path('/tmp/vars.json').read_text())
+          url=str(variables['DATABASE_URL'])
+          if url.startswith('postgresql://'):
+              url='postgresql+psycopg://' + url.split('://',1)[1]
+          elif url.startswith('postgres://'):
+              url='postgresql+psycopg://' + url.split('://',1)[1]
+          engine=create_engine(url)
+
+          tables = [
+              'project_master_import_rows',
+              'project_master_imports',
+              'project_product_master_items',
+              'project_product_master_versions',
+              'project_product_masters',
+              'price_list_items',
+              'price_list_versions',
+              'price_lists',
+              'discount_policy_parameters',
+              'discount_policy_versions',
+              'audit_control_versions',
+              'audit_controls',
+              'document_requirement_items',
+              'document_requirement_profile_versions',
+              'document_requirement_profiles',
+              'project_policy_versions',
+          ]
+
+          with engine.begin() as c:
+              project=c.execute(text("""
+                  SELECT tenant_id, project_name, project_status
+                  FROM auditcore.projects
+                  WHERE lower(project_name)=lower('MahindraOrissa')
+              """)).mappings().one()
+              tenant=str(project['tenant_id'])
+              if project['project_status'] != 'CONFIGURING':
+                  raise RuntimeError(f"Refusing reset: project status is {project['project_status']}, expected CONFIGURING")
+              c.execute(text("SELECT set_config('app.current_tenant_id', :tenant, true)"), {'tenant': tenant})
+              c.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {'key': 'master-reset:' + tenant})
+              print(f"RESET_PROJECT|{project['project_name']}|{project['project_status']}")
+
+              for table in tables:
+                  before=c.execute(text(f"SELECT count(*) FROM auditcore.{table} WHERE tenant_id=:tenant"), {'tenant':tenant}).scalar_one()
+                  print(f"BEFORE|{table}|{before}")
+
+              # Child-to-parent order. Project import rows also cascade from imports,
+              # but the explicit first delete makes the reset intent auditable.
+              for table in tables:
+                  result=c.execute(text(f"DELETE FROM auditcore.{table} WHERE tenant_id=:tenant"), {'tenant':tenant})
+                  print(f"DELETE|{table}|{result.rowcount}")
+
+              nonzero=[]
+              for table in tables:
+                  after=c.execute(text(f"SELECT count(*) FROM auditcore.{table} WHERE tenant_id=:tenant"), {'tenant':tenant}).scalar_one()
+                  print(f"AFTER|{table}|{after}")
+                  if after != 0:
+                      nonzero.append((table, after))
+              if nonzero:
+                  raise RuntimeError('Reset verification failed: ' + repr(nonzero))
+              print('MASTER_RESET|PASS|all tenant-scoped master tables zero')
+          engine.dispose()
+          PY
