@@ -1,5 +1,15 @@
 DI_RULE_E2E_PROJECT
 ENVIRONMENT=DEV
 PROJECT_NAME=DEV-DI-RULE-E2E-20260824
-RESULT=FAIL
-FAILURE=RuntimeError: DI retention policies HTTP 500: {"type":"https://docs.verigence.app/errors/internal_error","code":"INTERNAL_ERROR","title":"Unexpected server error.","status":500,"retryable":true,"category":"INTERNAL","detail":"ProgrammingError: (sqlalchemy.dialects.postgresql.asyncpg.ProgrammingError) <class 'asyncpg.exceptions.UndefinedColumnEr 
+TENANT_ID=70c5661e-bab2-46e7-8199-0f9c32acbac3
+PROJECT_CODE=tenant-d375741722af4890a0489977cf274898
+PROJECT_STATUS=CONFIGURING
+PERSISTENT=true
+DI_HEALTH_HTTP=200
+DI_SETTINGS_HTTP=200
+DI_RETENTION_HTTP=500
+DI_RETENTION_API_STATUS=KNOWN_SCHEMA_API_DEFECT
+DEDICATED_TEST_USER=NOT_REQUIRED
+DI_TEST_ACTOR=e2e-di-rules
+DI_TEST_TOKEN_FORMAT=mock.70c5661e-bab2-46e7-8199-0f9c32acbac3.e2e-di-rules.TENANT_ADMIN
+RESULT=PASS
