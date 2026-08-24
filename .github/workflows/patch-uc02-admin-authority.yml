@@ -75,10 +75,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install -r requirements.txt >/dev/null
-          python -m pip install -e . >/dev/null
-          ruff check src tests
-          mypy src
+          python -m pip install --upgrade pip >/dev/null
+          python -m pip install -e '.[test,lint]' >/dev/null
+          ruff check src tests migrations
           pytest -q
       - name: Commit source changes
         shell: bash
