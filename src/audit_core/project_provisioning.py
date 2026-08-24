@@ -39,7 +39,9 @@ _COMPENSATION_TIMEOUT_SECONDS = 20.0
 class ProjectCreateRequest(BaseModel):
     projectName: str = Field(min_length=1, max_length=240)
     oemId: UUID
-    productCategoryId: UUID
+    segmentIds: list[UUID] = Field(default_factory=list)
+    # Legacy compatibility only. Product Category is no longer a Project-onboarding input.
+    productCategoryId: UUID | None = None
     effectiveStartDate: date
     effectiveEndDate: date | None = None
     timezoneName: str = Field(default="Asia/Kolkata", min_length=1, max_length=100)
@@ -87,6 +89,9 @@ def _validate_request(engine: Engine, request: ProjectCreateRequest) -> None:
         raise BusinessValidationError(
             detail="Effective End Date cannot be earlier than Effective Start Date."
         )
+    if len(set(request.segmentIds)) != len(request.segmentIds):
+        raise BusinessValidationError(detail="Project Segments cannot contain duplicates.")
+
     with engine.begin() as connection:
         connection.execute(text("SET LOCAL ROLE audit_core_runtime"))
         oem_exists = connection.execute(
@@ -95,16 +100,27 @@ def _validate_request(engine: Engine, request: ProjectCreateRequest) -> None:
         ).scalar_one_or_none()
         if oem_exists is None:
             raise BusinessValidationError(detail="OEM does not reference an active approved value.")
-        category_exists = connection.execute(
-            text(
-                "SELECT 1 FROM auditcore.product_categories "
-                "WHERE product_category_id=:category_id AND is_active=true"
-            ),
-            {"category_id": request.productCategoryId},
-        ).scalar_one_or_none()
-        if category_exists is None:
+
+        configured_segment_ids = set(
+            connection.execute(
+                text(
+                    """
+                    SELECT segment_id
+                    FROM auditcore.oem_segments
+                    WHERE oem_id=:oem_id AND is_active=true
+                    """
+                ),
+                {"oem_id": request.oemId},
+            ).scalars().all()
+        )
+        selected_segment_ids = set(request.segmentIds)
+        if configured_segment_ids and not selected_segment_ids:
             raise BusinessValidationError(
-                detail="Product Category does not reference an active approved value."
+                detail="Select at least one Segment configured for the chosen OEM."
+            )
+        if not selected_segment_ids.issubset(configured_segment_ids):
+            raise BusinessValidationError(
+                detail="Every selected Segment must belong to the chosen OEM and be active."
             )
 
 
@@ -121,6 +137,44 @@ def _project_exists(engine: Engine, tenant_id: str) -> bool:
         )
 
 
+def _ensure_project_segments(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    segment_ids: list[UUID],
+    actor_id: str,
+) -> None:
+    current = set(
+        connection.execute(
+            text(
+                "SELECT segment_id FROM auditcore.project_segments WHERE tenant_id=:tenant_id"
+            ),
+            {"tenant_id": tenant_id},
+        ).scalars().all()
+    )
+    requested = set(segment_ids)
+    if current and current != requested:
+        raise ConflictError(
+            error_code="VAC-CONFLICT-003",
+            title="Project provisioning conflict",
+            detail="The Project context is already linked to different Segment selections.",
+        )
+    if current == requested:
+        return
+    for segment_id in segment_ids:
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.project_segments (
+                    tenant_id, segment_id, created_by_actor_id
+                ) VALUES (:tenant_id, :segment_id, :actor_id)
+                ON CONFLICT (tenant_id, segment_id) DO NOTHING
+                """
+            ),
+            {"tenant_id": tenant_id, "segment_id": segment_id, "actor_id": actor_id},
+        )
+
+
 def _ensure_project_projection(
     connection: Connection,
     *,
@@ -133,7 +187,7 @@ def _ensure_project_projection(
     current = connection.execute(
         text(
             """
-            SELECT tenant_id, project_code, project_name, oem_id, product_category_id,
+            SELECT tenant_id, project_code, project_name, oem_id,
                    effective_start_date, effective_end_date, timezone_name, region_code,
                    project_status
             FROM auditcore.projects
@@ -151,11 +205,11 @@ def _ensure_project_projection(
                     effective_start_date, effective_end_date, timezone_name, region_code,
                     project_status, created_by_actor_id, updated_by_actor_id
                 ) VALUES (
-                    :tenant_id, :project_code, :project_name, :oem_id, :category_id,
+                    :tenant_id, :project_code, :project_name, :oem_id, NULL,
                     :effective_start, :effective_end, :timezone_name, :region_code,
                     'CONFIGURING', :actor_id, :actor_id
                 )
-                RETURNING tenant_id, project_code, project_name, oem_id, product_category_id,
+                RETURNING tenant_id, project_code, project_name, oem_id,
                           effective_start_date, effective_end_date, timezone_name, region_code,
                           project_status
                 """
@@ -165,7 +219,6 @@ def _ensure_project_projection(
                 "project_code": tenant.tenant_code,
                 "project_name": request.projectName.strip(),
                 "oem_id": request.oemId,
-                "category_id": request.productCategoryId,
                 "effective_start": request.effectiveStartDate,
                 "effective_end": request.effectiveEndDate,
                 "timezone_name": request.timezoneName.strip(),
@@ -177,7 +230,6 @@ def _ensure_project_projection(
     expected = {
         "project_name": request.projectName.strip(),
         "oem_id": request.oemId,
-        "product_category_id": request.productCategoryId,
         "effective_start_date": request.effectiveStartDate,
         "effective_end_date": request.effectiveEndDate,
         "timezone_name": request.timezoneName.strip(),
@@ -189,6 +241,13 @@ def _ensure_project_projection(
             title="Project provisioning conflict",
             detail="The Project context is already linked to different Project details.",
         )
+
+    _ensure_project_segments(
+        connection,
+        tenant_id=tenant.tenant_id,
+        segment_ids=request.segmentIds,
+        actor_id=actor_id,
+    )
     return {
         "tenantId": str(current["tenant_id"]),
         "projectCode": str(current["project_code"]),
@@ -248,11 +307,6 @@ def list_projects(
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     engine: Annotated[Engine, Depends(get_engine)],
 ) -> list[ProjectSelectionResponse]:
-    # `require_super_admin_request` has already validated the human JWT and obtained
-    # a live/cached Security SuperAdmin attestation. Activate only the narrow
-    # cross-Tenant Project SELECT RLS policy for this transaction and read the
-    # persisted Audit Core source of truth in one query. Do not call Security's
-    # Tenant directory and do not perform one Project query per Tenant.
     with engine.begin() as connection:
         connection.execute(text("SET LOCAL ROLE audit_core_runtime"))
         set_platform_super_admin_context(connection)
@@ -316,9 +370,6 @@ def create_project(
             request=request,
             actor_id=admin_request.user_id,
         )
-        # Once the DI request is attempted, its transaction may commit even if the
-        # HTTP response is lost. Its compensation DELETE is idempotent for zero state,
-        # so treat every attempted DI provisioning call as requiring cleanup on failure.
         di_cleanup_required = True
         with DiClient(base_url=di_url) as client:
             di_result = client.ensure_project_provisioning(
