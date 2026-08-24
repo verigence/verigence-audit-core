@@ -1,0 +1,120 @@
+name: Diagnose UC02 Readiness and Master State
+
+on:
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install and link DEV
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e . 'psycopg[binary]' >/dev/null
+          npm install --global @railway/cli >/dev/null
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/vars.json
+      - name: Inspect live MahindraOrissa state
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, traceback
+          from pathlib import Path
+          from sqlalchemy import create_engine, text
+          from audit_core.db import set_tenant_context
+          from audit_core import readiness
+          from audit_core import mahindra_upload_state
+
+          variables = json.loads(Path('/tmp/vars.json').read_text())
+          url = str(variables.get('DATABASE_URL','')).strip()
+          if not url:
+              raise SystemExit('DATABASE_URL missing')
+          if url.startswith('postgresql+psycopg://'):
+              db_url = url
+          elif url.startswith('postgresql://'):
+              db_url = 'postgresql+psycopg://' + url.split('://',1)[1]
+          elif url.startswith('postgres://'):
+              db_url = 'postgresql+psycopg://' + url.split('://',1)[1]
+          else:
+              db_url = url
+          engine = create_engine(db_url)
+          with engine.begin() as c:
+              project = c.execute(text("SELECT tenant_id, project_name, project_status FROM auditcore.projects WHERE lower(project_name)=lower('MahindraOrissa')")).mappings().one()
+              tenant = project['tenant_id']
+              print(f"PROJECT|{project['project_name']}|{project['project_status']}")
+              set_tenant_context(c, tenant)
+
+              for table in ('project_product_master_versions','price_list_versions','dealer_outlets'):
+                  cols = c.execute(text("SELECT column_name FROM information_schema.columns WHERE table_schema='auditcore' AND table_name=:table ORDER BY ordinal_position"), {'table':table}).scalars().all()
+                  print('COLUMNS|' + table + '|' + ','.join(cols))
+
+              rows = c.execute(text("""
+                SELECT COALESCE(s.segment_code,'PROJECT') segment, i.status, i.rows_parsed,
+                       i.valid_rows, i.error_rows, i.original_file_name, i.effective_from,
+                       i.confirmation_receipt
+                FROM auditcore.project_master_imports i
+                LEFT JOIN auditcore.segments s ON s.segment_id=i.segment_id
+                WHERE i.tenant_id=:tenant
+                  AND i.master_key IN ('MAHINDRA_SEGMENT_MASTER','DISCOUNT_POLICY')
+                ORDER BY i.created_at_utc DESC
+                LIMIT 20
+              """), {'tenant': tenant}).mappings().all()
+              for r in rows:
+                  print(f"IMPORT|{r['segment']}|{r['status']}|rows={r['rows_parsed']}|valid={r['valid_rows']}|errors={r['error_rows']}|wef={r['effective_from']}|file={r['original_file_name']}|receipt={bool(r['confirmation_receipt'])}")
+
+              print('--- LIST_LATEST_IMPORTS ---')
+              try:
+                  imports = mahindra_upload_state.list_latest_imports(tenant, None, c)
+                  print('MASTER_LIST|PASS|count=' + str(len(imports)))
+                  for item in imports:
+                      print('MASTER_ITEM|' + item.model_dump_json())
+              except Exception as exc:
+                  print('MASTER_LIST|FAIL|' + type(exc).__name__ + '|' + str(exc))
+                  traceback.print_exc()
+
+              print('--- READINESS DB CHECKS ---')
+              try:
+                  project_state = readiness._project_state(c, tenant)
+                  checks = [
+                      readiness._project_setup_check(project_state),
+                      readiness._dealer_outlet_structure_check(c, tenant),
+                      readiness._pc_coverage_check(c, tenant),
+                      readiness._project_masters_check(c, tenant),
+                      readiness._optional_map_metadata_check(c, tenant),
+                  ]
+                  for check in checks:
+                      print('READY_CHECK|' + check.model_dump_json())
+              except Exception as exc:
+                  print('READINESS_DB|FAIL|' + type(exc).__name__ + '|' + str(exc))
+                  traceback.print_exc()
+
+              for table, id_col in (
+                  ('project_product_master_versions','product_master_version_id'),
+                  ('price_list_versions','price_list_version_id'),
+                  ('discount_policy_versions','discount_policy_version_id'),
+                  ('project_policy_versions','policy_version_id'),
+                  ('document_requirement_profile_versions','document_requirement_profile_version_id'),
+                  ('audit_control_versions','audit_control_version_id'),
+              ):
+                  try:
+                      data = c.execute(text(f"SELECT lifecycle_status, count(*) FROM auditcore.{table} WHERE tenant_id=:tenant GROUP BY lifecycle_status ORDER BY lifecycle_status"), {'tenant':tenant}).all()
+                      print('VERSION_COUNTS|' + table + '|' + repr(data))
+                  except Exception as exc:
+                      print('VERSION_COUNTS_FAIL|' + table + '|' + type(exc).__name__ + '|' + str(exc))
+          engine.dispose()
+          PY
