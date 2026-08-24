@@ -4,13 +4,16 @@ on:
   push:
     branches:
       - refactor/uc02-project-admin-workspace
+  pull_request:
+    branches:
+      - dev
 
 permissions:
   contents: write
 
 jobs:
   patch:
-    if: ${{ !contains(github.event.head_commit.message, '[uc02-admin-authority-applied]') }}
+    if: ${{ (github.event_name == 'pull_request' && github.head_ref == 'refactor/uc02-project-admin-workspace') || (github.event_name == 'push' && !contains(github.event.head_commit.message, '[uc02-admin-authority-applied]')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
