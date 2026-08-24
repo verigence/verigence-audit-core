@@ -1,0 +1,65 @@
+name: UC02 Master Upload DEV Proof
+
+on:
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    env:
+      DEV_AUDIT_URL: https://verigence-audit-core-production.up.railway.app
+      MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
+    steps:
+      - name: Verify deployed persisted-state route exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          status="$(curl --silent --show-error --output /tmp/body --write-out '%{http_code}' \
+            "$DEV_AUDIT_URL/v1/tenants/00000000-0000-0000-0000-000000000000/mahindra-masters/imports")"
+          cat /tmp/body
+          echo
+          case "$status" in
+            401|403) ;;
+            404) echo 'Persisted Mahindra upload-state route is not deployed.'; exit 1 ;;
+            *) echo "Unexpected route status: $status"; exit 1 ;;
+          esac
+          echo "MAHINDRA_UPLOAD_STATE_ROUTE=PASS http=$status"
+
+      - name: Verify MahindraOrissa prior BEV import is persisted
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${MIGRATION_DATABASE_URL:-}" ] || { echo 'MIGRATION_DATABASE_URL unavailable'; exit 1; }
+          case "$MIGRATION_DATABASE_URL" in
+            postgresql+psycopg://*) db="postgresql://${MIGRATION_DATABASE_URL#postgresql+psycopg://}" ;;
+            postgresql+asyncpg://*) db="postgresql://${MIGRATION_DATABASE_URL#postgresql+asyncpg://}" ;;
+            postgresql://*|postgres://*) db="$MIGRATION_DATABASE_URL" ;;
+            *) echo 'Unsupported database URL'; exit 1 ;;
+          esac
+          echo "::add-mask::$db"
+          result="$(psql "$db" -X -v ON_ERROR_STOP=1 -At -F '|' -c "
+            SELECT p.project_name,
+                   COALESCE(s.segment_code,'PROJECT'),
+                   i.status,
+                   i.rows_parsed,
+                   i.valid_rows,
+                   i.error_rows,
+                   i.original_file_name,
+                   i.effective_from,
+                   i.import_id
+            FROM auditcore.project_master_imports i
+            JOIN auditcore.projects p ON p.tenant_id=i.tenant_id
+            LEFT JOIN auditcore.segments s ON s.segment_id=i.segment_id
+            WHERE lower(p.project_name)=lower('MahindraOrissa')
+              AND i.master_key IN ('MAHINDRA_SEGMENT_MASTER','DISCOUNT_POLICY')
+            ORDER BY i.created_at_utc DESC;
+          ")"
+          [ -n "$result" ] || { echo 'No MahindraOrissa master imports are persisted.'; exit 1; }
+          printf '%s\n' "$result"
+          bev="$(printf '%s\n' "$result" | awk -F'|' '$2=="BATTERY_ELECTRIC" {print; exit}')"
+          [ -n "$bev" ] || { echo 'No persisted BATTERY_ELECTRIC import found for MahindraOrissa.'; exit 1; }
+          echo "MAHINDRA_ORISSA_BEV_PERSISTED=PASS|$bev"
