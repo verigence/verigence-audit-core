@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Self
 
@@ -7,6 +9,16 @@ import httpx
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+# ServiceIntegration tokens are platform-global and audience-bound. FastAPI creates
+# a short-lived client object for each request, so instance-only reuse still causes
+# repeated calls to Security. Keep a small process cache keyed by Security endpoint,
+# client and audience. Human authorization remains unchanged and is still evaluated
+# on every protected business request.
+_SERVICE_TOKEN_CACHE_LOCK = threading.Lock()
+_SERVICE_TOKEN_CACHE: dict[tuple[str, str, str], tuple[str, float]] = {}
+_SERVICE_TOKEN_CACHE_MAX_SECONDS = 300
+_SERVICE_TOKEN_CACHE_SKEW_SECONDS = 30
 
 
 class SecurityTokenError(RuntimeError):
@@ -427,11 +439,17 @@ class SecurityOAuthClient:
         timeout_seconds: float = 5.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        if not base_url.strip() or not client_id.strip() or not client_secret:
+        normalized_base_url = base_url.rstrip("/")
+        normalized_client_id = client_id.strip()
+        if not normalized_base_url or not normalized_client_id or not client_secret:
             raise ValueError("Security service-token base URL and client credentials are required")
+        self._cache_scope = (normalized_base_url, normalized_client_id)
+        # Custom transports are primarily tests. Isolate their cache so one mocked
+        # Security server cannot leak tokens into another mocked server.
+        self._cache_enabled = transport is None
         self._client = httpx.Client(
-            base_url=base_url.rstrip("/"),
-            auth=(client_id, client_secret),
+            base_url=normalized_base_url,
+            auth=(normalized_client_id, client_secret),
             timeout=timeout_seconds,
             transport=transport,
         )
@@ -449,6 +467,48 @@ class SecurityOAuthClient:
         requested_audience = audience.strip()
         if not requested_audience:
             raise ValueError("audience is required")
+
+        cache_key = (*self._cache_scope, requested_audience)
+        if self._cache_enabled:
+            # Keep the lock through a miss/fetch so simultaneous requests do not
+            # stampede Security for the same platform-global token.
+            with _SERVICE_TOKEN_CACHE_LOCK:
+                cached = _SERVICE_TOKEN_CACHE.get(cache_key)
+                now = time.monotonic()
+                if cached is not None and cached[1] > now:
+                    logger.debug("security_service_token_cache_hit", audience=requested_audience)
+                    return cached[0]
+                return self._fetch_and_cache_service_token(
+                    requested_audience=requested_audience,
+                    cache_key=cache_key,
+                    now=now,
+                )
+
+        return self._fetch_service_token(requested_audience=requested_audience)[0]
+
+    def _fetch_and_cache_service_token(
+        self,
+        *,
+        requested_audience: str,
+        cache_key: tuple[str, str, str],
+        now: float,
+    ) -> str:
+        access_token, expires_in = self._fetch_service_token(
+            requested_audience=requested_audience
+        )
+        ttl_seconds = 60
+        if isinstance(expires_in, int) and not isinstance(expires_in, bool) and expires_in > 0:
+            ttl_seconds = max(
+                1,
+                min(
+                    expires_in - _SERVICE_TOKEN_CACHE_SKEW_SECONDS,
+                    _SERVICE_TOKEN_CACHE_MAX_SECONDS,
+                ),
+            )
+        _SERVICE_TOKEN_CACHE[cache_key] = (access_token, now + ttl_seconds)
+        return access_token
+
+    def _fetch_service_token(self, *, requested_audience: str) -> tuple[str, int | None]:
         logger.debug(
             "security_service_token_start",
             audience=requested_audience,
@@ -484,13 +544,18 @@ class SecurityOAuthClient:
         access_token = payload.get("accessToken")
         token_type = payload.get("tokenType")
         returned_audience = payload.get("audience")
+        expires_in = payload.get("expiresIn")
         if not isinstance(access_token, str) or not access_token:
             raise SecurityTokenError("Security service-token response has no accessToken")
         if token_type != "Bearer":
             raise SecurityTokenError("Security service-token response has invalid tokenType")
         if returned_audience != requested_audience:
             raise SecurityTokenError("Security service-token response audience mismatch")
-        return access_token
+        if expires_in is not None and (
+            not isinstance(expires_in, int) or isinstance(expires_in, bool) or expires_in <= 0
+        ):
+            raise SecurityTokenError("Security service-token response has invalid expiresIn")
+        return access_token, expires_in
 
 
 def _safe_service_error(response: httpx.Response) -> str:
