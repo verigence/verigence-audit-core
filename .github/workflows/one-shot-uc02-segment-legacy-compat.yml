@@ -1,0 +1,57 @@
+name: One-shot UC02 Segment Legacy Compatibility
+
+on:
+  pull_request:
+    branches:
+      - dev
+    paths:
+      - .github/workflows/one-shot-uc02-segment-legacy-compat.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.head_ref == 'feature/uc02-universal-segments'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/uc02-universal-segments
+          fetch-depth: 0
+      - name: Preserve legacy Product Category compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/audit_core/project_provisioning.py')
+          text = p.read_text()
+          old = '''        selected_segment_ids = set(request.segmentIds)\n        if configured_segment_ids and not selected_segment_ids:\n            raise BusinessValidationError(\n                detail="Select at least one active Segment."\n            )\n        if not selected_segment_ids.issubset(configured_segment_ids):\n'''
+          new = '''        selected_segment_ids = set(request.segmentIds)\n        legacy_product_category = request.productCategoryId is not None\n        if configured_segment_ids and not selected_segment_ids and not legacy_product_category:\n            raise BusinessValidationError(\n                detail="Select at least one active Segment."\n            )\n        if not selected_segment_ids.issubset(configured_segment_ids):\n'''
+          if old not in text:
+              raise SystemExit('project_provisioning compatibility source not found')
+          p.write_text(text.replace(old, new))
+
+          p = Path('src/audit_core/readiness.py')
+          text = p.read_text()
+          old = '''            SELECT p.project_name, p.oem_id, o.oem_code, p.effective_start_date,\n                   p.timezone_name, p.project_status,\n'''
+          new = '''            SELECT p.project_name, p.oem_id, p.product_category_id, o.oem_code, p.effective_start_date,\n                   p.timezone_name, p.project_status,\n'''
+          if old not in text:
+              raise SystemExit('readiness project-state source not found')
+          text = text.replace(old, new)
+          old = '''    segment_selection_complete = (\n        int(project["configured_segments"]) == 0 or int(project["selected_segments"]) > 0\n    )\n'''
+          new = '''    segment_selection_complete = (\n        project["product_category_id"] is not None\n        or int(project["configured_segments"]) == 0\n        or int(project["selected_segments"]) > 0\n    )\n'''
+          if old not in text:
+              raise SystemExit('readiness compatibility source not found')
+          p.write_text(text.replace(old, new))
+          PY
+
+          python -m compileall -q src tests
+          find src tests -type d -name __pycache__ -prune -exec rm -rf {} +
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/audit_core/project_provisioning.py src/audit_core/readiness.py
+          git commit -m 'fix(uc02): preserve legacy category project compatibility'
+          git push origin HEAD:feature/uc02-universal-segments
