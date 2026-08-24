@@ -1,0 +1,75 @@
+name: Diagnose Master Reset Scope
+
+on:
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  scope:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Inspect tenant master tables and FKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install 'sqlalchemy>=2.0' 'psycopg[binary]' >/dev/null
+          npm install --global @railway/cli >/dev/null
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/vars.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from sqlalchemy import create_engine, text
+          v=json.loads(Path('/tmp/vars.json').read_text())
+          url=str(v['DATABASE_URL'])
+          if url.startswith('postgresql://'): url='postgresql+psycopg://' + url.split('://',1)[1]
+          elif url.startswith('postgres://'): url='postgresql+psycopg://' + url.split('://',1)[1]
+          e=create_engine(url)
+          with e.begin() as c:
+              tenant=c.execute(text("SELECT tenant_id FROM auditcore.projects WHERE lower(project_name)=lower('MahindraOrissa')")).scalar_one()
+              c.execute(text("SELECT set_config('app.current_tenant_id', :t, true)"), {'t':tenant})
+              tables=c.execute(text("""
+                SELECT table_name FROM information_schema.columns
+                WHERE table_schema='auditcore' AND column_name='tenant_id'
+                  AND (table_name ILIKE '%master%' OR table_name ILIKE '%price%' OR table_name ILIKE '%discount%'
+                       OR table_name ILIKE '%policy%' OR table_name ILIKE '%requirement%' OR table_name ILIKE '%control%'
+                       OR table_name ILIKE 'product_%')
+                ORDER BY table_name
+              """)).scalars().all()
+              for t in tables:
+                  try:
+                      n=c.execute(text(f'SELECT count(*) FROM auditcore.{t} WHERE tenant_id=:tenant'), {'tenant':tenant}).scalar_one()
+                      print(f'COUNT|{t}|{n}')
+                  except Exception as ex:
+                      print(f'COUNT_FAIL|{t}|{type(ex).__name__}|{ex}')
+              fks=c.execute(text("""
+                SELECT tc.table_name AS child_table, kcu.column_name AS child_column,
+                       ccu.table_name AS parent_table, ccu.column_name AS parent_column,
+                       rc.delete_rule
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                  ON tc.constraint_name=kcu.constraint_name AND tc.constraint_schema=kcu.constraint_schema
+                JOIN information_schema.constraint_column_usage ccu
+                  ON ccu.constraint_name=tc.constraint_name AND ccu.constraint_schema=tc.constraint_schema
+                JOIN information_schema.referential_constraints rc
+                  ON rc.constraint_name=tc.constraint_name AND rc.constraint_schema=tc.constraint_schema
+                WHERE tc.constraint_schema='auditcore' AND tc.constraint_type='FOREIGN KEY'
+                  AND (tc.table_name = ANY(:tables) OR ccu.table_name = ANY(:tables))
+                ORDER BY parent_table, child_table, child_column
+              """), {'tables':tables}).mappings().all()
+              for r in fks:
+                  print(f"FK|{r['child_table']}.{r['child_column']}->{r['parent_table']}.{r['parent_column']}|delete={r['delete_rule']}")
+          e.dispose()
+          PY
