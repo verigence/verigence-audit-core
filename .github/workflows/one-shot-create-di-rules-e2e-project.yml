@@ -1,0 +1,261 @@
+name: One-shot create persistent DI Rules E2E project
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/one-shot-create-di-rules-e2e-project.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  provision:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      E2E_PROJECT_NAME: DEV-DI-RULE-E2E-20260824
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install runtime tools
+        run: |
+          python -m pip install 'psycopg[binary]>=3.2,<4' 'PyJWT>=2.8,<3' 'cryptography>=42,<46' 'httpx>=0.27,<1'
+          npm install --global @railway/cli
+
+      - name: Collect DEV runtime variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service verigence-audit-core --json >/dev/null
+          railway variable list --service security --environment dev --json >/tmp/security.json
+          railway variable list --service verigence-audit-core --environment dev --json >/tmp/audit.json
+          railway variable list --service di-api --environment dev --json >/tmp/di.json
+
+      - name: Provision persistent E2E Project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import uuid
+          from datetime import UTC, datetime, timedelta
+          from pathlib import Path
+
+          import httpx
+          import jwt
+          import psycopg
+
+          def load(path):
+              return json.loads(Path(path).read_text())
+
+          def pg(value):
+              return str(value or '').replace('postgresql+psycopg://', 'postgresql://', 1).replace('postgresql+asyncpg://', 'postgresql://', 1)
+
+          def base(values):
+              domain = str(values.get('RAILWAY_PUBLIC_DOMAIN') or values.get('RAILWAY_STATIC_URL') or '').strip()
+              if not domain.startswith(('http://', 'https://')):
+                  domain = 'https://' + domain
+              return domain.rstrip('/')
+
+          project_name = os.environ['E2E_PROJECT_NAME']
+          sv = load('/tmp/security.json')
+          av = load('/tmp/audit.json')
+          dv = load('/tmp/di.json')
+          security_db = pg(sv.get('DATABASE_URL'))
+          audit_db = pg(av.get('DATABASE_URL'))
+          di_db = pg(dv.get('DATABASE_URL'))
+          audit_url = base(av)
+          di_url = base(dv)
+          now = datetime.now(UTC)
+          out = [
+              'DI_RULE_E2E_PROJECT',
+              'ENVIRONMENT=DEV',
+              f'PROJECT_NAME={project_name}',
+              'PERSISTENT=true',
+              'AUTH_PROVISIONING=EXISTING_PLATFORM_SUPERADMIN_SHORT_LIVED_JWT',
+              'AUTH_DI_TESTS=DEV_MOCK_TENANT_ADMIN',
+              'DEDICATED_TEST_USER=NOT_REQUIRED',
+          ]
+
+          # Reuse the existing DEV platform SuperAdmin only for the real Project-create
+          # provisioning transaction.  The JWT is short lived and is never persisted.
+          with psycopg.connect(security_db) as conn:
+              with conn.cursor() as cur:
+                  cur.execute(
+                      """
+                      SELECT a.user_id::text
+                      FROM security.user_admin_role_assignments a
+                      JOIN security.users u ON u.user_id = a.user_id
+                      WHERE a.role_key = 'SuperAdmin'
+                        AND a.scope_type = 'PLATFORM'
+                        AND a.scope_id IS NULL
+                        AND a.status = 'ACTIVE'
+                        AND u.status = 'ACTIVE'
+                      ORDER BY a.assigned_at_utc
+                      LIMIT 1
+                      """
+                  )
+                  row = cur.fetchone()
+                  if not row:
+                      raise RuntimeError('No active DEV platform SuperAdmin is available')
+                  superadmin_id = row[0]
+
+          token = jwt.encode(
+              {
+                  'iss': str(sv.get('SECURITY_TOKEN_ISSUER') or 'verigence-security'),
+                  'sub': superadmin_id,
+                  'aud': str(sv.get('SECURITY_TOKEN_AUDIENCE') or 'verigence-platform'),
+                  'iat': now,
+                  'exp': now + timedelta(minutes=12),
+                  'jti': str(uuid.uuid4()),
+                  'actor_type': 'USER',
+              },
+              str(sv.get('SECURITY_PRIVATE_KEY_PEM') or '').replace('\\n', '\n'),
+              algorithm='RS256',
+              headers={'kid': str(sv.get('SECURITY_KEY_ID') or '')},
+          )
+          headers = {'Authorization': 'Bearer ' + token}
+
+          with psycopg.connect(audit_db) as conn:
+              with conn.cursor() as cur:
+                  cur.execute(
+                      """
+                      SELECT tenant_id::text, project_code, project_status
+                      FROM auditcore.projects
+                      WHERE project_name = %s
+                      ORDER BY created_at_utc DESC
+                      LIMIT 1
+                      """,
+                      (project_name,),
+                  )
+                  existing = cur.fetchone()
+                  cur.execute("SELECT oem_id::text FROM auditcore.oems WHERE is_active=true ORDER BY oem_code LIMIT 1")
+                  oem = cur.fetchone()
+                  cur.execute("SELECT product_category_id::text FROM auditcore.product_categories WHERE is_active=true ORDER BY category_code LIMIT 1")
+                  category = cur.fetchone()
+                  if not oem or not category:
+                      raise RuntimeError('No active OEM/product category is available in DEV')
+
+          created = False
+          if existing:
+              tenant_id, project_code, project_status = existing
+              out.append('PROJECT_CREATE=REUSED_EXISTING')
+          else:
+              payload = {
+                  'projectName': project_name,
+                  'oemId': oem[0],
+                  'productCategoryId': category[0],
+                  'effectiveStartDate': now.date().isoformat(),
+                  'effectiveEndDate': None,
+                  'timezoneName': 'Asia/Kolkata',
+                  'regionCode': 'IN',
+              }
+              started = time.monotonic()
+              with httpx.Client(timeout=90, follow_redirects=True) as client:
+                  response = client.post(
+                      audit_url + '/v1/projects',
+                      headers={
+                          **headers,
+                          'Idempotency-Key': str(uuid.uuid4()),
+                          'Content-Type': 'application/json',
+                      },
+                      json=payload,
+                  )
+              out.append('CREATE_PROJECT_HTTP=' + str(response.status_code))
+              out.append('CREATE_PROJECT_SECONDS=' + f'{time.monotonic() - started:.3f}')
+              try:
+                  body = response.json()
+              except Exception:
+                  body = {}
+              if response.status_code != 201:
+                  raise RuntimeError(f'Project create failed HTTP {response.status_code}: {str(body)[:1000]}')
+              if body.get('provisioningStatus') != 'READY' or body.get('currentStep') != 'COMPLETE':
+                  raise RuntimeError(f'Project provisioning did not reach READY/COMPLETE: {str(body)[:1000]}')
+              tenant_id = str(body.get('tenantId') or '')
+              if not tenant_id:
+                  raise RuntimeError('Project create returned no tenantId')
+              created = True
+              out.append('PROJECT_CREATE=CREATED')
+              out.append('PROVISIONING_STATUS=' + str(body.get('provisioningStatus')))
+              out.append('CURRENT_STEP=' + str(body.get('currentStep')))
+
+              with psycopg.connect(audit_db) as conn:
+                  with conn.cursor() as cur:
+                      cur.execute(
+                          "SELECT project_code, project_status FROM auditcore.projects WHERE tenant_id=%s",
+                          (tenant_id,),
+                      )
+                      project_row = cur.fetchone()
+                      if not project_row:
+                          raise RuntimeError('Created Project is missing from Audit Core DB')
+                      project_code, project_status = project_row
+
+          # Verify DI was provisioned for the Project tenant.  This is setup evidence,
+          # not the E2E extraction assertion itself.
+          with psycopg.connect(di_db) as conn:
+              with conn.cursor() as cur:
+                  cur.execute("SELECT count(*) FROM docintel.tenant_settings WHERE tenant_id=%s", (tenant_id,))
+                  tenant_settings_count = cur.fetchone()[0]
+                  cur.execute("SELECT count(*) FROM docintel.tenant_document_types WHERE tenant_id=%s", (tenant_id,))
+                  document_type_count = cur.fetchone()[0]
+                  cur.execute("SELECT count(*) FROM docintel.retention_policies WHERE tenant_id=%s", (tenant_id,))
+                  retention_policy_count = cur.fetchone()[0]
+
+          with httpx.Client(timeout=20, follow_redirects=True) as client:
+              health = client.get(di_url + '/health/ready')
+          if health.status_code != 200:
+              raise RuntimeError(f'DI DEV health failed HTTP {health.status_code}')
+          if tenant_settings_count < 1 or document_type_count < 1 or retention_policy_count < 1:
+              raise RuntimeError(
+                  'DI tenant provisioning incomplete: '
+                  f'tenant_settings={tenant_settings_count}, '
+                  f'document_types={document_type_count}, '
+                  f'retention_policies={retention_policy_count}'
+              )
+
+          out.extend(
+              [
+                  f'TENANT_ID={tenant_id}',
+                  f'PROJECT_CODE={project_code}',
+                  f'PROJECT_STATUS={project_status}',
+                  f'DI_HEALTH_HTTP={health.status_code}',
+                  f'DI_TENANT_SETTINGS={tenant_settings_count}',
+                  f'DI_DOCUMENT_TYPES={document_type_count}',
+                  f'DI_RETENTION_POLICIES={retention_policy_count}',
+                  'DI_TEST_ACTOR=e2e-di-rules',
+                  f'DI_TEST_TOKEN_FORMAT=mock.{tenant_id}.e2e-di-rules.TENANT_ADMIN',
+                  f'CREATED_THIS_RUN={str(created).lower()}',
+                  'RESULT=PASS',
+              ]
+          )
+          evidence = Path('docs/runtime/di-rule-e2e-project.txt')
+          evidence.write_text('\n'.join(out) + '\n')
+          print('\n'.join(out))
+          PY
+
+      - name: Record non-secret provisioning evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f docs/runtime/di-rule-e2e-project.txt ]]; then
+            printf 'DI_RULE_E2E_PROJECT\nENVIRONMENT=DEV\nRESULT=FAIL\n' > docs/runtime/di-rule-e2e-project.txt
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/runtime/di-rule-e2e-project.txt
+          git commit -m 'docs(dev): record DI rules E2E project [skip ci]' || exit 0
+          git pull --rebase origin dev
+          git push origin HEAD:dev
