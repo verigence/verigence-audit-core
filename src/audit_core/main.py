@@ -22,6 +22,7 @@ from audit_core.journeys import router as journey_router
 from audit_core.logging_config import configure_logging
 from audit_core.mahindra_native_effective_date import install_native_effective_date
 from audit_core.mahindra_native_workbooks import install_native_workbook_parser
+from audit_core.mahindra_upload_state import router as mahindra_upload_state_router
 from audit_core.observability import install_observability
 from audit_core.otel import configure_otlp
 from audit_core.payments_finance import router as payments_finance_router
@@ -111,6 +112,9 @@ def create_app() -> FastAPI:
     application.include_router(uc03_audit_router)
     application.include_router(readiness_router)
     application.include_router(project_activation_router)
+    # Persisted Mahindra upload state and native-workbook upload endpoints must precede the
+    # original generated-template routes. Native OEM files may carry their own WEF.
+    application.include_router(mahindra_upload_state_router)
     # Mahindra OEM-specific segment uploads are registered before the generic master
     # routes. Native OEM workbooks are normalized at upload time into Product + dynamic
     # Price masters; the older generated-template contract remains available as fallback.
