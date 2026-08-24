@@ -1,0 +1,82 @@
+name: Diagnose UC02 Full Readiness
+
+on:
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose-full:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Inspect full readiness and staged rows
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e . 'psycopg[binary]' >/dev/null
+          npm install --global @railway/cli >/dev/null
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/vars.json
+          python - <<'PY'
+          import json, os, traceback
+          from pathlib import Path
+          from types import SimpleNamespace
+          from sqlalchemy import create_engine, text
+          from audit_core.db import set_tenant_context
+          from audit_core import readiness
+
+          variables=json.loads(Path('/tmp/vars.json').read_text())
+          for key in ('SECURITY_BASE_URL','DI_BASE_URL'):
+              value=str(variables.get(key,'')).strip()
+              print(f'ENV|{key}|present={bool(value)}')
+              if value: os.environ[key]=value
+          url=str(variables['DATABASE_URL'])
+          if url.startswith('postgresql://'):
+              url='postgresql+psycopg://' + url.split('://',1)[1]
+          elif url.startswith('postgres://'):
+              url='postgresql+psycopg://' + url.split('://',1)[1]
+          engine=create_engine(url)
+          with engine.begin() as c:
+              tenant=c.execute(text("SELECT tenant_id FROM auditcore.projects WHERE lower(project_name)=lower('MahindraOrissa')")).scalar_one()
+              set_tenant_context(c, tenant)
+              print('--- BEV IMPORT SAMPLES ---')
+              imports=c.execute(text("""
+                SELECT i.import_id, i.created_at_utc, i.original_file_name, i.rows_parsed
+                FROM auditcore.project_master_imports i
+                JOIN auditcore.segments s ON s.segment_id=i.segment_id
+                WHERE i.tenant_id=:tenant AND s.segment_code='BATTERY_ELECTRIC'
+                  AND i.master_key='MAHINDRA_SEGMENT_MASTER'
+                ORDER BY i.created_at_utc DESC
+              """), {'tenant':tenant}).mappings().all()
+              for item in imports:
+                  sample=c.execute(text("""
+                    SELECT parsed_data FROM auditcore.project_master_import_rows
+                    WHERE tenant_id=:tenant AND import_id=:import_id
+                    ORDER BY row_number LIMIT 1
+                  """), {'tenant':tenant,'import_id':item['import_id']}).scalar_one_or_none()
+                  print(f"BEV_IMPORT|{item['import_id']}|{item['original_file_name']}|rows={item['rows_parsed']}|sample={json.dumps(sample, default=str, sort_keys=True)[:1800]}")
+
+              print('--- FULL READINESS ---')
+              try:
+                  result=readiness.evaluate_project_readiness(
+                      tenant_id=tenant,
+                      admin_request=SimpleNamespace(bearer_token='diagnostic-invalid-token'),
+                      connection=c,
+                  )
+                  print('FULL_READINESS|PASS|' + result.model_dump_json())
+              except Exception as exc:
+                  print('FULL_READINESS|FAIL|' + type(exc).__name__ + '|' + str(exc))
+                  traceback.print_exc()
+          engine.dispose()
+          PY
