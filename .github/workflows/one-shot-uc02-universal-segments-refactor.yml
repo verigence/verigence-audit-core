@@ -1,17 +1,20 @@
 name: One-shot UC02 Universal Segments Refactor
 
 on:
-  push:
+  pull_request:
     branches:
-      - feature/uc02-universal-segments
+      - dev
     paths:
       - .github/workflows/one-shot-uc02-universal-segments-refactor.yml
+      - migrations/versions/0015_uc02_universal_segments.py
+      - src/audit_core/project_reference_data.py
 
 permissions:
   contents: write
 
 jobs:
   refactor:
+    if: github.head_ref == 'feature/uc02-universal-segments'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -96,7 +99,6 @@ jobs:
                   text += section
               doc.write_text(text)
 
-          # Safety checks: the runtime model must not retain OEM-owned Segment SQL.
           bad = []
           for path in Path('src').rglob('*.py'):
               text = path.read_text()
