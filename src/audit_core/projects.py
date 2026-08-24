@@ -88,7 +88,7 @@ def _segment_rows(connection: Connection, tenant_id: str):
             """
             SELECT s.segment_id, s.segment_code, s.segment_name
             FROM auditcore.project_segments ps
-            JOIN auditcore.oem_segments s ON s.segment_id = ps.segment_id
+            JOIN auditcore.segments s ON s.segment_id = ps.segment_id
             WHERE ps.tenant_id=:tenant_id
             ORDER BY s.segment_name, s.segment_code
             """
@@ -219,8 +219,8 @@ def _validate_segment_ids(
         connection.execute(
             text(
                 """
-                SELECT segment_id FROM auditcore.oem_segments
-                WHERE oem_id=:oem_id AND is_active=true
+                SELECT segment_id FROM auditcore.segments
+                WHERE is_active=true
                 """
             ),
             {"oem_id": oem_id},
@@ -229,11 +229,11 @@ def _validate_segment_ids(
     selected = set(segment_ids)
     if configured and not selected:
         raise BusinessValidationError(
-            detail="Select at least one Segment configured for the chosen OEM."
+            detail="Select at least one active Segment."
         )
     if not selected.issubset(configured):
         raise BusinessValidationError(
-            detail="Every selected Segment must belong to the chosen OEM and be active."
+            detail="Every selected Segment must reference an active universal Segment."
         )
 
 

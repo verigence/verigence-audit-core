@@ -116,7 +116,7 @@ def resolve_sellable_configuration(
             JOIN auditcore.oems o ON o.oem_id = s.oem_id
             JOIN auditcore.product_models m ON m.model_id = s.model_id
             JOIN auditcore.product_variants v ON v.variant_id = s.variant_id
-            LEFT JOIN auditcore.oem_segments seg ON seg.segment_id = m.segment_id
+            LEFT JOIN auditcore.segments seg ON seg.segment_id = m.segment_id
             LEFT JOIN auditcore.product_configurations pc
               ON pc.configuration_id = s.configuration_id
             LEFT JOIN auditcore.colours c ON c.colour_id = s.colour_id

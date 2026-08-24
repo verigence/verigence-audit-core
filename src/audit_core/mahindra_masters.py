@@ -207,7 +207,7 @@ def _selected_segments(connection: Connection, tenant_id: str):
             """
             SELECT s.segment_id, s.segment_code, s.segment_name
             FROM auditcore.project_segments ps
-            JOIN auditcore.oem_segments s ON s.segment_id=ps.segment_id
+            JOIN auditcore.segments s ON s.segment_id=ps.segment_id
             WHERE ps.tenant_id=:tenant_id AND s.is_active=true
             ORDER BY s.segment_name, s.segment_code
             """
@@ -222,8 +222,8 @@ def _require_selected_segment(connection: Connection, tenant_id: str, segment_id
             """
             SELECT s.segment_id, s.segment_code, s.segment_name
             FROM auditcore.project_segments ps
-            JOIN auditcore.oem_segments s ON s.segment_id=ps.segment_id
-            JOIN auditcore.projects p ON p.tenant_id=ps.tenant_id AND p.oem_id=s.oem_id
+            JOIN auditcore.segments s ON s.segment_id=ps.segment_id
+            JOIN auditcore.projects p ON p.tenant_id=ps.tenant_id
             JOIN auditcore.oems o ON o.oem_id=p.oem_id
             WHERE ps.tenant_id=:tenant_id
               AND ps.segment_id=:segment_id
@@ -562,7 +562,7 @@ def _import_record(connection: Connection, tenant_id: str, import_id: UUID):
                    i.error_rows, i.confirmation_receipt,
                    s.segment_code
             FROM auditcore.project_master_imports i
-            LEFT JOIN auditcore.oem_segments s ON s.segment_id=i.segment_id
+            LEFT JOIN auditcore.segments s ON s.segment_id=i.segment_id
             WHERE i.tenant_id=:tenant_id AND i.import_id=:import_id
             """
         ),

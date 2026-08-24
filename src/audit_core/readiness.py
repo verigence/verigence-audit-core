@@ -70,8 +70,8 @@ def _project_state(connection: Connection, tenant_id: str):
             """
             SELECT p.project_name, p.oem_id, o.oem_code, p.effective_start_date,
                    p.timezone_name, p.project_status,
-                   (SELECT count(*) FROM auditcore.oem_segments os
-                    WHERE os.oem_id=p.oem_id AND os.is_active=true) AS configured_segments,
+                   (SELECT count(*) FROM auditcore.segments s
+                    WHERE s.is_active=true) AS configured_segments,
                    (SELECT count(*) FROM auditcore.project_segments ps
                     WHERE ps.tenant_id=p.tenant_id) AS selected_segments
             FROM auditcore.projects p
@@ -110,7 +110,7 @@ def _project_setup_check(project) -> ReadinessCheck:
         message=(
             "Project setup is complete."
             if complete
-            else "Complete the required Project Details and OEM Segment selection before activation."
+            else "Complete the required Project Details and Segment selection before activation."
         ),
         targetTask="PROJECT_DETAILS",
     )
@@ -236,7 +236,7 @@ def _mahindra_master_gaps(connection: Connection, tenant_id: str) -> list[str]:
             """
             SELECT s.segment_id, s.segment_name, s.segment_code
             FROM auditcore.project_segments ps
-            JOIN auditcore.oem_segments s ON s.segment_id=ps.segment_id
+            JOIN auditcore.segments s ON s.segment_id=ps.segment_id
             WHERE ps.tenant_id=:tenant_id
             ORDER BY s.segment_name
             """
