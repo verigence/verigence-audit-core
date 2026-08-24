@@ -10,7 +10,7 @@ from audit_core.db import set_tenant_context
 from audit_core.dependencies import (
     HumanAdminRequest,
     get_connection,
-    require_super_admin_request,
+    require_project_admin_request,
 )
 from audit_core.errors import (
     BusinessValidationError,
@@ -265,7 +265,7 @@ def _replace_segments(
 def get_project(
     tenant_id: str,
     response: Response,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> ProjectResponse:
     del admin_request
@@ -281,7 +281,7 @@ def patch_project(
     patch: ProjectPatch,
     response: Response,
     if_match: Annotated[str, Header(alias="If-Match", min_length=1)],
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> ProjectResponse:
     set_tenant_context(connection, tenant_id)

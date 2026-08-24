@@ -12,7 +12,7 @@ from audit_core.db import set_tenant_context
 from audit_core.dependencies import (
     HumanAdminRequest,
     get_connection,
-    require_super_admin_request,
+    require_project_admin_request,
 )
 from audit_core.di_client import DiClient, DiClientError
 from audit_core.errors import NotFoundError
@@ -522,7 +522,7 @@ def evaluate_project_readiness(
 @router.get("/readiness", response_model=ProjectReadinessResponse)
 def get_project_readiness(
     tenant_id: str,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> ProjectReadinessResponse:
     return evaluate_project_readiness(

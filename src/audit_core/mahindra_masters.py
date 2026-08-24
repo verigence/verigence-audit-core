@@ -19,7 +19,7 @@ from audit_core.db import set_tenant_context
 from audit_core.dependencies import (
     HumanAdminRequest,
     get_connection,
-    require_super_admin_request,
+    require_project_admin_request,
 )
 from audit_core.errors import ConflictError, NotFoundError, ValidationError
 from audit_core.idempotency import stable_request_hash
@@ -1080,7 +1080,7 @@ def _confirm_discount_policy(connection: Connection, *, tenant_id: str, import_r
 @router.get("/options", response_model=MahindraMasterOptionsResponse)
 def get_options(
     tenant_id: str,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> MahindraMasterOptionsResponse:
     del admin_request
@@ -1113,7 +1113,7 @@ def get_options(
 def download_segment_template(
     tenant_id: str,
     segment_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ):
     del admin_request
@@ -1134,7 +1134,7 @@ def download_segment_template(
 @router.get("/discount-policy/template")
 def download_discount_policy_template(
     tenant_id: str,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ):
     del admin_request
@@ -1155,7 +1155,7 @@ async def upload_segment_master(
     effective_from: Annotated[date, Form(alias="effectiveFrom")],
     file: Annotated[UploadFile, File()],
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1)],
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> MahindraImportResponse:
     set_tenant_context(connection, tenant_id)
@@ -1184,7 +1184,7 @@ async def upload_discount_policy(
     effective_from: Annotated[date, Form(alias="effectiveFrom")],
     file: Annotated[UploadFile, File()],
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1)],
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> MahindraImportResponse:
     set_tenant_context(connection, tenant_id)
@@ -1211,7 +1211,7 @@ async def upload_discount_policy(
 def confirm_import(
     tenant_id: str,
     import_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> MahindraImportResponse:
     set_tenant_context(connection, tenant_id)
@@ -1276,7 +1276,7 @@ def confirm_import(
 def publish_import(
     tenant_id: str,
     import_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> MahindraImportResponse:
     set_tenant_context(connection, tenant_id)

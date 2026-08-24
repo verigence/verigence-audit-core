@@ -12,7 +12,7 @@ from audit_core.db import set_tenant_context
 from audit_core.dependencies import (
     HumanAdminRequest,
     get_connection,
-    require_super_admin_request,
+    require_project_admin_request,
 )
 from audit_core.discount_schemes import (
     publish_discount_scheme_version,
@@ -525,7 +525,7 @@ def retire_audit_core_version(
 @router.get("", response_model=list[MasterDescriptor])
 def get_project_master_catalogue(
     tenant_id: str,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> list[MasterDescriptor]:
     set_tenant_context(connection, tenant_id)
@@ -540,7 +540,7 @@ def get_master_versions(
     tenant_id: str,
     owner_module: OwnerModule,
     master_key: str,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> list[MasterVersionResponse]:
     set_tenant_context(connection, tenant_id)
@@ -564,7 +564,7 @@ def publish_master_facade(
     owner_module: OwnerModule,
     master_key: str,
     version_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> MasterVersionResponse:
     set_tenant_context(connection, tenant_id)
@@ -593,7 +593,7 @@ def retire_master_facade(
     owner_module: OwnerModule,
     master_key: str,
     version_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> MasterVersionResponse:
     set_tenant_context(connection, tenant_id)

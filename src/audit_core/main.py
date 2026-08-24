@@ -27,6 +27,7 @@ from audit_core.observability import install_observability
 from audit_core.otel import configure_otlp
 from audit_core.payments_finance import router as payments_finance_router
 from audit_core.project_activation import router as project_activation_router
+from audit_core.project_master_admin import router as project_master_admin_router
 from audit_core.project_master_imports import router as project_master_import_router
 from audit_core.project_masters import router as project_master_router
 from audit_core.project_provisioning import router as project_provisioning_router
@@ -123,6 +124,7 @@ def create_app() -> FastAPI:
     # before the older owner-module dynamic routes so DI requests cannot fall into
     # the Audit-Core-only rejection branches.
     application.include_router(di_project_master_proxy_router)
+    application.include_router(project_master_admin_router)
     application.include_router(project_master_router)
     application.include_router(project_master_import_router)
     application.include_router(dealer_router)

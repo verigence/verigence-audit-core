@@ -11,7 +11,11 @@ from pydantic import BaseModel
 from sqlalchemy import Connection, text
 
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import HumanAdminRequest, get_connection, require_project_admin_request
+from audit_core.dependencies import (
+    HumanAdminRequest,
+    get_connection,
+    require_project_admin_request,
+)
 from audit_core.errors import ConflictError, NotFoundError
 
 logger = structlog.get_logger(__name__)

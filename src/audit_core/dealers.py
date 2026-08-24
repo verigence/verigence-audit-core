@@ -10,7 +10,7 @@ from audit_core.db import set_tenant_context
 from audit_core.dependencies import (
     HumanAdminRequest,
     get_connection,
-    require_super_admin_request,
+    require_project_admin_request,
 )
 from audit_core.errors import (
     BusinessValidationError,
@@ -280,7 +280,7 @@ def create_dealer(
     tenant_id: str,
     payload: DealerCreate,
     response: Response,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> DealerResponse:
     set_tenant_context(connection, tenant_id)
@@ -314,7 +314,7 @@ def create_dealer(
 @router.get("/dealers", response_model=list[DealerResponse])
 def list_dealers(
     tenant_id: str,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> list[DealerResponse]:
     set_tenant_context(connection, tenant_id)
@@ -337,7 +337,7 @@ def get_dealer(
     tenant_id: str,
     dealer_id: UUID,
     response: Response,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> DealerResponse:
     set_tenant_context(connection, tenant_id)
@@ -364,7 +364,7 @@ def patch_dealer(
     payload: DealerPatch,
     response: Response,
     if_match: Annotated[str, Header(alias="If-Match", min_length=1)],
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> DealerResponse:
     set_tenant_context(connection, tenant_id)
@@ -433,7 +433,7 @@ def patch_dealer(
 def dealer_deletion_impact(
     tenant_id: str,
     dealer_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> DeletionImpactResponse:
     set_tenant_context(connection, tenant_id)
@@ -451,7 +451,7 @@ def delete_dealer(
     tenant_id: str,
     dealer_id: UUID,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1)],
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> Response:
     set_tenant_context(connection, tenant_id)
@@ -500,7 +500,7 @@ def create_outlet(
     dealer_id: UUID,
     payload: OutletCreate,
     response: Response,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> OutletResponse:
     set_tenant_context(connection, tenant_id)
@@ -554,7 +554,7 @@ def create_outlet(
 def list_outlets(
     tenant_id: str,
     dealer_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> list[OutletResponse]:
     set_tenant_context(connection, tenant_id)
@@ -581,7 +581,7 @@ def get_outlet(
     dealer_id: UUID,
     outlet_id: UUID,
     response: Response,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> OutletResponse:
     set_tenant_context(connection, tenant_id)
@@ -613,7 +613,7 @@ def patch_outlet(
     payload: OutletPatch,
     response: Response,
     if_match: Annotated[str, Header(alias="If-Match", min_length=1)],
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> OutletResponse:
     set_tenant_context(connection, tenant_id)
@@ -697,7 +697,7 @@ def outlet_deletion_impact(
     tenant_id: str,
     dealer_id: UUID,
     outlet_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> DeletionImpactResponse:
     set_tenant_context(connection, tenant_id)
@@ -719,7 +719,7 @@ def delete_outlet(
     dealer_id: UUID,
     outlet_id: UUID,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1)],
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> Response:
     set_tenant_context(connection, tenant_id)
