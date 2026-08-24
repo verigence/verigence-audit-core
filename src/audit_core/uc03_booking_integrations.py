@@ -62,6 +62,13 @@ def _active_booking(state: Any) -> bool:
     }
 
 
+def _audit_context_ref(journey_id: UUID, customer_id: object) -> str:
+    """Return the frozen DI Audit storage-context reference used at evidence intake."""
+    if customer_id is None:
+        raise ValueError("UC03 evidence is missing its customer lineage")
+    return f"audit-{journey_id}-{customer_id}"
+
+
 def _proposal_payload(fact: Any) -> dict[str, Any]:
     """Preserve the machine value and add optional DI source localization."""
     payload: dict[str, Any] = {"value": fact.value}
@@ -114,7 +121,9 @@ def _enrich_workspace_localization(
             continue
         page_no = localization.get("pageNo")
         region = localization.get("evidenceRegion")
-        proposal["pageNo"] = page_no if isinstance(page_no, int) and not isinstance(page_no, bool) else None
+        proposal["pageNo"] = (
+            page_no if isinstance(page_no, int) and not isinstance(page_no, bool) else None
+        )
         proposal["evidenceRegion"] = region if isinstance(region, dict) else None
 
 
@@ -149,7 +158,7 @@ def refresh_booking_extraction_strict(
     evidence_rows = connection.execute(
         text(
             """
-            SELECT e.evidence_id, e.di_subject_id, e.di_document_id,
+            SELECT e.evidence_id, e.customer_id, e.di_subject_id, e.di_document_id,
                    e.document_type_key
             FROM auditcore.evidence e
             LEFT JOIN auditcore.journey_document_requirements jdr
@@ -175,13 +184,18 @@ def refresh_booking_extraction_strict(
         ) from exc
 
     for evidence in evidence_rows:
-        if evidence["di_subject_id"] is None or evidence["di_document_id"] is None:
+        if (
+            evidence["customer_id"] is None
+            or evidence["di_subject_id"] is None
+            or evidence["di_document_id"] is None
+        ):
             continue
+        context_ref = _audit_context_ref(journey_id, evidence["customer_id"])
         try:
-            document = di_client.get_document(
+            document = di_client.get_audit_document(
                 token=token,
                 tenant_id=tenant_id,
-                subject_id=str(evidence["di_subject_id"]),
+                external_context_ref=context_ref,
                 document_id=str(evidence["di_document_id"]),
             )
             processing = (document.processing_status or "PENDING").upper()
@@ -208,10 +222,10 @@ def refresh_booking_extraction_strict(
             if processing not in _TERMINAL_PROCESSING_STATUSES:
                 continue
 
-            facts = di_client.get_document_facts(
+            facts = di_client.get_audit_document_facts(
                 token=token,
                 tenant_id=tenant_id,
-                subject_id=str(evidence["di_subject_id"]),
+                external_context_ref=context_ref,
                 document_id=str(evidence["di_document_id"]),
             )
             document_type = (
@@ -324,7 +338,7 @@ def get_booking_evidence_review_content(
     row = connection.execute(
         text(
             """
-            SELECT di_subject_id, di_document_id
+            SELECT customer_id, di_subject_id, di_document_id
             FROM auditcore.evidence
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
               AND evidence_id=:evidence_id AND association_status='ACTIVE'
@@ -336,19 +350,25 @@ def get_booking_evidence_review_content(
             "evidence_id": evidence_id,
         },
     ).mappings().one_or_none()
-    if row is None or row["di_subject_id"] is None or row["di_document_id"] is None:
+    if (
+        row is None
+        or row["customer_id"] is None
+        or row["di_subject_id"] is None
+        or row["di_document_id"] is None
+    ):
         raise NotFoundError(
             error_code="VAC-NF-006",
             title="Evidence not found",
             detail="The source document was not found for this Journey evidence.",
         )
 
+    context_ref = _audit_context_ref(journey_id, row["customer_id"])
     try:
         token = security_client.get_service_token(audience=_DI_AUDIENCE)
-        content, mime_type, content_disposition = di_client.get_document_content(
+        content, mime_type, content_disposition = di_client.get_audit_document_content(
             token=token,
             tenant_id=tenant_id,
-            subject_id=str(row["di_subject_id"]),
+            external_context_ref=context_ref,
             document_id=str(row["di_document_id"]),
         )
     except (DiClientError, SecurityTokenError) as exc:
