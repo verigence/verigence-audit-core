@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from audit_core import role_mappings
+from audit_core import mahindra_masters, role_mappings
 from audit_core.audit_review import router as audit_review_router
 from audit_core.bookings import router as booking_router
 from audit_core.commercials import router as commercials_router
@@ -20,7 +20,7 @@ from audit_core.findings import router as findings_router
 from audit_core.insurance_tradein import router as insurance_tradein_router
 from audit_core.journeys import router as journey_router
 from audit_core.logging_config import configure_logging
-from audit_core.mahindra_masters import router as mahindra_master_router
+from audit_core.mahindra_native_workbooks import install_native_workbook_parser
 from audit_core.observability import install_observability
 from audit_core.otel import configure_otlp
 from audit_core.payments_finance import router as payments_finance_router
@@ -52,7 +52,9 @@ from audit_core.uc03_project_context import router as uc03_project_context_route
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
 install_role_mapping_policy(role_mappings)
+install_native_workbook_parser(mahindra_masters)
 role_mapping_router = role_mappings.router
+mahindra_master_router = mahindra_masters.router
 
 _CORS_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 _CORS_HEADERS = [
@@ -108,8 +110,8 @@ def create_app() -> FastAPI:
     application.include_router(readiness_router)
     application.include_router(project_activation_router)
     # Mahindra OEM-specific segment uploads are registered before the generic master
-    # routes. They normalize one segment workbook into Product + dynamic Price masters
-    # while keeping the older generic import contract available for other OEMs.
+    # routes. Native OEM workbooks are normalized at upload time into Product + dynamic
+    # Price masters; the older generated-template contract remains available as fallback.
     application.include_router(mahindra_master_router)
     # Literal DI-owned Project Master and generic import routes must be registered
     # before the older owner-module dynamic routes so DI requests cannot fall into
