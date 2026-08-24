@@ -38,6 +38,8 @@ class DiFact:
     value_source: str
     confidence_score: float | None
     version_no: int
+    page_no: int | None = None
+    evidence_region: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -58,12 +60,7 @@ class DiClientError(RuntimeError):
 
 
 class DiClient:
-    """Audit Core adapter for DI's D8 HTTP contract.
-
-    Normal module-to-module operations use a Security-v2 ServiceIntegration token
-    with aud=di. Human administrative proxy calls pass the initiating Security
-    human token unchanged; the token policy is enforced by the DI route itself.
-    """
+    """Audit Core adapter for DI's D8 HTTP contract."""
 
     def __init__(
         self,
@@ -186,8 +183,6 @@ class DiClient:
         )
         return _document(payload)
 
-    # Existing human/operational document reads are kept for current Audit Core
-    # workflows. The adapter now unwraps D8 instead of expecting the payload at root.
     def get_document(
         self,
         *,
@@ -222,6 +217,27 @@ class DiClient:
         if not isinstance(fields, list):
             raise _contract_error()
         return tuple(_fact(item) for item in fields)
+
+    def get_document_content(
+        self,
+        *,
+        token: str,
+        tenant_id: str,
+        subject_id: str,
+        document_id: str,
+    ) -> tuple[bytes, str, str | None]:
+        """Fetch original DI bytes for an authorized Audit Core review façade."""
+        response = self._request_raw(
+            "GET",
+            f"/v1/tenants/{tenant_id}/subjects/{subject_id}/documents/{document_id}/content",
+            operation="get_document_content",
+            token=token,
+        )
+        return (
+            response.content,
+            response.headers.get("content-type", "application/octet-stream"),
+            response.headers.get("content-disposition"),
+        )
 
     def verify_document(
         self,
@@ -507,6 +523,9 @@ def _document(payload: dict[str, Any]) -> DiDocument:
 def _fact(payload: Any) -> DiFact:
     if not isinstance(payload, dict):
         raise _contract_error()
+    region = payload.get("evidenceRegion")
+    if region is not None and not isinstance(region, dict):
+        raise _contract_error()
     return DiFact(
         canonical_field_id=_required_str(payload, "canonicalFieldId"),
         field_key=_required_str(payload, "fieldKey"),
@@ -514,6 +533,8 @@ def _fact(payload: Any) -> DiFact:
         value_source=_required_str(payload, "valueSource"),
         confidence_score=_optional_float(payload, "confidenceScore"),
         version_no=_required_int(payload, "versionNo"),
+        page_no=_optional_int(payload, "pageNo"),
+        evidence_region=dict(region) if region is not None else None,
     )
 
 
@@ -556,6 +577,15 @@ def _optional_str(payload: dict[str, Any], key: str) -> str | None:
 
 def _required_int(payload: dict[str, Any], key: str) -> int:
     value = payload.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise _contract_error()
+    return value
+
+
+def _optional_int(payload: dict[str, Any], key: str) -> int | None:
+    value = payload.get(key)
+    if value is None:
+        return None
     if not isinstance(value, int) or isinstance(value, bool):
         raise _contract_error()
     return value
