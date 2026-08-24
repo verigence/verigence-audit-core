@@ -16,7 +16,7 @@ from audit_core.dependencies import (
 router = APIRouter(prefix="/v1", tags=["project-reference-data"])
 
 
-class OemSegmentReferenceResponse(BaseModel):
+class SegmentReferenceResponse(BaseModel):
     segmentId: UUID
     segmentCode: str
     segmentName: str
@@ -26,11 +26,11 @@ class OemReferenceResponse(BaseModel):
     oemId: UUID
     oemCode: str
     oemName: str
-    segments: list[OemSegmentReferenceResponse]
 
 
 class ProjectReferenceDataResponse(BaseModel):
     oems: list[OemReferenceResponse]
+    segments: list[SegmentReferenceResponse]
 
 
 @router.get("/project-reference-data", response_model=ProjectReferenceDataResponse)
@@ -41,43 +41,54 @@ def get_project_reference_data(
     del admin_request
     with engine.begin() as connection:
         connection.execute(text("SET LOCAL ROLE audit_core_runtime"))
-        rows = connection.execute(
+        oem_rows = connection.execute(
             text(
                 """
-                SELECT o.oem_id, o.oem_code, o.oem_name,
-                       s.segment_id, s.segment_code, s.segment_name
-                FROM auditcore.oems o
-                LEFT JOIN auditcore.oem_segments s
-                  ON s.oem_id = o.oem_id AND s.is_active = true
-                WHERE o.is_active = true
-                  AND o.oem_code IN (
+                SELECT oem_id, oem_code, oem_name
+                FROM auditcore.oems
+                WHERE is_active = true
+                  AND oem_code IN (
                       'MAHINDRA', 'HYUNDAI', 'MARUTI', 'MERCEDES_BENZ',
                       'BMW', 'SKODA', 'VOLKSWAGEN', 'TATA_MOTORS'
                   )
-                ORDER BY o.oem_name, o.oem_code, s.segment_name, s.segment_code
+                ORDER BY oem_name, oem_code
+                """
+            )
+        ).mappings().all()
+        segment_rows = connection.execute(
+            text(
+                """
+                SELECT segment_id, segment_code, segment_name
+                FROM auditcore.segments
+                WHERE is_active = true
+                  AND segment_code IN (
+                      'PASSENGER_VEHICLE', 'COMMERCIAL', 'BATTERY_ELECTRIC'
+                  )
+                ORDER BY CASE segment_code
+                    WHEN 'PASSENGER_VEHICLE' THEN 1
+                    WHEN 'COMMERCIAL' THEN 2
+                    WHEN 'BATTERY_ELECTRIC' THEN 3
+                    ELSE 99
+                END, segment_name
                 """
             )
         ).mappings().all()
 
-    grouped: dict[UUID, OemReferenceResponse] = {}
-    for row in rows:
-        oem_id = row["oem_id"]
-        oem = grouped.get(oem_id)
-        if oem is None:
-            oem = OemReferenceResponse(
-                oemId=oem_id,
+    return ProjectReferenceDataResponse(
+        oems=[
+            OemReferenceResponse(
+                oemId=row["oem_id"],
                 oemCode=row["oem_code"],
                 oemName=row["oem_name"],
-                segments=[],
             )
-            grouped[oem_id] = oem
-        if row["segment_id"] is not None:
-            oem.segments.append(
-                OemSegmentReferenceResponse(
-                    segmentId=row["segment_id"],
-                    segmentCode=row["segment_code"],
-                    segmentName=row["segment_name"],
-                )
+            for row in oem_rows
+        ],
+        segments=[
+            SegmentReferenceResponse(
+                segmentId=row["segment_id"],
+                segmentCode=row["segment_code"],
+                segmentName=row["segment_name"],
             )
-
-    return ProjectReferenceDataResponse(oems=list(grouped.values()))
+            for row in segment_rows
+        ],
+    )
