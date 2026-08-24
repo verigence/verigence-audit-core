@@ -12,7 +12,11 @@ from sqlalchemy import Connection, text
 
 from audit_core import mahindra_masters as masters
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import HumanAdminRequest, get_connection, require_super_admin_request
+from audit_core.dependencies import (
+    HumanAdminRequest,
+    get_connection,
+    require_super_admin_request,
+)
 from audit_core.errors import ValidationError
 
 router = APIRouter(
@@ -146,7 +150,7 @@ def validation_report(
     keys: list[str] = []
     seen: set[str] = set()
     for row in rows:
-        for key in dict(row["parsed_data"]).keys():
+        for key in dict(row["parsed_data"]):
             if key not in seen:
                 seen.add(key)
                 keys.append(key)
