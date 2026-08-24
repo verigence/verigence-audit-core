@@ -114,7 +114,8 @@ def _validate_request(engine: Engine, request: ProjectCreateRequest) -> None:
             ).scalars().all()
         )
         selected_segment_ids = set(request.segmentIds)
-        if configured_segment_ids and not selected_segment_ids:
+        legacy_product_category = request.productCategoryId is not None
+        if configured_segment_ids and not selected_segment_ids and not legacy_product_category:
             raise BusinessValidationError(
                 detail="Select at least one active Segment."
             )

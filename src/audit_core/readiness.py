@@ -68,7 +68,7 @@ def _project_state(connection: Connection, tenant_id: str):
     row = connection.execute(
         text(
             """
-            SELECT p.project_name, p.oem_id, o.oem_code, p.effective_start_date,
+            SELECT p.project_name, p.oem_id, p.product_category_id, o.oem_code, p.effective_start_date,
                    p.timezone_name, p.project_status,
                    (SELECT count(*) FROM auditcore.segments s
                     WHERE s.is_active=true) AS configured_segments,
@@ -92,7 +92,9 @@ def _project_state(connection: Connection, tenant_id: str):
 
 def _project_setup_check(project) -> ReadinessCheck:
     segment_selection_complete = (
-        int(project["configured_segments"]) == 0 or int(project["selected_segments"]) > 0
+        project["product_category_id"] is not None
+        or int(project["configured_segments"]) == 0
+        or int(project["selected_segments"]) > 0
     )
     complete = bool(
         str(project["project_name"]).strip()
