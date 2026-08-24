@@ -28,6 +28,7 @@ from audit_core.otel import configure_otlp
 from audit_core.payments_finance import router as payments_finance_router
 from audit_core.project_activation import router as project_activation_router
 from audit_core.project_master_admin import router as project_master_admin_router
+from audit_core.project_master_forms import router as project_master_form_router
 from audit_core.project_master_imports import router as project_master_import_router
 from audit_core.project_masters import router as project_master_router
 from audit_core.project_provisioning import router as project_provisioning_router
@@ -84,8 +85,6 @@ def create_app() -> FastAPI:
         redoc_url=None,
         openapi_url=None,
     )
-    # Optional telemetry is configured before the structlog pipeline so application events can be
-    # queued to the OTel BatchLogRecordProcessor. Fail-open bootstrap can never block app startup.
     configure_otlp(application, settings)
     configure_logging(settings)
     install_error_handlers(application)
@@ -107,7 +106,6 @@ def create_app() -> FastAPI:
     application.include_router(uc03_work_items_router)
     application.include_router(uc03_create_booking_router)
     application.include_router(uc03_booking_router)
-    # Exact C1/C2/C3 typed routes must precede generic capture/findings routes.
     application.include_router(uc03_booking_exchange_router)
     application.include_router(uc03_booking_integrations_router)
     application.include_router(uc03_booking_capture_router)
@@ -118,21 +116,13 @@ def create_app() -> FastAPI:
     application.include_router(uc03_audit_router)
     application.include_router(readiness_router)
     application.include_router(project_activation_router)
-    # Persisted Mahindra upload state and native-workbook upload endpoints must precede the
-    # original generated-template routes. Native OEM files may carry their own WEF.
     application.include_router(mahindra_upload_state_router)
-    # Mahindra OEM-specific segment uploads are registered before the generic master
-    # routes. Native OEM workbooks are normalized at upload time into Product + dynamic
-    # Price masters; the older generated-template contract remains available as fallback.
     application.include_router(mahindra_master_router)
-    # Literal DI-owned Project Master and generic import routes must be registered
-    # before the older owner-module dynamic routes so DI requests cannot fall into
-    # the Audit-Core-only rejection branches.
     application.include_router(di_project_master_proxy_router)
     application.include_router(project_master_admin_router)
+    application.include_router(project_master_form_router)
     application.include_router(project_master_router)
     application.include_router(project_master_import_router)
-    # UC02 additive read/setup routes are registered before the legacy Dealer router.
     application.include_router(uc02_project_admin_stabilization_router)
     application.include_router(dealer_router)
     application.include_router(role_mapping_router)
