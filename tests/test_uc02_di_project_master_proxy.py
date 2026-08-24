@@ -11,7 +11,7 @@ from sqlalchemy import create_engine, text
 from audit_core.dependencies import (
     HumanAdminRequest,
     get_connection,
-    require_super_admin_request,
+    require_project_admin_request,
 )
 from audit_core.di_project_master_proxy import get_di_admin_client
 from audit_core.main import app
@@ -198,7 +198,7 @@ def di_proxy_setup():
         ),
     )
     app.dependency_overrides[get_connection] = connection_override
-    app.dependency_overrides[require_super_admin_request] = lambda: admin_request
+    app.dependency_overrides[require_project_admin_request] = lambda: admin_request
     app.dependency_overrides[get_di_admin_client] = lambda: fake_di
     try:
         yield {

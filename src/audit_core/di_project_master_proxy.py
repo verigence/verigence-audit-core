@@ -17,7 +17,7 @@ from audit_core.db import set_tenant_context
 from audit_core.dependencies import (
     HumanAdminRequest,
     get_connection,
-    require_super_admin_request,
+    require_project_admin_request,
 )
 from audit_core.di_client import DiClient, DiClientError
 from audit_core.errors import AuditCoreError, ValidationError
@@ -261,7 +261,7 @@ def _di_import_identity(connection: Connection, *, tenant_id: str, import_id: UU
 @router.get("/v1/tenants/{tenant_id}/project-masters")
 def get_project_master_catalogue_proxy(
     tenant_id: str,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
     di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
 ) -> list[dict[str, Any]]:
@@ -320,7 +320,7 @@ def get_project_master_catalogue_proxy(
 def download_di_master_template(
     tenant_id: str,
     master_key: str,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
 ) -> StreamingResponse:
     client = _require_di_client(di_client)
@@ -351,7 +351,7 @@ async def upload_di_master_import(
     master_key: str,
     file: Annotated[UploadFile, File()],
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1)],
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
     di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
     effective_from: Annotated[date | None, Form(alias="effectiveFrom")] = None,
@@ -393,7 +393,7 @@ async def upload_di_master_import(
 def get_di_master_versions(
     tenant_id: str,
     master_key: str,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
 ) -> list[dict[str, Any]]:
     client = _require_di_client(di_client)
@@ -423,7 +423,7 @@ def publish_di_master_version(
     tenant_id: str,
     master_key: str,
     version_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
 ) -> dict[str, Any]:
     client = _require_di_client(di_client)
@@ -454,7 +454,7 @@ def publish_di_master_version(
 def get_project_master_import_proxy(
     tenant_id: str,
     import_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
     di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
 ) -> local_imports.ProjectMasterImportResponse:
@@ -493,7 +493,7 @@ def get_project_master_import_proxy(
 def get_project_master_import_rows_proxy(
     tenant_id: str,
     import_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
     di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
     offset: Annotated[int, Query(ge=0)] = 0,
@@ -538,7 +538,7 @@ def get_project_master_import_rows_proxy(
 def download_project_master_error_report_proxy(
     tenant_id: str,
     import_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
     di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
 ) -> StreamingResponse:
@@ -580,7 +580,7 @@ def download_project_master_error_report_proxy(
 def confirm_project_master_import_proxy(
     tenant_id: str,
     import_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
     di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
 ) -> local_imports.ProjectMasterImportResponse:
@@ -619,7 +619,7 @@ def confirm_project_master_import_proxy(
 def delete_project_master_import_proxy(
     tenant_id: str,
     import_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_project_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
     di_client: Annotated[DiClient | None, Depends(get_di_admin_client)],
 ) -> None:
