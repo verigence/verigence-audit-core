@@ -181,6 +181,11 @@ def delivery_setup():
                     :tenant_id, :profile_version_id,
                     'TRADE_IN_RC_DELIVERY', 'TRADE_IN_RC', 'DELIVERY',
                     'CONDITIONAL', '{"conditionKey":"exchangeTaken"}'::jsonb, 30
+                ),
+                (
+                    :tenant_id, :profile_version_id,
+                    'BOOKING_DOCKET', 'BOOKING_DOCKET', 'BOOKING',
+                    'OPTIONAL', '{}'::jsonb, 40
                 )
                 """
             ),
