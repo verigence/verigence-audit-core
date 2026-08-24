@@ -124,6 +124,15 @@ def test_document_control_and_policy_versions_are_immutable_and_referenceable() 
                 process_area="BOOKING",
                 requirement_level="REQUIRED",
             )
+            add_document_requirement(
+                connection,
+                tenant_id=tenant_id,
+                profile_version_id=profile_version_id,
+                requirement_key="NDC",
+                document_type_key="NO_DUES_CERTIFICATE",
+                process_area="DELIVERY",
+                requirement_level="OPTIONAL",
+            )
             control_id = create_audit_control(
                 connection,
                 tenant_id=tenant_id,

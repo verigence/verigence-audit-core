@@ -182,6 +182,11 @@ def booking_document_setup():
                     'TRADE_IN_RC', 'TRADE_IN_RC', 'BOOKING',
                     'CONDITIONAL',
                     '{"conditionKey":"exchangeTaken"}'::jsonb, 20
+                ),
+                (
+                    :tenant_id, :profile_version_id,
+                    'NDC', 'NO_DUES_CERTIFICATE', 'DELIVERY',
+                    'OPTIONAL', '{}'::jsonb, 30
                 )
                 """
             ),

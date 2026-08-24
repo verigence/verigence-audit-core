@@ -62,7 +62,7 @@ jobs:
           engine = create_engine(os.environ["DATABASE_URL"])
           with engine.connect() as connection:
               assert connection.execute(text("select to_regclass('auditcore.projects')::text")).scalar_one() == "auditcore.projects"
-              assert connection.execute(text("select version_num from alembic_version")).scalar_one() == "0016_uc02_project_delete"
+              assert connection.execute(text("select version_num from alembic_version")).scalar_one() == "0016_uc02_project_delete_uc03"
               assert connection.execute(text("select to_regprocedure('auditcore.hard_delete_zero_journey_project(character varying)')::text")).scalar_one() == "auditcore.hard_delete_zero_journey_project(character varying)"
               assert connection.execute(text("select to_regclass('auditcore.administrative_operations')::text")).scalar_one() == "auditcore.administrative_operations"
               assert connection.execute(text("select to_regclass('auditcore.project_product_masters')::text")).scalar_one() == "auditcore.project_product_masters"
