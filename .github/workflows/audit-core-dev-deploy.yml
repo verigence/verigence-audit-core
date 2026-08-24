@@ -43,9 +43,10 @@ jobs:
         run: |
           set -euo pipefail
           test -f migrations/versions/0015_uc02_universal_segments.py
+          test -f migrations/versions/0016_uc02_project_hard_delete.py
           alembic heads | tee /tmp/alembic-heads.txt
-          grep -q '0015_uc02_global_segments' /tmp/alembic-heads.txt
-          echo 'AUDIT_CORE_ALEMBIC_SOURCE_HEAD=0015_uc02_global_segments'
+          grep -q '0016_uc02_project_delete' /tmp/alembic-heads.txt
+          echo 'AUDIT_CORE_ALEMBIC_SOURCE_HEAD=0016_uc02_project_delete'
 
           PYTHONPATH=src python - <<'PY'
           from audit_core.main import app
@@ -55,6 +56,8 @@ jobs:
               "/v1/projects",
               "/v1/tenants/{tenant_id}/project/readiness",
               "/v1/tenants/{tenant_id}/project/activate",
+              "/v1/tenants/{tenant_id}/project/deletion-impact",
+              "/v1/tenants/{tenant_id}/project",
               "/v1/tenants/{tenant_id}/project-masters",
               "/v1/tenants/{tenant_id}/role-mapping-candidates",
               "/v1/tenants/{tenant_id}/role-mappings",
@@ -64,6 +67,9 @@ jobs:
           missing = [path for path in required if path not in paths]
           if missing:
               raise SystemExit("Missing UC02 API path(s) before deploy: " + ", ".join(missing))
+          project_methods = paths["/v1/tenants/{tenant_id}/project"]
+          if "delete" not in project_methods:
+              raise SystemExit("Missing UC02 Project hard-delete method before deploy")
           print("AUDIT_CORE_UC02_ROUTE_CONTRACT=PASS")
           PY
 
