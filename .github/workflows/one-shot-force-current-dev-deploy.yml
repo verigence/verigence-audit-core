@@ -30,13 +30,15 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install -e .
-          test -f migrations/versions/0014_uc02_mahindra_segment_masters.py
+          test -f migrations/versions/0015_uc02_universal_segments.py
           head="$(alembic heads)"
           printf '%s\n' "$head"
-          grep -q '0014_uc02_mahindra_seg' <<<"$head"
-          grep -q 'test -f migrations/versions/0014_uc02_mahindra_segment_masters.py' railway.toml
+          grep -q '0015_uc02_global_segments' <<<"$head"
+          grep -q '0015_uc02_universal_segments.py' railway.toml
+          grep -q 'install_native_workbook_parser(mahindra_masters)' src/audit_core/main.py
+          grep -q 'install_native_effective_date(mahindra_masters)' src/audit_core/main.py
           echo "SOURCE_SHA=${GITHUB_SHA}"
-          echo 'SOURCE_0014=PASS'
+          echo 'SOURCE_0015_NATIVE_MAHINDRA=PASS'
       - run: npm install --global @railway/cli
       - name: Upload exact DEV source to Railway
         shell: bash
