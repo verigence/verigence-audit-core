@@ -33,6 +33,11 @@ _REQUIRED_DI_MASTER_STATES = {
     "EXTRACTION_PROFILES": "PUBLISHED",
     "REQUIREMENT_PROFILES": "PUBLISHED",
 }
+_DI_MASTER_LABELS = {
+    "DOCUMENT_TYPES": "Document Types",
+    "EXTRACTION_PROFILES": "Extraction Profiles",
+    "REQUIREMENT_PROFILES": "Requirement Profiles",
+}
 
 
 class ReadinessCheck(BaseModel):
@@ -144,7 +149,7 @@ def _security_tenant_check(
             checkKey="SECURITY_TENANT_LIFECYCLE",
             severity="BLOCKING",
             status="PENDING",
-            message="Security Tenant readiness could not be verified yet.",
+            message="Security Tenant readiness could not be verified yet. Refresh the check before activation.",
             targetTask="PROJECT_DETAILS",
         )
 
@@ -224,9 +229,9 @@ def _pc_coverage_check(connection: Connection, tenant_id: str) -> ReadinessCheck
         severity="BLOCKING",
         status="PASS" if covered else "FAIL",
         message=(
-            "Every active Dealer Outlet has an active PC mapping."
+            "Every active Dealer Outlet has an active Process Consultant mapping."
             if covered
-            else f"{len(uncovered)} active Dealer Outlet(s) still require an active PC mapping."
+            else f"{len(uncovered)} active Dealer Outlet(s) still require an active Process Consultant mapping."
         ),
         targetTask="ROLE_MAPPING",
     )
@@ -394,8 +399,8 @@ def _di_project_check(*, tenant_id: str, human_bearer_token: str) -> ReadinessCh
                     checkKey="DI_PROJECT_READY",
                     severity="BLOCKING",
                     status="FAIL",
-                    message="Document Intelligence Project provisioning is incomplete.",
-                    targetTask="PROJECT_MASTERS",
+                    message="Document Intelligence provisioning is incomplete for this Project.",
+                    targetTask="DOCUMENT_INTELLIGENCE",
                 )
             catalogue = client.list_project_masters(
                 human_token=human_bearer_token,
@@ -423,29 +428,33 @@ def _di_project_check(*, tenant_id: str, human_bearer_token: str) -> ReadinessCh
                     isinstance(version, dict) and version.get("status") == expected_state
                     for version in versions
                 ):
-                    wrong_states.append(f"{master_key} ({expected_state})")
+                    wrong_states.append(master_key)
     except DiClientError:
         return ReadinessCheck(
             area="DI",
             checkKey="DI_PROJECT_READY",
             severity="BLOCKING",
             status="PENDING",
-            message="Document Intelligence readiness could not be verified yet.",
-            targetTask="PROJECT_MASTERS",
+            message="Document Intelligence readiness could not be verified. Refresh the check before activation.",
+            targetTask="DOCUMENT_INTELLIGENCE",
         )
 
     failures = [*missing_domains, *wrong_states]
+    if failures:
+        actions = [
+            f"{_DI_MASTER_LABELS.get(key, key)} must be {_REQUIRED_DI_MASTER_STATES.get(key, 'configured')}"
+            for key in failures
+        ]
+        message = "Complete Document Intelligence configuration: " + "; ".join(actions) + "."
+    else:
+        message = "Document Intelligence provisioning and required configuration are ready."
     return ReadinessCheck(
         area="DI",
         checkKey="DI_PROJECT_READY",
         severity="BLOCKING",
         status="PASS" if not failures else "FAIL",
-        message=(
-            "Document Intelligence provisioning and required configuration are ready."
-            if not failures
-            else "Complete DI Project configuration: " + ", ".join(failures) + "."
-        ),
-        targetTask="PROJECT_MASTERS",
+        message=message,
+        targetTask="DOCUMENT_INTELLIGENCE",
     )
 
 
@@ -477,7 +486,7 @@ def _optional_map_metadata_check(connection: Connection, tenant_id: str) -> Read
             if incomplete == 0
             else (
                 f"{incomplete} active Dealer Outlet(s) use manual or incomplete map metadata; "
-                "this does not block activation."
+                "this is optional and does not block activation."
             )
         ),
         targetTask="DEALER_OUTLETS",
@@ -507,10 +516,9 @@ def evaluate_project_readiness(
         ),
         _optional_map_metadata_check(connection, tenant_id),
     ]
-    # TEMPORARY DEV UNBLOCKER: keep the full checklist visible, but do not make
-    # readiness failures mandatory while UC03 human testing is being brought up.
-    # Restore the normal blocking aggregation once UC02 readiness defects are fixed.
-    ready = True
+    ready = not any(
+        check.severity == "BLOCKING" and check.status != "PASS" for check in checks
+    )
     return ProjectReadinessResponse(
         readyToActivate=ready,
         evaluatedAtUtc=datetime.now(UTC),
