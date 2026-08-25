@@ -313,5 +313,6 @@ def test_landing_metrics_are_scope_filtered_and_live_authorized(landing_metrics_
         "deliveryInProgress": 1,
         "needsAttention": 1,
         "auditFlags": 2,
+        "auditInProgress": 3,
     }
     assert setup["authorization"].calls == 1
