@@ -26,8 +26,8 @@ from audit_core.uc03_booking_commands import (
     _stage_state,
 )
 from audit_core.uc03_booking_details import (
-    DocumentApprovalResponse,
     _DI_AUDIENCE,
+    DocumentApprovalResponse,
     _require_active,
 )
 
