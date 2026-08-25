@@ -18,6 +18,7 @@ from audit_core.security_authorization import (
 )
 from audit_core.security_integration import SecurityOAuthClient, SecurityTokenError
 from audit_core.uc03_booking_capture import _scope
+from audit_core.uc03_booking_integrations import _audit_context_ref
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/journeys/{journey_id}/booking/evidence",
@@ -37,7 +38,7 @@ def _evidence_row(
     row = connection.execute(
         text(
             """
-            SELECT di_subject_id, di_document_id
+            SELECT customer_id, di_subject_id, di_document_id
             FROM auditcore.evidence
             WHERE tenant_id=:tenant_id
               AND journey_id=:journey_id
@@ -53,6 +54,7 @@ def _evidence_row(
     ).mappings().one_or_none()
     if (
         row is None
+        or row["customer_id"] is None
         or row["di_subject_id"] is None
         or row["di_document_id"] is None
     ):
@@ -114,7 +116,7 @@ def _fact_rows(
     ]
 
 
-def _persist_facts(
+def _update_evidence_cache(
     connection: Connection,
     *,
     tenant_id: str,
@@ -123,8 +125,7 @@ def _persist_facts(
     processing_status: str,
     verification_status: str | None,
     confirmation_status: str | None,
-    facts: tuple[DiFact, ...],
-) -> list[dict[str, Any]]:
+) -> None:
     connection.execute(
         text(
             """
@@ -147,6 +148,28 @@ def _persist_facts(
             "verification_status": verification_status,
             "confirmation_status": confirmation_status,
         },
+    )
+
+
+def _persist_facts(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    evidence_id: UUID,
+    processing_status: str,
+    verification_status: str | None,
+    confirmation_status: str | None,
+    facts: tuple[DiFact, ...],
+) -> list[dict[str, Any]]:
+    _update_evidence_cache(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        evidence_id=evidence_id,
+        processing_status=processing_status,
+        verification_status=verification_status,
+        confirmation_status=confirmation_status,
     )
     connection.execute(
         text(
@@ -220,21 +243,46 @@ def refresh_booking_evidence_details(
         journey_id=journey_id,
         evidence_id=evidence_id,
     )
+    context_ref = _audit_context_ref(journey_id, row["customer_id"])
     try:
         service_token = security_client.get_service_token(audience=_DI_AUDIENCE)
-        document = di_client.get_document(
+        document = di_client.get_audit_document(
             token=service_token,
             tenant_id=tenant_id,
-            subject_id=str(row["di_subject_id"]),
-            document_id=str(row["di_document_id"]),
-        )
-        facts = di_client.get_document_facts(
-            token=service_token,
-            tenant_id=tenant_id,
-            subject_id=str(row["di_subject_id"]),
+            external_context_ref=context_ref,
             document_id=str(row["di_document_id"]),
         )
     except (DiClientError, SecurityTokenError) as exc:
+        raise DependencyUnavailableError(
+            detail="Document processing is temporarily unavailable. Please try again."
+        ) from exc
+
+    processing_status = (document.processing_status or "PENDING").upper()
+    confirmation_status = (document.confirmation_status or "").upper()
+    if confirmation_status != "CONFIRMED":
+        _update_evidence_cache(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            evidence_id=evidence_id,
+            processing_status=processing_status,
+            verification_status=document.verification_state,
+            confirmation_status=document.confirmation_status,
+        )
+        return _fact_rows(
+            connection,
+            tenant_id=tenant_id,
+            evidence_id=evidence_id,
+        )
+
+    try:
+        facts = di_client.get_audit_document_facts(
+            token=service_token,
+            tenant_id=tenant_id,
+            external_context_ref=context_ref,
+            document_id=str(row["di_document_id"]),
+        )
+    except DiClientError as exc:
         raise DependencyUnavailableError(
             detail="Document processing is temporarily unavailable. Please try again."
         ) from exc
@@ -244,7 +292,7 @@ def refresh_booking_evidence_details(
         tenant_id=tenant_id,
         journey_id=journey_id,
         evidence_id=evidence_id,
-        processing_status=(document.processing_status or "PENDING").upper(),
+        processing_status=processing_status,
         verification_status=document.verification_state,
         confirmation_status=document.confirmation_status,
         facts=facts,
