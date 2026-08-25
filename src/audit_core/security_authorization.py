@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import binascii
 import json
 import os
 import threading
@@ -38,13 +37,7 @@ def _service_token_reuse_seconds(token: str) -> float:
         payload = json.loads(
             base64.urlsafe_b64decode(payload_segment + padding).decode("utf-8")
         )
-    except (
-        ValueError,
-        TypeError,
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-        binascii.Error,
-    ):
+    except (ValueError, TypeError):
         return _SERVICE_TOKEN_FALLBACK_REUSE_SECONDS
     if not isinstance(payload, dict):
         return _SERVICE_TOKEN_FALLBACK_REUSE_SECONDS
