@@ -1,6 +1,6 @@
 """Complete UC03 Booking Screen-2 reference masters.
 
-Revision ID: 0024_uc03_booking_reference_completion
+Revision ID: 0024_uc03_booking_refs
 Revises: 0023_uc03_booking_review_flow
 Create Date: 2026-08-25
 
@@ -14,7 +14,7 @@ huge national district catalogue into every Project.
 """
 from alembic import op
 
-revision = "0024_uc03_booking_reference_completion"
+revision = "0024_uc03_booking_refs"
 down_revision = "0023_uc03_booking_review_flow"
 branch_labels = None
 depends_on = None
