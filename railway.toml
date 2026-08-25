@@ -2,7 +2,7 @@
 builder = "railpack"
 
 [deploy]
-preDeployCommand = ["sh -c 'set -eu; test -f migrations/versions/0016_uc02_project_hard_delete.py; test -f migrations/versions/0017_uc03_default_document_requirements.py; alembic heads; alembic upgrade head'"]
+preDeployCommand = ["sh -c 'set -eu; test -f migrations/versions/0016_uc02_project_hard_delete.py; test -f migrations/versions/0017_uc03_default_document_requirements.py; test -f migrations/versions/0018_uc03_identity_business_date.py; alembic heads; alembic upgrade head'"]
 startCommand = "PYTHONPATH=src uvicorn audit_core.main:app --host 0.0.0.0 --port $PORT"
 healthcheckPath = "/health"
 healthcheckTimeout = 100

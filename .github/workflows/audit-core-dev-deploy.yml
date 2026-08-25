@@ -38,16 +38,22 @@ jobs:
       - name: Install Audit Core
         run: python -m pip install -e .
 
-      - name: Verify Alembic and UC02 route contracts before deploy
+      - name: Verify Alembic and route contracts before deploy
         shell: bash
         run: |
           set -euo pipefail
           test -f migrations/versions/0015_uc02_universal_segments.py
           test -f migrations/versions/0016_uc02_project_hard_delete.py
           test -f migrations/versions/0017_uc03_default_document_requirements.py
+          test -f migrations/versions/0018_uc03_identity_business_date.py
           alembic heads | tee /tmp/alembic-heads.txt
-          grep -q '0016_uc02_project_delete_uc03' /tmp/alembic-heads.txt
-          echo 'AUDIT_CORE_ALEMBIC_SOURCE_HEAD=0016_uc02_project_delete_uc03'
+          head_count="$(grep -c '(head)' /tmp/alembic-heads.txt || true)"
+          if [[ "$head_count" != "1" ]]; then
+            echo "::error::Audit Core must have exactly one Alembic head; found $head_count"
+            cat /tmp/alembic-heads.txt >&2
+            exit 1
+          fi
+          echo "AUDIT_CORE_ALEMBIC_SOURCE_HEAD=$(sed -n '1s/ (head)$//p' /tmp/alembic-heads.txt)"
 
           PYTHONPATH=src python - <<'PY'
           from audit_core.main import app
@@ -64,14 +70,15 @@ jobs:
               "/v1/tenants/{tenant_id}/role-mappings",
               "/v1/tenants/{tenant_id}/mahindra-masters/segments/{segment_id}/imports",
               "/v1/tenants/{tenant_id}/mahindra-masters/discount-policy/imports",
+              "/v1/tenants/{tenant_id}/journeys/{journey_id}/booking/identity-context",
           ]
           missing = [path for path in required if path not in paths]
           if missing:
-              raise SystemExit("Missing UC02 API path(s) before deploy: " + ", ".join(missing))
+              raise SystemExit("Missing Audit Core API path(s) before deploy: " + ", ".join(missing))
           project_methods = paths["/v1/tenants/{tenant_id}/project"]
           if "delete" not in project_methods:
               raise SystemExit("Missing UC02 Project hard-delete method before deploy")
-          print("AUDIT_CORE_UC02_ROUTE_CONTRACT=PASS")
+          print("AUDIT_CORE_ROUTE_CONTRACT=PASS")
           PY
 
       - name: Install Railway CLI

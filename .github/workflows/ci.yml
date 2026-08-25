@@ -62,7 +62,7 @@ jobs:
           engine = create_engine(os.environ["DATABASE_URL"])
           with engine.connect() as connection:
               assert connection.execute(text("select to_regclass('auditcore.projects')::text")).scalar_one() == "auditcore.projects"
-              assert connection.execute(text("select version_num from alembic_version")).scalar_one() == "0016_uc02_project_delete_uc03"
+              assert connection.execute(text("select version_num from alembic_version")).scalar_one() == "0017_uc03_identity_business_date"
               assert connection.execute(text("select to_regprocedure('auditcore.hard_delete_zero_journey_project(character varying)')::text")).scalar_one() == "auditcore.hard_delete_zero_journey_project(character varying)"
               assert connection.execute(text("select to_regclass('auditcore.administrative_operations')::text")).scalar_one() == "auditcore.administrative_operations"
               assert connection.execute(text("select to_regclass('auditcore.project_product_masters')::text")).scalar_one() == "auditcore.project_product_masters"
@@ -97,6 +97,17 @@ jobs:
                         'closed_by_actor_id', 'closed_at_utc'
                     )
               """)).scalar_one() == 4
+              assert connection.execute(text("""
+                  select count(*) from information_schema.columns
+                  where table_schema='auditcore'
+                    and table_name='customers'
+                    and column_name in (
+                        'legal_name', 'legal_name_status',
+                        'legal_name_source_evidence_id',
+                        'legal_name_verified_by_actor_id',
+                        'legal_name_verified_at_utc'
+                    )
+              """)).scalar_one() == 5
               assert connection.execute(text("""
                   select has_table_privilege(
                       'audit_core_runtime', 'auditcore.dealers', 'DELETE'
