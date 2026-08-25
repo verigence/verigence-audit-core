@@ -459,7 +459,7 @@ def _business_date_aware_completion_summary(
         text(
             """
             SELECT b.booking_date,
-                   j.document_requirement_profile_version_id,
+                   j.document_requirement_profile_version_id AS document_profile_version_id,
                    j.policy_version_id, j.price_list_version_id
             FROM auditcore.journeys j
             LEFT JOIN auditcore.bookings b
