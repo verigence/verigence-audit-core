@@ -157,7 +157,7 @@ def booking_document_setup():
                     tenant_id, document_requirement_profile_id, version_no,
                     lifecycle_status, effective_from
                 ) VALUES (
-                    :tenant_id, :profile_id, 1, 'DRAFT', CURRENT_DATE - 1
+                    :tenant_id, :profile_id, 1, 'DRAFT', CURRENT_DATE
                 )
                 RETURNING document_requirement_profile_version_id
                 """
@@ -203,15 +203,66 @@ def booking_document_setup():
             ),
             {"tenant_id": tenant_id, "profile_version_id": profile_version_id},
         )
+        policy_version_id = connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.project_policy_versions (
+                    tenant_id, version_no, lifecycle_status, effective_from,
+                    created_by_actor_id, published_by_actor_id, published_at_utc
+                ) VALUES (
+                    :tenant_id, 1, 'PUBLISHED', CURRENT_DATE,
+                    :actor_id, :actor_id, now()
+                ) RETURNING policy_version_id
+                """
+            ),
+            {"tenant_id": tenant_id, "actor_id": actor_id},
+        ).scalar_one()
+        price_list_id = connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.price_lists (
+                    tenant_id, price_list_code, price_list_name, created_by_actor_id
+                ) VALUES (
+                    :tenant_id, :code, 'UC03 Document Price List', :actor_id
+                ) RETURNING price_list_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "code": f"UC03-DOC-PRICE-{suffix}",
+                "actor_id": actor_id,
+            },
+        ).scalar_one()
+        price_list_version_id = connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.price_list_versions (
+                    tenant_id, price_list_id, version_no, lifecycle_status,
+                    effective_from, created_by_actor_id,
+                    published_by_actor_id, published_at_utc
+                ) VALUES (
+                    :tenant_id, :price_list_id, 1, 'PUBLISHED',
+                    CURRENT_DATE, :actor_id, :actor_id, now()
+                ) RETURNING price_list_version_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "price_list_id": price_list_id,
+                "actor_id": actor_id,
+            },
+        ).scalar_one()
         journey_id = connection.execute(
             text(
                 """
                 INSERT INTO auditcore.journeys (
                     tenant_id, dealer_id, outlet_id, customer_id,
-                    journey_reference, document_requirement_profile_version_id
+                    journey_reference, document_requirement_profile_version_id,
+                    policy_version_id, price_list_version_id
                 ) VALUES (
                     :tenant_id, :dealer_id, :outlet_id, :customer_id,
-                    :reference, :profile_version_id
+                    :reference, :profile_version_id,
+                    :policy_version_id, :price_list_version_id
                 ) RETURNING journey_id
                 """
             ),
@@ -222,8 +273,19 @@ def booking_document_setup():
                 "customer_id": customer_id,
                 "reference": f"UC03-DOC-J-{suffix}",
                 "profile_version_id": profile_version_id,
+                "policy_version_id": policy_version_id,
+                "price_list_version_id": price_list_version_id,
             },
         ).scalar_one()
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.bookings (tenant_id, journey_id, booking_date)
+                VALUES (:tenant_id, :journey_id, CURRENT_DATE)
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        )
 
     app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=actor_id)
     app.dependency_overrides[get_security_authorization_client] = lambda: AllowedAuthorization()
@@ -485,7 +547,7 @@ def test_corrected_extraction_proposal_preserves_machine_original(
             ),
             {"tenant_id": setup["tenant_id"], "proposal_id": proposal_id},
         ).mappings().one()
-        customer_name = connection.execute(
+        entered_name = connection.execute(
             text(
                 """
                 SELECT display_name FROM auditcore.customers
@@ -498,7 +560,7 @@ def test_corrected_extraction_proposal_preserves_machine_original(
     assert proposal["accepted_value"] == {"value": "Corrected Customer"}
     assert proposal["proposal_status"] == "CORRECTED"
     assert proposal["owning_domain_key"] == "CUSTOMER"
-    assert customer_name == "Corrected Customer"
+    assert entered_name == "Document Customer"
 
 
 def test_normal_booking_close_allows_nonblocking_human_flag(
