@@ -13,6 +13,7 @@ def _dependencies(monkeypatch):
     evidence_id = uuid4()
     customer_id = uuid4()
     document_id = uuid4()
+    connection = object()
 
     monkeypatch.setattr(details, "_scope", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -35,6 +36,7 @@ def _dependencies(monkeypatch):
         "evidence_id": evidence_id,
         "customer_id": customer_id,
         "document_id": document_id,
+        "connection": connection,
         "security_client": security_client,
         "di_client": di_client,
     }
@@ -60,20 +62,26 @@ def test_refresh_pending_document_does_not_request_fields(monkeypatch) -> None:
         authorization_client=object(),
         security_client=deps["security_client"],
         di_client=deps["di_client"],
-        connection=object(),
+        connection=deps["connection"],
     )
 
     assert result == []
     deps["di_client"].get_audit_document.assert_called_once_with(
         token="service-token",
         tenant_id=deps["tenant_id"],
-        external_context_ref=(
-            f"audit-{deps['journey_id']}-{deps['customer_id']}"
-        ),
+        external_context_ref=f"audit-{deps['journey_id']}-{deps['customer_id']}",
         document_id=str(deps["document_id"]),
     )
     deps["di_client"].get_audit_document_facts.assert_not_called()
-    update_cache.assert_called_once()
+    update_cache.assert_called_once_with(
+        deps["connection"],
+        tenant_id=deps["tenant_id"],
+        journey_id=deps["journey_id"],
+        evidence_id=deps["evidence_id"],
+        processing_status="PROCESSING",
+        verification_status="OPTIONAL",
+        confirmation_status="PENDING",
+    )
 
 
 def test_refresh_confirmed_document_requests_and_persists_fields(monkeypatch) -> None:
@@ -98,18 +106,23 @@ def test_refresh_confirmed_document_requests_and_persists_fields(monkeypatch) ->
         authorization_client=object(),
         security_client=deps["security_client"],
         di_client=deps["di_client"],
-        connection=object(),
+        connection=deps["connection"],
     )
 
     assert result == [{"fieldKey": "customer_name"}]
     deps["di_client"].get_audit_document_facts.assert_called_once_with(
         token="service-token",
         tenant_id=deps["tenant_id"],
-        external_context_ref=(
-            f"audit-{deps['journey_id']}-{deps['customer_id']}"
-        ),
+        external_context_ref=f"audit-{deps['journey_id']}-{deps['customer_id']}",
         document_id=str(deps["document_id"]),
     )
     persist.assert_called_once_with(
-        object=MagicMock.ANY if False else None,
+        deps["connection"],
+        tenant_id=deps["tenant_id"],
+        journey_id=deps["journey_id"],
+        evidence_id=deps["evidence_id"],
+        processing_status="COMPLETED",
+        verification_status="OPTIONAL",
+        confirmation_status="CONFIRMED",
+        facts=facts,
     )
