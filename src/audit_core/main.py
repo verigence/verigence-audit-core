@@ -51,6 +51,7 @@ from audit_core.uc03_booking_integrations import (
     router as uc03_booking_integrations_router,
 )
 from audit_core.uc03_booking_part1 import router as uc03_booking_part1_router
+from audit_core.uc03_booking_receipt_capture import install_uc03_booking_receipt_capture
 from audit_core.uc03_create_booking import router as uc03_create_booking_router
 from audit_core.uc03_delivery_commands import router as uc03_delivery_router
 from audit_core.uc03_delivery_documents import router as uc03_delivery_documents_router
@@ -68,6 +69,7 @@ install_role_mapping_policy(role_mappings)
 install_native_workbook_parser(mahindra_masters)
 install_native_effective_date(mahindra_masters)
 install_uc03_identity_business_date()
+install_uc03_booking_receipt_capture()
 role_mapping_router = role_mappings.router
 mahindra_master_router = mahindra_masters.router
 
