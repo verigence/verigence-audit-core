@@ -4,7 +4,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import uuid4
 
+import pytest
+
 import audit_core.uc03_booking_evidence_details as details
+from audit_core.errors import DependencyUnavailableError
 
 
 def _dependencies(monkeypatch):
@@ -126,3 +129,73 @@ def test_refresh_confirmed_document_requests_and_persists_fields(monkeypatch) ->
         confirmation_status="CONFIRMED",
         facts=facts,
     )
+
+
+def test_refresh_e008_fields_not_ready_returns_cached_facts(monkeypatch) -> None:
+    deps = _dependencies(monkeypatch)
+    deps["di_client"].get_audit_document.return_value = SimpleNamespace(
+        processing_status="COMPLETED",
+        verification_state="OPTIONAL",
+        confirmation_status="CONFIRMED",
+    )
+    deps["di_client"].get_audit_document_facts.side_effect = details.DiClientError(
+        status_code=422,
+        code="E008",
+        retryable=False,
+    )
+
+    update_cache = MagicMock()
+    monkeypatch.setattr(details, "_update_evidence_cache", update_cache)
+    monkeypatch.setattr(
+        details,
+        "_fact_rows",
+        lambda *args, **kwargs: [{"fieldKey": "cached"}],
+    )
+
+    result = details.refresh_booking_evidence_details(
+        tenant_id=deps["tenant_id"],
+        journey_id=deps["journey_id"],
+        evidence_id=deps["evidence_id"],
+        human_principal=object(),
+        authorization_client=object(),
+        security_client=deps["security_client"],
+        di_client=deps["di_client"],
+        connection=deps["connection"],
+    )
+
+    assert result == [{"fieldKey": "cached"}]
+    update_cache.assert_called_once_with(
+        deps["connection"],
+        tenant_id=deps["tenant_id"],
+        journey_id=deps["journey_id"],
+        evidence_id=deps["evidence_id"],
+        processing_status="COMPLETED",
+        verification_status="OPTIONAL",
+        confirmation_status="CONFIRMED",
+    )
+
+
+def test_refresh_non_e008_fields_error_remains_dependency_error(monkeypatch) -> None:
+    deps = _dependencies(monkeypatch)
+    deps["di_client"].get_audit_document.return_value = SimpleNamespace(
+        processing_status="COMPLETED",
+        verification_state="OPTIONAL",
+        confirmation_status="CONFIRMED",
+    )
+    deps["di_client"].get_audit_document_facts.side_effect = details.DiClientError(
+        status_code=502,
+        code="DI_CONTRACT_ERROR",
+        retryable=False,
+    )
+
+    with pytest.raises(DependencyUnavailableError):
+        details.refresh_booking_evidence_details(
+            tenant_id=deps["tenant_id"],
+            journey_id=deps["journey_id"],
+            evidence_id=deps["evidence_id"],
+            human_principal=object(),
+            authorization_client=object(),
+            security_client=deps["security_client"],
+            di_client=deps["di_client"],
+            connection=deps["connection"],
+        )
