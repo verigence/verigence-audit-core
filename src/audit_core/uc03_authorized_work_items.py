@@ -32,6 +32,11 @@ class LandingMetrics(BaseModel):
     auditInProgress: int
 
 
+class DashboardBootstrap(BaseModel):
+    metrics: LandingMetrics
+    workItems: WorkItemPage
+
+
 def _authorize_workspace(
     client: SecurityAuthorizationClient,
     *,
@@ -225,3 +230,38 @@ def list_authorized_work_items(
         limit=limit,
         cursor=cursor,
     )
+
+
+@router.get("/dashboard", response_model=DashboardBootstrap)
+def get_dashboard_bootstrap(
+    tenant_id: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+    outlet_id: Annotated[UUID | None, Query(alias="outletId")] = None,
+) -> DashboardBootstrap:
+    """Return landing metrics and the first work-items page in one page-bootstrap call."""
+
+    metrics = get_landing_metrics(
+        tenant_id=tenant_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        connection=connection,
+        outlet_id=outlet_id,
+    )
+    work_items = list_authorized_work_items(
+        tenant_id=tenant_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        connection=connection,
+        work_type="ALL",
+        from_date=None,
+        to_date=None,
+        outlet_id=outlet_id,
+        limit=10,
+        cursor=None,
+    )
+    return DashboardBootstrap(metrics=metrics, workItems=work_items)

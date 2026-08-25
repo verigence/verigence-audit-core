@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, status
@@ -17,6 +17,7 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.uc03_booking_capture import get_booking_workspace
 from audit_core.uc03_booking_commands import _append_workflow_event, _authorize_security
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/uc03", tags=["uc03-create-booking"])
@@ -36,6 +37,7 @@ class CreateBookingResponse(BaseModel):
     outletId: UUID
     businessStatus: str
     aggregateVersion: int
+    workspace: dict[str, Any]
 
 
 def _selected_pc_outlet(
@@ -325,6 +327,14 @@ def create_booking(
             aggregate_version=int(stage["version_no"]),
         )
 
+        workspace = get_booking_workspace(
+            tenant_id=tenant_id,
+            journey_id=journey["journey_id"],
+            human_principal=human_principal,
+            authorization_client=authorization_client,
+            connection=connection,
+        )
+
         return {
             "journeyId": str(journey["journey_id"]),
             "customerId": str(customer["customer_id"]),
@@ -332,6 +342,7 @@ def create_booking(
             "outletId": str(selected["outlet_id"]),
             "businessStatus": stage["business_status"],
             "aggregateVersion": int(stage["version_no"]),
+            "workspace": workspace,
         }
 
     body, _ = execute_idempotent_json_command(

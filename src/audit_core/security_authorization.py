@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import os
 import threading
 import time
@@ -14,16 +17,44 @@ from audit_core.security_integration import SecurityOAuthClient, SecurityTokenEr
 
 logger = structlog.get_logger(__name__)
 
-# Security currently issues ServiceIntegration tokens for four hours. A short
-# server-side reuse window removes page-burst token issuance while remaining far
-# below the authoritative token lifetime.
-_SERVICE_TOKEN_REUSE_SECONDS = 60.0
+# Reuse the Security ServiceIntegration token until shortly before its JWT expiry.
+# If a non-JWT test/dummy token is returned, preserve the previous short fallback.
+_SERVICE_TOKEN_EXPIRY_SAFETY_SECONDS = 300.0
+_SERVICE_TOKEN_FALLBACK_REUSE_SECONDS = 60.0
 
-# UC03 lazy pages can issue concurrent requests that require the exact same live
-# permission decision (for example landing metrics + work items). Reuse only a
-# successful ALLOW for a very short process-local window. DENY and errors are
-# deliberately never cached. Human JWT validation still happens on every request.
-_AUTHORIZATION_ALLOW_REUSE_SECONDS = 10.0
+# Reuse only a successful identical ALLOW for a short process-local window. DENY
+# and errors are deliberately never cached. Human JWT validation still happens on
+# every request.
+_AUTHORIZATION_ALLOW_REUSE_SECONDS = 60.0
+
+
+def _service_token_reuse_seconds(token: str) -> float:
+    parts = token.split(".")
+    if len(parts) != 3:
+        return _SERVICE_TOKEN_FALLBACK_REUSE_SECONDS
+    try:
+        payload_segment = parts[1]
+        padding = "=" * (-len(payload_segment) % 4)
+        payload = json.loads(
+            base64.urlsafe_b64decode(payload_segment + padding).decode("utf-8")
+        )
+    except (
+        ValueError,
+        TypeError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        binascii.Error,
+    ):
+        return _SERVICE_TOKEN_FALLBACK_REUSE_SECONDS
+    if not isinstance(payload, dict):
+        return _SERVICE_TOKEN_FALLBACK_REUSE_SECONDS
+    expires_at = payload.get("exp")
+    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        return _SERVICE_TOKEN_FALLBACK_REUSE_SECONDS
+    return max(
+        0.0,
+        float(expires_at) - time.time() - _SERVICE_TOKEN_EXPIRY_SAFETY_SECONDS,
+    )
 
 
 class SecurityAuthorizationError(RuntimeError):
@@ -53,8 +84,8 @@ class SecurityAuthorizationClient:
     the human token.
 
     Backend credentials are reused and a successful identical authorization ALLOW may
-    be reused for only a few seconds to coalesce one UI request burst. DENY/error
-    responses are never cached and browser state never becomes authoritative.
+    be reused briefly to coalesce one UI request burst. DENY/error responses are never
+    cached and browser state never becomes authoritative.
     """
 
     def __init__(
@@ -118,7 +149,7 @@ class SecurityAuthorizationClient:
                     "Security ServiceIntegration token could not be issued"
                 ) from exc
             self._service_token = token
-            self._service_token_reuse_until = now + _SERVICE_TOKEN_REUSE_SECONDS
+            self._service_token_reuse_until = now + _service_token_reuse_seconds(token)
             return token
 
     def _cached_allow(
