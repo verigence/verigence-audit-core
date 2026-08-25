@@ -51,11 +51,7 @@ def _evidence_row(
             "evidence_id": evidence_id,
         },
     ).mappings().one_or_none()
-    if (
-        row is None
-        or row["di_subject_id"] is None
-        or row["di_document_id"] is None
-    ):
+    if row is None or row["di_subject_id"] is None or row["di_document_id"] is None:
         raise NotFoundError(
             error_code="VAC-NF-006",
             title="Evidence not found",
@@ -85,7 +81,7 @@ def _fact_rows(
             """
             SELECT evidence_fact_id, field_key, value_type, value_json,
                    normalized_value, confidence_score, verification_status,
-                   fetched_at_utc
+                   page_no, evidence_region, fetched_at_utc
             FROM auditcore.evidence_facts
             WHERE tenant_id=:tenant_id
               AND evidence_id=:evidence_id
@@ -108,6 +104,8 @@ def _fact_rows(
                 else None
             ),
             "verificationStatus": row["verification_status"],
+            "pageNo": row["page_no"],
+            "evidenceRegion": row["evidence_region"],
             "fetchedAtUtc": row["fetched_at_utc"].isoformat(),
         }
         for row in rows
@@ -168,11 +166,13 @@ def _persist_facts(
                 INSERT INTO auditcore.evidence_facts (
                     tenant_id, evidence_id, journey_id,
                     field_key, value_type, value_json, normalized_value,
-                    confidence_score, di_field_reference, verification_status
+                    confidence_score, di_field_reference, verification_status,
+                    page_no, evidence_region
                 ) VALUES (
                     :tenant_id, :evidence_id, :journey_id,
                     :field_key, :value_type, CAST(:value_json AS jsonb), :normalized_value,
-                    :confidence_score, :di_field_reference, :verification_status
+                    :confidence_score, :di_field_reference, :verification_status,
+                    :page_no, CAST(:evidence_region AS jsonb)
                 )
                 """
             ),
@@ -187,6 +187,10 @@ def _persist_facts(
                 "confidence_score": fact.confidence_score,
                 "di_field_reference": fact.canonical_field_id,
                 "verification_status": verification_status,
+                "page_no": fact.page_no,
+                "evidence_region": json.dumps(fact.evidence_region)
+                if fact.evidence_region is not None
+                else None,
             },
         )
     return _fact_rows(connection, tenant_id=tenant_id, evidence_id=evidence_id)
@@ -206,7 +210,7 @@ def refresh_booking_evidence_details(
     di_client: Annotated[DiClient, Depends(get_di_client)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> list[dict[str, Any]]:
-    """Refresh one UC03 Booking document with the authenticated human-token model."""
+    """Refresh one UC03 Booking document and persist DI facts plus source localization."""
     _scope(
         connection,
         tenant_id=tenant_id,

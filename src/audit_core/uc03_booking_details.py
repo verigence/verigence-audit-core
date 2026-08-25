@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from decimal import Decimal
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -9,15 +8,17 @@ from fastapi import APIRouter, Depends, Header, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import Connection, text
 
-from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_human_principal
-from audit_core.errors import AuditCoreError, ConflictError
+from audit_core.di_client import DiClient, DiClientError
+from audit_core.errors import AuditCoreError, ConflictError, DependencyUnavailableError
+from audit_core.evidence import get_di_client, get_security_oauth_client
 from audit_core.observability import get_correlation_id
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.security_integration import SecurityOAuthClient, SecurityTokenError
 from audit_core.uc03_booking_capture import _scope
 from audit_core.uc03_booking_commands import (
     _aggregate_lock,
@@ -33,53 +34,26 @@ router = APIRouter(
 )
 
 _ACTIVE_BOOKING_STATUSES = {"BOOKING_STARTED", "BOOKING_IN_PROGRESS"}
+_DI_AUDIENCE = "di"
 _CORPORATE_ID_RULE = "BK_CORPORATE_ID_NOT_AVAILABLE"
 _GST_DOCUMENT_RULE = "BK_GST_CERTIFICATE_NOT_AVAILABLE"
 
+_MASTER_DOMAINS = {
+    "customerType": "CUSTOMER_TYPE",
+    "dealType": "DEAL_TYPE",
+    "dealSource": "DEAL_SOURCE",
+    "leadSource": "LEAD_SOURCE",
+    "registrationState": "REGISTRATION_STATE",
+    "territoryCategorization": "TERRITORY_CATEGORIZATION",
+    "districtName": "DISTRICT",
+    "registrationType": "REGISTRATION_TYPE",
+    "registrationCategory": "REGISTRATION_CATEGORY",
+}
 
-class BookingDetailsCommand(BaseModel):
-    """PC-entered Booking facts for the dedicated Booking Details screen."""
 
-    model_config = ConfigDict(extra="forbid")
-
-    priceListId: UUID
-    corporateCustomer: bool
-    dealType: str = Field(min_length=1, max_length=100)
-    dealSource: str = Field(min_length=1, max_length=100)
-    leadSource: str = Field(min_length=1, max_length=100)
-    registrationState: str = Field(min_length=1, max_length=160)
-    territoryCategorization: str = Field(min_length=1, max_length=160)
-    districtName: str = Field(min_length=1, max_length=160)
-    registrationType: str = Field(min_length=1, max_length=100)
-    registrationCategory: str = Field(min_length=1, max_length=100)
-    outrightPurchase: bool
-
-    accessoriesTaken: bool | None = None
-    fasttagTaken: bool | None = None
-    greenTax: bool | None = None
-    otherCharges: Decimal | None = Field(default=None, ge=0)
-    hpCharges: Decimal | None = Field(default=None, ge=0)
-
-    exchangeTaken: bool
-    exchangeDiscountTaken: bool | None = None
-    tradeInRcAvailable: bool | None = None
-    tradeInSameOwner: bool | None = None
-    exchangeDiscountType: str | None = Field(default=None, max_length=120)
-
-    corporateDiscountTaken: bool | None = None
-    corporateDiscountType: str | None = Field(default=None, max_length=120)
-    corporateIdAvailable: bool | None = None
-    gstBenefit: bool
-
-    @model_validator(mode="after")
-    def validate_conditionals(self):
-        if self.corporateCustomer and self.corporateIdAvailable is None:
-            raise ValueError("Corporate ID availability is required for a Corporate Booking")
-        if self.corporateDiscountTaken and not (self.corporateDiscountType or "").strip():
-            raise ValueError("Corporate Discount Type is required when Corporate Discount is taken")
-        if self.exchangeDiscountTaken and not (self.exchangeDiscountType or "").strip():
-            raise ValueError("Exchange Discount Type is required when Exchange Discount is taken")
-        return self
+class ReferenceOption(BaseModel):
+    code: str
+    label: str
 
 
 class PriceListOption(BaseModel):
@@ -89,57 +63,85 @@ class PriceListOption(BaseModel):
     effectiveVersionId: UUID
 
 
+class OptionalEvidenceView(BaseModel):
+    requirementKey: str
+    documentTypeKey: str
+    evidenceId: UUID | None = None
+    processingStatus: str | None = None
+
+
 class BookingDetailsOptionsResponse(BaseModel):
     effectiveOn: str
     priceLists: list[PriceListOption]
+    customerTypes: list[ReferenceOption]
+    dealTypes: list[ReferenceOption]
+    dealSources: list[ReferenceOption]
+    leadSources: list[ReferenceOption]
+    registrationStates: list[ReferenceOption]
+    territoryCategories: list[ReferenceOption]
+    districts: list[ReferenceOption]
+    registrationTypes: list[ReferenceOption]
+    registrationCategories: list[ReferenceOption]
 
 
-class OptionalEvidenceState(BaseModel):
-    corporateIdEvidenceId: UUID | None
-    gstCertificateEvidenceId: UUID | None
+class BookingDetailsCommand(BaseModel):
+    """Only PC-entered Booking facts for Screen 2."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    priceListId: UUID
+    customerType: str = Field(min_length=1, max_length=80)
+    dealType: str = Field(min_length=1, max_length=100)
+    dealSource: str = Field(min_length=1, max_length=100)
+    leadSource: str = Field(min_length=1, max_length=100)
+    registrationState: str = Field(min_length=1, max_length=160)
+    territoryCategorization: str = Field(min_length=1, max_length=160)
+    districtName: str = Field(min_length=1, max_length=160)
+    registrationType: str = Field(min_length=1, max_length=100)
+    registrationCategory: str = Field(min_length=1, max_length=100)
+    outrightPurchase: bool
+    tradeIn: bool
+    gstBenefit: bool
+    corporateIdAvailable: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_conditionals(self):
+        if self.customerType.strip().upper() == "CORPORATE" and self.corporateIdAvailable is None:
+            raise ValueError("Corporate ID availability is required for a Corporate Booking")
+        return self
 
 
 class BookingDetailsView(BaseModel):
     aggregateVersion: int
-    priceListId: UUID | None
-    corporateCustomer: bool | None
-    dealType: str | None
-    dealSource: str | None
-    leadSource: str | None
-    registrationState: str | None
-    territoryCategorization: str | None
-    districtName: str | None
-    registrationType: str | None
-    registrationCategory: str | None
-    outrightPurchase: bool | None
-    accessoriesTaken: bool | None
-    fasttagTaken: bool | None
-    greenTax: bool | None
-    otherCharges: Decimal | None
-    hpCharges: Decimal | None
-    exchangeTaken: bool | None
-    exchangeDiscountTaken: bool | None
-    tradeInRcAvailable: bool | None
-    tradeInSameOwner: bool | None
-    exchangeDiscountType: str | None
-    corporateDiscountTaken: bool | None
-    corporateDiscountType: str | None
-    corporateIdAvailable: bool | None
-    gstBenefit: bool | None
-    optionalEvidence: OptionalEvidenceState
+    priceListId: UUID | None = None
+    customerType: str | None = None
+    dealType: str | None = None
+    dealSource: str | None = None
+    leadSource: str | None = None
+    registrationState: str | None = None
+    territoryCategorization: str | None = None
+    districtName: str | None = None
+    registrationType: str | None = None
+    registrationCategory: str | None = None
+    outrightPurchase: bool | None = None
+    tradeIn: bool | None = None
+    gstBenefit: bool | None = None
+    corporateIdAvailable: bool | None = None
+    optionalEvidence: list[OptionalEvidenceView] = Field(default_factory=list)
 
 
 class BookingDetailsSaveResponse(BaseModel):
     journeyId: UUID
     aggregateVersion: int
+    optionalEvidence: list[OptionalEvidenceView]
 
 
 class ReviewEvidenceItem(BaseModel):
     evidenceId: UUID
-    documentTypeKey: str | None
-    evidencePurpose: str
-    processingStatus: str | None
-    verificationStatus: str | None
+    requirementKey: str | None = None
+    documentTypeKey: str | None = None
+    processingStatus: str | None = None
+    verificationStatus: str | None = None
 
 
 class BookingReviewStartResponse(BaseModel):
@@ -149,6 +151,12 @@ class BookingReviewStartResponse(BaseModel):
     documents: list[ReviewEvidenceItem]
 
 
+class DocumentApprovalResponse(BaseModel):
+    evidenceId: UUID
+    aggregateVersion: int
+    verificationStatus: str
+
+
 def _require_active(state) -> None:
     if state is None or state["business_status"] not in _ACTIVE_BOOKING_STATUSES:
         raise ConflictError(
@@ -156,159 +164,6 @@ def _require_active(state) -> None:
             title="Booking state conflict",
             detail="The Booking must be active before Booking Details can change.",
         )
-
-
-def _optional_evidence(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-) -> OptionalEvidenceState:
-    rows = connection.execute(
-        text(
-            """
-            SELECT evidence_id, document_type_key, evidence_purpose
-            FROM auditcore.evidence
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND association_status='ACTIVE'
-              AND (
-                    document_type_key IN ('corporate_id', 'gst_certificate')
-                    OR evidence_purpose IN (
-                        'UC03_BOOKING:CORPORATE_ID',
-                        'UC03_BOOKING:GST_CERTIFICATE'
-                    )
-              )
-            ORDER BY linked_at_utc DESC, evidence_id DESC
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().all()
-    corporate_id: UUID | None = None
-    gst: UUID | None = None
-    for row in rows:
-        doc_type = (row["document_type_key"] or "").lower()
-        purpose = row["evidence_purpose"] or ""
-        if corporate_id is None and (
-            doc_type == "corporate_id" or purpose == "UC03_BOOKING:CORPORATE_ID"
-        ):
-            corporate_id = row["evidence_id"]
-        if gst is None and (
-            doc_type == "gst_certificate" or purpose == "UC03_BOOKING:GST_CERTIFICATE"
-        ):
-            gst = row["evidence_id"]
-    return OptionalEvidenceState(
-        corporateIdEvidenceId=corporate_id,
-        gstCertificateEvidenceId=gst,
-    )
-
-
-def _trade_details(value: Any) -> dict[str, Any]:
-    return dict(value) if isinstance(value, dict) else {}
-
-
-def _details_view(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-) -> BookingDetailsView:
-    state = connection.execute(
-        text(
-            """
-            SELECT version_no
-            FROM auditcore.journey_stage_states
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code='BOOKING'
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one_or_none()
-    aggregate_version = int(state["version_no"]) if state is not None else 0
-
-    booking = connection.execute(
-        text(
-            """
-            SELECT b.price_list_id, b.deal_type_code, b.deal_source_code,
-                   b.lead_source_code, b.outright_purchase, b.accessories_taken,
-                   b.fasttag_taken, b.green_tax, b.other_charges, b.hp_charges,
-                   b.exchange_discount_taken, b.corporate_customer,
-                   b.corporate_discount_taken, b.corporate_discount_type,
-                   b.corporate_id_available, b.gst_benefit,
-                   c.customer_type_code
-            FROM auditcore.journeys j
-            JOIN auditcore.customers c
-              ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
-            LEFT JOIN auditcore.bookings b
-              ON b.tenant_id=j.tenant_id AND b.journey_id=j.journey_id
-            WHERE j.tenant_id=:tenant_id AND j.journey_id=:journey_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one()
-
-    registration = connection.execute(
-        text(
-            """
-            SELECT registration_state, registration_territory,
-                   registration_district, registration_type_code,
-                   registration_category_code
-            FROM auditcore.registration_records
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one_or_none()
-
-    trade = connection.execute(
-        text(
-            """
-            SELECT actual_status_code, details
-            FROM auditcore.trade_in_cases
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one_or_none()
-    trade_details = _trade_details(trade["details"] if trade is not None else None)
-    exchange_taken = None
-    if trade is not None and trade["actual_status_code"]:
-        exchange_taken = trade["actual_status_code"] == "EXCHANGE_TAKEN"
-
-    corporate_value = booking["corporate_customer"]
-    if corporate_value is None and booking["customer_type_code"] is not None:
-        corporate_value = str(booking["customer_type_code"]).upper() == "CORPORATE"
-
-    return BookingDetailsView(
-        aggregateVersion=aggregate_version,
-        priceListId=booking["price_list_id"],
-        corporateCustomer=corporate_value,
-        dealType=booking["deal_type_code"],
-        dealSource=booking["deal_source_code"],
-        leadSource=booking["lead_source_code"],
-        registrationState=registration["registration_state"] if registration else None,
-        territoryCategorization=registration["registration_territory"] if registration else None,
-        districtName=registration["registration_district"] if registration else None,
-        registrationType=registration["registration_type_code"] if registration else None,
-        registrationCategory=registration["registration_category_code"] if registration else None,
-        outrightPurchase=booking["outright_purchase"],
-        accessoriesTaken=booking["accessories_taken"],
-        fasttagTaken=booking["fasttag_taken"],
-        greenTax=booking["green_tax"],
-        otherCharges=booking["other_charges"],
-        hpCharges=booking["hp_charges"],
-        exchangeTaken=exchange_taken,
-        exchangeDiscountTaken=booking["exchange_discount_taken"],
-        tradeInRcAvailable=trade_details.get("rcAvailable"),
-        tradeInSameOwner=trade_details.get("sameOwner"),
-        exchangeDiscountType=trade_details.get("exchangeDiscountType"),
-        corporateDiscountTaken=booking["corporate_discount_taken"],
-        corporateDiscountType=booking["corporate_discount_type"],
-        corporateIdAvailable=booking["corporate_id_available"],
-        gstBenefit=booking["gst_benefit"],
-        optionalEvidence=_optional_evidence(
-            connection, tenant_id=tenant_id, journey_id=journey_id
-        ),
-    )
 
 
 def _effective_date(connection: Connection, *, tenant_id: str, journey_id: UUID) -> str:
@@ -327,13 +182,74 @@ def _effective_date(connection: Connection, *, tenant_id: str, journey_id: UUID)
     return value.isoformat()
 
 
+def _master_options(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    domain: str,
+    effective_on: str,
+) -> list[ReferenceOption]:
+    rows = connection.execute(
+        text(
+            """
+            SELECT status_code, status_label
+            FROM auditcore.business_status_codes
+            WHERE tenant_id=:tenant_id AND domain_key=:domain
+              AND is_active=true
+              AND (effective_from IS NULL OR effective_from <= CAST(:effective_on AS date))
+              AND (effective_to IS NULL OR effective_to >= CAST(:effective_on AS date))
+            ORDER BY status_label, status_code
+            """
+        ),
+        {"tenant_id": tenant_id, "domain": domain, "effective_on": effective_on},
+    ).mappings().all()
+    return [ReferenceOption(code=row["status_code"], label=row["status_label"]) for row in rows]
+
+
+def _validate_master(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    domain: str,
+    value: str,
+    effective_on: str,
+    label: str,
+) -> str:
+    code = value.strip().upper()
+    found = connection.execute(
+        text(
+            """
+            SELECT 1
+            FROM auditcore.business_status_codes
+            WHERE tenant_id=:tenant_id AND domain_key=:domain AND status_code=:code
+              AND is_active=true
+              AND (effective_from IS NULL OR effective_from <= CAST(:effective_on AS date))
+              AND (effective_to IS NULL OR effective_to >= CAST(:effective_on AS date))
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "domain": domain,
+            "code": code,
+            "effective_on": effective_on,
+        },
+    ).scalar_one_or_none()
+    if found is None:
+        raise AuditCoreError(
+            error_code="VAC-MASTER-002",
+            status_code=422,
+            title="Booking master value unavailable",
+            detail=f"{label} must be selected from the effective Project master.",
+        )
+    return code
+
+
 def _price_list_options(
     connection: Connection,
     *,
     tenant_id: str,
-    journey_id: UUID,
-) -> BookingDetailsOptionsResponse:
-    effective_on = _effective_date(connection, tenant_id=tenant_id, journey_id=journey_id)
+    effective_on: str,
+) -> list[PriceListOption]:
     rows = connection.execute(
         text(
             """
@@ -342,8 +258,7 @@ def _price_list_options(
                    plv.price_list_version_id
             FROM auditcore.price_lists pl
             JOIN auditcore.price_list_versions plv
-              ON plv.tenant_id=pl.tenant_id
-             AND plv.price_list_id=pl.price_list_id
+              ON plv.tenant_id=pl.tenant_id AND plv.price_list_id=pl.price_list_id
             WHERE pl.tenant_id=:tenant_id
               AND plv.lifecycle_status='PUBLISHED'
               AND plv.effective_from <= CAST(:effective_on AS date)
@@ -353,29 +268,25 @@ def _price_list_options(
         ),
         {"tenant_id": tenant_id, "effective_on": effective_on},
     ).mappings().all()
-    options = sorted(
-        [
-            PriceListOption(
-                priceListId=row["price_list_id"],
-                code=row["price_list_code"],
-                name=row["price_list_name"],
-                effectiveVersionId=row["price_list_version_id"],
-            )
-            for row in rows
-        ],
-        key=lambda item: (item.name.lower(), item.code.lower()),
-    )
-    return BookingDetailsOptionsResponse(effectiveOn=effective_on, priceLists=options)
+    result = [
+        PriceListOption(
+            priceListId=row["price_list_id"],
+            code=row["price_list_code"],
+            name=row["price_list_name"],
+            effectiveVersionId=row["price_list_version_id"],
+        )
+        for row in rows
+    ]
+    return sorted(result, key=lambda item: (item.name.lower(), item.code.lower()))
 
 
 def _validate_price_list(
     connection: Connection,
     *,
     tenant_id: str,
-    journey_id: UUID,
     price_list_id: UUID,
+    effective_on: str,
 ) -> None:
-    effective_on = _effective_date(connection, tenant_id=tenant_id, journey_id=journey_id)
     found = connection.execute(
         text(
             """
@@ -400,9 +311,272 @@ def _validate_price_list(
         raise AuditCoreError(
             error_code="VAC-MASTER-002",
             status_code=422,
-            title="No effective master version",
-            detail="The selected Price List is not effective for this Booking date.",
+            title="No effective Price List",
+            detail="Price List must be selected from the effective Project master.",
         )
+
+
+def _optional_evidence(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+) -> list[OptionalEvidenceView]:
+    rows = connection.execute(
+        text(
+            """
+            SELECT jdr.requirement_key, jdr.document_type_key,
+                   e.evidence_id, e.processing_status_cache
+            FROM auditcore.journey_document_requirements jdr
+            LEFT JOIN LATERAL (
+                SELECT evidence_id, processing_status_cache
+                FROM auditcore.evidence e
+                WHERE e.tenant_id=jdr.tenant_id
+                  AND e.journey_document_requirement_id=jdr.journey_document_requirement_id
+                  AND e.association_status='ACTIVE'
+                ORDER BY e.linked_at_utc DESC, e.evidence_id DESC
+                LIMIT 1
+            ) e ON true
+            WHERE jdr.tenant_id=:tenant_id AND jdr.journey_id=:journey_id
+              AND jdr.requirement_key IN ('corporate_id','gst_certificate','trade_in_vehicle_rc')
+            ORDER BY CASE jdr.requirement_key
+                WHEN 'corporate_id' THEN 10
+                WHEN 'gst_certificate' THEN 20
+                ELSE 30 END
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    return [
+        OptionalEvidenceView(
+            requirementKey=row["requirement_key"],
+            documentTypeKey=row["document_type_key"],
+            evidenceId=row["evidence_id"],
+            processingStatus=row["processing_status_cache"],
+        )
+        for row in rows
+    ]
+
+
+def _set_optional_requirement(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    requirement_key: str,
+    document_type_key: str,
+    applies: bool,
+    reason: str,
+) -> None:
+    row = connection.execute(
+        text(
+            """
+            SELECT journey_document_requirement_id
+            FROM auditcore.journey_document_requirements
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND requirement_key=:requirement_key
+            FOR UPDATE
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "requirement_key": requirement_key,
+        },
+    ).mappings().one_or_none()
+    snapshot = json.dumps(
+        {
+            "applicabilityState": "APPLICABLE" if applies else "NOT_APPLICABLE",
+            "applicabilityReason": reason,
+        }
+    )
+    if row is None:
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.journey_document_requirements (
+                    tenant_id, journey_id, requirement_key, document_type_key,
+                    process_area, requirement_level, requirement_status,
+                    condition_snapshot
+                ) VALUES (
+                    :tenant_id, :journey_id, :requirement_key, :document_type_key,
+                    'BOOKING', 'OPTIONAL', :status, CAST(:snapshot AS jsonb)
+                )
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "requirement_key": requirement_key,
+                "document_type_key": document_type_key,
+                "status": "PENDING" if applies else "NOT_APPLICABLE",
+                "snapshot": snapshot,
+            },
+        )
+        return
+
+    requirement_id = row["journey_document_requirement_id"]
+    has_evidence = connection.execute(
+        text(
+            """
+            SELECT 1 FROM auditcore.evidence
+            WHERE tenant_id=:tenant_id
+              AND journey_document_requirement_id=:requirement_id
+              AND association_status='ACTIVE'
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "requirement_id": requirement_id},
+    ).scalar_one_or_none()
+    status = "SATISFIED" if applies and has_evidence is not None else "PENDING"
+    if not applies:
+        status = "NOT_APPLICABLE"
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.journey_document_requirements
+            SET document_type_key=:document_type_key,
+                process_area='BOOKING', requirement_level='OPTIONAL',
+                requirement_status=:status,
+                condition_snapshot=CAST(:snapshot AS jsonb), updated_at_utc=now()
+            WHERE tenant_id=:tenant_id
+              AND journey_document_requirement_id=:requirement_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "requirement_id": requirement_id,
+            "document_type_key": document_type_key,
+            "status": status,
+            "snapshot": snapshot,
+        },
+    )
+
+
+def _details_view(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+) -> BookingDetailsView:
+    state = connection.execute(
+        text(
+            """
+            SELECT version_no
+            FROM auditcore.journey_stage_states
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND stage_code='BOOKING'
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
+    booking = connection.execute(
+        text(
+            """
+            SELECT c.customer_type_code,
+                   b.price_list_id, b.deal_type_code, b.deal_source_code,
+                   b.lead_source_code, b.outright_purchase,
+                   b.corporate_id_available, b.gst_benefit
+            FROM auditcore.journeys j
+            JOIN auditcore.customers c
+              ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+            LEFT JOIN auditcore.bookings b
+              ON b.tenant_id=j.tenant_id AND b.journey_id=j.journey_id
+            WHERE j.tenant_id=:tenant_id AND j.journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one()
+    registration = connection.execute(
+        text(
+            """
+            SELECT registration_state, registration_territory,
+                   registration_district, registration_type_code,
+                   registration_category_code
+            FROM auditcore.registration_records
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
+    trade_status = connection.execute(
+        text(
+            """
+            SELECT actual_status_code
+            FROM auditcore.trade_in_cases
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalar_one_or_none()
+    trade_in: bool | None = None
+    if trade_status is not None:
+        trade_in = str(trade_status).upper() == "EXCHANGE_TAKEN"
+    return BookingDetailsView(
+        aggregateVersion=int(state["version_no"]) if state is not None else 0,
+        priceListId=booking["price_list_id"],
+        customerType=booking["customer_type_code"],
+        dealType=booking["deal_type_code"],
+        dealSource=booking["deal_source_code"],
+        leadSource=booking["lead_source_code"],
+        registrationState=registration["registration_state"] if registration else None,
+        territoryCategorization=registration["registration_territory"] if registration else None,
+        districtName=registration["registration_district"] if registration else None,
+        registrationType=registration["registration_type_code"] if registration else None,
+        registrationCategory=registration["registration_category_code"] if registration else None,
+        outrightPurchase=booking["outright_purchase"],
+        tradeIn=trade_in,
+        gstBenefit=booking["gst_benefit"],
+        corporateIdAvailable=booking["corporate_id_available"],
+        optionalEvidence=_optional_evidence(connection, tenant_id=tenant_id, journey_id=journey_id),
+    )
+
+
+def _review_documents(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+) -> list[ReviewEvidenceItem]:
+    rows = connection.execute(
+        text(
+            """
+            SELECT e.evidence_id, jdr.requirement_key, e.document_type_key,
+                   e.processing_status_cache, e.verification_status_cache,
+                   e.linked_at_utc
+            FROM auditcore.evidence e
+            LEFT JOIN auditcore.journey_document_requirements jdr
+              ON jdr.tenant_id=e.tenant_id
+             AND jdr.journey_document_requirement_id=e.journey_document_requirement_id
+            WHERE e.tenant_id=:tenant_id AND e.journey_id=:journey_id
+              AND e.association_status='ACTIVE'
+              AND upper(COALESCE(e.process_area, 'BOOKING'))='BOOKING'
+            ORDER BY
+              CASE COALESCE(jdr.requirement_key, '')
+                WHEN 'booking_docket' THEN 10
+                WHEN 'pan_card' THEN 20
+                WHEN 'aadhaar' THEN 30
+                WHEN 'booking_payment_receipt' THEN 40
+                WHEN 'corporate_id' THEN 50
+                WHEN 'gst_certificate' THEN 60
+                WHEN 'trade_in_vehicle_rc' THEN 70
+                ELSE 90
+              END,
+              e.linked_at_utc, e.evidence_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    return [
+        ReviewEvidenceItem(
+            evidenceId=row["evidence_id"],
+            requirementKey=row["requirement_key"],
+            documentTypeKey=row["document_type_key"],
+            processingStatus=row["processing_status_cache"],
+            verificationStatus=row["verification_status_cache"],
+        )
+        for row in rows
+    ]
 
 
 def _record_machine_observation(
@@ -423,15 +597,13 @@ def _record_machine_observation(
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
               AND stage_code='BOOKING' AND rule_key=:rule_key
               AND finding_status <> 'VOIDED'
-            ORDER BY created_at_utc DESC, audit_finding_id DESC
-            LIMIT 1
+            ORDER BY created_at_utc DESC, audit_finding_id DESC LIMIT 1
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id, "rule_key": rule_key},
     ).scalar_one_or_none()
     if existing is not None:
         return existing
-
     finding_id = connection.execute(
         text(
             """
@@ -445,8 +617,7 @@ def _record_machine_observation(
                 'OPEN', :title, :description, NULL,
                 :correlation_id, 'BOOKING', 'MACHINE', NULL,
                 'SYSTEM', :rule_key, false
-            )
-            RETURNING audit_finding_id
+            ) RETURNING audit_finding_id
             """
         ),
         {
@@ -467,8 +638,7 @@ def _record_machine_observation(
                 safe_payload, correlation_id
             ) VALUES (
                 :tenant_id, :finding_id, :journey_id, 'BOOKING',
-                'RAISED', NULL, 'SYSTEM', CAST(:safe_payload AS jsonb),
-                :correlation_id
+                'RAISED', NULL, 'SYSTEM', CAST(:payload AS jsonb), :correlation_id
             )
             """
         ),
@@ -476,72 +646,11 @@ def _record_machine_observation(
             "tenant_id": tenant_id,
             "finding_id": finding_id,
             "journey_id": journey_id,
-            "safe_payload": json.dumps({"originKind": "MACHINE", "ruleKey": rule_key}),
+            "payload": json.dumps({"originKind": "MACHINE", "ruleKey": rule_key}),
             "correlation_id": correlation_id,
         },
     )
-    connection.execute(
-        text(
-            """
-            UPDATE auditcore.journey_stage_states
-            SET audit_status='FLAGS_RAISED', updated_at_utc=now()
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code='BOOKING'
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    )
     return finding_id
-
-
-def _review_documents(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-) -> list[ReviewEvidenceItem]:
-    rows = connection.execute(
-        text(
-            """
-            SELECT evidence_id, document_type_key, evidence_purpose,
-                   processing_status_cache, verification_status_cache,
-                   linked_at_utc
-            FROM auditcore.evidence
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND association_status='ACTIVE'
-              AND (
-                    upper(COALESCE(process_area, 'BOOKING'))='BOOKING'
-                    OR evidence_purpose LIKE 'UC03_BOOKING:%'
-              )
-            ORDER BY
-              CASE lower(COALESCE(document_type_key, ''))
-                WHEN 'booking_docket' THEN 10
-                WHEN 'booking_form' THEN 10
-                WHEN 'pan_card' THEN 20
-                WHEN 'pan' THEN 20
-                WHEN 'aadhaar' THEN 30
-                WHEN 'dealer_receipt' THEN 40
-                WHEN 'minimum_booking_payment_proof' THEN 40
-                WHEN 'corporate_id' THEN 50
-                WHEN 'gst_certificate' THEN 60
-                ELSE 90
-              END,
-              linked_at_utc,
-              evidence_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().all()
-    return [
-        ReviewEvidenceItem(
-            evidenceId=row["evidence_id"],
-            documentTypeKey=row["document_type_key"],
-            evidencePurpose=row["evidence_purpose"],
-            processingStatus=row["processing_status_cache"],
-            verificationStatus=row["verification_status_cache"],
-        )
-        for row in rows
-    ]
 
 
 @router.get("", response_model=BookingDetailsView)
@@ -581,7 +690,20 @@ def get_booking_details_options(
         human_principal=human_principal,
         authorization_client=authorization_client,
     )
-    return _price_list_options(connection, tenant_id=tenant_id, journey_id=journey_id)
+    effective_on = _effective_date(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return BookingDetailsOptionsResponse(
+        effectiveOn=effective_on,
+        priceLists=_price_list_options(connection, tenant_id=tenant_id, effective_on=effective_on),
+        customerTypes=_master_options(connection, tenant_id=tenant_id, domain=_MASTER_DOMAINS["customerType"], effective_on=effective_on),
+        dealTypes=_master_options(connection, tenant_id=tenant_id, domain=_MASTER_DOMAINS["dealType"], effective_on=effective_on),
+        dealSources=_master_options(connection, tenant_id=tenant_id, domain=_MASTER_DOMAINS["dealSource"], effective_on=effective_on),
+        leadSources=_master_options(connection, tenant_id=tenant_id, domain=_MASTER_DOMAINS["leadSource"], effective_on=effective_on),
+        registrationStates=_master_options(connection, tenant_id=tenant_id, domain=_MASTER_DOMAINS["registrationState"], effective_on=effective_on),
+        territoryCategories=_master_options(connection, tenant_id=tenant_id, domain=_MASTER_DOMAINS["territoryCategorization"], effective_on=effective_on),
+        districts=_master_options(connection, tenant_id=tenant_id, domain=_MASTER_DOMAINS["districtName"], effective_on=effective_on),
+        registrationTypes=_master_options(connection, tenant_id=tenant_id, domain=_MASTER_DOMAINS["registrationType"], effective_on=effective_on),
+        registrationCategories=_master_options(connection, tenant_id=tenant_id, domain=_MASTER_DOMAINS["registrationCategory"], effective_on=effective_on),
+    )
 
 
 @router.put("", response_model=BookingDetailsSaveResponse)
@@ -609,51 +731,55 @@ def save_booking_details(
     state = _stage_state(connection, tenant_id=tenant_id, journey_id=journey_id)
     _require_active(state)
     _require_expected_version(state, _parse_if_match(if_match))
+    effective_on = _effective_date(connection, tenant_id=tenant_id, journey_id=journey_id)
     _validate_price_list(
         connection,
         tenant_id=tenant_id,
-        journey_id=journey_id,
         price_list_id=command.priceListId,
+        effective_on=effective_on,
     )
+    values: dict[str, str] = {}
+    for field_name, domain in _MASTER_DOMAINS.items():
+        raw = getattr(command, field_name)
+        values[field_name] = _validate_master(
+            connection,
+            tenant_id=tenant_id,
+            domain=domain,
+            value=raw,
+            effective_on=effective_on,
+            label=field_name,
+        )
 
     customer_id = connection.execute(
-        text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:tenant_id AND journey_id=:journey_id"),
+        text(
+            "SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:tenant_id AND journey_id=:journey_id"
+        ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).scalar_one()
     connection.execute(
         text(
             """
             UPDATE auditcore.customers
-            SET customer_type_code=:customer_type, updated_at_utc=now(),
-                version_no=version_no+1
+            SET customer_type_code=:customer_type, updated_at_utc=now(), version_no=version_no+1
             WHERE tenant_id=:tenant_id AND customer_id=:customer_id
             """
         ),
         {
             "tenant_id": tenant_id,
             "customer_id": customer_id,
-            "customer_type": "CORPORATE" if command.corporateCustomer else "INDIVIDUAL",
+            "customer_type": values["customerType"],
         },
     )
-
     connection.execute(
         text(
             """
             INSERT INTO auditcore.bookings (
-                tenant_id, journey_id, price_list_id,
-                deal_type_code, deal_source_code, lead_source_code,
-                outright_purchase, accessories_taken, fasttag_taken,
-                green_tax, other_charges, hp_charges,
-                exchange_discount_taken, corporate_customer,
-                corporate_discount_taken, corporate_discount_type,
+                tenant_id, journey_id, price_list_id, deal_type_code,
+                deal_source_code, lead_source_code, outright_purchase,
                 corporate_id_available, gst_benefit
             ) VALUES (
-                :tenant_id, :journey_id, :price_list_id,
-                :deal_type, :deal_source, :lead_source,
-                :outright_purchase, :accessories_taken, :fasttag_taken,
-                :green_tax, :other_charges, :hp_charges,
-                :exchange_discount_taken, :corporate_customer,
-                :corporate_discount_taken, :corporate_discount_type,
+                :tenant_id, :journey_id, :price_list_id, :deal_type,
+                :deal_source, :lead_source, :outright_purchase,
                 :corporate_id_available, :gst_benefit
             )
             ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
@@ -662,51 +788,32 @@ def save_booking_details(
                 deal_source_code=EXCLUDED.deal_source_code,
                 lead_source_code=EXCLUDED.lead_source_code,
                 outright_purchase=EXCLUDED.outright_purchase,
-                accessories_taken=EXCLUDED.accessories_taken,
-                fasttag_taken=EXCLUDED.fasttag_taken,
-                green_tax=EXCLUDED.green_tax,
-                other_charges=EXCLUDED.other_charges,
-                hp_charges=EXCLUDED.hp_charges,
-                exchange_discount_taken=EXCLUDED.exchange_discount_taken,
-                corporate_customer=EXCLUDED.corporate_customer,
-                corporate_discount_taken=EXCLUDED.corporate_discount_taken,
-                corporate_discount_type=EXCLUDED.corporate_discount_type,
                 corporate_id_available=EXCLUDED.corporate_id_available,
                 gst_benefit=EXCLUDED.gst_benefit,
-                updated_at_utc=now(),
-                version_no=auditcore.bookings.version_no+1
+                updated_at_utc=now(), version_no=auditcore.bookings.version_no+1
             """
         ),
         {
             "tenant_id": tenant_id,
             "journey_id": journey_id,
             "price_list_id": command.priceListId,
-            "deal_type": command.dealType.strip(),
-            "deal_source": command.dealSource.strip(),
-            "lead_source": command.leadSource.strip(),
+            "deal_type": values["dealType"],
+            "deal_source": values["dealSource"],
+            "lead_source": values["leadSource"],
             "outright_purchase": command.outrightPurchase,
-            "accessories_taken": command.accessoriesTaken,
-            "fasttag_taken": command.fasttagTaken,
-            "green_tax": command.greenTax,
-            "other_charges": command.otherCharges,
-            "hp_charges": command.hpCharges,
-            "exchange_discount_taken": command.exchangeDiscountTaken,
-            "corporate_customer": command.corporateCustomer,
-            "corporate_discount_taken": command.corporateDiscountTaken,
-            "corporate_discount_type": (command.corporateDiscountType or "").strip() or None,
-            "corporate_id_available": command.corporateIdAvailable if command.corporateCustomer else None,
+            "corporate_id_available": command.corporateIdAvailable
+            if values["customerType"] == "CORPORATE"
+            else None,
             "gst_benefit": command.gstBenefit,
         },
     )
-
     connection.execute(
         text(
             """
             INSERT INTO auditcore.registration_records (
                 tenant_id, journey_id, registration_state,
                 registration_territory, registration_district,
-                registration_type_code, registration_category_code,
-                source_kind
+                registration_type_code, registration_category_code, source_kind
             ) VALUES (
                 :tenant_id, :journey_id, :registration_state,
                 :territory, :district, :registration_type,
@@ -719,54 +826,66 @@ def save_booking_details(
                 registration_type_code=EXCLUDED.registration_type_code,
                 registration_category_code=EXCLUDED.registration_category_code,
                 source_kind='OPERATIONAL_INPUT', source_evidence_id=NULL,
-                updated_at_utc=now(),
-                version_no=auditcore.registration_records.version_no+1
+                updated_at_utc=now(), version_no=auditcore.registration_records.version_no+1
             """
         ),
         {
             "tenant_id": tenant_id,
             "journey_id": journey_id,
-            "registration_state": command.registrationState.strip(),
-            "territory": command.territoryCategorization.strip(),
-            "district": command.districtName.strip(),
-            "registration_type": command.registrationType.strip(),
-            "registration_category": command.registrationCategory.strip(),
+            "registration_state": values["registrationState"],
+            "territory": values["territoryCategorization"],
+            "district": values["districtName"],
+            "registration_type": values["registrationType"],
+            "registration_category": values["registrationCategory"],
         },
     )
-
-    trade_details = {
-        "rcAvailable": command.tradeInRcAvailable if command.exchangeTaken else None,
-        "sameOwner": command.tradeInSameOwner if command.exchangeTaken else None,
-        "exchangeDiscountType": (
-            (command.exchangeDiscountType or "").strip() or None
-            if command.exchangeTaken
-            else None
-        ),
-    }
     connection.execute(
         text(
             """
             INSERT INTO auditcore.trade_in_cases (
-                tenant_id, journey_id, actual_status_code, source_kind, details
+                tenant_id, journey_id, actual_status_code, source_kind
             ) VALUES (
-                :tenant_id, :journey_id, :status_code,
-                'OPERATIONAL_INPUT', CAST(:details AS jsonb)
+                :tenant_id, :journey_id, :status_code, 'OPERATIONAL_INPUT'
             )
             ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
                 actual_status_code=EXCLUDED.actual_status_code,
                 source_kind='OPERATIONAL_INPUT', source_evidence_id=NULL,
-                details=COALESCE(auditcore.trade_in_cases.details, '{}'::jsonb)
-                        || EXCLUDED.details,
-                updated_at_utc=now(),
-                version_no=auditcore.trade_in_cases.version_no+1
+                updated_at_utc=now(), version_no=auditcore.trade_in_cases.version_no+1
             """
         ),
         {
             "tenant_id": tenant_id,
             "journey_id": journey_id,
-            "status_code": "EXCHANGE_TAKEN" if command.exchangeTaken else "NO_EXCHANGE",
-            "details": json.dumps(trade_details),
+            "status_code": "EXCHANGE_TAKEN" if command.tradeIn else "NO_EXCHANGE",
         },
+    )
+
+    _set_optional_requirement(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        requirement_key="corporate_id",
+        document_type_key="corporate_id",
+        applies=values["customerType"] == "CORPORATE",
+        reason=f"customerType={values['customerType']}",
+    )
+    _set_optional_requirement(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        requirement_key="gst_certificate",
+        document_type_key="gst_certificate",
+        applies=command.gstBenefit,
+        reason=f"gstBenefit={'Yes' if command.gstBenefit else 'No'}",
+    )
+    _set_optional_requirement(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        requirement_key="trade_in_vehicle_rc",
+        document_type_key="vehicle_rc",
+        applies=command.tradeIn,
+        reason=f"tradeIn={'Yes' if command.tradeIn else 'No'}",
     )
 
     next_version = int(state["version_no"]) + 1
@@ -776,10 +895,8 @@ def save_booking_details(
             UPDATE auditcore.journey_stage_states
             SET business_status='BOOKING_IN_PROGRESS',
                 audit_state=CASE WHEN audit_state='NOT_STARTED' THEN 'IN_PROGRESS' ELSE audit_state END,
-                latest_activity_at_utc=now(), updated_at_utc=now(),
-                version_no=:version
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code='BOOKING'
+                latest_activity_at_utc=now(), updated_at_utc=now(), version_no=:version
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND stage_code='BOOKING'
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id, "version": next_version},
@@ -795,13 +912,17 @@ def save_booking_details(
         idempotency_key=idempotency_key,
         correlation_id=get_correlation_id(request),
         safe_payload={
-            "corporateCustomer": command.corporateCustomer,
-            "exchangeTaken": command.exchangeTaken,
+            "customerType": values["customerType"],
+            "tradeIn": command.tradeIn,
             "gstBenefit": command.gstBenefit,
         },
         aggregate_version=next_version,
     )
-    return BookingDetailsSaveResponse(journeyId=journey_id, aggregateVersion=next_version)
+    return BookingDetailsSaveResponse(
+        journeyId=journey_id,
+        aggregateVersion=next_version,
+        optionalEvidence=_optional_evidence(connection, tenant_id=tenant_id, journey_id=journey_id),
+    )
 
 
 @router.post("/review", response_model=BookingReviewStartResponse)
@@ -828,11 +949,10 @@ def start_booking_review(
     state = _stage_state(connection, tenant_id=tenant_id, journey_id=journey_id)
     _require_active(state)
     _require_expected_version(state, _parse_if_match(if_match))
-
     details = _details_view(connection, tenant_id=tenant_id, journey_id=journey_id)
-    required_values = {
+    required: dict[str, Any] = {
         "Price List": details.priceListId,
-        "Corporate / Individual": details.corporateCustomer,
+        "Type of Customer": details.customerType,
         "Type of Deal": details.dealType,
         "Deal Source": details.dealSource,
         "Lead Generated Through": details.leadSource,
@@ -842,11 +962,11 @@ def start_booking_review(
         "Registration Type": details.registrationType,
         "Registration Category": details.registrationCategory,
         "Outright Purchase": details.outrightPurchase,
-        "Exchange Taken": details.exchangeTaken,
+        "Trade In": details.tradeIn,
         "GST Benefit": details.gstBenefit,
     }
-    missing = [label for label, value in required_values.items() if value is None or value == ""]
-    if details.corporateCustomer and details.corporateIdAvailable is None:
+    missing = [label for label, value in required.items() if value is None or value == ""]
+    if details.customerType == "CORPORATE" and details.corporateIdAvailable is None:
         missing.append("Corporate ID availability")
     if missing:
         raise AuditCoreError(
@@ -856,11 +976,12 @@ def start_booking_review(
             detail="Complete the required Booking Details before review: " + ", ".join(missing),
         )
 
-    observations: list[UUID] = []
-    evidence = details.optionalEvidence
+    by_key = {item.requirementKey: item for item in details.optionalEvidence}
     correlation_id = get_correlation_id(request)
-    if details.corporateCustomer and (
-        details.corporateIdAvailable is False or evidence.corporateIdEvidenceId is None
+    observations: list[UUID] = []
+    corporate = by_key.get("corporate_id")
+    if details.customerType == "CORPORATE" and (
+        details.corporateIdAvailable is False or corporate is None or corporate.evidenceId is None
     ):
         observations.append(
             _record_machine_observation(
@@ -870,13 +991,14 @@ def start_booking_review(
                 rule_key=_CORPORATE_ID_RULE,
                 title="Corporate ID not available",
                 description=(
-                    "The Booking is marked Corporate but a Corporate ID document was not supplied "
-                    "before document review. The evidence remains optional and Booking may continue."
+                    "The Booking is Corporate and no Corporate ID document was supplied before review. "
+                    "The document is optional and Booking may continue."
                 ),
                 correlation_id=correlation_id,
             )
         )
-    if details.gstBenefit and evidence.gstCertificateEvidenceId is None:
+    gst = by_key.get("gst_certificate")
+    if details.gstBenefit and (gst is None or gst.evidenceId is None):
         observations.append(
             _record_machine_observation(
                 connection,
@@ -885,8 +1007,8 @@ def start_booking_review(
                 rule_key=_GST_DOCUMENT_RULE,
                 title="GST Certificate not available",
                 description=(
-                    "GST benefit is marked Yes but a GST Certificate was not supplied before "
-                    "document review. The evidence remains optional and Booking may continue."
+                    "GST Benefit is Yes and no GST Certificate was supplied before review. "
+                    "The document is optional and Booking may continue."
                 ),
                 correlation_id=correlation_id,
             )
@@ -899,10 +1021,8 @@ def start_booking_review(
             UPDATE auditcore.journey_stage_states
             SET business_status='BOOKING_IN_PROGRESS',
                 audit_state=CASE WHEN audit_state='NOT_STARTED' THEN 'IN_PROGRESS' ELSE audit_state END,
-                latest_activity_at_utc=now(), updated_at_utc=now(),
-                version_no=:version
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code='BOOKING'
+                latest_activity_at_utc=now(), updated_at_utc=now(), version_no=:version
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND stage_code='BOOKING'
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id, "version": next_version},
@@ -925,4 +1045,131 @@ def start_booking_review(
         aggregateVersion=next_version,
         raisedObservationIds=observations,
         documents=_review_documents(connection, tenant_id=tenant_id, journey_id=journey_id),
+    )
+
+
+@router.post("/review/{evidence_id}/approve", response_model=DocumentApprovalResponse)
+def approve_review_document(
+    request: Request,
+    tenant_id: str,
+    journey_id: UUID,
+    evidence_id: UUID,
+    if_match: Annotated[str, Header(alias="If-Match")],
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
+    di_client: Annotated[DiClient, Depends(get_di_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> DocumentApprovalResponse:
+    context = _scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
+    state = _stage_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+    _require_active(state)
+    _require_expected_version(state, _parse_if_match(if_match))
+    evidence = connection.execute(
+        text(
+            """
+            SELECT di_subject_id, di_document_id
+            FROM auditcore.evidence
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND evidence_id=:evidence_id AND association_status='ACTIVE'
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "evidence_id": evidence_id,
+        },
+    ).mappings().one_or_none()
+    if evidence is None:
+        raise AuditCoreError(
+            error_code="VAC-NF-006",
+            status_code=404,
+            title="Evidence not found",
+            detail="The Booking evidence was not found for this Journey.",
+        )
+    pending = connection.execute(
+        text(
+            """
+            SELECT count(*)
+            FROM auditcore.journey_capture_proposals
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND source_evidence_id=:evidence_id AND proposal_status='PENDING'
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "evidence_id": evidence_id,
+        },
+    ).scalar_one()
+    if int(pending) > 0:
+        raise AuditCoreError(
+            error_code="VAC-VAL-002",
+            status_code=422,
+            title="Document review incomplete",
+            detail="Review all editable extracted fields before approving this document.",
+        )
+    try:
+        service_token = security_client.get_service_token(audience=_DI_AUDIENCE)
+        di_client.verify_document(
+            token=service_token,
+            tenant_id=tenant_id,
+            subject_id=str(evidence["di_subject_id"]),
+            document_id=str(evidence["di_document_id"]),
+            remarks="UC03 Process Consultant document review approved",
+            field_corrections=[],
+        )
+    except (DiClientError, SecurityTokenError) as exc:
+        raise DependencyUnavailableError(
+            detail="Document verification is temporarily unavailable. Please try again."
+        ) from exc
+
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.evidence
+            SET verification_status_cache='VERIFIED', cache_updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND evidence_id=:evidence_id
+            """
+        ),
+        {"tenant_id": tenant_id, "evidence_id": evidence_id},
+    )
+    next_version = int(state["version_no"]) + 1
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.journey_stage_states
+            SET latest_activity_at_utc=now(), updated_at_utc=now(), version_no=:version
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND stage_code='BOOKING'
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "version": next_version},
+    )
+    _append_workflow_event(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        event_type="BOOKING_DOCUMENT_REVIEW_APPROVED",
+        source_kind="HUMAN",
+        actor_id=human_principal.subject,
+        actor_role_snapshot=context["operating_role"],
+        idempotency_key=idempotency_key,
+        correlation_id=get_correlation_id(request),
+        safe_payload={"evidenceId": str(evidence_id)},
+        aggregate_version=next_version,
+    )
+    return DocumentApprovalResponse(
+        evidenceId=evidence_id,
+        aggregateVersion=next_version,
+        verificationStatus="VERIFIED",
     )
