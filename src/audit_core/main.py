@@ -56,6 +56,7 @@ from audit_core.uc03_booking_integrations import (
 )
 from audit_core.uc03_booking_part1 import router as uc03_booking_part1_router
 from audit_core.uc03_booking_receipt_capture import install_uc03_booking_receipt_capture
+from audit_core.uc03_booking_review import router as uc03_booking_review_router
 from audit_core.uc03_create_booking import router as uc03_create_booking_router
 from audit_core.uc03_delivery_commands import router as uc03_delivery_router
 from audit_core.uc03_delivery_documents import router as uc03_delivery_documents_router
@@ -126,6 +127,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_booking_evidence_router)
     application.include_router(uc03_booking_evidence_details_router)
     application.include_router(uc03_booking_details_router)
+    application.include_router(uc03_booking_review_router)
     application.include_router(uc03_delivery_router)
     application.include_router(uc03_delivery_documents_router)
     application.include_router(uc03_document_assessments_router)
