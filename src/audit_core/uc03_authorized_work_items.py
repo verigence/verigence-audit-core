@@ -29,6 +29,7 @@ class LandingMetrics(BaseModel):
     deliveryInProgress: int
     needsAttention: int
     auditFlags: int
+    auditInProgress: int
 
 
 def _authorize_workspace(
@@ -134,7 +135,9 @@ def get_landing_metrics(
                 SELECT
                     s.journey_id,
                     COALESCE(bs.business_status, b.actual_status_code) AS booking_status,
-                    COALESCE(ds.business_status, d.actual_delivery_status_code) AS delivery_status
+                    COALESCE(ds.business_status, d.actual_delivery_status_code) AS delivery_status,
+                    COALESCE(bs.audit_state, 'NOT_STARTED') AS booking_audit_state,
+                    COALESCE(ds.audit_state, 'NOT_STARTED') AS delivery_audit_state
                 FROM scoped s
                 LEFT JOIN auditcore.bookings b
                   ON b.tenant_id = :tenant_id AND b.journey_id = s.journey_id
@@ -164,6 +167,10 @@ def get_landing_metrics(
                 count(*) FILTER (
                     WHERE delivery_status IN ('DELIVERY_STARTED','DELIVERY_IN_PROGRESS')
                 ) AS delivery_in_progress,
+                count(*) FILTER (
+                    WHERE booking_audit_state = 'IN_PROGRESS'
+                       OR delivery_audit_state = 'IN_PROGRESS'
+                ) AS audit_in_progress,
                 (SELECT count(*) FROM active_findings) AS needs_attention,
                 COALESCE((SELECT sum(flag_count) FROM active_findings), 0) AS audit_flags
             FROM stage_projection
@@ -180,6 +187,7 @@ def get_landing_metrics(
         deliveryInProgress=int(row["delivery_in_progress"]),
         needsAttention=int(row["needs_attention"]),
         auditFlags=int(row["audit_flags"]),
+        auditInProgress=int(row["audit_in_progress"]),
     )
 
 
