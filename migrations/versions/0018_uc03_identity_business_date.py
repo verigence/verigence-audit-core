@@ -46,11 +46,9 @@ def upgrade() -> None:
         """
     )
 
-    # The name keyed at Journey creation is an observation made by the PC. Once the
-    # Journey exists it is historical audit input and must not be overwritten by DI.
-    # Existing proposal-decision code still writes the legacy CUSTOMER_NAME typed
-    # target; the write is intentionally neutralised here and the identity proposal
-    # trigger below applies the value to legal_name instead.
+    # A generic Customer may still be maintained before it is used by a Journey.
+    # Once linked to a Journey, display_name is historical Entered Name and becomes
+    # immutable regardless of which API path attempts the update.
     op.execute(
         """
         CREATE OR REPLACE FUNCTION auditcore.protect_customer_entered_name()
@@ -58,7 +56,13 @@ def upgrade() -> None:
         LANGUAGE plpgsql
         AS $$
         BEGIN
-            IF NEW.display_name IS DISTINCT FROM OLD.display_name THEN
+            IF NEW.display_name IS DISTINCT FROM OLD.display_name
+               AND EXISTS (
+                    SELECT 1
+                    FROM auditcore.journeys j
+                    WHERE j.tenant_id = OLD.tenant_id
+                      AND j.customer_id = OLD.customer_id
+               ) THEN
                 NEW.display_name := OLD.display_name;
             END IF;
             RETURN NEW;
@@ -76,8 +80,8 @@ def upgrade() -> None:
     )
 
     # Apply only identity-authoritative proposal fields. Booking-form customer_name
-    # is deliberately excluded by the Audit Core publication installer and therefore
-    # cannot establish Legal Name.
+    # is excluded by the runtime publication installer and therefore cannot establish
+    # Legal Name.
     op.execute(
         r"""
         CREATE OR REPLACE FUNCTION auditcore.apply_uc03_legal_name_proposal()
@@ -216,13 +220,13 @@ def upgrade() -> None:
     op.execute(
         """
         CREATE TRIGGER trg_validate_actual_booking_date
-        BEFORE INSERT OR UPDATE OF booking_date ON auditcore.bookings
+        BEFORE INSERT OR UPDATE ON auditcore.bookings
         FOR EACH ROW
         EXECUTE FUNCTION auditcore.validate_actual_booking_date()
         """
     )
 
-    op.execute("COMMENT ON COLUMN auditcore.customers.display_name IS 'Entered Name captured by the Process Coordinator at Journey creation; immutable after creation.'")
+    op.execute("COMMENT ON COLUMN auditcore.customers.display_name IS 'Entered Name captured by the Process Coordinator at Journey creation; immutable after the Customer is linked to a Journey.'")
     op.execute("COMMENT ON COLUMN auditcore.customers.legal_name IS 'Legal Name validated from an approved identity document (PAN/Aadhaar).'")
     op.execute("COMMENT ON COLUMN auditcore.bookings.booking_date IS 'Actual Booking Date: real-world date on which the dealer/customer made the Booking.'")
     op.execute("COMMENT ON COLUMN auditcore.journeys.created_at_utc IS 'Audit Captured At: immutable timestamp when Verigence created the Journey.'")
