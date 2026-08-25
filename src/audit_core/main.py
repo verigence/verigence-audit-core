@@ -56,12 +56,17 @@ from audit_core.uc03_delivery_documents import router as uc03_delivery_documents
 from audit_core.uc03_document_assessments import (
     router as uc03_document_assessments_router,
 )
+from audit_core.uc03_identity_business_date import (
+    install_uc03_identity_business_date,
+    router as uc03_identity_business_date_router,
+)
 from audit_core.uc03_project_context import router as uc03_project_context_router
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
 install_role_mapping_policy(role_mappings)
 install_native_workbook_parser(mahindra_masters)
 install_native_effective_date(mahindra_masters)
+install_uc03_identity_business_date()
 role_mapping_router = role_mappings.router
 mahindra_master_router = mahindra_masters.router
 
@@ -109,6 +114,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_booking_exchange_router)
     application.include_router(uc03_booking_integrations_router)
     application.include_router(uc03_booking_capture_router)
+    application.include_router(uc03_identity_business_date_router)
     application.include_router(uc03_booking_evidence_router)
     application.include_router(uc03_delivery_router)
     application.include_router(uc03_delivery_documents_router)
