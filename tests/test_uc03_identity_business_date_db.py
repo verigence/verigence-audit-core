@@ -343,18 +343,17 @@ def test_actual_booking_date_allows_delayed_capture_but_rejects_future_date(iden
             },
         )
 
-    with pytest.raises(DBAPIError):
-        with setup["engine"].begin() as connection:
-            connection.execute(
-                text(
-                    """
-                    UPDATE auditcore.bookings
-                    SET booking_date = (now() AT TIME ZONE 'Asia/Kolkata')::date + 1
-                    WHERE tenant_id = :tenant_id AND journey_id = :journey_id
-                    """
-                ),
-                {"tenant_id": setup["tenant_id"], "journey_id": setup["journey_id"]},
-            )
+    with pytest.raises(DBAPIError), setup["engine"].begin() as connection:
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.bookings
+                SET booking_date = (now() AT TIME ZONE 'Asia/Kolkata')::date + 1
+                WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+                """
+            ),
+            {"tenant_id": setup["tenant_id"], "journey_id": setup["journey_id"]},
+        )
 
     with setup["engine"].begin() as connection:
         row = connection.execute(
