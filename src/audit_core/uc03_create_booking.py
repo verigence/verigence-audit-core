@@ -4,7 +4,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Connection, text
 
 from audit_core.authorization import AuthorizationError
@@ -26,6 +26,7 @@ class CreateBookingCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     outletId: UUID
+    customerName: str = Field(min_length=1, max_length=200)
 
 
 class CreateBookingResponse(BaseModel):
@@ -229,6 +230,14 @@ def create_booking(
         authorization_client=authorization_client,
     )
     versions = _effective_project_versions(connection, tenant_id=tenant_id)
+    customer_name = " ".join(payload.customerName.split())
+    if not customer_name:
+        raise AuditCoreError(
+            error_code="VAC-VAL-002",
+            status_code=422,
+            title="Business validation failed",
+            detail="Customer Name is required before Booking details can be captured.",
+        )
 
     def execute() -> dict:
         customer = connection.execute(
@@ -239,7 +248,7 @@ def create_booking(
                     display_name, created_by_actor_id
                 ) VALUES (
                     :tenant_id, :dealer_id, :outlet_id, 'PENDING',
-                    'Customer pending', :actor_id
+                    :customer_name, :actor_id
                 )
                 RETURNING customer_id
                 """
@@ -248,6 +257,7 @@ def create_booking(
                 "tenant_id": tenant_id,
                 "dealer_id": selected["dealer_id"],
                 "outlet_id": selected["outlet_id"],
+                "customer_name": customer_name,
                 "actor_id": human_principal.subject,
             },
         ).mappings().one()
@@ -308,7 +318,10 @@ def create_booking(
             actor_role_snapshot="PC",
             idempotency_key=idempotency_key,
             correlation_id=idempotency_key,
-            safe_payload={"outletId": str(selected["outlet_id"])},
+            safe_payload={
+                "outletId": str(selected["outlet_id"]),
+                "customerNameCaptured": True,
+            },
             aggregate_version=int(stage["version_no"]),
         )
 
