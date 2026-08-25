@@ -319,6 +319,7 @@ def historical_booking_setup():
                 WHERE i.tenant_id = CAST(:tenant_id AS varchar)
                   AND i.document_requirement_profile_version_id = :profile_version_id
                   AND upper(i.process_area) = 'BOOKING'
+                ON CONFLICT (tenant_id, journey_id, requirement_key) DO NOTHING
                 """
             ),
             {
