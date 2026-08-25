@@ -4,6 +4,7 @@ import json
 from typing import Annotated, Any
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends
 from sqlalchemy import Connection, text
 
@@ -26,6 +27,7 @@ router = APIRouter(
 )
 
 _DI_AUDIENCE = "di"
+logger = structlog.get_logger(__name__)
 
 
 def _evidence_row(
@@ -283,6 +285,30 @@ def refresh_booking_evidence_details(
             document_id=str(row["di_document_id"]),
         )
     except DiClientError as exc:
+        logger.warning(
+            "uc03_evidence_fields_failed",
+            tenant_id=tenant_id,
+            journey_id=str(journey_id),
+            evidence_id=str(evidence_id),
+            di_error_code=exc.code,
+            di_status_code=exc.status_code,
+            retryable=exc.retryable,
+        )
+        if exc.code == "E008":
+            _update_evidence_cache(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                evidence_id=evidence_id,
+                processing_status=processing_status,
+                verification_status=document.verification_state,
+                confirmation_status=document.confirmation_status,
+            )
+            return _fact_rows(
+                connection,
+                tenant_id=tenant_id,
+                evidence_id=evidence_id,
+            )
         raise DependencyUnavailableError(
             detail="Document processing is temporarily unavailable. Please try again."
         ) from exc
