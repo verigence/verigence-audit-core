@@ -35,6 +35,7 @@ router = APIRouter(
 
 _ACTIVE_BOOKING_STATUSES = {"BOOKING_STARTED", "BOOKING_IN_PROGRESS"}
 _DI_AUDIENCE = "di"
+_PRICE_LIST_RULE = "BK_PRICE_LIST_NOT_CONFIGURED"
 _CORPORATE_ID_RULE = "BK_CORPORATE_ID_NOT_AVAILABLE"
 _GST_DOCUMENT_RULE = "BK_GST_CERTIFICATE_NOT_AVAILABLE"
 
@@ -89,7 +90,7 @@ class BookingDetailsCommand(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    priceListId: UUID
+    priceListId: UUID | None = None
     customerType: str = Field(min_length=1, max_length=80)
     dealType: str = Field(min_length=1, max_length=100)
     dealSource: str = Field(min_length=1, max_length=100)
@@ -732,12 +733,13 @@ def save_booking_details(
     _require_active(state)
     _require_expected_version(state, _parse_if_match(if_match))
     effective_on = _effective_date(connection, tenant_id=tenant_id, journey_id=journey_id)
-    _validate_price_list(
-        connection,
-        tenant_id=tenant_id,
-        price_list_id=command.priceListId,
-        effective_on=effective_on,
-    )
+    if command.priceListId is not None:
+        _validate_price_list(
+            connection,
+            tenant_id=tenant_id,
+            price_list_id=command.priceListId,
+            effective_on=effective_on,
+        )
     values: dict[str, str] = {}
     for field_name, domain in _MASTER_DOMAINS.items():
         raw = getattr(command, field_name)
@@ -915,6 +917,7 @@ def save_booking_details(
             "customerType": values["customerType"],
             "tradeIn": command.tradeIn,
             "gstBenefit": command.gstBenefit,
+            "priceListConfigured": command.priceListId is not None,
         },
         aggregate_version=next_version,
     )
@@ -951,7 +954,6 @@ def start_booking_review(
     _require_expected_version(state, _parse_if_match(if_match))
     details = _details_view(connection, tenant_id=tenant_id, journey_id=journey_id)
     required: dict[str, Any] = {
-        "Price List": details.priceListId,
         "Type of Customer": details.customerType,
         "Type of Deal": details.dealType,
         "Deal Source": details.dealSource,
@@ -979,6 +981,21 @@ def start_booking_review(
     by_key = {item.requirementKey: item for item in details.optionalEvidence}
     correlation_id = get_correlation_id(request)
     observations: list[UUID] = []
+    if details.priceListId is None:
+        observations.append(
+            _record_machine_observation(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                rule_key=_PRICE_LIST_RULE,
+                title="Price List not configured",
+                description=(
+                    "No effective published Price List was available for this Booking date. "
+                    "Booking capture may continue; the missing Project configuration is recorded at INFO level."
+                ),
+                correlation_id=correlation_id,
+            )
+        )
     corporate = by_key.get("corporate_id")
     if details.customerType == "CORPORATE" and (
         details.corporateIdAvailable is False or corporate is None or corporate.evidenceId is None
