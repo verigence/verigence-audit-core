@@ -311,11 +311,12 @@ def historical_booking_setup():
                     requirement_key, document_type_key, process_area,
                     requirement_level, requirement_status, condition_snapshot
                 )
-                SELECT :tenant_id, :journey_id, i.document_requirement_item_id,
+                SELECT CAST(:tenant_id AS varchar), CAST(:journey_id AS uuid),
+                       i.document_requirement_item_id,
                        i.requirement_key, i.document_type_key, i.process_area,
                        i.requirement_level, 'PENDING', i.condition_config
                 FROM auditcore.document_requirement_items i
-                WHERE i.tenant_id = :tenant_id
+                WHERE i.tenant_id = CAST(:tenant_id AS varchar)
                   AND i.document_requirement_profile_version_id = :profile_version_id
                   AND upper(i.process_area) = 'BOOKING'
                 """
