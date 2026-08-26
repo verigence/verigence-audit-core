@@ -15,12 +15,15 @@ _RUNTIME_ROLE = "audit_core_runtime"
 
 
 def upgrade() -> None:
-    # 0025 performs the main privileged purge. Journey add-ons also reference
-    # Evidence, so remove that child table (and its audit chain) first, then invoke
-    # the 0025 function for the remainder of the transaction graph.
+    # Preserve the public housekeeping function contract while inserting a small
+    # privileged pre-delete step for Journey add-ons, which also reference Evidence.
+    op.execute(
+        "ALTER FUNCTION auditcore.hard_delete_journey_transactions(varchar, uuid[]) "
+        "RENAME TO hard_delete_journey_transactions_legacy"
+    )
     op.execute(
         r"""
-        CREATE OR REPLACE FUNCTION auditcore.hard_delete_journey_transactions_v2(
+        CREATE FUNCTION auditcore.hard_delete_journey_transactions(
             p_tenant_id varchar,
             p_journey_ids uuid[]
         ) RETURNS jsonb
@@ -61,7 +64,7 @@ def upgrade() -> None:
                   AND journey_id = ANY(p_journey_ids);
             END IF;
 
-            SELECT auditcore.hard_delete_journey_transactions(
+            SELECT auditcore.hard_delete_journey_transactions_legacy(
                 p_tenant_id,
                 p_journey_ids
             ) INTO v_receipt;
@@ -72,16 +75,30 @@ def upgrade() -> None:
     )
     op.execute(
         "REVOKE ALL ON FUNCTION "
-        "auditcore.hard_delete_journey_transactions_v2(varchar, uuid[]) FROM PUBLIC"
+        "auditcore.hard_delete_journey_transactions(varchar, uuid[]) FROM PUBLIC"
     )
     op.execute(
         f"GRANT EXECUTE ON FUNCTION "
-        f"auditcore.hard_delete_journey_transactions_v2(varchar, uuid[]) TO {_RUNTIME_ROLE}"
+        f"auditcore.hard_delete_journey_transactions(varchar, uuid[]) TO {_RUNTIME_ROLE}"
+    )
+    op.execute(
+        "REVOKE ALL ON FUNCTION "
+        "auditcore.hard_delete_journey_transactions_legacy(varchar, uuid[]) "
+        "FROM audit_core_runtime"
     )
 
 
 def downgrade() -> None:
     op.execute(
         "DROP FUNCTION IF EXISTS "
-        "auditcore.hard_delete_journey_transactions_v2(varchar, uuid[])"
+        "auditcore.hard_delete_journey_transactions(varchar, uuid[])"
+    )
+    op.execute(
+        "ALTER FUNCTION "
+        "auditcore.hard_delete_journey_transactions_legacy(varchar, uuid[]) "
+        "RENAME TO hard_delete_journey_transactions"
+    )
+    op.execute(
+        f"GRANT EXECUTE ON FUNCTION "
+        f"auditcore.hard_delete_journey_transactions(varchar, uuid[]) TO {_RUNTIME_ROLE}"
     )
