@@ -57,6 +57,11 @@ from audit_core.uc03_booking_commands import (
     _append_workflow_event,
     _stage_state,
 )
+from audit_core.uc03_booking_receipt_capture import (
+    _RECEIPT_CAPTURE_MAP,
+    _RECEIPT_DOCUMENT_TYPE,
+    _write_receipt_capture,
+)
 from audit_core.uc03_document_assessments import _effective_applicability
 
 logger = structlog.get_logger(__name__)
@@ -76,6 +81,7 @@ class BookingUploadRequirement(BaseModel):
     applicabilityState: Literal["APPLICABLE", "NOT_APPLICABLE", "UNRESOLVED"]
     applicabilityReason: str | None = None
     currentDocumentId: UUID | None = None
+    captureEligibleFieldKeys: list[str] = Field(default_factory=list)
 
 
 class BookingUploadContextResponse(BaseModel):
@@ -175,6 +181,14 @@ def _applicability(requirement: dict[str, Any]) -> tuple[str, str | None]:
         reason = requirement.get("assessment_applicability_reason")
         return assessment_state, reason if isinstance(reason, str) else None
     return _effective_applicability(requirement)
+
+
+def _capture_eligible_field_keys(document_type_key: str) -> list[str]:
+    normalized = document_type_key.strip().lower()
+    if normalized == _RECEIPT_DOCUMENT_TYPE:
+        return sorted(_RECEIPT_CAPTURE_MAP)
+    supported = _SUPPORTED_PROPOSAL_FIELDS.get(normalized, set())
+    return sorted(field for field in supported if field in _PROPOSAL_CAPTURE_MAP)
 
 
 @router.post(
@@ -299,6 +313,7 @@ def prepare_booking_document_upload_context(
                 applicabilityState="APPLICABLE",
                 applicabilityReason=applicability_reason,
                 currentDocumentId=item["current_di_document_id"],
+                captureEligibleFieldKeys=_capture_eligible_field_keys(item["document_type_key"]),
             )
         )
 
@@ -679,14 +694,24 @@ def submit_booking_document_extraction_decisions(
             document_id=payload.documentId,
         )
         document_type_key = str(linked["document_type_key"] or "").strip().lower()
-        allowed_source_fields = _SUPPORTED_PROPOSAL_FIELDS.get(document_type_key, set())
+        allowed_source_fields = (
+            set(_RECEIPT_CAPTURE_MAP)
+            if document_type_key == _RECEIPT_DOCUMENT_TYPE
+            else _SUPPORTED_PROPOSAL_FIELDS.get(document_type_key, set())
+        )
         evidence_id: UUID = linked["evidence_id"]
         next_version = int(state["version_no"]) + 1
         results: list[dict[str, Any]] = []
 
         for index, field in enumerate(payload.fields):
             source_field_key = field.fieldKey.strip().lower()
-            capture_key = _PROPOSAL_CAPTURE_MAP.get(source_field_key)
+            receipt_capture_key = (
+                _RECEIPT_CAPTURE_MAP.get(source_field_key)
+                if document_type_key == _RECEIPT_DOCUMENT_TYPE
+                else None
+            )
+            normal_capture_key = _PROPOSAL_CAPTURE_MAP.get(source_field_key)
+            capture_key = receipt_capture_key or normal_capture_key
             if capture_key is None or source_field_key not in allowed_source_fields:
                 raise AuditCoreError(
                     error_code="VAC-VAL-002",
@@ -694,14 +719,24 @@ def submit_booking_document_extraction_decisions(
                     title="Unsupported extraction field",
                     detail="This DI field does not have an approved Booking typed-domain mapping.",
                 )
-            domain, record_reference = _write_typed_capture(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                field_key=capture_key,
-                value=field.approvedValue,
-                source_evidence_id=evidence_id,
-            )
+            if receipt_capture_key is not None:
+                domain, record_reference = _write_receipt_capture(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    capture_key=receipt_capture_key,
+                    value=field.approvedValue,
+                    source_evidence_id=evidence_id,
+                )
+            else:
+                domain, record_reference = _write_typed_capture(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    field_key=capture_key,
+                    value=field.approvedValue,
+                    source_evidence_id=evidence_id,
+                )
             event_id = _append_workflow_event(
                 connection,
                 tenant_id=tenant_id,
