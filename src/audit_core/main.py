@@ -18,6 +18,7 @@ from audit_core.evidence import router as evidence_router
 from audit_core.evidence_read import router as evidence_read_router
 from audit_core.findings import router as findings_router
 from audit_core.insurance_tradein import router as insurance_tradein_router
+from audit_core.journey_housekeeping import router as journey_housekeeping_router
 from audit_core.journeys import router as journey_router
 from audit_core.logging_config import configure_logging
 from audit_core.mahindra_native_effective_date import install_native_effective_date
@@ -115,6 +116,7 @@ def create_app() -> FastAPI:
     application.include_router(project_reference_data_router)
     application.include_router(project_provisioning_router)
     application.include_router(project_router)
+    application.include_router(journey_housekeeping_router)
     application.include_router(uc03_project_context_router)
     application.include_router(uc03_work_items_router)
     application.include_router(uc03_create_booking_router)
