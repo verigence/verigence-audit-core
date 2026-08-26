@@ -18,14 +18,15 @@ router = APIRouter(
     tags=["journey-housekeeping"],
 )
 
-_SCOPE = Literal["TENANT", "OUTLET", "JOURNEY"]
+HousekeepingScope = Literal["TENANT", "OUTLET", "JOURNEY"]
 _CONFIRMATION = "PURGE_JOURNEY_DATA"
 _DI_BATCH_SIZE = 1000
+_TARGET = "journey_id = ANY(CAST(:journey_ids AS uuid[]))"
 
 
 class JourneyHousekeepingPreview(BaseModel):
     tenantId: str
-    scope: _SCOPE
+    scope: HousekeepingScope
     scopeId: str
     journeys: int
     customers: int
@@ -38,7 +39,7 @@ class JourneyHousekeepingPreview(BaseModel):
 
 
 class JourneyHousekeepingCommand(BaseModel):
-    scope: _SCOPE
+    scope: HousekeepingScope
     outletId: UUID | None = None
     journeyId: UUID | None = None
     confirmScopeId: str
@@ -47,7 +48,7 @@ class JourneyHousekeepingCommand(BaseModel):
 
 class JourneyHousekeepingResult(BaseModel):
     tenantId: str
-    scope: _SCOPE
+    scope: HousekeepingScope
     scopeId: str
     purgeStatus: Literal["REMOVED"]
     deletedJourneys: int
@@ -68,20 +69,29 @@ def _di_base_url() -> str:
 def _scope_id(
     *,
     tenant_id: str,
-    scope: _SCOPE,
+    scope: HousekeepingScope,
     outlet_id: UUID | None,
     journey_id: UUID | None,
 ) -> str:
     if scope == "TENANT":
         if outlet_id is not None or journey_id is not None:
-            raise HTTPException(status_code=400, detail="Tenant scope cannot include Outlet/Journey ID.")
+            raise HTTPException(
+                status_code=400,
+                detail="Tenant scope cannot include Outlet/Journey ID.",
+            )
         return tenant_id
     if scope == "OUTLET":
         if outlet_id is None or journey_id is not None:
-            raise HTTPException(status_code=400, detail="Outlet scope requires only outletId.")
+            raise HTTPException(
+                status_code=400,
+                detail="Outlet scope requires only outletId.",
+            )
         return str(outlet_id)
     if journey_id is None or outlet_id is not None:
-        raise HTTPException(status_code=400, detail="Journey scope requires only journeyId.")
+        raise HTTPException(
+            status_code=400,
+            detail="Journey scope requires only journeyId.",
+        )
     return str(journey_id)
 
 
@@ -89,19 +99,20 @@ def _target_journeys(
     connection: Connection,
     *,
     tenant_id: str,
-    scope: _SCOPE,
+    scope: HousekeepingScope,
     outlet_id: UUID | None,
     journey_id: UUID | None,
 ) -> list[UUID]:
     if scope == "TENANT":
-        rows = connection.execute(
-            text(
-                "SELECT journey_id FROM auditcore.journeys "
-                "WHERE tenant_id=:tenant_id ORDER BY created_at_utc, journey_id"
-            ),
-            {"tenant_id": tenant_id},
-        ).scalars().all()
-        return list(rows)
+        return list(
+            connection.execute(
+                text(
+                    "SELECT journey_id FROM auditcore.journeys "
+                    "WHERE tenant_id=:tenant_id ORDER BY created_at_utc, journey_id"
+                ),
+                {"tenant_id": tenant_id},
+            ).scalars().all()
+        )
 
     if scope == "OUTLET":
         assert outlet_id is not None
@@ -118,38 +129,73 @@ def _target_journeys(
                 title="Outlet not found",
                 detail="Outlet not found for the selected Project/Tenant.",
             )
-        rows = connection.execute(
-            text(
-                "SELECT journey_id FROM auditcore.journeys "
-                "WHERE tenant_id=:tenant_id AND outlet_id=:outlet_id "
-                "ORDER BY created_at_utc, journey_id"
-            ),
-            {"tenant_id": tenant_id, "outlet_id": outlet_id},
-        ).scalars().all()
-        return list(rows)
+        return list(
+            connection.execute(
+                text(
+                    "SELECT journey_id FROM auditcore.journeys "
+                    "WHERE tenant_id=:tenant_id AND outlet_id=:outlet_id "
+                    "ORDER BY created_at_utc, journey_id"
+                ),
+                {"tenant_id": tenant_id, "outlet_id": outlet_id},
+            ).scalars().all()
+        )
 
     assert journey_id is not None
-    exists = connection.execute(
+    existing = connection.execute(
         text(
             "SELECT journey_id FROM auditcore.journeys "
             "WHERE tenant_id=:tenant_id AND journey_id=:journey_id"
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).scalar_one_or_none()
-    if exists is None:
+    if existing is None:
         raise NotFoundError(
             error_code="VAC-NF-005",
             title="Journey not found",
             detail="Journey not found for the selected Project/Tenant.",
         )
-    return [exists]
+    return [existing]
+
+
+def _di_document_ids(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_ids: list[UUID],
+) -> list[UUID]:
+    if not journey_ids:
+        return []
+    return list(
+        connection.execute(
+            text(
+                """
+                SELECT DISTINCT di_document_id
+                FROM (
+                    SELECT di_document_id
+                    FROM auditcore.evidence
+                    WHERE tenant_id=:tenant_id
+                      AND journey_id = ANY(CAST(:journey_ids AS uuid[]))
+                      AND di_document_id IS NOT NULL
+                    UNION
+                    SELECT di_document_id
+                    FROM auditcore.evidence_ingestion_operations
+                    WHERE tenant_id=:tenant_id
+                      AND journey_id = ANY(CAST(:journey_ids AS uuid[]))
+                      AND di_document_id IS NOT NULL
+                ) document_refs
+                ORDER BY di_document_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_ids": journey_ids},
+        ).scalars().all()
+    )
 
 
 def _preview(
     connection: Connection,
     *,
     tenant_id: str,
-    scope: _SCOPE,
+    scope: HousekeepingScope,
     scope_id: str,
     journey_ids: list[UUID],
 ) -> JourneyHousekeepingPreview:
@@ -181,10 +227,6 @@ def _preview(
               (SELECT count(*) FROM auditcore.evidence
                  WHERE tenant_id=:tenant_id
                    AND journey_id = ANY(CAST(:journey_ids AS uuid[]))) AS evidence,
-              (SELECT count(DISTINCT di_document_id) FROM auditcore.evidence
-                 WHERE tenant_id=:tenant_id
-                   AND journey_id = ANY(CAST(:journey_ids AS uuid[]))
-                   AND di_document_id IS NOT NULL) AS di_documents,
               (SELECT count(*) FROM auditcore.audit_findings
                  WHERE tenant_id=:tenant_id
                    AND journey_id = ANY(CAST(:journey_ids AS uuid[]))) AS findings,
@@ -208,36 +250,17 @@ def _preview(
         journeys=int(row["journeys"]),
         customers=int(row["customers"]),
         evidence=int(row["evidence"]),
-        diDocuments=int(row["di_documents"]),
+        diDocuments=len(
+            _di_document_ids(
+                connection,
+                tenant_id=tenant_id,
+                journey_ids=journey_ids,
+            )
+        ),
         auditFindings=int(row["findings"]),
         payments=int(row["payments"]),
         deliveries=int(row["deliveries"]),
         workflowTasks=int(row["workflow_tasks"]),
-    )
-
-
-def _di_documents(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_ids: list[UUID],
-) -> list[UUID]:
-    if not journey_ids:
-        return []
-    return list(
-        connection.execute(
-            text(
-                """
-                SELECT DISTINCT di_document_id
-                FROM auditcore.evidence
-                WHERE tenant_id=:tenant_id
-                  AND journey_id = ANY(CAST(:journey_ids AS uuid[]))
-                  AND di_document_id IS NOT NULL
-                ORDER BY di_document_id
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_ids": journey_ids},
-        ).scalars().all()
     )
 
 
@@ -264,8 +287,10 @@ def _purge_di_documents(
                         "documentIds": [str(document_id) for document_id in batch],
                     },
                 )
-                if response.status_code < 200 or response.status_code >= 300:
-                    raise RuntimeError(f"DI housekeeping returned HTTP {response.status_code}")
+                if not response.is_success:
+                    raise RuntimeError(
+                        f"DI housekeeping returned HTTP {response.status_code}"
+                    )
                 payload = response.json()
                 if not isinstance(payload, dict) or payload.get("errorCode") != "000":
                     raise RuntimeError("DI housekeeping returned an unsuccessful response")
@@ -284,6 +309,110 @@ def _purge_di_documents(
     return deleted_documents, deleted_storage_objects
 
 
+def _ids_for_journeys(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_ids: list[UUID],
+    table_name: str,
+    id_column: str,
+) -> list[UUID]:
+    return list(
+        connection.execute(
+            text(
+                f"SELECT {id_column} FROM auditcore.{table_name} "
+                f"WHERE tenant_id=:tenant_id AND {_TARGET}"
+            ),
+            {"tenant_id": tenant_id, "journey_ids": journey_ids},
+        ).scalars().all()
+    )
+
+
+def _delete_direct_journey_rows(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_ids: list[UUID],
+    table_name: str,
+) -> None:
+    connection.execute(
+        text(
+            f"DELETE FROM auditcore.{table_name} "
+            f"WHERE tenant_id=:tenant_id AND {_TARGET}"
+        ),
+        {"tenant_id": tenant_id, "journey_ids": journey_ids},
+    )
+
+
+def _audit_entity_ids(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_ids: list[UUID],
+) -> list[str]:
+    sources = (
+        ("activity_records", "activity_record_id"),
+        ("audit_evaluations", "audit_evaluation_id"),
+        ("audit_findings", "audit_finding_id"),
+        ("bookings", "booking_id"),
+        ("commercial_lines", "commercial_line_id"),
+        ("deliveries", "delivery_id"),
+        ("escalations", "escalation_id"),
+        ("evidence", "evidence_id"),
+        ("finance_records", "finance_record_id"),
+        ("insurance_records", "insurance_record_id"),
+        ("journey_capture_proposals", "capture_proposal_id"),
+        ("journey_document_assessments", "journey_document_assessment_id"),
+        ("journey_document_requirements", "journey_document_requirement_id"),
+        ("journey_products", "journey_product_id"),
+        ("payments", "payment_id"),
+        ("registration_records", "registration_record_id"),
+        ("review_decisions", "review_decision_id"),
+        ("trade_in_cases", "trade_in_case_id"),
+        ("vehicle_records", "vehicle_record_id"),
+        ("workflow_instances", "workflow_instance_id"),
+        ("workflow_tasks", "workflow_task_id"),
+    )
+    entity_ids = [str(value) for value in journey_ids]
+    for table_name, id_column in sources:
+        entity_ids.extend(
+            str(value)
+            for value in _ids_for_journeys(
+                connection,
+                tenant_id=tenant_id,
+                journey_ids=journey_ids,
+                table_name=table_name,
+                id_column=id_column,
+            )
+        )
+    return list(dict.fromkeys(entity_ids))
+
+
+def _delete_audit_event_chains(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    entity_ids: list[str],
+) -> None:
+    if not entity_ids:
+        return
+    params = {"tenant_id": tenant_id, "entity_ids": entity_ids}
+    connection.execute(
+        text(
+            "DELETE FROM auditcore.audit_events WHERE tenant_id=:tenant_id "
+            "AND entity_id = ANY(CAST(:entity_ids AS text[]))"
+        ),
+        params,
+    )
+    connection.execute(
+        text(
+            "DELETE FROM auditcore.audit_chain_heads WHERE tenant_id=:tenant_id "
+            "AND entity_id = ANY(CAST(:entity_ids AS text[]))"
+        ),
+        params,
+    )
+
+
 def _delete_audit_core_journeys(
     connection: Connection,
     *,
@@ -294,38 +423,36 @@ def _delete_audit_core_journeys(
         return 0, 0, 0
 
     params = {"tenant_id": tenant_id, "journey_ids": journey_ids}
-    target = "journey_id = ANY(CAST(:journey_ids AS uuid[]))"
-    customer_ids = list(
-        connection.execute(
-            text(
-                f"SELECT DISTINCT customer_id FROM auditcore.journeys "
-                f"WHERE tenant_id=:tenant_id AND {target}"
-            ),
-            params,
-        ).scalars().all()
+    customer_ids = _ids_for_journeys(
+        connection,
+        tenant_id=tenant_id,
+        journey_ids=journey_ids,
+        table_name="journeys",
+        id_column="customer_id",
     )
-    evidence_ids = list(
-        connection.execute(
-            text(
-                f"SELECT evidence_id FROM auditcore.evidence "
-                f"WHERE tenant_id=:tenant_id AND {target}"
-            ),
-            params,
-        ).scalars().all()
+    customer_ids = list(dict.fromkeys(customer_ids))
+    evidence_ids = _ids_for_journeys(
+        connection,
+        tenant_id=tenant_id,
+        journey_ids=journey_ids,
+        table_name="evidence",
+        id_column="evidence_id",
     )
-    finding_ids = list(
-        connection.execute(
-            text(
-                f"SELECT audit_finding_id FROM auditcore.audit_findings "
-                f"WHERE tenant_id=:tenant_id AND {target}"
-            ),
-            params,
-        ).scalars().all()
+    finding_ids = _ids_for_journeys(
+        connection,
+        tenant_id=tenant_id,
+        journey_ids=journey_ids,
+        table_name="audit_findings",
+        id_column="audit_finding_id",
     )
-    entity_ids = [str(value) for value in journey_ids + evidence_ids + finding_ids]
+    audit_entity_ids = _audit_entity_ids(
+        connection,
+        tenant_id=tenant_id,
+        journey_ids=journey_ids,
+    )
 
-    # Break the only Customer -> Evidence cycle before evidence rows are removed.
     if evidence_ids:
+        evidence_params = {"tenant_id": tenant_id, "evidence_ids": evidence_ids}
         connection.execute(
             text(
                 """
@@ -336,7 +463,7 @@ def _delete_audit_core_journeys(
                   AND legal_name_source_evidence_id = ANY(CAST(:evidence_ids AS uuid[]))
                 """
             ),
-            {"tenant_id": tenant_id, "evidence_ids": evidence_ids},
+            evidence_params,
         )
         connection.execute(
             text(
@@ -347,10 +474,9 @@ def _delete_audit_core_journeys(
                   AND supersedes_evidence_id = ANY(CAST(:evidence_ids AS uuid[]))
                 """
             ),
-            {"tenant_id": tenant_id, "evidence_ids": evidence_ids},
+            evidence_params,
         )
 
-    # Second-level children first.
     connection.execute(
         text(
             """
@@ -365,11 +491,19 @@ def _delete_audit_core_journeys(
         ),
         params,
     )
-    connection.execute(text(f"DELETE FROM auditcore.crm_interactions WHERE tenant_id=:tenant_id AND {target}"), params)
-    connection.execute(text(f"DELETE FROM auditcore.workflow_dead_letters WHERE tenant_id=:tenant_id AND {target}"), params)
-    connection.execute(text(f"DELETE FROM auditcore.workflow_task_events WHERE tenant_id=:tenant_id AND {target}"), params)
-    connection.execute(text(f"DELETE FROM auditcore.workflow_tasks WHERE tenant_id=:tenant_id AND {target}"), params)
-    connection.execute(text(f"DELETE FROM auditcore.workflow_instances WHERE tenant_id=:tenant_id AND {target}"), params)
+    for table_name in (
+        "crm_interactions",
+        "workflow_dead_letters",
+        "workflow_task_events",
+        "workflow_tasks",
+        "workflow_instances",
+    ):
+        _delete_direct_journey_rows(
+            connection,
+            tenant_id=tenant_id,
+            journey_ids=journey_ids,
+            table_name=table_name,
+        )
 
     if finding_ids or evidence_ids:
         connection.execute(
@@ -397,14 +531,22 @@ def _delete_audit_core_journeys(
             ),
             {"tenant_id": tenant_id, "finding_ids": finding_ids},
         )
-    connection.execute(text(f"DELETE FROM auditcore.audit_finding_events WHERE tenant_id=:tenant_id AND {target}"), params)
-    connection.execute(text(f"DELETE FROM auditcore.audit_findings WHERE tenant_id=:tenant_id AND {target}"), params)
-    connection.execute(text(f"DELETE FROM auditcore.audit_evaluations WHERE tenant_id=:tenant_id AND {target}"), params)
-    connection.execute(text(f"DELETE FROM auditcore.payment_verification_events WHERE tenant_id=:tenant_id AND {target}"), params)
-    connection.execute(text(f"DELETE FROM auditcore.delivery_status_history WHERE tenant_id=:tenant_id AND {target}"), params)
 
-    # All remaining Journey children that may also reference Evidence.
-    direct_tables = (
+    for table_name in (
+        "audit_finding_events",
+        "audit_findings",
+        "audit_evaluations",
+        "payment_verification_events",
+        "delivery_status_history",
+    ):
+        _delete_direct_journey_rows(
+            connection,
+            tenant_id=tenant_id,
+            journey_ids=journey_ids,
+            table_name=table_name,
+        )
+
+    for table_name in (
         "activity_records",
         "audit_state_events",
         "bookings",
@@ -430,42 +572,30 @@ def _delete_audit_core_journeys(
         "review_decisions",
         "trade_in_cases",
         "vehicle_records",
-    )
-    for table_name in direct_tables:
-        connection.execute(
-            text(
-                f"DELETE FROM auditcore.{table_name} "  # noqa: S608
-                f"WHERE tenant_id=:tenant_id AND {target}"
-            ),
-            params,
+    ):
+        _delete_direct_journey_rows(
+            connection,
+            tenant_id=tenant_id,
+            journey_ids=journey_ids,
+            table_name=table_name,
         )
 
-    # Non-FK transaction records can otherwise retain stale references/idempotent results.
-    if entity_ids:
-        connection.execute(
-            text(
-                "DELETE FROM auditcore.audit_events WHERE tenant_id=:tenant_id "
-                "AND entity_id = ANY(CAST(:entity_ids AS text[]))"
-            ),
-            {"tenant_id": tenant_id, "entity_ids": entity_ids},
-        )
-        connection.execute(
-            text(
-                "DELETE FROM auditcore.audit_chain_heads WHERE tenant_id=:tenant_id "
-                "AND entity_id = ANY(CAST(:entity_ids AS text[]))"
-            ),
-            {"tenant_id": tenant_id, "entity_ids": entity_ids},
-        )
+    _delete_audit_event_chains(
+        connection,
+        tenant_id=tenant_id,
+        entity_ids=audit_entity_ids,
+    )
+    journey_text_ids = [str(value) for value in journey_ids]
     connection.execute(
         text(
             """
             DELETE FROM auditcore.inbox_events
             WHERE tenant_id=:tenant_id
               AND COALESCE(event_payload->>'journeyId', event_payload->>'journey_id')
-                    = ANY(CAST(:journey_text_ids AS text[]))
+                    = ANY(CAST(:journey_ids AS text[]))
             """
         ),
-        {"tenant_id": tenant_id, "journey_text_ids": [str(value) for value in journey_ids]},
+        {"tenant_id": tenant_id, "journey_ids": journey_text_ids},
     )
     connection.execute(
         text(
@@ -474,15 +604,15 @@ def _delete_audit_core_journeys(
             WHERE tenant_id=:tenant_id
               AND (
                    COALESCE(response_body->>'journeyId', response_body->>'journey_id')
-                     = ANY(CAST(:journey_text_ids AS text[]))
+                     = ANY(CAST(:journey_ids AS text[]))
                    OR logical_result_id = ANY(CAST(:entity_ids AS text[]))
               )
             """
         ),
         {
             "tenant_id": tenant_id,
-            "journey_text_ids": [str(value) for value in journey_ids],
-            "entity_ids": entity_ids,
+            "journey_ids": journey_text_ids,
+            "entity_ids": audit_entity_ids,
         },
     )
 
@@ -494,9 +624,17 @@ def _delete_audit_core_journeys(
             ),
             {"tenant_id": tenant_id, "evidence_ids": evidence_ids},
         )
-    connection.execute(text(f"DELETE FROM auditcore.journey_document_requirements WHERE tenant_id=:tenant_id AND {target}"), params)
+    _delete_direct_journey_rows(
+        connection,
+        tenant_id=tenant_id,
+        journey_ids=journey_ids,
+        table_name="journey_document_requirements",
+    )
     deleted_journeys = connection.execute(
-        text(f"DELETE FROM auditcore.journeys WHERE tenant_id=:tenant_id AND {target}"),
+        text(
+            "DELETE FROM auditcore.journeys WHERE tenant_id=:tenant_id "
+            f"AND {_TARGET}"
+        ),
         params,
     ).rowcount or 0
 
@@ -535,19 +673,18 @@ def _delete_audit_core_journeys(
                 ),
                 orphan_params,
             )
-            connection.execute(
-                text(
-                    "DELETE FROM auditcore.audit_events WHERE tenant_id=:tenant_id "
-                    "AND entity_id = ANY(CAST(:customer_text_ids AS text[]))"
-                ),
-                {"tenant_id": tenant_id, "customer_text_ids": [str(value) for value in orphan_ids]},
+            orphan_text_ids = [str(value) for value in orphan_ids]
+            _delete_audit_event_chains(
+                connection,
+                tenant_id=tenant_id,
+                entity_ids=orphan_text_ids,
             )
             connection.execute(
                 text(
-                    "DELETE FROM auditcore.audit_chain_heads WHERE tenant_id=:tenant_id "
-                    "AND entity_id = ANY(CAST(:customer_text_ids AS text[]))"
+                    "DELETE FROM auditcore.idempotency_records WHERE tenant_id=:tenant_id "
+                    "AND logical_result_id = ANY(CAST(:customer_ids AS text[]))"
                 ),
-                {"tenant_id": tenant_id, "customer_text_ids": [str(value) for value in orphan_ids]},
+                {"tenant_id": tenant_id, "customer_ids": orphan_text_ids},
             )
             deleted_customers = connection.execute(
                 text(
@@ -563,7 +700,7 @@ def _delete_audit_core_journeys(
 @router.get("/preview", response_model=JourneyHousekeepingPreview)
 def preview_journey_housekeeping(
     tenant_id: str,
-    scope: Annotated[_SCOPE, Query()],
+    scope: Annotated[HousekeepingScope, Query()],
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     engine: Annotated[Engine, Depends(get_engine)],
     outletId: UUID | None = None,
@@ -608,7 +745,10 @@ def purge_journey_housekeeping(
         journey_id=command.journeyId,
     )
     if command.confirmScopeId != scope_id:
-        raise HTTPException(status_code=400, detail="Housekeeping confirmation does not match scope.")
+        raise HTTPException(
+            status_code=400,
+            detail="Housekeeping confirmation does not match scope.",
+        )
     if command.confirmation != _CONFIRMATION:
         raise HTTPException(status_code=400, detail="Invalid housekeeping confirmation.")
 
@@ -621,14 +761,7 @@ def purge_journey_housekeeping(
             outlet_id=command.outletId,
             journey_id=command.journeyId,
         )
-        preview = _preview(
-            connection,
-            tenant_id=tenant_id,
-            scope=command.scope,
-            scope_id=scope_id,
-            journey_ids=journey_ids,
-        )
-        document_ids = _di_documents(
+        document_ids = _di_document_ids(
             connection,
             tenant_id=tenant_id,
             journey_ids=journey_ids,
@@ -642,10 +775,12 @@ def purge_journey_housekeeping(
 
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
-        deleted_journeys, deleted_customers, deleted_evidence = _delete_audit_core_journeys(
-            connection,
-            tenant_id=tenant_id,
-            journey_ids=journey_ids,
+        deleted_journeys, deleted_customers, deleted_evidence = (
+            _delete_audit_core_journeys(
+                connection,
+                tenant_id=tenant_id,
+                journey_ids=journey_ids,
+            )
         )
 
     return JourneyHousekeepingResult(
