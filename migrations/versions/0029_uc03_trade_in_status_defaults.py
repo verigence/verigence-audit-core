@@ -99,14 +99,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Preserve the seeded rows because existing trade_in_cases may reference
+    # them. Downgrade only removes automatic synchronization for future Projects.
     op.execute(
         "DROP TRIGGER IF EXISTS trg_projects_trade_in_status_defaults ON auditcore.projects"
     )
     op.execute("DROP FUNCTION IF EXISTS auditcore.ensure_trade_in_status_defaults()")
-    op.execute(
-        """
-        DELETE FROM auditcore.business_status_codes
-        WHERE domain_key='TRADE_IN'
-          AND status_code IN ('EXCHANGE_TAKEN', 'NO_EXCHANGE')
-        """
-    )
