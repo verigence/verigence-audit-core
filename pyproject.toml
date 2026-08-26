@@ -59,3 +59,7 @@ target-version = "py312"
 # together as explicit review boundaries (Security / DI / Audit Core ownership).
 "src/audit_core/readiness.py" = ["I001"]
 "src/audit_core/uc02_project_admin_stabilization.py" = ["I001"]
+# The focused PC Booking document module deliberately groups reused legacy helpers
+# by ownership boundary (DI, Security, Booking capture, receipt capture) so the
+# direct-document integration remains auditable without reordering private imports.
+"src/audit_core/uc03_pc_booking_documents.py" = ["I001"]
