@@ -78,9 +78,13 @@ def _requires_idempotency(parameters: list[dict]) -> bool:
 
 
 def _is_forbidden_di_boundary(path: str) -> bool:
-    """Block direct DI exposure while allowing DI as a Project-Master owner value."""
+    """Block browser/public DI proxy exposure, not authenticated service callbacks."""
     normalized = path.lower()
     if "/project-masters/di/" in normalized:
+        return False
+    # UC03 uses one ServiceIntegration-authenticated DI -> Audit Core callback.
+    # It does not expose DI data or credentials to browser/mobile callers.
+    if normalized.startswith("/v1/internal/di/"):
         return False
     return "/di/" in normalized or normalized.endswith("/di")
 

@@ -10,6 +10,7 @@ from audit_core.security import (
     Principal,
     SecurityTokenError,
     SecurityTokenValidator,
+    ServiceIntegrationPrincipal,
 )
 
 ISSUER = "https://security.verigence.test"
@@ -63,6 +64,21 @@ def _human_token(private_key, **overrides) -> str:
     return jwt.encode(claims, private_key, algorithm="RS256")
 
 
+def _service_token(private_key, **overrides) -> str:
+    now = datetime.now(UTC)
+    claims = {
+        "iss": ISSUER,
+        "aud": AUDIENCE,
+        "sub": "di-service",
+        "actor_type": "SERVICE_INTEGRATION",
+        "iat": now,
+        "exp": now + timedelta(minutes=5),
+        "jti": str(uuid4()),
+    }
+    claims.update(overrides)
+    return jwt.encode(claims, private_key, algorithm="RS256")
+
+
 def _validator(private_key) -> SecurityTokenValidator:
     return SecurityTokenValidator(
         jwks_url="https://security.verigence.test/.well-known/jwks.json",
@@ -90,6 +106,14 @@ def test_valid_security_human_token_returns_global_user_only() -> None:
     principal = _validator(private_key).validate_human(_human_token(private_key))
 
     assert principal == HumanPrincipal(subject="user-123")
+
+
+def test_valid_service_integration_token_returns_service_identity_only() -> None:
+    private_key = _private_key()
+
+    principal = _validator(private_key).validate_service_integration(_service_token(private_key))
+
+    assert principal == ServiceIntegrationPrincipal(subject="di-service")
 
 
 @pytest.mark.parametrize(
@@ -137,5 +161,27 @@ def test_human_validation_rejects_embedded_tenant_authority() -> None:
                 private_key,
                 tenant_id="tenant-123",
                 permissions=["audit.project.write"],
+            )
+        )
+
+
+def test_service_validation_rejects_user_actor() -> None:
+    private_key = _private_key()
+
+    with pytest.raises(SecurityTokenError, match="not a ServiceIntegration token"):
+        _validator(private_key).validate_service_integration(
+            _service_token(private_key, actor_type="USER")
+        )
+
+
+def test_service_validation_rejects_embedded_tenant_authority() -> None:
+    private_key = _private_key()
+
+    with pytest.raises(SecurityTokenError, match="unsupported authority claims"):
+        _validator(private_key).validate_service_integration(
+            _service_token(
+                private_key,
+                tenant_id="tenant-123",
+                permissions=["audit.journey.write"],
             )
         )
