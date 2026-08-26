@@ -68,7 +68,9 @@ from audit_core.uc03_identity_business_date import install_uc03_identity_busines
 from audit_core.uc03_identity_business_date import (
     router as uc03_identity_business_date_router,
 )
-from audit_core.uc03_pc_booking_documents import router as uc03_pc_booking_documents_router
+from audit_core.uc03_pc_booking_documents import (
+    router as uc03_pc_booking_documents_router,
+)
 from audit_core.uc03_project_context import router as uc03_project_context_router
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
