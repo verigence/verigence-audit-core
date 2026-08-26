@@ -50,6 +50,7 @@ from audit_core.uc03_delivery_documents import router as uc03_delivery_documents
 from audit_core.uc03_document_assessments import (
     router as uc03_document_assessments_router,
 )
+from audit_core.uc03_pc_verification import router as uc03_pc_verification_router
 from audit_core.uc03_project_context import router as uc03_project_context_router
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
@@ -104,6 +105,7 @@ def create_app() -> FastAPI:
     # Exact C1/C2/C3 typed routes must precede generic capture/findings routes.
     application.include_router(uc03_booking_exchange_router)
     application.include_router(uc03_booking_integrations_router)
+    application.include_router(uc03_pc_verification_router)
     application.include_router(uc03_booking_capture_router)
     application.include_router(uc03_booking_evidence_router)
     application.include_router(uc03_delivery_router)
