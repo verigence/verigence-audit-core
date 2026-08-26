@@ -31,7 +31,10 @@ def _field(*, field_key: str = "customer_name", confidence: float | None = 0.91)
 
 def test_booking_context_exposes_only_fields_with_existing_typed_owner() -> None:
     booking = _capture_eligible_field_keys("booking_form")
-    assert "customer_name" in booking
+    # Existing UC03 Legal Name handling deliberately excludes Booking Form
+    # customer_name from PC acceptance; identity evidence owns legal-name review.
+    assert "customer_name" not in booking
+    assert "customer_phone" in booking
     assert "booking_date" in booking
     assert "vehicle_model" not in booking
 
