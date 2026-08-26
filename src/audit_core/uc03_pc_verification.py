@@ -5,7 +5,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Connection, text
 
 from audit_core.db import set_tenant_context
@@ -23,17 +23,24 @@ from audit_core.uc03_booking_capture import (
     _PROPOSAL_CAPTURE_MAP,
     _TERMINAL_PROCESSING_STATUSES,
     _document_views,
+    _resolve_booking_applicability,
     _scope,
+    _write_typed_capture,
 )
 from audit_core.uc03_booking_commands import (
     _aggregate_lock,
     _append_workflow_event,
     _parse_if_match,
-    _set_etag,
 )
 
 router = APIRouter(tags=["uc03-pc-verification"])
 _FAILED_PROCESSING_STATUSES = {"FAILED", "ERROR", "REJECTED"}
+
+
+class PcBookingSubmitCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    values: dict[str, Any]
 
 
 class PcVerificationView(BaseModel):
@@ -140,16 +147,8 @@ def _review_readiness(
 
 
 def _view(connection: Connection, *, tenant_id: str, journey_id: UUID) -> PcVerificationView:
-    state = _verification_state(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-    )
-    readiness = _review_readiness(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-    )
+    state = _verification_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+    readiness = _review_readiness(connection, tenant_id=tenant_id, journey_id=journey_id)
     status = state["pc_verification_status"]
     if state["capture_completed_at_utc"] is None:
         status = "NOT_SUBMITTED"
@@ -174,10 +173,7 @@ def get_pc_verification(
     tenant_id: str,
     journey_id: UUID,
     human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> PcVerificationView:
     _scope(
@@ -197,18 +193,13 @@ def get_pc_verification(
 def submit_pc_booking_capture(
     tenant_id: str,
     journey_id: UUID,
+    payload: PcBookingSubmitCommand,
     request: Request,
     response: Response,
-    idempotency_key: Annotated[
-        str,
-        Header(alias="Idempotency-Key", min_length=8, max_length=200),
-    ],
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
     if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
     human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> PcVerificationView:
     context = _scope(
@@ -223,18 +214,34 @@ def submit_pc_booking_capture(
 
     def execute() -> dict[str, Any]:
         _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
-        state = _verification_state(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            for_update=True,
-        )
+        state = _verification_state(connection, tenant_id=tenant_id, journey_id=journey_id, for_update=True)
         if int(state["version_no"]) != expected_version:
             raise ConflictError(
                 error_code="VAC-CONFLICT-005",
                 title="Booking version conflict",
                 detail="Booking changed since it was loaded. Refresh the Booking and retry.",
             )
+
+        captured_fields: list[str] = []
+        for raw_key, value in payload.values.items():
+            key = raw_key.strip().upper()
+            if value is None or (isinstance(value, str) and not value.strip()):
+                continue
+            _write_typed_capture(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                field_key=key,
+                value=value,
+                source_evidence_id=None,
+            )
+            captured_fields.append(key)
+
+        applicability_changes = _resolve_booking_applicability(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+        )
         next_version = expected_version + 1
         connection.execute(
             text(
@@ -249,11 +256,7 @@ def submit_pc_booking_capture(
                   AND stage_code='BOOKING'
                 """
             ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "version": next_version,
-            },
+            {"tenant_id": tenant_id, "journey_id": journey_id, "version": next_version},
         )
         _append_workflow_event(
             connection,
@@ -265,7 +268,12 @@ def submit_pc_booking_capture(
             actor_role_snapshot=context["operating_role"],
             idempotency_key=idempotency_key,
             correlation_id=correlation_id,
-            safe_payload={"pcVerificationStatus": "PENDING"},
+            safe_payload={
+                "pcVerificationStatus": "PENDING",
+                "capturedFields": captured_fields,
+                "applicabilityChanges": applicability_changes,
+                "bookingBusinessStatusChanged": False,
+            },
             aggregate_version=next_version,
         )
         return _view(connection, tenant_id=tenant_id, journey_id=journey_id).model_dump(mode="json")
@@ -275,7 +283,7 @@ def submit_pc_booking_capture(
         tenant_id=tenant_id,
         operation_key=f"uc03.pc-verification.submit:{journey_id}",
         idempotency_key=idempotency_key,
-        request_payload={"expectedVersion": expected_version},
+        request_payload={"expectedVersion": expected_version, "values": payload.values},
         execute=execute,
     )
     response.headers["ETag"] = f'"{body["aggregateVersion"]}"'
@@ -291,16 +299,10 @@ def verify_pc_booking(
     journey_id: UUID,
     request: Request,
     response: Response,
-    idempotency_key: Annotated[
-        str,
-        Header(alias="Idempotency-Key", min_length=8, max_length=200),
-    ],
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
     if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
     human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> PcVerificationView:
     context = _scope(
@@ -315,12 +317,7 @@ def verify_pc_booking(
 
     def execute() -> dict[str, Any]:
         _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
-        state = _verification_state(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            for_update=True,
-        )
+        state = _verification_state(connection, tenant_id=tenant_id, journey_id=journey_id, for_update=True)
         if int(state["version_no"]) != expected_version:
             raise ConflictError(
                 error_code="VAC-CONFLICT-005",
@@ -333,11 +330,7 @@ def verify_pc_booking(
                 title="PC verification is not pending",
                 detail="Submit Booking capture before completing PC verification.",
             )
-        readiness = _review_readiness(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-        )
+        readiness = _review_readiness(connection, tenant_id=tenant_id, journey_id=journey_id)
         if not readiness["reviewReady"]:
             raise ConflictError(
                 error_code="VAC-CONFLICT-011",
@@ -363,11 +356,7 @@ def verify_pc_booking(
                   AND stage_code='BOOKING'
                 """
             ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "version": next_version,
-            },
+            {"tenant_id": tenant_id, "journey_id": journey_id, "version": next_version},
         )
         _append_workflow_event(
             connection,
@@ -379,7 +368,11 @@ def verify_pc_booking(
             actor_role_snapshot=context["operating_role"],
             idempotency_key=idempotency_key,
             correlation_id=correlation_id,
-            safe_payload={"pcVerificationStatus": "VERIFIED"},
+            safe_payload={
+                "pcVerificationStatus": "VERIFIED",
+                "bookingBusinessStatusChanged": False,
+                "tlReviewRequired": False,
+            },
             aggregate_version=next_version,
         )
         return _view(connection, tenant_id=tenant_id, journey_id=journey_id).model_dump(mode="json")
@@ -403,10 +396,7 @@ def verify_pc_booking(
 def list_review_pending(
     tenant_id: str,
     human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ) -> ReviewPendingPage:
@@ -452,10 +442,7 @@ def list_review_pending(
           )
     """
     params = {"tenant_id": tenant_id, "actor_id": human_principal.subject, "limit": limit}
-    total = connection.execute(
-        text("SELECT count(*) " + scope_sql),
-        params,
-    ).scalar_one()
+    total = connection.execute(text("SELECT count(*) " + scope_sql), params).scalar_one()
     rows = connection.execute(
         text(
             """
