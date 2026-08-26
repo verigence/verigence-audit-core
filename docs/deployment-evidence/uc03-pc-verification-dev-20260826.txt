@@ -1,0 +1,5 @@
+UC03 PC verification DEV promotion trigger
+Merged capability commit: a09b647581028f97781340f87e672f334dcb468b
+Migration: 0028_uc03_pc_verification
+Security: unchanged
+DI: unchanged
