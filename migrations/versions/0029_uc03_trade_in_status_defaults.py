@@ -1,12 +1,12 @@
 """Seed system Trade-In status codes required by UC03 Booking capture.
 
-Revision ID: 0029_uc03_trade_in_status_defaults
+Revision ID: 0029_uc03_trade_in_status
 Revises: 0028_uc03_pc_verification
 Create Date: 2026-08-26
 """
 from alembic import op
 
-revision = "0029_uc03_trade_in_status_defaults"
+revision = "0029_uc03_trade_in_status"
 down_revision = "0028_uc03_pc_verification"
 branch_labels = None
 depends_on = None
