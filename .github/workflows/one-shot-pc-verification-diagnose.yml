@@ -1,0 +1,50 @@
+name: One-shot diagnose PC verification submit
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/one-shot-pc-verification-diagnose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      - name: Read filtered Audit Core runtime errors
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway logs --service "$AUDIT_SERVICE" --lines 700 > /tmp/audit-runtime.log 2>&1 || true
+          python - <<'PY'
+          import re
+          from pathlib import Path
+
+          lines = Path('/tmp/audit-runtime.log').read_text(errors='replace').splitlines()
+          markers = (
+              'pc-verification', 'Traceback', 'ERROR', 'Exception', 'ProgrammingError',
+              'IntegrityError', 'DataError', 'ValidationError', 'Undefined', 'sqlalchemy',
+              'psycopg', '500 Internal Server Error',
+          )
+          selected = set()
+          for i, line in enumerate(lines):
+              if any(marker.lower() in line.lower() for marker in markers):
+                  for j in range(max(0, i - 6), min(len(lines), i + 16)):
+                      selected.add(j)
+          output = [lines[i] for i in sorted(selected)]
+          text = '\n'.join(output[-220:])
+          text = re.sub(r'(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}', '<email-redacted>', text)
+          text = re.sub(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b', '<uuid-redacted>', text)
+          print(text or 'NO_MATCHING_RUNTIME_ERROR_LINES')
+          PY
