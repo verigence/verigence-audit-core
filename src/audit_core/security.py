@@ -21,6 +21,11 @@ class HumanPrincipal:
     subject: str
 
 
+@dataclass(frozen=True)
+class ServiceIntegrationPrincipal:
+    subject: str
+
+
 # A Project Administration page can legitimately make several protected Audit Core
 # requests. They must all validate the JWT, but they must not all fetch JWKS. Keep
 # the public key set warm for five minutes; PyJWKClient still refreshes when an
@@ -93,6 +98,35 @@ class SecurityTokenValidator:
         if forbidden_authority_claims.intersection(claims):
             raise SecurityTokenError("Security human token carries unsupported authority claims")
         return HumanPrincipal(subject=subject)
+
+    def validate_service_integration(self, token: str) -> ServiceIntegrationPrincipal:
+        claims = self._decode(
+            token,
+            required_claims=["exp", "iss", "aud", "sub", "iat", "jti", "actor_type"],
+        )
+        subject = claims.get("sub")
+        if not isinstance(subject, str) or not subject.strip():
+            raise SecurityTokenError("Invalid Security ServiceIntegration token claims")
+        if claims.get("actor_type") != "SERVICE_INTEGRATION":
+            raise SecurityTokenError("Security token is not a ServiceIntegration token")
+
+        # Security service tokens are audience-bound machine identities only. They
+        # deliberately carry no Tenant/USER authority; accepting such claims here
+        # would blur the internal callback trust boundary.
+        forbidden_authority_claims = {
+            "tenant_id",
+            "access_session_id",
+            "permissions",
+            "roles",
+            "device_id",
+            "location_id",
+            "act",
+        }
+        if forbidden_authority_claims.intersection(claims):
+            raise SecurityTokenError(
+                "Security ServiceIntegration token carries unsupported authority claims"
+            )
+        return ServiceIntegrationPrincipal(subject=subject.strip())
 
     def _decode(self, token: str, *, required_claims: list[str]) -> dict:
         try:
