@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from uuid import uuid4
 
 import pytest
@@ -10,7 +11,10 @@ from audit_core.uc03_pc_booking_documents import (
     BookingExtractionDecisionCommand,
     BookingExtractionFieldDecision,
     _capture_eligible_field_keys,
+    _current_linked_evidence,
+    _is_repeatable_requirement,
     _validate_unique_decisions,
+    acknowledge_booking_document_link,
 )
 
 
@@ -37,6 +41,27 @@ def test_dealer_receipt_reuses_existing_payment_capture_mapping() -> None:
     assert "receipt_number" in receipt
     assert "amount_paid" in receipt
     assert "payment_reference_no" in receipt
+
+
+def test_booking_payment_receipt_is_repeatable_but_identity_documents_are_not() -> None:
+    assert _is_repeatable_requirement("booking_payment_receipt") is True
+    assert _is_repeatable_requirement("booking_docket") is False
+    assert _is_repeatable_requirement("pan_card") is False
+    assert _is_repeatable_requirement("aadhaar") is False
+
+
+def test_repeatable_callback_does_not_supersede_prior_receipts() -> None:
+    source = inspect.getsource(acknowledge_booking_document_link)
+    assert "if not repeatable:" in source
+    assert "association_status='SUPERSEDED'" in source
+    assert 'supersedes_evidence_id=NULL' in source
+
+
+def test_repeatable_review_accepts_any_active_document_for_requirement() -> None:
+    source = inspect.getsource(_current_linked_evidence)
+    assert "_is_repeatable_requirement" in source
+    assert "di_document_id=:document_id" in source
+    assert "association_status='ACTIVE'" in source
 
 
 def test_confidence_is_transport_provenance_and_accepts_native_di_scale() -> None:
