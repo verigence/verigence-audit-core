@@ -70,6 +70,7 @@ router = APIRouter(tags=["uc03-pc-booking-documents"])
 
 _DI_AUDIENCE = "di"
 _AUDIT_SERVICE_AUDIENCE = "audit"
+_REPEATABLE_REQUIREMENT_KEYS = {"booking_payment_receipt"}
 
 
 class BookingUploadRequirement(BaseModel):
@@ -81,6 +82,8 @@ class BookingUploadRequirement(BaseModel):
     applicabilityState: Literal["APPLICABLE", "NOT_APPLICABLE", "UNRESOLVED"]
     applicabilityReason: str | None = None
     currentDocumentId: UUID | None = None
+    activeDocumentIds: list[UUID] = Field(default_factory=list)
+    repeatable: bool = False
     captureEligibleFieldKeys: list[str] = Field(default_factory=list)
 
 
@@ -191,6 +194,10 @@ def _capture_eligible_field_keys(document_type_key: str) -> list[str]:
     return sorted(field for field in supported if field in _PROPOSAL_CAPTURE_MAP)
 
 
+def _is_repeatable_requirement(requirement_key: str | None) -> bool:
+    return str(requirement_key or "").strip().lower() in _REPEATABLE_REQUIREMENT_KEYS
+
+
 @router.post(
     "/v1/tenants/{tenant_id}/journeys/{journey_id}/booking/document-upload-context",
     response_model=BookingUploadContextResponse,
@@ -274,6 +281,15 @@ def prepare_booking_document_upload_context(
                    jda.applicability_state AS assessment_applicability_state,
                    jda.applicability_reason AS assessment_applicability_reason,
                    e.di_document_id AS current_di_document_id,
+                   ARRAY(
+                       SELECT e2.di_document_id
+                       FROM auditcore.evidence e2
+                       WHERE e2.tenant_id=jdr.tenant_id
+                         AND e2.journey_id=jdr.journey_id
+                         AND e2.journey_document_requirement_id=jdr.journey_document_requirement_id
+                         AND e2.association_status='ACTIVE'
+                       ORDER BY e2.linked_at_utc, e2.evidence_id
+                   ) AS active_di_document_ids,
                    COALESCE(dri.sort_order, 999999) AS sort_order
             FROM auditcore.journey_document_requirements jdr
             LEFT JOIN auditcore.journey_document_assessments jda
@@ -313,6 +329,8 @@ def prepare_booking_document_upload_context(
                 applicabilityState="APPLICABLE",
                 applicabilityReason=applicability_reason,
                 currentDocumentId=item["current_di_document_id"],
+                activeDocumentIds=list(item["active_di_document_ids"] or []),
+                repeatable=_is_repeatable_requirement(item["requirement_key"]),
                 captureEligibleFieldKeys=_capture_eligible_field_keys(item["document_type_key"]),
             )
         )
@@ -418,6 +436,7 @@ def acknowledge_booking_document_link(
     ).mappings().one()
     applicability_state, applicability_reason = _require_callback_applicable(requirement)
     customer_id: UUID = requirement["customer_id"]
+    repeatable = _is_repeatable_requirement(requirement["requirement_key"])
 
     subject_id = _subject_mapping(
         connection,
@@ -455,49 +474,60 @@ def acknowledge_booking_document_link(
             )
         evidence_id: UUID = existing_for_document["evidence_id"]
         if existing_for_document["association_status"] != "ACTIVE":
+            if not repeatable:
+                # A delayed duplicate callback for an older replaced single-value
+                # document must ACK without making it current again.
+                return BookingDocumentLinkResponse(
+                    requirementRef=payload.requirementRef,
+                    documentId=payload.documentId,
+                    evidenceId=evidence_id,
+                )
             connection.execute(
                 text(
                     """
                     UPDATE auditcore.evidence
                     SET association_status='ACTIVE', void_reason=NULL,
-                        voided_by_actor_id=NULL, voided_at_utc=NULL
+                        voided_by_actor_id=NULL, voided_at_utc=NULL,
+                        supersedes_evidence_id=NULL
                     WHERE tenant_id=:tenant_id AND evidence_id=:evidence_id
                     """
                 ),
                 {"tenant_id": tenant_id, "evidence_id": evidence_id},
             )
     else:
-        prior_evidence_id = connection.execute(
-            text(
-                """
-                SELECT evidence_id
-                FROM auditcore.evidence
-                WHERE tenant_id=:tenant_id
-                  AND journey_id=:journey_id
-                  AND journey_document_requirement_id=:requirement_ref
-                  AND association_status='ACTIVE'
-                ORDER BY linked_at_utc DESC, evidence_id DESC
-                LIMIT 1
-                FOR UPDATE
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "requirement_ref": payload.requirementRef,
-            },
-        ).scalar_one_or_none()
-        if prior_evidence_id is not None:
-            connection.execute(
+        prior_evidence_id = None
+        if not repeatable:
+            prior_evidence_id = connection.execute(
                 text(
                     """
-                    UPDATE auditcore.evidence
-                    SET association_status='SUPERSEDED'
-                    WHERE tenant_id=:tenant_id AND evidence_id=:evidence_id
+                    SELECT evidence_id
+                    FROM auditcore.evidence
+                    WHERE tenant_id=:tenant_id
+                      AND journey_id=:journey_id
+                      AND journey_document_requirement_id=:requirement_ref
+                      AND association_status='ACTIVE'
+                    ORDER BY linked_at_utc DESC, evidence_id DESC
+                    LIMIT 1
+                    FOR UPDATE
                     """
                 ),
-                {"tenant_id": tenant_id, "evidence_id": prior_evidence_id},
-            )
+                {
+                    "tenant_id": tenant_id,
+                    "journey_id": journey_id,
+                    "requirement_ref": payload.requirementRef,
+                },
+            ).scalar_one_or_none()
+            if prior_evidence_id is not None:
+                connection.execute(
+                    text(
+                        """
+                        UPDATE auditcore.evidence
+                        SET association_status='SUPERSEDED'
+                        WHERE tenant_id=:tenant_id AND evidence_id=:evidence_id
+                        """
+                    ),
+                    {"tenant_id": tenant_id, "evidence_id": prior_evidence_id},
+                )
 
         evidence_id = connection.execute(
             text(
@@ -533,8 +563,9 @@ def acknowledge_booking_document_link(
             },
         ).scalar_one()
 
-    # Make the acknowledged document the current evidence for the requirement. Do
-    # not touch answer/remarks when an assessment already exists.
+    # The assessment pointer remains the most recently acknowledged evidence for
+    # generic current-document views. Repeatable requirements retain all evidence
+    # rows ACTIVE and are validated by documentId during extraction decisions.
     connection.execute(
         text(
             """
@@ -585,26 +616,16 @@ def _current_linked_evidence(
     requirement_ref: UUID,
     document_id: UUID,
 ):
-    row = connection.execute(
+    requirement = connection.execute(
         text(
             """
-            SELECT jdr.requirement_key, jdr.document_type_key,
-                   jda.evidence_id, e.di_document_id
-            FROM auditcore.journey_document_requirements jdr
-            JOIN auditcore.journey_document_assessments jda
-              ON jda.tenant_id=jdr.tenant_id
-             AND jda.journey_id=jdr.journey_id
-             AND jda.stage_code='BOOKING'
-             AND jda.requirement_key=jdr.requirement_key
-            JOIN auditcore.evidence e
-              ON e.tenant_id=jda.tenant_id
-             AND e.evidence_id=jda.evidence_id
-             AND e.association_status='ACTIVE'
-            WHERE jdr.tenant_id=:tenant_id
-              AND jdr.journey_id=:journey_id
-              AND jdr.journey_document_requirement_id=:requirement_ref
-              AND upper(jdr.process_area)='BOOKING'
-            FOR UPDATE OF jdr, jda, e
+            SELECT requirement_key, document_type_key
+            FROM auditcore.journey_document_requirements
+            WHERE tenant_id=:tenant_id
+              AND journey_id=:journey_id
+              AND journey_document_requirement_id=:requirement_ref
+              AND upper(process_area)='BOOKING'
+            FOR UPDATE
             """
         ),
         {
@@ -613,19 +634,76 @@ def _current_linked_evidence(
             "requirement_ref": requirement_ref,
         },
     ).mappings().one_or_none()
-    if row is None:
+    if requirement is None:
         raise NotFoundError(
             error_code="VAC-NF-006",
             title="Booking document requirement not found",
             detail="The Booking document requirement is not linked to current evidence.",
         )
-    if row["di_document_id"] != document_id:
+
+    if _is_repeatable_requirement(requirement["requirement_key"]):
+        evidence = connection.execute(
+            text(
+                """
+                SELECT evidence_id, di_document_id
+                FROM auditcore.evidence
+                WHERE tenant_id=:tenant_id
+                  AND journey_id=:journey_id
+                  AND journey_document_requirement_id=:requirement_ref
+                  AND di_document_id=:document_id
+                  AND association_status='ACTIVE'
+                FOR UPDATE
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "requirement_ref": requirement_ref,
+                "document_id": document_id,
+            },
+        ).mappings().one_or_none()
+    else:
+        evidence = connection.execute(
+            text(
+                """
+                SELECT e.evidence_id, e.di_document_id
+                FROM auditcore.journey_document_assessments jda
+                JOIN auditcore.evidence e
+                  ON e.tenant_id=jda.tenant_id
+                 AND e.evidence_id=jda.evidence_id
+                 AND e.association_status='ACTIVE'
+                WHERE jda.tenant_id=:tenant_id
+                  AND jda.journey_id=:journey_id
+                  AND jda.stage_code='BOOKING'
+                  AND jda.journey_document_requirement_id=:requirement_ref
+                  AND e.di_document_id=:document_id
+                FOR UPDATE OF jda, e
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "requirement_ref": requirement_ref,
+                "document_id": document_id,
+            },
+        ).mappings().one_or_none()
+
+    if evidence is None:
         raise ConflictError(
             error_code="VAC-CONFLICT-009",
             title="Booking document changed",
-            detail="The reviewed DI document is no longer the current document for this requirement.",
+            detail=(
+                "The reviewed DI document is not an active document for this repeatable requirement."
+                if _is_repeatable_requirement(requirement["requirement_key"])
+                else "The reviewed DI document is no longer the current document for this requirement."
+            ),
         )
-    return row
+    return {
+        "requirement_key": requirement["requirement_key"],
+        "document_type_key": requirement["document_type_key"],
+        "evidence_id": evidence["evidence_id"],
+        "di_document_id": evidence["di_document_id"],
+    }
 
 
 def _validate_unique_decisions(fields: list[BookingExtractionFieldDecision]) -> None:
