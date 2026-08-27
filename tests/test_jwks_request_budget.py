@@ -77,3 +77,5 @@ def test_repeated_human_validation_fetches_jwks_once(monkeypatch) -> None:  # ty
     assert observed_kwargs["cache_keys"] is True
     assert observed_kwargs["cache_jwk_set"] is True
     assert observed_kwargs["lifespan"] == security._JWKS_CACHE_LIFESPAN_SECONDS
+    assert observed_kwargs["timeout"] == security._JWKS_REQUEST_TIMEOUT_SECONDS
+    assert security._JWKS_REQUEST_TIMEOUT_SECONDS <= 5.0
