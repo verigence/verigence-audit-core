@@ -10,9 +10,32 @@ from audit_core.customer_matching import (
     add_customer_match_key,
     protect_normalized_match_key,
 )
-from audit_core.dependencies import get_connection, get_principal
+from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.main import app
-from audit_core.security import Principal
+from audit_core.security import HumanPrincipal
+from audit_core.security_authorization import (
+    SecurityAuthorizationDecision,
+    get_security_authorization_client,
+)
+
+
+class _AuthorizationClient:
+    def check_user_permission(
+        self,
+        *,
+        user_id: str,
+        tenant_id: str,
+        permission_key: str,
+    ) -> SecurityAuthorizationDecision:
+        allowed = permission_key == "audit.customer.read"
+        return SecurityAuthorizationDecision(
+            allowed=allowed,
+            reason_code="ALLOWED" if allowed else "PERMISSION_DENIED",
+            user_id=user_id,
+            tenant_id=tenant_id,
+            permission_key=permission_key,
+            role_key="PC",
+        )
 
 
 def test_protected_match_finds_customers_across_dealers_without_raw_id_logging(caplog) -> None:
@@ -124,12 +147,12 @@ def test_protected_match_finds_customers_across_dealers_without_raw_id_logging(c
         with engine.begin() as connection:
             yield connection
 
+    authorization = _AuthorizationClient()
     app.dependency_overrides[get_connection] = connection_override
-    app.dependency_overrides[get_principal] = lambda: Principal(
-        subject="match-user",
-        tenant_id=tenant_id,
-        permissions=(),
+    app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(
+        subject="match-user"
     )
+    app.dependency_overrides[get_security_authorization_client] = lambda: authorization
     caplog.set_level(logging.INFO, logger="audit_core")
     try:
         client = TestClient(app, raise_server_exceptions=False)
