@@ -261,8 +261,6 @@ def _create_context(
         },
     ).mappings().one_or_none()
     if row is None:
-        # Preserve the existing authorization boundary: an invalid/unassigned Outlet
-        # remains indistinguishable from an inaccessible Outlet.
         raise AuthorizationError(
             error_code="VAC-AUTH-002",
             status_code=403,
@@ -288,12 +286,7 @@ def _execute_create_booking_atomic(
     idempotency_key: str,
     request_payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """Create/replay the Booking in one PostgreSQL round trip.
-
-    The transaction advisory lock, replay check, aggregate inserts, workflow event,
-    and replay record are one statement. This preserves the same idempotency and FK
-    transaction semantics while removing the generic three-round-trip command path.
-    """
+    """Create/replay the Booking in one PostgreSQL round trip."""
 
     request_hash = stable_request_hash(request_payload)
     lock_key = f"{tenant_id}:{_OPERATION_KEY}:{idempotency_key}"
@@ -444,7 +437,7 @@ def _execute_create_booking_atomic(
 
     body = row["response_body"]
     if not isinstance(body, dict):
-        raise RuntimeError("Create Booking idempotent response has invalid shape")
+        raise TypeError("Create Booking idempotent response has invalid shape")
     return dict(body)
 
 
