@@ -40,6 +40,7 @@ from audit_core.projects import router as project_router
 from audit_core.readiness import router as readiness_router
 from audit_core.reference_data import router as reference_data_router
 from audit_core.role_mapping_policy import install_role_mapping_policy
+from audit_core.runtime_warmup import warm_runtime_dependencies
 from audit_core.tasks_api import router as task_router
 from audit_core.uc02_project_admin_stabilization import (
     router as uc02_project_admin_stabilization_router,
@@ -110,6 +111,7 @@ def create_app() -> FastAPI:
         redoc_url=None,
         openapi_url=None,
     )
+    application.add_event_handler("startup", warm_runtime_dependencies)
     configure_otlp(application, settings)
     configure_logging(settings)
     install_error_handlers(application)
