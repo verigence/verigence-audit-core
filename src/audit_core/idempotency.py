@@ -35,21 +35,29 @@ def execute_idempotent_json_command(
 ) -> tuple[dict[str, Any], bool]:
     request_hash = stable_request_hash(request_payload)
     lock_key = f"{tenant_id}:{operation_key}:{idempotency_key}"
-    connection.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
+
+    # Acquire the transaction advisory lock and inspect any replay record in one
+    # PostgreSQL round trip. MATERIALIZED guarantees the volatile lock function is
+    # evaluated before the lateral idempotency lookup.
     existing = connection.execute(
         text(
             """
-            SELECT request_hash, response_body
-            FROM auditcore.idempotency_records
-            WHERE tenant_id = :tenant_id
-              AND operation_key = :operation_key
-              AND idempotency_key = :idempotency_key
+            WITH lock_guard AS MATERIALIZED (
+                SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))
+            )
+            SELECT r.request_hash, r.response_body
+            FROM lock_guard
+            CROSS JOIN LATERAL (
+                SELECT request_hash, response_body
+                FROM auditcore.idempotency_records
+                WHERE tenant_id = :tenant_id
+                  AND operation_key = :operation_key
+                  AND idempotency_key = :idempotency_key
+            ) r
             """
         ),
         {
+            "lock_key": lock_key,
             "tenant_id": tenant_id,
             "operation_key": operation_key,
             "idempotency_key": idempotency_key,
