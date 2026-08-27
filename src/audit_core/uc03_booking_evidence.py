@@ -50,6 +50,17 @@ router = APIRouter(
 _DI_AUDIENCE = "di"
 
 
+class BookingEvidenceResponse(EvidenceResponse):
+    aggregateVersion: int
+
+
+def _with_aggregate_version(response: EvidenceResponse, aggregate_version: int) -> BookingEvidenceResponse:
+    return BookingEvidenceResponse(
+        **response.model_dump(),
+        aggregateVersion=aggregate_version,
+    )
+
+
 def _record_upload_activity(
     engine: Engine,
     *,
@@ -61,7 +72,7 @@ def _record_upload_activity(
     correlation_id: str,
     requirement_key: str,
     evidence_id: UUID,
-) -> None:
+) -> int:
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
         already_recorded = connection.execute(
@@ -82,11 +93,12 @@ def _record_upload_activity(
             },
         ).scalar_one_or_none()
         if already_recorded is not None:
-            return
+            state = _stage_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+            return int(state["version_no"]) if state is not None else 0
         _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
         state = _stage_state(connection, tenant_id=tenant_id, journey_id=journey_id)
         if state is None or state["business_status"] not in {"BOOKING_STARTED", "BOOKING_IN_PROGRESS"}:
-            return
+            return int(state["version_no"]) if state is not None else 0
         next_version = int(state["version_no"]) + 1
         connection.execute(
             text(
@@ -118,11 +130,12 @@ def _record_upload_activity(
             },
             aggregate_version=next_version,
         )
+        return next_version
 
 
 @router.post(
     "/{requirement_key}/evidence",
-    response_model=EvidenceResponse,
+    response_model=BookingEvidenceResponse,
     status_code=status.HTTP_201_CREATED,
 )
 def upload_booking_document(
@@ -143,7 +156,7 @@ def upload_booking_document(
     engine: Annotated[Engine, Depends(get_engine)],
     security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
     di_client: Annotated[DiClient, Depends(get_di_client)],
-) -> EvidenceResponse:
+) -> BookingEvidenceResponse:
     _authorize_security(
         authorization_client,
         human_principal=human_principal,
@@ -227,7 +240,7 @@ def upload_booking_document(
             correlation_id=correlation_id,
         )
         if cached is not None:
-            return cached
+            return _with_aggregate_version(cached, int(state["version_no"]))
         if operation is None:
             raise RuntimeError("Evidence ingestion operation was not created")
         customer_id = journey["customer_id"]
@@ -339,7 +352,7 @@ def upload_booking_document(
         evidence_purpose=evidence_purpose,
         actor_id=human_principal.subject,
     )
-    _record_upload_activity(
+    aggregate_version = _record_upload_activity(
         engine,
         tenant_id=tenant_id,
         journey_id=journey_id,
@@ -350,4 +363,4 @@ def upload_booking_document(
         requirement_key=requirement_key,
         evidence_id=response.evidenceId,
     )
-    return response
+    return _with_aggregate_version(response, aggregate_version)
