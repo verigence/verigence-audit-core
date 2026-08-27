@@ -90,7 +90,6 @@ def _submission_context(
             error_code="VAC-AUTH-002",
             status_code=403,
             title="Permission denied",
-            detail="Feedback submission is available to active PC, TL and PM users in this Project.",
         )
     return str(row["project_name"]), str(row["business_role_code"]).upper()
 
