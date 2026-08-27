@@ -100,8 +100,8 @@ async def _read_screenshot(screenshot: UploadFile | None) -> tuple[str | None, s
     content_type = (screenshot.content_type or "").lower().strip()
     if content_type not in _ALLOWED_SCREENSHOT_TYPES:
         raise ValidationError(detail="Screenshot must be a PNG, JPEG or WebP image.")
-    data = await screenshot.read(_MAX_SCREENSHOT_BYTES + 1)
-    if len(data) > _MAX_SCREENSHOT_BYTES:
+    data = await screenshot.read(_MAX_SCREENSHOT_BYTES)
+    if len(data) >= _MAX_SCREENSHOT_BYTES:
         raise ValidationError(detail="Screenshot must be smaller than 1 MB.")
     if not data:
         raise ValidationError(detail="Screenshot file is empty.")
