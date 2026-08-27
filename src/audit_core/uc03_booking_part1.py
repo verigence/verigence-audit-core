@@ -121,6 +121,56 @@ def _requirement_rows(
     return result
 
 
+def _capture_bootstrap(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    operating_role: str,
+) -> dict[str, Any]:
+    """Return only the state required to paint the two-step PC capture screen."""
+
+    row = connection.execute(
+        text(
+            """
+            SELECT
+                c.display_name,
+                s.business_status,
+                s.closure_disposition,
+                s.audit_state,
+                s.audit_status,
+                s.close_reason_code,
+                s.closure_remarks,
+                s.version_no
+            FROM auditcore.journeys j
+            JOIN auditcore.customers c
+              ON c.tenant_id = j.tenant_id
+             AND c.customer_id = j.customer_id
+            LEFT JOIN auditcore.journey_stage_states s
+              ON s.tenant_id = j.tenant_id
+             AND s.journey_id = j.journey_id
+             AND s.stage_code = 'BOOKING'
+            WHERE j.tenant_id = :tenant_id
+              AND j.journey_id = :journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one()
+    return {
+        "aggregateVersion": int(row["version_no"] or 0),
+        "operatingRole": operating_role,
+        "capture": {"CUSTOMER_NAME": row["display_name"]},
+        "bookingStage": {
+            "businessStatus": row["business_status"],
+            "closureDisposition": row["closure_disposition"],
+            "auditState": row["audit_state"] or "NOT_STARTED",
+            "auditStatus": row["audit_status"] or "NOT_EVALUATED",
+            "closeReasonCode": row["close_reason_code"],
+            "closureRemarks": row["closure_remarks"],
+        },
+    }
+
+
 def _product_master_compatibility_placeholder() -> dict[str, Any]:
     """Preserve the existing response shape without doing Product Master work.
 
@@ -151,7 +201,7 @@ def get_booking_part1(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
-    _scope(
+    context = _scope(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
@@ -163,6 +213,12 @@ def get_booking_part1(
         tenant_id=tenant_id,
         journey_id=journey_id,
     )
+    bootstrap = _capture_bootstrap(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        operating_role=context["operating_role"],
+    )
     by_kind = {item["kind"]: item for item in requirements}
     pan_count = len(by_kind.get("PAN", {}).get("evidence", []))
     aadhaar_count = len(by_kind.get("AADHAAR", {}).get("evidence", []))
@@ -171,6 +227,7 @@ def get_booking_part1(
 
     return {
         "journeyId": str(journey_id),
+        **bootstrap,
         "requirements": requirements,
         "mandatoryEvidence": {
             "bookingDocketComplete": docket_count > 0,
