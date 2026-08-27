@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -143,7 +143,7 @@ async def submit_feedback(
     # response values in the application avoids turning a write-only submission into a
     # forbidden read while keeping the stored values and API response identical.
     feedback_id = uuid4()
-    created_at_utc = datetime.now(timezone.utc)
+    created_at_utc = datetime.now(UTC)
     connection.execute(
         text(
             """
