@@ -33,14 +33,9 @@ def test_only_approved_control_plane_and_master_gets_use_lightweight_auth() -> N
     for path in approved:
         assert dependencies._is_lightweight_authenticated_read(_request("GET", path))
 
-    # Cross-Tenant UC02 Project Administration remains SuperAdmin-only.
     assert not dependencies._is_lightweight_authenticated_read(_request("GET", "/v1/projects"))
-    assert not dependencies._is_lightweight_authenticated_read(
-        _request("POST", "/v1/projects")
-    )
-    assert not dependencies._is_lightweight_authenticated_read(
-        _request("GET", "/v1/tenants/t-1/dealers")
-    )
+    assert not dependencies._is_lightweight_authenticated_read(_request("POST", "/v1/projects"))
+    assert not dependencies._is_lightweight_authenticated_read(_request("GET", "/v1/tenants/t-1/dealers"))
     assert not dependencies._is_lightweight_authenticated_read(
         _request("POST", "/v1/tenants/t-1/project-masters/AUDIT_CORE/PRICE_LIST/versions/v-1/publish")
     )
@@ -67,7 +62,7 @@ def test_admin_context_is_reused_for_short_page_bursts(monkeypatch) -> None:  # 
     dependencies._admin_context_cache.clear()
 
 
-def test_postgresql_engine_uses_simple_bounded_pool_configuration(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_postgresql_engine_uses_low_roundtrip_pool_configuration(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     observed: dict[str, object] = {}
     sentinel = object()
 
@@ -84,11 +79,17 @@ def test_postgresql_engine_uses_simple_bounded_pool_configuration(monkeypatch) -
     finally:
         dependencies._engine.cache_clear()
 
-    assert observed["pool_pre_ping"] is True
+    assert observed["pool_pre_ping"] is False
     assert observed["pool_timeout"] == 5
+    assert observed["pool_recycle"] == 600
+    assert observed["pool_use_lifo"] is True
     assert observed["connect_args"] == {
         "connect_timeout": 5,
-        "options": "-c statement_timeout=10000",
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 3,
+        "options": "-c statement_timeout=10000 -c role=audit_core_runtime",
     }
 
 
