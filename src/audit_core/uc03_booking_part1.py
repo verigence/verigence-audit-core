@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import Connection, text
 
 from audit_core.authorization import AuthorizationError
+from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.errors import ConflictError, NotFoundError
 from audit_core.security import HumanPrincipal
@@ -48,18 +49,16 @@ def _part1_bootstrap_rows(
 ) -> list[dict[str, Any]]:
     """Load all state needed to paint Booking Part-1 in one database round trip.
 
-    Tenant RLS context is established inside this statement, so the hot read does
-    not pay a separate set_tenant_context SQL round trip before loading the Journey,
-    role, stage header, four document requirements and active Evidence.
+    This intentionally does not use the generic Booking workspace scope helper: that
+    helper also loads policy context and resolves the operating role in separate SQL
+    calls. Part-1 needs only the current Journey scope, role, customer/stage header,
+    four document requirements, and their evidence.
     """
 
     rows = connection.execute(
         text(
             """
-            WITH runtime_context AS MATERIALIZED (
-                SELECT set_config('app.tenant_id', :tenant_id, true) AS tenant_context
-            ),
-            scoped_journey AS MATERIALIZED (
+            WITH scoped_journey AS MATERIALIZED (
                 SELECT
                     j.dealer_id,
                     j.outlet_id,
@@ -90,8 +89,7 @@ def _part1_bootstrap_rows(
                                 )
                           )
                     ) AS operating_roles
-                FROM runtime_context rc
-                CROSS JOIN auditcore.journeys j
+                FROM auditcore.journeys j
                 JOIN auditcore.customers c
                   ON c.tenant_id = j.tenant_id
                  AND c.customer_id = j.customer_id
@@ -102,7 +100,7 @@ def _part1_bootstrap_rows(
                 WHERE j.tenant_id = :tenant_id
                   AND j.journey_id = :journey_id
             ),
-            requirements AS MATERIALIZED (
+            requirements AS (
                 SELECT
                     r.journey_document_requirement_id,
                     r.requirement_key,
@@ -122,8 +120,7 @@ def _part1_bootstrap_rows(
                         ) FILTER (WHERE e.evidence_id IS NOT NULL),
                         '[]'::jsonb
                     ) AS evidence
-                FROM runtime_context rc
-                CROSS JOIN auditcore.journey_document_requirements r
+                FROM auditcore.journey_document_requirements r
                 LEFT JOIN auditcore.evidence e
                   ON e.tenant_id = r.tenant_id
                  AND e.journey_id = r.journey_id
@@ -209,6 +206,8 @@ def _part1_view_from_rows(
         if not isinstance(requirement_key, str):
             continue
         kind = _PART1_KINDS[requirement_key]
+        # Prefer the canonical payment requirement if an old and new snapshot both
+        # exist during migration/reconciliation.
         if kind in seen and requirement_key != "booking_payment_receipt":
             continue
         if kind in seen:
@@ -295,6 +294,7 @@ def get_booking_part1(
         human_principal=human_principal,
         tenant_id=tenant_id,
     )
+    set_tenant_context(connection, tenant_id)
     rows = _part1_bootstrap_rows(
         connection,
         tenant_id=tenant_id,
