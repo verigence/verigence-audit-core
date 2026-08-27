@@ -1,0 +1,114 @@
+name: Validate Booking Form field mismatch
+
+on:
+  push:
+    branches:
+      - validation/pc-booking-review-direct-di-live-20260827
+    paths:
+      - '.github/workflows/validate-booking-form-field-mismatch.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      TENANT_ID: 5fbe26ab-6ed7-444a-8488-5bfb81208588
+      JOURNEY_ID: 89cb1ca8-f9cf-488d-ad82-108a37fa4a43
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install 'psycopg[binary]>=3.2,<4' 'PyJWT>=2.8,<3' 'cryptography>=42,<46' 'httpx>=0.27,<1'
+          npm install --global @railway/cli
+      - name: Collect DEV variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service verigence-audit-core --json >/dev/null
+          railway variable list --service security --environment dev --json > /tmp/security.json
+          railway variable list --service verigence-audit-core --environment dev --json > /tmp/audit.json
+          railway variable list --service di-api --environment dev --json > /tmp/di.json
+      - name: Compare DI Booking Form facts with Audit Core review allow-list
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, uuid
+          from datetime import UTC, datetime, timedelta
+          from pathlib import Path
+          import httpx, jwt, psycopg
+
+          tenant_id = os.environ['TENANT_ID']
+          journey_id = os.environ['JOURNEY_ID']
+          def load(path): return json.loads(Path(path).read_text())
+          def pg(value): return str(value or '').replace('postgresql+psycopg://','postgresql://',1).replace('postgresql+asyncpg://','postgresql://',1)
+          def base(values):
+              d=str(values.get('RAILWAY_PUBLIC_DOMAIN') or values.get('RAILWAY_STATIC_URL') or '').strip()
+              if not d.startswith(('http://','https://')): d='https://'+d
+              return d.rstrip('/')
+
+          sv,av,dv=load('/tmp/security.json'),load('/tmp/audit.json'),load('/tmp/di.json')
+          with psycopg.connect(pg(av.get('DATABASE_URL'))) as conn:
+              with conn.cursor() as cur:
+                  cur.execute('''
+                    SELECT ba.security_actor_id::text, ba.business_role_code
+                    FROM auditcore.business_assignments ba
+                    JOIN auditcore.journeys j ON j.tenant_id=ba.tenant_id AND j.journey_id=%s
+                    WHERE ba.tenant_id=%s AND ba.assignment_status='ACTIVE'
+                      AND ba.effective_from <= now() AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+                      AND (ba.dealer_id IS NULL OR ba.dealer_id=j.dealer_id)
+                      AND (ba.outlet_id IS NULL OR ba.outlet_id=j.outlet_id)
+                  ''',(journey_id,tenant_id))
+                  rows=cur.fetchall()
+                  actor_id=next((str(a) for a,r in rows if str(r).upper() in {'PC','PROCESS_CONSULTANT','PROCESS CONSULTANT'}),None)
+          if not actor_id: raise SystemExit('No PC assignment found')
+
+          now=datetime.now(UTC)
+          token=jwt.encode({'iss':str(sv.get('SECURITY_TOKEN_ISSUER') or 'verigence-security'),'sub':actor_id,'aud':str(sv.get('SECURITY_TOKEN_AUDIENCE') or 'verigence-platform'),'iat':now,'exp':now+timedelta(minutes=8),'jti':str(uuid.uuid4()),'actor_type':'USER'},str(sv.get('SECURITY_PRIVATE_KEY_PEM') or '').replace('\\n','\n'),algorithm='RS256',headers={'kid':str(sv.get('SECURITY_KEY_ID') or '')})
+          headers={'Authorization':'Bearer '+token}
+          audit,di=base(av),base(dv)
+
+          with httpx.Client(timeout=90,follow_redirects=True) as client:
+              c=client.post(f'{audit}/v1/tenants/{tenant_id}/journeys/{journey_id}/booking/document-upload-context',headers=headers)
+              print('AUDIT_CONTEXT_HTTP='+str(c.status_code))
+              c.raise_for_status(); context=c.json()
+              booking_req=next((r for r in context.get('requirements',[]) if str(r.get('documentTypeKey') or '').lower() in {'booking_form','booking_docket'}),None)
+              if not booking_req: raise SystemExit('No Booking Form requirement found')
+              eligible=sorted(str(x) for x in booking_req.get('captureEligibleFieldKeys',[]))
+              print('AUDIT_DOCUMENT_TYPE='+str(booking_req.get('documentTypeKey')))
+              print('AUDIT_CAPTURE_ELIGIBLE_COUNT='+str(len(eligible)))
+              print('AUDIT_CAPTURE_ELIGIBLE_KEYS='+','.join(eligible))
+              context_ref=str(context.get('externalContextRef') or '')
+              l=client.get(f'{di}/v1/tenants/{tenant_id}/audit-storage-contexts/{context_ref}/pc-booking-documents',headers=headers)
+              print('DI_LIST_HTTP='+str(l.status_code)); l.raise_for_status()
+              docs=(l.json().get('data') or {}).get('documents') or []
+              booking_docs=[d for d in docs if str(d.get('documentTypeKey') or '').lower() in {'booking_form','booking_docket'}]
+              print('DI_BOOKING_FORM_DOCUMENT_COUNT='+str(len(booking_docs)))
+              if not booking_docs: raise SystemExit('No DI Booking Form document found')
+              doc=booking_docs[-1]
+              doc_id=str(doc.get('documentId'))
+              e=client.get(f'{di}/v1/tenants/{tenant_id}/audit-storage-contexts/{context_ref}/pc-booking-documents/{doc_id}/extraction-review',headers=headers)
+              print('DI_EXTRACTION_HTTP='+str(e.status_code)); e.raise_for_status()
+              facts=(e.json().get('data') or {}).get('facts') or []
+              print('DI_FACT_COUNT='+str(len(facts)))
+              for fact in sorted(facts,key=lambda x:str(x.get('fieldKey') or '')):
+                  print('DI_FACT='+str(fact.get('fieldKey'))+'|'+str(fact.get('foundStatus')))
+              fact_keys={str(f.get('fieldKey') or '').lower() for f in facts}
+              found_keys={str(f.get('fieldKey') or '').lower() for f in facts if str(f.get('foundStatus') or '').upper() not in {'NOT_FOUND','MISSING'} and (f.get('normalizedValue') is not None or f.get('rawValue') is not None)}
+              visible=sorted(found_keys.intersection({x.lower() for x in eligible}))
+              suppressed=sorted(found_keys.difference({x.lower() for x in eligible}))
+              print('DI_FOUND_VALUE_COUNT='+str(len(found_keys)))
+              print('WEB_VISIBLE_BY_CURRENT_LOGIC_COUNT='+str(len(visible)))
+              print('WEB_VISIBLE_BY_CURRENT_LOGIC_KEYS='+','.join(visible))
+              print('FOUND_BUT_SUPPRESSED_COUNT='+str(len(suppressed)))
+              print('FOUND_BUT_SUPPRESSED_KEYS='+','.join(suppressed))
+              print('BOOKING_FORM_FIELD_MISMATCH_VALIDATION=PASS')
+          PY
