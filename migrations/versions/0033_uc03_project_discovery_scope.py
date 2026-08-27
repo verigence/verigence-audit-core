@@ -1,12 +1,12 @@
 """Allow actor-scoped Dealer/Outlet reads during UC03 Project discovery.
 
-Revision ID: 0033_uc03_project_discovery_scope
+Revision ID: 0033_uc03_project_scope
 Revises: 0032_user_feedback
 Create Date: 2026-08-27
 """
 from alembic import op
 
-revision = "0033_uc03_project_discovery_scope"
+revision = "0033_uc03_project_scope"
 down_revision = "0032_user_feedback"
 branch_labels = None
 depends_on = None
