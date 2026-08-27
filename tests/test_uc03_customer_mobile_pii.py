@@ -10,7 +10,6 @@ class _Connection:
 
     def execute(self, _statement, parameters):
         self.parameters = parameters
-        return None
 
 
 def test_customer_number_capture_persists_full_normalized_mobile(monkeypatch) -> None:
