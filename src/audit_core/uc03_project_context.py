@@ -5,7 +5,6 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import Connection, text
 
-from audit_core.db import set_security_actor_context
 from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.security import HumanPrincipal
 
@@ -48,23 +47,28 @@ def list_my_projects(
 ) -> MyProjectsResponse:
     """Return active operational Projects and the actor's concrete working scope.
 
-    Project, role and PC Outlet scope are deliberately resolved in one database round
-    trip. Cross-Tenant discovery remains RLS constrained to the authenticated Security
-    actor; Dealer/Outlet discovery is limited to concrete active PC assignments.
+    Actor RLS context, Project, role and PC Outlet scope are deliberately resolved in
+    one PostgreSQL statement. The MATERIALIZED runtime_context CTE is a dependency of
+    every protected read, so the validated Security actor is established before RLS
+    evaluates Projects, assignments, Dealers or Outlets. No cross-Tenant write access
+    or broad Dealer/Outlet visibility is introduced.
     """
 
-    set_security_actor_context(connection, human_principal.subject)
     rows = list(
         connection.execute(
             text(
                 """
-                WITH active_assignments AS MATERIALIZED (
+                WITH runtime_context AS MATERIALIZED (
+                    SELECT set_config('app.security_actor_id', :actor_id, true) AS actor_context
+                ),
+                active_assignments AS MATERIALIZED (
                     SELECT
                         ba.tenant_id,
                         ba.business_role_code,
                         ba.dealer_id,
                         ba.outlet_id
-                    FROM auditcore.business_assignments ba
+                    FROM runtime_context rc
+                    CROSS JOIN auditcore.business_assignments ba
                     WHERE ba.security_actor_id = :actor_id
                       AND ba.assignment_status = 'ACTIVE'
                       AND ba.effective_from <= now()
@@ -82,7 +86,8 @@ def list_my_projects(
                         bool_or(a.dealer_id IS NULL AND a.outlet_id IS NULL) AS all_dealers,
                         count(DISTINCT a.dealer_id) AS dealer_count,
                         count(DISTINCT a.outlet_id) AS outlet_count
-                    FROM auditcore.projects p
+                    FROM runtime_context rc
+                    CROSS JOIN auditcore.projects p
                     JOIN active_assignments a
                       ON a.tenant_id = p.tenant_id
                     WHERE p.project_status = 'ACTIVE'
