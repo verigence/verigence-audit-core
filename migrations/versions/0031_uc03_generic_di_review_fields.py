@@ -1,6 +1,6 @@
 """Store every DI extraction used by PC document review.
 
-Revision ID: 0031_uc03_generic_di_review_fields
+Revision ID: 0031_uc03_generic_review_fields
 Revises: 0030_uc03_customer_mobile_pii
 Create Date: 2026-08-27
 
@@ -11,7 +11,7 @@ audit columns; unchanged fields retain modified_value as SQL NULL.
 """
 from alembic import op
 
-revision = "0031_uc03_generic_di_review_fields"
+revision = "0031_uc03_generic_review_fields"
 down_revision = "0030_uc03_customer_mobile_pii"
 branch_labels = None
 depends_on = None
