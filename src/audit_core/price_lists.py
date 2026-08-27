@@ -1,10 +1,11 @@
 from datetime import date
 from decimal import Decimal
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import Connection, text
 
-from audit_core.errors import AuditCoreError
+from audit_core.errors import AuditCoreError, NotFoundError
 
 
 def create_price_list(
@@ -155,6 +156,112 @@ def retire_price_list_version(
         )
 
 
+def find_effective_price_plan(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    effective_on: date,
+) -> dict[str, Any] | None:
+    """Return the single latest Price List version effective on a business date.
+
+    Runtime lookup deliberately stays small: one query over static versioned master
+    rows. RETIRED versions remain eligible for historical business dates so a Booking
+    captured on a later day still resolves the master that applied when it occurred.
+    """
+
+    row = connection.execute(
+        text(
+            """
+            SELECT pl.price_list_id,
+                   pl.price_list_code,
+                   pl.price_list_name,
+                   plv.price_list_version_id,
+                   plv.version_no,
+                   plv.effective_from,
+                   plv.effective_to,
+                   plv.currency_code,
+                   plv.lifecycle_status
+            FROM auditcore.price_list_versions plv
+            JOIN auditcore.price_lists pl
+              ON pl.tenant_id = plv.tenant_id
+             AND pl.price_list_id = plv.price_list_id
+            WHERE plv.tenant_id = :tenant_id
+              AND plv.lifecycle_status IN ('PUBLISHED', 'RETIRED')
+              AND plv.effective_from <= :effective_on
+              AND (plv.effective_to IS NULL OR plv.effective_to >= :effective_on)
+            ORDER BY plv.effective_from DESC,
+                     plv.version_no DESC,
+                     plv.price_list_version_id DESC
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "effective_on": effective_on},
+    ).mappings().one_or_none()
+    return dict(row) if row is not None else None
+
+
+def resolve_effective_price_plan(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    effective_on: date,
+) -> dict[str, Any]:
+    plan = find_effective_price_plan(
+        connection,
+        tenant_id=tenant_id,
+        effective_on=effective_on,
+    )
+    if plan is None:
+        raise AuditCoreError(
+            error_code="VAC-MASTER-002",
+            status_code=422,
+            title="No effective master version",
+            detail="No effective Price List version exists for the requested business date.",
+        )
+    return plan
+
+
+def get_price_matrix(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    price_list_version_id: UUID,
+    product_sku_id: UUID,
+) -> list[dict[str, Any]]:
+    """Return static price components for one Price List version and one SKU."""
+
+    rows = connection.execute(
+        text(
+            """
+            SELECT plv.currency_code,
+                   pli.component_key,
+                   pli.standard_amount,
+                   pli.tax_inclusive
+            FROM auditcore.price_list_items pli
+            JOIN auditcore.price_list_versions plv
+              ON plv.tenant_id = pli.tenant_id
+             AND plv.price_list_version_id = pli.price_list_version_id
+            WHERE pli.tenant_id = :tenant_id
+              AND pli.price_list_version_id = :price_list_version_id
+              AND pli.product_sku_id = :product_sku_id
+            ORDER BY pli.component_key
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "price_list_version_id": price_list_version_id,
+            "product_sku_id": product_sku_id,
+        },
+    ).mappings().all()
+    if not rows:
+        raise NotFoundError(
+            error_code="VAC-NF-012",
+            title="Price matrix not found",
+            detail="No Price Master rows exist for the selected Price List version and Product SKU.",
+        )
+    return [dict(row) for row in rows]
+
+
 def resolve_effective_price_list_version(
     connection: Connection,
     *,
@@ -169,10 +276,10 @@ def resolve_effective_price_list_version(
             FROM auditcore.price_list_versions
             WHERE tenant_id = :tenant_id
               AND price_list_id = :price_list_id
-              AND lifecycle_status = 'PUBLISHED'
+              AND lifecycle_status IN ('PUBLISHED', 'RETIRED')
               AND effective_from <= :effective_on
               AND (effective_to IS NULL OR effective_to >= :effective_on)
-            ORDER BY version_no DESC
+            ORDER BY effective_from DESC, version_no DESC, price_list_version_id DESC
             LIMIT 1
             """
         ),
@@ -187,6 +294,6 @@ def resolve_effective_price_list_version(
             error_code="VAC-MASTER-002",
             status_code=422,
             title="No effective master version",
-            detail="No effective published Price List version exists for the requested date.",
+            detail="No effective Price List version exists for the requested date.",
         )
     return version_id

@@ -27,6 +27,7 @@ from audit_core.mahindra_upload_state import router as mahindra_upload_state_rou
 from audit_core.observability import install_observability
 from audit_core.otel import configure_otlp
 from audit_core.payments_finance import router as payments_finance_router
+from audit_core.pricing import router as pricing_router
 from audit_core.project_activation import router as project_activation_router
 from audit_core.project_master_admin import router as project_master_admin_router
 from audit_core.project_master_forms import router as project_master_form_router
@@ -174,6 +175,7 @@ def create_app() -> FastAPI:
     application.include_router(crm_router)
     application.include_router(escalation_router)
     application.include_router(reference_data_router)
+    application.include_router(pricing_router)
 
     @application.get("/health")
     def health() -> dict[str, str]:
