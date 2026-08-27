@@ -56,11 +56,7 @@ def _require_tl_scope(
     tenant_id: str,
     actor_id: str,
 ) -> None:
-    """Require the current actor to have an active TL business assignment.
-
-    TL scope is Dealer-wide by design. The case query below reuses the same active
-    assignment predicate so the endpoint cannot widen a TL beyond assigned Dealers.
-    """
+    """Require an active Dealer-wide TL assignment for the current actor."""
 
     assigned = connection.execute(
         text(
@@ -88,10 +84,12 @@ def _require_tl_scope(
         )
 
 
-_SCOPE_SQL = """
+_BASE_FROM_SQL = """
     FROM auditcore.journeys j
     JOIN auditcore.customers c
       ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+    JOIN auditcore.projects project
+      ON project.tenant_id=j.tenant_id AND project.project_status='ACTIVE'
     JOIN auditcore.dealers dealer
       ON dealer.tenant_id=j.tenant_id AND dealer.dealer_id=j.dealer_id
     JOIN auditcore.dealer_outlets outlet
@@ -112,6 +110,9 @@ _SCOPE_SQL = """
       ON ds.tenant_id=j.tenant_id
      AND ds.journey_id=j.journey_id
      AND ds.stage_code='DELIVERY'
+"""
+
+_SCOPE_WHERE_SQL = """
     WHERE j.tenant_id=:tenant_id
       AND EXISTS (
             SELECT 1
@@ -145,7 +146,7 @@ def list_tl_supervisory_cases(
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> TlSupervisoryCasePage:
-    """Return PC-submitted/progressed cases for the TL's assigned Dealer scope.
+    """Return PC-submitted/progressed cases in the TL's assigned Dealer scope.
 
     The endpoint intentionally returns case facts rather than a pre-shaped dashboard.
     Web owns the supervisory presentation, grouping and filters. PC drafts are kept
@@ -171,7 +172,7 @@ def list_tl_supervisory_cases(
         "offset": offset,
     }
     total = connection.execute(
-        text("SELECT count(*) " + _SCOPE_SQL),
+        text("SELECT count(*) " + _BASE_FROM_SQL + _SCOPE_WHERE_SQL),
         params,
     ).scalar_one()
 
@@ -199,17 +200,17 @@ def list_tl_supervisory_cases(
                 COALESCE(bs.business_status, b.actual_status_code) AS booking_business_status,
                 COALESCE(
                     b.booking_date,
-                    (bs.first_started_at_utc AT TIME ZONE 'UTC')::date,
-                    (b.created_at_utc AT TIME ZONE 'UTC')::date
+                    (bs.first_started_at_utc AT TIME ZONE project.timezone_name)::date,
+                    (b.created_at_utc AT TIME ZONE project.timezone_name)::date
                 ) AS booking_business_date,
                 bs.capture_completed_at_utc AS booking_submitted_at_utc,
                 bs.pc_verification_status,
                 COALESCE(ds.business_status, delivery.actual_delivery_status_code)
                     AS delivery_business_status,
                 COALESCE(
-                    (delivery.actual_delivered_at AT TIME ZONE 'UTC')::date,
-                    (ds.first_started_at_utc AT TIME ZONE 'UTC')::date,
-                    (delivery.created_at_utc AT TIME ZONE 'UTC')::date
+                    (delivery.actual_delivered_at AT TIME ZONE project.timezone_name)::date,
+                    (ds.first_started_at_utc AT TIME ZONE project.timezone_name)::date,
+                    (delivery.created_at_utc AT TIME ZONE project.timezone_name)::date
                 ) AS delivery_business_date,
                 pc_submit.actor_id AS responsible_pc_actor_id,
                 COALESCE(findings.open_flag_count, 0) AS open_flag_count,
@@ -224,7 +225,7 @@ def list_tl_supervisory_cases(
                     pc_submit.recorded_at_utc
                 ) AS latest_activity_at_utc
             """
-            + _SCOPE_SQL
+            + _BASE_FROM_SQL
             + """
             LEFT JOIN LATERAL (
                 SELECT e.actor_id, e.recorded_at_utc
@@ -264,6 +265,9 @@ def list_tl_supervisory_cases(
                 FROM auditcore.audit_findings f
                 WHERE f.tenant_id=j.tenant_id AND f.journey_id=j.journey_id
             ) findings ON true
+            """
+            + _SCOPE_WHERE_SQL
+            + """
             ORDER BY latest_activity_at_utc DESC, j.journey_id DESC
             LIMIT :limit OFFSET :offset
             """
