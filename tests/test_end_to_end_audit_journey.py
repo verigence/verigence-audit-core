@@ -8,11 +8,20 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-from audit_core.dependencies import get_connection, get_engine, get_principal
+from audit_core.dependencies import (
+    get_connection,
+    get_engine,
+    get_human_principal,
+    get_principal,
+)
 from audit_core.di_client import DiDocument, DiSubject
 from audit_core.evidence import get_di_client, get_security_oauth_client
 from audit_core.main import app
-from audit_core.security import Principal
+from audit_core.security import HumanPrincipal, Principal
+from audit_core.security_authorization import (
+    SecurityAuthorizationDecision,
+    get_security_authorization_client,
+)
 
 
 @dataclass
@@ -23,6 +32,25 @@ class FakeSecurityClient:
         assert audience == "di"
         self.audiences.append(audience)
         return "service-integration-di-token"
+
+
+class FakeAuthorizationClient:
+    def check_user_permission(
+        self,
+        *,
+        user_id: str,
+        tenant_id: str,
+        permission_key: str,
+    ) -> SecurityAuthorizationDecision:
+        allowed = permission_key in {"audit.customer.read", "audit.customer.write"}
+        return SecurityAuthorizationDecision(
+            allowed=allowed,
+            reason_code="ALLOWED" if allowed else "PERMISSION_DENIED",
+            user_id=user_id,
+            tenant_id=tenant_id,
+            permission_key=permission_key,
+            role_key="PC",
+        )
 
 
 @dataclass
@@ -99,6 +127,7 @@ def test_critical_journey_uses_audit_core_only_and_keeps_delivery_independent() 
     dealer_id = uuid4()
     outlet_id = uuid4()
     security_client = FakeSecurityClient(audiences=[])
+    authorization_client = FakeAuthorizationClient()
     di_client = FakeDiClient(
         tenant_id=tenant_id,
         subject_id=subject_id,
@@ -194,6 +223,8 @@ def test_critical_journey_uses_audit_core_only_and_keeps_delivery_independent() 
     app.dependency_overrides[get_engine] = lambda: engine
     app.dependency_overrides[get_security_oauth_client] = lambda: security_client
     app.dependency_overrides[get_di_client] = lambda: di_client
+    app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=pc_id)
+    app.dependency_overrides[get_security_authorization_client] = lambda: authorization_client
     app.dependency_overrides[get_principal] = lambda: Principal(
         subject=pc_id,
         tenant_id=tenant_id,
