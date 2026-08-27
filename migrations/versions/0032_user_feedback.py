@@ -40,7 +40,7 @@ def upgrade() -> None:
                 OR
                 (screenshot_data IS NOT NULL
                  AND screenshot_content_type IN ('image/png', 'image/jpeg', 'image/webp')
-                 AND octet_length(screenshot_data) <= {_MAX_SCREENSHOT_BYTES})
+                 AND octet_length(screenshot_data) < {_MAX_SCREENSHOT_BYTES})
             )
         )
         """
