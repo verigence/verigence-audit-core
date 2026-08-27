@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -103,6 +105,12 @@ _CORS_HEADERS = [
 _CORS_EXPOSE_HEADERS = ["ETag", "X-Correlation-ID", "X-Trace-ID"]
 
 
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    warm_runtime_dependencies()
+    yield
+
+
 def create_app() -> FastAPI:
     settings = load_settings()
     application = FastAPI(
@@ -110,8 +118,8 @@ def create_app() -> FastAPI:
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=_lifespan,
     )
-    application.add_event_handler("startup", warm_runtime_dependencies)
     configure_otlp(application, settings)
     configure_logging(settings)
     install_error_handlers(application)
