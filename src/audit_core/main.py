@@ -16,6 +16,7 @@ from audit_core.errors import install_error_handlers
 from audit_core.escalations_api import router as escalation_router
 from audit_core.evidence import router as evidence_router
 from audit_core.evidence_read import router as evidence_read_router
+from audit_core.feedback import router as feedback_router
 from audit_core.findings import router as findings_router
 from audit_core.insurance_tradein import router as insurance_tradein_router
 from audit_core.journey_housekeeping import router as journey_housekeeping_router
@@ -176,6 +177,7 @@ def create_app() -> FastAPI:
     application.include_router(escalation_router)
     application.include_router(reference_data_router)
     application.include_router(pricing_router)
+    application.include_router(feedback_router)
 
     @application.get("/health")
     def health() -> dict[str, str]:
