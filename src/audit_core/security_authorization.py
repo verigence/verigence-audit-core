@@ -126,6 +126,10 @@ class SecurityAuthorizationClient:
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
 
+    def warm_service_token(self) -> None:
+        """Issue and cache the backend Security token before the first work request."""
+        self._service_token_for_security()
+
     def _service_token_for_security(self) -> str:
         now = time.monotonic()
         if self._service_token and now < self._service_token_reuse_until:
