@@ -5,15 +5,22 @@ from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
-from audit_core.authorization import require_tenant
+from audit_core.authorization import AuthorizationError
 from audit_core.customer_matching import find_customer_matches
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import get_connection, get_principal
-from audit_core.errors import AuditCoreError, NotFoundError
-from audit_core.security import Principal
+from audit_core.dependencies import get_connection, get_human_principal
+from audit_core.errors import AuditCoreError, DependencyUnavailableError, NotFoundError
+from audit_core.security import HumanPrincipal
+from audit_core.security_authorization import (
+    SecurityAuthorizationClient,
+    SecurityAuthorizationError,
+    get_security_authorization_client,
+)
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["customers"])
 
+_CUSTOMER_READ_PERMISSION = "audit.customer.read"
+_CUSTOMER_WRITE_PERMISSION = "audit.customer.write"
 _FULL_CONTACT_PERMISSION = "audit.customer.contact.full.read"
 _MASK_PREFIX = "******"
 
@@ -22,7 +29,12 @@ class CustomerCreate(BaseModel):
     customerTypeCode: str = Field(min_length=1, max_length=80)
     displayName: str = Field(min_length=1, max_length=240)
     mobileNumber: str | None = Field(default=None, min_length=4, max_length=40)
-    mobileLast4: str | None = Field(default=None, min_length=4, max_length=4, pattern=r"^[0-9]{4}$")
+    mobileLast4: str | None = Field(
+        default=None,
+        min_length=4,
+        max_length=4,
+        pattern=r"^[0-9]{4}$",
+    )
     emailReference: str | None = Field(default=None, max_length=240)
     externalCustomerRef: str | None = Field(default=None, max_length=160)
 
@@ -31,7 +43,12 @@ class CustomerPatch(BaseModel):
     customerTypeCode: str | None = Field(default=None, min_length=1, max_length=80)
     displayName: str | None = Field(default=None, min_length=1, max_length=240)
     mobileNumber: str | None = Field(default=None, min_length=4, max_length=40)
-    mobileLast4: str | None = Field(default=None, min_length=4, max_length=4, pattern=r"^[0-9]{4}$")
+    mobileLast4: str | None = Field(
+        default=None,
+        min_length=4,
+        max_length=4,
+        pattern=r"^[0-9]{4}$",
+    )
     emailReference: str | None = Field(default=None, max_length=240)
     externalCustomerRef: str | None = Field(default=None, max_length=160)
     status: Literal["ACTIVE", "INACTIVE"] | None = None
@@ -102,16 +119,56 @@ def _mobile_fields(
     return normalized, derived_last4
 
 
-def _scope(connection: Connection, principal: Principal, tenant_id: str) -> None:
-    require_tenant(principal, tenant_id)
+def _authorize(
+    connection: Connection,
+    *,
+    human_principal: HumanPrincipal,
+    authorization_client: SecurityAuthorizationClient,
+    tenant_id: str,
+    permission_key: str,
+) -> None:
+    try:
+        decision = authorization_client.check_user_permission(
+            user_id=human_principal.subject,
+            tenant_id=tenant_id,
+            permission_key=permission_key,
+        )
+    except SecurityAuthorizationError as exc:
+        raise DependencyUnavailableError(
+            detail="Customer data is temporarily unavailable. Please try again."
+        ) from exc
+    if not decision.allowed:
+        raise AuthorizationError(
+            error_code="VAC-AUTH-002",
+            status_code=403,
+            title="Permission denied",
+        )
     set_tenant_context(connection, tenant_id)
 
 
-def _visible_mobile(row, principal: Principal) -> str | None:
+def _can_read_full_contact(
+    *,
+    human_principal: HumanPrincipal,
+    authorization_client: SecurityAuthorizationClient,
+    tenant_id: str,
+) -> bool:
+    """Fail closed to masked output when the optional PII decision is unavailable."""
+
+    try:
+        return authorization_client.check_user_permission(
+            user_id=human_principal.subject,
+            tenant_id=tenant_id,
+            permission_key=_FULL_CONTACT_PERMISSION,
+        ).allowed
+    except SecurityAuthorizationError:
+        return False
+
+
+def _visible_mobile(row, *, full_contact: bool) -> str | None:
     full_value = row["mobile_number"]
     if full_value is None:
         return None
-    if _FULL_CONTACT_PERMISSION in principal.permissions:
+    if full_contact:
         return full_value
     last4 = row["mobile_last4"]
     if last4 is None:
@@ -119,14 +176,14 @@ def _visible_mobile(row, principal: Principal) -> str | None:
     return f"{_MASK_PREFIX}{last4}"
 
 
-def _customer_response(row, principal: Principal) -> CustomerResponse:
+def _customer_response(row, *, full_contact: bool) -> CustomerResponse:
     return CustomerResponse(
         customerId=row["customer_id"],
         dealerId=row["dealer_id"],
         outletId=row["outlet_id"],
         customerTypeCode=row["customer_type_code"],
         displayName=row["display_name"],
-        mobileNumber=_visible_mobile(row, principal),
+        mobileNumber=_visible_mobile(row, full_contact=full_contact),
         mobileLast4=row["mobile_last4"],
         emailReference=row["email_reference"],
         externalCustomerRef=row["external_customer_ref"],
@@ -160,10 +217,20 @@ def create_customer(
     tenant_id: str,
     outlet_id: UUID,
     payload: CustomerCreate,
-    principal: Annotated[Principal, Depends(get_principal)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> CustomerResponse:
-    _scope(connection, principal, tenant_id)
+    _authorize(
+        connection,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        tenant_id=tenant_id,
+        permission_key=_CUSTOMER_WRITE_PERMISSION,
+    )
     dealer_id = _dealer_for_outlet(connection, tenant_id, outlet_id)
     mobile_number, mobile_last4 = _mobile_fields(payload.mobileNumber, payload.mobileLast4)
     row = connection.execute(
@@ -193,20 +260,35 @@ def create_customer(
             "mobile_last4": mobile_last4,
             "email_reference": payload.emailReference,
             "external_customer_ref": payload.externalCustomerRef,
-            "actor_id": principal.subject,
+            "actor_id": human_principal.subject,
         },
     ).mappings().one()
-    return _customer_response(row, principal)
+    full_contact = _can_read_full_contact(
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        tenant_id=tenant_id,
+    )
+    return _customer_response(row, full_contact=full_contact)
 
 
 @router.get("/outlets/{outlet_id}/customers", response_model=list[CustomerResponse])
 def list_customers(
     tenant_id: str,
     outlet_id: UUID,
-    principal: Annotated[Principal, Depends(get_principal)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> list[CustomerResponse]:
-    _scope(connection, principal, tenant_id)
+    _authorize(
+        connection,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        tenant_id=tenant_id,
+        permission_key=_CUSTOMER_READ_PERMISSION,
+    )
     _dealer_for_outlet(connection, tenant_id, outlet_id)
     rows = connection.execute(
         text(
@@ -221,7 +303,12 @@ def list_customers(
         ),
         {"tenant_id": tenant_id, "outlet_id": outlet_id},
     ).mappings()
-    return [_customer_response(row, principal) for row in rows]
+    full_contact = _can_read_full_contact(
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        tenant_id=tenant_id,
+    )
+    return [_customer_response(row, full_contact=full_contact) for row in rows]
 
 
 @router.get("/customers/matches", response_model=list[CustomerMatchResponse])
@@ -229,10 +316,20 @@ def match_customers(
     tenant_id: str,
     identity_type: Annotated[str, Query(alias="identityType", min_length=1, max_length=40)],
     match_hash: Annotated[str, Query(alias="matchHash", min_length=1, max_length=256)],
-    principal: Annotated[Principal, Depends(get_principal)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> list[CustomerMatchResponse]:
-    _scope(connection, principal, tenant_id)
+    _authorize(
+        connection,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        tenant_id=tenant_id,
+        permission_key=_CUSTOMER_READ_PERMISSION,
+    )
     rows = find_customer_matches(
         connection,
         tenant_id=tenant_id,
@@ -255,10 +352,20 @@ def match_customers(
 def get_customer(
     tenant_id: str,
     customer_id: UUID,
-    principal: Annotated[Principal, Depends(get_principal)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> CustomerResponse:
-    _scope(connection, principal, tenant_id)
+    _authorize(
+        connection,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        tenant_id=tenant_id,
+        permission_key=_CUSTOMER_READ_PERMISSION,
+    )
     row = connection.execute(
         text(
             """
@@ -277,7 +384,12 @@ def get_customer(
             title="Customer not found",
             detail="Customer not found for the requested tenant.",
         )
-    return _customer_response(row, principal)
+    full_contact = _can_read_full_contact(
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        tenant_id=tenant_id,
+    )
+    return _customer_response(row, full_contact=full_contact)
 
 
 @router.patch("/customers/{customer_id}", response_model=CustomerResponse)
@@ -285,10 +397,20 @@ def patch_customer(
     tenant_id: str,
     customer_id: UUID,
     payload: CustomerPatch,
-    principal: Annotated[Principal, Depends(get_principal)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> CustomerResponse:
-    _scope(connection, principal, tenant_id)
+    _authorize(
+        connection,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        tenant_id=tenant_id,
+        permission_key=_CUSTOMER_WRITE_PERMISSION,
+    )
     mobile_number, derived_last4 = _mobile_fields(payload.mobileNumber, payload.mobileLast4)
     row = connection.execute(
         text(
@@ -325,7 +447,7 @@ def patch_customer(
             "email_reference": payload.emailReference,
             "external_customer_ref": payload.externalCustomerRef,
             "status": payload.status,
-            "actor_id": principal.subject,
+            "actor_id": human_principal.subject,
         },
     ).mappings().one_or_none()
     if row is None:
@@ -334,4 +456,9 @@ def patch_customer(
             title="Customer not found",
             detail="Customer not found for the requested tenant.",
         )
-    return _customer_response(row, principal)
+    full_contact = _can_read_full_contact(
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        tenant_id=tenant_id,
+    )
+    return _customer_response(row, full_contact=full_contact)
