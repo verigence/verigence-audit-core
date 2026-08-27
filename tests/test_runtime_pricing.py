@@ -15,7 +15,12 @@ from audit_core.price_lists import (
     resolve_effective_price_plan,
     retire_price_list_version,
 )
-from audit_core.product_catalogue import create_model, create_oem, create_sku, create_variant
+from audit_core.product_catalogue import (
+    create_model,
+    create_oem,
+    create_sku,
+    create_variant,
+)
 
 
 def test_runtime_price_plan_uses_business_date_and_returns_sku_matrix() -> None:
