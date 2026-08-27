@@ -67,6 +67,7 @@ from audit_core.uc03_delivery_documents import router as uc03_delivery_documents
 from audit_core.uc03_document_assessments import (
     router as uc03_document_assessments_router,
 )
+from audit_core.uc03_fast_work_items import router as uc03_fast_work_items_router
 from audit_core.uc03_identity_business_date import install_uc03_identity_business_date
 from audit_core.uc03_identity_business_date import (
     router as uc03_identity_business_date_router,
@@ -128,6 +129,7 @@ def create_app() -> FastAPI:
     application.include_router(project_router)
     application.include_router(journey_housekeeping_router)
     application.include_router(uc03_project_context_router)
+    application.include_router(uc03_fast_work_items_router)
     application.include_router(uc03_work_items_router)
     application.include_router(uc03_create_booking_router)
     application.include_router(uc03_booking_router)
