@@ -10,7 +10,7 @@ from typing import Annotated
 import structlog
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import Connection, Engine, create_engine, text
+from sqlalchemy import Connection, Engine, create_engine
 
 from audit_core.authorization import AuthorizationError
 from audit_core.errors import DependencyUnavailableError
@@ -71,15 +71,24 @@ def _engine() -> Engine:
     if not database_url:
         raise RuntimeError("DATABASE_URL is required")
 
-    # Keep DB resilience central and small: one pool, stale-connection detection,
-    # and bounded waits. API handlers do not implement their own retry loops.
-    engine_options: dict[str, object] = {"pool_pre_ping": True}
+    # Runtime API connections always operate as the constrained database role. Set
+    # that role when a physical PostgreSQL connection is created instead of issuing
+    # SET LOCAL ROLE on every HTTP request. TCP keepalives plus bounded connection
+    # lifetime avoid paying a SELECT 1 pre-ping on every pooled checkout while still
+    # retiring stale network connections proactively.
+    engine_options: dict[str, object] = {"pool_pre_ping": False}
     if _postgresql_url(database_url):
         engine_options.update(
             pool_timeout=5,
+            pool_recycle=600,
+            pool_use_lifo=True,
             connect_args={
                 "connect_timeout": 5,
-                "options": "-c statement_timeout=10000",
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 3,
+                "options": "-c statement_timeout=10000 -c role=audit_core_runtime",
             },
         )
     return create_engine(database_url, **engine_options)
@@ -91,7 +100,6 @@ def get_engine() -> Engine:
 
 def get_connection() -> Iterator[Connection]:
     with get_engine().begin() as connection:
-        connection.execute(text("SET LOCAL ROLE audit_core_runtime"))
         yield connection
 
 
@@ -266,6 +274,7 @@ def require_super_admin_request(
         )
     return request
 
+
 def _has_tenant_admin_scope(context: SecurityAdminContext, tenant_id: str) -> bool:
     return any(
         scope.role_key == "TenantAdmin"
@@ -311,4 +320,3 @@ def require_project_admin_request(
         status_code=403,
         title="Permission denied",
     )
-
