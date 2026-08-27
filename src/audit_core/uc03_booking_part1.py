@@ -43,19 +43,50 @@ def _requirement_rows(
     tenant_id: str,
     journey_id: UUID,
 ) -> list[dict[str, Any]]:
+    # One database round trip for the complete Part-1 document state. The previous
+    # implementation loaded requirements and then issued one evidence SELECT per
+    # requirement (normally five SQL calls just to paint four upload cards).
     rows = connection.execute(
         text(
             """
-            SELECT journey_document_requirement_id, requirement_key,
-                   document_type_key, requirement_level, requirement_status
-            FROM auditcore.journey_document_requirements
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND upper(process_area)='BOOKING'
-              AND requirement_key IN (
+            SELECT
+                r.journey_document_requirement_id,
+                r.requirement_key,
+                r.document_type_key,
+                r.requirement_level,
+                r.requirement_status,
+                COALESCE(
+                    jsonb_agg(
+                        jsonb_build_object(
+                            'evidenceId', e.evidence_id::text,
+                            'documentTypeKey', e.document_type_key,
+                            'processingStatus', e.processing_status_cache,
+                            'verificationStatus', e.verification_status_cache,
+                            'linkedAtUtc', e.linked_at_utc
+                        )
+                        ORDER BY e.linked_at_utc, e.evidence_id
+                    ) FILTER (WHERE e.evidence_id IS NOT NULL),
+                    '[]'::jsonb
+                ) AS evidence
+            FROM auditcore.journey_document_requirements r
+            LEFT JOIN auditcore.evidence e
+              ON e.tenant_id = r.tenant_id
+             AND e.journey_id = r.journey_id
+             AND e.journey_document_requirement_id = r.journey_document_requirement_id
+             AND e.association_status = 'ACTIVE'
+            WHERE r.tenant_id=:tenant_id AND r.journey_id=:journey_id
+              AND upper(r.process_area)='BOOKING'
+              AND r.requirement_key IN (
                   'booking_docket','pan_card','aadhaar',
                   'booking_payment_receipt','minimum_booking_payment_proof'
               )
-            ORDER BY requirement_key
+            GROUP BY
+                r.journey_document_requirement_id,
+                r.requirement_key,
+                r.document_type_key,
+                r.requirement_level,
+                r.requirement_status
+            ORDER BY r.requirement_key
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
@@ -71,25 +102,7 @@ def _requirement_rows(
             continue
         if kind in seen:
             result = [item for item in result if item["kind"] != kind]
-        evidence_rows = connection.execute(
-            text(
-                """
-                SELECT evidence_id, document_type_key, processing_status_cache,
-                       verification_status_cache, linked_at_utc
-                FROM auditcore.evidence
-                WHERE tenant_id=:tenant_id
-                  AND journey_id=:journey_id
-                  AND journey_document_requirement_id=:requirement_id
-                  AND association_status='ACTIVE'
-                ORDER BY linked_at_utc, evidence_id
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "requirement_id": row["journey_document_requirement_id"],
-            },
-        ).mappings().all()
+        evidence_rows = row["evidence"] if isinstance(row["evidence"], list) else []
         result.append(
             {
                 "kind": kind,
@@ -101,16 +114,7 @@ def _requirement_rows(
                 ),
                 "requirementLevel": row["requirement_level"],
                 "requirementStatus": row["requirement_status"],
-                "evidence": [
-                    {
-                        "evidenceId": str(evidence["evidence_id"]),
-                        "documentTypeKey": evidence["document_type_key"],
-                        "processingStatus": evidence["processing_status_cache"],
-                        "verificationStatus": evidence["verification_status_cache"],
-                        "linkedAtUtc": evidence["linked_at_utc"].isoformat(),
-                    }
-                    for evidence in evidence_rows
-                ],
+                "evidence": evidence_rows,
             }
         )
         seen.add(kind)
