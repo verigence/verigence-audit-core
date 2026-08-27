@@ -32,6 +32,11 @@ class ServiceIntegrationPrincipal:
 # unknown signing kid is observed, which preserves normal Security key rotation.
 _JWKS_CACHE_LIFESPAN_SECONDS = 300
 
+# Never inherit PyJWT's much larger network timeout for a signing-key refresh. A
+# healthy Security JWKS endpoint is a very small read; five seconds is already a
+# generous dependency budget and matches the rest of Audit Core's Security calls.
+_JWKS_REQUEST_TIMEOUT_SECONDS = 5.0
+
 
 class SecurityTokenValidator:
     def __init__(
@@ -49,6 +54,7 @@ class SecurityTokenValidator:
             cache_keys=True,
             cache_jwk_set=True,
             lifespan=_JWKS_CACHE_LIFESPAN_SECONDS,
+            timeout=_JWKS_REQUEST_TIMEOUT_SECONDS,
         )
 
     def validate(self, token: str) -> Principal:
