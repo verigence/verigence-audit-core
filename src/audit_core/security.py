@@ -57,6 +57,10 @@ class SecurityTokenValidator:
             timeout=_JWKS_REQUEST_TIMEOUT_SECONDS,
         )
 
+    def warm(self) -> None:
+        """Fetch and cache the current Security JWK set before the first human request."""
+        self._jwks_client.get_jwk_set(refresh=False)
+
     def validate(self, token: str) -> Principal:
         claims = self._decode(
             token,
