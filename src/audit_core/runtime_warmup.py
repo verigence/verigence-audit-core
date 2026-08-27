@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import structlog
+from jwt.exceptions import PyJWKClientError
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from audit_core.dependencies import _token_validator, get_engine
-from audit_core.security_authorization import get_security_authorization_client
+from audit_core.security_authorization import (
+    SecurityAuthorizationError,
+    get_security_authorization_client,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -29,8 +34,8 @@ def warm_runtime_dependencies() -> None:
     """Best-effort warm of cold dependencies before the first user request.
 
     The warmers run concurrently so startup pays roughly the slowest dependency once,
-    rather than serially. Failures are logged but never prevent Audit Core from
-    starting; request-time validation and authorization remain authoritative.
+    rather than serially. Known dependency failures are logged but never prevent Audit
+    Core from starting; request-time validation and authorization remain authoritative.
     """
 
     warmers: dict[str, Callable[[], None]] = {
@@ -45,7 +50,14 @@ def warm_runtime_dependencies() -> None:
             dependency = futures[future]
             try:
                 future.result()
-            except Exception as exc:  # best-effort startup optimization
+            except (
+                OSError,
+                PyJWKClientError,
+                RuntimeError,
+                SQLAlchemyError,
+                SecurityAuthorizationError,
+                ValueError,
+            ) as exc:
                 logger.warning(
                     "runtime_dependency_warmup_failed",
                     dependency=dependency,
