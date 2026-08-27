@@ -41,7 +41,7 @@ def _authorize_workspace(
         )
     except SecurityAuthorizationError as exc:
         raise DependencyUnavailableError(
-            detail="Project work is temporarily unavailable. Please try again."
+            detail="Work Queue is temporarily unavailable. Please try again."
         ) from exc
     if not decision.allowed:
         raise AuthorizationError(
@@ -63,12 +63,12 @@ def list_first_work_items_fast(
     outlet_id: Annotated[UUID | None, Query(alias="outletId")] = None,
     limit: Annotated[int, Query(ge=1, le=10)] = 10,
 ) -> WorkItemPage:
-    """Return the first Work Queue page with one database statement after Security.
+    """Return the first Work Queue page with candidate-first enrichment.
 
-    This endpoint is intentionally narrow: it serves only the initial ALL-work landing
-    page. Tenant RLS context, Project metadata, authorized Journey selection, flags,
-    Evidence activity and ingestion activity are resolved inside one PostgreSQL
-    statement. Filtered/paginated reads continue to use the general work-items route.
+    The landing page needs at most 10 rows. Resolve the actor's authorized Journey
+    ids and their latest activity first, rank/limit to 11 rows for cursor detection,
+    and only then join customer/stage/product data and calculate finding/processing
+    aggregates. This avoids tenant-wide lateral aggregation before the page limit.
     """
 
     _authorize_workspace(
@@ -90,18 +90,114 @@ def list_first_work_items_fast(
                     CROSS JOIN auditcore.projects p
                     WHERE p.tenant_id = :tenant_id
                       AND p.project_status = 'ACTIVE'
+                    LIMIT 1
                 ),
-                base AS MATERIALIZED (
+                authorized_journeys AS MATERIALIZED (
                     SELECT
                         j.journey_id,
+                        j.customer_id,
                         j.dealer_id,
                         j.outlet_id,
+                        j.updated_at_utc
+                    FROM runtime_context rc
+                    CROSS JOIN auditcore.journeys j
+                    WHERE j.tenant_id = :tenant_id
+                      AND (
+                            CAST(:outlet_id AS uuid) IS NULL
+                            OR j.outlet_id = CAST(:outlet_id AS uuid)
+                      )
+                      AND EXISTS (
+                            SELECT 1
+                            FROM auditcore.business_assignments ba
+                            WHERE ba.tenant_id = j.tenant_id
+                              AND ba.security_actor_id = :actor_id
+                              AND ba.assignment_status = 'ACTIVE'
+                              AND ba.effective_from <= now()
+                              AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+                              AND (
+                                    ba.dealer_id IS NULL
+                                    OR (
+                                        ba.dealer_id = j.dealer_id
+                                        AND (ba.outlet_id IS NULL OR ba.outlet_id = j.outlet_id)
+                                    )
+                              )
+                      )
+                      AND (
+                            EXISTS (
+                                SELECT 1 FROM auditcore.bookings b
+                                WHERE b.tenant_id = j.tenant_id
+                                  AND b.journey_id = j.journey_id
+                            )
+                            OR EXISTS (
+                                SELECT 1 FROM auditcore.deliveries dl
+                                WHERE dl.tenant_id = j.tenant_id
+                                  AND dl.journey_id = j.journey_id
+                            )
+                            OR EXISTS (
+                                SELECT 1 FROM auditcore.journey_stage_states s
+                                WHERE s.tenant_id = j.tenant_id
+                                  AND s.journey_id = j.journey_id
+                                  AND s.stage_code IN ('BOOKING', 'DELIVERY')
+                            )
+                      )
+                ),
+                activity_events AS (
+                    SELECT aj.journey_id, aj.updated_at_utc AS activity_at_utc
+                    FROM authorized_journeys aj
+                    UNION ALL
+                    SELECT s.journey_id, s.latest_activity_at_utc
+                    FROM auditcore.journey_stage_states s
+                    JOIN authorized_journeys aj ON aj.journey_id = s.journey_id
+                    WHERE s.tenant_id = :tenant_id
+                      AND s.stage_code IN ('BOOKING', 'DELIVERY')
+                      AND s.latest_activity_at_utc IS NOT NULL
+                    UNION ALL
+                    SELECT b.journey_id, b.updated_at_utc
+                    FROM auditcore.bookings b
+                    JOIN authorized_journeys aj ON aj.journey_id = b.journey_id
+                    WHERE b.tenant_id = :tenant_id
+                      AND b.updated_at_utc IS NOT NULL
+                    UNION ALL
+                    SELECT dl.journey_id, dl.updated_at_utc
+                    FROM auditcore.deliveries dl
+                    JOIN authorized_journeys aj ON aj.journey_id = dl.journey_id
+                    WHERE dl.tenant_id = :tenant_id
+                      AND dl.updated_at_utc IS NOT NULL
+                    UNION ALL
+                    SELECT e.journey_id, COALESCE(e.cache_updated_at_utc, e.linked_at_utc)
+                    FROM auditcore.evidence e
+                    JOIN authorized_journeys aj ON aj.journey_id = e.journey_id
+                    WHERE e.tenant_id = :tenant_id
+                      AND e.association_status = 'ACTIVE'
+                    UNION ALL
+                    SELECT f.journey_id, f.updated_at_utc
+                    FROM auditcore.audit_findings f
+                    JOIN authorized_journeys aj ON aj.journey_id = f.journey_id
+                    WHERE f.tenant_id = :tenant_id
+                      AND f.updated_at_utc IS NOT NULL
+                    UNION ALL
+                    SELECT io.journey_id, io.updated_at_utc
+                    FROM auditcore.evidence_ingestion_operations io
+                    JOIN authorized_journeys aj ON aj.journey_id = io.journey_id
+                    WHERE io.tenant_id = :tenant_id
+                      AND io.updated_at_utc IS NOT NULL
+                ),
+                ranked_candidates AS MATERIALIZED (
+                    SELECT ae.journey_id, max(ae.activity_at_utc) AS latest_activity_at_utc
+                    FROM activity_events ae
+                    GROUP BY ae.journey_id
+                    ORDER BY max(ae.activity_at_utc) DESC, ae.journey_id DESC
+                    LIMIT :fetch_limit
+                ),
+                enriched AS MATERIALIZED (
+                    SELECT
+                        aj.journey_id,
+                        aj.dealer_id,
+                        aj.outlet_id,
                         c.display_name AS customer_display_name,
                         c.mobile_last4 AS customer_mobile_last4,
                         d.dealer_name,
                         o.outlet_name,
-                        (b.booking_id IS NOT NULL OR bs.journey_id IS NOT NULL) AS has_booking,
-                        (dl.delivery_id IS NOT NULL OR ds.journey_id IS NOT NULL) AS has_delivery,
                         b.booking_reference,
                         NULLIF(
                             concat_ws(
@@ -132,59 +228,45 @@ def list_first_work_items_fast(
                         COALESCE(fc.total_flag_count, 0) AS total_flag_count,
                         fc.highest_open_severity,
                         COALESCE(proc.processing_document_count, 0) AS processing_document_count,
-                        GREATEST(
-                            j.updated_at_utc,
-                            bs.latest_activity_at_utc,
-                            ds.latest_activity_at_utc,
-                            b.updated_at_utc,
-                            dl.updated_at_utc,
-                            ev.latest_evidence_activity,
-                            fc.latest_finding_activity,
-                            proc.latest_processing_activity
-                        ) AS latest_activity_at_utc
-                    FROM project_context pc
-                    JOIN auditcore.journeys j
-                      ON j.tenant_id = :tenant_id
+                        rc.latest_activity_at_utc
+                    FROM ranked_candidates rc
+                    JOIN authorized_journeys aj ON aj.journey_id = rc.journey_id
+                    CROSS JOIN project_context pc
                     JOIN auditcore.customers c
-                      ON c.tenant_id = j.tenant_id
-                     AND c.customer_id = j.customer_id
+                      ON c.tenant_id = :tenant_id AND c.customer_id = aj.customer_id
                     JOIN auditcore.dealers d
-                      ON d.tenant_id = j.tenant_id
-                     AND d.dealer_id = j.dealer_id
+                      ON d.tenant_id = :tenant_id AND d.dealer_id = aj.dealer_id
                     JOIN auditcore.dealer_outlets o
-                      ON o.tenant_id = j.tenant_id
-                     AND o.dealer_id = j.dealer_id
-                     AND o.outlet_id = j.outlet_id
+                      ON o.tenant_id = :tenant_id
+                     AND o.dealer_id = aj.dealer_id
+                     AND o.outlet_id = aj.outlet_id
                     LEFT JOIN auditcore.bookings b
-                      ON b.tenant_id = j.tenant_id
-                     AND b.journey_id = j.journey_id
+                      ON b.tenant_id = :tenant_id AND b.journey_id = aj.journey_id
                     LEFT JOIN auditcore.deliveries dl
-                      ON dl.tenant_id = j.tenant_id
-                     AND dl.journey_id = j.journey_id
+                      ON dl.tenant_id = :tenant_id AND dl.journey_id = aj.journey_id
                     LEFT JOIN auditcore.journey_products jp
-                      ON jp.tenant_id = j.tenant_id
-                     AND jp.journey_id = j.journey_id
+                      ON jp.tenant_id = :tenant_id AND jp.journey_id = aj.journey_id
                     LEFT JOIN auditcore.journey_stage_states bs
-                      ON bs.tenant_id = j.tenant_id
-                     AND bs.journey_id = j.journey_id
+                      ON bs.tenant_id = :tenant_id
+                     AND bs.journey_id = aj.journey_id
                      AND bs.stage_code = 'BOOKING'
                     LEFT JOIN auditcore.journey_stage_states ds
-                      ON ds.tenant_id = j.tenant_id
-                     AND ds.journey_id = j.journey_id
+                      ON ds.tenant_id = :tenant_id
+                     AND ds.journey_id = aj.journey_id
                      AND ds.stage_code = 'DELIVERY'
                     LEFT JOIN LATERAL (
                         SELECT
                             count(*) FILTER (
-                                WHERE af.finding_status IN ('OPEN','ACKNOWLEDGED')
+                                WHERE f.finding_status IN ('OPEN','ACKNOWLEDGED')
                             ) AS open_flag_count,
                             count(*) FILTER (
-                                WHERE af.finding_status <> 'VOIDED'
+                                WHERE f.finding_status <> 'VOIDED'
                             ) AS total_flag_count,
                             (
                                 array_agg(
-                                    af.severity
+                                    f.severity
                                     ORDER BY
-                                        CASE af.severity
+                                        CASE f.severity
                                             WHEN 'CRITICAL' THEN 5
                                             WHEN 'HIGH' THEN 4
                                             WHEN 'MEDIUM' THEN 3
@@ -192,82 +274,34 @@ def list_first_work_items_fast(
                                             WHEN 'INFO' THEN 1
                                             ELSE 0
                                         END DESC,
-                                        af.severity
+                                        f.severity
                                 ) FILTER (
-                                    WHERE af.finding_status IN ('OPEN','ACKNOWLEDGED')
+                                    WHERE f.finding_status IN ('OPEN','ACKNOWLEDGED')
                                 )
-                            )[1] AS highest_open_severity,
-                            max(af.updated_at_utc) AS latest_finding_activity
-                        FROM auditcore.audit_findings af
-                        WHERE af.tenant_id = j.tenant_id
-                          AND af.journey_id = j.journey_id
-                    ) fc ON TRUE
+                            )[1] AS highest_open_severity
+                        FROM auditcore.audit_findings f
+                        WHERE f.tenant_id = :tenant_id
+                          AND f.journey_id = aj.journey_id
+                    ) fc ON true
                     LEFT JOIN LATERAL (
-                        SELECT
-                            max(COALESCE(e.cache_updated_at_utc, e.linked_at_utc)) AS latest_evidence_activity
-                        FROM auditcore.evidence e
-                        WHERE e.tenant_id = j.tenant_id
-                          AND e.journey_id = j.journey_id
-                          AND e.association_status = 'ACTIVE'
-                    ) ev ON TRUE
-                    LEFT JOIN LATERAL (
-                        SELECT
-                            count(*) FILTER (
-                                WHERE op.operation_status IN (
-                                    'RECEIVED','DI_SUBMITTING','DI_ACCEPTED','RETRY_WAIT'
-                                )
-                            ) AS processing_document_count,
-                            max(op.updated_at_utc) FILTER (
-                                WHERE op.operation_status IN (
-                                    'RECEIVED','DI_SUBMITTING','DI_ACCEPTED','RETRY_WAIT'
-                                )
-                            ) AS latest_processing_activity
-                        FROM auditcore.evidence_ingestion_operations op
-                        WHERE op.tenant_id = j.tenant_id
-                          AND op.journey_id = j.journey_id
-                    ) proc ON TRUE
-                    WHERE (
-                            CAST(:outlet_id AS uuid) IS NULL
-                            OR j.outlet_id = CAST(:outlet_id AS uuid)
-                        )
-                      AND (
-                            b.booking_id IS NOT NULL
-                            OR dl.delivery_id IS NOT NULL
-                            OR bs.journey_id IS NOT NULL
-                            OR ds.journey_id IS NOT NULL
-                        )
-                      AND EXISTS (
-                            SELECT 1
-                            FROM auditcore.business_assignments ba
-                            WHERE ba.tenant_id = j.tenant_id
-                              AND ba.security_actor_id = :actor_id
-                              AND ba.assignment_status = 'ACTIVE'
-                              AND ba.effective_from <= now()
-                              AND (ba.effective_to IS NULL OR ba.effective_to >= now())
-                              AND (
-                                    ba.dealer_id IS NULL
-                                    OR (
-                                        ba.dealer_id = j.dealer_id
-                                        AND (ba.outlet_id IS NULL OR ba.outlet_id = j.outlet_id)
-                                    )
-                              )
-                        )
-                ),
-                ranked AS MATERIALIZED (
-                    SELECT *
-                    FROM base
-                    ORDER BY latest_activity_at_utc DESC, journey_id DESC
-                    LIMIT :fetch_limit
+                        SELECT count(*) FILTER (
+                            WHERE io.operation_status IN (
+                                'RECEIVED','DI_SUBMITTING','DI_ACCEPTED','RETRY_WAIT'
+                            )
+                        ) AS processing_document_count
+                        FROM auditcore.evidence_ingestion_operations io
+                        WHERE io.tenant_id = :tenant_id
+                          AND io.journey_id = aj.journey_id
+                    ) proc ON true
                 )
                 SELECT
                     pc.project_name AS _project_name,
                     pc.timezone_name AS _timezone_name,
-                    (r.journey_id IS NOT NULL) AS _has_item,
-                    r.*
+                    (e.journey_id IS NOT NULL) AS _has_item,
+                    e.*
                 FROM project_context pc
-                LEFT JOIN ranked r ON TRUE
-                ORDER BY r.latest_activity_at_utc DESC NULLS LAST,
-                         r.journey_id DESC NULLS LAST
+                LEFT JOIN enriched e ON true
+                ORDER BY e.latest_activity_at_utc DESC NULLS LAST, e.journey_id DESC NULLS LAST
                 """
             ),
             {
@@ -290,8 +324,7 @@ def list_first_work_items_fast(
     timezone_name = str(rows[0]["_timezone_name"])
     item_rows = [row for row in rows if bool(row["_has_item"])]
     has_more = len(item_rows) > limit
-    page_rows = item_rows[:limit]
-    items = [_row_to_item(row, project_name=project_name) for row in page_rows]
+    visible_rows = item_rows[:limit]
 
     fingerprint = _filter_fingerprint(
         tenant_id=tenant_id,
@@ -302,8 +335,8 @@ def list_first_work_items_fast(
         outlet_id=outlet_id,
     )
     next_cursor = None
-    if has_more and page_rows:
-        last = page_rows[-1]
+    if has_more and visible_rows:
+        last = visible_rows[-1]
         next_cursor = _encode_cursor(
             latest_activity=last["latest_activity_at_utc"],
             journey_id=last["journey_id"],
@@ -311,8 +344,8 @@ def list_first_work_items_fast(
         )
 
     return WorkItemPage(
-        items=items,
-        pageSize=len(items),
+        items=[_row_to_item(row, project_name=project_name) for row in visible_rows],
+        pageSize=len(visible_rows),
         nextCursor=next_cursor,
         previousCursor=None,
         filters=WorkItemFilters(
