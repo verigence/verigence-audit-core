@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
 from pydantic import BaseModel
@@ -138,10 +138,17 @@ async def submit_feedback(
     )
     file_name, content_type, screenshot_data = await _read_screenshot(screenshot)
 
-    row = connection.execute(
+    # Normal submitters intentionally have INSERT but not SELECT access to feedback rows.
+    # PostgreSQL applies SELECT RLS policies to INSERT ... RETURNING, so generating these
+    # response values in the application avoids turning a write-only submission into a
+    # forbidden read while keeping the stored values and API response identical.
+    feedback_id = uuid4()
+    created_at_utc = datetime.now(UTC)
+    connection.execute(
         text(
             """
             INSERT INTO auditcore.user_feedback (
+                feedback_id,
                 tenant_id,
                 project_name_snapshot,
                 submitted_by_user_id,
@@ -151,8 +158,10 @@ async def submit_feedback(
                 page_path,
                 screenshot_file_name,
                 screenshot_content_type,
-                screenshot_data
+                screenshot_data,
+                created_at_utc
             ) VALUES (
+                :feedback_id,
                 :tenant_id,
                 :project_name,
                 :user_id,
@@ -162,12 +171,13 @@ async def submit_feedback(
                 :page_path,
                 :file_name,
                 :content_type,
-                :screenshot_data
+                :screenshot_data,
+                :created_at_utc
             )
-            RETURNING feedback_id, created_at_utc
             """
         ),
         {
+            "feedback_id": feedback_id,
             "tenant_id": tenant_id,
             "project_name": project_name,
             "user_id": human_principal.subject,
@@ -178,11 +188,12 @@ async def submit_feedback(
             "file_name": file_name,
             "content_type": content_type,
             "screenshot_data": screenshot_data,
+            "created_at_utc": created_at_utc,
         },
-    ).mappings().one()
+    )
     return FeedbackSubmittedResponse(
-        feedbackId=row["feedback_id"],
-        createdAtUtc=row["created_at_utc"],
+        feedbackId=feedback_id,
+        createdAtUtc=created_at_utc,
     )
 
 
