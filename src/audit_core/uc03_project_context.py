@@ -1,14 +1,19 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends
 from pydantic import BaseModel
 from sqlalchemy import Connection, text
 
 from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.security import HumanPrincipal
+from audit_core.security_authorization import (
+    SecurityAuthorizationError,
+    get_security_authorization_client,
+)
 
 router = APIRouter(prefix="/v1/me", tags=["uc03-project-context"])
+_PROJECT_READ_PERMISSION = "audit.journey.read"
 
 
 class OperationalOutletScope(BaseModel):
@@ -40,8 +45,30 @@ class MyProjectsResponse(BaseModel):
     projects: list[OperationalProject]
 
 
+def _warm_project_read_permission(*, actor_id: str, tenant_id: str) -> None:
+    """Best-effort warm of the existing short Security ALLOW cache.
+
+    Workspace discovery never depends on this task. It runs only after the response is
+    sent so the immediately-following Work Queue request can reuse, or join, the same
+    live Security decision instead of starting that network dependency from cold.
+    DENY and error decisions are never cached by SecurityAuthorizationClient.
+    """
+
+    try:
+        get_security_authorization_client().check_user_permission(
+            user_id=actor_id,
+            tenant_id=tenant_id,
+            permission_key=_PROJECT_READ_PERMISSION,
+        )
+    except (RuntimeError, SecurityAuthorizationError):
+        # Warming is an optimization only. The Work Queue still performs its normal
+        # authoritative Security check and will surface any dependency/permission error.
+        return
+
+
 @router.get("/projects", response_model=MyProjectsResponse)
 def list_my_projects(
+    background_tasks: BackgroundTasks,
     human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> MyProjectsResponse:
@@ -179,4 +206,12 @@ def list_my_projects(
                 ),
             )
         )
+
+    for project in projects:
+        background_tasks.add_task(
+            _warm_project_read_permission,
+            actor_id=human_principal.subject,
+            tenant_id=project.tenantId,
+        )
+
     return MyProjectsResponse(projects=projects)
