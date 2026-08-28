@@ -1,11 +1,10 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import Connection, text
 
-from audit_core.authorization import AuthorizationError
 from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.security import HumanPrincipal
 
@@ -38,10 +37,11 @@ def current_attendance_context(
 ) -> AttendanceWorkContext:
     """Return only the authenticated user's effective work-location context.
 
-    This route is intentionally read-only and isolated from Booking/Delivery/Review
-    paths. Dealer/Outlet coordinates remain Audit Core master data. PC receives only
-    currently assigned active Outlets; non-PC operating roles return no geofence
-    Outlets because Phase 1 captures their location without enforcing a work geofence.
+    This route is read-only and isolated from Booking/Delivery/Review paths. PC
+    receives currently assigned active Outlet coordinates. Other operating roles
+    return their role only because Phase 1 captures location without geofencing them.
+    A user with no Audit Core operating assignment gets 404 so a secondary HRADMIN
+    role can still use Attendance without being forced into a business assignment.
     """
 
     row = connection.execute(
@@ -57,11 +57,14 @@ def current_attendance_context(
                     ba.outlet_id
                 FROM runtime_context rc
                 CROSS JOIN auditcore.business_assignments ba
-                WHERE ba.tenant_id = :tenant_id
-                  AND ba.security_actor_id = :actor_id
-                  AND ba.assignment_status = 'ACTIVE'
-                  AND ba.effective_from <= now()
-                  AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+                JOIN auditcore.projects p
+                  ON p.tenant_id=ba.tenant_id
+                 AND p.project_status='ACTIVE'
+                WHERE ba.tenant_id=:tenant_id
+                  AND ba.security_actor_id=:actor_id
+                  AND ba.assignment_status='ACTIVE'
+                  AND ba.effective_from<=now()
+                  AND (ba.effective_to IS NULL OR ba.effective_to>=now())
             ),
             role_summary AS (
                 SELECT
@@ -85,18 +88,15 @@ def current_attendance_context(
                 ) AS outlets
                 FROM active_assignments a
                 JOIN auditcore.dealer_outlets o
-                  ON o.tenant_id = :tenant_id
-                 AND o.dealer_id = a.dealer_id
-                 AND o.outlet_id = a.outlet_id
-                 AND o.status = 'ACTIVE'
-                WHERE a.business_role_code = 'PC'
+                  ON o.tenant_id=:tenant_id
+                 AND o.dealer_id=a.dealer_id
+                 AND o.outlet_id=a.outlet_id
+                 AND o.status='ACTIVE'
+                WHERE a.business_role_code='PC'
                   AND a.dealer_id IS NOT NULL
                   AND a.outlet_id IS NOT NULL
             )
-            SELECT
-                rs.operating_role,
-                rs.operating_role_count,
-                po.outlets
+            SELECT rs.operating_role, rs.operating_role_count, po.outlets
             FROM role_summary rs
             CROSS JOIN pc_outlets po
             """
@@ -106,11 +106,7 @@ def current_attendance_context(
 
     role_count = int(row["operating_role_count"])
     if role_count == 0:
-        raise AuthorizationError(
-            error_code="VAC-AUTH-004",
-            status_code=403,
-            title="Business scope denied",
-        )
+        raise HTTPException(status_code=404, detail="No active operating assignment for this Project")
     if role_count != 1:
         raise RuntimeError("Attendance context has inconsistent operating roles")
 
