@@ -1,0 +1,95 @@
+name: One-shot prove UC03 TL authorization through Audit Core client
+
+on:
+  push:
+    branches: [diagnose/uc03-tl-live-overview-20260828]
+    paths:
+      - '.github/workflows/one-shot-uc03-tl-security-client-proof.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  prove:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Audit Core and Railway CLI
+        run: |
+          pip install -e .
+          npm install --global @railway/cli
+      - name: Prove live Security HTTP decisions for active project-wide TL
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --environment dev --json >/tmp/audit-vars.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          import psycopg
+
+          from audit_core.security_authorization import SecurityAuthorizationClient
+
+          variables = json.loads(Path('/tmp/audit-vars.json').read_text())
+          database_url = str(variables.get('DATABASE_URL') or '')
+          database_url = database_url.replace('postgresql+psycopg://', 'postgresql://', 1).replace('postgresql+asyncpg://', 'postgresql://', 1)
+          base_url = str(variables.get('SECURITY_BASE_URL') or '')
+          client_id = str(variables.get('SECURITY_CLIENT_ID') or '')
+          client_secret = str(variables.get('SECURITY_CLIENT_SECRET') or '')
+          if not all((database_url, base_url, client_id, client_secret)):
+              raise RuntimeError('Audit Core live Security integration variables are incomplete')
+
+          with psycopg.connect(database_url) as conn:
+              with conn.cursor() as cur:
+                  cur.execute('''
+                      SELECT a.tenant_id, a.security_actor_id, p.project_name
+                      FROM auditcore.business_assignments a
+                      JOIN auditcore.projects p ON p.tenant_id=a.tenant_id
+                      WHERE a.business_role_code='TL'
+                        AND a.assignment_status='ACTIVE'
+                        AND a.effective_from <= now()
+                        AND (a.effective_to IS NULL OR a.effective_to >= now())
+                        AND a.dealer_id IS NULL
+                        AND a.outlet_id IS NULL
+                      ORDER BY p.project_name
+                  ''')
+                  rows = cur.fetchall()
+                  if len(rows) != 1:
+                      raise RuntimeError(f'Expected exactly one active project-wide TL, found {len(rows)}')
+                  tenant_id, actor_id, project_name = rows[0]
+                  print(f'PROJECT={project_name}')
+
+          permissions = ('audit.journey.read', 'audit.review.read', 'audit.review.decide')
+          with SecurityAuthorizationClient(
+              base_url=base_url,
+              client_id=client_id,
+              client_secret=client_secret,
+              timeout_seconds=10.0,
+          ) as client:
+              for permission in permissions:
+                  decision = client.check_user_permission(
+                      user_id=str(actor_id),
+                      tenant_id=str(tenant_id),
+                      permission_key=permission,
+                  )
+                  print(f'{permission}_ALLOWED={decision.allowed}')
+                  print(f'{permission}_REASON={decision.reason_code}')
+                  print(f'{permission}_ROLE={decision.role_key}')
+                  if (
+                      not decision.allowed
+                      or decision.reason_code != 'ALLOW_OPERATING_ROLE'
+                      or decision.role_key != 'TL'
+                  ):
+                      raise RuntimeError(f'Live Audit Core Security authorization failed for {permission}')
+          print('AUDIT_CORE_SECURITY_CLIENT_PROOF=PASS')
+          PY
