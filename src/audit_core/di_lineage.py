@@ -1,7 +1,7 @@
 """Schema V2 DI field-lineage contract used by Audit Core evidence refresh.
 
 The richer contract is intentionally isolated from the legacy DiFact parser while
-Schema V2 is proving compatibility.  Once every DI consumer has adopted the
+Schema V2 is proving compatibility. Once every DI consumer has adopted the
 additive lineage fields, this can be folded into DiClient proper without changing
 persistence semantics.
 """
@@ -44,11 +44,35 @@ def get_document_facts_with_lineage(
 ) -> tuple[DiLineageFact, ...]:
     """Read the additive Schema V2 field-lineage endpoint.
 
-    DiClient._request_data already owns DI authentication, tracing, retry/error
-    translation and D8-envelope validation.  Keeping the call here avoids a
-    breaking change to legacy DiFact while the new contract is under test.
+    Real DiClient instances use the new endpoint. Lightweight test/downgrade
+    adapters that do not expose the internal D8 request helper fall back to the
+    legacy fact call with role=UNSPECIFIED and null lineage. That keeps a rolling
+    deployment safe while DI and Audit Core versions overlap.
     """
-    payload = client._request_data(  # noqa: SLF001 - transitional contract adapter
+    request_data = getattr(client, "_request_data", None)
+    if not callable(request_data):
+        legacy = client.get_document_facts(
+            token=token,
+            tenant_id=tenant_id,
+            subject_id=subject_id,
+            document_id=document_id,
+        )
+        return tuple(
+            DiLineageFact(
+                canonical_field_id=fact.canonical_field_id,
+                field_key=fact.field_key,
+                value=fact.value,
+                value_source=fact.value_source,
+                confidence_score=fact.confidence_score,
+                version_no=fact.version_no,
+                fact_role="UNSPECIFIED",
+                page_no=fact.page_no,
+                evidence_region=fact.evidence_region,
+            )
+            for fact in legacy
+        )
+
+    payload = request_data(
         "GET",
         f"/v1/tenants/{tenant_id}/subjects/{subject_id}/documents/{document_id}/fields/lineage",
         operation="get_document_facts_with_lineage",
@@ -66,7 +90,6 @@ def _fact(payload: Any) -> DiLineageFact:
     region = payload.get("evidenceRegion")
     if region is not None and not isinstance(region, dict):
         raise _contract_error()
-    fact_role = _required_str(payload, "factRole")
     return DiLineageFact(
         canonical_field_id=_required_str(payload, "canonicalFieldId"),
         field_key=_required_str(payload, "fieldKey"),
@@ -74,7 +97,7 @@ def _fact(payload: Any) -> DiLineageFact:
         value_source=_required_str(payload, "valueSource"),
         confidence_score=_optional_float(payload, "confidenceScore"),
         version_no=_required_int(payload, "versionNo"),
-        fact_role=fact_role,
+        fact_role=_required_str(payload, "factRole"),
         extraction_key=_optional_str(payload, "extractionKey"),
         extracted_fact_id=_optional_uuid(payload, "extractedFactId"),
         processing_run_id=_optional_uuid(payload, "processingRunId"),
