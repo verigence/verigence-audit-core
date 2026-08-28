@@ -1,0 +1,182 @@
+name: One-shot diagnose UC03 TL live overview
+
+on:
+  push:
+    branches: [diagnose/uc03-tl-live-overview-20260828]
+    paths:
+      - '.github/workflows/one-shot-uc03-tl-live-diagnose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install diagnostic dependencies
+        run: |
+          pip install 'psycopg[binary]>=3.3,<4'
+          npm install --global @railway/cli
+      - name: Diagnose TL SQL and recent runtime errors
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --environment dev --json >/tmp/audit-vars.json
+          railway logs --service "$AUDIT_SERVICE" --lines 1000 >/tmp/audit-runtime.log 2>&1 || true
+          python - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+          import psycopg
+
+          variables = json.loads(Path('/tmp/audit-vars.json').read_text())
+          database_url = str(variables.get('DATABASE_URL') or '')
+          database_url = database_url.replace('postgresql+psycopg://', 'postgresql://', 1).replace('postgresql+asyncpg://', 'postgresql://', 1)
+          if not database_url:
+              raise SystemExit('DATABASE_URL unavailable')
+
+          base_from = '''
+              FROM auditcore.journeys j
+              JOIN auditcore.customers c
+                ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+              JOIN auditcore.projects project
+                ON project.tenant_id=j.tenant_id AND project.project_status='ACTIVE'
+              JOIN auditcore.dealers dealer
+                ON dealer.tenant_id=j.tenant_id AND dealer.dealer_id=j.dealer_id
+              JOIN auditcore.dealer_outlets outlet
+                ON outlet.tenant_id=j.tenant_id
+               AND outlet.dealer_id=j.dealer_id
+               AND outlet.outlet_id=j.outlet_id
+              LEFT JOIN auditcore.bookings b
+                ON b.tenant_id=j.tenant_id AND b.journey_id=j.journey_id
+              LEFT JOIN auditcore.deliveries delivery
+                ON delivery.tenant_id=j.tenant_id AND delivery.journey_id=j.journey_id
+              LEFT JOIN auditcore.journey_products jp
+                ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
+              LEFT JOIN auditcore.journey_stage_states bs
+                ON bs.tenant_id=j.tenant_id
+               AND bs.journey_id=j.journey_id
+               AND bs.stage_code='BOOKING'
+              LEFT JOIN auditcore.journey_stage_states ds
+                ON ds.tenant_id=j.tenant_id
+               AND ds.journey_id=j.journey_id
+               AND ds.stage_code='DELIVERY'
+          '''
+          scope_where = '''
+              WHERE j.tenant_id=%s
+                AND EXISTS (
+                      SELECT 1
+                      FROM auditcore.business_assignments tl
+                      WHERE tl.tenant_id=j.tenant_id
+                        AND tl.security_actor_id=%s
+                        AND tl.business_role_code='TL'
+                        AND tl.assignment_status='ACTIVE'
+                        AND tl.effective_from <= now()
+                        AND (tl.effective_to IS NULL OR tl.effective_to >= now())
+                        AND tl.dealer_id IS NULL
+                        AND tl.outlet_id IS NULL
+                )
+                AND (
+                      bs.capture_completed_at_utc IS NOT NULL
+                      OR delivery.delivery_id IS NOT NULL
+                      OR ds.business_status IS NOT NULL
+                )
+          '''
+          detail_select = '''
+              SELECT
+                  j.journey_id,
+                  b.booking_reference,
+                  c.display_name AS customer_display_name,
+                  c.mobile_last4 AS customer_mobile_last4,
+                  NULLIF(concat_ws(' · ', NULLIF(jp.model_name_snapshot, ''), NULLIF(jp.variant_name_snapshot, ''), NULLIF(jp.colour_name_snapshot, '')), '') AS product_label,
+                  j.dealer_id,
+                  dealer.dealer_name,
+                  j.outlet_id,
+                  outlet.outlet_name,
+                  COALESCE(bs.business_status, b.actual_status_code) AS booking_business_status,
+                  COALESCE(b.booking_date, (bs.first_started_at_utc AT TIME ZONE project.timezone_name)::date, (b.created_at_utc AT TIME ZONE project.timezone_name)::date) AS booking_business_date,
+                  bs.capture_completed_at_utc AS booking_submitted_at_utc,
+                  bs.pc_verification_status,
+                  COALESCE(ds.business_status, delivery.actual_delivery_status_code) AS delivery_business_status,
+                  COALESCE((delivery.actual_delivered_at AT TIME ZONE project.timezone_name)::date, (ds.first_started_at_utc AT TIME ZONE project.timezone_name)::date, (delivery.created_at_utc AT TIME ZONE project.timezone_name)::date) AS delivery_business_date,
+                  pc_submit.actor_id AS responsible_pc_actor_id,
+                  COALESCE(findings.open_flag_count, 0) AS open_flag_count,
+                  findings.highest_open_severity,
+                  GREATEST(j.updated_at_utc, bs.latest_activity_at_utc, ds.latest_activity_at_utc, b.updated_at_utc, delivery.updated_at_utc, findings.latest_finding_activity, pc_submit.occurred_at_utc) AS latest_activity_at_utc
+          '''
+          lateral = '''
+              LEFT JOIN LATERAL (
+                  SELECT e.actor_id, e.occurred_at_utc
+                  FROM auditcore.journey_workflow_events e
+                  WHERE e.tenant_id=j.tenant_id AND e.journey_id=j.journey_id
+                    AND e.stage_code='BOOKING' AND e.event_type='PC_BOOKING_CAPTURE_SUBMITTED'
+                    AND e.source_kind='HUMAN' AND e.actor_id IS NOT NULL
+                  ORDER BY e.occurred_at_utc DESC, e.event_id DESC LIMIT 1
+              ) pc_submit ON true
+              LEFT JOIN LATERAL (
+                  SELECT
+                      count(*) FILTER (WHERE f.finding_status IN ('OPEN','ACKNOWLEDGED')) AS open_flag_count,
+                      (array_agg(f.severity ORDER BY CASE f.severity WHEN 'CRITICAL' THEN 5 WHEN 'HIGH' THEN 4 WHEN 'MEDIUM' THEN 3 WHEN 'LOW' THEN 2 WHEN 'INFO' THEN 1 ELSE 0 END DESC, f.severity)
+                       FILTER (WHERE f.finding_status IN ('OPEN','ACKNOWLEDGED')))[1] AS highest_open_severity,
+                      max(f.updated_at_utc) AS latest_finding_activity
+                  FROM auditcore.audit_findings f
+                  WHERE f.tenant_id=j.tenant_id AND f.journey_id=j.journey_id
+              ) findings ON true
+          '''
+
+          with psycopg.connect(database_url) as conn:
+              with conn.cursor() as cur:
+                  cur.execute('''
+                      SELECT p.tenant_id, p.project_name, a.security_actor_id
+                      FROM auditcore.business_assignments a
+                      JOIN auditcore.projects p ON p.tenant_id=a.tenant_id
+                      WHERE a.business_role_code='TL'
+                        AND a.assignment_status='ACTIVE'
+                        AND a.effective_from <= now()
+                        AND (a.effective_to IS NULL OR a.effective_to >= now())
+                        AND a.dealer_id IS NULL AND a.outlet_id IS NULL
+                      ORDER BY p.project_name
+                  ''')
+                  assignments = cur.fetchall()
+                  print('TL_PROJECT_WIDE_ASSIGNMENTS=' + str(len(assignments)))
+                  for idx, (tenant_id, project_name, actor_id) in enumerate(assignments, 1):
+                      print(f'TL_SCOPE_{idx}_PROJECT={project_name}')
+                      cur.execute("SELECT set_config('app.tenant_id', %s, true)", (tenant_id,))
+                      try:
+                          cur.execute('SELECT count(*) ' + base_from + scope_where, (tenant_id, actor_id))
+                          print(f'TL_SCOPE_{idx}_COUNT_QUERY=PASS:{cur.fetchone()[0]}')
+                      except Exception as exc:
+                          print(f'TL_SCOPE_{idx}_COUNT_QUERY=FAIL:{type(exc).__name__}:{str(exc).splitlines()[0][:500]}')
+                          conn.rollback()
+                          continue
+                      try:
+                          cur.execute(detail_select + base_from + lateral + scope_where + ' ORDER BY latest_activity_at_utc DESC, j.journey_id DESC LIMIT 200 OFFSET 0', (tenant_id, actor_id))
+                          rows = cur.fetchall()
+                          print(f'TL_SCOPE_{idx}_DETAIL_QUERY=PASS:{len(rows)}')
+                      except Exception as exc:
+                          print(f'TL_SCOPE_{idx}_DETAIL_QUERY=FAIL:{type(exc).__name__}:{str(exc).splitlines()[0][:500]}')
+                          conn.rollback()
+
+          lines = Path('/tmp/audit-runtime.log').read_text(errors='replace').splitlines()
+          markers = ('/uc03/tl/', 'uc03_tl_supervisory', 'Traceback', 'ProgrammingError', 'UndefinedColumn', 'UndefinedTable', 'DataError', 'ValidationError', '500 Internal Server Error')
+          selected = set()
+          for i, line in enumerate(lines):
+              if any(marker.lower() in line.lower() for marker in markers):
+                  for j in range(max(0, i - 5), min(len(lines), i + 15)):
+                      selected.add(j)
+          text = '\n'.join(lines[i] for i in sorted(selected))[-16000:]
+          text = re.sub(r'(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}', '<email-redacted>', text)
+          text = re.sub(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b', '<uuid-redacted>', text)
+          print('--- TL_RUNTIME_MATCHES ---')
+          print(text or 'NO_MATCHING_RUNTIME_ERROR_LINES')
+          PY
