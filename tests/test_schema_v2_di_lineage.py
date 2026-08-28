@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from uuid import UUID
 
-from audit_core.di_lineage import _fact
+import pytest
+
+from audit_core.di_client import DiClientError
+from audit_core.di_lineage import _fact, get_document_facts_with_lineage
 
 
 def test_same_chassis_canonical_can_carry_two_distinct_vehicle_roles() -> None:
@@ -89,3 +93,65 @@ def test_lineage_parser_preserves_exact_profile_and_invocation_version() -> None
     assert fact.extraction_profile_version == 2
     assert fact.pipeline_version == "2.2.0"
     assert fact.invocation_id == UUID("7f608ab1-9ea9-4fe5-bd8f-aaea0fe188b2")
+
+
+class _OlderDiClient:
+    def __init__(self, lineage_status: int = 404) -> None:
+        self.lineage_status = lineage_status
+        self.legacy_called = False
+
+    def _request_data(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+        raise DiClientError(
+            status_code=self.lineage_status,
+            code=f"DI_HTTP_{self.lineage_status}",
+            retryable=False,
+        )
+
+    def get_document_facts(self, **_kwargs: object) -> tuple[SimpleNamespace, ...]:
+        self.legacy_called = True
+        return (
+            SimpleNamespace(
+                canonical_field_id="canonical-1",
+                field_key="legacy_field",
+                value="legacy-value",
+                value_source="MACHINE",
+                confidence_score=88.0,
+                version_no=2,
+                page_no=1,
+                evidence_region=None,
+            ),
+        )
+
+
+def test_lineage_route_404_falls_back_to_legacy_fields_during_rolling_deploy() -> None:
+    client = _OlderDiClient()
+
+    facts = get_document_facts_with_lineage(
+        client,  # type: ignore[arg-type]
+        token="token",
+        tenant_id="tenant-1",
+        subject_id="subject-1",
+        document_id="document-1",
+    )
+
+    assert client.legacy_called is True
+    assert len(facts) == 1
+    assert facts[0].field_key == "legacy_field"
+    assert facts[0].fact_role == "UNSPECIFIED"
+    assert facts[0].extracted_fact_id is None
+
+
+def test_lineage_route_authorization_error_does_not_fall_back() -> None:
+    client = _OlderDiClient(lineage_status=403)
+
+    with pytest.raises(DiClientError) as exc_info:
+        get_document_facts_with_lineage(
+            client,  # type: ignore[arg-type]
+            token="token",
+            tenant_id="tenant-1",
+            subject_id="subject-1",
+            document_id="document-1",
+        )
+
+    assert exc_info.value.status_code == 403
+    assert client.legacy_called is False
