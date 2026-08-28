@@ -63,3 +63,7 @@ target-version = "py312"
 # by ownership boundary (DI, Security, Booking capture, receipt capture) so the
 # direct-document integration remains auditable without reordering private imports.
 "src/audit_core/uc03_pc_booking_documents.py" = ["I001"]
+# TL correction mirrors the generic PC review's best-effort typed projection boundary:
+# generic extracted/modified values are already durable, so an unexpected optional
+# typed projection failure must not roll back the TL review or block the PC journey.
+"src/audit_core/uc03_tl_supervisory.py" = ["BLE001"]
