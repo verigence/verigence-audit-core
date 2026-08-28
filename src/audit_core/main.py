@@ -82,6 +82,7 @@ from audit_core.uc03_pc_direct_review import router as uc03_pc_direct_review_rou
 from audit_core.uc03_pc_generic_review import router as uc03_pc_generic_review_router
 from audit_core.uc03_pc_verification import router as uc03_pc_verification_router
 from audit_core.uc03_project_context import router as uc03_project_context_router
+from audit_core.uc03_tl_supervisory import router as uc03_tl_supervisory_router
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
 install_role_mapping_policy(role_mappings)
@@ -141,6 +142,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_project_context_router)
     application.include_router(uc03_fast_work_items_router)
     application.include_router(uc03_work_items_router)
+    application.include_router(uc03_tl_supervisory_router)
     application.include_router(uc03_create_booking_router)
     application.include_router(uc03_booking_router)
     application.include_router(uc03_booking_exchange_router)
