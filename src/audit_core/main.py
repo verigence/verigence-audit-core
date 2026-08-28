@@ -82,6 +82,7 @@ from audit_core.uc03_pc_direct_review import router as uc03_pc_direct_review_rou
 from audit_core.uc03_pc_generic_review import router as uc03_pc_generic_review_router
 from audit_core.uc03_pc_verification import router as uc03_pc_verification_router
 from audit_core.uc03_project_context import router as uc03_project_context_router
+from audit_core.uc03_tl_scope_alignment import install_tl_scope_alignment
 from audit_core.uc03_tl_supervisory import router as uc03_tl_supervisory_router
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
@@ -91,6 +92,7 @@ install_native_effective_date(mahindra_masters)
 install_uc03_identity_business_date()
 install_uc03_customer_mobile_pii()
 install_uc03_booking_receipt_capture()
+install_tl_scope_alignment()
 role_mapping_router = role_mappings.router
 mahindra_master_router = mahindra_masters.router
 
