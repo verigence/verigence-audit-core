@@ -155,11 +155,12 @@ def _require_tl_case_scope(
     actor_id: str,
     journey_id: UUID | None = None,
 ) -> dict[str, Any] | None:
-    """Require an active Dealer-wide TL assignment.
+    """Require the approved active project-wide TL assignment.
 
-    TL scope is Dealer-wide, never Outlet-only. When a Journey is supplied this also
-    proves that the Journey belongs to one of those Dealers and has crossed the PC
-    submission/progression boundary. TL review therefore cannot expose PC drafts.
+    Current role-mapping policy represents TL as Project-wide using a single active
+    assignment with both Dealer and Outlet NULL. When a Journey is supplied this also
+    proves that it belongs to the TL's Project and has crossed the PC submission/
+    progression boundary, so TL review never exposes PC drafts.
     """
 
     if journey_id is None:
@@ -174,7 +175,7 @@ def _require_tl_case_scope(
                   AND assignment_status='ACTIVE'
                   AND effective_from <= now()
                   AND (effective_to IS NULL OR effective_to >= now())
-                  AND dealer_id IS NOT NULL
+                  AND dealer_id IS NULL
                   AND outlet_id IS NULL
                 LIMIT 1
                 """
@@ -220,7 +221,7 @@ def _require_tl_case_scope(
                       AND tl.assignment_status='ACTIVE'
                       AND tl.effective_from <= now()
                       AND (tl.effective_to IS NULL OR tl.effective_to >= now())
-                      AND tl.dealer_id=j.dealer_id
+                      AND tl.dealer_id IS NULL
                       AND tl.outlet_id IS NULL
               )
               AND (
@@ -280,7 +281,7 @@ _SCOPE_WHERE_SQL = """
               AND tl.assignment_status='ACTIVE'
               AND tl.effective_from <= now()
               AND (tl.effective_to IS NULL OR tl.effective_to >= now())
-              AND tl.dealer_id=j.dealer_id
+              AND tl.dealer_id IS NULL
               AND tl.outlet_id IS NULL
       )
       AND (
@@ -303,7 +304,7 @@ def list_tl_supervisory_cases(
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> TlSupervisoryCasePage:
-    """Return submitted/progressed cases for the TL's assigned Dealer scope."""
+    """Return submitted/progressed cases across the TL's project-wide scope."""
 
     _authorize_workspace(
         authorization_client,
