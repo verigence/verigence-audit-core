@@ -108,6 +108,20 @@ def test_valid_security_human_token_returns_global_user_only() -> None:
     assert principal == HumanPrincipal(subject="user-123")
 
 
+def test_security_human_token_accepts_device_and_session_identity_metadata() -> None:
+    private_key = _private_key()
+
+    principal = _validator(private_key).validate_human(
+        _human_token(
+            private_key,
+            device_id=str(uuid4()),
+            session_id=str(uuid4()),
+        )
+    )
+
+    assert principal == HumanPrincipal(subject="user-123")
+
+
 def test_valid_service_integration_token_returns_service_identity_only() -> None:
     private_key = _private_key()
 
