@@ -3,9 +3,9 @@ from __future__ import annotations
 from uuid import UUID
 
 import pytest
+from fastapi import HTTPException
 
 from audit_core.attendance_context import current_attendance_context
-from audit_core.authorization import AuthorizationError
 from audit_core.security import HumanPrincipal
 
 USER_ID = "00000000-0000-4000-8000-000000000101"
@@ -88,7 +88,7 @@ def test_tl_context_captures_role_without_geofence_outlets() -> None:
     assert result.outlets == []
 
 
-def test_context_requires_existing_business_assignment() -> None:
+def test_no_operating_assignment_is_optional_for_secondary_hr_role() -> None:
     connection = _Connection(
         {
             "operating_role": None,
@@ -97,11 +97,11 @@ def test_context_requires_existing_business_assignment() -> None:
         }
     )
 
-    with pytest.raises(AuthorizationError) as exc_info:
+    with pytest.raises(HTTPException) as exc_info:
         current_attendance_context(
             tenant_id=TENANT_ID,
             human_principal=HumanPrincipal(subject=USER_ID),
             connection=connection,  # type: ignore[arg-type]
         )
 
-    assert exc_info.value.error_code == "VAC-AUTH-004"
+    assert exc_info.value.status_code == 404
