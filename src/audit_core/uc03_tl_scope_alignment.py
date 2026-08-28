@@ -5,7 +5,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
-from audit_core import uc03_tl_supervisory as tl_supervisory
+import audit_core.uc03_tl_supervisory as tl_supervisory
 from audit_core.authorization import AuthorizationError
 from audit_core.errors import NotFoundError
 
