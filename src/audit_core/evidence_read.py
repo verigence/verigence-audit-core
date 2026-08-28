@@ -37,13 +37,6 @@ class EvidenceFactResponse(BaseModel):
     normalizedValue: str | None
     confidenceScore: float | None
     verificationStatus: str | None
-    diValueVersionNo: int | None = None
-    diExtractedFactId: UUID | None = None
-    diProcessingRunId: UUID | None = None
-    diExtractionProfileId: UUID | None = None
-    diExtractionProfileVersion: int | None = None
-    diInvocationId: UUID | None = None
-    diPipelineVersion: str | None = None
     fetchedAtUtc: str
 
 
@@ -131,11 +124,7 @@ def _fact_rows(
             """
             SELECT evidence_fact_id, field_key, fact_role,
                    value_type, value_json, normalized_value,
-                   confidence_score, verification_status,
-                   di_value_version_no, di_extracted_fact_id,
-                   di_processing_run_id, di_extraction_profile_id,
-                   di_extraction_profile_version, di_invocation_id,
-                   di_pipeline_version, fetched_at_utc
+                   confidence_score, verification_status, fetched_at_utc
             FROM auditcore.evidence_facts
             WHERE tenant_id = :tenant_id
               AND evidence_id = :evidence_id
@@ -159,13 +148,6 @@ def _fact_rows(
                 else None
             ),
             verificationStatus=row["verification_status"],
-            diValueVersionNo=row["di_value_version_no"],
-            diExtractedFactId=row["di_extracted_fact_id"],
-            diProcessingRunId=row["di_processing_run_id"],
-            diExtractionProfileId=row["di_extraction_profile_id"],
-            diExtractionProfileVersion=row["di_extraction_profile_version"],
-            diInvocationId=row["di_invocation_id"],
-            diPipelineVersion=row["di_pipeline_version"],
             fetchedAtUtc=row["fetched_at_utc"].isoformat(),
         )
         for row in rows
