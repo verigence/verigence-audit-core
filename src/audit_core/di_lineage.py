@@ -44,44 +44,74 @@ def get_document_facts_with_lineage(
 ) -> tuple[DiLineageFact, ...]:
     """Read the additive Schema V2 field-lineage endpoint.
 
-    Real DiClient instances use the new endpoint. Lightweight test/downgrade
-    adapters that do not expose the internal D8 request helper fall back to the
-    legacy fact call with role=UNSPECIFIED and null lineage. That keeps a rolling
-    deployment safe while DI and Audit Core versions overlap.
+    New DI deployments expose the additive lineage route. During a rolling
+    deployment an older DI API can legitimately return 404/405 for that route;
+    only in that compatibility case do we fall back to the legacy field contract
+    with ``UNSPECIFIED`` role and null lineage. Authentication, authorization,
+    server and contract failures continue to surface normally.
     """
     request_data = getattr(client, "_request_data", None)
     if not callable(request_data):
-        legacy = client.get_document_facts(
+        return _legacy_facts(
+            client,
             token=token,
             tenant_id=tenant_id,
             subject_id=subject_id,
             document_id=document_id,
         )
-        return tuple(
-            DiLineageFact(
-                canonical_field_id=fact.canonical_field_id,
-                field_key=fact.field_key,
-                value=fact.value,
-                value_source=fact.value_source,
-                confidence_score=fact.confidence_score,
-                version_no=fact.version_no,
-                fact_role="UNSPECIFIED",
-                page_no=fact.page_no,
-                evidence_region=fact.evidence_region,
-            )
-            for fact in legacy
+
+    try:
+        payload = request_data(
+            "GET",
+            f"/v1/tenants/{tenant_id}/subjects/{subject_id}/documents/{document_id}/fields/lineage",
+            operation="get_document_facts_with_lineage",
+            token=token,
+        )
+    except DiClientError as exc:
+        if exc.status_code not in {404, 405}:
+            raise
+        return _legacy_facts(
+            client,
+            token=token,
+            tenant_id=tenant_id,
+            subject_id=subject_id,
+            document_id=document_id,
         )
 
-    payload = request_data(
-        "GET",
-        f"/v1/tenants/{tenant_id}/subjects/{subject_id}/documents/{document_id}/fields/lineage",
-        operation="get_document_facts_with_lineage",
-        token=token,
-    )
     fields = payload.get("fields")
     if not isinstance(fields, list):
         raise _contract_error()
     return tuple(_fact(item) for item in fields)
+
+
+def _legacy_facts(
+    client: DiClient,
+    *,
+    token: str,
+    tenant_id: str,
+    subject_id: str,
+    document_id: str,
+) -> tuple[DiLineageFact, ...]:
+    legacy = client.get_document_facts(
+        token=token,
+        tenant_id=tenant_id,
+        subject_id=subject_id,
+        document_id=document_id,
+    )
+    return tuple(
+        DiLineageFact(
+            canonical_field_id=fact.canonical_field_id,
+            field_key=fact.field_key,
+            value=fact.value,
+            value_source=fact.value_source,
+            confidence_score=fact.confidence_score,
+            version_no=fact.version_no,
+            fact_role="UNSPECIFIED",
+            page_no=fact.page_no,
+            evidence_region=fact.evidence_region,
+        )
+        for fact in legacy
+    )
 
 
 def _fact(payload: Any) -> DiLineageFact:
