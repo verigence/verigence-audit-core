@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from audit_core import mahindra_masters, role_mappings
+from audit_core.attendance_context import router as attendance_context_router
 from audit_core.audit_review import router as audit_review_router
 from audit_core.bookings import router as booking_router
 from audit_core.commercials import router as commercials_router
@@ -142,6 +143,7 @@ def create_app() -> FastAPI:
     application.include_router(project_router)
     application.include_router(journey_housekeeping_router)
     application.include_router(uc03_project_context_router)
+    application.include_router(attendance_context_router)
     application.include_router(uc03_fast_work_items_router)
     application.include_router(uc03_work_items_router)
     application.include_router(uc03_tl_supervisory_router)
