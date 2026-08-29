@@ -38,7 +38,7 @@ class AttributeCandidate:
     page_no: int | None
     evidence_region: dict[str, Any] | None
     evidence_id: str | None = None
-    source_fact_ref: str | None = None
+    canonical_field_id: str | None = None
     source_fact_version: int | None = None
 
 
