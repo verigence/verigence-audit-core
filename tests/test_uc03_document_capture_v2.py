@@ -2,7 +2,6 @@ from uuid import UUID
 
 from audit_core.uc03_document_capture_v2 import _build_capture_response
 
-
 JOURNEY_ID = UUID("11111111-1111-1111-1111-111111111111")
 DOCUMENT_ID = UUID("22222222-2222-2222-2222-222222222222")
 
