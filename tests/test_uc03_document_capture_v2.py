@@ -1,7 +1,7 @@
 from uuid import UUID
 
-from audit_core.security import HumanPrincipal
 from audit_core.main import app
+from audit_core.security import HumanPrincipal
 from audit_core.uc03_document_capture_v2 import (
     _build_capture_response,
     _build_local_capture_response,
