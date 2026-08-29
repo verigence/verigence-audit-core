@@ -5,7 +5,7 @@ from collections.abc import Iterator
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Connection, Engine, text
 
@@ -13,6 +13,8 @@ from audit_core.dependencies import get_connection, get_engine, get_human_princi
 from audit_core.di_capture_v2_client import DiCaptureV2Client, DiCaptureV2Error
 from audit_core.di_client import DiClient
 from audit_core.errors import ConflictError, DependencyUnavailableError, NotFoundError
+from audit_core.idempotency import execute_idempotent_json_command
+from audit_core.observability import get_correlation_id
 from audit_core.evidence import (
     _external_context_ref,
     _journey_context,
@@ -28,7 +30,12 @@ from audit_core.security_authorization import (
 )
 from audit_core.security_integration import SecurityOAuthClient
 from audit_core.uc03_booking_capture import _require_active_booking, _scope
-from audit_core.uc03_booking_commands import _stage_state
+from audit_core.uc03_booking_commands import (
+    _aggregate_lock,
+    _append_workflow_event,
+    _parse_if_match,
+    _stage_state,
+)
 
 router = APIRouter(prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}", tags=["uc03-document-capture-v2"])
 _DI_AUDIENCE = "di"
@@ -113,6 +120,13 @@ class FinalizeResponse(BaseModel):
     state: str
 
 
+class BookingCaptureV2CompletionResponse(BaseModel):
+    journeyId: UUID
+    phase: Literal["BOOKING"] = "BOOKING"
+    status: Literal["COMPLETED"] = "COMPLETED"
+    aggregateVersion: int
+
+
 def get_di_capture_v2_client() -> Iterator[DiCaptureV2Client]:
     base_url = os.environ.get("DI_BASE_URL", "").strip()
     if not base_url:
@@ -123,6 +137,44 @@ def get_di_capture_v2_client() -> Iterator[DiCaptureV2Client]:
 
 def _human_actor_id(human_principal: HumanPrincipal) -> str:
     return human_principal.subject
+
+
+def _capture_phase_state(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    for_update: bool = False,
+):
+    suffix = " FOR UPDATE" if for_update else ""
+    row = connection.execute(
+        text(
+            """
+            SELECT business_status, capture_completed_at_utc, version_no
+            FROM auditcore.journey_stage_states
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND stage_code='BOOKING'
+            """ + suffix
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
+    if row is None:
+        raise NotFoundError(
+            error_code="VAC-NF-005",
+            title="Booking not found",
+            detail="Booking stage not found for the requested Project.",
+        )
+    return row
+
+
+def _require_capture_phase_open(connection: Connection, *, tenant_id: str, journey_id: UUID) -> None:
+    state = _capture_phase_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if state["capture_completed_at_utc"] is not None:
+        raise ConflictError(
+            error_code="VAC-CONFLICT-004",
+            title="Booking document capture is complete",
+            detail="Booking V2 document capture is locked after Booking submission.",
+        )
 
 
 def _authorize_booking(
@@ -454,6 +506,35 @@ def _build_capture_response(
     )
 
 
+def _build_local_capture_response(
+    *,
+    journey_id: UUID,
+    requirements: list[dict[str, Any]],
+    declaration_rows: dict[str, dict[str, Any]],
+    audit_documents: list[dict[str, Any]],
+) -> BookingCaptureV2Response:
+    di_documents = [
+        {
+            "documentId": str(row["di_document_id"]),
+            "clientUploadId": str(row["client_upload_id"]),
+            "state": str(row["capture_status"]),
+            "classifiedDocumentTypeKey": row.get("classified_document_type_key"),
+            "originalFilename": str(row["original_filename"]),
+            "contentUrl": None,
+            "processingStatus": None,
+        }
+        for row in audit_documents
+    ]
+    return _build_capture_response(
+        journey_id=journey_id,
+        context_ref="local-v2-completion-check",
+        requirements=requirements,
+        declaration_rows=declaration_rows,
+        audit_documents=audit_documents,
+        di_documents=di_documents,
+    )
+
+
 def _read_capture(
     *,
     connection: Connection,
@@ -532,6 +613,109 @@ def get_booking_capture_v2(
     )
 
 
+@router.post("/booking/complete", response_model=BookingCaptureV2CompletionResponse)
+def complete_booking_capture_v2(
+    tenant_id: str,
+    journey_id: UUID,
+    request: Request,
+    response: Response,
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
+    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> BookingCaptureV2CompletionResponse:
+    context = _scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    expected_version = _parse_if_match(if_match)
+    correlation_id = get_correlation_id(request)
+
+    def execute() -> dict[str, Any]:
+        _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
+        state = _capture_phase_state(
+            connection, tenant_id=tenant_id, journey_id=journey_id, for_update=True
+        )
+        _require_active_booking(state)
+        if int(state["version_no"]) != expected_version:
+            raise ConflictError(
+                error_code="VAC-CONFLICT-005",
+                title="Booking version conflict",
+                detail="Booking changed since it was loaded. Refresh the Booking and retry.",
+            )
+        if state["capture_completed_at_utc"] is not None:
+            raise ConflictError(
+                error_code="VAC-CONFLICT-004",
+                title="Booking document capture is complete",
+                detail="Booking V2 document capture has already been submitted.",
+            )
+
+        local_capture = _build_local_capture_response(
+            journey_id=journey_id,
+            requirements=_base_requirements(connection, tenant_id, journey_id),
+            declaration_rows=_declarations(connection, tenant_id, journey_id),
+            audit_documents=_linked_documents(connection, tenant_id, journey_id),
+        )
+        if not local_capture.canContinue:
+            raise ConflictError(
+                error_code="VAC-CONFLICT-004",
+                title="Booking document capture is incomplete",
+                detail="Required classifications or applicability decisions are still pending.",
+            )
+
+        next_version = expected_version + 1
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.journey_stage_states
+                SET capture_completed_at_utc=now(),
+                    pc_verification_status='PENDING',
+                    latest_activity_at_utc=now(),
+                    updated_at_utc=now(),
+                    version_no=:version
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND stage_code='BOOKING'
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "version": next_version},
+        )
+        _append_workflow_event(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            event_type="PC_BOOKING_CAPTURE_SUBMITTED",
+            source_kind="HUMAN",
+            actor_id=human_principal.subject,
+            actor_role_snapshot=context["operating_role"],
+            idempotency_key=idempotency_key,
+            correlation_id=correlation_id,
+            safe_payload={
+                "capturePath": "V2",
+                "pcVerificationStatus": "PENDING",
+                "bookingBusinessStatusChanged": False,
+            },
+            aggregate_version=next_version,
+        )
+        return BookingCaptureV2CompletionResponse(
+            journeyId=journey_id, aggregateVersion=next_version
+        ).model_dump(mode="json")
+
+    body, _ = execute_idempotent_json_command(
+        connection,
+        tenant_id=tenant_id,
+        operation_key=f"uc03.document-capture-v2.complete:{journey_id}",
+        idempotency_key=idempotency_key,
+        request_payload={"expectedVersion": expected_version},
+        execute=execute,
+    )
+    response.headers["ETag"] = f'"{body["aggregateVersion"]}"'
+    return BookingCaptureV2CompletionResponse.model_validate(body)
+
+
 @router.post("/booking/upload-intents", response_model=UploadIntentResponse)
 def create_booking_upload_intents_v2(
     tenant_id: str,
@@ -551,6 +735,9 @@ def create_booking_upload_intents_v2(
         journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
+    )
+    _require_capture_phase_open(
+        connection, tenant_id=tenant_id, journey_id=journey_id
     )
     requirements = _base_requirements(connection, tenant_id, journey_id)
     context_ref, token = _ensure_di_context(
@@ -638,6 +825,9 @@ def finalize_booking_document_v2(
         human_principal=human_principal,
         authorization_client=authorization_client,
     )
+    _require_capture_phase_open(
+        connection, tenant_id=tenant_id, journey_id=journey_id
+    )
     context_ref, token = _ensure_di_context(
         connection=connection,
         engine=engine,
@@ -677,6 +867,9 @@ def delete_booking_document_v2(
         journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
+    )
+    _require_capture_phase_open(
+        connection, tenant_id=tenant_id, journey_id=journey_id
     )
     exists = connection.execute(
         text(
@@ -739,6 +932,9 @@ def set_booking_declaration_v2(
         journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
+    )
+    _require_capture_phase_open(
+        connection, tenant_id=tenant_id, journey_id=journey_id
     )
     allowed = {
         str(row["condition_key"])

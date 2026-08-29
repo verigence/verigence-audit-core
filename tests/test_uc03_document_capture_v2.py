@@ -1,7 +1,12 @@
 from uuid import UUID
 
 from audit_core.security import HumanPrincipal
-from audit_core.uc03_document_capture_v2 import _build_capture_response, _human_actor_id
+from audit_core.main import app
+from audit_core.uc03_document_capture_v2 import (
+    _build_capture_response,
+    _build_local_capture_response,
+    _human_actor_id,
+)
 
 JOURNEY_ID = UUID("11111111-1111-1111-1111-111111111111")
 DOCUMENT_ID = UUID("22222222-2222-2222-2222-222222222222")
@@ -199,3 +204,29 @@ def test_v2_actor_id_uses_human_principal_subject() -> None:
 
     assert _human_actor_id(principal) == "pc-user-123"
 
+
+
+def test_v2_completion_route_is_additive() -> None:
+    assert "/v2/tenants/{tenant_id}/journeys/{journey_id}/booking/complete" in app.openapi()["paths"]
+
+
+def test_local_completion_check_uses_reconciled_classified_links() -> None:
+    requirements = [_requirement()]
+    audit_documents = [{
+        "di_document_id": DOCUMENT_ID,
+        "client_upload_id": "client-upload-1",
+        "capture_status": "CLASSIFIED",
+        "classified_document_type_key": "booking_docket",
+        "requirement_key": "booking_docket",
+        "original_filename": "booking.pdf",
+    }]
+
+    result = _build_local_capture_response(
+        journey_id=JOURNEY_ID,
+        requirements=requirements,
+        declaration_rows={},
+        audit_documents=audit_documents,
+    )
+
+    assert result.canContinue is True
+    assert result.requirements[0].state == "UPLOADED"
