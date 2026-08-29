@@ -12,6 +12,7 @@ from sqlalchemy import Connection, Engine, text
 from audit_core.dependencies import get_connection, get_engine, get_human_principal
 from audit_core.di_capture_v2_client import DiCaptureV2Client, DiCaptureV2Error
 from audit_core.di_client import DiClient
+from audit_core.errors import ConflictError, DependencyUnavailableError, NotFoundError
 from audit_core.evidence import (
     _external_context_ref,
     _journey_context,
@@ -20,7 +21,6 @@ from audit_core.evidence import (
     get_di_client,
     get_security_oauth_client,
 )
-from audit_core.errors import ConflictError, DependencyUnavailableError, NotFoundError
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
@@ -375,10 +375,7 @@ def _build_capture_response(
         di = active_by_requirement.get(key)
         declaration = declaration_rows.get(condition_key) if condition_key else None
 
-        if condition_key is None:
-            applicability = "APPLICABLE"
-            needs_decision = False
-        elif di is not None:
+        if condition_key is None or di is not None:
             applicability = "APPLICABLE"
             needs_decision = False
         elif declaration is None:
@@ -415,13 +412,7 @@ def _build_capture_response(
             state = "NOT_UPLOADED"
 
         blocks = False
-        if level == "REQUIRED" and applicability == "APPLICABLE" and di is None:
-            blocks = True
-        elif level == "REQUIRED" and applicability == "UNRESOLVED":
-            blocks = True
-        elif level == "CONDITIONAL" and needs_decision:
-            blocks = True
-        elif (
+        if level == "REQUIRED" and applicability == "APPLICABLE" and di is None or level == "REQUIRED" and applicability == "UNRESOLVED" or level == "CONDITIONAL" and needs_decision or (
             level == "CONDITIONAL"
             and applicability == "APPLICABLE"
             and di is None

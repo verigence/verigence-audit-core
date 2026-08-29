@@ -71,7 +71,9 @@ from audit_core.uc03_delivery_documents import router as uc03_delivery_documents
 from audit_core.uc03_document_assessments import (
     router as uc03_document_assessments_router,
 )
-from audit_core.uc03_document_capture_v2 import router as uc03_document_capture_v2_router
+from audit_core.uc03_document_capture_v2 import (
+    router as uc03_document_capture_v2_router,
+)
 from audit_core.uc03_document_review_v2 import router as uc03_document_review_v2_router
 from audit_core.uc03_fast_work_items import router as uc03_fast_work_items_router
 from audit_core.uc03_identity_business_date import install_uc03_identity_business_date
