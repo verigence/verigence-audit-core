@@ -7,6 +7,7 @@ from audit_core.uc03_pc_generic_review import (
     DirectDocumentFieldReviewCommand,
     DirectExtractedField,
     _project_known_field,
+    _store_fields,
     submit_direct_document_field_review,
 )
 
@@ -49,13 +50,22 @@ def test_generic_review_does_not_use_source_field_allowlist() -> None:
     assert "_store_fields" in source
 
 
-def test_unmapped_projection_is_a_noop() -> None:
+def test_unmapped_projection_is_a_noop_through_common_mapping() -> None:
     source = inspect.getsource(_project_known_field)
-    assert "if capture_key is None" in source
+    assert "spec_for_field" in source
+    assert "if spec is None" in source
     assert "return None" in source
 
 
-def test_generic_persistence_precedes_best_effort_projection() -> None:
+def test_generic_review_stores_only_human_corrections_not_raw_di_values() -> None:
+    source = inspect.getsource(_store_fields)
+    assert "corrected_fields" in source
+    assert "field.modifiedValue is not None" in source
+    assert "extracted_value=NULL" in source
+    assert "confidence_score=NULL" in source
+
+
+def test_correction_persistence_precedes_best_effort_typed_projection() -> None:
     source = inspect.getsource(submit_direct_document_field_review)
     assert source.index("_store_fields(") < source.index("_project_known_field(")
     assert "with connection.begin_nested()" in source
@@ -67,3 +77,4 @@ def test_only_modified_fields_emit_correction_events() -> None:
     assert "if field.modifiedValue is not None" in source
     assert 'event_type="BOOKING_EXTRACTION_CORRECTED"' in source
     assert "BOOKING_EXTRACTION_APPROVED" not in source
+    assert '"rawDiValuesCopied": False' in source
