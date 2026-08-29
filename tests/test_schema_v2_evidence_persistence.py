@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import UUID
 
-import audit_core.evidence_read as evidence_read
+from audit_core import evidence_read
 from audit_core.di_lineage import DiLineageFact
 
 
