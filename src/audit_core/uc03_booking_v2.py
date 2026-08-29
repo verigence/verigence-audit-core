@@ -23,9 +23,9 @@ from audit_core.uc03_booking_commands import (
     _parse_if_match,
 )
 from audit_core.uc03_booking_details import (
+    _MASTER_DOMAINS,
     BookingDetailsCommand,
     BookingDetailsView,
-    _MASTER_DOMAINS,
     _details_view,
     _effective_date,
     _validate_master,
@@ -102,14 +102,17 @@ def _validate_declaration_alignment(
     corporate = declarations.get("corporateCustomer")
     if corporate and bool(corporate["applicable"]):
         availability = corporate.get("document_available")
-        if availability is not None and command.corporateIdAvailable is not None:
-            if bool(availability) != bool(command.corporateIdAvailable):
-                raise AuditCoreError(
-                    error_code="VAC-VAL-002",
-                    status_code=422,
-                    title="Booking details conflict with Documents",
-                    detail="Corporate ID availability must match the answer captured on Documents.",
-                )
+        if (
+            availability is not None
+            and command.corporateIdAvailable is not None
+            and bool(availability) != bool(command.corporateIdAvailable)
+        ):
+            raise AuditCoreError(
+                error_code="VAC-VAL-002",
+                status_code=422,
+                title="Booking details conflict with Documents",
+                detail="Corporate ID availability must match the answer captured on Documents.",
+            )
 
 
 def _validated_details(
