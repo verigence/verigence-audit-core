@@ -14,7 +14,7 @@ _MAPPING_VERSION = "UC03-ATTR-2026-08-30"
 
 def _normalize_identity_name(value: Any) -> str:
     if not isinstance(value, (str, int, float)) or isinstance(value, bool):
-        raise ValueError("Identity name must be a scalar text value")
+        raise TypeError("Identity name must be a scalar text value")
     name = re.sub(r"\s+", " ", str(value).strip())
     if not name:
         raise ValueError("Identity name cannot be blank")
