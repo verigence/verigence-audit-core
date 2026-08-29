@@ -121,6 +121,10 @@ def get_di_capture_v2_client() -> Iterator[DiCaptureV2Client]:
         yield client
 
 
+def _human_actor_id(human_principal: HumanPrincipal) -> str:
+    return human_principal.subject
+
+
 def _authorize_booking(
     connection: Connection,
     *,
@@ -599,7 +603,7 @@ def create_booking_upload_intents_v2(
                 "client_upload_id": item["clientUploadId"],
                 "filename": input_item.filename,
                 "content_type": input_item.contentType,
-                "actor_id": human_principal.actor_id,
+                "actor_id": _human_actor_id(human_principal),
             },
         )
         results.append(
@@ -777,7 +781,7 @@ def set_booking_declaration_v2(
             "condition_key": condition_key,
             "applicable": command.applicable,
             "document_available": document_available,
-            "actor_id": human_principal.actor_id,
+            "actor_id": _human_actor_id(human_principal),
         },
     )
     return _read_capture(
