@@ -101,6 +101,7 @@ class SecurityTokenValidator:
             "tenant_id",
             "permissions",
             "roles",
+            "device_id",
             "location_id",
             "act",
         }
