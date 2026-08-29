@@ -25,11 +25,11 @@ jobs:
           ref: diagnose/v2-screen2-latency
       - name: Install Railway CLI
         run: npm install --global @railway/cli
-      - name: Read recent Screen 2 request logs
+      - name: Read recent Screen 2 submit logs
         shell: bash
         run: |
           set -euo pipefail
           railway link --project "$PLATFORM_PROJECT_ID" --environment "$RAILWAY_ENVIRONMENT" --json >/dev/null
-          railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 1500 >/tmp/audit.log
-          echo '--- recent booking capture/details/pc-capture lines ---'
-          grep -E '/v2/tenants/.*/booking/capture|/v1/tenants/.*/booking/details|pc.*capture|booking.*capture' /tmp/audit.log | tail -n 250 || true
+          railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 2500 >/tmp/audit.log
+          echo '--- recent submit/details/errors ---'
+          grep -E '/booking/details|/pc-verification/submit|status_code=4|status_code=5|ERROR:|Traceback|api_error|Exception' /tmp/audit.log | tail -n 500 || true
