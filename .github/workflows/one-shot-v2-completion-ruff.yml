@@ -1,0 +1,37 @@
+name: One-shot V2 completion Ruff
+
+on:
+  push:
+    branches:
+      - fix/v2-booking-completion
+    paths:
+      - .github/workflows/one-shot-v2-completion-ruff.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/v2-booking-completion
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Apply only reported Ruff import fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install ruff==0.16.0
+          ruff check --fix --select I001 src/audit_core/uc03_document_capture_v2.py tests/test_uc03_document_capture_v2.py
+          ruff check src/audit_core/uc03_document_capture_v2.py tests/test_uc03_document_capture_v2.py
+          git diff --check
+          git config user.name "Verigence-admin"
+          git config user.email "jbrconsulting.it@gmail.com"
+          git add src/audit_core/uc03_document_capture_v2.py tests/test_uc03_document_capture_v2.py
+          git commit -m "style(v2): fix completion import ordering"
+          git push origin HEAD:fix/v2-booking-completion
