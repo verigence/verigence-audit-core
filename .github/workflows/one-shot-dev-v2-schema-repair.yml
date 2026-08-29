@@ -1,0 +1,122 @@
+name: One-shot Audit Core DEV V2 schema repair
+
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - .github/workflows/one-shot-dev-v2-schema-repair.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-dev-v2-schema-repair
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
+      DEV_DATABASE_URL: ${{ secrets.DEV_DATABASE_URL }}
+
+    steps:
+      - name: Check out DEV revision
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Audit Core
+        run: python -m pip install -e .
+
+      - name: Resolve DEV migration connection
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw="${MIGRATION_DATABASE_URL:-${DEV_DATABASE_URL:-}}"
+          if [[ -z "$raw" ]]; then
+            echo '::error::Neither MIGRATION_DATABASE_URL nor DEV_DATABASE_URL is configured.'
+            exit 1
+          fi
+
+          case "$raw" in
+            postgresql+psycopg://*) sqlalchemy_url="$raw" ;;
+            postgresql+asyncpg://*) sqlalchemy_url="postgresql+psycopg://${raw#postgresql+asyncpg://}" ;;
+            postgresql://*) sqlalchemy_url="postgresql+psycopg://${raw#postgresql://}" ;;
+            postgres://*) sqlalchemy_url="postgresql+psycopg://${raw#postgres://}" ;;
+            *) echo '::error::Configured DEV migration credential is not a PostgreSQL URL.'; exit 1 ;;
+          esac
+
+          echo "::add-mask::$sqlalchemy_url"
+          echo "DATABASE_URL=$sqlalchemy_url" >> "$GITHUB_ENV"
+
+      - name: Apply exact Audit Core Alembic head to DEV
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_head="$(alembic heads | awk '/\(head\)/ {print $1}')"
+          if [[ -z "$source_head" ]]; then
+            echo '::error::Could not resolve Audit Core Alembic source head.'
+            exit 1
+          fi
+          echo "AUDIT_CORE_SOURCE_HEAD=$source_head"
+          alembic upgrade head
+
+      - name: Verify DEV V2 schema and Alembic head
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import subprocess
+          from sqlalchemy import create_engine, text
+
+          heads = [
+              line.split()[0]
+              for line in subprocess.check_output(["alembic", "heads"], text=True).splitlines()
+              if "(head)" in line
+          ]
+          if len(heads) != 1:
+              raise SystemExit(f"Expected one Audit Core source head, found {heads}")
+          expected = heads[0]
+
+          engine = create_engine(os.environ["DATABASE_URL"])
+          required_tables = [
+              "document_capture_v2_requirement_policy",
+              "document_capture_v2_documents",
+              "document_capture_v2_declarations",
+              "document_capture_v2_source_truth_rules",
+          ]
+          with engine.connect() as connection:
+              actual = connection.execute(text("select version_num from alembic_version")).scalar_one()
+              if actual != expected:
+                  raise SystemExit(f"DEV Audit Core Alembic head mismatch: expected {expected}, found {actual}")
+
+              missing = []
+              for table in required_tables:
+                  regclass = connection.execute(
+                      text("select to_regclass(:name)::text"),
+                      {"name": f"auditcore.{table}"},
+                  ).scalar_one()
+                  if regclass != f"auditcore.{table}":
+                      missing.append(table)
+              if missing:
+                  raise SystemExit("Missing DEV Audit Core V2 table(s): " + ", ".join(missing))
+
+              policy_count = connection.execute(
+                  text("select count(*) from auditcore.document_capture_v2_requirement_policy")
+              ).scalar_one()
+              if policy_count <= 0:
+                  raise SystemExit("V2 requirement policy table exists but has no seeded rows")
+
+          engine.dispose()
+          print("AUDIT_CORE_DEV_V2_SCHEMA_REPAIR=PASS")
+          print("AUDIT_CORE_DEV_ALEMBIC_HEAD=" + expected)
+          PY
