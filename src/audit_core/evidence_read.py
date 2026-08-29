@@ -12,7 +12,8 @@ from audit_core.authorization import authorize
 from audit_core.business_assignments import require_business_scope
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_engine, get_principal
-from audit_core.di_client import DiClient, DiClientError, DiFact
+from audit_core.di_client import DiClient, DiClientError
+from audit_core.di_lineage import DiLineageFact, get_document_facts_with_lineage
 from audit_core.errors import NotFoundError
 from audit_core.evidence import (
     EvidenceResponse,
@@ -30,6 +31,7 @@ _DI_AUDIENCE = "di"
 class EvidenceFactResponse(BaseModel):
     evidenceFactId: UUID
     fieldKey: str
+    factRole: str
     valueType: str
     value: Any
     normalizedValue: str | None
@@ -120,14 +122,14 @@ def _fact_rows(
     rows = connection.execute(
         text(
             """
-            SELECT evidence_fact_id, field_key, value_type, value_json,
-                   normalized_value, confidence_score, verification_status,
-                   fetched_at_utc
+            SELECT evidence_fact_id, field_key, fact_role,
+                   value_type, value_json, normalized_value,
+                   confidence_score, verification_status, fetched_at_utc
             FROM auditcore.evidence_facts
             WHERE tenant_id = :tenant_id
               AND evidence_id = :evidence_id
               AND superseded_at_utc IS NULL
-            ORDER BY field_key, evidence_fact_id
+            ORDER BY field_key, fact_role, evidence_fact_id
             """
         ),
         {"tenant_id": tenant_id, "evidence_id": evidence_id},
@@ -136,6 +138,7 @@ def _fact_rows(
         EvidenceFactResponse(
             evidenceFactId=row["evidence_fact_id"],
             fieldKey=row["field_key"],
+            factRole=row["fact_role"],
             valueType=row["value_type"],
             value=row["value_json"],
             normalizedValue=row["normalized_value"],
@@ -168,7 +171,7 @@ def _persist_refresh(
     evidence_id: UUID,
     journey_id: UUID,
     document,
-    facts: tuple[DiFact, ...],
+    facts: tuple[DiLineageFact, ...],
 ) -> EvidenceDetailResponse:
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
@@ -216,12 +219,22 @@ def _persist_refresh(
                     """
                     INSERT INTO auditcore.evidence_facts (
                         tenant_id, evidence_id, journey_id,
-                        field_key, value_type, value_json, normalized_value,
-                        confidence_score, di_field_reference, verification_status
+                        field_key, fact_role,
+                        value_type, value_json, normalized_value,
+                        confidence_score, di_field_reference, verification_status,
+                        di_value_version_no, di_extracted_fact_id,
+                        di_processing_run_id, di_extraction_profile_id,
+                        di_extraction_profile_version, di_invocation_id,
+                        di_pipeline_version
                     ) VALUES (
                         :tenant_id, :evidence_id, :journey_id,
-                        :field_key, :value_type, CAST(:value_json AS jsonb), :normalized_value,
-                        :confidence_score, :di_field_reference, :verification_status
+                        :field_key, :fact_role,
+                        :value_type, CAST(:value_json AS jsonb), :normalized_value,
+                        :confidence_score, :di_field_reference, :verification_status,
+                        :di_value_version_no, :di_extracted_fact_id,
+                        :di_processing_run_id, :di_extraction_profile_id,
+                        :di_extraction_profile_version, :di_invocation_id,
+                        :di_pipeline_version
                     )
                     """
                 ),
@@ -230,12 +243,20 @@ def _persist_refresh(
                     "evidence_id": evidence_id,
                     "journey_id": journey_id,
                     "field_key": fact.field_key,
+                    "fact_role": fact.fact_role,
                     "value_type": value_type,
                     "value_json": json.dumps(value_json),
                     "normalized_value": normalized_value,
                     "confidence_score": fact.confidence_score,
                     "di_field_reference": fact.canonical_field_id,
                     "verification_status": document.verification_state,
+                    "di_value_version_no": fact.version_no,
+                    "di_extracted_fact_id": fact.extracted_fact_id,
+                    "di_processing_run_id": fact.processing_run_id,
+                    "di_extraction_profile_id": fact.extraction_profile_id,
+                    "di_extraction_profile_version": fact.extraction_profile_version,
+                    "di_invocation_id": fact.invocation_id,
+                    "di_pipeline_version": fact.pipeline_version,
                 },
             )
         refreshed = dict(row)
@@ -396,7 +417,8 @@ def refresh_journey_evidence(
             subject_id=str(row["di_subject_id"]),
             document_id=str(row["di_document_id"]),
         )
-        facts = di_client.get_document_facts(
+        facts = get_document_facts_with_lineage(
+            di_client,
             token=token,
             tenant_id=tenant_id,
             subject_id=str(row["di_subject_id"]),
