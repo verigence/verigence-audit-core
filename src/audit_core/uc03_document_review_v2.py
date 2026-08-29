@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Header, Request, Response
 from pydantic import BaseModel
 from sqlalchemy import Connection, Engine, text
 
@@ -12,6 +12,8 @@ from audit_core.di_capture_v2_client import DiCaptureV2Client, DiCaptureV2Error
 from audit_core.di_client import DiClient, DiClientError
 from audit_core.errors import ConflictError, DependencyUnavailableError, NotFoundError
 from audit_core.evidence import get_di_client, get_security_oauth_client
+from audit_core.idempotency import execute_idempotent_json_command
+from audit_core.observability import get_correlation_id
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
@@ -25,7 +27,16 @@ from audit_core.uc03_attribute_mapping import (
     spec_for_field,
     specs_for_stage,
 )
+from audit_core.uc03_attribute_resolution import (
+    apply_supported_operational_attribute,
+    record_attribute_resolution,
+)
 from audit_core.uc03_booking_capture import _scope
+from audit_core.uc03_booking_commands import (
+    _aggregate_lock,
+    _append_workflow_event,
+    _parse_if_match,
+)
 from audit_core.uc03_document_capture_v2 import (
     _base_requirements,
     _declarations,
@@ -45,9 +56,11 @@ _FAILED_PROCESSING = {"FAILED", "ERROR", "REJECTED"}
 
 
 class ReviewV2Field(BaseModel):
+    canonicalFieldId: str
     fieldKey: str
     value: Any | None = None
     confidenceScore: float | None = None
+    sourceFactVersion: int
     reviewState: Literal["READY", "NEEDS_REVIEW"]
     source: Literal["DI"] = "DI"
     pageNo: int | None = None
@@ -68,9 +81,11 @@ class ReviewV2Document(BaseModel):
 
 
 class ReviewV2SourceValue(BaseModel):
+    canonicalFieldId: str
     fieldKey: str
     value: Any | None = None
     confidenceScore: float | None = None
+    sourceFactVersion: int
     reviewState: Literal["READY", "NEEDS_REVIEW"]
     documentId: UUID
     evidenceId: UUID | None = None
@@ -97,9 +112,11 @@ class ReviewV2Attribute(BaseModel):
 
 
 class ReviewV2UnmappedField(BaseModel):
+    canonicalFieldId: str
     fieldKey: str
     value: Any | None = None
     confidenceScore: float | None = None
+    sourceFactVersion: int
     documentId: UUID
     documentTypeKey: str | None = None
     documentLabel: str
@@ -121,12 +138,23 @@ class BookingReviewV2Response(BaseModel):
     phase: Literal["BOOKING"] = "BOOKING"
     captureSubmitted: bool
     pcVerificationStatus: str
+    aggregateVersion: int
     processingPending: bool
     needsReviewCount: int
     attributes: list[ReviewV2Attribute]
     unmappedFields: list[ReviewV2UnmappedField]
     documents: list[ReviewV2Document]
     missingDeclarations: list[ReviewV2MissingDeclaration]
+
+
+class BookingReviewV2ConfirmResponse(BaseModel):
+    journeyId: UUID
+    pcVerificationStatus: Literal["VERIFIED"] = "VERIFIED"
+    aggregateVersion: int
+    resolvedAttributeCount: int
+    appliedAttributes: list[str]
+    reviewOnlyAttributes: list[str]
+    conflictAttributes: list[str]
 
 
 class AuditSourceComparisonV2Response(BaseModel):
@@ -150,11 +178,11 @@ def _stage_submission_state(
     tenant_id: str,
     journey_id: UUID,
     stage_code: str,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, int]:
     row = connection.execute(
         text(
             """
-            SELECT capture_completed_at_utc, pc_verification_status
+            SELECT capture_completed_at_utc, pc_verification_status, version_no
             FROM auditcore.journey_stage_states
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
               AND stage_code=:stage_code
@@ -164,12 +192,13 @@ def _stage_submission_state(
     ).mappings().one_or_none()
     submitted = row is not None and row["capture_completed_at_utc"] is not None
     status = "NOT_SUBMITTED"
+    version = int(row["version_no"]) if row is not None else 0
     if submitted:
         status = str(row["pc_verification_status"] or "PENDING")
-    return submitted, status
+    return submitted, status, version
 
 
-def _submission_state(connection: Connection, *, tenant_id: str, journey_id: UUID) -> tuple[bool, str]:
+def _submission_state(connection: Connection, *, tenant_id: str, journey_id: UUID) -> tuple[bool, str, int]:
     return _stage_submission_state(
         connection,
         tenant_id=tenant_id,
@@ -215,6 +244,7 @@ def _legacy_evidence_links(
     journey_id: UUID,
     stages: tuple[str, ...],
 ) -> list[dict[str, Any]]:
+    allowed = {stage.upper() for stage in stages}
     rows = connection.execute(
         text(
             """
@@ -228,13 +258,13 @@ def _legacy_evidence_links(
               AND e.journey_id=:journey_id
               AND e.association_status='ACTIVE'
               AND e.di_document_id IS NOT NULL
-              AND upper(jdr.process_area) = ANY(CAST(:stages AS text[]))
+              AND upper(jdr.process_area) IN ('BOOKING','DELIVERY')
             ORDER BY e.linked_at_utc, e.evidence_id
             """
         ),
-        {"tenant_id": tenant_id, "journey_id": journey_id, "stages": list(stages)},
+        {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
-    return [dict(row) for row in rows]
+    return [dict(row) for row in rows if str(row["stage_code"]).upper() in allowed]
 
 
 def _review_document(
@@ -289,9 +319,11 @@ def _review_document(
             if extraction_state == "READY":
                 fields = [
                     ReviewV2Field(
+                        canonicalFieldId=fact.canonical_field_id,
                         fieldKey=fact.field_key,
                         value=fact.value,
                         confidenceScore=fact.confidence_score,
+                        sourceFactVersion=fact.version_no,
                         reviewState=_field_review_state(
                             value=fact.value,
                             confidence_score=fact.confidence_score,
@@ -318,9 +350,11 @@ def _review_document(
 
 def _source_value(document: ReviewV2Document, field: ReviewV2Field) -> ReviewV2SourceValue:
     return ReviewV2SourceValue(
+        canonicalFieldId=field.canonicalFieldId,
         fieldKey=field.fieldKey,
         value=field.value,
         confidenceScore=field.confidenceScore,
+        sourceFactVersion=field.sourceFactVersion,
         reviewState=field.reviewState,
         documentId=document.documentId,
         evidenceId=document.evidenceId,
@@ -346,6 +380,8 @@ def _candidate(document: ReviewV2Document, field: ReviewV2Field) -> AttributeCan
         page_no=field.pageNo,
         evidence_region=field.evidenceRegion,
         evidence_id=str(document.evidenceId) if document.evidenceId else None,
+        canonical_field_id=field.canonicalFieldId,
+        source_fact_version=field.sourceFactVersion,
     )
 
 
@@ -363,9 +399,11 @@ def _build_attributes(
             if spec is None or not any(stage in spec.stages for stage in stages):
                 unmapped.append(
                     ReviewV2UnmappedField(
+                        canonicalFieldId=field.canonicalFieldId,
                         fieldKey=field.fieldKey,
                         value=field.value,
                         confidenceScore=field.confidenceScore,
+                        sourceFactVersion=field.sourceFactVersion,
                         documentId=document.documentId,
                         documentTypeKey=document.documentTypeKey,
                         documentLabel=document.label,
@@ -393,7 +431,7 @@ def _build_attributes(
                     if (
                         str(document.documentId) == resolved.document_id
                         and field.fieldKey == resolved.field_key
-                        and field.value == resolved.value
+                        and field.sourceFactVersion == resolved.source_fact_version
                     ):
                         resolved_source = _source_value(document, field)
                         break
@@ -466,7 +504,7 @@ def _v2_documents_for_stage(
         )
         links = _linked_documents(connection, tenant_id, journey_id)
     else:
-        links = connection.execute(
+        rows = connection.execute(
             text(
                 """
                 SELECT di_document_id, requirement_key, classified_document_type_key,
@@ -479,7 +517,7 @@ def _v2_documents_for_stage(
             ),
             {"tenant_id": tenant_id, "journey_id": journey_id, "stage": stage},
         ).mappings().all()
-        links = [dict(row) for row in links]
+        links = [dict(row) for row in rows]
 
     link_by_id = {str(row["di_document_id"]): row for row in links}
     requirement_by_key = {
@@ -630,37 +668,16 @@ def _all_review_documents(
     return documents
 
 
-@router.get("/booking/review", response_model=BookingReviewV2Response)
-def get_booking_review_v2(
+def _booking_review_data(
+    *,
+    connection: Connection,
+    engine: Engine,
     tenant_id: str,
     journey_id: UUID,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
-    connection: Annotated[Connection, Depends(get_connection)],
-    engine: Annotated[Engine, Depends(get_engine)],
-    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
-    di_client: Annotated[DiClient, Depends(get_di_client)],
-    v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
-) -> BookingReviewV2Response:
-    _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    capture_submitted, verification_status = _submission_state(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-    )
-    if not capture_submitted:
-        raise ConflictError(
-            error_code="VAC-CONFLICT-010",
-            title="Booking capture has not been submitted",
-            detail="Submit Booking Details before opening Review.",
-        )
-
+    security_client: SecurityOAuthClient,
+    di_client: DiClient,
+    v2_client: DiCaptureV2Client,
+) -> tuple[list[dict[str, Any]], list[ReviewV2Document], list[ReviewV2Attribute], list[ReviewV2UnmappedField]]:
     requirements = _base_requirements(connection, tenant_id, journey_id)
     context_ref, token = _ensure_di_context(
         connection=connection,
@@ -682,12 +699,56 @@ def get_booking_review_v2(
         requirements=requirements,
     )
     attributes, unmapped = _build_attributes(documents, stages=("BOOKING",))
+    return requirements, documents, attributes, unmapped
+
+
+@router.get("/booking/review", response_model=BookingReviewV2Response)
+def get_booking_review_v2(
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    engine: Annotated[Engine, Depends(get_engine)],
+    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
+    di_client: Annotated[DiClient, Depends(get_di_client)],
+    v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
+) -> BookingReviewV2Response:
+    _scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    capture_submitted, verification_status, aggregate_version = _submission_state(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+    )
+    if not capture_submitted:
+        raise ConflictError(
+            error_code="VAC-CONFLICT-010",
+            title="Booking capture has not been submitted",
+            detail="Submit Booking Details before opening Review.",
+        )
+
+    requirements, documents, attributes, unmapped = _booking_review_data(
+        connection=connection,
+        engine=engine,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        security_client=security_client,
+        di_client=di_client,
+        v2_client=v2_client,
+    )
     needs_review = sum(1 for attribute in attributes if attribute.resolvedValue is not None and attribute.reviewState == "NEEDS_REVIEW")
     pending = any(document.extractionState == "PENDING" for document in documents)
     return BookingReviewV2Response(
         journeyId=journey_id,
         captureSubmitted=True,
         pcVerificationStatus=verification_status,
+        aggregateVersion=aggregate_version,
         processingPending=pending,
         needsReviewCount=needs_review,
         attributes=attributes,
@@ -700,6 +761,194 @@ def get_booking_review_v2(
             requirements=requirements,
         ),
     )
+
+
+@router.post("/booking/review/confirm", response_model=BookingReviewV2ConfirmResponse)
+def confirm_booking_review_v2(
+    tenant_id: str,
+    journey_id: UUID,
+    request: Request,
+    response: Response,
+    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    engine: Annotated[Engine, Depends(get_engine)],
+    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
+    di_client: Annotated[DiClient, Depends(get_di_client)],
+    v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
+) -> BookingReviewV2ConfirmResponse:
+    context = _scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    expected_version = _parse_if_match(if_match)
+    _, documents, attributes, _ = _booking_review_data(
+        connection=connection,
+        engine=engine,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        security_client=security_client,
+        di_client=di_client,
+        v2_client=v2_client,
+    )
+    if any(document.extractionState == "PENDING" for document in documents):
+        raise ConflictError(
+            error_code="VAC-CONFLICT-011",
+            title="Documents are not ready for review",
+            detail="Document Intelligence is still preparing one or more Booking documents.",
+        )
+    if any(document.extractionState == "FAILED" for document in documents):
+        raise ConflictError(
+            error_code="VAC-CONFLICT-011",
+            title="Document processing requires follow-up",
+            detail="One or more Booking documents failed processing and must be resolved before verification.",
+        )
+
+    correlation_id = get_correlation_id(request)
+
+    def execute() -> dict[str, Any]:
+        _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
+        state = connection.execute(
+            text(
+                """
+                SELECT capture_completed_at_utc, pc_verification_status, version_no
+                FROM auditcore.journey_stage_states
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND stage_code='BOOKING'
+                FOR UPDATE
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).mappings().one_or_none()
+        if state is None or state["capture_completed_at_utc"] is None:
+            raise ConflictError(
+                error_code="VAC-CONFLICT-010",
+                title="Booking capture has not been submitted",
+                detail="Submit Booking before completing Review.",
+            )
+        if int(state["version_no"]) != expected_version:
+            raise ConflictError(
+                error_code="VAC-CONFLICT-005",
+                title="Booking version conflict",
+                detail="Booking changed since Review was loaded. Refresh Review and try again.",
+            )
+        if str(state["pc_verification_status"] or "PENDING") != "PENDING":
+            raise ConflictError(
+                error_code="VAC-CONFLICT-010",
+                title="Booking Review is not pending",
+                detail="This Booking Review has already been completed.",
+            )
+
+        applied: list[str] = []
+        review_only: list[str] = []
+        conflicts: list[str] = []
+        resolved_count = 0
+        for attribute in attributes:
+            source = attribute.resolvedSource
+            if source is None or attribute.resolvedValue is None:
+                continue
+            spec = spec_for_field(source.fieldKey)
+            if spec is None or spec.attribute_key != attribute.attributeKey:
+                continue
+            resolved_count += 1
+            application = apply_supported_operational_attribute(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                spec=spec,
+                value=attribute.resolvedValue,
+                actor_id=human_principal.subject,
+                source_document_type_key=source.documentTypeKey,
+                source_field_key=source.fieldKey,
+                source_evidence_id=source.evidenceId,
+            )
+            owning_domain_key: str | None = None
+            owning_record_reference: str | None = None
+            if application is None:
+                review_only.append(attribute.attributeKey)
+            else:
+                owning_domain_key, owning_record_reference, application_status = application
+                applied.append(attribute.attributeKey)
+                if application_status == "CONFLICT":
+                    conflicts.append(attribute.attributeKey)
+
+            if spec.mapping_status == "SUPPORTED":
+                record_attribute_resolution(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    stage_code="BOOKING",
+                    spec=spec,
+                    source_di_document_id=source.documentId,
+                    source_evidence_id=source.evidenceId,
+                    source_canonical_field_id=source.canonicalFieldId,
+                    source_field_key=source.fieldKey,
+                    source_fact_version=source.sourceFactVersion,
+                    source_document_type_key=source.documentTypeKey,
+                    actor_id=human_principal.subject,
+                    owning_domain_key=owning_domain_key,
+                    owning_record_reference=owning_record_reference,
+                )
+
+        next_version = expected_version + 1
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.journey_stage_states
+                SET pc_verification_status='VERIFIED',
+                    latest_activity_at_utc=now(),
+                    updated_at_utc=now(),
+                    version_no=:version
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND stage_code='BOOKING'
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "version": next_version},
+        )
+        _append_workflow_event(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            event_type="PC_BOOKING_ATTRIBUTE_REVIEW_CONFIRMED",
+            source_kind="HUMAN",
+            actor_id=human_principal.subject,
+            actor_role_snapshot=context["operating_role"],
+            idempotency_key=f"{idempotency_key}:review-confirmed",
+            correlation_id=correlation_id,
+            safe_payload={
+                "resolvedAttributeCount": resolved_count,
+                "appliedAttributeKeys": sorted(applied),
+                "reviewOnlyAttributeKeys": sorted(review_only),
+                "conflictAttributeKeys": sorted(conflicts),
+                "rawDiValuesCopied": False,
+            },
+            aggregate_version=next_version,
+        )
+        return {
+            "journeyId": str(journey_id),
+            "pcVerificationStatus": "VERIFIED",
+            "aggregateVersion": next_version,
+            "resolvedAttributeCount": resolved_count,
+            "appliedAttributes": sorted(applied),
+            "reviewOnlyAttributes": sorted(review_only),
+            "conflictAttributes": sorted(conflicts),
+        }
+
+    body, _ = execute_idempotent_json_command(
+        connection,
+        tenant_id=tenant_id,
+        operation_key=f"uc03.booking.attribute-review.confirm:{journey_id}",
+        idempotency_key=idempotency_key,
+        request_payload={"expectedVersion": expected_version},
+        execute=execute,
+    )
+    response.headers["ETag"] = f'"{body["aggregateVersion"]}"'
+    return BookingReviewV2ConfirmResponse.model_validate(body)
 
 
 @router.get("/audit/source-comparison", response_model=AuditSourceComparisonV2Response)
@@ -721,7 +970,7 @@ def get_audit_source_comparison_v2(
         human_principal=human_principal,
         authorization_client=authorization_client,
     )
-    delivery_submitted, _ = _stage_submission_state(
+    delivery_submitted, _, _ = _stage_submission_state(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
