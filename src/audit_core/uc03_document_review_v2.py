@@ -10,8 +10,8 @@ from sqlalchemy import Connection, Engine, text
 from audit_core.dependencies import get_connection, get_engine, get_human_principal
 from audit_core.di_capture_v2_client import DiCaptureV2Client, DiCaptureV2Error
 from audit_core.di_client import DiClient, DiClientError
-from audit_core.evidence import get_di_client, get_security_oauth_client
 from audit_core.errors import ConflictError, DependencyUnavailableError
+from audit_core.evidence import get_di_client, get_security_oauth_client
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
