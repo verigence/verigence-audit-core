@@ -1,0 +1,35 @@
+name: One-shot V2 Screen 2 latency
+
+on:
+  push:
+    branches:
+      - diagnose/v2-screen2-latency
+    paths:
+      - .github/workflows/one-shot-v2-screen2-latency.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      RAILWAY_ENVIRONMENT: dev
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: diagnose/v2-screen2-latency
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      - name: Read recent Screen 2 request logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment "$RAILWAY_ENVIRONMENT" --json >/dev/null
+          railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 1500 >/tmp/audit.log
+          echo '--- recent booking capture/details/pc-capture lines ---'
+          grep -E '/v2/tenants/.*/booking/capture|/v1/tenants/.*/booking/details|pc.*capture|booking.*capture' /tmp/audit.log | tail -n 250 || true
