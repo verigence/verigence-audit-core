@@ -21,8 +21,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
-      DEV_DATABASE_URL: ${{ secrets.DEV_DATABASE_URL }}
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
 
     steps:
       - name: Check out DEV revision
@@ -33,16 +34,28 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Audit Core
-        run: python -m pip install -e .
+      - name: Install Audit Core and Railway CLI
+        run: |
+          python -m pip install -e .
+          npm install --global @railway/cli
 
-      - name: Resolve DEV migration connection
+      - name: Resolve approved Railway DEV database connection
         shell: bash
         run: |
           set -euo pipefail
-          raw="${MIGRATION_DATABASE_URL:-${DEV_DATABASE_URL:-}}"
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+
+          raw="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          variables = json.loads(Path('/tmp/audit-vars.json').read_text())
+          print(variables.get('DATABASE_URL') or '')
+          PY
+          )"
           if [[ -z "$raw" ]]; then
-            echo '::error::Neither MIGRATION_DATABASE_URL nor DEV_DATABASE_URL is configured.'
+            echo '::error::Audit Core Railway DEV service has no DATABASE_URL.'
             exit 1
           fi
 
@@ -51,7 +64,7 @@ jobs:
             postgresql+asyncpg://*) sqlalchemy_url="postgresql+psycopg://${raw#postgresql+asyncpg://}" ;;
             postgresql://*) sqlalchemy_url="postgresql+psycopg://${raw#postgresql://}" ;;
             postgres://*) sqlalchemy_url="postgresql+psycopg://${raw#postgres://}" ;;
-            *) echo '::error::Configured DEV migration credential is not a PostgreSQL URL.'; exit 1 ;;
+            *) echo '::error::Railway DEV DATABASE_URL is not a PostgreSQL URL.'; exit 1 ;;
           esac
 
           echo "::add-mask::$sqlalchemy_url"
