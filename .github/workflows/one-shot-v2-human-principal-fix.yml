@@ -1,0 +1,75 @@
+name: One-shot V2 human principal contract fix
+
+on:
+  push:
+    branches:
+      - fix/v2-human-principal-actor-id
+    paths:
+      - .github/workflows/one-shot-v2-human-principal-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/v2-human-principal-actor-id
+
+      - name: Apply principal contract fix and regression test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          source_path = Path('src/audit_core/uc03_document_capture_v2.py')
+          source = source_path.read_text()
+
+          bad = 'human_principal.actor_id'
+          if source.count(bad) != 2:
+              raise SystemExit(f'Expected exactly two invalid HumanPrincipal actor_id reads, found {source.count(bad)}')
+
+          authorize_anchor = '\ndef _authorize_booking(\n'
+          if source.count(authorize_anchor) != 1:
+              raise SystemExit('Could not locate unique V2 authorization helper insertion point')
+
+          helper = (
+              '\ndef _human_actor_id(human_principal: HumanPrincipal) -> str:\n'
+              '    return human_principal.subject\n\n\n'
+              'def _authorize_booking(\n'
+          )
+          source = source.replace(authorize_anchor, helper, 1)
+          source = source.replace(bad, '_human_actor_id(human_principal)')
+          source_path.write_text(source)
+
+          test_path = Path('tests/test_uc03_document_capture_v2.py')
+          tests = test_path.read_text()
+          old_import = 'from audit_core.uc03_document_capture_v2 import _build_capture_response\n'
+          new_import = (
+              'from audit_core.security import HumanPrincipal\n'
+              'from audit_core.uc03_document_capture_v2 import _build_capture_response, _human_actor_id\n'
+          )
+          if old_import not in tests:
+              raise SystemExit('Could not locate V2 capture test import anchor')
+          tests = tests.replace(old_import, new_import, 1)
+
+          regression = '''\n\ndef test_v2_actor_id_uses_human_principal_subject() -> None:\n    principal = HumanPrincipal(subject="pc-user-123")\n\n    assert _human_actor_id(principal) == "pc-user-123"\n'''
+          if 'test_v2_actor_id_uses_human_principal_subject' in tests:
+              raise SystemExit('Regression test already exists unexpectedly')
+          test_path.write_text(tests.rstrip() + regression + '\n')
+          PY
+
+          if grep -R "human_principal\.actor_id" -n src/audit_core/uc03_document_capture_v2.py; then
+            echo '::error::Invalid HumanPrincipal.actor_id reference remains in V2 capture code.'
+            exit 1
+          fi
+
+          git rm .github/workflows/one-shot-v2-human-principal-fix.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/audit_core/uc03_document_capture_v2.py tests/test_uc03_document_capture_v2.py
+          git commit -m 'fix(v2): use human principal subject as actor id'
+          git push origin HEAD:fix/v2-human-principal-actor-id
