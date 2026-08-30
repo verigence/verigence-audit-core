@@ -18,6 +18,7 @@ from audit_core.security_authorization import (
     SecurityAuthorizationError,
     get_security_authorization_client,
 )
+from audit_core.uc03_fast_work_items import list_first_work_items_fast
 from audit_core.uc03_work_items import WorkItemPage, WorkType, list_work_items
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/uc03", tags=["uc03-work-items"])
@@ -243,7 +244,7 @@ def get_dashboard_bootstrap(
     connection: Annotated[Connection, Depends(get_connection)],
     outlet_id: Annotated[UUID | None, Query(alias="outletId")] = None,
 ) -> DashboardBootstrap:
-    """Return landing metrics and the first work-items page in one page-bootstrap call."""
+    """Return landing metrics and the optimized first Work Queue page in one request."""
 
     metrics = get_landing_metrics(
         tenant_id=tenant_id,
@@ -252,16 +253,12 @@ def get_dashboard_bootstrap(
         connection=connection,
         outlet_id=outlet_id,
     )
-    work_items = list_authorized_work_items(
+    work_items = list_first_work_items_fast(
         tenant_id=tenant_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
         connection=connection,
-        work_type="ALL",
-        from_date=None,
-        to_date=None,
         outlet_id=outlet_id,
         limit=10,
-        cursor=None,
     )
     return DashboardBootstrap(metrics=metrics, workItems=work_items)
