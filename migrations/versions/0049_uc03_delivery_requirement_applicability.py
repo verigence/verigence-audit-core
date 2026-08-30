@@ -1,6 +1,6 @@
 """Correct UC03 Delivery document applicability.
 
-Revision ID: 0049_uc03_delivery_req_applicability
+Revision ID: 0049_uc03_delivery_applicability
 Revises: 0048_uc03_di_core_fields
 Create Date: 2026-08-30
 
@@ -16,18 +16,10 @@ for future journeys. Delivery remains non-blocking.
 
 from alembic import op
 
-revision = "0049_uc03_delivery_req_applicability"
+revision = "0049_uc03_delivery_applicability"
 down_revision = "0048_uc03_di_core_fields"
 branch_labels = None
 depends_on = None
-
-_CONDITIONAL_KEYS = (
-    "accessory_invoice_dms",
-    "accessory_invoice_tally",
-    "rto_challan",
-    "ew_invoice",
-    "rsa_invoice",
-)
 
 
 def upgrade() -> None:
