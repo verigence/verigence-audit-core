@@ -1,6 +1,6 @@
 """Add reference-only UC03 Booking Review exception decisions.
 
-Revision ID: 0039_uc03_booking_review_decisions
+Revision ID: 0039_uc03_review_decisions
 Revises: 0038_uc03_tentative_sku
 Create Date: 2026-08-30
 
@@ -11,7 +11,7 @@ remain owned by Document Intelligence.
 
 from alembic import op
 
-revision = "0039_uc03_booking_review_decisions"
+revision = "0039_uc03_review_decisions"
 down_revision = "0038_uc03_tentative_sku"
 branch_labels = None
 depends_on = None
