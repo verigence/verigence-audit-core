@@ -28,9 +28,15 @@ from audit_core.uc03_booking_commands import (
     _append_workflow_event,
     _parse_if_match,
 )
+from audit_core.uc03_v2_review_materialization import (
+    materialize_reviewed_booking_receipts,
+    receipt_document_ordinals,
+    receipt_review_key,
+)
 
 DecisionValue = Literal["ACCEPTED", "REJECTED"]
 ReviewKind = Literal["ATTRIBUTE", "RAW_FIELD"]
+_RECEIPT_DOCUMENT_TYPE = "dealer_receipt"
 
 
 class BookingReviewDecisionCommand(BaseModel):
@@ -126,45 +132,70 @@ def _mapped_review_items(
     return items
 
 
+def _build_raw_review_item(
+    review_key: str,
+    sources: list[review_v2.ReviewV2UnmappedField],
+) -> _ReviewItem | None:
+    populated = [source for source in sources if _has_value(source.value)]
+    if not populated:
+        return None
+    selected = min(
+        populated,
+        key=lambda source: (
+            -(source.confidenceScore if source.confidenceScore is not None else -1.0),
+            source.documentLabel.casefold(),
+            str(source.documentId),
+            source.canonicalFieldId,
+            source.sourceFactVersion,
+        ),
+    )
+    distinct_values = {_normalized_value(source.value) for source in populated}
+    low_confidence = (
+        selected.confidenceScore is None
+        or selected.confidenceScore < review_v2._REVIEW_THRESHOLD
+    )
+    return _ReviewItem(
+        review_key=review_key,
+        review_kind="RAW_FIELD",
+        decision_required=len(distinct_values) > 1 or low_confidence,
+        source_set_ref=_source_set_ref(sources),
+        source_document_id=selected.documentId,
+        source_canonical_field_id=selected.canonicalFieldId,
+        source_field_key=selected.fieldKey,
+        source_fact_version=selected.sourceFactVersion,
+    )
+
+
 def _raw_review_items(
     unmapped: list[review_v2.ReviewV2UnmappedField],
 ) -> list[_ReviewItem]:
     grouped: dict[str, list[review_v2.ReviewV2UnmappedField]] = {}
+    receipt_grouped: dict[
+        tuple[UUID, str], list[review_v2.ReviewV2UnmappedField]
+    ] = {}
+    receipt_document_ids: list[UUID] = []
+
     for field in unmapped:
-        grouped.setdefault(field.fieldKey, []).append(field)
+        if str(field.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE:
+            receipt_grouped.setdefault((field.documentId, field.fieldKey), []).append(field)
+            receipt_document_ids.append(field.documentId)
+        else:
+            grouped.setdefault(field.fieldKey, []).append(field)
 
     items: list[_ReviewItem] = []
     for field_key, sources in grouped.items():
-        populated = [source for source in sources if _has_value(source.value)]
-        if not populated:
-            continue
-        selected = sorted(
-            populated,
-            key=lambda source: (
-                -(source.confidenceScore if source.confidenceScore is not None else -1.0),
-                source.documentLabel.casefold(),
-                str(source.documentId),
-                source.canonicalFieldId,
-                source.sourceFactVersion,
-            ),
-        )[0]
-        distinct_values = {_normalized_value(source.value) for source in populated}
-        low_confidence = (
-            selected.confidenceScore is None
-            or selected.confidenceScore < review_v2._REVIEW_THRESHOLD
+        item = _build_raw_review_item(f"raw:{field_key}", sources)
+        if item is not None:
+            items.append(item)
+
+    ordinals = receipt_document_ordinals(receipt_document_ids)
+    for (document_id, field_key), sources in receipt_grouped.items():
+        item = _build_raw_review_item(
+            receipt_review_key(ordinals[document_id], field_key),
+            sources,
         )
-        items.append(
-            _ReviewItem(
-                review_key=f"raw:{field_key}",
-                review_kind="RAW_FIELD",
-                decision_required=len(distinct_values) > 1 or low_confidence,
-                source_set_ref=_source_set_ref(sources),
-                source_document_id=selected.documentId,
-                source_canonical_field_id=selected.canonicalFieldId,
-                source_field_key=selected.fieldKey,
-                source_fact_version=selected.sourceFactVersion,
-            )
-        )
+        if item is not None:
+            items.append(item)
     return items
 
 
@@ -551,6 +582,14 @@ def confirm_booking_review_v2_with_decisions(
                     owning_record_reference=owning_record_reference,
                 )
 
+        receipt_result = materialize_reviewed_booking_receipts(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            documents=documents,
+            rejected_review_keys=rejected_keys,
+        )
+
         next_version = expected_version + 1
         connection.execute(
             text(
@@ -582,6 +621,12 @@ def confirm_booking_review_v2_with_decisions(
                 "reviewOnlyAttributeKeys": sorted(review_only),
                 "conflictAttributeKeys": sorted(conflicts),
                 "rejectedReviewKeys": sorted(rejected_keys),
+                "receiptPaymentsCreated": receipt_result["created"],
+                "receiptPaymentsUpdated": receipt_result["updated"],
+                "receiptPaymentsUnchanged": receipt_result["unchanged"],
+                "receiptPaymentsSkippedWithoutAmount": receipt_result[
+                    "skippedWithoutAmount"
+                ],
                 "rawDiValuesCopied": False,
             },
             aggregate_version=next_version,
