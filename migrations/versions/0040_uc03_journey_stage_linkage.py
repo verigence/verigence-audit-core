@@ -1,7 +1,7 @@
 """Establish explicit UC03 Journey/Booking/Delivery/Customer/Payment linkage.
 
-Revision ID: 0040_uc03_stage_linkage
-Revises: 0039_uc03_booking_fields
+Revision ID: 0041_uc03_stage_linkage
+Revises: 0040_uc03_booking_fields
 Create Date: 2026-08-30
 
 Forward foreign keys remain the integrity source of truth. Reverse identifiers on
@@ -10,8 +10,8 @@ we do not introduce cyclic delete dependencies into the existing Journey model.
 """
 from alembic import op
 
-revision = "0040_uc03_stage_linkage"
-down_revision = "0039_uc03_booking_fields"
+revision = "0041_uc03_stage_linkage"
+down_revision = "0040_uc03_booking_fields"
 branch_labels = None
 depends_on = None
 
