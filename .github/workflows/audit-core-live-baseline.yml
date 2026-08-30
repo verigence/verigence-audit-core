@@ -48,6 +48,7 @@ jobs:
           python - <<'PY'
           import json, os, subprocess
           from pathlib import Path
+          from urllib.parse import urlparse
           import psycopg
 
           def load(path):
@@ -56,74 +57,95 @@ jobs:
           def normalize(url):
               return str(url or '').replace('postgresql+psycopg://','postgresql://',1).replace('postgresql+asyncpg://','postgresql://',1)
 
+          def externally_reachable(values, *keys):
+              for key in keys:
+                  value=normalize(values.get(key))
+                  if not value:
+                      continue
+                  host=(urlparse(value).hostname or '').lower()
+                  if host and not host.endswith('.railway.internal'):
+                      return value
+              return None
+
           def latest(path):
               rows=load(path)
-              row=rows[0] if rows else {}
-              meta=row.get('meta') if isinstance(row.get('meta'),dict) else {}
-              return row, meta
+              return rows[0] if rows else {}
 
           av=load('/tmp/verigence_audit_core_vars.json')
           sv=load('/tmp/security_vars.json')
           dv=load('/tmp/di_api_vars.json')
-          au=normalize(av.get('DATABASE_URL'))
-          su=normalize(sv.get('DATABASE_URL'))
-          du=normalize(dv.get('DI_DATABASE_URL') or dv.get('DATABASE_URL'))
-          if not all([au,su,du]):
-              raise SystemExit('One or more DEV database URLs are missing')
+
+          # GitHub-hosted runners cannot resolve Railway private DNS names such as
+          # postgres.railway.internal. Use an explicitly available public/TCP-proxy
+          # URL when present; otherwise record that DB inspection is private-network
+          # only instead of turning a diagnostic baseline into a false deployment failure.
+          au=externally_reachable(av, 'DATABASE_PUBLIC_URL', 'DATABASE_URL')
+          su=externally_reachable(sv, 'DATABASE_PUBLIC_URL', 'DATABASE_URL')
+          du=externally_reachable(dv, 'DI_DATABASE_PUBLIC_URL', 'DATABASE_PUBLIC_URL', 'DI_DATABASE_URL', 'DATABASE_URL')
 
           source_head=subprocess.check_output(['alembic','heads'],text=True).strip()
           source_0012=Path('migrations/versions/0012_uc03_delivery_capture.py').exists()
 
-          with psycopg.connect(au) as a, psycopg.connect(su) as s, psycopg.connect(du) as d:
-              with a.cursor() as c:
-                  c.execute('select version_num from alembic_version')
-                  db_rev=c.fetchone()[0]
-                  c.execute('select tenant_id::text, project_name, project_status from auditcore.projects order by created_at_utc')
-                  projects=c.fetchall()
+          db_status='AVAILABLE'
+          db_rev='UNAVAILABLE_FROM_GITHUB_RUNNER'
+          projects=[]
+          tenants=[]
+          configuring=[]
+          project_details=[]
+          orphan=[]
+          cfg_with_project=[]
+          cfg_with_docs=[]
 
-              with s.cursor() as c:
-                  c.execute('select tenant_id::text, tenant_name, status from security.tenants order by created_at_utc')
-                  tenants=c.fetchall()
+          if all([au,su,du]):
+              with psycopg.connect(au) as a, psycopg.connect(su) as s, psycopg.connect(du) as d:
+                  with a.cursor() as c:
+                      c.execute('select version_num from alembic_version')
+                      db_rev=c.fetchone()[0]
+                      c.execute('select tenant_id::text, project_name, project_status from auditcore.projects order by created_at_utc')
+                      projects=c.fetchall()
 
-              tenant_by_id={row[0]: row for row in tenants}
-              configuring=[t for t in tenants if str(t[2])=='CONFIGURING']
-              project_ids={p[0] for p in projects}
-              project_details=[]
-              orphan=[]
-              cfg_with_project=[]
-              cfg_with_docs=[]
+                  with s.cursor() as c:
+                      c.execute('select tenant_id::text, tenant_name, status from security.tenants order by created_at_utc')
+                      tenants=c.fetchall()
 
-              for tid,name,project_status in projects:
-                  security_row=tenant_by_id.get(tid)
-                  security_status=str(security_row[2]) if security_row else 'MISSING'
-                  with d.cursor() as c:
-                      c.execute('select exists (select 1 from docintel.documents where tenant_id=%s)',(tid,))
-                      docs=bool(c.fetchone()[0])
-                      c.execute('select (select count(*) from docintel.tenant_settings where tenant_id=%s)+(select count(*) from docintel.retention_policies where tenant_id=%s)+(select count(*) from docintel.tenant_document_types where tenant_id=%s)',(tid,tid,tid))
-                      prov=int(c.fetchone()[0])
-                  project_details.append((tid,name,project_status,security_status,prov,docs))
+                  tenant_by_id={row[0]: row for row in tenants}
+                  configuring=[t for t in tenants if str(t[2])=='CONFIGURING']
+                  project_ids={p[0] for p in projects}
 
-              for tid,name,status in configuring:
-                  with d.cursor() as c:
-                      c.execute('select exists (select 1 from docintel.documents where tenant_id=%s)',(tid,))
-                      docs=bool(c.fetchone()[0])
-                      c.execute('select (select count(*) from docintel.tenant_settings where tenant_id=%s)+(select count(*) from docintel.retention_policies where tenant_id=%s)+(select count(*) from docintel.tenant_document_types where tenant_id=%s)',(tid,tid,tid))
-                      prov=int(c.fetchone()[0])
-                  if tid in project_ids:
-                      cfg_with_project.append((tid,name))
-                  elif docs:
-                      cfg_with_docs.append((tid,name))
-                  else:
-                      orphan.append((tid,name,prov))
+                  for tid,name,project_status in projects:
+                      security_row=tenant_by_id.get(tid)
+                      security_status=str(security_row[2]) if security_row else 'MISSING'
+                      with d.cursor() as c:
+                          c.execute('select exists (select 1 from docintel.documents where tenant_id=%s)',(tid,))
+                          docs=bool(c.fetchone()[0])
+                          c.execute('select (select count(*) from docintel.tenant_settings where tenant_id=%s)+(select count(*) from docintel.retention_policies where tenant_id=%s)+(select count(*) from docintel.tenant_document_types where tenant_id=%s)',(tid,tid,tid))
+                          prov=int(c.fetchone()[0])
+                      project_details.append((tid,name,project_status,security_status,prov,docs))
 
-          ar,am=latest('/tmp/verigence_audit_core_deploy.json')
-          sr,sm=latest('/tmp/security_deploy.json')
-          dr,dm=latest('/tmp/di_api_deploy.json')
+                  for tid,name,status in configuring:
+                      with d.cursor() as c:
+                          c.execute('select exists (select 1 from docintel.documents where tenant_id=%s)',(tid,))
+                          docs=bool(c.fetchone()[0])
+                          c.execute('select (select count(*) from docintel.tenant_settings where tenant_id=%s)+(select count(*) from docintel.retention_policies where tenant_id=%s)+(select count(*) from docintel.tenant_document_types where tenant_id=%s)',(tid,tid,tid))
+                          prov=int(c.fetchone()[0])
+                      if tid in project_ids:
+                          cfg_with_project.append((tid,name))
+                      elif docs:
+                          cfg_with_docs.append((tid,name))
+                      else:
+                          orphan.append((tid,name,prov))
+          else:
+              db_status='PRIVATE_NETWORK_ONLY'
+
+          ar=latest('/tmp/verigence_audit_core_deploy.json')
+          sr=latest('/tmp/security_deploy.json')
+          dr=latest('/tmp/di_api_deploy.json')
           out=[
               'AUDIT_CORE_LIVE_BASELINE',
               f'CHECKED_GITHUB_SHA={os.environ.get("GITHUB_SHA","")}',
               f'SOURCE_ALEMBIC_HEAD={source_head}',
               f'SOURCE_0012_FILE_PRESENT={str(source_0012).lower()}',
+              f'DB_INSPECTION_STATUS={db_status}',
               f'DB_ALEMBIC_VERSION={db_rev}',
               f'AUDIT_CORE_DEPLOYMENT_STATUS={ar.get("status","")}',
               f'AUDIT_CORE_DEPLOYMENT_CREATED_AT={ar.get("createdAt","")}',
@@ -131,17 +153,23 @@ jobs:
               f'SECURITY_DEPLOYMENT_CREATED_AT={sr.get("createdAt","")}',
               f'DI_DEPLOYMENT_STATUS={dr.get("status","")}',
               f'DI_DEPLOYMENT_CREATED_AT={dr.get("createdAt","")}',
-              f'DB_PROJECT_COUNT={len(projects)}',
-              f'SECURITY_TENANT_COUNT={len(tenants)}',
-              f'SECURITY_CONFIGURING_COUNT={len(configuring)}',
-              f'CONFIGURING_WITH_PROJECT={len(cfg_with_project)}',
-              f'CONFIGURING_WITH_DI_DOCUMENTS_NO_PROJECT={len(cfg_with_docs)}',
-              f'ORPHAN_CANDIDATE_COUNT={len(orphan)}',
           ]
-          for i,(tid,name,project_status,security_status,prov,docs) in enumerate(project_details,1):
-              out.append(f'PROJECT_{i}={name}|PROJECT_STATUS={project_status}|SECURITY_STATUS={security_status}|DI_PROVISIONING_ROWS={prov}|DI_DOCUMENTS={str(docs).lower()}|{tid}')
-          for i,(tid,name,prov) in enumerate(orphan,1):
-              out.append(f'ORPHAN_{i}={name}|DI_PROVISIONING_ROWS={prov}|{tid}')
+          if db_status == 'AVAILABLE':
+              out.extend([
+                  f'DB_PROJECT_COUNT={len(projects)}',
+                  f'SECURITY_TENANT_COUNT={len(tenants)}',
+                  f'SECURITY_CONFIGURING_COUNT={len(configuring)}',
+                  f'CONFIGURING_WITH_PROJECT={len(cfg_with_project)}',
+                  f'CONFIGURING_WITH_DI_DOCUMENTS_NO_PROJECT={len(cfg_with_docs)}',
+                  f'ORPHAN_CANDIDATE_COUNT={len(orphan)}',
+              ])
+              for i,(tid,name,project_status,security_status,prov,docs) in enumerate(project_details,1):
+                  out.append(f'PROJECT_{i}={name}|PROJECT_STATUS={project_status}|SECURITY_STATUS={security_status}|DI_PROVISIONING_ROWS={prov}|DI_DOCUMENTS={str(docs).lower()}|{tid}')
+              for i,(tid,name,prov) in enumerate(orphan,1):
+                  out.append(f'ORPHAN_{i}={name}|DI_PROVISIONING_ROWS={prov}|{tid}')
+          else:
+              out.append('DB_INSPECTION_NOTE=Railway private database DNS is intentionally unavailable from GitHub-hosted runners; fresh migration and deployed smoke are enforced by the Audit Core CI/deploy workflow.')
+
           Path('docs/runtime').mkdir(parents=True,exist_ok=True)
           Path('docs/runtime/audit-core-live-baseline.txt').write_text('\n'.join(out)+'\n')
           print('\n'.join(out))
@@ -158,6 +186,7 @@ jobs:
             case "$domain" in http://*|https://*) base="${domain%/}" ;; *) base="https://${domain%/}" ;; esac
             code="$(curl -sS -o /tmp/health -w '%{http_code}' "$base/health" || true)"
             echo "LIVE_HEALTH_HTTP=$code" >> docs/runtime/audit-core-live-baseline.txt
+            test "$code" = "200"
           else
             echo 'LIVE_HEALTH_HTTP=NO_PUBLIC_DOMAIN' >> docs/runtime/audit-core-live-baseline.txt
           fi
