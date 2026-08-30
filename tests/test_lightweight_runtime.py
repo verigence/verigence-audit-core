@@ -62,7 +62,7 @@ def test_admin_context_is_reused_for_short_page_bursts(monkeypatch) -> None:  # 
     dependencies._admin_context_cache.clear()
 
 
-def test_postgresql_engine_uses_low_roundtrip_pool_configuration(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_postgresql_engine_uses_resilient_pool_configuration(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     observed: dict[str, object] = {}
     sentinel = object()
 
@@ -79,7 +79,7 @@ def test_postgresql_engine_uses_low_roundtrip_pool_configuration(monkeypatch) ->
     finally:
         dependencies._engine.cache_clear()
 
-    assert observed["pool_pre_ping"] is False
+    assert observed["pool_pre_ping"] is True
     assert observed["pool_timeout"] == 5
     assert observed["pool_recycle"] == 600
     assert observed["pool_use_lifo"] is True
