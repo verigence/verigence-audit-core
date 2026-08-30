@@ -1,9 +1,11 @@
 # UC03 Document Capture V2 — Frozen Design
 
 **Date:** 2026-08-29  
-**Status:** FROZEN FOR IMPLEMENTATION  
+**Status:** FROZEN FOR IMPLEMENTATION — REVIEW UX AMENDED 2026-08-30  
 **Scope:** New parallel Document Capture V2 path for Booking and Delivery  
-**Legacy impact:** NONE. Existing Booking/Delivery UI, V1 APIs, adapters and behavior remain unchanged.
+**Legacy impact:** Existing capture contracts remain compatible. The common review mapping now also governs safe V1 typed projection.
+
+> **2026-08-30 amendment:** Screen 3 / post-Delivery audit review is superseded where necessary by `UC03_ATTRIBUTE_AUDIT_REVIEW_DESIGN_2026-08-30.md`. In particular, numeric confidence is now intentionally visible in Review, the primary Booking Review is attribute-centric, and Audit Core does not duplicate unchanged DI machine facts.
 
 ## 1. Source material and precedence
 
@@ -13,7 +15,7 @@ This design is grounded in:
 2. the uploaded field/source workbook `b89992d0-d386-45d2-a1db-1e1be331979a.xlsx`;
 3. the existing Audit Core document-requirement master;
 4. the deployed DI Schema V2 extraction/lineage contract; and
-5. the business decisions confirmed on 2026-08-29.
+5. the business decisions confirmed on 2026-08-29 and Review amendment confirmed on 2026-08-30.
 
 For the workbook, only the generic left-hand **B:K** block is global policy. The right-hand **Basant Swain** block is a worked case and MUST NOT be seeded as global policy.
 
@@ -23,12 +25,12 @@ The generic workbook block contains 115 attributes. 66 have an explicit `Final S
 
 Document Capture V2 is additive and parallel.
 
-- Do not change an existing V1 endpoint request/response contract.
-- Do not change an existing adapter contract.
+- Do not change an existing V1 endpoint request/response contract without an explicit compatibility amendment.
 - Existing adapters/services may be reused exactly as-is.
-- If different behavior is required, add a V2 API/module/adapter.
+- If different capture behavior is required, add a V2 API/module/adapter.
 - Legacy Booking and Delivery must remain usable while V2 is piloted.
 - V2 may be hidden/disabled without a database rollback.
+- The common attribute mapping may be shared by V1 and V2 after DI extraction because it is a business/audit semantic layer, not a capture transport contract.
 
 ## 3. Business processes
 
@@ -102,16 +104,31 @@ The legacy Screen 2 remains unchanged.
 
 Booking is submitted on Screen 2.
 
-### Screen 3 — Review V2
+### Screen 3 — Booking Attribute Review V2
 
-After Booking submit, navigate to the new V2 Review.
+After Booking submit, navigate to the V2 Review.
+
+The **primary Review is attribute-centric**, not document-centric. It uses the common explicit UC03 Excel/business-attribute mapping.
+
+Show:
+
+- Attribute / Excel field number;
+- resolved extracted value;
+- **numeric confidence score**;
+- selected document type/source;
+- `Ready` / `Needs Review` state;
+- `View evidence` link.
+
+Rules:
 
 - Show extracted values progressively as DI completes extraction.
-- Do not display numeric confidence scores.
-- A field with confidence **< 92%** is marked `Needs review`.
+- A field with confidence **< 92%** is marked `Needs Review`.
 - Confidence **>= 92%** does not create a confidence-only review task.
 - Review may open while some documents are still extracting; it must clearly show processing state without blocking the already-completed Booking.
-- PC can view the source document for an extracted value.
+- PC/TL can click any selected source value and open the original document on the correct page with DI's `evidenceRegion` box highlighted.
+- The older document-wise list remains a secondary evidence inventory.
+- PC confirmation is blocked while extraction is pending or any document has failed processing.
+- On confirmation, Audit Core re-reads DI server-side and writes only attributes with an explicitly approved typed owner. Raw DI facts are not copied.
 
 ## 5. Performance contract
 
@@ -160,6 +177,8 @@ Audit Core stores only linkage/capture state and DI document IDs; it does not du
 
 Audit Core periodically/read-time reconciles its active V2 links with DI V2 document status. Reconciliation is idempotent.
 
+Review adds only reference-level provenance (`journey_attribute_resolutions`) when a supported attribute is confirmed. Value/confidence/page/box stay in DI.
+
 ## 7. Delete and replacement rules
 
 ### OPEN phase
@@ -198,7 +217,7 @@ DI preserves every extracted value with its document lineage. Audit Core V2 expo
 
 For a given attribute, values may accumulate from Booking and later Delivery documents. Earlier candidate values are not overwritten merely because a later source arrives.
 
-The workbook `Final Source of truth` determines the authoritative value when that source becomes available.
+The workbook `Final Source of truth` determines the authoritative value when that source becomes available, subject to an explicitly approved source-label → DI document-type mapping.
 
 Rules:
 
@@ -206,10 +225,16 @@ Rules:
 - a supporting source never silently becomes the final authority when a configured final source is absent;
 - if a final-source document is due but absent, raise/recompute `FINAL_SOURCE_DOCUMENT_MISSING`;
 - if the final-source document exists but the attribute is absent, raise/recompute `FINAL_SOURCE_FIELD_MISSING`;
-- if an extracted field confidence is <92%, expose `Needs review` without exposing the numeric confidence to PC;
+- if an extracted field confidence is <92%, expose `Needs Review` **and display the numeric confidence in the Review/Audit UI**;
 - source-of-truth rules are evaluated when the corresponding source is due; Delivery-only sources must not create false Booking-stage missing flags.
 
 The exact workbook source labels are preserved. A source label is mapped to a DI `document_type_key` only when that mapping is explicitly supported by the existing document catalogue/design. Unresolved source aliases remain visible configuration work; they are not guessed.
+
+After Delivery submission the Audit UI renders a live cross-source table:
+
+`Attribute | Resolved Value | actual source document columns... | Match/Mismatch/Single Source/Not Available`
+
+Each source value links to the exact boxed document evidence. This table is a projection over DI facts, not duplicated Audit Core storage.
 
 ## 9. Audit recomputation
 
@@ -237,6 +262,8 @@ At minimum V2 supports/recomputes these finding classes:
 
 Delivery uses the same V2 capture engine and phase-lock semantics. Audit Core supplies the Delivery REQUIRED/CONDITIONAL/OPTIONAL document list from its master. Delivery-specific implementation follows Booking V2 after the Booking vertical slice is proven; no second document-capture architecture is introduced.
 
+After Delivery submission, the Audit Review consumes Booking + Delivery DI facts through the same common attribute mapper and displays the cross-source comparison view defined in the 2026-08-30 amendment.
+
 ## 11. Rollout
 
 V2 is exposed in parallel with the legacy flow.
@@ -244,3 +271,9 @@ V2 is exposed in parallel with the legacy flow.
 - `document_capture_v2_enabled = true|false`
 - legacy remains visible during pilot.
 - when V2 is proven, legacy can be hidden without changing the V2 contracts or migrating evidence back into legacy capture tables.
+
+## 12. Review amendment reference
+
+The detailed mapping, PC confirmation rules, V1 no-duplication correction, evidence viewer, API contracts and post-Delivery comparison are defined in:
+
+`docs/uc-003-booking-delivery-audit/UC03_ATTRIBUTE_AUDIT_REVIEW_DESIGN_2026-08-30.md`

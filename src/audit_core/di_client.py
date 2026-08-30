@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Self
@@ -633,6 +634,17 @@ def _optional_float(payload: dict[str, Any], key: str) -> float | None:
     value = payload.get(key)
     if value is None:
         return None
-    if not isinstance(value, int | float) or isinstance(value, bool):
+    if isinstance(value, bool):
         raise _contract_error()
-    return float(value)
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+    elif isinstance(value, str):
+        try:
+            parsed = float(value.strip())
+        except ValueError as exc:
+            raise _contract_error() from exc
+    else:
+        raise _contract_error()
+    if not math.isfinite(parsed):
+        raise _contract_error()
+    return parsed

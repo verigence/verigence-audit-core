@@ -18,11 +18,11 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.uc03_attribute_mapping import spec_for_field
+from audit_core.uc03_attribute_resolution import apply_supported_operational_attribute
 from audit_core.uc03_booking_capture import (
-    _PROPOSAL_CAPTURE_MAP,
     _require_active_booking,
     _scope,
-    _write_typed_capture,
 )
 from audit_core.uc03_booking_commands import (
     _aggregate_lock,
@@ -104,6 +104,7 @@ def _stored_field_count(
                 WHERE tenant_id=:tenant_id
                   AND journey_id=:journey_id
                   AND di_document_id=:document_id
+                  AND modified_value IS NOT NULL
                 """
             ),
             {
@@ -125,28 +126,25 @@ def _store_fields(
     actor_id: str,
     fields: list[DirectExtractedField],
 ) -> None:
-    if not fields:
+    """Persist human corrections only; unchanged DI machine facts remain in DI."""
+
+    corrected_fields = [field for field in fields if field.modifiedValue is not None]
+    if not corrected_fields:
         return
-    rows = []
-    for field in fields:
-        modified = field.modifiedValue is not None
-        rows.append(
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "evidence_id": evidence_id,
-                "document_id": document_id,
-                "source_fact_ref": field.sourceFactRef,
-                "source_fact_version": field.sourceFactVersion,
-                "field_key": field.fieldKey.strip().lower(),
-                "extracted_value": json.dumps(field.extractedValue, default=str),
-                "modified_value": (
-                    json.dumps(field.modifiedValue, default=str) if modified else None
-                ),
-                "confidence_score": field.confidenceScore,
-                "modified_by_actor_id": actor_id if modified else None,
-            }
-        )
+    rows = [
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "evidence_id": evidence_id,
+            "document_id": document_id,
+            "source_fact_ref": field.sourceFactRef,
+            "source_fact_version": field.sourceFactVersion,
+            "field_key": field.fieldKey.strip().lower(),
+            "modified_value": json.dumps(field.modifiedValue, default=str),
+            "modified_by_actor_id": actor_id,
+        }
+        for field in corrected_fields
+    ]
     connection.execute(
         text(
             """
@@ -158,9 +156,8 @@ def _store_fields(
             ) VALUES (
                 :tenant_id, :journey_id, :evidence_id, :document_id,
                 :source_fact_ref, :source_fact_version, :field_key,
-                CAST(:extracted_value AS jsonb), CAST(:modified_value AS jsonb),
-                :confidence_score, :modified_by_actor_id,
-                CASE WHEN :modified_by_actor_id IS NULL THEN NULL ELSE now() END
+                NULL, CAST(:modified_value AS jsonb), NULL,
+                :modified_by_actor_id, now()
             )
             ON CONFLICT (
                 tenant_id, journey_id, di_document_id,
@@ -168,9 +165,9 @@ def _store_fields(
             ) DO UPDATE SET
                 evidence_id=EXCLUDED.evidence_id,
                 field_key=EXCLUDED.field_key,
-                extracted_value=EXCLUDED.extracted_value,
+                extracted_value=NULL,
                 modified_value=EXCLUDED.modified_value,
-                confidence_score=EXCLUDED.confidence_score,
+                confidence_score=NULL,
                 modified_by_actor_id=EXCLUDED.modified_by_actor_id,
                 modified_at_utc=EXCLUDED.modified_at_utc,
                 updated_at_utc=now()
@@ -186,7 +183,9 @@ def _project_known_field(
     tenant_id: str,
     journey_id: UUID,
     evidence_id: UUID,
+    document_id: UUID,
     document_type_key: str,
+    actor_id: str,
     field: DirectExtractedField,
 ) -> tuple[str, str] | None:
     source_field_key = field.fieldKey.strip().lower()
@@ -195,10 +194,6 @@ def _project_known_field(
         if document_type_key == _RECEIPT_DOCUMENT_TYPE
         else None
     )
-    capture_key = receipt_capture_key or _PROPOSAL_CAPTURE_MAP.get(source_field_key)
-    if capture_key is None:
-        return None
-
     value = field.modifiedValue if field.modifiedValue is not None else field.extractedValue
     if receipt_capture_key is not None:
         return _write_receipt_capture(
@@ -209,14 +204,24 @@ def _project_known_field(
             value=value,
             source_evidence_id=evidence_id,
         )
-    return _write_typed_capture(
+
+    spec = spec_for_field(source_field_key)
+    if spec is None:
+        return None
+    application = apply_supported_operational_attribute(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
-        field_key=capture_key,
+        spec=spec,
         value=value,
+        actor_id=actor_id,
+        source_document_type_key=document_type_key,
+        source_field_key=source_field_key,
         source_evidence_id=evidence_id,
     )
+    if application is None:
+        return None
+    return application[0], application[1]
 
 
 @router.post(
@@ -310,7 +315,9 @@ def submit_direct_document_field_review(
                         tenant_id=tenant_id,
                         journey_id=journey_id,
                         evidence_id=evidence_id,
+                        document_id=payload.documentId,
                         document_type_key=document_type_key,
+                        actor_id=human_principal.subject,
                         field=field,
                     )
                 if projected is not None:
@@ -318,7 +325,7 @@ def submit_direct_document_field_review(
             except Exception:
                 projection_failure_count += 1
                 logger.warning(
-                    "UC03 typed projection failed after generic DI field persistence",
+                    "UC03 typed projection failed after document review",
                     exc_info=True,
                     extra={
                         "tenant_id": tenant_id,
@@ -362,10 +369,12 @@ def submit_direct_document_field_review(
             safe_payload={
                 "requirementRef": str(payload.requirementRef),
                 "documentId": str(payload.documentId),
-                "storedFieldCount": len(payload.fields),
+                "reviewedFieldCount": len(payload.fields),
+                "storedCorrectionCount": modified_count,
                 "modifiedFieldCount": modified_count,
                 "projectedFieldCount": projected_count,
                 "projectionFailureCount": projection_failure_count,
+                "rawDiValuesCopied": False,
             },
             aggregate_version=next_version,
         )
@@ -393,7 +402,7 @@ def submit_direct_document_field_review(
             "documentId": str(payload.documentId),
             "aggregateVersion": next_version,
             "reviewEventId": str(review_event_id),
-            "storedFieldCount": len(payload.fields),
+            "storedFieldCount": modified_count,
             "modifiedFieldCount": modified_count,
             "projectedFieldCount": projected_count,
             "projectionFailureCount": projection_failure_count,
