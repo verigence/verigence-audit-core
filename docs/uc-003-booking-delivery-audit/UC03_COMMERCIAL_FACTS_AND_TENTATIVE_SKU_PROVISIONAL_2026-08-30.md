@@ -1,4 +1,4 @@
-# UC03 Commercial Facts + Tentative SKU Resolution — PROVISIONAL
+# UC03 Commercial Facts + Booking SKU Resolution — PROVISIONAL
 
 Date: 2026-08-30  
 Status: **PROVISIONAL — discussion/design checkpoint, not a final TL/PM view design**
@@ -8,24 +8,25 @@ Status: **PROVISIONAL — discussion/design checkpoint, not a final TL/PM view d
 This note preserves the decisions made while fixing two immediate UC03 gaps:
 
 1. commercial facts extracted from documents must not be discarded before Audit can use them; and
-2. Booking Form model + variant text may not uniquely identify the exact Product SKU, so Audit Core needs an advisory SKU-candidate service using Product/Price masters.
+2. Audit Core should resolve a Product SKU directly from Booking Form evidence when the evidence uniquely identifies one master row, while retaining tentative candidates only when the Booking evidence remains ambiguous.
 
-The wider Review/TL/PM experience, Deal Integrity views, notification presentation, and final confirmation workflow are **not finalized by this note**.
+The wider Review/TL/PM experience, Deal Integrity views, notification presentation, and Delivery validation workflow are **not finalized by this note**.
 
 ## 2. Ownership boundary
 
 ### DI remains the source of truth for document extraction
 
 - DI stores the document and extracted machine facts.
-- Audit Core does **not** copy the entire DI extraction payload into its own transactional model.
+- Audit Core does **not** copy the entire DI extraction payload into its transactional model.
 - Audit Core consumes required extracted facts through the DI contract/API when business logic needs them.
 - Machine value, extraction confidence and source lineage remain DI facts.
+- If an SKU/product code is explicitly printed on a Booking Form, DI may extract `sku_code` exactly as visible; DI must never infer that code.
 
 ### Audit Core remains the source of truth for business interpretation
 
 - Product/Price masters remain Audit Core business masters.
-- SKU deduction is business logic and therefore belongs in Audit Core.
-- A deduced SKU is not treated as a document-extracted fact; it is an Audit Core inference based on evidence + masters.
+- Mapping Booking evidence to a Product SKU is business logic and therefore belongs in Audit Core.
+- A derived SKU is an Audit Core interpretation based on evidence + masters, not a DI-extracted fact unless the SKU code itself was explicitly visible.
 
 ## 3. Commercial-fact publication rule
 
@@ -33,25 +34,11 @@ Commercial facts are a cross-document exception to narrow UC03 document field al
 
 If DI extracts a canonical field whose semantic key represents money, price, cost, tax, discount, payment, balance, finance, invoice or similar commercial meaning, that field remains available to the audit-consumption stream even when the document type is not explicitly enumerated in the UC03 Booking profile.
 
-Examples include:
+Examples include `ex_showroom_price`, `insurance_amount`, `road_tax_registration`, `accessories_cost`, `other_charges`, `total_price`, `booking_amount_paid`, `balance_amount`, `mode_of_payment`, `payment_reference_no`, `invoice_value`, `dealer_discount_amount`, and `emi_amount`.
 
-- `ex_showroom_price`
-- `insurance_amount`
-- `road_tax_registration`
-- `accessories_cost`
-- `other_charges`
-- `total_price`
-- `booking_amount_paid`
-- `balance_amount`
-- `mode_of_payment`
-- `payment_reference_no`
-- `invoice_value`
-- `dealer_discount_amount`
-- `emi_amount`
+This does **not** make unrelated identity or personal fields authoritative.
 
-This does **not** make unrelated identity or personal fields authoritative. For example, a Booking Form customer name remains non-authoritative even though its commercial facts are retained.
-
-## 4. Tentative SKU candidate API
+## 4. Booking SKU resolution API
 
 ### Endpoint
 
@@ -63,48 +50,77 @@ This does **not** make unrelated identity or personal fields authoritative. For 
 {
   "modelName": "XUV 700",
   "variantName": "AX7L",
+  "colourName": "Red Rage",
+  "skuCode": "XUV700-AX7L-R",
   "totalCommercialAmount": 2500000,
   "currencyCode": "INR",
   "maxCandidates": 5
 }
 ```
 
-The intended caller supplies machine-observed Booking Form facts obtained from DI. Audit Core does not persist a second copy of those DI facts merely to perform this comparison.
+`variantName`, `colourName`, and `skuCode` are optional. Model and Booking commercial total are the primary comparison facts. The intended caller supplies machine-observed Booking Form facts obtained from DI.
 
-### Output + Booking-record rule
+## 5. Resolution hierarchy
 
-The API returns a ranked shortlist. Every returned candidate is always:
+The service must apply the following hierarchy before fuzzy ranking.
 
-- `candidateStatus = TENTATIVE`
-- `confirmationRequired = true`
+### A. Explicit SKU code from Booking Form
 
-The **highest-ranked credible candidate is also written into the existing `journey_products` Booking/Journey product record** with:
+If DI extracted an explicit `sku_code` and it maps to exactly one active/effective Product Master row:
 
-- `product_sku_id = <top candidate>`
-- `selection_source = EVIDENCE`
-- `selection_status = TENTATIVE`
-- `selection_method = BOOKING_COMMERCIAL_MATCH_V1`
-- `selection_score = <composite score>`
+- use that SKU directly;
+- store the Journey product as `CONFIRMED` for Booking resolution;
+- do **not** add the tentative `*` marker; and
+- still validate the booked product later against Delivery Invoice evidence.
 
-A tentative display should use an asterisk, for example:
+Selection method: `BOOKING_DIRECT_SKU_V1`.
+
+### B. Unique model + price mapping
+
+When no explicit SKU code resolves the product, Audit Core compares the Booking Form model and Booking total against effective Product/Price masters.
+
+A row is eligible for direct Booking resolution only when:
+
+- the normalized Booking model exactly matches the master model; and
+- the effective master commercial total is within the strict Booking-price tolerance.
+
+Variant and colour, when present in Booking evidence, are deterministic narrowing signals. If these Booking facts leave **exactly one** master row:
+
+- store that SKU as `CONFIRMED` for Booking resolution;
+- do **not** show `*`; and
+- validate it later against Delivery Invoice evidence.
+
+Selection method: `BOOKING_MODEL_PRICE_UNIQUE_V1`.
+
+### C. Multiple matching master rows
+
+If the Booking evidence leaves more than one matching SKU row, the result is ambiguous.
+
+Audit Core ranks those matching rows and:
+
+- returns the shortlist;
+- persists only the most likely row in `journey_products`;
+- sets `selection_status = TENTATIVE`;
+- sets `selection_method = BOOKING_MODEL_PRICE_MULTI_V1`; and
+- displays the tentative SKU with `*`.
+
+Example:
 
 `XUV700 AX7 L *`
 
-with the note:
+with:
 
-`* Tentative — confirmation required`
+`* Tentative — multiple Booking matches; confirmation required`
 
-If a SKU has already been explicitly confirmed, the inference service must **never overwrite it**. The service can still return candidate diagnostics, but the confirmed Booking product remains unchanged.
+### D. No strict Booking match
 
-If no candidate crosses the reliability floor, no random SKU is written.
+If no row meets the strict model/price rule, Audit Core may use deterministic fuzzy ranking across the bounded effective SKU set. Any result produced only by this fallback remains `TENTATIVE`; it is never silently promoted to confirmed.
 
-## 5. Processing design
+If no candidate crosses the reliability floor, no SKU is written.
 
-### Chosen approach: Master SQL + deterministic Python ranking
+## 6. Processing design
 
-The initial implementation intentionally does **not** use an LLM, embeddings or a vector database.
-
-#### Stage A — SQL master narrowing
+### Stage A — SQL master narrowing
 
 Audit Core uses the Booking business date and Project context to read only:
 
@@ -114,84 +130,71 @@ Audit Core uses the Booking business date and Project context to read only:
 
 Price components for each SKU are summed into a comparable master commercial total.
 
-This keeps the candidate population bounded to the Project's actual sellable configurations rather than comparing against an unconstrained catalogue.
+### Stage B — deterministic Booking resolution
 
-#### Stage B — Python deterministic scoring
+Before fuzzy scoring, the script attempts deterministic resolution in this order:
 
-Python scores the bounded candidate set using three explainable signals:
+1. exact explicit Booking SKU code;
+2. exact normalized Booking model + close Booking price;
+3. optional variant narrowing;
+4. optional colour narrowing.
 
-| Signal | Weight |
-|---|---:|
-| Model-name similarity | 40% |
-| Variant-name similarity | 35% |
-| Total-commercial proximity | 25% |
+Only a single remaining row is treated as directly resolved.
 
-Text normalization ignores punctuation, case and spacing so values such as `XUV 700` vs `XUV700`, or `AX7-L` vs `AX7 L`, can still match strongly.
+### Stage C — deterministic ranking for ambiguity
 
-Commercial proximity is based on percentage difference between the Booking Form total and the summed effective Price Master components. Commercial distance is intentionally a supporting signal, not the dominant signal, because different documents may present different total conventions.
+When multiple rows remain, Python ranks the bounded candidate set using explainable model, variant and commercial-proximity signals. This is used to order candidates, not to pretend that ambiguity has disappeared.
 
-Candidates below a minimum composite threshold are omitted rather than returning a misleading random SKU.
+The implementation intentionally does **not** use an LLM, embeddings or a vector database.
 
-## 6. Why this processing approach is preferred now
+## 7. Delivery Invoice validation
 
-For the current startup-scale master sizes, SQL + deterministic Python gives:
+A SKU that is uniquely resolved from Booking Form evidence does not need to remain tentative merely because Delivery has not happened yet.
 
-- low runtime cost;
-- no additional AI/token cost;
-- no new infrastructure;
-- predictable latency;
-- reproducible results;
-- easy audit explanation; and
-- straightforward unit testing.
+Delivery provides a separate lifecycle validation. When Delivery Invoice evidence becomes available, Audit should compare the delivered model/SKU facts with the Booking-resolved product and raise a mismatch when they disagree.
 
-An ML/embedding layer should only be considered later if real confirmation history demonstrates that deterministic matching cannot handle actual dealer naming variability.
+Therefore:
 
-## 7. Confirmation semantics
+- Booking resolution answers **what was booked**;
+- Delivery validation answers **whether what was delivered matches what was booked**.
 
-SKU candidate inference is **persisted but not authoritative**.
+These are separate checks and should not be collapsed into one tentative status.
 
-The service may write the top credible candidate to the Booking/Journey product record as `TENTATIVE`, but it does not:
+## 8. Existing confirmed SKU protection
 
-- mark the SKU as confirmed;
-- overwrite an already confirmed SKU;
-- change Product Master data;
-- change Price Master data; or
-- bypass later human/business confirmation.
+If `journey_products.selection_status = CONFIRMED` already exists, a later Booking inference/resolution call must not replace or downgrade it. Candidate diagnostics may still be returned, but the existing confirmed Journey product remains unchanged.
 
-The final confirmation actor and screen remain part of the broader Review design and are not finalized here.
-
-## 8. Important edge cases
+## 9. Important edge cases
 
 1. **Multiple Product Master versions on the same latest effective date for one Segment** — fail with master configuration conflict rather than choose arbitrarily.
 2. **No effective Price List** — fail rather than fabricate a price comparison.
-3. **Currency mismatch** — reject comparison when the caller supplies a currency different from the effective Price Master currency.
-4. **Price master contains only partial commercial components** — text signals can still rank candidates, but the result stays tentative. Component-level comparison can be added later.
-5. **Same model/variant/price across multiple colour SKUs** — multiple SKU candidates may legitimately remain. The top one may be stored as tentative, but confirmation is still required.
-6. **Existing confirmed product** — inference must not downgrade or replace it.
+3. **Currency mismatch** — reject comparison when the Booking currency differs from the effective Price Master currency.
+4. **Unique exact model + close price** — resolve directly; no tentative marker.
+5. **Same model/price across multiple SKU rows** — retain multiple candidates as tentative; variant/colour may narrow only when explicitly present in Booking evidence.
+6. **Price outside strict direct-resolution tolerance** — fuzzy ranking may still suggest candidates, but they remain tentative.
+7. **Existing confirmed product** — never downgrade or replace it.
 
-## 9. Deliberately deferred
+## 10. Deliberately deferred
 
-The following are **not finalized** and must not be inferred from this provisional note:
+The following remain outside this provisional note:
 
 - TL Review screen design;
 - PM Review screen design;
 - Deal Integrity/Commercial Integrity view layout;
-- final candidate-confirmation UI;
-- whether confirmation becomes an explicit audit observation or Booking amendment;
-- automatic triggering of SKU inference from DI completion;
+- final candidate-confirmation UI for genuinely ambiguous bookings;
+- automatic triggering of SKU resolution from DI completion;
 - persistence of the full candidate-history list;
-- use of confirmed matches as future learning data;
-- final scoring weights/tolerance after real project data is available; and
-- notification/timer behavior in the Review UI.
+- final price tolerance after real project data is available; and
+- exact Delivery Invoice mismatch presentation.
 
-## 10. Current implementation checkpoint
+## 11. Current implementation checkpoint
 
-The immediate implementation is intentionally narrow:
+The immediate implementation now covers:
 
-- DI commercial publication fix;
-- Audit Core tentative SKU candidate API;
-- top credible candidate persisted in the existing `journey_products` record as tentative;
-- deterministic ranking tests; and
-- this provisional design checkpoint.
-
-After these are validated, the broader Review views can resume without reopening the basic commercial/SKU boundary decision.
+- DI commercial publication;
+- explicit Booking `sku_code` extraction/publication when actually visible;
+- direct SKU mapping when an explicit SKU code uniquely resolves;
+- unique Booking model + price resolution without a tentative marker;
+- tentative shortlist only when multiple/fuzzy matches remain;
+- protection of already confirmed Journey products; and
+- later Delivery Invoice validation kept as an independent lifecycle check.
