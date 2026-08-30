@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from datetime import date
 from decimal import Decimal
 from difflib import SequenceMatcher
-from typing import Annotated, Any, Literal, Mapping
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends
@@ -99,9 +100,9 @@ def _label_similarity(observed: str, master: str) -> Decimal:
     left = _normalize_label(observed)
     right = _normalize_label(master)
     if not left or not right:
-        return Decimal("0")
+        return Decimal(0)
     if left == right or left.replace(" ", "") == right.replace(" ", ""):
-        return Decimal("1")
+        return Decimal(1)
 
     sequence = Decimal(str(SequenceMatcher(None, left, right).ratio()))
     left_tokens = set(left.split())
@@ -110,24 +111,24 @@ def _label_similarity(observed: str, master: str) -> Decimal:
     token_jaccard = (
         Decimal(len(left_tokens & right_tokens)) / Decimal(len(union))
         if union
-        else Decimal("0")
+        else Decimal(0)
     )
     containment = (
-        Decimal("1")
+        Decimal(1)
         if left.replace(" ", "") in right.replace(" ", "")
         or right.replace(" ", "") in left.replace(" ", "")
-        else Decimal("0")
+        else Decimal(0)
     )
     token_score = (token_jaccard * Decimal("0.85")) + (containment * Decimal("0.15"))
-    return min(Decimal("1"), max(sequence, token_score))
+    return min(Decimal(1), max(sequence, token_score))
 
 
 def _commercial_similarity(observed: Decimal, master: Decimal) -> tuple[Decimal, Decimal, Decimal]:
     difference = abs(master - observed)
     difference_pct = difference / observed
     score = max(
-        Decimal("0"),
-        Decimal("1") - (difference_pct / _COMMERCIAL_ZERO_SCORE_DELTA),
+        Decimal(0),
+        Decimal(1) - (difference_pct / _COMMERCIAL_ZERO_SCORE_DELTA),
     )
     return score, difference, difference_pct
 
@@ -197,9 +198,9 @@ def rank_sku_candidates(
                 masterTotalAmount=Decimal(str(row["master_total_amount"])),
                 observedTotalCommercialAmount=total_commercial_amount,
                 commercialDifferenceAmount=item["difference"].quantize(Decimal("0.01")),
-                commercialDifferencePercent=(
-                    item["difference_pct"] * Decimal("100")
-                ).quantize(Decimal("0.01")),
+                commercialDifferencePercent=(item["difference_pct"] * Decimal(100)).quantize(
+                    Decimal("0.01")
+                ),
                 score=item["score"].quantize(Decimal("0.0001")),
                 modelScore=item["model_score"].quantize(Decimal("0.0001")),
                 variantScore=item["variant_score"].quantize(Decimal("0.0001")),
@@ -521,7 +522,9 @@ def derive_sku_candidates(
         effectiveOn=effective_on,
         priceListVersionId=price_list_version_id,
         currencyCode=plan_currency,
-        status=("CONFIRMED_SKU_PRESERVED" if confirmed_preserved else "CONFIRMATION_REQUIRED"),
+        status=(
+            "CONFIRMED_SKU_PRESERVED" if confirmed_preserved else "CONFIRMATION_REQUIRED"
+        ),
         bookingRecordUpdated=updated,
         mostLikelyProductSkuId=most_likely.productSkuId,
         candidates=candidates,
