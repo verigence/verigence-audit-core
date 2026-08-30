@@ -209,13 +209,21 @@ def test_dealer_policy_reference_cannot_cross_tenant_boundary() -> None:
     tenant_b = f"tenant-policy-b-{suffix}"
     try:
         with engine.begin() as connection:
-            dealers_a = _seed_project(connection, tenant_id=tenant_a, suffix=f"a-{suffix}")
+            _seed_project(connection, tenant_id=tenant_a, suffix=f"a-{suffix}")
             dealers_b = _seed_project(connection, tenant_id=tenant_b, suffix=f"b-{suffix}")
-            version_id = _publish_policy(
-                connection,
-                tenant_id=tenant_a,
-                dealer_a_id=dealers_a["A"],
-            )
+            draft_version_id = connection.execute(
+                text(
+                    """
+                    INSERT INTO auditcore.discount_policy_versions (
+                        tenant_id, version_no, effective_from, lifecycle_status,
+                        created_by_actor_id
+                    ) VALUES (
+                        :tenant_id, 1, DATE '2026-08-01', 'DRAFT', 'test-admin'
+                    ) RETURNING discount_policy_version_id
+                    """
+                ),
+                {"tenant_id": tenant_a},
+            ).scalar_one()
 
             with (
                 pytest.raises(DBAPIError),
@@ -235,7 +243,7 @@ def test_dealer_policy_reference_cannot_cross_tenant_boundary() -> None:
                     ),
                     {
                         "tenant_id": tenant_a,
-                        "version_id": version_id,
+                        "version_id": draft_version_id,
                         "dealer_id": dealers_b["A"],
                     },
                 )
