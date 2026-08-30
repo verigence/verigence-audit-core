@@ -53,6 +53,7 @@ router = APIRouter(
 
 _REVIEW_THRESHOLD = 92.0
 _FAILED_PROCESSING = {"FAILED", "ERROR", "REJECTED"}
+_RECEIPT_DOCUMENT_TYPE = "dealer_receipt"
 
 
 class ReviewV2Field(BaseModel):
@@ -394,8 +395,12 @@ def _build_attributes(
     unmapped: list[ReviewV2UnmappedField] = []
 
     for document in documents:
+        receipt_scoped = (
+            "BOOKING" in stages
+            and str(document.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE
+        )
         for field in document.fields:
-            spec = spec_for_field(field.fieldKey)
+            spec = None if receipt_scoped else spec_for_field(field.fieldKey)
             if spec is None or not any(stage in spec.stages for stage in stages):
                 unmapped.append(
                     ReviewV2UnmappedField(
