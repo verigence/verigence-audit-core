@@ -1,0 +1,145 @@
+from uuid import uuid4
+
+from audit_core.uc03_booking_review_decisions import _raw_review_items
+from audit_core.uc03_document_review_v2 import (
+    ReviewV2Document,
+    ReviewV2Field,
+    ReviewV2UnmappedField,
+)
+from audit_core.uc03_v2_review_materialization import (
+    _reviewed_receipt_values,
+    receipt_document_ordinals,
+    receipt_review_key,
+)
+
+
+def _field(field_key: str, value, *, confidence: float = 99.0) -> ReviewV2Field:
+    return ReviewV2Field(
+        canonicalFieldId=str(uuid4()),
+        fieldKey=field_key,
+        value=value,
+        confidenceScore=confidence,
+        sourceFactVersion=1,
+        reviewState="READY" if confidence >= 92.0 else "NEEDS_REVIEW",
+    )
+
+
+def _receipt(document_id, *, amount: str, confidence: float = 99.0) -> ReviewV2Document:
+    return ReviewV2Document(
+        documentId=document_id,
+        label="Dealer Receipt",
+        documentTypeKey="dealer_receipt",
+        originalFilename=f"{document_id}.pdf",
+        processingStatus="PROCESSED",
+        extractionState="READY",
+        fields=[
+            _field("receipt_number", f"R-{str(document_id)[:6]}"),
+            _field("receipt_date", "2026-08-30"),
+            _field("amount_paid", amount, confidence=confidence),
+            _field("payment_mode", "UPI"),
+            _field("payment_reference_no", "UTR-123"),
+        ],
+    )
+
+
+def _receipt_unmapped(document_id, *, amount: str, confidence: float):
+    return ReviewV2UnmappedField(
+        canonicalFieldId=str(uuid4()),
+        fieldKey="amount_paid",
+        value=amount,
+        confidenceScore=confidence,
+        sourceFactVersion=1,
+        documentId=document_id,
+        documentTypeKey="dealer_receipt",
+        documentLabel="Dealer Receipt",
+        originalFilename=f"{document_id}.pdf",
+    )
+
+
+def test_receipt_review_key_is_receipt_scoped() -> None:
+    assert receipt_review_key(1, "amount_paid") != receipt_review_key(
+        2, "amount_paid"
+    )
+
+
+def test_receipt_ordinals_are_deterministic() -> None:
+    first = uuid4()
+    second = uuid4()
+    forward = receipt_document_ordinals([first, second])
+    reverse = receipt_document_ordinals([second, first])
+
+    assert forward == reverse
+    assert set(forward.values()) == {1, 2}
+
+
+def test_two_receipts_with_different_amounts_are_not_cross_source_mismatch() -> None:
+    first = uuid4()
+    second = uuid4()
+    ordinals = receipt_document_ordinals([first, second])
+
+    items = _raw_review_items(
+        [
+            _receipt_unmapped(first, amount="20000", confidence=99.0),
+            _receipt_unmapped(second, amount="30000", confidence=99.0),
+        ]
+    )
+
+    assert len(items) == 2
+    assert {item.review_key for item in items} == {
+        receipt_review_key(ordinals[first], "amount_paid"),
+        receipt_review_key(ordinals[second], "amount_paid"),
+    }
+    assert all(item.decision_required is False for item in items)
+
+
+def test_low_confidence_receipt_field_requires_only_its_own_decision() -> None:
+    first = uuid4()
+    second = uuid4()
+    ordinals = receipt_document_ordinals([first, second])
+
+    items = {
+        item.review_key: item
+        for item in _raw_review_items(
+            [
+                _receipt_unmapped(first, amount="20000", confidence=80.0),
+                _receipt_unmapped(second, amount="30000", confidence=99.0),
+            ]
+        )
+    }
+
+    assert items[
+        receipt_review_key(ordinals[first], "amount_paid")
+    ].decision_required is True
+    assert items[
+        receipt_review_key(ordinals[second], "amount_paid")
+    ].decision_required is False
+
+
+def test_rejected_receipt_amount_is_not_materialized_as_zero_payment() -> None:
+    document_id = uuid4()
+    document = _receipt(document_id, amount="50000")
+
+    values = _reviewed_receipt_values(
+        document,
+        receipt_ordinal=1,
+        rejected_review_keys={receipt_review_key(1, "amount_paid")},
+    )
+
+    assert "amount" not in values
+    assert values["receipt_number"] is not None
+
+
+def test_reviewed_receipt_fields_are_collected_once_in_memory() -> None:
+    document_id = uuid4()
+    document = _receipt(document_id, amount="50000")
+
+    values = _reviewed_receipt_values(
+        document,
+        receipt_ordinal=1,
+        rejected_review_keys=set(),
+    )
+
+    assert str(values["amount"]) == "50000"
+    assert str(values["receipt_date"]) == "2026-08-30"
+    assert values["payment_method_code"] == "UPI"
+    assert values["payment_reference"] == "UTR-123"

@@ -47,8 +47,6 @@ def _apply_gst_corporate_exclusivity(
             continue
 
         if conflict:
-            # Keep both evidence items visible. This is an audit exception, not a
-            # business-process gate.
             requirement.needsDecision = False
             requirement.blocksContinue = False
             continue
