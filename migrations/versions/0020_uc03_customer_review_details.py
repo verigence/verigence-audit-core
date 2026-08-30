@@ -1,6 +1,6 @@
 from alembic import op
 
-revision = "0020_uc03_customer_review_details"
+revision = "0020_uc03_customer_review"
 down_revision = "0019_uc03_booking_audit_derived"
 branch_labels = None
 depends_on = None
