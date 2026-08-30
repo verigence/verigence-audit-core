@@ -131,10 +131,14 @@ def install_uc03_v2_capture_business_rules() -> None:
     from audit_core.uc03_booking_review_decisions import (
         install_uc03_booking_review_decisions,
     )
+    from audit_core.uc03_booking_rule_trigger import (
+        install_uc03_booking_review_rule_trigger,
+    )
     from audit_core.uc03_di_core_persistence import install_uc03_di_core_persistence
 
     install_uc03_booking_review_decisions()
     install_uc03_di_core_persistence()
+    install_uc03_booking_review_rule_trigger()
     if getattr(capture_v2, "_gst_corporate_exclusivity_installed", False):
         return
 
