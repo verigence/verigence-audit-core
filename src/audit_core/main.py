@@ -25,6 +25,7 @@ from audit_core.insurance_tradein import router as insurance_tradein_router
 from audit_core.journey_housekeeping import router as journey_housekeeping_router
 from audit_core.journeys import router as journey_router
 from audit_core.logging_config import configure_logging
+from audit_core.mahindra_dealer_policy_scope import install_dealer_policy_scope
 from audit_core.mahindra_native_effective_date import install_native_effective_date
 from audit_core.mahindra_native_workbooks import install_native_workbook_parser
 from audit_core.mahindra_upload_state import router as mahindra_upload_state_router
@@ -102,6 +103,7 @@ from audit_core.vehicle_delivery import router as vehicle_delivery_router
 install_role_mapping_policy(role_mappings)
 install_native_workbook_parser(mahindra_masters)
 install_native_effective_date(mahindra_masters)
+install_dealer_policy_scope(mahindra_masters)
 install_uc03_identity_business_date()
 install_uc03_customer_mobile_pii()
 install_uc03_booking_receipt_capture()
