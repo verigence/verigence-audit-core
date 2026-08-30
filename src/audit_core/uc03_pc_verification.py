@@ -4,12 +4,12 @@ from datetime import datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, Query, Request, Response
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, Engine, text
 
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import get_connection, get_human_principal
+from audit_core.dependencies import get_connection, get_engine, get_human_principal
 from audit_core.errors import ConflictError, NotFoundError
 from audit_core.idempotency import execute_idempotent_json_command
 from audit_core.observability import get_correlation_id
@@ -19,6 +19,7 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_authorized_work_items import _authorize_workspace
+from audit_core.uc03_booking_audit import enqueue_booking_audit, process_booking_audit_event
 from audit_core.uc03_booking_capture import (
     _PROPOSAL_CAPTURE_MAP,
     _TERMINAL_PROCESSING_STATUSES,
@@ -299,11 +300,13 @@ def verify_pc_booking(
     journey_id: UUID,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
     if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
     human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
     authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
+    engine: Annotated[Engine, Depends(get_engine)],
 ) -> PcVerificationView:
     context = _scope(
         connection,
@@ -375,6 +378,14 @@ def verify_pc_booking(
             },
             aggregate_version=next_version,
         )
+        enqueue_booking_audit(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            review_version=next_version,
+            correlation_id=correlation_id,
+            actor_id=human_principal.subject,
+        )
         return _view(connection, tenant_id=tenant_id, journey_id=journey_id).model_dump(mode="json")
 
     body, _ = execute_idempotent_json_command(
@@ -385,6 +396,32 @@ def verify_pc_booking(
         request_payload={"expectedVersion": expected_version},
         execute=execute,
     )
+    pending_audit_event_id = connection.execute(
+        text(
+            """
+            SELECT outbox_event_id
+            FROM auditcore.outbox_events
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND event_type='BOOKING_AUDIT_REQUESTED'
+              AND event_status='PENDING'
+              AND event_payload->>'reviewVersion'=:review_version
+            ORDER BY occurred_at_utc DESC, outbox_event_id DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "review_version": str(body["aggregateVersion"]),
+        },
+    ).scalar_one_or_none()
+    if pending_audit_event_id is not None:
+        background_tasks.add_task(
+            process_booking_audit_event,
+            engine,
+            tenant_id,
+            pending_audit_event_id,
+        )
     response.headers["ETag"] = f'"{body["aggregateVersion"]}"'
     return PcVerificationView.model_validate(body)
 
