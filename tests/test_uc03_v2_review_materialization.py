@@ -7,6 +7,7 @@ from audit_core.uc03_document_review_v2 import (
 )
 from audit_core.uc03_v2_review_materialization import (
     _reviewed_receipt_values,
+    receipt_document_ordinals,
     receipt_review_key,
 )
 from audit_core.uc03_v2_review_materialization_install import (
@@ -43,18 +44,26 @@ def _receipt(document_id, *, amount: str, confidence: float = 99.0) -> ReviewV2D
     )
 
 
-def test_receipt_review_key_is_document_scoped() -> None:
+def test_receipt_review_key_is_receipt_scoped() -> None:
+    assert receipt_review_key(1, "amount_paid") != receipt_review_key(
+        2, "amount_paid"
+    )
+
+
+def test_receipt_ordinals_are_deterministic() -> None:
     first = uuid4()
     second = uuid4()
+    forward = receipt_document_ordinals([first, second])
+    reverse = receipt_document_ordinals([second, first])
 
-    assert receipt_review_key(first, "amount_paid") != receipt_review_key(
-        second, "amount_paid"
-    )
+    assert forward == reverse
+    assert set(forward.values()) == {1, 2}
 
 
 def test_two_receipts_with_different_amounts_are_not_cross_source_mismatch() -> None:
     first = uuid4()
     second = uuid4()
+    ordinals = receipt_document_ordinals([first, second])
     fields = [
         ReviewV2UnmappedField(
             canonicalFieldId=str(uuid4()),
@@ -84,8 +93,8 @@ def test_two_receipts_with_different_amounts_are_not_cross_source_mismatch() -> 
 
     assert len(items) == 2
     assert {item.review_key for item in items} == {
-        receipt_review_key(first, "amount_paid"),
-        receipt_review_key(second, "amount_paid"),
+        receipt_review_key(ordinals[first], "amount_paid"),
+        receipt_review_key(ordinals[second], "amount_paid"),
     }
     assert all(item.decision_required is False for item in items)
 
@@ -93,6 +102,7 @@ def test_two_receipts_with_different_amounts_are_not_cross_source_mismatch() -> 
 def test_low_confidence_receipt_field_requires_only_its_own_decision() -> None:
     first = uuid4()
     second = uuid4()
+    ordinals = receipt_document_ordinals([first, second])
     fields = [
         ReviewV2UnmappedField(
             canonicalFieldId=str(uuid4()),
@@ -120,8 +130,12 @@ def test_low_confidence_receipt_field_requires_only_its_own_decision() -> None:
 
     items = {item.review_key: item for item in _receipt_raw_review_items(fields)}
 
-    assert items[receipt_review_key(first, "amount_paid")].decision_required is True
-    assert items[receipt_review_key(second, "amount_paid")].decision_required is False
+    assert items[
+        receipt_review_key(ordinals[first], "amount_paid")
+    ].decision_required is True
+    assert items[
+        receipt_review_key(ordinals[second], "amount_paid")
+    ].decision_required is False
 
 
 def test_rejected_receipt_amount_is_not_materialized_as_zero_payment() -> None:
@@ -130,7 +144,8 @@ def test_rejected_receipt_amount_is_not_materialized_as_zero_payment() -> None:
 
     values = _reviewed_receipt_values(
         document,
-        rejected_review_keys={receipt_review_key(document_id, "amount_paid")},
+        receipt_ordinal=1,
+        rejected_review_keys={receipt_review_key(1, "amount_paid")},
     )
 
     assert "amount" not in values
@@ -141,7 +156,11 @@ def test_reviewed_receipt_fields_are_collected_once_in_memory() -> None:
     document_id = uuid4()
     document = _receipt(document_id, amount="50000")
 
-    values = _reviewed_receipt_values(document, rejected_review_keys=set())
+    values = _reviewed_receipt_values(
+        document,
+        receipt_ordinal=1,
+        rejected_review_keys=set(),
+    )
 
     assert str(values["amount"]) == "50000"
     assert str(values["receipt_date"]) == "2026-08-30"
