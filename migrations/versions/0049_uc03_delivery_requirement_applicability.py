@@ -24,18 +24,17 @@ depends_on = None
 def upgrade() -> None:
     op.execute(
         """
-        WITH corrections(requirement_key, condition_key, display_label, sort_order) AS (
+        WITH corrections(requirement_key, condition_key) AS (
             VALUES
-                ('accessory_invoice_dms', 'accessoriesTaken', 'Accessory Invoice - DMS', 150),
-                ('accessory_invoice_tally', 'accessoriesTaken', 'Accessory Invoice - Tally', 160),
-                ('rto_challan', 'registrationByDealer', 'RTO Challan', 170),
-                ('ew_invoice', 'extendedWarrantyTaken', 'Extended Warranty Invoice', 220),
-                ('rsa_invoice', 'rsaTaken', 'RSA Invoice', 230)
+                ('accessory_invoice_dms', 'accessoriesTaken'),
+                ('accessory_invoice_tally', 'accessoriesTaken'),
+                ('rto_challan', 'registrationByDealer'),
+                ('ew_invoice', 'extendedWarrantyTaken'),
+                ('rsa_invoice', 'rsaTaken')
         )
         UPDATE auditcore.document_requirement_items i
         SET requirement_level='CONDITIONAL',
-            condition_config=jsonb_build_object('conditionKey', c.condition_key),
-            updated_at_utc=now()
+            condition_config=jsonb_build_object('conditionKey', c.condition_key)
         FROM corrections c
         WHERE i.requirement_key=c.requirement_key
           AND upper(i.process_area)='DELIVERY'
@@ -92,8 +91,7 @@ def downgrade() -> None:
         """
         UPDATE auditcore.document_requirement_items
         SET requirement_level='REQUIRED',
-            condition_config='{}'::jsonb,
-            updated_at_utc=now()
+            condition_config='{}'::jsonb
         WHERE requirement_key IN (
             'accessory_invoice_dms', 'accessory_invoice_tally', 'rto_challan',
             'ew_invoice', 'rsa_invoice'
