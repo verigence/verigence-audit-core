@@ -20,6 +20,7 @@ from audit_core.security_authorization import (
 )
 from audit_core.security_integration import SecurityOAuthClient
 from audit_core.uc03_booking_capture import _scope
+from audit_core.uc03_delivery_commands import _append_delivery_event, _machine_flag
 from audit_core.uc03_document_capture_v2 import (
     CaptureV2Document,
     CaptureV2Requirement,
@@ -34,7 +35,6 @@ from audit_core.uc03_document_capture_v2 import (
     get_di_client,
     get_security_oauth_client,
 )
-from audit_core.uc03_delivery_commands import _append_delivery_event, _machine_flag
 
 router = APIRouter(
     prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}/delivery",
