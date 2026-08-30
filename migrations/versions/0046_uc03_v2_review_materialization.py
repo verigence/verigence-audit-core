@@ -1,6 +1,6 @@
 """Add only the V2 post-review derived/linkage fields that do not already exist.
 
-Revision ID: 0046_uc03_v2_review_materialization
+Revision ID: 0046_uc03_v2_review_mat
 Revises: 0045_journey_housekeeping
 Create Date: 2026-08-30
 
@@ -13,7 +13,7 @@ migration deliberately adds no duplicate business owner. It adds:
 """
 from alembic import op
 
-revision = "0046_uc03_v2_review_materialization"
+revision = "0046_uc03_v2_review_mat"
 down_revision = "0045_journey_housekeeping"
 branch_labels = None
 depends_on = None
