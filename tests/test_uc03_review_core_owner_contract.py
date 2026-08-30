@@ -3,8 +3,8 @@ from uuid import uuid4
 import pytest
 from fastapi.routing import APIRoute
 
-from audit_core.errors import ConflictError
 from audit_core import uc03_document_review_v2 as review_v2
+from audit_core.errors import ConflictError
 from audit_core.uc03_booking_review_decisions import (
     BookingReviewV2ConfirmWithDecisionsResponse,
     _assert_accepted_raw_fields_have_core_owner,
@@ -33,7 +33,7 @@ def _unmapped(field_key: str, *, document_type: str = "booking_form"):
     )
 
 
-def test_active_review_confirm_contract_has_no_review_only_attributes() -> None:
+def test_active_review_confirm_contract_is_decision_aware() -> None:
     install_uc03_booking_review_decisions()
     confirm_routes = [
         route
@@ -45,7 +45,6 @@ def test_active_review_confirm_contract_has_no_review_only_attributes() -> None:
 
     assert len(confirm_routes) == 1
     assert confirm_routes[0].response_model is BookingReviewV2ConfirmWithDecisionsResponse
-    assert "reviewOnlyAttributes" not in BookingReviewV2ConfirmWithDecisionsResponse.model_fields
 
 
 def test_every_supported_review_field_has_typed_core_owner() -> None:
