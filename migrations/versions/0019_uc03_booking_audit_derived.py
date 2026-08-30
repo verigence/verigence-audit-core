@@ -50,6 +50,11 @@ def upgrade() -> None:
         "CREATE INDEX ix_booking_duplicate_links_duplicate "
         "ON auditcore.booking_duplicate_links(tenant_id, duplicate_booking_id)"
     )
+    # Duplicate-name fallback must not force a tenant-wide customer scan.
+    op.execute(
+        "CREATE INDEX ix_customers_booking_name_ci "
+        "ON auditcore.customers(tenant_id, lower(btrim(display_name)))"
+    )
     op.execute("ALTER TABLE auditcore.booking_duplicate_links ENABLE ROW LEVEL SECURITY")
     op.execute("ALTER TABLE auditcore.booking_duplicate_links FORCE ROW LEVEL SECURITY")
     op.execute(
@@ -66,9 +71,15 @@ def upgrade() -> None:
     op.execute(
         f"REVOKE DELETE ON auditcore.booking_duplicate_links FROM {_RUNTIME_ROLE}"
     )
+    # The PC verification transaction enqueues one audit request and the background
+    # runner claims/completes that row. No separate workflow-task tables are used.
+    op.execute(
+        f"GRANT SELECT, INSERT, UPDATE ON auditcore.outbox_events TO {_RUNTIME_ROLE}"
+    )
 
 
 def downgrade() -> None:
+    op.execute("DROP INDEX IF EXISTS auditcore.ix_customers_booking_name_ci")
     op.execute("DROP INDEX IF EXISTS auditcore.ix_booking_duplicate_links_duplicate")
     op.execute("DROP TABLE IF EXISTS auditcore.booking_duplicate_links")
     op.execute(
