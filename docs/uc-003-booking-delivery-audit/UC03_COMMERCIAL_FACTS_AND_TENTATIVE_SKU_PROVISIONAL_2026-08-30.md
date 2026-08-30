@@ -25,7 +25,7 @@ The wider Review/TL/PM experience, Deal Integrity views, notification presentati
 
 - Product/Price masters remain Audit Core business masters.
 - SKU deduction is business logic and therefore belongs in Audit Core.
-- A deduced SKU is never treated as a document-extracted fact.
+- A deduced SKU is not treated as a document-extracted fact; it is an Audit Core inference based on evidence + masters.
 
 ## 3. Commercial-fact publication rule
 
@@ -69,16 +69,34 @@ This does **not** make unrelated identity or personal fields authoritative. For 
 }
 ```
 
-The intended caller supplies machine-observed Booking Form facts obtained from DI. Audit Core does not persist a second copy merely to perform this comparison.
+The intended caller supplies machine-observed Booking Form facts obtained from DI. Audit Core does not persist a second copy of those DI facts merely to perform this comparison.
 
-### Output rule
+### Output + Booking-record rule
 
-The API returns a ranked shortlist. Every returned item is always:
+The API returns a ranked shortlist. Every returned candidate is always:
 
 - `candidateStatus = TENTATIVE`
 - `confirmationRequired = true`
 
-Even an exact score must **not** auto-confirm the SKU.
+The **highest-ranked credible candidate is also written into the existing `journey_products` Booking/Journey product record** with:
+
+- `product_sku_id = <top candidate>`
+- `selection_source = EVIDENCE`
+- `selection_status = TENTATIVE`
+- `selection_method = BOOKING_COMMERCIAL_MATCH_V1`
+- `selection_score = <composite score>`
+
+A tentative display should use an asterisk, for example:
+
+`XUV700 AX7 L *`
+
+with the note:
+
+`* Tentative — confirmation required`
+
+If a SKU has already been explicitly confirmed, the inference service must **never overwrite it**. The service can still return candidate diagnostics, but the confirmed Booking product remains unchanged.
+
+If no candidate crosses the reliability floor, no random SKU is written.
 
 ## 5. Processing design
 
@@ -130,17 +148,17 @@ An ML/embedding layer should only be considered later if real confirmation histo
 
 ## 7. Confirmation semantics
 
-SKU candidate inference is advisory only.
+SKU candidate inference is **persisted but not authoritative**.
 
-The service does not:
+The service may write the top credible candidate to the Booking/Journey product record as `TENTATIVE`, but it does not:
 
-- write `product_sku_id` into the Booking;
+- mark the SKU as confirmed;
+- overwrite an already confirmed SKU;
 - change Product Master data;
-- change Price Master data;
-- mark a candidate as confirmed; or
-- bypass human/business confirmation.
+- change Price Master data; or
+- bypass later human/business confirmation.
 
-The final confirmation actor, screen, and persistence workflow remain to be designed together with the broader Review experience.
+The final confirmation actor and screen remain part of the broader Review design and are not finalized here.
 
 ## 8. Important edge cases
 
@@ -148,7 +166,8 @@ The final confirmation actor, screen, and persistence workflow remain to be desi
 2. **No effective Price List** — fail rather than fabricate a price comparison.
 3. **Currency mismatch** — reject comparison when the caller supplies a currency different from the effective Price Master currency.
 4. **Price master contains only partial commercial components** — text signals can still rank candidates, but the result stays tentative. Component-level comparison can be added later.
-5. **Same model/variant/price across multiple colour SKUs** — multiple SKU candidates may legitimately remain. Confirmation is required.
+5. **Same model/variant/price across multiple colour SKUs** — multiple SKU candidates may legitimately remain. The top one may be stored as tentative, but confirmation is still required.
+6. **Existing confirmed product** — inference must not downgrade or replace it.
 
 ## 9. Deliberately deferred
 
@@ -160,7 +179,7 @@ The following are **not finalized** and must not be inferred from this provision
 - final candidate-confirmation UI;
 - whether confirmation becomes an explicit audit observation or Booking amendment;
 - automatic triggering of SKU inference from DI completion;
-- persistence of candidate history;
+- persistence of the full candidate-history list;
 - use of confirmed matches as future learning data;
 - final scoring weights/tolerance after real project data is available; and
 - notification/timer behavior in the Review UI.
@@ -171,6 +190,7 @@ The immediate implementation is intentionally narrow:
 
 - DI commercial publication fix;
 - Audit Core tentative SKU candidate API;
+- top credible candidate persisted in the existing `journey_products` record as tentative;
 - deterministic ranking tests; and
 - this provisional design checkpoint.
 
