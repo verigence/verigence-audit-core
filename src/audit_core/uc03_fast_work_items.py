@@ -65,10 +65,11 @@ def list_first_work_items_fast(
 ) -> WorkItemPage:
     """Return the first Work Queue page with candidate-first enrichment.
 
-    The landing page needs at most 10 rows. Resolve the actor's authorized Journey
-    ids and their latest activity first, rank/limit to 11 rows for cursor detection,
-    and only then join customer/stage/product data and calculate finding/processing
-    aggregates. This avoids tenant-wide lateral aggregation before the page limit.
+    The landing page needs at most 10 rows. Rank authorized Journeys from the
+    operational Journey/Booking/Delivery stage projection first, limit to one page
+    plus cursor detection, and only then calculate findings and processing counts.
+    Evidence/finding tables therefore cannot force a tenant-wide scan before first
+    paint.
     """
 
     _authorize_workspace(
@@ -98,9 +99,29 @@ def list_first_work_items_fast(
                         j.customer_id,
                         j.dealer_id,
                         j.outlet_id,
-                        j.updated_at_utc
+                        GREATEST(
+                            j.updated_at_utc,
+                            b.updated_at_utc,
+                            dl.updated_at_utc,
+                            bs.latest_activity_at_utc,
+                            ds.latest_activity_at_utc
+                        ) AS latest_activity_at_utc
                     FROM runtime_context rc
                     CROSS JOIN auditcore.journeys j
+                    LEFT JOIN auditcore.bookings b
+                      ON b.tenant_id = j.tenant_id
+                     AND b.journey_id = j.journey_id
+                    LEFT JOIN auditcore.deliveries dl
+                      ON dl.tenant_id = j.tenant_id
+                     AND dl.journey_id = j.journey_id
+                    LEFT JOIN auditcore.journey_stage_states bs
+                      ON bs.tenant_id = j.tenant_id
+                     AND bs.journey_id = j.journey_id
+                     AND bs.stage_code = 'BOOKING'
+                    LEFT JOIN auditcore.journey_stage_states ds
+                      ON ds.tenant_id = j.tenant_id
+                     AND ds.journey_id = j.journey_id
+                     AND ds.stage_code = 'DELIVERY'
                     WHERE j.tenant_id = :tenant_id
                       AND (
                             CAST(:outlet_id AS uuid) IS NULL
@@ -123,70 +144,16 @@ def list_first_work_items_fast(
                               )
                       )
                       AND (
-                            EXISTS (
-                                SELECT 1 FROM auditcore.bookings b
-                                WHERE b.tenant_id = j.tenant_id
-                                  AND b.journey_id = j.journey_id
-                            )
-                            OR EXISTS (
-                                SELECT 1 FROM auditcore.deliveries dl
-                                WHERE dl.tenant_id = j.tenant_id
-                                  AND dl.journey_id = j.journey_id
-                            )
-                            OR EXISTS (
-                                SELECT 1 FROM auditcore.journey_stage_states s
-                                WHERE s.tenant_id = j.tenant_id
-                                  AND s.journey_id = j.journey_id
-                                  AND s.stage_code IN ('BOOKING', 'DELIVERY')
-                            )
+                            b.journey_id IS NOT NULL
+                            OR dl.journey_id IS NOT NULL
+                            OR bs.journey_id IS NOT NULL
+                            OR ds.journey_id IS NOT NULL
                       )
                 ),
-                activity_events AS (
-                    SELECT aj.journey_id, aj.updated_at_utc AS activity_at_utc
-                    FROM authorized_journeys aj
-                    UNION ALL
-                    SELECT s.journey_id, s.latest_activity_at_utc
-                    FROM auditcore.journey_stage_states s
-                    JOIN authorized_journeys aj ON aj.journey_id = s.journey_id
-                    WHERE s.tenant_id = :tenant_id
-                      AND s.stage_code IN ('BOOKING', 'DELIVERY')
-                      AND s.latest_activity_at_utc IS NOT NULL
-                    UNION ALL
-                    SELECT b.journey_id, b.updated_at_utc
-                    FROM auditcore.bookings b
-                    JOIN authorized_journeys aj ON aj.journey_id = b.journey_id
-                    WHERE b.tenant_id = :tenant_id
-                      AND b.updated_at_utc IS NOT NULL
-                    UNION ALL
-                    SELECT dl.journey_id, dl.updated_at_utc
-                    FROM auditcore.deliveries dl
-                    JOIN authorized_journeys aj ON aj.journey_id = dl.journey_id
-                    WHERE dl.tenant_id = :tenant_id
-                      AND dl.updated_at_utc IS NOT NULL
-                    UNION ALL
-                    SELECT e.journey_id, COALESCE(e.cache_updated_at_utc, e.linked_at_utc)
-                    FROM auditcore.evidence e
-                    JOIN authorized_journeys aj ON aj.journey_id = e.journey_id
-                    WHERE e.tenant_id = :tenant_id
-                      AND e.association_status = 'ACTIVE'
-                    UNION ALL
-                    SELECT f.journey_id, f.updated_at_utc
-                    FROM auditcore.audit_findings f
-                    JOIN authorized_journeys aj ON aj.journey_id = f.journey_id
-                    WHERE f.tenant_id = :tenant_id
-                      AND f.updated_at_utc IS NOT NULL
-                    UNION ALL
-                    SELECT io.journey_id, io.updated_at_utc
-                    FROM auditcore.evidence_ingestion_operations io
-                    JOIN authorized_journeys aj ON aj.journey_id = io.journey_id
-                    WHERE io.tenant_id = :tenant_id
-                      AND io.updated_at_utc IS NOT NULL
-                ),
                 ranked_candidates AS MATERIALIZED (
-                    SELECT ae.journey_id, max(ae.activity_at_utc) AS latest_activity_at_utc
-                    FROM activity_events ae
-                    GROUP BY ae.journey_id
-                    ORDER BY max(ae.activity_at_utc) DESC, ae.journey_id DESC
+                    SELECT aj.journey_id, aj.latest_activity_at_utc
+                    FROM authorized_journeys aj
+                    ORDER BY aj.latest_activity_at_utc DESC, aj.journey_id DESC
                     LIMIT :fetch_limit
                 ),
                 enriched AS MATERIALIZED (
