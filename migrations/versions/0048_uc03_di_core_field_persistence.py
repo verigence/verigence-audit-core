@@ -191,6 +191,67 @@ def upgrade() -> None:
         """
     )
 
+    # Keep every reviewed Dealer Receipt field even when amount is absent. A Payment
+    # row cannot be created in that case because payments.amount is intentionally
+    # NOT NULL; this dependent row prevents any accepted receipt field from being lost.
+    op.execute(
+        """
+        CREATE TABLE auditcore.dealer_receipt_review_values (
+            tenant_id                       varchar(128) NOT NULL,
+            journey_id                      uuid NOT NULL,
+            dealer_receipt_review_value_id  uuid NOT NULL DEFAULT gen_random_uuid(),
+            source_di_document_id            uuid NOT NULL,
+            source_evidence_id               uuid,
+
+            dealer_name                      varchar(240),
+            dealer_gstin                     varchar(40),
+            customer_name                    varchar(240),
+            customer_phone                   varchar(40),
+            receipt_number                   varchar(160),
+            receipt_date                     date,
+            amount_paid                      numeric(18,2),
+            payment_mode                     varchar(80),
+            payment_reference_no             varchar(240),
+            payment_reference_date           date,
+            bank_name                        varchar(240),
+            bank_location                    varchar(240),
+            booking_reference_number         varchar(160),
+            remarks                          text,
+            amount_in_words                  text,
+
+            reviewed_by_actor_id             varchar(160) NOT NULL,
+            reviewed_at_utc                  timestamptz NOT NULL DEFAULT now(),
+            created_at_utc                   timestamptz NOT NULL DEFAULT now(),
+            updated_at_utc                   timestamptz NOT NULL DEFAULT now(),
+            version_no                       bigint NOT NULL DEFAULT 1 CHECK (version_no > 0),
+
+            PRIMARY KEY (tenant_id, dealer_receipt_review_value_id),
+            UNIQUE (tenant_id, journey_id, source_di_document_id),
+            FOREIGN KEY (tenant_id, journey_id)
+                REFERENCES auditcore.journeys(tenant_id, journey_id),
+            FOREIGN KEY (tenant_id, source_evidence_id)
+                REFERENCES auditcore.evidence(tenant_id, evidence_id)
+        );
+
+        CREATE INDEX ix_dealer_receipt_review_values_journey
+            ON auditcore.dealer_receipt_review_values
+               (tenant_id, journey_id, reviewed_at_utc DESC);
+
+        ALTER TABLE auditcore.dealer_receipt_review_values ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE auditcore.dealer_receipt_review_values FORCE ROW LEVEL SECURITY;
+        CREATE POLICY tenant_isolation_dealer_receipt_review_values
+            ON auditcore.dealer_receipt_review_values
+            USING (tenant_id = auditcore.current_tenant_id())
+            WITH CHECK (tenant_id = auditcore.current_tenant_id());
+        CREATE TRIGGER trg_dealer_receipt_review_values_updated
+            BEFORE UPDATE ON auditcore.dealer_receipt_review_values
+            FOR EACH ROW EXECUTE FUNCTION auditcore.set_updated_at();
+        GRANT SELECT, INSERT, UPDATE ON auditcore.dealer_receipt_review_values
+            TO audit_core_runtime;
+        REVOKE DELETE ON auditcore.dealer_receipt_review_values FROM audit_core_runtime;
+        """
+    )
+
     # Dealer Receipt v1.1 has 15 fields. Five already had typed Payment columns;
     # promote the remaining ten out of receipt_details JSON into first-class columns.
     op.execute(
@@ -285,5 +346,6 @@ def downgrade() -> None:
             DROP COLUMN IF EXISTS receipt_dealer_name;
         """
     )
+    op.execute("DROP TABLE IF EXISTS auditcore.dealer_receipt_review_values")
     op.execute("DROP TABLE IF EXISTS auditcore.customer_identity_review_values")
     op.execute("DROP TABLE IF EXISTS auditcore.booking_form_review_values")
