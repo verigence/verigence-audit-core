@@ -90,11 +90,11 @@ def _journey(
             INSERT INTO auditcore.customers (
                 tenant_id, dealer_id, outlet_id, customer_type_code,
                 display_name, legal_name, legal_name_status,
-                mobile_number, mobile_last4, relationship_type, relationship_name
+                mobile_number, mobile_last4
             ) VALUES (
                 :tenant_id, :dealer_id, :outlet_id, 'INDIVIDUAL',
                 :entered_name, :legal_name, 'VERIFIED',
-                :mobile, :mobile_last4, 'S/O', 'Parent Name'
+                :mobile, :mobile_last4
             ) RETURNING customer_id
             """
         ),
@@ -229,11 +229,11 @@ def _journey(
                 INSERT INTO auditcore.payments (
                     tenant_id, journey_id, payment_at_utc, amount,
                     currency_code, payment_reference, actual_status_code,
-                    status_source, payment_stage
+                    status_source
                 ) VALUES (
                     :tenant_id, :journey_id, now(), :amount,
                     'INR', :payment_reference, 'RECEIVED',
-                    'SOURCE_SYSTEM', 'BOOKING'
+                    'SOURCE_SYSTEM'
                 )
                 """
             ),
@@ -298,6 +298,18 @@ def journey_search_setup():
                 "oem_id": oem_id,
                 "category_id": category_id,
             },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.business_status_codes (
+                    tenant_id, domain_key, status_code, status_label
+                ) VALUES
+                    (:tenant_id, 'DELIVERY', 'DELIVERED', 'Delivered'),
+                    (:tenant_id, 'PAYMENT', 'RECEIVED', 'Received')
+                """
+            ),
+            {"tenant_id": tenant_id},
         )
 
         dealer_a, outlet_a1 = _dealer_outlet(
@@ -441,8 +453,10 @@ def test_pc_search_is_outlet_scoped_and_supports_operational_keys(journey_search
         "9819751923",
         "DLR-BOOK-1001",
         "MA1VIN1234567890",
+        "CHASSIS1234567890",
         "CH01AB1234",
         "INV-1001",
+        "DMS-DLR-BOOK-1001",
         "UTR-1001",
     ):
         response = _search(client, setup["tenant_id"], query)
@@ -450,6 +464,9 @@ def test_pc_search_is_outlet_scoped_and_supports_operational_keys(journey_search
         body = response.json()
         assert body["resultCount"] >= 1
         assert body["items"][0]["journeyId"] == str(setup["primary"])
+
+    mobile = _search(client, setup["tenant_id"], "9819751923").json()["items"][0]
+    assert mobile["matchedValue"] == "******1923"
 
     hidden = _search(client, setup["tenant_id"], "DLR-BOOK-2002")
     assert hidden.status_code == 200
@@ -488,12 +505,12 @@ def test_journey_overview_returns_booking_delivery_and_multiple_payments(journey
     assert body["journey"]["deliveryId"] == str(setup["delivery_id"])
     assert body["customer"]["enteredName"] == "Manmohan Oja"
     assert body["customer"]["legalName"] == "Manmohan Ojha"
-    assert body["customer"]["relationshipType"] == "S/O"
     assert body["booking"]["bookingReference"] == "DLR-BOOK-1001"
     assert body["delivery"]["actualDeliveryStatusCode"] == "DELIVERED"
     assert body["vehicle"]["vin"] == "MA1VIN1234567890"
     assert body["registration"]["registrationNumber"] == "CH01AB1234"
     assert len(body["payments"]) == 2
+    assert "paymentStage" not in body["payments"][0]
 
 
 def test_out_of_scope_overview_does_not_disclose_journey(journey_search_setup) -> None:
