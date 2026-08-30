@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from audit_core import uc03_document_capture_v2 as capture_v2
+import audit_core.uc03_document_capture_v2 as capture_v2
 from audit_core.security import HumanPrincipal
 
 
