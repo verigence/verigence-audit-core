@@ -70,8 +70,13 @@ def _apply_gst_corporate_exclusivity(
 
 
 def install_uc03_v2_capture_business_rules() -> None:
-    """Install additive V2-only capture rules without changing V1 behavior."""
+    """Install additive V2-only capture/review rules without changing V1 behavior."""
 
+    from audit_core.uc03_booking_review_decisions import (
+        install_uc03_booking_review_decisions,
+    )
+
+    install_uc03_booking_review_decisions()
     if getattr(capture_v2, "_gst_corporate_exclusivity_installed", False):
         return
 
