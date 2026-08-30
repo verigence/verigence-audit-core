@@ -121,6 +121,37 @@ _RECEIPT_DATE_FIELDS = {"receipt_date", "payment_reference_date"}
 _RECEIPT_DECIMAL_FIELDS = {"amount_paid"}
 
 
+def reviewed_field_core_owner(
+    *,
+    document_type_key: str | None,
+    field_key: str,
+    document_id: UUID,
+) -> tuple[str, str] | None:
+    """Return the typed Audit Core owner for one reviewed DI business field.
+
+    A None result is intentionally actionable: Review Confirm must not succeed for an
+    accepted value unless another operational Core writer returns a concrete owner.
+    """
+
+    document_type = str(document_type_key or "").strip().lower()
+    normalized_field = str(field_key).strip().lower()
+    if (
+        document_type == _BOOKING_FORM_DOCUMENT_TYPE
+        and normalized_field in _BOOKING_FORM_FIELDS
+    ):
+        return "BOOKING_FORM_REVIEW_VALUE", str(document_id)
+    if document_type in _PAN_DOCUMENT_TYPES and normalized_field in _PAN_FIELDS:
+        return "CUSTOMER_IDENTITY_REVIEW_VALUE", str(document_id)
+    if (
+        document_type == _AADHAAR_DOCUMENT_TYPE
+        and normalized_field in _AADHAAR_FIELDS
+    ):
+        return "CUSTOMER_IDENTITY_REVIEW_VALUE", str(document_id)
+    if document_type == _RECEIPT_DOCUMENT_TYPE and normalized_field in _RECEIPT_FIELDS:
+        return "DEALER_RECEIPT_REVIEW_VALUE", str(document_id)
+    return None
+
+
 def receipt_review_key(receipt_ordinal: int, field_key: str) -> str:
     """Return the readable/stable review key for one field on one receipt."""
 

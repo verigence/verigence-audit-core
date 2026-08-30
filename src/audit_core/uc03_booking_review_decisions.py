@@ -29,9 +29,10 @@ from audit_core.uc03_booking_commands import (
     _parse_if_match,
 )
 from audit_core.uc03_v2_review_materialization import (
-    materialize_reviewed_booking_receipts,
+    materialize_reviewed_di_business_values,
     receipt_document_ordinals,
     receipt_review_key,
+    reviewed_field_core_owner,
 )
 
 DecisionValue = Literal["ACCEPTED", "REJECTED"]
@@ -67,7 +68,6 @@ class BookingReviewV2ConfirmWithDecisionsResponse(BaseModel):
     aggregateVersion: int
     resolvedAttributeCount: int
     appliedAttributes: list[str]
-    reviewOnlyAttributes: list[str]
     conflictAttributes: list[str]
     rejectedAttributes: list[str]
 
@@ -410,6 +410,63 @@ def _current_decisions(
     return current
 
 
+def _missing_core_owner_error(
+    *,
+    field_key: str,
+    document_type_key: str | None,
+    attribute_key: str | None = None,
+) -> ConflictError:
+    document_type = str(document_type_key or "UNKNOWN")
+    subject = f"attribute '{attribute_key}' / " if attribute_key else ""
+    return ConflictError(
+        error_code="VAC-CONFLICT-013",
+        title="Reviewed value has no Audit Core owner",
+        detail=(
+            f"Accepted {subject}DI field '{field_key}' from document type "
+            f"'{document_type}' has no Audit Core persistence owner. "
+            "Add an explicit Core owner before confirming Review."
+        ),
+    )
+
+
+def _raw_review_key(
+    field: review_v2.ReviewV2UnmappedField,
+    *,
+    receipt_ordinals: dict[UUID, int],
+) -> str:
+    if str(field.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE:
+        return receipt_review_key(receipt_ordinals[field.documentId], field.fieldKey)
+    return f"raw:{field.fieldKey}"
+
+
+def _assert_accepted_raw_fields_have_core_owner(
+    unmapped: list[review_v2.ReviewV2UnmappedField],
+    *,
+    rejected_keys: set[str],
+) -> None:
+    receipt_ids = [
+        field.documentId
+        for field in unmapped
+        if str(field.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE
+    ]
+    receipt_ordinals = receipt_document_ordinals(receipt_ids)
+    for field in unmapped:
+        if not _has_value(field.value):
+            continue
+        if _raw_review_key(field, receipt_ordinals=receipt_ordinals) in rejected_keys:
+            continue
+        owner = reviewed_field_core_owner(
+            document_type_key=field.documentTypeKey,
+            field_key=field.fieldKey,
+            document_id=field.documentId,
+        )
+        if owner is None:
+            raise _missing_core_owner_error(
+                field_key=field.fieldKey,
+                document_type_key=field.documentTypeKey,
+            )
+
+
 def confirm_booking_review_v2_with_decisions(
     tenant_id: str,
     journey_id: UUID,
@@ -491,6 +548,10 @@ def confirm_booking_review_v2_with_decisions(
     rejected_keys = {
         key for key, decision in decisions.items() if decision == "REJECTED"
     }
+    _assert_accepted_raw_fields_have_core_owner(
+        unmapped,
+        rejected_keys=rejected_keys,
+    )
     correlation_id = get_correlation_id(request)
 
     def execute() -> dict[str, Any]:
@@ -527,7 +588,6 @@ def confirm_booking_review_v2_with_decisions(
             )
 
         applied: list[str] = []
-        review_only: list[str] = []
         conflicts: list[str] = []
         rejected_attributes: list[str] = []
         resolved_count = 0
@@ -539,9 +599,15 @@ def confirm_booking_review_v2_with_decisions(
             if review_key in rejected_keys:
                 rejected_attributes.append(attribute.attributeKey)
                 continue
+
             spec = review_v2.spec_for_field(source.fieldKey)
             if spec is None or spec.attribute_key != attribute.attributeKey:
-                continue
+                raise _missing_core_owner_error(
+                    field_key=source.fieldKey,
+                    document_type_key=source.documentTypeKey,
+                    attribute_key=attribute.attributeKey,
+                )
+
             resolved_count += 1
             application = review_v2.apply_supported_operational_attribute(
                 connection,
@@ -554,16 +620,26 @@ def confirm_booking_review_v2_with_decisions(
                 source_field_key=source.fieldKey,
                 source_evidence_id=source.evidenceId,
             )
-            owning_domain_key: str | None = None
-            owning_record_reference: str | None = None
+
             if application is None:
-                review_only.append(attribute.attributeKey)
+                typed_owner = reviewed_field_core_owner(
+                    document_type_key=source.documentTypeKey,
+                    field_key=source.fieldKey,
+                    document_id=source.documentId,
+                )
+                if typed_owner is None:
+                    raise _missing_core_owner_error(
+                        field_key=source.fieldKey,
+                        document_type_key=source.documentTypeKey,
+                        attribute_key=attribute.attributeKey,
+                    )
+                owning_domain_key, owning_record_reference = typed_owner
             else:
                 owning_domain_key, owning_record_reference, application_status = application
-                applied.append(attribute.attributeKey)
                 if application_status == "CONFLICT":
                     conflicts.append(attribute.attributeKey)
 
+            applied.append(attribute.attributeKey)
             if spec.mapping_status == "SUPPORTED":
                 review_v2.record_attribute_resolution(
                     connection,
@@ -582,12 +658,13 @@ def confirm_booking_review_v2_with_decisions(
                     owning_record_reference=owning_record_reference,
                 )
 
-        receipt_result = materialize_reviewed_booking_receipts(
+        materialization = materialize_reviewed_di_business_values(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
             documents=documents,
             rejected_review_keys=rejected_keys,
+            actor_id=human_principal.subject,
         )
 
         next_version = expected_version + 1
@@ -618,15 +695,9 @@ def confirm_booking_review_v2_with_decisions(
             safe_payload={
                 "resolvedAttributeCount": resolved_count,
                 "appliedAttributeKeys": sorted(applied),
-                "reviewOnlyAttributeKeys": sorted(review_only),
                 "conflictAttributeKeys": sorted(conflicts),
                 "rejectedReviewKeys": sorted(rejected_keys),
-                "receiptPaymentsCreated": receipt_result["created"],
-                "receiptPaymentsUpdated": receipt_result["updated"],
-                "receiptPaymentsUnchanged": receipt_result["unchanged"],
-                "receiptPaymentsSkippedWithoutAmount": receipt_result[
-                    "skippedWithoutAmount"
-                ],
+                **materialization,
                 "rawDiValuesCopied": False,
             },
             aggregate_version=next_version,
@@ -637,7 +708,6 @@ def confirm_booking_review_v2_with_decisions(
             "aggregateVersion": next_version,
             "resolvedAttributeCount": resolved_count,
             "appliedAttributes": sorted(applied),
-            "reviewOnlyAttributes": sorted(review_only),
             "conflictAttributes": sorted(conflicts),
             "rejectedAttributes": sorted(rejected_attributes),
         }
