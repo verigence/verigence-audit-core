@@ -1,0 +1,397 @@
+name: One-shot publish MahindraOrissa August policy
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - .github/workflows/one-shot-publish-mahindraorissa-policy-202608.yml
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      DB_SERVICE: Postgres
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Audit Core and Railway CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e .
+          npm install --global @railway/cli
+
+      - name: Resolve approved DEV database
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$DB_SERVICE" --json >/tmp/db-vars.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path('/tmp/db-vars.json').read_text())
+          raw = (data.get('DATABASE_PUBLIC_URL') or data.get('DATABASE_URL') or '').strip()
+          if not raw:
+              raise SystemExit('DEV Postgres URL is unavailable')
+          if raw.startswith('postgres://'):
+              raw = 'postgresql+psycopg://' + raw[len('postgres://'):]
+          elif raw.startswith('postgresql://'):
+              raw = 'postgresql+psycopg://' + raw[len('postgresql://'):]
+          elif raw.startswith('postgresql+asyncpg://'):
+              raw = 'postgresql+psycopg://' + raw[len('postgresql+asyncpg://'):]
+          Path('/tmp/db-url').write_text(raw)
+          print('AUDIT_DEV_DATABASE_RESOLVED=PASS')
+          PY
+
+      - name: Verify schema is current
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DATABASE_URL="$(cat /tmp/db-url)"
+          head_count="$(alembic heads | grep -c '(head)' || true)"
+          if [[ "$head_count" != "1" ]]; then
+            echo "Expected one Alembic head, found $head_count" >&2
+            alembic heads >&2
+            exit 1
+          fi
+          alembic upgrade head
+          alembic current
+
+      - name: Publish effective-dated policy version
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DATABASE_URL="$(cat /tmp/db-url)"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from sqlalchemy import create_engine, text
+
+          TARGET_KEY = 'mahindraorissa'
+          EFFECTIVE_FROM = '2026-08-01'
+          ACTOR = 'dev-master-publication-20260830'
+
+          engine = create_engine(os.environ['DATABASE_URL'])
+          with engine.begin() as connection:
+              projects = connection.execute(
+                  text(
+                      """
+                      SELECT tenant_id, project_code, project_name
+                      FROM auditcore.projects
+                      WHERE regexp_replace(lower(coalesce(project_code, '')), '[^a-z0-9]+', '', 'g') = :target
+                         OR regexp_replace(lower(coalesce(project_name, '')), '[^a-z0-9]+', '', 'g') = :target
+                      ORDER BY created_at_utc DESC
+                      """
+                  ),
+                  {'target': TARGET_KEY},
+              ).mappings().all()
+              if len(projects) != 1:
+                  raise SystemExit(
+                      f'Safety stop: expected exactly one MahindraOrissa DEV project, found {len(projects)}'
+                  )
+
+              project = projects[0]
+              tenant_id = project['tenant_id']
+              dealers = connection.execute(
+                  text(
+                      """
+                      SELECT dealer_id, dealer_code
+                      FROM auditcore.dealers
+                      WHERE tenant_id = :tenant_id
+                      ORDER BY dealer_code, dealer_id
+                      """
+                  ),
+                  {'tenant_id': tenant_id},
+              ).mappings().all()
+              if len(dealers) != 2:
+                  raise SystemExit(
+                      f'Safety stop: MahindraOrissa must have exactly two Dealers; found {len(dealers)}'
+                  )
+              dealer_ids = [row['dealer_id'] for row in dealers]
+
+              current = connection.execute(
+                  text(
+                      """
+                      SELECT discount_policy_version_id, version_no, effective_from, effective_to
+                      FROM auditcore.discount_policy_versions
+                      WHERE tenant_id = :tenant_id
+                        AND lifecycle_status IN ('PUBLISHED', 'RETIRED')
+                        AND effective_from <= DATE '2026-08-30'
+                        AND (effective_to IS NULL OR effective_to >= DATE '2026-08-30')
+                      ORDER BY effective_from DESC, version_no DESC, discount_policy_version_id DESC
+                      LIMIT 1
+                      """
+                  ),
+                  {'tenant_id': tenant_id},
+              ).mappings().one_or_none()
+
+              if current is not None:
+                  minimum_ok = connection.execute(
+                      text(
+                          """
+                          SELECT count(*)
+                          FROM auditcore.discount_policy_parameters
+                          WHERE tenant_id=:tenant_id
+                            AND discount_policy_version_id=:version_id
+                            AND scope_type='PROJECT'
+                            AND parameter_key='MINIMUM_BOOKING_AMOUNT'
+                            AND value_type='NUMBER'
+                            AND value_number=21000
+                            AND unit='INR'
+                          """
+                      ),
+                      {'tenant_id': tenant_id, 'version_id': current['discount_policy_version_id']},
+                  ).scalar_one() == 1
+                  dealer_mr_count = connection.execute(
+                      text(
+                          """
+                          SELECT count(DISTINCT dealer_id)
+                          FROM auditcore.discount_policy_parameters
+                          WHERE tenant_id=:tenant_id
+                            AND discount_policy_version_id=:version_id
+                            AND scope_type='DEALER'
+                            AND parameter_key='MR_MAX_PERCENT_PREVIOUS_MONTH_RETAIL'
+                            AND value_type='NUMBER'
+                            AND value_number=4
+                            AND unit='PERCENT'
+                            AND dealer_id = ANY(:dealer_ids)
+                          """
+                      ),
+                      {
+                          'tenant_id': tenant_id,
+                          'version_id': current['discount_policy_version_id'],
+                          'dealer_ids': dealer_ids,
+                      },
+                  ).scalar_one()
+                  if minimum_ok and dealer_mr_count == 2:
+                      Path('/tmp/policy-result.txt').write_text(
+                          'PROJECT=MahindraOrissa\n'
+                          'DEALER_COUNT=2\n'
+                          'MINIMUM_BOOKING_AMOUNT=21000 INR\n'
+                          'MR_PERCENT_EACH=4\n'
+                          f"VERSION_NO={current['version_no']}\n"
+                          'RESULT=ALREADY_PUBLISHED\n'
+                      )
+                      print('MAHINDRAORISSA_POLICY=ALREADY_PUBLISHED')
+                      raise SystemExit(0)
+
+                  if str(current['effective_from']) > EFFECTIVE_FROM:
+                      raise SystemExit(
+                          'Safety stop: a newer-dated effective policy already exists; refusing to backdate over it'
+                      )
+
+              next_version = connection.execute(
+                  text(
+                      """
+                      SELECT coalesce(max(version_no), 0) + 1
+                      FROM auditcore.discount_policy_versions
+                      WHERE tenant_id=:tenant_id
+                      """
+                  ),
+                  {'tenant_id': tenant_id},
+              ).scalar_one()
+
+              new_version_id = connection.execute(
+                  text(
+                      """
+                      INSERT INTO auditcore.discount_policy_versions (
+                          tenant_id, version_no, effective_from, effective_to,
+                          lifecycle_status, created_by_actor_id
+                      ) VALUES (
+                          :tenant_id, :version_no, DATE '2026-08-01', :effective_to,
+                          'DRAFT', :actor
+                      )
+                      RETURNING discount_policy_version_id
+                      """
+                  ),
+                  {
+                      'tenant_id': tenant_id,
+                      'version_no': next_version,
+                      'effective_to': current['effective_to'] if current is not None else None,
+                      'actor': ACTOR,
+                  },
+              ).scalar_one()
+
+              if current is not None:
+                  connection.execute(
+                      text(
+                          """
+                          INSERT INTO auditcore.discount_policy_parameters (
+                              tenant_id, discount_policy_version_id, scope_type,
+                              segment_id, scope_key, dealer_id, parameter_key,
+                              value_type, value_number, value_text, unit, notes,
+                              source_import_row_no
+                          )
+                          SELECT
+                              tenant_id, :new_version_id, scope_type,
+                              segment_id, scope_key, dealer_id, parameter_key,
+                              value_type, value_number, value_text, unit, notes,
+                              source_import_row_no
+                          FROM auditcore.discount_policy_parameters
+                          WHERE tenant_id=:tenant_id
+                            AND discount_policy_version_id=:source_version_id
+                          """
+                      ),
+                      {
+                          'tenant_id': tenant_id,
+                          'new_version_id': new_version_id,
+                          'source_version_id': current['discount_policy_version_id'],
+                      },
+                  )
+
+              connection.execute(
+                  text(
+                      """
+                      DELETE FROM auditcore.discount_policy_parameters
+                      WHERE tenant_id=:tenant_id
+                        AND discount_policy_version_id=:version_id
+                        AND scope_type='PROJECT'
+                        AND parameter_key='MINIMUM_BOOKING_AMOUNT'
+                      """
+                  ),
+                  {'tenant_id': tenant_id, 'version_id': new_version_id},
+              )
+              connection.execute(
+                  text(
+                      """
+                      INSERT INTO auditcore.discount_policy_parameters (
+                          tenant_id, discount_policy_version_id, scope_type,
+                          parameter_key, value_type, value_number, unit, notes
+                      ) VALUES (
+                          :tenant_id, :version_id, 'PROJECT',
+                          'MINIMUM_BOOKING_AMOUNT', 'NUMBER', 21000, 'INR',
+                          'Minimum Booking Amount effective 01-Aug-2026'
+                      )
+                      """
+                  ),
+                  {'tenant_id': tenant_id, 'version_id': new_version_id},
+              )
+
+              connection.execute(
+                  text(
+                      """
+                      DELETE FROM auditcore.discount_policy_parameters
+                      WHERE tenant_id=:tenant_id
+                        AND discount_policy_version_id=:version_id
+                        AND scope_type='DEALER'
+                        AND parameter_key='MR_MAX_PERCENT_PREVIOUS_MONTH_RETAIL'
+                        AND dealer_id = ANY(:dealer_ids)
+                      """
+                  ),
+                  {
+                      'tenant_id': tenant_id,
+                      'version_id': new_version_id,
+                      'dealer_ids': dealer_ids,
+                  },
+              )
+              for dealer_id in dealer_ids:
+                  connection.execute(
+                      text(
+                          """
+                          INSERT INTO auditcore.discount_policy_parameters (
+                              tenant_id, discount_policy_version_id, scope_type,
+                              dealer_id, parameter_key, value_type,
+                              value_number, unit, notes
+                          ) VALUES (
+                              :tenant_id, :version_id, 'DEALER',
+                              :dealer_id, 'MR_MAX_PERCENT_PREVIOUS_MONTH_RETAIL',
+                              'NUMBER', 4, 'PERCENT',
+                              'Management Referral entitlement for Dealer'
+                          )
+                          """
+                      ),
+                      {
+                          'tenant_id': tenant_id,
+                          'version_id': new_version_id,
+                          'dealer_id': dealer_id,
+                      },
+                  )
+
+              connection.execute(
+                  text(
+                      """
+                      UPDATE auditcore.discount_policy_versions
+                      SET lifecycle_status='PUBLISHED',
+                          published_by_actor_id=:actor,
+                          published_at_utc=now(),
+                          updated_at_utc=now()
+                      WHERE tenant_id=:tenant_id
+                        AND discount_policy_version_id=:version_id
+                        AND lifecycle_status='DRAFT'
+                      """
+                  ),
+                  {
+                      'tenant_id': tenant_id,
+                      'version_id': new_version_id,
+                      'actor': ACTOR,
+                  },
+              )
+
+              verify = connection.execute(
+                  text(
+                      """
+                      SELECT
+                        count(*) FILTER (
+                          WHERE scope_type='PROJECT'
+                            AND parameter_key='MINIMUM_BOOKING_AMOUNT'
+                            AND value_number=21000 AND unit='INR'
+                        ) AS minimum_rows,
+                        count(DISTINCT dealer_id) FILTER (
+                          WHERE scope_type='DEALER'
+                            AND parameter_key='MR_MAX_PERCENT_PREVIOUS_MONTH_RETAIL'
+                            AND value_number=4 AND unit='PERCENT'
+                        ) AS mr_dealers
+                      FROM auditcore.discount_policy_parameters
+                      WHERE tenant_id=:tenant_id
+                        AND discount_policy_version_id=:version_id
+                      """
+                  ),
+                  {'tenant_id': tenant_id, 'version_id': new_version_id},
+              ).mappings().one()
+              if verify['minimum_rows'] != 1 or verify['mr_dealers'] != 2:
+                  raise SystemExit('Post-publication verification failed')
+
+              Path('/tmp/policy-result.txt').write_text(
+                  'PROJECT=MahindraOrissa\n'
+                  'DEALER_COUNT=2\n'
+                  'MINIMUM_BOOKING_AMOUNT=21000 INR\n'
+                  'MR_PERCENT_EACH=4\n'
+                  f'VERSION_NO={next_version}\n'
+                  'EFFECTIVE_FROM=2026-08-01\n'
+                  'RESULT=PASS\n'
+              )
+              print('MAHINDRAORISSA_POLICY=PASS')
+          engine.dispose()
+          PY
+
+      - name: Record result and self-clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs/runtime
+          cp /tmp/policy-result.txt docs/runtime/mahindraorissa-policy-202608.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm -f .github/workflows/one-shot-publish-mahindraorissa-policy-202608.yml
+          git add docs/runtime/mahindraorissa-policy-202608.txt
+          git commit -m 'docs(dev): record MahindraOrissa August policy publication [skip ci]'
+          git pull --rebase origin dev
+          git push origin HEAD:dev
