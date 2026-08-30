@@ -1,6 +1,6 @@
 """Add reference-only UC03 attribute resolution provenance.
 
-Revision ID: 0037_uc03_attribute_resolution_refs
+Revision ID: 0037_uc03_attr_resolution_refs
 Revises: 0036_uc03_document_capture_v2
 Create Date: 2026-08-30
 
@@ -10,7 +10,7 @@ business attribute is committed to an Audit Core typed domain.
 """
 from alembic import op
 
-revision = "0037_uc03_attribute_resolution_refs"
+revision = "0037_uc03_attr_resolution_refs"
 down_revision = "0036_uc03_document_capture_v2"
 branch_labels = None
 depends_on = None
