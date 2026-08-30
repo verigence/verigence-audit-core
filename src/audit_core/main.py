@@ -67,7 +67,9 @@ from audit_core.uc03_booking_review import router as uc03_booking_review_router
 from audit_core.uc03_booking_v2 import router as uc03_booking_v2_router
 from audit_core.uc03_create_booking import router as uc03_create_booking_router
 from audit_core.uc03_customer_mobile_pii import install_uc03_customer_mobile_pii
-from audit_core.uc03_delivery_capture_v2 import router as uc03_delivery_capture_v2_router
+from audit_core.uc03_delivery_capture_v2 import (
+    router as uc03_delivery_capture_v2_router,
+)
 from audit_core.uc03_delivery_commands import router as uc03_delivery_router
 from audit_core.uc03_delivery_documents import router as uc03_delivery_documents_router
 from audit_core.uc03_document_assessments import (
