@@ -7,6 +7,10 @@ from audit_core.uc03_document_review_v2 import (
     ReviewV2UnmappedField,
 )
 from audit_core.uc03_v2_review_materialization import (
+    _AADHAAR_FIELDS,
+    _BOOKING_FORM_FIELDS,
+    _PAN_FIELDS,
+    _RECEIPT_FIELDS,
     _reviewed_receipt_values,
     receipt_document_ordinals,
     receipt_review_key,
@@ -54,6 +58,94 @@ def _receipt_unmapped(document_id, *, amount: str, confidence: float):
         documentLabel="Dealer Receipt",
         originalFilename=f"{document_id}.pdf",
     )
+
+
+def test_booking_form_di_contract_has_core_review_owner_for_every_field() -> None:
+    # Mirrors verigence-di booking_form schema v1.4 exactly. This test must change
+    # whenever DI adds/removes a Booking Form extraction field.
+    assert set(_BOOKING_FORM_FIELDS) == {
+        "dealer_name",
+        "dealer_branch",
+        "booking_reference_number",
+        "booking_date",
+        "customer_name",
+        "customer_phone",
+        "customer_email",
+        "customer_address",
+        "vehicle_model",
+        "vehicle_variant",
+        "vehicle_color",
+        "sku_code",
+        "sales_person",
+        "registration_by",
+        "registration_type",
+        "insurance_by",
+        "exchange_applicable",
+        "exchange_value",
+        "ex_showroom_price",
+        "insurance_amount",
+        "registration_charges",
+        "road_tax_amount",
+        "road_tax_registration",
+        "tcs_amount",
+        "rsa_amount",
+        "additional_warranty_amount",
+        "accessories_cost",
+        "other_charges",
+        "discount_amount",
+        "bonus_amount",
+        "total_price",
+        "net_amount",
+        "booking_amount_paid",
+        "balance_amount",
+        "mode_of_payment",
+        "payment_reference_no",
+        "expected_delivery",
+        "expected_delivery_date",
+    }
+
+
+def test_pan_di_contract_has_core_review_owner_for_every_field() -> None:
+    assert _PAN_FIELDS == {
+        "pan_number",
+        "pan_name",
+        "pan_father_name",
+        "pan_relationship_type",
+        "pan_relationship_name",
+        "date_of_birth",
+    }
+
+
+def test_aadhaar_di_contract_has_core_review_owner_for_every_field() -> None:
+    assert _AADHAAR_FIELDS == {
+        "aadhaar_number",
+        "aadhaar_name",
+        "date_of_birth",
+        "gender",
+        "aadhaar_address",
+        "aadhaar_relationship_type",
+        "aadhaar_relationship_name",
+    }
+
+
+def test_dealer_receipt_di_contract_has_core_review_owner_for_every_field() -> None:
+    assert set(_RECEIPT_FIELDS) == {
+        "dealer_name",
+        "dealer_gstin",
+        "customer_name",
+        "customer_phone",
+        "receipt_number",
+        "receipt_date",
+        "amount_paid",
+        "payment_mode",
+        "payment_reference_no",
+        "payment_reference_date",
+        "bank_name",
+        "bank_location",
+        "booking_reference_number",
+        "remarks",
+        "amount_in_words",
+    }
 
 
 def test_receipt_review_key_is_receipt_scoped() -> None:
@@ -125,7 +217,7 @@ def test_rejected_receipt_amount_is_not_materialized_as_zero_payment() -> None:
         rejected_review_keys={receipt_review_key(1, "amount_paid")},
     )
 
-    assert "amount" not in values
+    assert "amount_paid" not in values
     assert values["receipt_number"] is not None
 
 
@@ -139,7 +231,7 @@ def test_reviewed_receipt_fields_are_collected_once_in_memory() -> None:
         rejected_review_keys=set(),
     )
 
-    assert str(values["amount"]) == "50000"
+    assert str(values["amount_paid"]) == "50000"
     assert str(values["receipt_date"]) == "2026-08-30"
-    assert values["payment_method_code"] == "UPI"
-    assert values["payment_reference"] == "UTR-123"
+    assert values["payment_mode"] == "UPI"
+    assert values["payment_reference_no"] == "UTR-123"
