@@ -73,10 +73,10 @@ def _engine() -> Engine:
 
     # Runtime API connections always operate as the constrained database role. Set
     # that role when a physical PostgreSQL connection is created instead of issuing
-    # SET LOCAL ROLE on every HTTP request. TCP keepalives plus bounded connection
-    # lifetime avoid paying a SELECT 1 pre-ping on every pooled checkout while still
-    # retiring stale network connections proactively.
-    engine_options: dict[str, object] = {"pool_pre_ping": False}
+    # SET LOCAL ROLE on every HTTP request. Railway/PostgreSQL can terminate pooled
+    # connections during a restart/failover, so pre-ping each checkout and let
+    # SQLAlchemy discard a dead connection before a user request receives it.
+    engine_options: dict[str, object] = {"pool_pre_ping": True}
     if _postgresql_url(database_url):
         engine_options.update(
             pool_timeout=5,
