@@ -60,7 +60,7 @@ def _response(
     )
 
 
-def test_required_document_missing_remains_visible_but_does_not_block_screen_two() -> None:
+def test_required_document_missing_is_non_blocking_audit_observation() -> None:
     result = _response(requirements=[_requirement()])
 
     assert result.canContinue is True
@@ -108,7 +108,7 @@ def test_unknown_upload_does_not_satisfy_requirement_but_does_not_block() -> Non
     assert result.uploads[0].state == "UNKNOWN"
 
 
-def test_unresolved_conditional_requirement_remains_visible_but_non_blocking() -> None:
+def test_unresolved_conditional_requirement_is_non_blocking() -> None:
     result = _response(
         requirements=[
             _requirement(
@@ -213,16 +213,14 @@ def test_v2_completion_route_is_additive() -> None:
 
 def test_local_completion_check_uses_reconciled_classified_links() -> None:
     requirements = [_requirement()]
-    audit_documents = [
-        {
-            "di_document_id": DOCUMENT_ID,
-            "client_upload_id": "client-upload-1",
-            "capture_status": "CLASSIFIED",
-            "classified_document_type_key": "booking_docket",
-            "requirement_key": "booking_docket",
-            "original_filename": "booking.pdf",
-        }
-    ]
+    audit_documents = [{
+        "di_document_id": DOCUMENT_ID,
+        "client_upload_id": "client-upload-1",
+        "capture_status": "CLASSIFIED",
+        "classified_document_type_key": "booking_docket",
+        "requirement_key": "booking_docket",
+        "original_filename": "booking.pdf",
+    }]
 
     result = _build_local_capture_response(
         journey_id=JOURNEY_ID,
