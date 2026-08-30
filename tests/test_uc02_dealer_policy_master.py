@@ -84,19 +84,19 @@ def _publish_policy(connection, *, tenant_id: str, dealer_a_id):
         {"tenant_id": tenant_id},
     ).scalar_one()
     rows = [
-        ("PROJECT", None, "MINIMUM_BOOKING_AMOUNT", Decimal("21000"), "INR"),
+        ("PROJECT", None, "MINIMUM_BOOKING_AMOUNT", Decimal(21000), "INR"),
         (
             "PROJECT",
             None,
             "MR_MAX_PERCENT_PREVIOUS_MONTH_RETAIL",
-            Decimal("5"),
+            Decimal(5),
             "PERCENT",
         ),
         (
             "DEALER",
             dealer_a_id,
             "MR_MAX_PERCENT_PREVIOUS_MONTH_RETAIL",
-            Decimal("7"),
+            Decimal(7),
             "PERCENT",
         ),
     ]
@@ -170,7 +170,7 @@ def test_project_minimum_and_dealer_mr_override_resolve_by_business_date() -> No
             )
             assert booking_minimum is not None
             assert booking_minimum["scope_type"] == "PROJECT"
-            assert booking_minimum["value_number"] == Decimal("21000")
+            assert booking_minimum["value_number"] == Decimal(21000)
             assert booking_minimum["unit"] == "INR"
 
             dealer_a_mr = resolve_numeric_policy_parameter(
@@ -182,7 +182,7 @@ def test_project_minimum_and_dealer_mr_override_resolve_by_business_date() -> No
             )
             assert dealer_a_mr is not None
             assert dealer_a_mr["scope_type"] == "DEALER"
-            assert dealer_a_mr["value_number"] == Decimal("7")
+            assert dealer_a_mr["value_number"] == Decimal(7)
 
             dealer_b_mr = resolve_numeric_policy_parameter(
                 connection,
@@ -193,7 +193,7 @@ def test_project_minimum_and_dealer_mr_override_resolve_by_business_date() -> No
             )
             assert dealer_b_mr is not None
             assert dealer_b_mr["scope_type"] == "PROJECT"
-            assert dealer_b_mr["value_number"] == Decimal("5")
+            assert dealer_b_mr["value_number"] == Decimal(5)
     finally:
         engine.dispose()
 
