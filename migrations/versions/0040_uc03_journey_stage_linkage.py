@@ -68,6 +68,12 @@ def upgrade() -> None:
         WHERE b.tenant_id = d.tenant_id
           AND b.journey_id = d.journey_id;
 
+        UPDATE auditcore.journeys j
+        SET delivery_id = d.delivery_id
+        FROM auditcore.deliveries d
+        WHERE d.tenant_id = j.tenant_id
+          AND d.journey_id = j.journey_id;
+
         UPDATE auditcore.payments p
         SET booking_id = b.booking_id
         FROM auditcore.bookings b
