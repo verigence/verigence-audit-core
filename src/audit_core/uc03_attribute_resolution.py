@@ -8,8 +8,10 @@ from sqlalchemy import Connection, text
 
 from audit_core.uc03_attribute_mapping import AttributeSpec
 from audit_core.uc03_booking_capture import _write_typed_capture
+from audit_core.uc03_booking_field_owners import apply_booking_field_owner
 
-_MAPPING_VERSION = "UC03-ATTR-2026-08-30"
+_MAPPING_VERSION = "UC03-ATTR-2026-08-30-v2"
+_RELATIONSHIP_TYPES = {"S/O", "W/O", "D/O"}
 
 
 def _normalize_identity_name(value: Any) -> str:
@@ -34,12 +36,7 @@ def apply_legal_name_review(
     actor_id: str,
     source_evidence_id: UUID | None,
 ) -> tuple[str, str, str]:
-    """Apply an identity-authoritative reviewed name without touching Entered Name.
-
-    Returns (owning domain, owning record reference, resulting legal-name status).
-    A materially different already-verified name becomes CONFLICT; the existing
-    legal name is retained rather than silently overwritten.
-    """
+    """Apply an identity-authoritative reviewed name without touching Entered Name."""
 
     name = _normalize_identity_name(value)
     customer = connection.execute(
@@ -107,6 +104,95 @@ def apply_legal_name_review(
     return "CUSTOMER", str(customer["customer_id"]), "CONFLICT"
 
 
+def apply_customer_relationship_review(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    attribute_key: str,
+    value: Any,
+    actor_id: str,
+) -> tuple[str, str, str]:
+    """Apply only a reviewed explicit S/O/W/O/D/O relationship value.
+
+    PAN/Aadhaar raw values remain source-specific in DI. A materially different
+    already-reviewed value is retained and surfaced as CONFLICT rather than being
+    silently overwritten by another source.
+    """
+
+    customer = connection.execute(
+        text(
+            """
+            SELECT c.customer_id, c.relationship_type, c.relationship_name
+            FROM auditcore.journeys j
+            JOIN auditcore.customers c
+              ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+            WHERE j.tenant_id=:tenant_id AND j.journey_id=:journey_id
+            FOR UPDATE OF c
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one()
+
+    if attribute_key == "customer_relationship_type":
+        normalized = re.sub(r"\s+", "", str(value).strip()).upper()
+        if normalized not in _RELATIONSHIP_TYPES:
+            raise ValueError("Relationship Type must be S/O, W/O or D/O")
+        existing = customer["relationship_type"]
+        if existing is not None and str(existing).strip() and str(existing).upper() != normalized:
+            return "CUSTOMER", str(customer["customer_id"]), "CONFLICT"
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.customers
+                SET relationship_type=:value,
+                    updated_by_actor_id=:actor_id,
+                    updated_at_utc=now(),
+                    version_no=version_no+1
+                WHERE tenant_id=:tenant_id AND customer_id=:customer_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "customer_id": customer["customer_id"],
+                "value": normalized,
+                "actor_id": actor_id,
+            },
+        )
+        return "CUSTOMER", str(customer["customer_id"]), "APPLIED"
+
+    if attribute_key == "customer_relationship_name":
+        normalized = _normalize_identity_name(value)
+        existing = customer["relationship_name"]
+        if (
+            existing is not None
+            and str(existing).strip()
+            and _identity_equivalence(str(existing)) != _identity_equivalence(normalized)
+        ):
+            return "CUSTOMER", str(customer["customer_id"]), "CONFLICT"
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.customers
+                SET relationship_name=:value,
+                    updated_by_actor_id=:actor_id,
+                    updated_at_utc=now(),
+                    version_no=version_no+1
+                WHERE tenant_id=:tenant_id AND customer_id=:customer_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "customer_id": customer["customer_id"],
+                "value": normalized,
+                "actor_id": actor_id,
+            },
+        )
+        return "CUSTOMER", str(customer["customer_id"]), "APPLIED"
+
+    raise RuntimeError("Unsupported customer relationship attribute")
+
+
 def apply_supported_operational_attribute(
     connection: Connection,
     *,
@@ -121,9 +207,9 @@ def apply_supported_operational_attribute(
 ) -> tuple[str, str, str] | None:
     """Write only an explicitly approved typed-domain owner.
 
-    A return value is (domain, record reference, application status). None means
-    the mapped attribute remains review/audit-only because no safe typed owner has
-    been approved. This intentionally excludes free-text product fields and PAN.
+    Commercial machine facts can be SUPPORTED for review and source resolution
+    while returning None here; DI remains their source of truth. Audit Core stores
+    only reviewed business values with an approved typed owner.
     """
 
     if spec.mapping_status != "SUPPORTED":
@@ -138,7 +224,7 @@ def apply_supported_operational_attribute(
         )
         if not identity_source:
             return None
-        domain, record, status = apply_legal_name_review(
+        return apply_legal_name_review(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
@@ -146,9 +232,30 @@ def apply_supported_operational_attribute(
             actor_id=actor_id,
             source_evidence_id=source_evidence_id,
         )
-        return domain, record, status
+
+    if spec.attribute_key in {"customer_relationship_type", "customer_relationship_name"}:
+        return apply_customer_relationship_review(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            attribute_key=spec.attribute_key,
+            value=value,
+            actor_id=actor_id,
+        )
+
+    booking_owner = apply_booking_field_owner(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        attribute_key=spec.attribute_key,
+        value=value,
+        source_evidence_id=source_evidence_id,
+    )
+    if booking_owner is not None:
+        return booking_owner
 
     if spec.operational_field is None:
+        # Deliberate review/provenance-only fact (especially commercial values).
         return None
 
     domain, record = _write_typed_capture(

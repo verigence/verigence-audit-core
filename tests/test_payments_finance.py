@@ -150,6 +150,33 @@ def test_multiple_payments_verification_exception_and_finance_are_recorded() -> 
         assert first.status_code == 201, first.text
         first_id = first.json()["paymentId"]
 
+        # A receipt/payment lazily establishes the Journey's Booking linkage but
+        # does not guess whether the receipt belongs to Booking or Delivery.
+        with engine.begin() as connection:
+            first_link = connection.execute(
+                text(
+                    """
+                    SELECT p.booking_id, p.delivery_id, p.payment_stage,
+                           j.booking_id AS journey_booking_id,
+                           c.journey_id AS customer_journey_id,
+                           c.booking_id AS customer_booking_id
+                    FROM auditcore.payments p
+                    JOIN auditcore.journeys j
+                      ON j.tenant_id=p.tenant_id AND j.journey_id=p.journey_id
+                    JOIN auditcore.customers c
+                      ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+                    WHERE p.tenant_id=:tenant_id AND p.payment_id=:payment_id
+                    """
+                ),
+                {"tenant_id": tenant_id, "payment_id": first_id},
+            ).mappings().one()
+        assert first_link["booking_id"] is not None
+        assert first_link["booking_id"] == first_link["journey_booking_id"]
+        assert first_link["booking_id"] == first_link["customer_booking_id"]
+        assert first_link["customer_journey_id"] == journey_id
+        assert first_link["delivery_id"] is None
+        assert first_link["payment_stage"] == "UNSPECIFIED"
+
         verified = client.patch(
             payments_url,
             json={
@@ -175,9 +202,28 @@ def test_multiple_payments_verification_exception_and_finance_are_recorded() -> 
             },
         )
         assert second.status_code == 201, second.text
+        second_id = second.json()["paymentId"]
+        assert second_id != first_id
+
         listed = client.get(payments_url)
         assert listed.status_code == 200
         assert len(listed.json()) == 2
+
+        with engine.begin() as connection:
+            links = connection.execute(
+                text(
+                    """
+                    SELECT payment_id, booking_id, payment_stage
+                    FROM auditcore.payments
+                    WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                    ORDER BY created_at_utc, payment_id
+                    """
+                ),
+                {"tenant_id": tenant_id, "journey_id": journey_id},
+            ).mappings().all()
+        assert len(links) == 2
+        assert {row["booking_id"] for row in links} == {first_link["booking_id"]}
+        assert {row["payment_stage"] for row in links} == {"UNSPECIFIED"}
 
         finance_url = f"/v1/tenants/{tenant_id}/journeys/{journey_id}/finance"
         finance = client.put(
