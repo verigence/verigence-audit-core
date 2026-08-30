@@ -38,13 +38,13 @@ def _candidate() -> SkuCandidate:
         variantName="AX7 L",
         colourName="Red Rage",
         displayLabel="XUV700 AX7 L *",
-        masterTotalAmount=Decimal("2510000"),
-        observedTotalCommercialAmount=Decimal("2500000"),
-        commercialDifferenceAmount=Decimal("10000"),
+        masterTotalAmount=Decimal(2510000),
+        observedTotalCommercialAmount=Decimal(2500000),
+        commercialDifferenceAmount=Decimal(10000),
         commercialDifferencePercent=Decimal("0.40"),
         score=Decimal("0.9967"),
-        modelScore=Decimal("1"),
-        variantScore=Decimal("1"),
+        modelScore=Decimal(1),
+        variantScore=Decimal(1),
         commercialScore=Decimal("0.9867"),
     )
 
@@ -76,13 +76,13 @@ class _FakeConnection:
 
 
 def test_label_similarity_normalizes_spacing_and_punctuation() -> None:
-    assert _label_similarity("XUV 700", "XUV700") == Decimal("1")
-    assert _label_similarity("AX7-L", "AX7 L") == Decimal("1")
+    assert _label_similarity("XUV 700", "XUV700") == Decimal(1)
+    assert _label_similarity("AX7-L", "AX7 L") == Decimal(1)
 
 
 def test_commercial_similarity_rewards_price_proximity() -> None:
-    near, _, near_pct = _commercial_similarity(Decimal("2500000"), Decimal("2510000"))
-    far, _, far_pct = _commercial_similarity(Decimal("2500000"), Decimal("3000000"))
+    near, _, near_pct = _commercial_similarity(Decimal(2500000), Decimal(2510000))
+    far, _, far_pct = _commercial_similarity(Decimal(2500000), Decimal(3000000))
     assert near > far
     assert near_pct < far_pct
 
@@ -119,7 +119,7 @@ def test_ranked_candidate_uses_model_variant_and_commercial_total() -> None:
         rows,
         model_name="XUV 700",
         variant_name="AX7L",
-        total_commercial_amount=Decimal("2500000"),
+        total_commercial_amount=Decimal(2500000),
         max_candidates=5,
     )
 
@@ -147,7 +147,7 @@ def test_exact_model_variant_is_not_auto_confirmed_even_at_exact_price() -> None
         rows,
         model_name="Model X",
         variant_name="Variant Pro",
-        total_commercial_amount=Decimal("1000000"),
+        total_commercial_amount=Decimal(1000000),
         max_candidates=1,
     )[0]
     assert candidate.score == Decimal("1.0000")
@@ -170,7 +170,7 @@ def test_unrelated_low_score_rows_are_not_returned_as_false_candidates() -> None
         rows,
         model_name="XUV700",
         variant_name="AX7 L",
-        total_commercial_amount=Decimal("2500000"),
+        total_commercial_amount=Decimal(2500000),
         max_candidates=5,
     )
     assert candidates == []
