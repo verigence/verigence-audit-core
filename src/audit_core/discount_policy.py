@@ -55,42 +55,55 @@ def resolve_numeric_policy_parameter(
     if version is None:
         return None
 
-    row = connection.execute(
-        text(
-            """
-            SELECT parameter_id, scope_type, dealer_id, parameter_key,
-                   value_number, unit, notes
-            FROM auditcore.discount_policy_parameters
-            WHERE tenant_id = :tenant_id
-              AND discount_policy_version_id = :version_id
-              AND parameter_key = :parameter_key
-              AND value_type = 'NUMBER'
-              AND (
-                    scope_type = 'PROJECT'
-                    OR (
-                        :dealer_id IS NOT NULL
-                        AND scope_type = 'DEALER'
-                        AND dealer_id = :dealer_id
-                    )
-              )
-            ORDER BY
-                CASE
-                    WHEN :dealer_id IS NOT NULL
-                     AND scope_type = 'DEALER'
-                     AND dealer_id = :dealer_id THEN 0
-                    ELSE 1
-                END,
-                parameter_id
-            LIMIT 1
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "version_id": version["discount_policy_version_id"],
-            "parameter_key": parameter_key.upper(),
-            "dealer_id": dealer_id,
-        },
-    ).mappings().one_or_none()
+    common_parameters = {
+        "tenant_id": tenant_id,
+        "version_id": version["discount_policy_version_id"],
+        "parameter_key": parameter_key.upper(),
+    }
+    if dealer_id is None:
+        row = connection.execute(
+            text(
+                """
+                SELECT parameter_id, scope_type, dealer_id, parameter_key,
+                       value_number, unit, notes
+                FROM auditcore.discount_policy_parameters
+                WHERE tenant_id = :tenant_id
+                  AND discount_policy_version_id = :version_id
+                  AND parameter_key = :parameter_key
+                  AND value_type = 'NUMBER'
+                  AND scope_type = 'PROJECT'
+                ORDER BY parameter_id
+                LIMIT 1
+                """
+            ),
+            common_parameters,
+        ).mappings().one_or_none()
+    else:
+        row = connection.execute(
+            text(
+                """
+                SELECT parameter_id, scope_type, dealer_id, parameter_key,
+                       value_number, unit, notes
+                FROM auditcore.discount_policy_parameters
+                WHERE tenant_id = :tenant_id
+                  AND discount_policy_version_id = :version_id
+                  AND parameter_key = :parameter_key
+                  AND value_type = 'NUMBER'
+                  AND (
+                        scope_type = 'PROJECT'
+                        OR (scope_type = 'DEALER' AND dealer_id = :dealer_id)
+                  )
+                ORDER BY
+                    CASE
+                        WHEN scope_type = 'DEALER' AND dealer_id = :dealer_id THEN 0
+                        ELSE 1
+                    END,
+                    parameter_id
+                LIMIT 1
+                """
+            ),
+            {**common_parameters, "dealer_id": dealer_id},
+        ).mappings().one_or_none()
     if row is None:
         return None
 
