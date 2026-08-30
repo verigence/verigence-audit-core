@@ -37,6 +37,15 @@ def _text_or_none(value: Any) -> str | None:
     return normalized or None
 
 
+def _has_reviewable_receipt_value(document: Any) -> bool:
+    return any(
+        str(field.fieldKey).strip().lower() in _RECEIPT_CAPTURE_MAP
+        and field.value is not None
+        and field.value != ""
+        for field in document.fields
+    )
+
+
 def _reviewed_receipt_values(
     document: Any,
     *,
@@ -172,6 +181,7 @@ def materialize_reviewed_booking_receipts(
         for document in documents
         if str(document.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE
         and str(document.extractionState).upper() == "READY"
+        and _has_reviewable_receipt_value(document)
     ]
     ordinals = receipt_document_ordinals(
         [document.documentId for document in receipt_documents]
