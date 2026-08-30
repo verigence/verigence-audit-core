@@ -19,6 +19,7 @@ from audit_core.security_authorization import (
 from audit_core.security_integration import SecurityOAuthClient
 from audit_core.uc03_v2_review_materialization import (
     materialize_reviewed_booking_receipts,
+    receipt_document_ordinals,
     receipt_review_key,
 )
 
@@ -37,6 +38,7 @@ def _receipt_raw_review_items(
             continue
         grouped.setdefault((field.documentId, field.fieldKey), []).append(field)
 
+    ordinals = receipt_document_ordinals([document_id for document_id, _ in grouped])
     items: list[review_decisions._ReviewItem] = []
     for (document_id, field_key), sources in grouped.items():
         selected = sorted(
@@ -56,7 +58,7 @@ def _receipt_raw_review_items(
         )
         items.append(
             review_decisions._ReviewItem(
-                review_key=receipt_review_key(document_id, field_key),
+                review_key=receipt_review_key(ordinals[document_id], field_key),
                 review_kind="RAW_FIELD",
                 decision_required=len(distinct_values) > 1 or low_confidence,
                 source_set_ref=review_decisions._source_set_ref(sources),
