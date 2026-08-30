@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from datetime import datetime
 from typing import Annotated, Any
 from uuid import UUID
@@ -195,8 +194,8 @@ def search_journeys(
             WITH scoped AS (
                 SELECT
                     j.journey_id,
-                    j.booking_id,
-                    j.delivery_id,
+                    b.booking_id,
+                    dl.delivery_id,
                     j.dealer_id,
                     j.outlet_id,
                     c.display_name AS customer_display_name,
@@ -460,8 +459,8 @@ def _scoped_overview_header(
             SELECT
                 j.journey_id AS "journeyId",
                 j.customer_id AS "customerId",
-                j.booking_id AS "bookingId",
-                j.delivery_id AS "deliveryId",
+                b.booking_id AS "bookingId",
+                dl.delivery_id AS "deliveryId",
                 j.dealer_id AS "dealerId",
                 d.dealer_name AS "dealerName",
                 j.outlet_id AS "outletId",
@@ -590,8 +589,6 @@ def get_journey_overview(
                 c.email_reference AS "emailReference",
                 c.external_customer_ref AS "externalCustomerReference",
                 c.customer_type_code AS "customerType",
-                c.relationship_type AS "relationshipType",
-                c.relationship_name AS "relationshipName",
                 c.status AS "status"
             FROM auditcore.customers c
             WHERE c.tenant_id = :tenant_id
@@ -622,8 +619,6 @@ def get_journey_overview(
                 b.outright_purchase AS "outrightPurchase",
                 b.corporate_id_available AS "corporateIdAvailable",
                 b.gst_benefit AS "gstBenefit",
-                b.expected_delivery_text AS "expectedDeliveryText",
-                b.expected_delivery_date AS "expectedDeliveryDate",
                 b.actual_status_code AS "actualStatusCode",
                 jp.product_sku_id AS "productSkuId",
                 jp.model_code_snapshot AS "modelCode",
@@ -685,9 +680,6 @@ def get_journey_overview(
             """
             SELECT
                 payment_id AS "paymentId",
-                booking_id AS "bookingId",
-                delivery_id AS "deliveryId",
-                payment_stage AS "paymentStage",
                 payment_at_utc AS "paymentAtUtc",
                 amount AS "amount",
                 currency_code AS "currencyCode",
@@ -719,6 +711,8 @@ def get_journey_overview(
                 details AS "details"
             FROM auditcore.finance_records
             WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+            ORDER BY created_at_utc DESC, finance_record_id DESC
+            LIMIT 1
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
@@ -734,7 +728,6 @@ def get_journey_overview(
                 standard_premium_amount AS "standardPremiumAmount",
                 actual_premium_amount AS "actualPremiumAmount",
                 self_insurance_flag AS "selfInsuranceFlag",
-                insurance_by AS "insuranceBy",
                 actual_status_code AS "actualStatusCode",
                 source_kind AS "sourceKind",
                 source_evidence_id AS "sourceEvidenceId"
@@ -815,7 +808,6 @@ def get_journey_overview(
                 registration_type_code AS "registrationTypeCode",
                 registration_category_code AS "registrationCategoryCode",
                 registration_number AS "registrationNumber",
-                registration_by AS "registrationBy",
                 actual_status_code AS "actualStatusCode",
                 source_kind AS "sourceKind",
                 source_evidence_id AS "sourceEvidenceId"
@@ -830,7 +822,6 @@ def get_journey_overview(
             """
             SELECT
                 delivery_id AS "deliveryId",
-                booking_id AS "bookingId",
                 planned_delivery_at AS "plannedDeliveryAt",
                 delivery_intimated_at AS "deliveryIntimatedAt",
                 actual_delivery_status_code AS "actualDeliveryStatusCode",
