@@ -60,12 +60,12 @@ def _response(
     )
 
 
-def test_required_document_missing_blocks_screen_two() -> None:
+def test_required_document_missing_is_non_blocking_audit_observation() -> None:
     result = _response(requirements=[_requirement()])
 
-    assert result.canContinue is False
+    assert result.canContinue is True
     assert result.requirements[0].state == "NOT_UPLOADED"
-    assert result.requirements[0].blocksContinue is True
+    assert result.requirements[0].blocksContinue is False
 
 
 def test_required_classified_document_allows_screen_two() -> None:
@@ -86,7 +86,7 @@ def test_required_classified_document_allows_screen_two() -> None:
     assert result.requirements[0].canDelete is True
 
 
-def test_unknown_upload_does_not_satisfy_required_requirement() -> None:
+def test_unknown_upload_does_not_satisfy_requirement_but_does_not_block() -> None:
     unknown = _classified_document()
     unknown["state"] = "UNKNOWN"
     unknown["classifiedDocumentTypeKey"] = None
@@ -102,13 +102,13 @@ def test_unknown_upload_does_not_satisfy_required_requirement() -> None:
         di_documents=[unknown],
     )
 
-    assert result.canContinue is False
+    assert result.canContinue is True
     assert result.requirements[0].state == "NOT_UPLOADED"
-    assert result.requirements[0].blocksContinue is True
+    assert result.requirements[0].blocksContinue is False
     assert result.uploads[0].state == "UNKNOWN"
 
 
-def test_unresolved_conditional_requirement_blocks_screen_two() -> None:
+def test_unresolved_conditional_requirement_is_non_blocking() -> None:
     result = _response(
         requirements=[
             _requirement(
@@ -120,13 +120,14 @@ def test_unresolved_conditional_requirement_blocks_screen_two() -> None:
         ]
     )
 
-    assert result.canContinue is False
+    assert result.canContinue is True
     assert result.requirements[0].applicabilityState == "UNRESOLVED"
     assert result.requirements[0].state == "NEEDS_DECISION"
     assert result.requirements[0].needsDecision is True
+    assert result.requirements[0].blocksContinue is False
 
 
-def test_applicable_available_conditional_document_missing_blocks_screen_two() -> None:
+def test_applicable_available_conditional_document_missing_is_non_blocking() -> None:
     result = _response(
         requirements=[
             _requirement(
@@ -144,9 +145,9 @@ def test_applicable_available_conditional_document_missing_blocks_screen_two() -
         },
     )
 
-    assert result.canContinue is False
+    assert result.canContinue is True
     assert result.requirements[0].state == "NOT_UPLOADED"
-    assert result.requirements[0].blocksContinue is True
+    assert result.requirements[0].blocksContinue is False
 
 
 def test_applicable_but_document_unavailable_is_recorded_and_does_not_block() -> None:
@@ -199,11 +200,11 @@ def test_not_applicable_conditional_requirement_does_not_block() -> None:
     assert result.requirements[0].state == "NOT_APPLICABLE"
     assert result.requirements[0].blocksContinue is False
 
+
 def test_v2_actor_id_uses_human_principal_subject() -> None:
     principal = HumanPrincipal(subject="pc-user-123")
 
     assert _human_actor_id(principal) == "pc-user-123"
-
 
 
 def test_v2_completion_route_is_additive() -> None:
