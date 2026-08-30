@@ -2,7 +2,8 @@
 
 **Date:** 2026-08-30  
 **Status:** Implementation baseline  
-**Migration:** `0040_uc03_journey_stage_linkage.py`
+**Migration file:** `0040_uc03_journey_stage_linkage.py`  
+**Alembic revision:** `0041_uc03_stage_linkage` (after `0040_uc03_booking_fields`)
 
 ## 1. Decision
 
