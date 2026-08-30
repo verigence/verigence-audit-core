@@ -8,16 +8,24 @@ from fastapi import APIRouter, Depends, Header
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Connection, text
 
-from audit_core.authorization import authorize
+from audit_core.authorization import AuthorizationError
 from audit_core.business_assignments import require_business_scope
 from audit_core.daily_operations import complete_daily_ops_run, create_daily_ops_run
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import get_connection, get_principal
-from audit_core.errors import NotFoundError
+from audit_core.dependencies import get_connection, get_human_principal
+from audit_core.errors import DependencyUnavailableError, NotFoundError
 from audit_core.idempotency import execute_idempotent_json_command
-from audit_core.security import Principal
+from audit_core.security import HumanPrincipal, Principal
+from audit_core.security_authorization import (
+    SecurityAuthorizationClient,
+    SecurityAuthorizationError,
+    get_security_authorization_client,
+)
 
 router = APIRouter(tags=["daily-operations"])
+
+_DAILY_OPS_READ_PERMISSION = "audit.daily_ops.read"
+_DAILY_OPS_EXECUTE_PERMISSION = "audit.daily_ops.execute"
 
 
 class DailyOpsCreateInput(BaseModel):
@@ -35,6 +43,46 @@ class DailyOpsResponse(BaseModel):
     startedAtUtc: datetime
     completedAtUtc: datetime | None
     versionNo: int
+
+
+def _authorized_daily_ops_principal(
+    authorization_client: SecurityAuthorizationClient,
+    *,
+    human_principal: HumanPrincipal,
+    tenant_id: str,
+    permission: str,
+) -> Principal:
+    """Resolve Daily Operations authority without trusting browser JWT claims.
+
+    Security human tokens prove only USER identity. Audit Core asks Security for the
+    current Tenant permission and then adapts that trusted decision into the legacy
+    Principal shape used by the existing business-scope guard. The adapter is local
+    to Daily Operations so other modules retain their current authentication paths.
+    """
+
+    try:
+        decision = authorization_client.check_user_permission(
+            user_id=human_principal.subject,
+            tenant_id=tenant_id,
+            permission_key=permission,
+        )
+    except SecurityAuthorizationError as exc:
+        raise DependencyUnavailableError(
+            detail="Daily operations are temporarily unavailable. Please try again."
+        ) from exc
+
+    if not decision.allowed:
+        raise AuthorizationError(
+            error_code="VAC-AUTH-002",
+            status_code=403,
+            title="Permission denied",
+        )
+
+    return Principal(
+        subject=human_principal.subject,
+        tenant_id=tenant_id,
+        permissions=(permission,),
+    )
 
 
 def _response(row) -> DailyOpsResponse:
@@ -80,10 +128,19 @@ def create_daily_run(
     tenant_id: str,
     outlet_id: UUID,
     payload: DailyOpsCreateInput,
-    principal: Annotated[Principal, Depends(get_principal)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> DailyOpsResponse:
-    authorize(principal, tenant_id=tenant_id, permission="audit.daily_ops.execute")
+    principal = _authorized_daily_ops_principal(
+        authorization_client,
+        human_principal=human_principal,
+        tenant_id=tenant_id,
+        permission=_DAILY_OPS_EXECUTE_PERMISSION,
+    )
     set_tenant_context(connection, tenant_id)
     outlet = connection.execute(
         text(
@@ -125,10 +182,19 @@ def create_daily_run(
 def list_daily_runs(
     tenant_id: str,
     outlet_id: UUID,
-    principal: Annotated[Principal, Depends(get_principal)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> list[DailyOpsResponse]:
-    authorize(principal, tenant_id=tenant_id, permission="audit.daily_ops.read")
+    principal = _authorized_daily_ops_principal(
+        authorization_client,
+        human_principal=human_principal,
+        tenant_id=tenant_id,
+        permission=_DAILY_OPS_READ_PERMISSION,
+    )
     set_tenant_context(connection, tenant_id)
     outlet = connection.execute(
         text(
@@ -175,10 +241,19 @@ def list_daily_runs(
 def read_daily_run(
     tenant_id: str,
     run_id: UUID,
-    principal: Annotated[Principal, Depends(get_principal)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> DailyOpsResponse:
-    authorize(principal, tenant_id=tenant_id, permission="audit.daily_ops.read")
+    principal = _authorized_daily_ops_principal(
+        authorization_client,
+        human_principal=human_principal,
+        tenant_id=tenant_id,
+        permission=_DAILY_OPS_READ_PERMISSION,
+    )
     set_tenant_context(connection, tenant_id)
     row = _run(connection, tenant_id=tenant_id, run_id=run_id)
     outlet = connection.execute(
@@ -212,10 +287,19 @@ def complete_daily_run(
         str,
         Header(alias="Idempotency-Key", min_length=8, max_length=200),
     ],
-    principal: Annotated[Principal, Depends(get_principal)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> DailyOpsResponse:
-    authorize(principal, tenant_id=tenant_id, permission="audit.daily_ops.execute")
+    principal = _authorized_daily_ops_principal(
+        authorization_client,
+        human_principal=human_principal,
+        tenant_id=tenant_id,
+        permission=_DAILY_OPS_EXECUTE_PERMISSION,
+    )
     set_tenant_context(connection, tenant_id)
     current = _run(connection, tenant_id=tenant_id, run_id=run_id)
     outlet = connection.execute(
