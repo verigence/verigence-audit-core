@@ -13,6 +13,8 @@ class AttributeSpec:
 
     The registry is intentionally explicit. A DI field that is not listed here is
     not guessed from a similar-looking label; callers must surface it as UNMAPPED.
+    Commercial facts may be SUPPORTED for review/provenance while intentionally
+    having no Audit Core value column because DI remains the machine-fact source.
     """
 
     attribute_key: str
@@ -42,11 +44,12 @@ class AttributeCandidate:
     source_fact_version: int | None = None
 
 
-# This registry contains only mappings supported by an existing UC03 design,
-# current DI schema, or an explicitly identified provisional source relationship.
-# It is deliberately smaller than the 123-field inventory: unknown/provisional
-# canonical relationships must remain visible as unmapped rather than being
-# inferred from English labels.
+_B = ("booking_form", "booking_docket")
+_ID = ("pan_card", "pan", "aadhaar")
+_INVOICE = ("customer_invoice_dms", "tax_invoice_tally", "tax_invoice_dms", "tax_invoice")
+
+
+# Explicit UC03 mappings. Nothing here relies on fuzzy English-label matching.
 ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
     AttributeSpec(
         attribute_key="customer_name",
@@ -54,9 +57,8 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Customer Name",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"customer_name", "pan_name", "aadhaar_name"}),
-        # Identity amendment makes PAN/Aadhaar authoritative for Legal Name.
-        # Booking-form customer_name remains useful source evidence but cannot
-        # silently replace Entered Name or Legal Name.
+        # PAN/Aadhaar can establish Legal Name. Booking Form customer_name remains
+        # genuine evidence for comparison but cannot overwrite Entered/Legal Name.
         source_priority=("pan_card", "pan", "aadhaar", "booking_form", "booking_docket"),
     ),
     AttributeSpec(
@@ -65,7 +67,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Customer Number",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"customer_phone"}),
-        source_priority=("booking_form", "booking_docket"),
+        source_priority=_B,
         operational_field="CUSTOMER_NUMBER",
     ),
     AttributeSpec(
@@ -74,17 +76,40 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Mail ID",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"customer_email"}),
-        source_priority=("booking_form", "booking_docket"),
-        mapping_status="PROVISIONAL",
+        source_priority=_B,
         operational_field="CUSTOMER_EMAIL",
     ),
     AttributeSpec(
         attribute_key="pan",
         excel_field_no=7,
-        label="Pan",
+        label="PAN",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"pan_number"}),
         source_priority=("pan_card", "pan"),
+    ),
+    AttributeSpec(
+        attribute_key="pan_father_name",
+        excel_field_no=None,
+        label="PAN Father Name",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"pan_father_name"}),
+        source_priority=("pan_card", "pan"),
+    ),
+    AttributeSpec(
+        attribute_key="customer_relationship_type",
+        excel_field_no=None,
+        label="Relationship Type (S/O, W/O, D/O)",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"pan_relationship_type", "aadhaar_relationship_type"}),
+        source_priority=_ID,
+    ),
+    AttributeSpec(
+        attribute_key="customer_relationship_name",
+        excel_field_no=None,
+        label="Relationship Name",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"pan_relationship_name", "aadhaar_relationship_name"}),
+        source_priority=_ID,
     ),
     AttributeSpec(
         attribute_key="sc_name",
@@ -92,7 +117,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="SC Name",
         stages=("BOOKING",),
         field_keys=frozenset({"sales_person"}),
-        source_priority=("booking_form", "booking_docket"),
+        source_priority=_B,
         mapping_status="PROVISIONAL",
     ),
     AttributeSpec(
@@ -101,7 +126,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Model",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"vehicle_model"}),
-        source_priority=("booking_form", "booking_docket", "tax_invoice_dms", "tax_invoice"),
+        source_priority=_B + _INVOICE,
     ),
     AttributeSpec(
         attribute_key="variant",
@@ -109,7 +134,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Variant",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"vehicle_variant"}),
-        source_priority=("booking_form", "booking_docket", "tax_invoice_dms", "tax_invoice"),
+        source_priority=_B + _INVOICE,
     ),
     AttributeSpec(
         attribute_key="color",
@@ -117,44 +142,222 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Color",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"vehicle_color"}),
-        source_priority=("booking_form", "booking_docket", "tax_invoice_dms", "tax_invoice"),
+        source_priority=_B + _INVOICE,
     ),
     AttributeSpec(
-        attribute_key="ex_showroom",
+        attribute_key="booking_registration_by",
+        excel_field_no=None,
+        label="Registration By",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"registration_by"}),
+        source_priority=_B,
+    ),
+    AttributeSpec(
+        attribute_key="booking_registration_type",
+        excel_field_no=None,
+        label="Registration Type",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"registration_type"}),
+        source_priority=_B,
+        operational_field="REGISTRATION_TYPE",
+    ),
+    AttributeSpec(
+        attribute_key="booking_insurance_by",
+        excel_field_no=None,
+        label="Insurance By",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"insurance_by"}),
+        source_priority=_B,
+    ),
+    AttributeSpec(
+        attribute_key="booking_exchange_applicable",
+        excel_field_no=None,
+        label="Exchange",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"exchange_applicable"}),
+        source_priority=_B,
+        operational_field="EXCHANGE_TAKEN",
+    ),
+    AttributeSpec(
+        attribute_key="booking_exchange_value",
+        excel_field_no=None,
+        label="Exchange Value",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"exchange_value"}),
+        source_priority=_B,
+        operational_field="TRADE_IN_ACTUAL_VALUE",
+    ),
+    # Commercial values are supported audit facts but stay in DI as machine facts.
+    # Audit Core records only the selected source/provenance until a rule/business
+    # action requires an approved typed business value.
+    AttributeSpec(
+        attribute_key="booking_ex_showroom_price",
         excel_field_no=35,
-        label="Ex Showroom",
+        label="Ex-Showroom Price",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"ex_showroom_price"}),
-        source_priority=("booking_form", "booking_docket", "cost_sheet", "tax_invoice_dms", "tax_invoice"),
-        mapping_status="PROVISIONAL",
+        source_priority=_B + ("cost_sheet",) + _INVOICE,
     ),
     AttributeSpec(
-        attribute_key="registration_type_amount",
+        attribute_key="booking_tcs_amount",
+        excel_field_no=None,
+        label="TCS",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"tcs_amount"}),
+        source_priority=_B + _INVOICE,
+    ),
+    AttributeSpec(
+        attribute_key="booking_registration_charges",
+        excel_field_no=None,
+        label="Registration Charges",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"registration_charges"}),
+        source_priority=_B,
+    ),
+    AttributeSpec(
+        attribute_key="booking_road_tax_amount",
+        excel_field_no=None,
+        label="Road Tax",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"road_tax_amount"}),
+        source_priority=_B,
+    ),
+    AttributeSpec(
+        attribute_key="booking_road_tax_registration_combined",
         excel_field_no=36,
-        label="Registration Type (amount)",
+        label="Road Tax / Registration (combined source value)",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"road_tax_registration"}),
-        source_priority=("booking_form", "booking_docket"),
-        mapping_status="PROVISIONAL",
+        source_priority=_B,
     ),
     AttributeSpec(
-        attribute_key="insurance",
+        attribute_key="booking_insurance_amount",
         excel_field_no=44,
-        label="Insurance",
+        label="Insurance Amount",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"insurance_amount"}),
-        source_priority=("insurance_cover_note", "insurance_policy", "booking_form", "booking_docket"),
-        mapping_status="PROVISIONAL",
+        source_priority=("insurance_cover_note", "insurance_policy") + _B,
     ),
-    # Operational Booking concepts already have approved typed-domain owners even
-    # though they are not numbered extracted rows in the 123-field inventory.
+    AttributeSpec(
+        attribute_key="booking_rsa_amount",
+        excel_field_no=None,
+        label="RSA Amount",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"rsa_amount"}),
+        source_priority=_B,
+    ),
+    AttributeSpec(
+        attribute_key="booking_accessories_cost",
+        excel_field_no=None,
+        label="Accessories",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"accessories_cost"}),
+        source_priority=_B,
+    ),
+    AttributeSpec(
+        attribute_key="booking_additional_warranty_amount",
+        excel_field_no=None,
+        label="Additional Warranty",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"additional_warranty_amount"}),
+        source_priority=_B,
+    ),
+    AttributeSpec(
+        attribute_key="booking_other_charges",
+        excel_field_no=None,
+        label="Other Charges",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"other_charges"}),
+        source_priority=_B,
+    ),
+    AttributeSpec(
+        attribute_key="booking_total_price",
+        excel_field_no=None,
+        label="Total Price",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"total_price"}),
+        source_priority=_B + _INVOICE,
+    ),
+    AttributeSpec(
+        attribute_key="booking_discount_amount",
+        excel_field_no=None,
+        label="Discount",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"discount_amount"}),
+        source_priority=_B + _INVOICE,
+    ),
+    AttributeSpec(
+        attribute_key="booking_bonus_amount",
+        excel_field_no=None,
+        label="Bonus",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"bonus_amount"}),
+        source_priority=_B,
+    ),
+    AttributeSpec(
+        attribute_key="booking_net_amount",
+        excel_field_no=None,
+        label="Net Amount",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"net_amount"}),
+        source_priority=_B + _INVOICE,
+    ),
+    AttributeSpec(
+        attribute_key="booking_amount_paid",
+        excel_field_no=None,
+        label="Booking Amount",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"booking_amount_paid"}),
+        source_priority=_B,
+    ),
+    AttributeSpec(
+        attribute_key="booking_balance_amount",
+        excel_field_no=None,
+        label="Balance Amount",
+        stages=("BOOKING", "DELIVERY"),
+        field_keys=frozenset({"balance_amount"}),
+        source_priority=_B,
+    ),
+    AttributeSpec(
+        attribute_key="booking_payment_mode",
+        excel_field_no=None,
+        label="Booking Payment Mode",
+        stages=("BOOKING",),
+        field_keys=frozenset({"mode_of_payment"}),
+        source_priority=_B,
+    ),
+    AttributeSpec(
+        attribute_key="booking_payment_reference",
+        excel_field_no=None,
+        label="Booking Payment Reference",
+        stages=("BOOKING",),
+        field_keys=frozenset({"payment_reference_no"}),
+        source_priority=_B,
+    ),
+    AttributeSpec(
+        attribute_key="expected_delivery_text",
+        excel_field_no=None,
+        label="Expected Delivery",
+        stages=("BOOKING",),
+        field_keys=frozenset({"expected_delivery"}),
+        source_priority=_B,
+    ),
+    AttributeSpec(
+        attribute_key="expected_delivery_date",
+        excel_field_no=None,
+        label="Expected Delivery Date",
+        stages=("BOOKING",),
+        field_keys=frozenset({"expected_delivery_date"}),
+        source_priority=_B,
+    ),
+    # Operational Booking concepts already have approved typed-domain owners.
     AttributeSpec(
         attribute_key="booking_reference",
         excel_field_no=None,
         label="Booking Reference",
         stages=("BOOKING",),
         field_keys=frozenset({"booking_reference_number"}),
-        source_priority=("booking_form", "booking_docket"),
+        source_priority=_B,
         operational_field="BOOKING_REFERENCE",
     ),
     AttributeSpec(
@@ -163,7 +366,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Actual Booking Date",
         stages=("BOOKING",),
         field_keys=frozenset({"booking_date"}),
-        source_priority=("booking_form", "booking_docket"),
+        source_priority=_B,
         operational_field="BOOKING_DATE",
     ),
 )
@@ -197,12 +400,7 @@ def _confidence_rank(candidate: AttributeCandidate) -> float:
 
 
 def resolve_candidate(spec: AttributeSpec, candidates: list[AttributeCandidate]) -> AttributeCandidate | None:
-    """Select a deterministic current source without using fuzzy field matching.
-
-    Source precedence wins first. Confidence only breaks ties within the same
-    precedence level; document id is the stable final tie-breaker. Null values are
-    retained as evidence candidates but never selected over a non-null value.
-    """
+    """Select a deterministic current source without using fuzzy field matching."""
 
     usable = [candidate for candidate in candidates if candidate.value is not None]
     if not usable:
