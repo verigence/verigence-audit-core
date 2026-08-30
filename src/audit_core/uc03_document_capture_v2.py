@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from functools import lru_cache
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -18,8 +18,6 @@ from audit_core.evidence import (
     _journey_context,
     _persist_subject_mapping,
     _subject_mapping,
-    get_di_client,
-    get_security_oauth_client,
 )
 from audit_core.idempotency import execute_idempotent_json_command
 from audit_core.observability import get_correlation_id
@@ -127,12 +125,34 @@ class BookingCaptureV2CompletionResponse(BaseModel):
     aggregateVersion: int
 
 
-def get_di_capture_v2_client() -> Iterator[DiCaptureV2Client]:
+@lru_cache
+def get_security_oauth_client() -> SecurityOAuthClient:
+    base_url = os.environ.get("SECURITY_BASE_URL", "").strip()
+    client_id = os.environ.get("SECURITY_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("SECURITY_CLIENT_SECRET", "")
+    if not base_url or not client_id or not client_secret:
+        raise RuntimeError("Security ServiceIntegration is not configured")
+    return SecurityOAuthClient(
+        base_url=base_url,
+        client_id=client_id,
+        client_secret=client_secret,
+    )
+
+
+@lru_cache
+def get_di_client() -> DiClient:
     base_url = os.environ.get("DI_BASE_URL", "").strip()
     if not base_url:
         raise RuntimeError("DI integration is not configured")
-    with DiCaptureV2Client(base_url=base_url) as client:
-        yield client
+    return DiClient(base_url=base_url)
+
+
+@lru_cache
+def get_di_capture_v2_client() -> DiCaptureV2Client:
+    base_url = os.environ.get("DI_BASE_URL", "").strip()
+    if not base_url:
+        raise RuntimeError("DI integration is not configured")
+    return DiCaptureV2Client(base_url=base_url)
 
 
 def _human_actor_id(human_principal: HumanPrincipal) -> str:
@@ -546,6 +566,21 @@ def _read_capture(
     v2_client: DiCaptureV2Client,
 ) -> BookingCaptureV2Response:
     requirements = _base_requirements(connection, tenant_id, journey_id)
+    declaration_rows = _declarations(connection, tenant_id, journey_id)
+    audit_documents = _linked_documents(connection, tenant_id, journey_id)
+
+    # A brand-new Booking has no DI-linked documents. Its checklist is entirely
+    # determined by Audit Core's pinned requirement profile plus V2 policy, so do not
+    # block first paint on Security-for-DI, Subject creation, storage-context creation,
+    # or a DI list call. DI is initialized lazily when the first upload is requested.
+    if not audit_documents:
+        return _build_local_capture_response(
+            journey_id=journey_id,
+            requirements=requirements,
+            declaration_rows=declaration_rows,
+            audit_documents=audit_documents,
+        )
+
     context_ref, token = _ensure_di_context(
         connection=connection,
         engine=engine,
@@ -577,8 +612,8 @@ def _read_capture(
         journey_id=journey_id,
         context_ref=context_ref,
         requirements=requirements,
-        declaration_rows=_declarations(connection, tenant_id, journey_id),
-        audit_documents=_linked_documents(connection, tenant_id, journey_id),
+        declaration_rows=declaration_rows,
+        audit_documents=audit_documents,
         di_documents=di_documents,
     )
 
@@ -936,9 +971,10 @@ def set_booking_declaration_v2(
     _require_capture_phase_open(
         connection, tenant_id=tenant_id, journey_id=journey_id
     )
+    requirements = _base_requirements(connection, tenant_id, journey_id)
     allowed = {
         str(row["condition_key"])
-        for row in _base_requirements(connection, tenant_id, journey_id)
+        for row in requirements
         if row.get("condition_key")
     }
     if condition_key not in allowed:
@@ -980,12 +1016,9 @@ def set_booking_declaration_v2(
             "actor_id": _human_actor_id(human_principal),
         },
     )
-    return _read_capture(
-        connection=connection,
-        engine=engine,
-        tenant_id=tenant_id,
+    return _build_local_capture_response(
         journey_id=journey_id,
-        security_client=security_client,
-        di_client=di_client,
-        v2_client=v2_client,
+        requirements=requirements,
+        declaration_rows=_declarations(connection, tenant_id, journey_id),
+        audit_documents=_linked_documents(connection, tenant_id, journey_id),
     )
