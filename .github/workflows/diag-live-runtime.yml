@@ -1,0 +1,51 @@
+name: Diagnose live DEV runtime
+
+on:
+  push:
+    branches: [diag/live-runtime-20260830]
+    paths:
+      - '.github/workflows/diag-live-runtime.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      - name: Capture live service state and error logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${RAILWAY_API_TOKEN:-}"
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service verigence-audit-core --json >/tmp/link.json
+          echo '=== SERVICES ==='
+          railway service list --json | tee /tmp/services.json
+          echo '=== TARGETED RECENT LOGS ==='
+          python - <<'PY' > /tmp/target-services.txt
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/services.json').read_text())
+          for row in rows:
+              name=str(row.get('name',''))
+              low=name.lower()
+              if any(token in low for token in ('audit','security','attendance','postgres','database')):
+                  print(name)
+          PY
+          while IFS= read -r svc; do
+            [ -n "$svc" ] || continue
+            echo "===== SERVICE: $svc ====="
+            echo '-- deployment --'
+            railway deployment list --service "$svc" --limit 3 --json || true
+            echo '-- recent error-related logs --'
+            railway logs --service "$svc" --latest --lines 250 2>&1 \
+              | grep -Ei 'error|exception|traceback|503|500|AdminShutdown|shutdown|terminating connection|database|authorization|unavailable|failed|crash|restart' \
+              | tail -n 180 || true
+          done < /tmp/target-services.txt
