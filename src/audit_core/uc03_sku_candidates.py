@@ -35,11 +35,13 @@ _VARIANT_WEIGHT = Decimal("0.35")
 _COMMERCIAL_WEIGHT = Decimal("0.25")
 _MIN_CANDIDATE_SCORE = Decimal("0.45")
 _COMMERCIAL_ZERO_SCORE_DELTA = Decimal("0.30")
+_SELECTION_METHOD = "BOOKING_COMMERCIAL_MATCH_V1"
+_TENTATIVE_NOTE = "* Tentative — confirmation required"
 _NON_ALNUM = re.compile(r"[^A-Z0-9]+")
 
 
 class SkuCandidateRequest(BaseModel):
-    """Machine-observed Booking Form facts used only for advisory SKU inference."""
+    """Machine-observed Booking Form facts used for tentative SKU inference."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -57,6 +59,7 @@ class SkuCandidate(BaseModel):
     modelName: str
     variantName: str
     colourName: str | None = None
+    displayLabel: str
     masterTotalAmount: Decimal
     observedTotalCommercialAmount: Decimal
     commercialDifferenceAmount: Decimal
@@ -74,7 +77,14 @@ class SkuCandidateResponse(BaseModel):
     effectiveOn: date
     priceListVersionId: UUID
     currencyCode: str
-    status: Literal["CONFIRMATION_REQUIRED"] = "CONFIRMATION_REQUIRED"
+    status: Literal[
+        "CONFIRMATION_REQUIRED",
+        "NO_RELIABLE_CANDIDATE",
+        "CONFIRMED_SKU_PRESERVED",
+    ]
+    selectionNote: str = _TENTATIVE_NOTE
+    bookingRecordUpdated: bool
+    mostLikelyProductSkuId: UUID | None = None
     processingMethod: Literal["MASTER_SQL_PLUS_DETERMINISTIC_PYTHON"] = (
         "MASTER_SQL_PLUS_DETERMINISTIC_PYTHON"
     )
@@ -120,6 +130,10 @@ def _commercial_similarity(observed: Decimal, master: Decimal) -> tuple[Decimal,
         Decimal("1") - (difference_pct / _COMMERCIAL_ZERO_SCORE_DELTA),
     )
     return score, difference, difference_pct
+
+
+def _display_label(model_name: str, variant_name: str) -> str:
+    return f"{model_name.strip()} {variant_name.strip()} *"
 
 
 def rank_sku_candidates(
@@ -179,6 +193,7 @@ def rank_sku_candidates(
                 modelName=str(row["model_name"]),
                 variantName=str(row["variant_name"]),
                 colourName=(str(row["colour_name"]) if row.get("colour_name") else None),
+                displayLabel=_display_label(str(row["model_name"]), str(row["variant_name"])),
                 masterTotalAmount=Decimal(str(row["master_total_amount"])),
                 observedTotalCommercialAmount=total_commercial_amount,
                 commercialDifferenceAmount=item["difference"].quantize(Decimal("0.01")),
@@ -338,6 +353,95 @@ def _effective_sku_rows(
     return rows
 
 
+def _persist_most_likely_sku(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    candidate: SkuCandidate,
+) -> tuple[bool, bool]:
+    """Persist the top candidate unless a confirmed SKU already exists.
+
+    Returns (record_updated, confirmed_selection_preserved).
+    """
+
+    existing_status = connection.execute(
+        text(
+            """
+            SELECT selection_status
+            FROM auditcore.journey_products
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalar_one_or_none()
+    if existing_status == "CONFIRMED":
+        return False, True
+
+    result = connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.journey_products (
+                tenant_id,
+                journey_id,
+                product_sku_id,
+                model_code_snapshot,
+                model_name_snapshot,
+                variant_code_snapshot,
+                variant_name_snapshot,
+                colour_code_snapshot,
+                colour_name_snapshot,
+                selection_source,
+                selection_status,
+                selection_method,
+                selection_score
+            )
+            SELECT
+                :tenant_id,
+                :journey_id,
+                s.product_sku_id,
+                pm.model_code,
+                pm.model_name,
+                pv.variant_code,
+                pv.variant_name,
+                c.colour_code,
+                c.colour_name,
+                'EVIDENCE',
+                'TENTATIVE',
+                :selection_method,
+                :selection_score
+            FROM auditcore.product_skus s
+            JOIN auditcore.product_models pm ON pm.model_id=s.model_id
+            JOIN auditcore.product_variants pv ON pv.variant_id=s.variant_id
+            LEFT JOIN auditcore.colours c ON c.colour_id=s.colour_id
+            WHERE s.product_sku_id=:product_sku_id
+            ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
+                product_sku_id=EXCLUDED.product_sku_id,
+                model_code_snapshot=EXCLUDED.model_code_snapshot,
+                model_name_snapshot=EXCLUDED.model_name_snapshot,
+                variant_code_snapshot=EXCLUDED.variant_code_snapshot,
+                variant_name_snapshot=EXCLUDED.variant_name_snapshot,
+                colour_code_snapshot=EXCLUDED.colour_code_snapshot,
+                colour_name_snapshot=EXCLUDED.colour_name_snapshot,
+                selection_source='EVIDENCE',
+                selection_status='TENTATIVE',
+                selection_method=EXCLUDED.selection_method,
+                selection_score=EXCLUDED.selection_score,
+                updated_at_utc=now()
+            WHERE auditcore.journey_products.selection_status IS DISTINCT FROM 'CONFIRMED'
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "product_sku_id": candidate.productSkuId,
+            "selection_method": _SELECTION_METHOD,
+            "selection_score": candidate.score,
+        },
+    )
+    return result.rowcount > 0, False
+
+
 @router.post("/sku-candidates", response_model=SkuCandidateResponse)
 def derive_sku_candidates(
     tenant_id: str,
@@ -349,7 +453,7 @@ def derive_sku_candidates(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> SkuCandidateResponse:
-    """Return advisory SKU candidates. This endpoint never selects or persists a SKU."""
+    """Rank SKU candidates and persist the most likely result as tentative."""
 
     _scope(
         connection,
@@ -393,10 +497,32 @@ def derive_sku_candidates(
         total_commercial_amount=command.totalCommercialAmount,
         max_candidates=command.maxCandidates,
     )
+
+    if not candidates:
+        return SkuCandidateResponse(
+            journeyId=journey_id,
+            effectiveOn=effective_on,
+            priceListVersionId=price_list_version_id,
+            currencyCode=plan_currency,
+            status="NO_RELIABLE_CANDIDATE",
+            bookingRecordUpdated=False,
+            candidates=[],
+        )
+
+    most_likely = candidates[0]
+    updated, confirmed_preserved = _persist_most_likely_sku(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        candidate=most_likely,
+    )
     return SkuCandidateResponse(
         journeyId=journey_id,
         effectiveOn=effective_on,
         priceListVersionId=price_list_version_id,
         currencyCode=plan_currency,
+        status=("CONFIRMED_SKU_PRESERVED" if confirmed_preserved else "CONFIRMATION_REQUIRED"),
+        bookingRecordUpdated=updated,
+        mostLikelyProductSkuId=most_likely.productSkuId,
         candidates=candidates,
     )
