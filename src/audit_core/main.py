@@ -73,6 +73,7 @@ from audit_core.uc03_delivery_capture_v2 import (
 )
 from audit_core.uc03_delivery_commands import router as uc03_delivery_router
 from audit_core.uc03_delivery_documents import router as uc03_delivery_documents_router
+from audit_core.uc03_di_core_persistence import install_uc03_di_core_persistence
 from audit_core.uc03_document_assessments import (
     router as uc03_document_assessments_router,
 )
@@ -108,6 +109,7 @@ install_dealer_policy_scope(mahindra_masters)
 install_uc03_identity_business_date()
 install_uc03_customer_mobile_pii()
 install_uc03_booking_receipt_capture()
+install_uc03_di_core_persistence()
 install_tl_scope_alignment()
 install_uc03_v2_capture_business_rules()
 role_mapping_router = role_mappings.router
