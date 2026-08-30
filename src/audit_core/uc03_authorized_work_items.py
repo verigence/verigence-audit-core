@@ -27,6 +27,7 @@ _PERMISSION_KEY = "audit.journey.read"
 class LandingMetrics(BaseModel):
     bookingsInProgress: int
     deliveryInProgress: int
+    reviewPending: int
     needsAttention: int
     auditFlags: int
     auditInProgress: int
@@ -142,7 +143,9 @@ def get_landing_metrics(
                     COALESCE(bs.business_status, b.actual_status_code) AS booking_status,
                     COALESCE(ds.business_status, d.actual_delivery_status_code) AS delivery_status,
                     COALESCE(bs.audit_state, 'NOT_STARTED') AS booking_audit_state,
-                    COALESCE(ds.audit_state, 'NOT_STARTED') AS delivery_audit_state
+                    COALESCE(ds.audit_state, 'NOT_STARTED') AS delivery_audit_state,
+                    bs.capture_completed_at_utc AS booking_capture_completed_at_utc,
+                    bs.pc_verification_status AS booking_pc_verification_status
                 FROM scoped s
                 LEFT JOIN auditcore.bookings b
                   ON b.tenant_id = :tenant_id AND b.journey_id = s.journey_id
@@ -173,6 +176,10 @@ def get_landing_metrics(
                     WHERE delivery_status IN ('DELIVERY_STARTED','DELIVERY_IN_PROGRESS')
                 ) AS delivery_in_progress,
                 count(*) FILTER (
+                    WHERE booking_capture_completed_at_utc IS NOT NULL
+                      AND booking_pc_verification_status = 'PENDING'
+                ) AS review_pending,
+                count(*) FILTER (
                     WHERE booking_audit_state = 'IN_PROGRESS'
                        OR delivery_audit_state = 'IN_PROGRESS'
                 ) AS audit_in_progress,
@@ -190,6 +197,7 @@ def get_landing_metrics(
     return LandingMetrics(
         bookingsInProgress=int(row["bookings_in_progress"]),
         deliveryInProgress=int(row["delivery_in_progress"]),
+        reviewPending=int(row["review_pending"]),
         needsAttention=int(row["needs_attention"]),
         auditFlags=int(row["audit_flags"]),
         auditInProgress=int(row["audit_in_progress"]),
