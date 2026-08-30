@@ -63,6 +63,9 @@ target-version = "py312"
 # by ownership boundary (DI, Security, Booking capture, receipt capture) so the
 # direct-document integration remains auditable without reordering private imports.
 "src/audit_core/uc03_pc_booking_documents.py" = ["I001"]
+# The explicit sort in exception Review is kept because the complete ranking is the
+# product rule used to choose and explain the selected DI source, not merely a min/max.
+"src/audit_core/uc03_booking_review_decisions.py" = ["FURB192"]
 # TL correction mirrors the generic PC review's best-effort typed projection boundary:
 # generic extracted/modified values are already durable, so an unexpected optional
 # typed projection failure must not roll back the TL review or block the PC journey.
