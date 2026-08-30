@@ -3,7 +3,6 @@ from uuid import UUID
 from audit_core.security import HumanPrincipal
 from audit_core.uc03_document_capture_v2 import _authorize_booking
 
-
 JOURNEY_ID = UUID("11111111-1111-1111-1111-111111111111")
 
 
