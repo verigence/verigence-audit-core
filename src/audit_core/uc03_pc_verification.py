@@ -33,6 +33,7 @@ from audit_core.uc03_booking_commands import (
     _append_workflow_event,
     _parse_if_match,
 )
+from audit_core.uc03_customer_review import apply_reviewed_customer_values
 
 router = APIRouter(tags=["uc03-pc-verification"])
 _FAILED_PROCESSING_STATUSES = {"FAILED", "ERROR", "REJECTED"}
@@ -346,6 +347,13 @@ def verify_pc_booking(
                 title="PC document review is incomplete",
                 detail="Review the remaining extracted values before marking the Booking verified.",
             )
+
+        customer_fields_updated = apply_reviewed_customer_values(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            actor_id=human_principal.subject,
+        )
         next_version = expected_version + 1
         connection.execute(
             text(
@@ -373,6 +381,7 @@ def verify_pc_booking(
             correlation_id=correlation_id,
             safe_payload={
                 "pcVerificationStatus": "VERIFIED",
+                "customerFieldsUpdated": customer_fields_updated,
                 "bookingBusinessStatusChanged": False,
                 "tlReviewRequired": False,
             },
