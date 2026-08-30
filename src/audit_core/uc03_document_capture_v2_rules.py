@@ -30,13 +30,11 @@ def _condition_is_active(response: capture_v2.BookingCaptureV2Response, conditio
 def _apply_gst_corporate_exclusivity(
     response: capture_v2.BookingCaptureV2Response,
 ) -> capture_v2.BookingCaptureV2Response:
-    """Apply the Booking rule that GST and Corporate cannot both be applicable.
+    """Apply the GST/Corporate business rule without blocking Booking progression.
 
-    Evidence remains the source of truth. If one side is positively established by a
-    classified document or an explicit PC declaration, the other side becomes
-    NOT_APPLICABLE without asking the PC another question. If both sides are positively
-    established, the capture is blocked until the contradictory evidence/declaration is
-    corrected; we never silently discard audit evidence.
+    GST and Corporate are mutually exclusive. Evidence continues to remain visible when
+    contradictory documents are present so Audit can raise an exception; the capture
+    flow must never hide or discard evidence and must never block the Booking process.
     """
 
     gst_active = _condition_is_active(response, _GST_CONDITION)
@@ -49,8 +47,10 @@ def _apply_gst_corporate_exclusivity(
             continue
 
         if conflict:
-            requirement.blocksContinue = True
+            # Keep both evidence items visible. This is an audit exception, not a
+            # business-process gate.
             requirement.needsDecision = False
+            requirement.blocksContinue = False
             continue
 
         suppress_condition = (
@@ -64,9 +64,6 @@ def _apply_gst_corporate_exclusivity(
             requirement.needsDecision = False
             requirement.blocksContinue = False
 
-    response.canContinue = not any(
-        requirement.blocksContinue for requirement in response.requirements
-    )
     return response
 
 
@@ -78,14 +75,7 @@ def _is_identity_requirement(requirement: capture_v2.CaptureV2Requirement) -> bo
 def _apply_identity_document_choice(
     response: capture_v2.BookingCaptureV2Response,
 ) -> capture_v2.BookingCaptureV2Response:
-    """Treat PAN and Aadhaar as one mandatory identity-document choice.
-
-    The Booking requires one supported identity document, not both. Existing project
-    requirement rows remain intact for evidence lineage; this rule changes only the
-    continuation gate. If either PAN or Aadhaar is classified, the alternative no
-    longer blocks. If neither is available and both are configured as required, only
-    one representative requirement blocks so the UI can present one business action.
-    """
+    """Treat PAN and Aadhaar as one identity-document choice for audit presentation."""
 
     identity_requirements = [
         requirement
@@ -110,13 +100,22 @@ def _apply_identity_document_choice(
     if identity_present:
         for requirement in required_identity:
             requirement.blocksContinue = False
-    else:
-        for index, requirement in enumerate(required_identity):
-            requirement.blocksContinue = index == 0
+    return response
 
-    response.canContinue = not any(
-        requirement.blocksContinue for requirement in response.requirements
-    )
+
+def _apply_non_blocking_audit_policy(
+    response: capture_v2.BookingCaptureV2Response,
+) -> capture_v2.BookingCaptureV2Response:
+    """Audit observations never stop the Booking business process.
+
+    Requirement states, missing evidence, unresolved optional applicability and
+    contradictory evidence remain visible for audit follow-up. They are deliberately
+    not converted into a continuation gate.
+    """
+
+    for requirement in response.requirements:
+        requirement.blocksContinue = False
+    response.canContinue = True
     return response
 
 
@@ -124,7 +123,8 @@ def _apply_capture_business_rules(
     response: capture_v2.BookingCaptureV2Response,
 ) -> capture_v2.BookingCaptureV2Response:
     response = _apply_gst_corporate_exclusivity(response)
-    return _apply_identity_document_choice(response)
+    response = _apply_identity_document_choice(response)
+    return _apply_non_blocking_audit_policy(response)
 
 
 def install_uc03_v2_capture_business_rules() -> None:
