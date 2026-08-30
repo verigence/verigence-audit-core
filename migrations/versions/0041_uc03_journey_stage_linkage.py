@@ -4,9 +4,16 @@ Revision ID: 0041_uc03_stage_linkage
 Revises: 0040_uc03_booking_fields
 Create Date: 2026-08-30
 
-Forward foreign keys remain the integrity source of truth. Reverse identifiers on
-Customer and Journey are intentionally maintained as lightweight query pointers so
-we do not introduce cyclic delete dependencies into the existing Journey model.
+Journey remains the lifecycle root. Booking and Delivery are stage records below
+that Journey. Payments remain one-to-many receipt/payment records below the same
+Journey and Booking, with optional Delivery linkage when the payment is explicitly
+associated with Delivery.
+
+This migration deliberately does NOT create a Booking row for every generic
+Journey. Existing rows are backfilled only when they already participate in UC03
+Booking/Delivery/Payment data. New UC03 Create Booking explicitly creates the
+Booking row; Delivery/Payment writes lazily ensure the same relationship for
+backward-compatible generic APIs.
 """
 from alembic import op
 
@@ -33,24 +40,41 @@ def upgrade() -> None:
         ALTER TABLE auditcore.payments
             ADD COLUMN booking_id uuid,
             ADD COLUMN delivery_id uuid,
-            ADD COLUMN payment_stage varchar(20) NOT NULL DEFAULT 'BOOKING';
+            ADD COLUMN payment_stage varchar(20) NOT NULL DEFAULT 'UNSPECIFIED';
         """
     )
 
-    # Every Journey is a Booking Journey. Older rows that pre-date this explicit
-    # linkage receive a lightweight Booking row; no document/extraction data is
-    # copied and no business value is invented.
+    # Backfill only Journeys that demonstrably participate in Booking/Delivery/
+    # Payment processing. Unrelated generic Journeys are left untouched.
     op.execute(
         """
+        WITH target_journeys AS (
+            SELECT j.tenant_id, j.journey_id
+            FROM auditcore.journeys j
+            WHERE EXISTS (
+                SELECT 1
+                FROM auditcore.journey_stage_states s
+                WHERE s.tenant_id = j.tenant_id
+                  AND s.journey_id = j.journey_id
+                  AND s.stage_code IN ('BOOKING','DELIVERY','POST_DELIVERY')
+            )
+            OR EXISTS (
+                SELECT 1 FROM auditcore.bookings b
+                WHERE b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
+            )
+            OR EXISTS (
+                SELECT 1 FROM auditcore.deliveries d
+                WHERE d.tenant_id = j.tenant_id AND d.journey_id = j.journey_id
+            )
+            OR EXISTS (
+                SELECT 1 FROM auditcore.payments p
+                WHERE p.tenant_id = j.tenant_id AND p.journey_id = j.journey_id
+            )
+        )
         INSERT INTO auditcore.bookings (tenant_id, journey_id)
-        SELECT j.tenant_id, j.journey_id
-        FROM auditcore.journeys j
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM auditcore.bookings b
-            WHERE b.tenant_id = j.tenant_id
-              AND b.journey_id = j.journey_id
-        );
+        SELECT t.tenant_id, t.journey_id
+        FROM target_journeys t
+        ON CONFLICT (tenant_id, journey_id) DO NOTHING;
         """
     )
 
@@ -83,8 +107,8 @@ def upgrade() -> None:
     )
 
     # Current UC03 Create Booking creates one Customer row per Journey. For any
-    # legacy/shared Customer, keep the most recent Journey as the reverse pointer;
-    # all Journey->Customer forward history remains unchanged.
+    # pre-existing shared Customer row, the reverse pointers are only convenience
+    # pointers; authoritative Journey->Customer history remains unchanged.
     op.execute(
         """
         WITH current_customer_journey AS (
@@ -129,10 +153,10 @@ def upgrade() -> None:
             FOREIGN KEY (tenant_id, delivery_id)
             REFERENCES auditcore.deliveries(tenant_id, delivery_id),
             ADD CONSTRAINT ck_payments_payment_stage
-            CHECK (payment_stage IN ('BOOKING','DELIVERY')),
+            CHECK (payment_stage IN ('UNSPECIFIED','BOOKING','DELIVERY')),
             ADD CONSTRAINT ck_payments_stage_delivery_link
             CHECK (
-                (payment_stage = 'BOOKING' AND delivery_id IS NULL)
+                (payment_stage IN ('UNSPECIFIED','BOOKING') AND delivery_id IS NULL)
                 OR
                 (payment_stage = 'DELIVERY' AND delivery_id IS NOT NULL)
             );
@@ -159,30 +183,8 @@ def upgrade() -> None:
         """
     )
 
-    # Journey creation now guarantees an immediately addressable Booking ID. The
-    # existing UC03 create command can remain small: the database creates only the
-    # linkage row, while Booking details continue to be captured later.
-    op.execute(
-        """
-        CREATE OR REPLACE FUNCTION auditcore.ensure_booking_for_journey()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $$
-        BEGIN
-            INSERT INTO auditcore.bookings (tenant_id, journey_id)
-            VALUES (NEW.tenant_id, NEW.journey_id)
-            ON CONFLICT (tenant_id, journey_id) DO NOTHING;
-            RETURN NEW;
-        END;
-        $$;
-
-        CREATE TRIGGER trg_ensure_booking_for_journey
-        AFTER INSERT ON auditcore.journeys
-        FOR EACH ROW
-        EXECUTE FUNCTION auditcore.ensure_booking_for_journey();
-        """
-    )
-
+    # Any Booking row, regardless of which supported API created it, keeps the
+    # Journey and Customer reverse pointers synchronized.
     op.execute(
         """
         CREATE OR REPLACE FUNCTION auditcore.sync_booking_reverse_links()
@@ -198,23 +200,25 @@ def upgrade() -> None:
             WHERE j.tenant_id = NEW.tenant_id
               AND j.journey_id = NEW.journey_id;
 
+            IF v_customer_id IS NULL THEN
+                RAISE EXCEPTION 'Booking Journey does not exist';
+            END IF;
+
             UPDATE auditcore.journeys
             SET booking_id = NEW.booking_id
             WHERE tenant_id = NEW.tenant_id
               AND journey_id = NEW.journey_id
               AND booking_id IS DISTINCT FROM NEW.booking_id;
 
-            IF v_customer_id IS NOT NULL THEN
-                UPDATE auditcore.customers
-                SET journey_id = NEW.journey_id,
-                    booking_id = NEW.booking_id
-                WHERE tenant_id = NEW.tenant_id
-                  AND customer_id = v_customer_id
-                  AND (
-                      journey_id IS DISTINCT FROM NEW.journey_id
-                      OR booking_id IS DISTINCT FROM NEW.booking_id
-                  );
-            END IF;
+            UPDATE auditcore.customers
+            SET journey_id = NEW.journey_id,
+                booking_id = NEW.booking_id
+            WHERE tenant_id = NEW.tenant_id
+              AND customer_id = v_customer_id
+              AND (
+                  journey_id IS DISTINCT FROM NEW.journey_id
+                  OR booking_id IS DISTINCT FROM NEW.booking_id
+              );
             RETURN NEW;
         END;
         $$;
@@ -226,6 +230,9 @@ def upgrade() -> None:
         """
     )
 
+    # Delivery is always associated with the Booking for its Journey. The lazy
+    # Booking INSERT preserves backward compatibility for callers that historically
+    # wrote Delivery directly against a Journey.
     op.execute(
         """
         CREATE OR REPLACE FUNCTION auditcore.prepare_delivery_booking_link()
@@ -235,6 +242,10 @@ def upgrade() -> None:
         DECLARE
             v_booking_id uuid;
         BEGIN
+            INSERT INTO auditcore.bookings (tenant_id, journey_id)
+            VALUES (NEW.tenant_id, NEW.journey_id)
+            ON CONFLICT (tenant_id, journey_id) DO NOTHING;
+
             SELECT b.booking_id
             INTO v_booking_id
             FROM auditcore.bookings b
@@ -280,6 +291,9 @@ def upgrade() -> None:
         """
     )
 
+    # A Payment remains an independent receipt/payment row (1:N). booking_id is
+    # derived from the Journey. delivery_id is present only for an explicitly
+    # DELIVERY-stage payment; no legacy receipt is guessed into a stage.
     op.execute(
         """
         CREATE OR REPLACE FUNCTION auditcore.prepare_payment_stage_link()
@@ -291,6 +305,10 @@ def upgrade() -> None:
             v_delivery_id uuid;
             v_delivery_journey_id uuid;
         BEGIN
+            INSERT INTO auditcore.bookings (tenant_id, journey_id)
+            VALUES (NEW.tenant_id, NEW.journey_id)
+            ON CONFLICT (tenant_id, journey_id) DO NOTHING;
+
             SELECT b.booking_id
             INTO v_booking_id
             FROM auditcore.bookings b
@@ -329,8 +347,8 @@ def upgrade() -> None:
             IF NEW.payment_stage = 'DELIVERY' AND NEW.delivery_id IS NULL THEN
                 RAISE EXCEPTION 'Delivery-stage payment requires a Delivery linked to the Journey';
             END IF;
-            IF NEW.payment_stage = 'BOOKING' AND NEW.delivery_id IS NOT NULL THEN
-                RAISE EXCEPTION 'Booking-stage payment cannot reference a Delivery';
+            IF NEW.payment_stage IN ('UNSPECIFIED','BOOKING') AND NEW.delivery_id IS NOT NULL THEN
+                RAISE EXCEPTION 'Only a Delivery-stage payment may reference a Delivery';
             END IF;
 
             RETURN NEW;
@@ -352,17 +370,17 @@ def upgrade() -> None:
         COMMENT ON COLUMN auditcore.customers.booking_id IS
             'Reverse query pointer to the Booking for the current/owning UC03 Journey.';
         COMMENT ON COLUMN auditcore.journeys.booking_id IS
-            'Reverse pointer to the one Booking row for this Journey.';
+            'Reverse pointer to the one Booking row for this Journey, when the Journey participates in Booking/Delivery/Payment processing.';
         COMMENT ON COLUMN auditcore.journeys.delivery_id IS
             'Reverse pointer to the one Delivery row for this Journey when Delivery exists.';
         COMMENT ON COLUMN auditcore.deliveries.booking_id IS
             'Booking owning this Delivery; derived from and constrained to the same Journey.';
         COMMENT ON COLUMN auditcore.payments.booking_id IS
-            'Booking owning this payment; derived from the Journey.';
+            'Booking owning this receipt/payment; derived from the Journey.';
         COMMENT ON COLUMN auditcore.payments.delivery_id IS
-            'Delivery owning a DELIVERY-stage payment; null for BOOKING-stage payments.';
+            'Delivery linked to an explicitly DELIVERY-stage payment; otherwise null.';
         COMMENT ON COLUMN auditcore.payments.payment_stage IS
-            'Business stage for the payment: BOOKING or DELIVERY.';
+            'Receipt/payment stage: UNSPECIFIED, BOOKING, or DELIVERY. UNSPECIFIED is used when the source does not prove a stage.';
         """
     )
 
@@ -376,8 +394,6 @@ def downgrade() -> None:
     op.execute("DROP FUNCTION IF EXISTS auditcore.prepare_delivery_booking_link()")
     op.execute("DROP TRIGGER IF EXISTS trg_sync_booking_reverse_links ON auditcore.bookings")
     op.execute("DROP FUNCTION IF EXISTS auditcore.sync_booking_reverse_links()")
-    op.execute("DROP TRIGGER IF EXISTS trg_ensure_booking_for_journey ON auditcore.journeys")
-    op.execute("DROP FUNCTION IF EXISTS auditcore.ensure_booking_for_journey()")
 
     op.execute("DROP INDEX IF EXISTS auditcore.ix_payments_delivery")
     op.execute("DROP INDEX IF EXISTS auditcore.ix_payments_booking_stage")
