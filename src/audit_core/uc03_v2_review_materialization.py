@@ -17,15 +17,17 @@ from audit_core.uc03_booking_receipt_capture import (
 logger = logging.getLogger(__name__)
 
 
-def receipt_review_key(document_id: UUID, field_key: str) -> str:
-    """Return the review key for one field on one receipt document.
+def receipt_review_key(receipt_ordinal: int, field_key: str) -> str:
+    """Return the readable/stable review key for one field on one receipt."""
 
-    Receipts are repeated entities. Two receipts with different amounts are not a
-    cross-source mismatch for one Booking attribute, so their review keys must stay
-    document-scoped.
-    """
+    return f"raw:receipt_{receipt_ordinal}_{field_key.strip().lower()}"
 
-    return f"raw:receipt:{document_id}:{field_key.strip().lower()}"
+
+def receipt_document_ordinals(document_ids: list[UUID]) -> dict[UUID, int]:
+    """Assign stable ordinals after capture is closed, without storing another ID."""
+
+    ordered = sorted(set(document_ids), key=str)
+    return {document_id: index + 1 for index, document_id in enumerate(ordered)}
 
 
 def _text_or_none(value: Any) -> str | None:
@@ -38,6 +40,7 @@ def _text_or_none(value: Any) -> str | None:
 def _reviewed_receipt_values(
     document: Any,
     *,
+    receipt_ordinal: int,
     rejected_review_keys: set[str],
 ) -> dict[str, Any]:
     values: dict[str, Any] = {}
@@ -48,7 +51,7 @@ def _reviewed_receipt_values(
         capture_key = _RECEIPT_CAPTURE_MAP.get(source_field_key)
         if capture_key is None:
             continue
-        if receipt_review_key(document.documentId, source_field_key) in rejected_review_keys:
+        if receipt_review_key(receipt_ordinal, source_field_key) in rejected_review_keys:
             continue
         value = field.value
         if value is None or value == "":
@@ -164,19 +167,25 @@ def materialize_reviewed_booking_receipts(
     the missing/invalid amount without contaminating cumulative-payment logic.
     """
 
+    receipt_documents = [
+        document
+        for document in documents
+        if str(document.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE
+        and str(document.extractionState).upper() == "READY"
+    ]
+    ordinals = receipt_document_ordinals(
+        [document.documentId for document in receipt_documents]
+    )
+
     created = 0
     updated = 0
     unchanged = 0
     skipped_without_amount = 0
 
-    for document in documents:
-        if str(document.documentTypeKey or "").strip().lower() != _RECEIPT_DOCUMENT_TYPE:
-            continue
-        if str(document.extractionState).upper() != "READY":
-            continue
-
+    for document in receipt_documents:
         values = _reviewed_receipt_values(
             document,
+            receipt_ordinal=ordinals[document.documentId],
             rejected_review_keys=rejected_review_keys,
         )
         if "amount" not in values:
