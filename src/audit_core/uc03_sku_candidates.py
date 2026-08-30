@@ -4,7 +4,6 @@ import re
 from collections.abc import Mapping
 from datetime import date
 from decimal import Decimal
-from difflib import SequenceMatcher
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -31,24 +30,18 @@ router = APIRouter(
     tags=["uc03-sku-candidates"],
 )
 
-_MODEL_WEIGHT = Decimal("0.40")
-_VARIANT_WEIGHT = Decimal("0.35")
-_COMMERCIAL_WEIGHT = Decimal("0.25")
-_MIN_CANDIDATE_SCORE = Decimal("0.45")
-_COMMERCIAL_ZERO_SCORE_DELTA = Decimal("0.30")
-_DIRECT_PRICE_MAX_DELTA = Decimal("0.02")
 _SELECTION_METHOD_DIRECT_SKU = "BOOKING_DIRECT_SKU_V1"
-_SELECTION_METHOD_UNIQUE_MODEL_PRICE = "BOOKING_MODEL_PRICE_UNIQUE_V1"
-_SELECTION_METHOD_TENTATIVE = "BOOKING_MODEL_PRICE_MULTI_V1"
-_TENTATIVE_NOTE = "* Tentative — multiple Booking matches; confirmation required"
+_SELECTION_METHOD_UNIQUE_MODEL_PRICE = "BOOKING_MODEL_PRICE_EXACT_V1"
+_SELECTION_METHOD_TENTATIVE = "BOOKING_MODEL_PRICE_MULTI_EXACT_V1"
+_TENTATIVE_NOTE = "* Tentative — multiple exact Booking matches; confirmation required"
 _RESOLVED_NOTE = (
-    "Resolved from Booking Form evidence; validate against Delivery Invoice later."
+    "Resolved from exact Booking Form evidence; validate against Delivery Invoice later."
 )
 _NON_ALNUM = re.compile(r"[^A-Z0-9]+")
 
 
 class SkuCandidateRequest(BaseModel):
-    """Machine-observed Booking Form facts used for SKU resolution."""
+    """Machine-observed Booking Form facts used for exact SKU resolution."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -89,7 +82,6 @@ class SkuCandidateResponse(BaseModel):
     status: Literal[
         "BOOKING_SKU_RESOLVED",
         "CONFIRMATION_REQUIRED",
-        "NO_RELIABLE_CANDIDATE",
         "CONFIRMED_SKU_PRESERVED",
     ]
     selectionNote: str
@@ -98,10 +90,8 @@ class SkuCandidateResponse(BaseModel):
     matchingRowCount: int = 0
     resolutionBasis: Literal[
         "DIRECT_SKU",
-        "MODEL_PRICE_UNIQUE",
-        "MULTIPLE_BOOKING_MATCHES",
-        "FUZZY_RANKING",
-        "NONE",
+        "MODEL_PRICE_EXACT_UNIQUE",
+        "MULTIPLE_EXACT_BOOKING_MATCHES",
         "EXISTING_CONFIRMED",
     ]
     deliveryValidationRequired: Literal[True] = True
@@ -115,43 +105,29 @@ def _normalize_label(value: str) -> str:
     return " ".join(part for part in _NON_ALNUM.sub(" ", value.upper()).split() if part)
 
 
+def _normalized_key(value: str) -> str:
+    return _normalize_label(value).replace(" ", "")
+
+
 def _label_similarity(observed: str, master: str) -> Decimal:
-    left = _normalize_label(observed)
-    right = _normalize_label(master)
+    """Return 1 only for formatting-normalized exact equality; never fuzzy-match."""
+
+    left = _normalized_key(observed)
+    right = _normalized_key(master)
     if not left or not right:
         return Decimal(0)
-    if left == right or left.replace(" ", "") == right.replace(" ", ""):
-        return Decimal(1)
-
-    sequence = Decimal(str(SequenceMatcher(None, left, right).ratio()))
-    left_tokens = set(left.split())
-    right_tokens = set(right.split())
-    union = left_tokens | right_tokens
-    token_jaccard = (
-        Decimal(len(left_tokens & right_tokens)) / Decimal(len(union))
-        if union
-        else Decimal(0)
-    )
-    containment = (
-        Decimal(1)
-        if left.replace(" ", "") in right.replace(" ", "")
-        or right.replace(" ", "") in left.replace(" ", "")
-        else Decimal(0)
-    )
-    token_score = (token_jaccard * Decimal("0.85")) + (containment * Decimal("0.15"))
-    return min(Decimal(1), max(sequence, token_score))
+    return Decimal(1) if left == right else Decimal(0)
 
 
 def _commercial_similarity(
     observed: Decimal,
     master: Decimal,
 ) -> tuple[Decimal, Decimal, Decimal]:
+    """Return exact-price diagnostics; no price tolerance is ever applied."""
+
     difference = abs(master - observed)
     difference_pct = difference / observed
-    score = max(
-        Decimal(0),
-        Decimal(1) - (difference_pct / _COMMERCIAL_ZERO_SCORE_DELTA),
-    )
+    score = Decimal(1) if difference == 0 else Decimal(0)
     return score, difference, difference_pct
 
 
@@ -165,13 +141,15 @@ def _display_label(
     return f"{label} *" if tentative else label
 
 
-def _score_row(
+def _candidate_from_row(
     row: Mapping[str, Any],
     *,
+    rank: int,
     model_name: str,
     variant_name: str | None,
     total_commercial_amount: Decimal,
-) -> dict[str, Any]:
+    tentative: bool,
+) -> SkuCandidate:
     master_total = Decimal(str(row["master_total_amount"]))
     model_score = _label_similarity(model_name, str(row["model_name"]))
     variant_score = (
@@ -184,29 +162,9 @@ def _score_row(
         master_total,
     )
     score = (
-        model_score * _MODEL_WEIGHT
-        + variant_score * _VARIANT_WEIGHT
-        + commercial_score * _COMMERCIAL_WEIGHT
-    )
-    return {
-        "row": row,
-        "score": score,
-        "model_score": model_score,
-        "variant_score": variant_score,
-        "commercial_score": commercial_score,
-        "difference": difference,
-        "difference_pct": difference_pct,
-    }
+        (model_score * Decimal(2)) + variant_score + (commercial_score * Decimal(2))
+    ) / Decimal(5)
 
-
-def _candidate_from_scored(
-    item: Mapping[str, Any],
-    *,
-    rank: int,
-    total_commercial_amount: Decimal,
-    tentative: bool,
-) -> SkuCandidate:
-    row = item["row"]
     return SkuCandidate(
         rank=rank,
         productSkuId=row["product_sku_id"],
@@ -219,20 +177,16 @@ def _candidate_from_scored(
             str(row["variant_name"]),
             tentative=tentative,
         ),
-        masterTotalAmount=Decimal(str(row["master_total_amount"])),
+        masterTotalAmount=master_total,
         observedTotalCommercialAmount=total_commercial_amount,
-        commercialDifferenceAmount=Decimal(str(item["difference"])).quantize(
+        commercialDifferenceAmount=difference.quantize(Decimal("0.01")),
+        commercialDifferencePercent=(difference_pct * Decimal(100)).quantize(
             Decimal("0.01")
         ),
-        commercialDifferencePercent=(
-            Decimal(str(item["difference_pct"])) * Decimal(100)
-        ).quantize(Decimal("0.01")),
-        score=Decimal(str(item["score"])).quantize(Decimal("0.0001")),
-        modelScore=Decimal(str(item["model_score"])).quantize(Decimal("0.0001")),
-        variantScore=Decimal(str(item["variant_score"])).quantize(Decimal("0.0001")),
-        commercialScore=Decimal(str(item["commercial_score"])).quantize(
-            Decimal("0.0001")
-        ),
+        score=score.quantize(Decimal("0.0001")),
+        modelScore=model_score.quantize(Decimal("0.0001")),
+        variantScore=variant_score.quantize(Decimal("0.0001")),
+        commercialScore=commercial_score.quantize(Decimal("0.0001")),
         candidateStatus="TENTATIVE" if tentative else "CONFIRMED",
         confirmationRequired=tentative,
     )
@@ -247,36 +201,34 @@ def rank_sku_candidates(
     max_candidates: int,
     tentative: bool = True,
 ) -> list[SkuCandidate]:
-    """Rank effective-master rows using explainable text and commercial proximity."""
+    """Deterministically order already-exact Booking matches.
 
-    scored: list[dict[str, Any]] = []
-    for row in rows:
-        item = _score_row(
+    This function never broadens the match set. Price proximity and fuzzy text
+    similarity are deliberately excluded from candidate discovery.
+    """
+
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            -int(
+                bool(variant_name)
+                and _label_similarity(variant_name or "", str(row["variant_name"]))
+                == Decimal(1)
+            ),
+            str(row.get("colour_name") or ""),
+            str(row["sku_code"]),
+        ),
+    )
+    return [
+        _candidate_from_row(
             row,
+            rank=index,
             model_name=model_name,
             variant_name=variant_name,
             total_commercial_amount=total_commercial_amount,
-        )
-        if Decimal(str(item["score"])) < _MIN_CANDIDATE_SCORE:
-            continue
-        scored.append(item)
-
-    scored.sort(
-        key=lambda item: (
-            -Decimal(str(item["score"])),
-            Decimal(str(item["difference_pct"])),
-            str(item["row"]["sku_code"]),
-        )
-    )
-
-    return [
-        _candidate_from_scored(
-            item,
-            rank=index,
-            total_commercial_amount=total_commercial_amount,
             tentative=tentative,
         )
-        for index, item in enumerate(scored[:max_candidates], start=1)
+        for index, row in enumerate(ordered[:max_candidates], start=1)
     ]
 
 
@@ -287,15 +239,11 @@ def _exact_direct_sku_matches(
 ) -> list[Mapping[str, Any]]:
     if not sku_code:
         return []
-    observed = _normalize_label(sku_code).replace(" ", "")
-    return [
-        row
-        for row in rows
-        if _normalize_label(str(row["sku_code"])).replace(" ", "") == observed
-    ]
+    observed = _normalized_key(sku_code)
+    return [row for row in rows if _normalized_key(str(row["sku_code"])) == observed]
 
 
-def _unique_booking_matches(
+def _exact_booking_matches(
     rows: list[Mapping[str, Any]],
     *,
     model_name: str,
@@ -303,24 +251,19 @@ def _unique_booking_matches(
     colour_name: str | None,
     total_commercial_amount: Decimal,
 ) -> list[Mapping[str, Any]]:
-    """Return strict Booking matches safe enough for direct SKU resolution.
+    """Return only exact Booking model + exact commercial-total master matches.
 
-    Model must be an exact normalized match and master price must be within two
-    percent of the Booking total. Variant and colour are deterministic
-    narrowing signals when they are present in the Booking evidence.
+    Text equality is formatting-normalized only. There is no fuzzy matching and
+    no price tolerance. Variant and colour can narrow an already exact
+    model/price set when those facts are available on the Booking Form.
     """
 
-    matches: list[Mapping[str, Any]] = []
-    for row in rows:
-        if _label_similarity(model_name, str(row["model_name"])) != Decimal(1):
-            continue
-        _, _, difference_pct = _commercial_similarity(
-            total_commercial_amount,
-            Decimal(str(row["master_total_amount"])),
-        )
-        if difference_pct > _DIRECT_PRICE_MAX_DELTA:
-            continue
-        matches.append(row)
+    matches = [
+        row
+        for row in rows
+        if _label_similarity(model_name, str(row["model_name"])) == Decimal(1)
+        and Decimal(str(row["master_total_amount"])) == total_commercial_amount
+    ]
 
     if len(matches) > 1 and variant_name:
         variant_matches = [
@@ -482,7 +425,7 @@ def _effective_sku_rows(
             title="Product Master configuration conflict",
             detail=(
                 "Multiple published Product Master versions share the latest applicable "
-                "effective date for a Segment; SKU candidates cannot be ranked safely."
+                "effective date for a Segment; Booking SKU cannot be resolved safely."
             ),
         )
     return rows
@@ -497,10 +440,7 @@ def _persist_sku_selection(
     selection_status: Literal["CONFIRMED", "TENTATIVE"],
     selection_method: str,
 ) -> tuple[bool, bool]:
-    """Persist a Booking-derived SKU unless a confirmed SKU already exists.
-
-    Returns (record_updated, confirmed_selection_preserved).
-    """
+    """Persist a Booking-derived SKU unless a confirmed SKU already exists."""
 
     existing_status = connection.execute(
         text(
@@ -587,17 +527,30 @@ def _resolved_candidate(
     variant_name: str | None,
     total_commercial_amount: Decimal,
 ) -> SkuCandidate:
-    item = _score_row(
+    return _candidate_from_row(
         row,
+        rank=1,
         model_name=model_name,
         variant_name=variant_name,
         total_commercial_amount=total_commercial_amount,
-    )
-    return _candidate_from_scored(
-        item,
-        rank=1,
-        total_commercial_amount=total_commercial_amount,
         tentative=False,
+    )
+
+
+def _raise_model_not_found(
+    *,
+    model_name: str,
+    total_commercial_amount: Decimal,
+) -> None:
+    raise AuditCoreError(
+        error_code="VAC-SKU-001",
+        status_code=422,
+        title="Model not found in masters",
+        detail=(
+            "No exact effective Product/Price Master row matches Booking Form model "
+            f"'{model_name}' and total commercial amount {total_commercial_amount}. "
+            "No tolerance or fuzzy fallback is permitted."
+        ),
     )
 
 
@@ -612,7 +565,7 @@ def derive_sku_candidates(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> SkuCandidateResponse:
-    """Resolve a Booking SKU directly when possible; otherwise return tentative matches."""
+    """Resolve an exact Booking SKU or flag the Booking when no exact match exists."""
 
     _scope(
         connection,
@@ -651,6 +604,13 @@ def derive_sku_candidates(
     )
 
     direct_sku_matches = _exact_direct_sku_matches(rows, sku_code=command.skuCode)
+    if len(direct_sku_matches) > 1:
+        raise AuditCoreError(
+            error_code="VAC-MASTER-004",
+            status_code=409,
+            title="Product Master SKU conflict",
+            detail="The Booking Form SKU code maps to multiple effective Product Master rows.",
+        )
     if len(direct_sku_matches) == 1:
         candidate = _resolved_candidate(
             direct_sku_matches[0],
@@ -686,16 +646,22 @@ def derive_sku_candidates(
             candidates=[candidate],
         )
 
-    strict_matches = _unique_booking_matches(
+    exact_matches = _exact_booking_matches(
         rows,
         model_name=command.modelName,
         variant_name=command.variantName,
         colour_name=command.colourName,
         total_commercial_amount=command.totalCommercialAmount,
     )
-    if len(strict_matches) == 1:
+    if not exact_matches:
+        _raise_model_not_found(
+            model_name=command.modelName,
+            total_commercial_amount=command.totalCommercialAmount,
+        )
+
+    if len(exact_matches) == 1:
         candidate = _resolved_candidate(
-            strict_matches[0],
+            exact_matches[0],
             model_name=command.modelName,
             variant_name=command.variantName,
             total_commercial_amount=command.totalCommercialAmount,
@@ -723,35 +689,21 @@ def derive_sku_candidates(
             mostLikelyProductSkuId=candidate.productSkuId,
             matchingRowCount=1,
             resolutionBasis=(
-                "EXISTING_CONFIRMED" if confirmed_preserved else "MODEL_PRICE_UNIQUE"
+                "EXISTING_CONFIRMED"
+                if confirmed_preserved
+                else "MODEL_PRICE_EXACT_UNIQUE"
             ),
             candidates=[candidate],
         )
 
-    candidate_rows = strict_matches if len(strict_matches) > 1 else rows
     candidates = rank_sku_candidates(
-        candidate_rows,
+        exact_matches,
         model_name=command.modelName,
         variant_name=command.variantName,
         total_commercial_amount=command.totalCommercialAmount,
         max_candidates=command.maxCandidates,
         tentative=True,
     )
-
-    if not candidates:
-        return SkuCandidateResponse(
-            journeyId=journey_id,
-            effectiveOn=effective_on,
-            priceListVersionId=price_list_version_id,
-            currencyCode=plan_currency,
-            status="NO_RELIABLE_CANDIDATE",
-            selectionNote="No reliable Booking SKU match found.",
-            bookingRecordUpdated=False,
-            matchingRowCount=0,
-            resolutionBasis="NONE",
-            candidates=[],
-        )
-
     most_likely = candidates[0]
     updated, confirmed_preserved = _persist_sku_selection(
         connection,
@@ -772,15 +724,11 @@ def derive_sku_candidates(
         selectionNote=_TENTATIVE_NOTE,
         bookingRecordUpdated=updated,
         mostLikelyProductSkuId=most_likely.productSkuId,
-        matchingRowCount=(len(strict_matches) if strict_matches else len(candidates)),
+        matchingRowCount=len(exact_matches),
         resolutionBasis=(
             "EXISTING_CONFIRMED"
             if confirmed_preserved
-            else (
-                "MULTIPLE_BOOKING_MATCHES"
-                if len(strict_matches) > 1
-                else "FUZZY_RANKING"
-            )
+            else "MULTIPLE_EXACT_BOOKING_MATCHES"
         ),
         candidates=candidates,
     )
