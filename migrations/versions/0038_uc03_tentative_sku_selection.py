@@ -1,7 +1,7 @@
 from alembic import op
 
 revision = "0038_uc03_tentative_sku_selection"
-down_revision = "0037_uc03_attribute_resolution_refs"
+down_revision = "0037_uc03_attr_resolution_refs"
 branch_labels = None
 depends_on = None
 
