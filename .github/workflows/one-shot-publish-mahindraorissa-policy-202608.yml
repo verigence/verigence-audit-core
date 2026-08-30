@@ -36,34 +36,63 @@ jobs:
           python -m pip install -e .
           npm install --global @railway/cli
 
-      - name: Resolve approved DEV database
+      - name: Publish through approved Railway DEV tunnel
         shell: bash
         run: |
           set -euo pipefail
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
           railway variable list --service "$DB_SERVICE" --json >/tmp/db-vars.json
+
           python - <<'PY'
           import json
           from pathlib import Path
 
           data = json.loads(Path('/tmp/db-vars.json').read_text())
-          raw = (data.get('DATABASE_PUBLIC_URL') or data.get('DATABASE_URL') or '').strip()
+          raw = (data.get('DATABASE_URL') or data.get('DATABASE_PUBLIC_URL') or '').strip()
           if not raw:
               raise SystemExit('DEV Postgres URL is unavailable')
-          if raw.startswith('postgres://'):
-              raw = 'postgresql+psycopg://' + raw[len('postgres://'):]
-          elif raw.startswith('postgresql://'):
-              raw = 'postgresql+psycopg://' + raw[len('postgresql://'):]
-          elif raw.startswith('postgresql+asyncpg://'):
-              raw = 'postgresql+psycopg://' + raw[len('postgresql+asyncpg://'):]
-          Path('/tmp/db-url').write_text(raw)
-          print('AUDIT_DEV_DATABASE_RESOLVED=PASS')
+          Path('/tmp/internal-db-url').write_text(raw)
+          print('AUDIT_DEV_DATABASE_CREDENTIALS=RESOLVED')
           PY
 
-      - name: Verify schema is current
-        shell: bash
-        run: |
-          set -euo pipefail
+          railway connect "$DB_SERVICE" --tunnel-only --port 55432 >/tmp/db-tunnel.log 2>&1 &
+          tunnel_pid=$!
+          cleanup() {
+            kill "$tunnel_pid" >/dev/null 2>&1 || true
+            wait "$tunnel_pid" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          python - <<'PY'
+          import socket
+          import time
+
+          for _ in range(60):
+              try:
+                  with socket.create_connection(('127.0.0.1', 55432), timeout=1):
+                      print('RAILWAY_DB_TUNNEL=PASS')
+                      break
+              except OSError:
+                  time.sleep(0.5)
+          else:
+              raise SystemExit('Railway database tunnel did not become ready')
+          PY
+
+          python - <<'PY'
+          from pathlib import Path
+          from sqlalchemy.engine import make_url
+
+          raw = Path('/tmp/internal-db-url').read_text().strip()
+          if raw.startswith('postgres://'):
+              raw = 'postgresql://' + raw[len('postgres://'):]
+          url = make_url(raw).set(
+              drivername='postgresql+psycopg',
+              host='127.0.0.1',
+              port=55432,
+          )
+          Path('/tmp/db-url').write_text(url.render_as_string(hide_password=False))
+          PY
+
           export DATABASE_URL="$(cat /tmp/db-url)"
           head_count="$(alembic heads | grep -c '(head)' || true)"
           if [[ "$head_count" != "1" ]]; then
@@ -74,11 +103,6 @@ jobs:
           alembic upgrade head
           alembic current
 
-      - name: Publish effective-dated policy version
-        shell: bash
-        run: |
-          set -euo pipefail
-          export DATABASE_URL="$(cat /tmp/db-url)"
           python - <<'PY'
           import os
           from pathlib import Path
@@ -325,7 +349,7 @@ jobs:
                       },
                   )
 
-              connection.execute(
+              updated = connection.execute(
                   text(
                       """
                       UPDATE auditcore.discount_policy_versions
@@ -344,6 +368,8 @@ jobs:
                       'actor': ACTOR,
                   },
               )
+              if updated.rowcount != 1:
+                  raise SystemExit('Policy version did not transition from DRAFT to PUBLISHED')
 
               verify = connection.execute(
                   text(
