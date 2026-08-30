@@ -6,10 +6,7 @@ from audit_core.uc03_document_capture_v2 import (
     CaptureV2Document,
     CaptureV2Requirement,
 )
-from audit_core.uc03_document_capture_v2_rules import (
-    _apply_gst_corporate_exclusivity,
-    _apply_identity_document_choice,
-)
+from audit_core.uc03_document_capture_v2_rules import _apply_capture_business_rules
 
 
 def _document(document_type_key: str) -> CaptureV2Document:
@@ -89,8 +86,8 @@ def _capture(gst_document=None, corporate_document=None) -> BookingCaptureV2Resp
     )
 
 
-def test_gst_evidence_suppresses_corporate_question() -> None:
-    capture = _apply_gst_corporate_exclusivity(_capture(gst_document=_document("GST_CERTIFICATE")))
+def test_gst_evidence_suppresses_corporate_question_without_blocking() -> None:
+    capture = _apply_capture_business_rules(_capture(gst_document=_document("GST_CERTIFICATE")))
     corporate = next(r for r in capture.requirements if r.conditionKey == "corporateCustomer")
     assert corporate.applicabilityState == "NOT_APPLICABLE"
     assert corporate.state == "NOT_APPLICABLE"
@@ -99,8 +96,8 @@ def test_gst_evidence_suppresses_corporate_question() -> None:
     assert capture.canContinue is True
 
 
-def test_corporate_evidence_suppresses_gst_question() -> None:
-    capture = _apply_gst_corporate_exclusivity(_capture(corporate_document=_document("CORPORATE_ID")))
+def test_corporate_evidence_suppresses_gst_question_without_blocking() -> None:
+    capture = _apply_capture_business_rules(_capture(corporate_document=_document("CORPORATE_ID")))
     gst = next(r for r in capture.requirements if r.conditionKey == "gstApplicable")
     assert gst.applicabilityState == "NOT_APPLICABLE"
     assert gst.state == "NOT_APPLICABLE"
@@ -109,16 +106,17 @@ def test_corporate_evidence_suppresses_gst_question() -> None:
     assert capture.canContinue is True
 
 
-def test_gst_and_corporate_evidence_together_block_capture() -> None:
-    capture = _apply_gst_corporate_exclusivity(
+def test_gst_and_corporate_conflict_is_retained_as_non_blocking_exception() -> None:
+    capture = _apply_capture_business_rules(
         _capture(
             gst_document=_document("GST_CERTIFICATE"),
             corporate_document=_document("CORPORATE_ID"),
         )
     )
     exclusive = [r for r in capture.requirements if r.conditionKey in {"gstApplicable", "corporateCustomer"}]
-    assert all(r.blocksContinue for r in exclusive)
-    assert capture.canContinue is False
+    assert len(capture.uploads) == 2
+    assert all(r.blocksContinue is False for r in exclusive)
+    assert capture.canContinue is True
 
 
 def _identity_capture(pan_document=None, aadhaar_document=None) -> BookingCaptureV2Response:
@@ -137,22 +135,22 @@ def _identity_capture(pan_document=None, aadhaar_document=None) -> BookingCaptur
     )
 
 
-def test_pan_or_aadhaar_group_blocks_once_when_neither_is_uploaded() -> None:
-    capture = _apply_identity_document_choice(_identity_capture())
-    blockers = [item for item in capture.requirements if item.blocksContinue]
-    assert len(blockers) == 1
-    assert capture.canContinue is False
+def test_missing_pan_and_aadhaar_are_audit_observations_not_process_blockers() -> None:
+    capture = _apply_capture_business_rules(_identity_capture())
+    assert all(item.blocksContinue is False for item in capture.requirements)
+    assert all(item.state == "NOT_UPLOADED" for item in capture.requirements)
+    assert capture.canContinue is True
 
 
-def test_pan_satisfies_identity_group_without_requiring_aadhaar() -> None:
+def test_pan_satisfies_identity_choice_without_requiring_aadhaar() -> None:
     pan = _document("PAN_CARD")
-    capture = _apply_identity_document_choice(_identity_capture(pan_document=pan))
+    capture = _apply_capture_business_rules(_identity_capture(pan_document=pan))
     assert all(item.blocksContinue is False for item in capture.requirements)
     assert capture.canContinue is True
 
 
-def test_aadhaar_satisfies_identity_group_without_requiring_pan() -> None:
+def test_aadhaar_satisfies_identity_choice_without_requiring_pan() -> None:
     aadhaar = _document("AADHAAR_CARD")
-    capture = _apply_identity_document_choice(_identity_capture(aadhaar_document=aadhaar))
+    capture = _apply_capture_business_rules(_identity_capture(aadhaar_document=aadhaar))
     assert all(item.blocksContinue is False for item in capture.requirements)
     assert capture.canContinue is True
