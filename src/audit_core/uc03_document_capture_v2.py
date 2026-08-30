@@ -32,7 +32,6 @@ from audit_core.uc03_booking_commands import (
     _aggregate_lock,
     _append_workflow_event,
     _parse_if_match,
-    _stage_state,
 )
 
 router = APIRouter(prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}", tags=["uc03-document-capture-v2"])
@@ -212,7 +211,15 @@ def _authorize_booking(
         human_principal=human_principal,
         authorization_client=authorization_client,
     )
-    state = _stage_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # Capture reads, upload intents, finalize, delete and declarations are not
+    # Booking aggregate commands. They must not hold journey_stage_states FOR UPDATE
+    # while Security/DI work is in flight; that causes polling/finalize lock contention.
+    state = _capture_phase_state(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        for_update=False,
+    )
     _require_active_booking(state)
     return dict(state)
 
