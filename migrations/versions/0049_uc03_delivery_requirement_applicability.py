@@ -6,11 +6,12 @@ Create Date: 2026-08-30
 
 The original default Delivery profile marked conditional evidence such as
 Accessories, Extended Warranty, RSA and dealer-registration evidence as REQUIRED.
-That made the Delivery capture screen report every such document as mandatory.
+That made Delivery capture report these documents as universally mandatory and
+could raise false missing-document audit flags.
 
-This migration corrects both the versioned profile and already-snapshotted Journey
-requirements. Delivery submission remains non-blocking; these levels are audit
-expectations and presentation/applicability metadata only.
+Published requirement masters remain immutable. This migration repairs effective
+Journey snapshots already created and corrects the Delivery-start snapshot function
+for future journeys. Delivery remains non-blocking.
 """
 
 from alembic import op
@@ -20,27 +21,19 @@ down_revision = "0048_uc03_di_core_fields"
 branch_labels = None
 depends_on = None
 
+_CONDITIONAL_KEYS = (
+    "accessory_invoice_dms",
+    "accessory_invoice_tally",
+    "rto_challan",
+    "ew_invoice",
+    "rsa_invoice",
+)
+
 
 def upgrade() -> None:
-    op.execute(
-        """
-        WITH corrections(requirement_key, condition_key) AS (
-            VALUES
-                ('accessory_invoice_dms', 'accessoriesTaken'),
-                ('accessory_invoice_tally', 'accessoriesTaken'),
-                ('rto_challan', 'registrationByDealer'),
-                ('ew_invoice', 'extendedWarrantyTaken'),
-                ('rsa_invoice', 'rsaTaken')
-        )
-        UPDATE auditcore.document_requirement_items i
-        SET requirement_level='CONDITIONAL',
-            condition_config=jsonb_build_object('conditionKey', c.condition_key)
-        FROM corrections c
-        WHERE i.requirement_key=c.requirement_key
-          AND upper(i.process_area)='DELIVERY'
-        """
-    )
-
+    # Repair snapshots already created for active/existing journeys. These are the
+    # effective per-Journey requirements and are intentionally mutable audit state,
+    # unlike the published master version from which they were originally copied.
     op.execute(
         """
         WITH corrections(requirement_key, condition_key) AS (
@@ -61,6 +54,8 @@ def upgrade() -> None:
         """
     )
 
+    # V2 presentation/applicability metadata. This is not a second source of
+    # business truth; it records the condition attached to the effective requirement.
     op.execute(
         """
         INSERT INTO auditcore.document_capture_v2_requirement_policy (
@@ -83,22 +78,71 @@ def upgrade() -> None:
         """
     )
 
-
-def downgrade() -> None:
-    # Restore only the five levels changed by this corrective migration. The
-    # original default profile used REQUIRED for each of them.
+    # Preserve published master immutability. When Delivery starts, normalize the
+    # known conditional requirements while copying the profile into Journey state.
     op.execute(
         """
-        UPDATE auditcore.document_requirement_items
-        SET requirement_level='REQUIRED',
-            condition_config='{}'::jsonb
-        WHERE requirement_key IN (
-            'accessory_invoice_dms', 'accessory_invoice_tally', 'rto_challan',
-            'ew_invoice', 'rsa_invoice'
-        )
-          AND upper(process_area)='DELIVERY'
+        CREATE OR REPLACE FUNCTION auditcore.initialize_uc03_delivery_requirements()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NEW.stage_code <> 'DELIVERY' THEN
+                RETURN NEW;
+            END IF;
+
+            INSERT INTO auditcore.journey_document_requirements (
+                tenant_id,
+                journey_id,
+                document_requirement_item_id,
+                requirement_key,
+                document_type_key,
+                process_area,
+                requirement_level,
+                requirement_status,
+                condition_snapshot
+            )
+            SELECT
+                j.tenant_id,
+                j.journey_id,
+                dri.document_requirement_item_id,
+                dri.requirement_key,
+                dri.document_type_key,
+                dri.process_area,
+                CASE
+                    WHEN dri.requirement_key IN (
+                        'accessory_invoice_dms', 'accessory_invoice_tally',
+                        'rto_challan', 'ew_invoice', 'rsa_invoice'
+                    ) THEN 'CONDITIONAL'
+                    ELSE dri.requirement_level
+                END,
+                'PENDING',
+                CASE dri.requirement_key
+                    WHEN 'accessory_invoice_dms' THEN jsonb_build_object('conditionKey', 'accessoriesTaken')
+                    WHEN 'accessory_invoice_tally' THEN jsonb_build_object('conditionKey', 'accessoriesTaken')
+                    WHEN 'rto_challan' THEN jsonb_build_object('conditionKey', 'registrationByDealer')
+                    WHEN 'ew_invoice' THEN jsonb_build_object('conditionKey', 'extendedWarrantyTaken')
+                    WHEN 'rsa_invoice' THEN jsonb_build_object('conditionKey', 'rsaTaken')
+                    ELSE dri.condition_config
+                END
+            FROM auditcore.journeys j
+            JOIN auditcore.document_requirement_items dri
+              ON dri.tenant_id = j.tenant_id
+             AND dri.document_requirement_profile_version_id =
+                    j.document_requirement_profile_version_id
+            WHERE j.tenant_id = NEW.tenant_id
+              AND j.journey_id = NEW.journey_id
+              AND upper(dri.process_area) = 'DELIVERY'
+            ON CONFLICT (tenant_id, journey_id, requirement_key) DO NOTHING;
+
+            RETURN NEW;
+        END;
+        $$
         """
     )
+
+
+def downgrade() -> None:
     op.execute(
         """
         UPDATE auditcore.journey_document_requirements
@@ -120,5 +164,52 @@ def downgrade() -> None:
             'ew_invoice', 'rsa_invoice'
         )
           AND process_area='DELIVERY'
+        """
+    )
+    op.execute(
+        """
+        CREATE OR REPLACE FUNCTION auditcore.initialize_uc03_delivery_requirements()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NEW.stage_code <> 'DELIVERY' THEN
+                RETURN NEW;
+            END IF;
+
+            INSERT INTO auditcore.journey_document_requirements (
+                tenant_id,
+                journey_id,
+                document_requirement_item_id,
+                requirement_key,
+                document_type_key,
+                process_area,
+                requirement_level,
+                requirement_status,
+                condition_snapshot
+            )
+            SELECT
+                j.tenant_id,
+                j.journey_id,
+                dri.document_requirement_item_id,
+                dri.requirement_key,
+                dri.document_type_key,
+                dri.process_area,
+                dri.requirement_level,
+                'PENDING',
+                dri.condition_config
+            FROM auditcore.journeys j
+            JOIN auditcore.document_requirement_items dri
+              ON dri.tenant_id = j.tenant_id
+             AND dri.document_requirement_profile_version_id =
+                    j.document_requirement_profile_version_id
+            WHERE j.tenant_id = NEW.tenant_id
+              AND j.journey_id = NEW.journey_id
+              AND upper(dri.process_area) = 'DELIVERY'
+            ON CONFLICT (tenant_id, journey_id, requirement_key) DO NOTHING;
+
+            RETURN NEW;
+        END;
+        $$
         """
     )
