@@ -145,7 +145,11 @@ def _minimum_amount_on(
         return None, "No published Minimum Booking Amount master is effective on the receipt date."
 
     latest_from = max(row["effective_from"] for row in active)
-    version_ids = {row["discount_policy_version_id"] for row in active if row["effective_from"] == latest_from}
+    version_ids = {
+        row["discount_policy_version_id"]
+        for row in active
+        if row["effective_from"] == latest_from
+    }
     if len(version_ids) != 1:
         return None, "Multiple published Minimum Booking Amount master versions share the applicable WEF."
     version_id = next(iter(version_ids))
@@ -159,7 +163,9 @@ def _minimum_amount_on(
     if not candidates:
         return None, "The effective master has no applicable Minimum Booking Amount parameter."
 
-    best_priority = max(_SCOPE_PRIORITY.get(str(row["scope_type"]).upper(), 0) for row in candidates)
+    best_priority = max(
+        _SCOPE_PRIORITY.get(str(row["scope_type"]).upper(), 0) for row in candidates
+    )
     winners = [
         row
         for row in candidates
@@ -179,7 +185,10 @@ def derive_booking_confirmation_date(
     *,
     identity: ProductIdentity | None,
 ) -> tuple[date | None, Decimal | None, Decimal, AuditIssue | None]:
-    verified = sorted(receipts, key=lambda item: (item.receipt_date or date.max, str(item.payment_id)))
+    verified = sorted(
+        receipts,
+        key=lambda item: (item.receipt_date or date.max, str(item.payment_id)),
+    )
     if any(item.receipt_date is None for item in verified):
         return None, None, Decimal("0"), AuditIssue(
             rule_key="BK_PAYMENT_RECEIPT_DATE_MISSING",
@@ -251,7 +260,9 @@ def enqueue_booking_audit(
             "event_type": _AUDIT_EVENT_TYPE,
             "aggregate_id": str(journey_id),
             "journey_id": journey_id,
-            "payload": json.dumps({"journeyId": str(journey_id), "reviewVersion": review_version}),
+            "payload": json.dumps(
+                {"journeyId": str(journey_id), "reviewVersion": review_version}
+            ),
             "correlation_id": correlation_id,
             "actor_id": actor_id,
         },
@@ -266,13 +277,18 @@ def enqueue_booking_audit(
     return event_id
 
 
-def _load_context(connection: Connection, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
+def _load_context(
+    connection: Connection,
+    tenant_id: str,
+    journey_id: UUID,
+) -> dict[str, Any] | None:
     row = connection.execute(
         text(
             """
             SELECT b.booking_id, b.booking_date, b.booking_confirmation_date,
                    b.created_at_utc AS booking_created_at_utc,
                    j.customer_id, j.price_list_version_id,
+                   p.oem_id,
                    c.display_name AS customer_name,
                    jp.product_sku_id, jp.product_master_version_id,
                    jp.model_code_snapshot, jp.model_name_snapshot,
@@ -282,6 +298,7 @@ def _load_context(connection: Connection, tenant_id: str, journey_id: UUID) -> d
             FROM auditcore.bookings b
             JOIN auditcore.journeys j
               ON j.tenant_id=b.tenant_id AND j.journey_id=b.journey_id
+            JOIN auditcore.projects p ON p.tenant_id=b.tenant_id
             JOIN auditcore.customers c
               ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
             LEFT JOIN auditcore.journey_products jp
@@ -307,7 +324,10 @@ def _load_product_identity(
         return None, AuditIssue(
             rule_key="BK_SKU_NOT_FOUND",
             title="Model/SKU not identified from Booking documents",
-            description="Reviewed Booking documents do not contain enough Model/Variant information for deterministic master resolution.",
+            description=(
+                "Reviewed Booking documents do not contain enough Model/Variant information "
+                "for deterministic master resolution."
+            ),
         )
 
     rows = connection.execute(
@@ -317,7 +337,8 @@ def _load_product_identity(
                             v.variant_id, v.variant_code, v.variant_name
             FROM auditcore.product_models m
             JOIN auditcore.product_variants v ON v.model_id=m.model_id
-            WHERE m.is_active=true AND v.is_active=true
+            WHERE m.oem_id=:oem_id
+              AND m.is_active=true AND v.is_active=true
               AND (
                     (:model_code IS NOT NULL AND upper(m.model_code)=upper(:model_code))
                     OR (:model_code IS NULL AND :model_name IS NOT NULL
@@ -331,6 +352,7 @@ def _load_product_identity(
             """
         ),
         {
+            "oem_id": context["oem_id"],
             "model_code": model_code,
             "model_name": model_name,
             "variant_code": variant_code,
@@ -341,9 +363,7 @@ def _load_product_identity(
         return None, AuditIssue(
             rule_key="BK_SKU_AMBIGUOUS" if rows else "BK_SKU_NOT_FOUND",
             title="Model/SKU could not be uniquely identified from Booking documents",
-            description=(
-                _SKU_AMBIGUOUS_REMARK if rows else _SKU_NOT_FOUND_REMARK
-            ),
+            description=_SKU_AMBIGUOUS_REMARK if rows else _SKU_NOT_FOUND_REMARK,
         )
     row = rows[0]
     return ProductIdentity(
@@ -357,7 +377,10 @@ def _load_product_identity(
     ), None
 
 
-def _load_minimum_booking_policy(connection: Connection, tenant_id: str) -> list[dict[str, Any]]:
+def _load_minimum_booking_policy(
+    connection: Connection,
+    tenant_id: str,
+) -> list[dict[str, Any]]:
     rows = connection.execute(
         text(
             """
@@ -379,7 +402,11 @@ def _load_minimum_booking_policy(connection: Connection, tenant_id: str) -> list
     return [dict(row) for row in rows]
 
 
-def _load_verified_receipts(connection: Connection, tenant_id: str, journey_id: UUID) -> list[Receipt]:
+def _load_verified_receipts(
+    connection: Connection,
+    tenant_id: str,
+    journey_id: UUID,
+) -> list[Receipt]:
     rows = connection.execute(
         text(
             """
@@ -398,7 +425,21 @@ def _load_verified_receipts(connection: Connection, tenant_id: str, journey_id: 
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
-    return [Receipt(row["payment_id"], Decimal(row["amount"]), row["receipt_date"]) for row in rows]
+    return [
+        Receipt(row["payment_id"], Decimal(row["amount"]), row["receipt_date"])
+        for row in rows
+    ]
+
+
+def _resolution_from_identity_issue(issue: AuditIssue) -> SkuResolution:
+    ambiguous = issue.rule_key == "BK_SKU_AMBIGUOUS"
+    return SkuResolution(
+        "MULTIPLE_MATCH" if ambiguous else "NOT_FOUND",
+        None,
+        None,
+        _SKU_AMBIGUOUS_REMARK if ambiguous else _SKU_NOT_FOUND_REMARK,
+        issue,
+    )
 
 
 def _resolve_sku(
@@ -406,19 +447,12 @@ def _resolve_sku(
     *,
     tenant_id: str,
     confirmation_date: date | None,
-    identity: ProductIdentity | None,
+    identity: ProductIdentity,
     colour_code: str | None,
     colour_name: str | None,
 ) -> SkuResolution:
     if confirmation_date is None:
         return SkuResolution("PENDING_CONFIRMATION", None, None, None, None)
-    if identity is None:
-        issue = AuditIssue(
-            rule_key="BK_SKU_NOT_FOUND",
-            title="Model/SKU not identified from Booking documents",
-            description=_SKU_NOT_FOUND_REMARK,
-        )
-        return SkuResolution("NOT_FOUND", None, None, _SKU_NOT_FOUND_REMARK, issue)
     try:
         version_id = resolve_effective_project_product_master_version(
             connection,
@@ -430,9 +464,18 @@ def _resolve_sku(
         issue = AuditIssue(
             rule_key="BK_SKU_NOT_FOUND",
             title="Applicable Product Master unavailable",
-            description="No unique published Product Master could be resolved for the confirmed Booking date.",
+            description=(
+                "No unique published Product Master could be resolved for the confirmed "
+                "Booking date."
+            ),
         )
-        return SkuResolution("MASTER_UNAVAILABLE", None, None, _SKU_NOT_FOUND_REMARK, issue)
+        return SkuResolution(
+            "MASTER_UNAVAILABLE",
+            None,
+            None,
+            _SKU_NOT_FOUND_REMARK,
+            issue,
+        )
 
     rows = connection.execute(
         text(
@@ -469,13 +512,25 @@ def _resolve_sku(
             title="Model/SKU could not be uniquely identified from Booking documents",
             description=_SKU_AMBIGUOUS_REMARK,
         )
-        return SkuResolution("MULTIPLE_MATCH", None, version_id, _SKU_AMBIGUOUS_REMARK, issue)
+        return SkuResolution(
+            "MULTIPLE_MATCH",
+            None,
+            version_id,
+            _SKU_AMBIGUOUS_REMARK,
+            issue,
+        )
     issue = AuditIssue(
         rule_key="BK_SKU_NOT_FOUND",
         title="Model/SKU not identified from Booking documents",
         description=_SKU_NOT_FOUND_REMARK,
     )
-    return SkuResolution("NOT_FOUND", None, version_id, _SKU_NOT_FOUND_REMARK, issue)
+    return SkuResolution(
+        "NOT_FOUND",
+        None,
+        version_id,
+        _SKU_NOT_FOUND_REMARK,
+        issue,
+    )
 
 
 def _persist_derived_fields(
@@ -484,27 +539,27 @@ def _persist_derived_fields(
     tenant_id: str,
     journey_id: UUID,
     confirmation_date: date | None,
+    confirmation_is_determinate: bool,
     sku: SkuResolution,
 ) -> None:
-    connection.execute(
-        text(
-            """
-            UPDATE auditcore.bookings
-            SET booking_confirmation_date=:confirmation_date,
-                updated_at_utc=CASE
-                    WHEN booking_confirmation_date IS DISTINCT FROM :confirmation_date THEN now()
-                    ELSE updated_at_utc
-                END,
-                version_no=CASE
-                    WHEN booking_confirmation_date IS DISTINCT FROM :confirmation_date THEN version_no + 1
-                    ELSE version_no
-                END
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND booking_confirmation_date IS DISTINCT FROM :confirmation_date
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id, "confirmation_date": confirmation_date},
-    )
+    if confirmation_is_determinate:
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.bookings
+                SET booking_confirmation_date=:confirmation_date,
+                    updated_at_utc=now(),
+                    version_no=version_no+1
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND booking_confirmation_date IS DISTINCT FROM :confirmation_date
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "confirmation_date": confirmation_date,
+            },
+        )
     if sku.status == "PENDING_CONFIRMATION":
         return
     connection.execute(
@@ -548,7 +603,10 @@ def _price_issue(
         return AuditIssue(
             rule_key="BK_PRICE_MASTER_UNAVAILABLE",
             title="Price Master unavailable",
-            description="The Booking has no Price List identity from which an effective Price Master can be resolved.",
+            description=(
+                "The Booking has no Price List identity from which an effective Price Master "
+                "can be resolved."
+            ),
         )
     price_list_id = connection.execute(
         text(
@@ -578,7 +636,11 @@ def _price_issue(
             ORDER BY effective_from DESC, version_no DESC
             """
         ),
-        {"tenant_id": tenant_id, "price_list_id": price_list_id, "effective_on": confirmation_date},
+        {
+            "tenant_id": tenant_id,
+            "price_list_id": price_list_id,
+            "effective_on": confirmation_date,
+        },
     ).mappings().all()
     if not versions:
         return AuditIssue(
@@ -623,19 +685,27 @@ def _price_issue(
             mismatches.append(f"{row['component_key']}: no matching master price")
         elif Decimal(row["actual_amount"]) != Decimal(row["standard_amount"]):
             mismatches.append(
-                f"{row['component_key']}: booking={row['actual_amount']}, master={row['standard_amount']}"
+                f"{row['component_key']}: booking={row['actual_amount']}, "
+                f"master={row['standard_amount']}"
             )
     if not mismatches:
         return None
     return AuditIssue(
         rule_key="BK_PRICE_MASTER_MISMATCH",
         title="Booking cost differs from Price Master",
-        description="One or more reviewed Booking cost components differ from the applicable SKU Price Master.",
+        description=(
+            "One or more reviewed Booking cost components differ from the applicable SKU "
+            "Price Master."
+        ),
         observed_summary="; ".join(mismatches)[:4000],
     )
 
 
-def _name_issue(connection: Connection, tenant_id: str, journey_id: UUID) -> AuditIssue | None:
+def _name_issue(
+    connection: Connection,
+    tenant_id: str,
+    journey_id: UUID,
+) -> AuditIssue | None:
     rows = connection.execute(
         text(
             """
@@ -656,7 +726,11 @@ def _name_issue(connection: Connection, tenant_id: str, journey_id: UUID) -> Aud
         source = str(row["source_document_type_key"] or row["field_key"])
         if source in latest_by_source:
             continue
-        raw = row["accepted_value"] if row["accepted_value"] is not None else row["proposed_value"]
+        raw = (
+            row["accepted_value"]
+            if row["accepted_value"] is not None
+            else row["proposed_value"]
+        )
         value = _json_value(raw)
         if isinstance(value, str) and value.strip():
             latest_by_source[source] = value.strip()
@@ -664,14 +738,21 @@ def _name_issue(connection: Connection, tenant_id: str, journey_id: UUID) -> Aud
     if len(names) < 2:
         return None
     baseline_source, baseline = names[0]
-    mismatched = [source for source, value in names[1:] if not names_logically_equal(baseline, value)]
+    mismatched = [
+        source
+        for source, value in names[1:]
+        if not names_logically_equal(baseline, value)
+    ]
     if not mismatched:
         return None
     sources = ", ".join([baseline_source, *mismatched])
     return AuditIssue(
         rule_key="BK_CUSTOMER_NAME_CROSS_DOCUMENT",
         title="Customer name is inconsistent across Booking documents",
-        description="Reviewed customer names are not logically consistent across the available Booking identity documents.",
+        description=(
+            "Reviewed customer names are not logically consistent across the available "
+            "Booking identity documents."
+        ),
         observed_summary=f"Mismatch across sources: {sources}",
     )
 
@@ -697,13 +778,13 @@ def _duplicate_issue_and_link(
                   ON i.tenant_id=:tenant_id
                  AND i.identity_type=ck.identity_type
                  AND i.match_hash=ck.match_hash
-                 AND i.customer_id<>:customer_id
                 JOIN auditcore.journeys j
                   ON j.tenant_id=i.tenant_id AND j.customer_id=i.customer_id
                 JOIN auditcore.bookings b
                   ON b.tenant_id=j.tenant_id AND b.journey_id=j.journey_id
                 LEFT JOIN auditcore.deliveries d
                   ON d.tenant_id=j.tenant_id AND d.journey_id=j.journey_id
+                WHERE b.booking_id<>:current_booking_id
                 UNION ALL
                 SELECT b.booking_id, b.created_at_utc, 'CUSTOMER_NAME' AS reason,
                        d.actual_delivery_status_code, d.actual_delivered_at
@@ -714,8 +795,9 @@ def _duplicate_issue_and_link(
                   ON b.tenant_id=j.tenant_id AND b.journey_id=j.journey_id
                 LEFT JOIN auditcore.deliveries d
                   ON d.tenant_id=j.tenant_id AND d.journey_id=j.journey_id
-                WHERE c.tenant_id=:tenant_id AND c.customer_id<>:customer_id
-                  AND lower(trim(c.display_name))=lower(trim(:customer_name))
+                WHERE c.tenant_id=:tenant_id
+                  AND b.booking_id<>:current_booking_id
+                  AND lower(btrim(c.display_name))=lower(btrim(:customer_name))
             )
             SELECT booking_id, min(created_at_utc) AS created_at_utc,
                    array_agg(DISTINCT reason ORDER BY reason) AS reasons,
@@ -729,6 +811,7 @@ def _duplicate_issue_and_link(
         {
             "tenant_id": tenant_id,
             "customer_id": context["customer_id"],
+            "current_booking_id": context["booking_id"],
             "customer_name": context["customer_name"],
         },
     ).mappings().all()
@@ -736,10 +819,17 @@ def _duplicate_issue_and_link(
         return None, False
 
     current = (context["booking_created_at_utc"], str(context["booking_id"]))
-    candidates = [row for row in rows if (row["created_at_utc"], str(row["booking_id"])) < current]
+    candidates = [
+        row
+        for row in rows
+        if (row["created_at_utc"], str(row["booking_id"])) < current
+    ]
     if not candidates:
         return None, False
-    original = min(candidates, key=lambda row: (row["created_at_utc"], str(row["booking_id"])))
+    original = min(
+        candidates,
+        key=lambda row: (row["created_at_utc"], str(row["booking_id"])),
+    )
     reasons = list(original["reasons"] or [])
     connection.execute(
         text(
@@ -771,7 +861,10 @@ def _duplicate_issue_and_link(
     return AuditIssue(
         rule_key="BK_DUPLICATE_BOOKING",
         title="Duplicate Booking detected",
-        description="The current Booking is later than an existing matching Booking and is therefore treated as the duplicate by default.",
+        description=(
+            "The current Booking is later than an existing matching Booking and is therefore "
+            "treated as the duplicate by default."
+        ),
         observed_summary=(
             f"Original booking={original['booking_id']}; match reasons={','.join(reasons)}; "
             f"original delivery={delivery_text}"
@@ -900,7 +993,9 @@ def _persist_issues(
                 "tenant_id": tenant_id,
                 "finding_id": finding_id,
                 "journey_id": journey_id,
-                "safe_payload": json.dumps({"originKind": "MACHINE", "ruleKey": issue.rule_key}),
+                "safe_payload": json.dumps(
+                    {"originKind": "MACHINE", "ruleKey": issue.rule_key}
+                ),
                 "correlation_id": correlation_id,
             }
             for finding_id, issue in rows
@@ -909,7 +1004,11 @@ def _persist_issues(
     return len(rows)
 
 
-def _claim_outbox_event(connection: Connection, tenant_id: str, event_id: UUID) -> dict[str, Any] | None:
+def _claim_outbox_event(
+    connection: Connection,
+    tenant_id: str,
+    event_id: UUID,
+) -> dict[str, Any] | None:
     row = connection.execute(
         text(
             """
@@ -920,12 +1019,20 @@ def _claim_outbox_event(connection: Connection, tenant_id: str, event_id: UUID) 
             RETURNING journey_id, event_payload, correlation_id, attempt_count
             """
         ),
-        {"tenant_id": tenant_id, "event_id": event_id, "event_type": _AUDIT_EVENT_TYPE},
+        {
+            "tenant_id": tenant_id,
+            "event_id": event_id,
+            "event_type": _AUDIT_EVENT_TYPE,
+        },
     ).mappings().one_or_none()
     return dict(row) if row is not None else None
 
 
-def process_booking_audit_event(engine: Engine, tenant_id: str, outbox_event_id: UUID) -> None:
+def process_booking_audit_event(
+    engine: Engine,
+    tenant_id: str,
+    outbox_event_id: UUID,
+) -> None:
     """FastAPI background task: one claimed outbox event, one compact rule run, no polling loop."""
     started = time.monotonic()
     journey_id: UUID | None = None
@@ -957,30 +1064,42 @@ def process_booking_audit_event(engine: Engine, tenant_id: str, outbox_event_id:
                 policy_rows,
                 identity=identity,
             )
-            sku = _resolve_sku(
-                connection,
-                tenant_id=tenant_id,
-                confirmation_date=confirmation_date,
-                identity=identity,
-                colour_code=context.get("colour_code_snapshot"),
-                colour_name=context.get("colour_name_snapshot"),
+            if identity is None:
+                sku = _resolution_from_identity_issue(
+                    identity_issue
+                    or AuditIssue(
+                        rule_key="BK_SKU_NOT_FOUND",
+                        title="Model/SKU not identified from Booking documents",
+                        description=_SKU_NOT_FOUND_REMARK,
+                    )
+                )
+            else:
+                sku = _resolve_sku(
+                    connection,
+                    tenant_id=tenant_id,
+                    confirmation_date=confirmation_date,
+                    identity=identity,
+                    colour_code=context.get("colour_code_snapshot"),
+                    colour_name=context.get("colour_name_snapshot"),
+                )
+            confirmation_is_determinate = (
+                confirmation_issue is None
+                or confirmation_issue.rule_key == "BK_MINIMUM_BOOKING_AMOUNT_NOT_MET"
             )
             _persist_derived_fields(
                 connection,
                 tenant_id=tenant_id,
                 journey_id=journey_id,
                 confirmation_date=confirmation_date,
+                confirmation_is_determinate=confirmation_is_determinate,
                 sku=sku,
             )
 
             issues: list[AuditIssue] = []
             if confirmation_issue is not None:
                 issues.append(confirmation_issue)
-            # Do not double-flag the same unresolved product condition.
             if sku.issue is not None:
                 issues.append(sku.issue)
-            elif identity_issue is not None:
-                issues.append(identity_issue)
 
             price_issue = _price_issue(
                 connection,
@@ -1028,7 +1147,9 @@ def process_booking_audit_event(engine: Engine, tenant_id: str, outbox_event_id:
                 tenant_id=tenant_id,
                 journey_id=str(journey_id),
                 outbox_event_id=str(outbox_event_id),
-                booking_confirmation_date=(confirmation_date.isoformat() if confirmation_date else None),
+                booking_confirmation_date=(
+                    confirmation_date.isoformat() if confirmation_date else None
+                ),
                 sku_resolution_status=sku.status,
                 issue_count=len(issues_by_rule),
                 flags_created=created,
@@ -1051,10 +1172,14 @@ def process_booking_audit_event(engine: Engine, tenant_id: str, outbox_event_id:
                         """
                         UPDATE auditcore.outbox_events
                         SET event_status='FAILED',
+                            attempt_count=CASE
+                                WHEN event_status='PENDING' THEN attempt_count+1
+                                ELSE attempt_count
+                            END,
                             last_error_code='BOOKING_AUDIT_FAILED',
                             last_error_summary=:summary
                         WHERE tenant_id=:tenant_id AND outbox_event_id=:event_id
-                          AND event_status='PUBLISHING'
+                          AND event_status IN ('PENDING','PUBLISHING')
                         """
                     ),
                     {
