@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Request, Response
+from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel
 from sqlalchemy import Connection, Engine, text
 
@@ -12,8 +12,6 @@ from audit_core.di_capture_v2_client import DiCaptureV2Client, DiCaptureV2Error
 from audit_core.di_client import DiClient, DiClientError
 from audit_core.errors import ConflictError, DependencyUnavailableError, NotFoundError
 from audit_core.evidence import get_di_client, get_security_oauth_client
-from audit_core.idempotency import execute_idempotent_json_command
-from audit_core.observability import get_correlation_id
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
@@ -27,16 +25,7 @@ from audit_core.uc03_attribute_mapping import (
     spec_for_field,
     specs_for_stage,
 )
-from audit_core.uc03_attribute_resolution import (
-    apply_supported_operational_attribute,
-    record_attribute_resolution,
-)
 from audit_core.uc03_booking_capture import _scope
-from audit_core.uc03_booking_commands import (
-    _aggregate_lock,
-    _append_workflow_event,
-    _parse_if_match,
-)
 from audit_core.uc03_document_capture_v2 import (
     _base_requirements,
     _declarations,
@@ -145,16 +134,6 @@ class BookingReviewV2Response(BaseModel):
     unmappedFields: list[ReviewV2UnmappedField]
     documents: list[ReviewV2Document]
     missingDeclarations: list[ReviewV2MissingDeclaration]
-
-
-class BookingReviewV2ConfirmResponse(BaseModel):
-    journeyId: UUID
-    pcVerificationStatus: Literal["VERIFIED"] = "VERIFIED"
-    aggregateVersion: int
-    resolvedAttributeCount: int
-    appliedAttributes: list[str]
-    reviewOnlyAttributes: list[str]
-    conflictAttributes: list[str]
 
 
 class AuditSourceComparisonV2Response(BaseModel):
@@ -761,194 +740,6 @@ def get_booking_review_v2(
             requirements=requirements,
         ),
     )
-
-
-@router.post("/booking/review/confirm", response_model=BookingReviewV2ConfirmResponse)
-def confirm_booking_review_v2(
-    tenant_id: str,
-    journey_id: UUID,
-    request: Request,
-    response: Response,
-    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
-    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
-    connection: Annotated[Connection, Depends(get_connection)],
-    engine: Annotated[Engine, Depends(get_engine)],
-    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
-    di_client: Annotated[DiClient, Depends(get_di_client)],
-    v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
-) -> BookingReviewV2ConfirmResponse:
-    context = _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    expected_version = _parse_if_match(if_match)
-    _, documents, attributes, _ = _booking_review_data(
-        connection=connection,
-        engine=engine,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        security_client=security_client,
-        di_client=di_client,
-        v2_client=v2_client,
-    )
-    if any(document.extractionState == "PENDING" for document in documents):
-        raise ConflictError(
-            error_code="VAC-CONFLICT-011",
-            title="Documents are not ready for review",
-            detail="Document Intelligence is still preparing one or more Booking documents.",
-        )
-    if any(document.extractionState == "FAILED" for document in documents):
-        raise ConflictError(
-            error_code="VAC-CONFLICT-011",
-            title="Document processing requires follow-up",
-            detail="One or more Booking documents failed processing and must be resolved before verification.",
-        )
-
-    correlation_id = get_correlation_id(request)
-
-    def execute() -> dict[str, Any]:
-        _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
-        state = connection.execute(
-            text(
-                """
-                SELECT capture_completed_at_utc, pc_verification_status, version_no
-                FROM auditcore.journey_stage_states
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND stage_code='BOOKING'
-                FOR UPDATE
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).mappings().one_or_none()
-        if state is None or state["capture_completed_at_utc"] is None:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-010",
-                title="Booking capture has not been submitted",
-                detail="Submit Booking before completing Review.",
-            )
-        if int(state["version_no"]) != expected_version:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-005",
-                title="Booking version conflict",
-                detail="Booking changed since Review was loaded. Refresh Review and try again.",
-            )
-        if str(state["pc_verification_status"] or "PENDING") != "PENDING":
-            raise ConflictError(
-                error_code="VAC-CONFLICT-010",
-                title="Booking Review is not pending",
-                detail="This Booking Review has already been completed.",
-            )
-
-        applied: list[str] = []
-        review_only: list[str] = []
-        conflicts: list[str] = []
-        resolved_count = 0
-        for attribute in attributes:
-            source = attribute.resolvedSource
-            if source is None or attribute.resolvedValue is None:
-                continue
-            spec = spec_for_field(source.fieldKey)
-            if spec is None or spec.attribute_key != attribute.attributeKey:
-                continue
-            resolved_count += 1
-            application = apply_supported_operational_attribute(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                spec=spec,
-                value=attribute.resolvedValue,
-                actor_id=human_principal.subject,
-                source_document_type_key=source.documentTypeKey,
-                source_field_key=source.fieldKey,
-                source_evidence_id=source.evidenceId,
-            )
-            owning_domain_key: str | None = None
-            owning_record_reference: str | None = None
-            if application is None:
-                review_only.append(attribute.attributeKey)
-            else:
-                owning_domain_key, owning_record_reference, application_status = application
-                applied.append(attribute.attributeKey)
-                if application_status == "CONFLICT":
-                    conflicts.append(attribute.attributeKey)
-
-            if spec.mapping_status == "SUPPORTED":
-                record_attribute_resolution(
-                    connection,
-                    tenant_id=tenant_id,
-                    journey_id=journey_id,
-                    stage_code="BOOKING",
-                    spec=spec,
-                    source_di_document_id=source.documentId,
-                    source_evidence_id=source.evidenceId,
-                    source_canonical_field_id=source.canonicalFieldId,
-                    source_field_key=source.fieldKey,
-                    source_fact_version=source.sourceFactVersion,
-                    source_document_type_key=source.documentTypeKey,
-                    actor_id=human_principal.subject,
-                    owning_domain_key=owning_domain_key,
-                    owning_record_reference=owning_record_reference,
-                )
-
-        next_version = expected_version + 1
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.journey_stage_states
-                SET pc_verification_status='VERIFIED',
-                    latest_activity_at_utc=now(),
-                    updated_at_utc=now(),
-                    version_no=:version
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND stage_code='BOOKING'
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id, "version": next_version},
-        )
-        _append_workflow_event(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            event_type="PC_BOOKING_ATTRIBUTE_REVIEW_CONFIRMED",
-            source_kind="HUMAN",
-            actor_id=human_principal.subject,
-            actor_role_snapshot=context["operating_role"],
-            idempotency_key=f"{idempotency_key}:review-confirmed",
-            correlation_id=correlation_id,
-            safe_payload={
-                "resolvedAttributeCount": resolved_count,
-                "appliedAttributeKeys": sorted(applied),
-                "reviewOnlyAttributeKeys": sorted(review_only),
-                "conflictAttributeKeys": sorted(conflicts),
-                "rawDiValuesCopied": False,
-            },
-            aggregate_version=next_version,
-        )
-        return {
-            "journeyId": str(journey_id),
-            "pcVerificationStatus": "VERIFIED",
-            "aggregateVersion": next_version,
-            "resolvedAttributeCount": resolved_count,
-            "appliedAttributes": sorted(applied),
-            "reviewOnlyAttributes": sorted(review_only),
-            "conflictAttributes": sorted(conflicts),
-        }
-
-    body, _ = execute_idempotent_json_command(
-        connection,
-        tenant_id=tenant_id,
-        operation_key=f"uc03.booking.attribute-review.confirm:{journey_id}",
-        idempotency_key=idempotency_key,
-        request_payload={"expectedVersion": expected_version},
-        execute=execute,
-    )
-    response.headers["ETag"] = f'"{body["aggregateVersion"]}"'
-    return BookingReviewV2ConfirmResponse.model_validate(body)
 
 
 @router.get("/audit/source-comparison", response_model=AuditSourceComparisonV2Response)
