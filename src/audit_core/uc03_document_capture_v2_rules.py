@@ -8,6 +8,7 @@ from audit_core import uc03_document_capture_v2 as capture_v2
 _GST_CONDITION = "gstApplicable"
 _CORPORATE_CONDITION = "corporateCustomer"
 _EXCLUSIVE_CONDITIONS = {_GST_CONDITION, _CORPORATE_CONDITION}
+_IDENTITY_MARKERS = ("PAN", "AADHAAR", "AADHAR")
 
 
 def _condition_is_active(response: capture_v2.BookingCaptureV2Response, condition_key: str) -> bool:
@@ -69,6 +70,63 @@ def _apply_gst_corporate_exclusivity(
     return response
 
 
+def _is_identity_requirement(requirement: capture_v2.CaptureV2Requirement) -> bool:
+    searchable = f"{requirement.documentTypeKey} {requirement.label}".upper()
+    return any(marker in searchable for marker in _IDENTITY_MARKERS)
+
+
+def _apply_identity_document_choice(
+    response: capture_v2.BookingCaptureV2Response,
+) -> capture_v2.BookingCaptureV2Response:
+    """Treat PAN and Aadhaar as one mandatory identity-document choice.
+
+    The Booking requires one supported identity document, not both. Existing project
+    requirement rows remain intact for evidence lineage; this rule changes only the
+    continuation gate. If either PAN or Aadhaar is classified, the alternative no
+    longer blocks. If neither is available and both are configured as required, only
+    one representative requirement blocks so the UI can present one business action.
+    """
+
+    identity_requirements = [
+        requirement
+        for requirement in response.requirements
+        if _is_identity_requirement(requirement)
+    ]
+    if len(identity_requirements) < 2:
+        return response
+
+    required_identity = [
+        requirement
+        for requirement in identity_requirements
+        if requirement.requirementLevel.upper() == "REQUIRED"
+    ]
+    if not required_identity:
+        return response
+
+    identity_present = any(
+        requirement.document is not None and requirement.state == "UPLOADED"
+        for requirement in identity_requirements
+    )
+    if identity_present:
+        for requirement in required_identity:
+            requirement.blocksContinue = False
+    else:
+        for index, requirement in enumerate(required_identity):
+            requirement.blocksContinue = index == 0
+
+    response.canContinue = not any(
+        requirement.blocksContinue for requirement in response.requirements
+    )
+    return response
+
+
+def _apply_capture_business_rules(
+    response: capture_v2.BookingCaptureV2Response,
+) -> capture_v2.BookingCaptureV2Response:
+    response = _apply_gst_corporate_exclusivity(response)
+    return _apply_identity_document_choice(response)
+
+
 def install_uc03_v2_capture_business_rules() -> None:
     """Install additive V2-only capture/review rules without changing V1 behavior."""
 
@@ -85,7 +143,7 @@ def install_uc03_v2_capture_business_rules() -> None:
     )
 
     def wrapped(*args: Any, **kwargs: Any) -> capture_v2.BookingCaptureV2Response:
-        return _apply_gst_corporate_exclusivity(original(*args, **kwargs))
+        return _apply_capture_business_rules(original(*args, **kwargs))
 
     capture_v2._build_capture_response = wrapped  # type: ignore[assignment]
     capture_v2._gst_corporate_exclusivity_installed = True
