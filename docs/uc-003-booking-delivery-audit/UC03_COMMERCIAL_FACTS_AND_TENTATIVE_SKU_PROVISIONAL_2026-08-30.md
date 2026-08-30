@@ -8,7 +8,7 @@ Status: **PROVISIONAL — discussion/design checkpoint, not a final TL/PM view d
 This note preserves the decisions made while fixing two immediate UC03 gaps:
 
 1. commercial facts extracted from documents must not be discarded before Audit can use them; and
-2. Audit Core should resolve a Product SKU directly from Booking Form evidence when the evidence uniquely identifies one master row, while retaining tentative candidates only when the Booking evidence remains ambiguous.
+2. Audit Core should resolve a Product SKU directly from Booking Form evidence only when that evidence maps exactly to the effective masters, while retaining tentative candidates only when more than one exact master row remains.
 
 The wider Review/TL/PM experience, Deal Integrity views, notification presentation, and Delivery validation workflow are **not finalized by this note**.
 
@@ -62,7 +62,7 @@ This does **not** make unrelated identity or personal fields authoritative.
 
 ## 5. Resolution hierarchy
 
-The service must apply the following hierarchy before fuzzy ranking.
+There is **no price tolerance and no fuzzy fallback**.
 
 ### A. Explicit SKU code from Booking Form
 
@@ -75,33 +75,42 @@ If DI extracted an explicit `sku_code` and it maps to exactly one active/effecti
 
 Selection method: `BOOKING_DIRECT_SKU_V1`.
 
-### B. Unique model + price mapping
+If the same explicit SKU code maps to more than one effective master row, treat that as a Product Master configuration conflict rather than choosing arbitrarily.
 
-When no explicit SKU code resolves the product, Audit Core compares the Booking Form model and Booking total against effective Product/Price masters.
+### B. Exact model + exact commercial total
 
-A row is eligible for direct Booking resolution only when:
+When no explicit SKU code resolves the product, Audit Core compares the Booking Form against the effective Product/Price masters.
 
-- the normalized Booking model exactly matches the master model; and
-- the effective master commercial total is within the strict Booking-price tolerance.
+A master row is eligible only when:
 
-Variant and colour, when present in Booking evidence, are deterministic narrowing signals. If these Booking facts leave **exactly one** master row:
+- the Booking model is an exact **format-normalized** match to the master model; and
+- the summed effective master commercial total is **numerically identical** to the Booking Form total commercial amount.
+
+Format normalization may ignore case, punctuation and spacing only. For example `XUV 700` and `XUV700` are treated as the same label. Semantic/fuzzy substitutions are not allowed.
+
+The commercial amount has **zero tolerance**. A difference of even ₹1 means the row is not an exact match.
+
+Variant and colour, when explicitly available in Booking evidence, may narrow an already exact model/price set. They do not expand the match set.
+
+If these facts leave **exactly one** master row:
 
 - store that SKU as `CONFIRMED` for Booking resolution;
 - do **not** show `*`; and
 - validate it later against Delivery Invoice evidence.
 
-Selection method: `BOOKING_MODEL_PRICE_UNIQUE_V1`.
+Selection method: `BOOKING_MODEL_PRICE_EXACT_V1`.
 
-### C. Multiple matching master rows
+### C. Multiple exact matching master rows
 
-If the Booking evidence leaves more than one matching SKU row, the result is ambiguous.
+If exact Booking model + exact Booking commercial total still leave more than one SKU row, the result is genuinely ambiguous.
 
-Audit Core ranks those matching rows and:
+Audit Core:
 
-- returns the shortlist;
-- persists only the most likely row in `journey_products`;
+- returns only those exact matching rows;
+- may use exact variant/colour evidence to order or narrow them;
+- persists only the most likely exact row in `journey_products`;
 - sets `selection_status = TENTATIVE`;
-- sets `selection_method = BOOKING_MODEL_PRICE_MULTI_V1`; and
+- sets `selection_method = BOOKING_MODEL_PRICE_MULTI_EXACT_V1`; and
 - displays the tentative SKU with `*`.
 
 Example:
@@ -110,13 +119,18 @@ Example:
 
 with:
 
-`* Tentative — multiple Booking matches; confirmation required`
+`* Tentative — multiple exact Booking matches; confirmation required`
 
-### D. No strict Booking match
+### D. No exact master match
 
-If no row meets the strict model/price rule, Audit Core may use deterministic fuzzy ranking across the bounded effective SKU set. Any result produced only by this fallback remains `TENTATIVE`; it is never silently promoted to confirmed.
+If there is no explicit SKU match and no exact model + exact commercial-total match:
 
-If no candidate crosses the reliability floor, no SKU is written.
+- do **not** select the nearest price;
+- do **not** fuzzy-match model or variant;
+- do **not** write a tentative SKU;
+- raise the domain validation flag/error **`Model not found in masters`** (`VAC-SKU-001`).
+
+This deliberately exposes master/evidence mismatch instead of hiding it behind an inferred SKU.
 
 ## 6. Processing design
 
@@ -130,22 +144,21 @@ Audit Core uses the Booking business date and Project context to read only:
 
 Price components for each SKU are summed into a comparable master commercial total.
 
-### Stage B — deterministic Booking resolution
+### Stage B — deterministic exact resolution
 
-Before fuzzy scoring, the script attempts deterministic resolution in this order:
+Python performs only deterministic comparison:
 
-1. exact explicit Booking SKU code;
-2. exact normalized Booking model + close Booking price;
-3. optional variant narrowing;
-4. optional colour narrowing.
+1. exact explicit Booking SKU code, when present;
+2. exact format-normalized Booking model;
+3. exact numeric Booking commercial total;
+4. optional exact variant narrowing;
+5. optional exact colour narrowing.
 
-Only a single remaining row is treated as directly resolved.
+There is no percentage tolerance, rupee tolerance, fuzzy string ranking, LLM, embeddings or vector search in SKU discovery.
 
-### Stage C — deterministic ranking for ambiguity
+### Stage C — ambiguity ordering only
 
-When multiple rows remain, Python ranks the bounded candidate set using explainable model, variant and commercial-proximity signals. This is used to order candidates, not to pretend that ambiguity has disappeared.
-
-The implementation intentionally does **not** use an LLM, embeddings or a vector database.
+Python ranking is permitted only after multiple **exact** master rows have already been found. It exists to present a stable shortlist; it must never introduce a row that failed exact model + exact commercial-total matching.
 
 ## 7. Delivery Invoice validation
 
@@ -162,17 +175,18 @@ These are separate checks and should not be collapsed into one tentative status.
 
 ## 8. Existing confirmed SKU protection
 
-If `journey_products.selection_status = CONFIRMED` already exists, a later Booking inference/resolution call must not replace or downgrade it. Candidate diagnostics may still be returned, but the existing confirmed Journey product remains unchanged.
+If `journey_products.selection_status = CONFIRMED` already exists, a later Booking resolution call must not replace or downgrade it.
 
 ## 9. Important edge cases
 
 1. **Multiple Product Master versions on the same latest effective date for one Segment** — fail with master configuration conflict rather than choose arbitrarily.
-2. **No effective Price List** — fail rather than fabricate a price comparison.
+2. **No effective Price List** — fail rather than fabricate a comparison.
 3. **Currency mismatch** — reject comparison when the Booking currency differs from the effective Price Master currency.
-4. **Unique exact model + close price** — resolve directly; no tentative marker.
-5. **Same model/price across multiple SKU rows** — retain multiple candidates as tentative; variant/colour may narrow only when explicitly present in Booking evidence.
-6. **Price outside strict direct-resolution tolerance** — fuzzy ranking may still suggest candidates, but they remain tentative.
-7. **Existing confirmed product** — never downgrade or replace it.
+4. **Exact model + exact commercial total yields one row** — resolve directly; no tentative marker.
+5. **Exact model + exact commercial total yields multiple rows** — keep only those exact rows as tentative candidates; optional exact variant/colour may narrow them.
+6. **Booking total differs from master by ₹1 or more** — no match; raise `Model not found in masters`.
+7. **Booking model is only semantically/fuzzily similar** — no match; raise `Model not found in masters`.
+8. **Existing confirmed product** — never downgrade or replace it.
 
 ## 10. Deliberately deferred
 
@@ -183,18 +197,18 @@ The following remain outside this provisional note:
 - Deal Integrity/Commercial Integrity view layout;
 - final candidate-confirmation UI for genuinely ambiguous bookings;
 - automatic triggering of SKU resolution from DI completion;
-- persistence of the full candidate-history list;
-- final price tolerance after real project data is available; and
+- persistence of the full candidate-history list; and
 - exact Delivery Invoice mismatch presentation.
 
 ## 11. Current implementation checkpoint
 
-The immediate implementation now covers:
+The immediate implementation covers:
 
 - DI commercial publication;
 - explicit Booking `sku_code` extraction/publication when actually visible;
 - direct SKU mapping when an explicit SKU code uniquely resolves;
-- unique Booking model + price resolution without a tentative marker;
-- tentative shortlist only when multiple/fuzzy matches remain;
+- zero-tolerance exact Booking model + commercial-total resolution;
+- tentative shortlist only when multiple exact matches remain;
+- `Model not found in masters` when there is no exact match;
 - protection of already confirmed Journey products; and
 - later Delivery Invoice validation kept as an independent lifecycle check.

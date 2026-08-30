@@ -1,14 +1,18 @@
 from decimal import Decimal
 from uuid import UUID
 
+import pytest
+
+from audit_core.errors import AuditCoreError
 from audit_core.uc03_sku_candidates import (
     SkuCandidate,
     _commercial_similarity,
+    _exact_booking_matches,
     _exact_direct_sku_matches,
     _label_similarity,
     _persist_sku_selection,
+    _raise_model_not_found,
     _resolved_candidate,
-    _unique_booking_matches,
     rank_sku_candidates,
 )
 
@@ -41,14 +45,14 @@ def _candidate(*, tentative: bool = True) -> SkuCandidate:
         variantName="AX7 L",
         colourName="Red Rage",
         displayLabel="XUV700 AX7 L *" if tentative else "XUV700 AX7 L",
-        masterTotalAmount=Decimal(2510000),
+        masterTotalAmount=Decimal(2500000),
         observedTotalCommercialAmount=Decimal(2500000),
-        commercialDifferenceAmount=Decimal(10000),
-        commercialDifferencePercent=Decimal("0.40"),
-        score=Decimal("0.9967"),
+        commercialDifferenceAmount=Decimal(0),
+        commercialDifferencePercent=Decimal(0),
+        score=Decimal(1),
         modelScore=Decimal(1),
         variantScore=Decimal(1),
-        commercialScore=Decimal("0.9867"),
+        commercialScore=Decimal(1),
         candidateStatus="TENTATIVE" if tentative else "CONFIRMED",
         confirmationRequired=tentative,
     )
@@ -80,16 +84,23 @@ class _FakeConnection:
         return _WriteResult(self.write_rowcount)
 
 
-def test_label_similarity_normalizes_spacing_and_punctuation() -> None:
+def test_label_match_is_format_normalized_but_not_fuzzy() -> None:
     assert _label_similarity("XUV 700", "XUV700") == Decimal(1)
     assert _label_similarity("AX7-L", "AX7 L") == Decimal(1)
+    assert _label_similarity("XUV700", "XUV 700 AX7") == Decimal(0)
 
 
-def test_commercial_similarity_rewards_price_proximity() -> None:
-    near, _, near_pct = _commercial_similarity(Decimal(2500000), Decimal(2510000))
-    far, _, far_pct = _commercial_similarity(Decimal(2500000), Decimal(3000000))
-    assert near > far
-    assert near_pct < far_pct
+def test_commercial_match_has_zero_tolerance() -> None:
+    exact, exact_difference, _ = _commercial_similarity(
+        Decimal(2500000), Decimal(2500000)
+    )
+    near, near_difference, _ = _commercial_similarity(
+        Decimal(2500000), Decimal(2500001)
+    )
+    assert exact == Decimal(1)
+    assert exact_difference == Decimal(0)
+    assert near == Decimal(0)
+    assert near_difference == Decimal(1)
 
 
 def test_explicit_booking_sku_code_maps_directly_to_master_row() -> None:
@@ -116,7 +127,7 @@ def test_explicit_booking_sku_code_maps_directly_to_master_row() -> None:
     assert matches[0]["sku_code"] == "XUV700-AX7L-R"
 
 
-def test_unique_model_price_booking_match_is_resolved_not_tentative() -> None:
+def test_unique_exact_model_and_price_match_is_resolved() -> None:
     rows = [
         _row(
             "00000000-0000-0000-0000-000000000010",
@@ -135,9 +146,9 @@ def test_unique_model_price_booking_match_is_resolved_not_tentative() -> None:
             "Red",
         ),
     ]
-    matches = _unique_booking_matches(
+    matches = _exact_booking_matches(
         rows,
-        model_name="Model X",
+        model_name="Model-X",
         variant_name=None,
         colour_name=None,
         total_commercial_amount=Decimal(1000000),
@@ -156,10 +167,55 @@ def test_unique_model_price_booking_match_is_resolved_not_tentative() -> None:
     assert not candidate.displayLabel.endswith(" *")
 
 
-def test_multiple_model_price_matches_remain_tentative() -> None:
+def test_one_rupee_price_difference_is_not_a_match() -> None:
     rows = [
         _row(
             "00000000-0000-0000-0000-000000000020",
+            "MODEL-X-PRO",
+            "Model X",
+            "Variant Pro",
+            "1000000",
+            "Red",
+        )
+    ]
+    assert (
+        _exact_booking_matches(
+            rows,
+            model_name="Model X",
+            variant_name="Variant Pro",
+            colour_name=None,
+            total_commercial_amount=Decimal(999999),
+        )
+        == []
+    )
+
+
+def test_non_exact_model_is_not_a_match_even_when_price_matches() -> None:
+    rows = [
+        _row(
+            "00000000-0000-0000-0000-000000000030",
+            "XUV700-AX7L",
+            "XUV700",
+            "AX7 L",
+            "2500000",
+        )
+    ]
+    assert (
+        _exact_booking_matches(
+            rows,
+            model_name="XUV700 AX7",
+            variant_name="AX7 L",
+            colour_name=None,
+            total_commercial_amount=Decimal(2500000),
+        )
+        == []
+    )
+
+
+def test_multiple_exact_model_price_matches_remain_tentative() -> None:
+    rows = [
+        _row(
+            "00000000-0000-0000-0000-000000000040",
             "MODEL-X-PRO-R",
             "Model X",
             "Variant Pro",
@@ -167,15 +223,15 @@ def test_multiple_model_price_matches_remain_tentative() -> None:
             "Red",
         ),
         _row(
-            "00000000-0000-0000-0000-000000000021",
+            "00000000-0000-0000-0000-000000000041",
             "MODEL-X-PRO-B",
             "Model X",
             "Variant Pro",
-            "1005000",
+            "1000000",
             "Blue",
         ),
     ]
-    matches = _unique_booking_matches(
+    matches = _exact_booking_matches(
         rows,
         model_name="Model X",
         variant_name="Variant Pro",
@@ -196,12 +252,13 @@ def test_multiple_model_price_matches_remain_tentative() -> None:
     assert all(item.candidateStatus == "TENTATIVE" for item in candidates)
     assert all(item.confirmationRequired is True for item in candidates)
     assert all(item.displayLabel.endswith(" *") for item in candidates)
+    assert all(item.commercialDifferenceAmount == Decimal("0.00") for item in candidates)
 
 
-def test_variant_and_colour_can_narrow_multiple_model_price_rows() -> None:
+def test_variant_and_colour_can_narrow_exact_model_price_rows() -> None:
     rows = [
         _row(
-            "00000000-0000-0000-0000-000000000030",
+            "00000000-0000-0000-0000-000000000050",
             "MODEL-X-PRO-R",
             "Model X",
             "Variant Pro",
@@ -209,7 +266,7 @@ def test_variant_and_colour_can_narrow_multiple_model_price_rows() -> None:
             "Red",
         ),
         _row(
-            "00000000-0000-0000-0000-000000000031",
+            "00000000-0000-0000-0000-000000000051",
             "MODEL-X-BASE-B",
             "Model X",
             "Variant Base",
@@ -217,7 +274,7 @@ def test_variant_and_colour_can_narrow_multiple_model_price_rows() -> None:
             "Blue",
         ),
     ]
-    matches = _unique_booking_matches(
+    matches = _exact_booking_matches(
         rows,
         model_name="Model X",
         variant_name="Variant Pro",
@@ -228,55 +285,16 @@ def test_variant_and_colour_can_narrow_multiple_model_price_rows() -> None:
     assert matches[0]["sku_code"] == "MODEL-X-PRO-R"
 
 
-def test_price_outside_direct_tolerance_falls_back_to_tentative_ranking() -> None:
-    rows = [
-        _row(
-            "00000000-0000-0000-0000-000000000040",
-            "XUV700-AX7L-R",
-            "XUV700",
-            "AX7 L",
-            "2510000",
-            "Red Rage",
+def test_no_exact_match_raises_model_not_found_flag() -> None:
+    with pytest.raises(AuditCoreError) as exc_info:
+        _raise_model_not_found(
+            model_name="XUV700",
+            total_commercial_amount=Decimal(2499999),
         )
-    ]
-    strict = _unique_booking_matches(
-        rows,
-        model_name="XUV700",
-        variant_name="AX7 L",
-        colour_name=None,
-        total_commercial_amount=Decimal(2400000),
-    )
-    assert strict == []
-
-    candidates = rank_sku_candidates(
-        rows,
-        model_name="XUV700",
-        variant_name="AX7 L",
-        total_commercial_amount=Decimal(2400000),
-        max_candidates=5,
-    )
-    assert candidates
-    assert candidates[0].candidateStatus == "TENTATIVE"
-
-
-def test_unrelated_low_score_rows_are_not_returned_as_false_candidates() -> None:
-    rows = [
-        _row(
-            "00000000-0000-0000-0000-000000000050",
-            "UNRELATED",
-            "Completely Different",
-            "Base",
-            "500000",
-        )
-    ]
-    candidates = rank_sku_candidates(
-        rows,
-        model_name="XUV700",
-        variant_name="AX7 L",
-        total_commercial_amount=Decimal(2500000),
-        max_candidates=5,
-    )
-    assert candidates == []
+    error = exc_info.value
+    assert error.error_code == "VAC-SKU-001"
+    assert error.status_code == 422
+    assert error.title == "Model not found in masters"
 
 
 def test_tentative_selection_is_written_as_tentative() -> None:
@@ -287,18 +305,15 @@ def test_tentative_selection_is_written_as_tentative() -> None:
         journey_id=UUID("00000000-0000-0000-0000-000000000099"),
         candidate=_candidate(tentative=True),
         selection_status="TENTATIVE",
-        selection_method="BOOKING_MODEL_PRICE_MULTI_V1",
+        selection_method="BOOKING_MODEL_PRICE_MULTI_EXACT_V1",
     )
     assert updated is True
     assert confirmed_preserved is False
-    assert len(connection.calls) == 2
-    sql, params = connection.calls[1]
-    assert "selection_status=EXCLUDED.selection_status" in sql
+    _, params = connection.calls[1]
     assert params["selection_status"] == "TENTATIVE"
-    assert params["selection_method"] == "BOOKING_MODEL_PRICE_MULTI_V1"
 
 
-def test_unique_booking_selection_is_written_as_confirmed() -> None:
+def test_unique_exact_booking_selection_is_written_as_confirmed() -> None:
     connection = _FakeConnection(existing_status="TENTATIVE")
     updated, confirmed_preserved = _persist_sku_selection(
         connection,
@@ -306,16 +321,15 @@ def test_unique_booking_selection_is_written_as_confirmed() -> None:
         journey_id=UUID("00000000-0000-0000-0000-000000000099"),
         candidate=_candidate(tentative=False),
         selection_status="CONFIRMED",
-        selection_method="BOOKING_MODEL_PRICE_UNIQUE_V1",
+        selection_method="BOOKING_MODEL_PRICE_EXACT_V1",
     )
     assert updated is True
     assert confirmed_preserved is False
     _, params = connection.calls[1]
     assert params["selection_status"] == "CONFIRMED"
-    assert params["selection_method"] == "BOOKING_MODEL_PRICE_UNIQUE_V1"
 
 
-def test_confirmed_sku_is_never_overwritten_by_new_booking_resolution() -> None:
+def test_confirmed_sku_is_never_overwritten() -> None:
     connection = _FakeConnection(existing_status="CONFIRMED")
     updated, confirmed_preserved = _persist_sku_selection(
         connection,
@@ -323,7 +337,7 @@ def test_confirmed_sku_is_never_overwritten_by_new_booking_resolution() -> None:
         journey_id=UUID("00000000-0000-0000-0000-000000000099"),
         candidate=_candidate(tentative=True),
         selection_status="TENTATIVE",
-        selection_method="BOOKING_MODEL_PRICE_MULTI_V1",
+        selection_method="BOOKING_MODEL_PRICE_MULTI_EXACT_V1",
     )
     assert updated is False
     assert confirmed_preserved is True
