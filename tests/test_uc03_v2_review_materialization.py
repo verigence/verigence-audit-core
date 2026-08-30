@@ -1,5 +1,6 @@
 from uuid import uuid4
 
+from audit_core.uc03_booking_review_decisions import _raw_review_items
 from audit_core.uc03_document_review_v2 import (
     ReviewV2Document,
     ReviewV2Field,
@@ -9,9 +10,6 @@ from audit_core.uc03_v2_review_materialization import (
     _reviewed_receipt_values,
     receipt_document_ordinals,
     receipt_review_key,
-)
-from audit_core.uc03_v2_review_materialization_install import (
-    _receipt_raw_review_items,
 )
 
 
@@ -44,6 +42,20 @@ def _receipt(document_id, *, amount: str, confidence: float = 99.0) -> ReviewV2D
     )
 
 
+def _receipt_unmapped(document_id, *, amount: str, confidence: float):
+    return ReviewV2UnmappedField(
+        canonicalFieldId=str(uuid4()),
+        fieldKey="amount_paid",
+        value=amount,
+        confidenceScore=confidence,
+        sourceFactVersion=1,
+        documentId=document_id,
+        documentTypeKey="dealer_receipt",
+        documentLabel="Dealer Receipt",
+        originalFilename=f"{document_id}.pdf",
+    )
+
+
 def test_receipt_review_key_is_receipt_scoped() -> None:
     assert receipt_review_key(1, "amount_paid") != receipt_review_key(
         2, "amount_paid"
@@ -64,32 +76,13 @@ def test_two_receipts_with_different_amounts_are_not_cross_source_mismatch() -> 
     first = uuid4()
     second = uuid4()
     ordinals = receipt_document_ordinals([first, second])
-    fields = [
-        ReviewV2UnmappedField(
-            canonicalFieldId=str(uuid4()),
-            fieldKey="amount_paid",
-            value="20000",
-            confidenceScore=99.0,
-            sourceFactVersion=1,
-            documentId=first,
-            documentTypeKey="dealer_receipt",
-            documentLabel="Receipt 1",
-            originalFilename="r1.pdf",
-        ),
-        ReviewV2UnmappedField(
-            canonicalFieldId=str(uuid4()),
-            fieldKey="amount_paid",
-            value="30000",
-            confidenceScore=99.0,
-            sourceFactVersion=1,
-            documentId=second,
-            documentTypeKey="dealer_receipt",
-            documentLabel="Receipt 2",
-            originalFilename="r2.pdf",
-        ),
-    ]
 
-    items = _receipt_raw_review_items(fields)
+    items = _raw_review_items(
+        [
+            _receipt_unmapped(first, amount="20000", confidence=99.0),
+            _receipt_unmapped(second, amount="30000", confidence=99.0),
+        ]
+    )
 
     assert len(items) == 2
     assert {item.review_key for item in items} == {
@@ -103,32 +96,16 @@ def test_low_confidence_receipt_field_requires_only_its_own_decision() -> None:
     first = uuid4()
     second = uuid4()
     ordinals = receipt_document_ordinals([first, second])
-    fields = [
-        ReviewV2UnmappedField(
-            canonicalFieldId=str(uuid4()),
-            fieldKey="amount_paid",
-            value="20000",
-            confidenceScore=80.0,
-            sourceFactVersion=1,
-            documentId=first,
-            documentTypeKey="dealer_receipt",
-            documentLabel="Receipt 1",
-            originalFilename="r1.pdf",
-        ),
-        ReviewV2UnmappedField(
-            canonicalFieldId=str(uuid4()),
-            fieldKey="amount_paid",
-            value="30000",
-            confidenceScore=99.0,
-            sourceFactVersion=1,
-            documentId=second,
-            documentTypeKey="dealer_receipt",
-            documentLabel="Receipt 2",
-            originalFilename="r2.pdf",
-        ),
-    ]
 
-    items = {item.review_key: item for item in _receipt_raw_review_items(fields)}
+    items = {
+        item.review_key: item
+        for item in _raw_review_items(
+            [
+                _receipt_unmapped(first, amount="20000", confidence=80.0),
+                _receipt_unmapped(second, amount="30000", confidence=99.0),
+            ]
+        )
+    }
 
     assert items[
         receipt_review_key(ordinals[first], "amount_paid")
