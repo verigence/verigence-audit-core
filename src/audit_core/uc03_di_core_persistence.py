@@ -6,11 +6,28 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from audit_core import uc03_booking_review_decisions as review_decisions
+from audit_core.db import set_security_actor_context
 from audit_core.uc03_v2_review_materialization import (
     materialize_reviewed_di_business_values,
 )
 
 _installed = False
+_original_review_scope = review_decisions._scope
+
+
+def _scope_with_actor_context(
+    connection: Connection,
+    *args: Any,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Preserve the authenticated Review actor in the transaction-local DB context."""
+
+    context = _original_review_scope(connection, *args, **kwargs)
+    human_principal = kwargs.get("human_principal")
+    if human_principal is None:
+        raise RuntimeError("UC03 Review scope requires an authenticated human principal")
+    set_security_actor_context(connection, human_principal.subject)
+    return context
 
 
 def _current_actor_id(connection: Connection) -> str:
@@ -62,6 +79,7 @@ def install_uc03_di_core_persistence() -> None:
     global _installed
     if _installed:
         return
+    review_decisions._scope = _scope_with_actor_context
     review_decisions.materialize_reviewed_booking_receipts = (
         _materialize_all_reviewed_business_values
     )
