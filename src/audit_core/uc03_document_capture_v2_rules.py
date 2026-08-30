@@ -133,8 +133,12 @@ def install_uc03_v2_capture_business_rules() -> None:
     from audit_core.uc03_booking_review_decisions import (
         install_uc03_booking_review_decisions,
     )
+    from audit_core.uc03_v2_review_materialization_install import (
+        install_uc03_v2_review_materialization,
+    )
 
     install_uc03_booking_review_decisions()
+    install_uc03_v2_review_materialization()
     if getattr(capture_v2, "_gst_corporate_exclusivity_installed", False):
         return
 
