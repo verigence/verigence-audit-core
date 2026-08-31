@@ -1,6 +1,6 @@
 """Add detailed Booking Form commercial components to existing Core storage.
 
-Revision ID: 0050_uc03_booking_commercial_components
+Revision ID: 0050_uc03_commercial_components
 Revises: 0049_uc03_delivery_applicability
 Create Date: 2026-08-31
 
@@ -10,7 +10,7 @@ commercial projection.
 """
 from alembic import op
 
-revision = "0050_uc03_booking_commercial_components"
+revision = "0050_uc03_commercial_components"
 down_revision = "0049_uc03_delivery_applicability"
 branch_labels = None
 depends_on = None
