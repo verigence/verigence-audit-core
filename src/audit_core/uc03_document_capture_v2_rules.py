@@ -128,6 +128,9 @@ def _apply_capture_business_rules(
 def install_uc03_v2_capture_business_rules() -> None:
     """Install additive V2-only capture/review rules without changing V1 behavior."""
 
+    from audit_core.uc03_booking_commercial_components import (
+        install_uc03_booking_commercial_components,
+    )
     from audit_core.uc03_booking_review_decisions import (
         install_uc03_booking_review_decisions,
     )
@@ -136,6 +139,9 @@ def install_uc03_v2_capture_business_rules() -> None:
     )
     from audit_core.uc03_di_core_persistence import install_uc03_di_core_persistence
 
+    # Register the complete Booking Form extraction contract before Review routes
+    # handle any request. This extends existing Core owners; it creates no new table.
+    install_uc03_booking_commercial_components()
     install_uc03_booking_review_decisions()
     install_uc03_di_core_persistence()
     install_uc03_booking_review_rule_trigger()
