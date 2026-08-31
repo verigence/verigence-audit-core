@@ -61,7 +61,7 @@ def _receipt_unmapped(document_id, *, amount: str, confidence: float):
 
 
 def test_booking_form_di_contract_has_core_review_owner_for_every_field() -> None:
-    # Mirrors verigence-di booking_form schema v1.4 exactly. This test must change
+    # Mirrors verigence-di booking_form schema v1.5 exactly. This test must change
     # whenever DI adds/removes a Booking Form extraction field.
     assert set(_BOOKING_FORM_FIELDS) == {
         "dealer_name",
@@ -90,9 +90,26 @@ def test_booking_form_di_contract_has_core_review_owner_for_every_field() -> Non
         "tcs_amount",
         "rsa_amount",
         "additional_warranty_amount",
+        "extended_warranty_amount",
         "accessories_cost",
+        "essential_kit_amount",
+        "genuine_accessories_amount",
+        "non_genuine_accessories_amount",
+        "fastag_amount",
+        "green_tax_amount",
+        "service_package_amount",
         "other_charges",
         "discount_amount",
+        "sales_discount_amount",
+        "buffer_discount_amount",
+        "exchange_discount_amount",
+        "corporate_discount_amount",
+        "loyalty_discount_amount",
+        "inhouse_insurance_discount_amount",
+        "mr_discount_amount",
+        "oem_referral_discount_amount",
+        "other_discount_amount",
+        "free_accessory_discount_amount",
         "bonus_amount",
         "total_price",
         "net_amount",
