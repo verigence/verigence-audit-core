@@ -6,6 +6,7 @@ Mode: **WRITE APPROVED only for the exact Audit Core scope in `UC03_IMPLEMENTATI
 Current repository: **`verigence-audit-core` only**  
 Implementation branch: `fix/uc03-persist-all-di-fields-booking-delivery-v2`  
 Branch starting SHA: `724ddbc4ed11ec82195763d9b10a6f9f339bb729` (current `dev` at re-anchor)  
+Latest application/test implementation SHA: `f1b0fd57490c1e6fcc92468cb9d853d001967392`  
 Previous stabilization branch: `fix/uc03-persist-all-di-fields-booking-delivery` — superseded for application work because it was 9 commits behind current `dev`; its governance files were restored byte-for-byte onto this branch.
 
 ## 1. Read-first instruction
@@ -227,22 +228,56 @@ These remain open and must not be conflated with the current write scope:
 - persisted final source-of-truth model after Delivery;
 - minimal rule-run status/reference placeholder.
 
-## 8. NEXT ACTION
+## 8. Implementation progress
+
+### Unit 1 — generic persistence foundation
+
+**Status: IMPLEMENTED / SOURCE-VERIFIED; CI/DB TEST EVIDENCE NOT YET AVAILABLE**  
+Application/test SHA: `f1b0fd57490c1e6fcc92468cb9d853d001967392`
+
+**CHANGED:**
+
+- Added `0051_uc03_lossless_review_fields.py` extending the existing `journey_document_extracted_fields` table rather than creating a second generic store.
+- V2-compatible persistence now has explicit `stage_code`, original document type, canonical field ID, reviewed `effective_value`, confidence scale, modification flag, and review actor/time.
+- Legacy `evidence_id` and `source_fact_ref` are nullable only so truthful V2 identity can be stored; existing V1 identity and unique key remain.
+- Added a partial V2 unique index using Journey + stage + DI document + canonical field + fact version, preserving repeated documents and same-type document cardinality.
+- Expanded confidence storage without guessing/rescaling and records `UNIT_INTERVAL` vs `PERCENT` explicitly.
+- Extended `uc03_di_core_persistence.py` with shared `ReviewedDiField` + `persist_reviewed_di_fields(...)` lossless persistence helper and retained the actor-context installer through a lazy import to avoid future import cycles.
+- Added focused tests covering zero/false retention, empty/null filtering, unknown V2 fields without typed owners, corrections preserving original+effective values, rejected-source provenance without effective value, no-guessed identity/scale, and migration reuse/no-second-table contract.
+
+**WHY:**
+
+Current V1/V2 paths could not durably represent every reviewed non-empty DI value in one existing table. The extension is the smallest reusable foundation required before wiring Booking and Delivery Review commits.
+
+**VERIFIED:**
+
+- Source inspection confirms the migration is linear from `0050_uc03_commercial_components` and creates no new table.
+- Source inspection confirms the helper retains valid `0`/`False`, skips only unchanged empty/null values, and routes legacy vs V2 identity through separate truthful conflict keys.
+- Existing `test_uc03_review_confirm_actor_context.py` remains compatible with the lazy `_original_review_scope` mechanism.
+- GitHub has no workflow run for this direct branch and no commit statuses/checks were posted for the implementation SHA. Therefore **pytest, migration execution, DB compatibility and CI remain UNVERIFIED**, not assumed green.
+
+**REMAINING:**
+
+- Run focused tests/DB migration when an executable CI/local DB path is available.
+- Wire legacy/direct Booking Review to call the shared helper for all populated fields.
+- Wire Booking V2 confirm to lossless persistence and remove typed-owner-only blockers while retaining typed projections.
+- Add explicit Delivery Review commit and DB/end-to-end acceptance coverage.
+
+## 9. NEXT ACTION
 
 **Current target: `verigence-audit-core` only. WRITE APPROVED for the lossless reviewed-DI persistence unit; NO MERGE / NO DEPLOY.**
 
-Proceed one coherent implementation unit at a time:
+Continue from Unit 1; do not rescan completed evidence:
 
-1. inspect the existing generic-review tests and Delivery verification/state contract needed to lock acceptance semantics;
-2. implement the smallest backward-compatible migration + shared generic persistence helper;
-3. test that helper/schema unit;
-4. wire legacy/direct Booking Review to persist all populated fields and test;
-5. wire Booking V2 confirm to generic persistence, remove typed-owner-only blockers, preserve typed projection, and test;
-6. add the smallest explicit Delivery Review commit path that persists Delivery fields without mutating GET behavior, and test;
-7. run focused regression/DB tests and update this checkpoint with actual results;
-8. stop before merge/deploy and before moving to DI/Web.
+1. wire `uc03_pc_generic_review.py` to persist every populated direct-review field using the shared helper, preserving original + modified/effective values and existing typed projections;
+2. update focused legacy/direct Review tests to enforce lossless storage semantics;
+3. source-verify and checkpoint that coherent unit;
+4. then wire Booking V2 confirm to generic persistence, remove typed-owner-only blockers, preserve typed projection and stale-decision logic;
+5. add the smallest explicit Delivery Review commit path that persists Delivery fields without mutating GET behavior;
+6. run focused regression/DB tests when executable evidence is available and update this checkpoint with actual results;
+7. stop before merge/deploy and before moving to DI/Web.
 
-## 9. Anti-stuck / recovery rule
+## 10. Anti-stuck / recovery rule
 
 If a path does not answer the current evidence question after a small number of direct attempts, record `UNKNOWN` and pivot. Do not recursively rescan the repository.
 
