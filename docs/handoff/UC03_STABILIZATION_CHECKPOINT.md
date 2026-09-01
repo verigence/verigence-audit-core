@@ -5,7 +5,7 @@ Current activity: **Step 1 — approved Audit Core final-source implementation; 
 Repository: **`verigence-audit-core` only**  
 Implementation branch: `fix/uc03-post-delivery-final-source-v1`  
 Branch starting `dev` SHA: `10701bf9968968d0efe4920b9230c2ed2664bd5f`  
-Latest application/test SHA before this checkpoint commit: `309a208f8b33c0fb91da55cc6576407e594ea35f`  
+Latest application/test SHA before this checkpoint commit: `27929a95c265ece4bf0d6f0937f92a0d5fe57cd1`  
 Mode: **WRITE APPROVED for final-source scope; merge/deploy NOT approved**
 
 ## Recovery order
@@ -25,6 +25,7 @@ Do not reconstruct completed work from chat history or broadly rescan completed 
 - Final report is blocked until post-Delivery final-source resolution + successful post-Delivery rule run.
 - Current authoritative report contract supersedes the earlier 152-field assumption: 122 physical rows, 113 labelled outputs excluding two `-` separators, 81 unique non-separator labels.
 - Current report does not require a typed repeated Invoice table.
+- Typed/source-system report fields (for example Booking & Retail Dump outputs) remain in existing typed owners and do **not** require duplicate rows in the final-resolution ledger.
 
 ## Completed baseline on `dev`
 
@@ -75,32 +76,31 @@ CHANGED:
 - Reused `auditcore.journey_attribute_resolutions`; no new final-state table.
 - Added `resolved_value_snapshot jsonb`.
 - Added nullable `source_reviewed_field_id` with a tenant+Journey-safe composite FK to `journey_document_extracted_fields`.
-- Added source-contract constraints preserving mandatory DI identity for existing BOOKING/DELIVERY rows.
-- Corrected a design assumption exposed by implementation: legacy `source_di_document_id`, `source_field_key`, `source_fact_version` were NOT NULL, so typed/source-system POST_DELIVERY resolutions could not be represented truthfully. `0052` relaxes them only under a POST_DELIVERY typed-owner contract; no fake DI values are allowed.
-- Added `src/audit_core/uc03_final_source_persistence.py` rather than changing the existing Booking helper.
-- Reviewed-field-backed final resolution loads `effective_value` + provenance from durable Audit Core reviewed fields and snapshots it.
-- Typed/source-system final resolution requires explicit owning domain/reference and leaves DI identifiers + reviewed-field reference NULL.
+- Kept existing DI source identity columns and NOT NULL constraints unchanged.
+- Added `src/audit_core/uc03_final_source_persistence.py` as a narrow POST_DELIVERY helper; existing Booking resolution helper is untouched.
+- Reviewed-field-backed final resolution loads `effective_value` + DI/document/fact provenance from durable Audit Core reviewed fields and snapshots it.
 - Added focused tests in `tests/test_uc03_final_source_persistence.py`.
 
-WHY:
+CORRECTED ASSUMPTION:
 
-- final source must be stable/reproducible and must not re-read live DI;
-- approved source-system values such as Booking & Retail Dump need a truthful non-DI source representation;
-- cross-Journey reviewed-field references must be impossible.
+- An initial implementation draft relaxed legacy DI source columns to support typed/source-system resolution rows.
+- The authoritative owner matrix disproves the need for that duplication: typed/source-system outputs are `TYPED SOURCE_SYSTEM / REUSE`, so they remain in existing domain owners and do not require ledger rows.
+- That draft was removed before CI. `0052` is now strictly additive and document-derived/sparse.
 
 VERIFIED:
 
-- source inspection confirms the migration is additive and preserves existing BOOKING/DELIVERY source-reference requirements;
-- source inspection confirms reviewed winner query is scoped by tenant + Journey + reviewed-field id and requires an accepted `effective_value`;
-- source inspection confirms typed winner writes no fake DI identifiers and preserves valid `0` values;
-- source test typo found during verification was corrected before CI.
+- source selection query is scoped by tenant + Journey + reviewed-field id and requires an accepted `effective_value`;
+- composite FK design prevents a selected reviewed field from crossing Journey/Tenant;
+- final snapshot is copied from durable reviewed Core state, not a live DI call;
+- no existing Booking/Delivery resolution constraints are relaxed;
+- source-test errors found during inspection were corrected before CI.
 
 NOT YET VERIFIED:
 
 - fresh PostgreSQL migration execution;
 - Ruff;
 - pytest;
-- DB FK/check behavior under a real database.
+- real DB FK behavior.
 
 ## Remaining UNKNOWN / fail-closed items
 
@@ -114,17 +114,17 @@ Do not invent these.
 
 **Implementation Unit 2 — final-source confirm/read command.**
 
-1. inspect only the existing UC03 authorization/aggregate-lock/idempotency patterns, stage-state fields, reviewed-field rows and router installation points needed for this command;
-2. define the smallest in-repo final-source policy for sources whose technical Audit Core mapping is already authoritative;
+1. inspect only existing UC03 authorization/aggregate-lock/idempotency patterns, stage-state fields, reviewed-field rows and router installation points needed for this command;
+2. define the smallest final-source policy adapter for document-derived scalar outputs whose technical Audit Core mapping is already authoritative; retain explicit unresolved policy entries for the rest;
 3. implement `POST /v2/tenants/{tenant_id}/journeys/{journey_id}/audit/final-source/confirm` that:
    - requires Booking Review VERIFIED;
    - requires Delivery Review VERIFIED;
    - uses If-Match + idempotency + Journey aggregate lock;
-   - reads durable Audit Core reviewed/typed state only;
-   - persists `POST_DELIVERY` resolutions through Unit 1 helpers;
-   - fails closed for unresolved technical source mappings;
+   - reads durable Audit Core reviewed state only;
+   - persists POST_DELIVERY document-derived resolutions through Unit 1 helper;
+   - fails closed before partial commit when required technical source mappings are unresolved;
    - does not scalar-collapse repeated Payments/Invoices;
-4. add a persisted read/status endpoint if required by the command contract;
+4. add persisted final-source/readiness GET if needed;
 5. add focused tests and update this checkpoint;
 6. then wire the post-Delivery workflow task/readiness gate as the next coherent unit.
 
