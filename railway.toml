@@ -2,7 +2,7 @@
 builder = "railpack"
 
 [deploy]
-preDeployCommand = ["sh", "-c", "PYTHONPATH=src DATABASE_URL=$DATABASE_URL_DIRECT alembic upgrade head"]
+preDeployCommand = ["alembic", "upgrade", "head"]
 startCommand = "PYTHONPATH=src uvicorn audit_core.main:app --host :: --port $PORT --timeout-graceful-shutdown 20 --max-requests 2000 --max-requests-jitter 200"
 healthcheckPath = "/health"
 healthcheckTimeout = 100
