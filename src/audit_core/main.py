@@ -17,9 +17,14 @@ from audit_core.daily_operations_api import router as daily_operations_router
 from audit_core.dealers import router as dealer_router
 from audit_core.dependencies import (
     _check_db_rtt,
+    clear_di_client,
     clear_security_admin_client,
+    clear_security_oauth_client,
+    set_di_client,
     set_security_admin_client,
+    set_security_oauth_client,
 )
+from audit_core.di_client import DiClient
 from audit_core.di_project_master_proxy import router as di_project_master_proxy_router
 from audit_core.errors import install_error_handlers
 from audit_core.escalations_api import router as escalation_router
@@ -39,7 +44,7 @@ from audit_core.projects import router as project_router
 from audit_core.readiness import router as readiness_router
 from audit_core.reference_data import router as reference_data_router
 from audit_core.role_mapping_policy import install_role_mapping_policy
-from audit_core.security_integration import SecurityAdminClient
+from audit_core.security_integration import SecurityAdminClient, SecurityOAuthClient
 from audit_core.tasks_api import router as task_router
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
@@ -51,26 +56,56 @@ role_mapping_router = role_mappings.router
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Start-up: create shared async HTTP clients, verify DB RTT.
+    """Start-up: create shared HTTP clients, verify DB RTT.
     Shut-down: drain and close all clients so Railway SIGTERM completes cleanly.
     """
     security_base_url = os.environ.get("SECURITY_BASE_URL", "").strip()
+    security_client_id = os.environ.get("SECURITY_CLIENT_ID", "").strip()
+    security_client_secret = os.environ.get("SECURITY_CLIENT_SECRET", "")
+    di_base_url = os.environ.get("DI_BASE_URL", "").strip()
+
     if not security_base_url:
         raise RuntimeError("SECURITY_BASE_URL is required")
+    if not security_client_id or not security_client_secret:
+        raise RuntimeError("SECURITY_CLIENT_ID and SECURITY_CLIENT_SECRET are required")
+    if not di_base_url:
+        raise RuntimeError("DI_BASE_URL is required")
 
+    # One async admin client — reused across all admin-proxy requests
     admin_client = SecurityAdminClient(base_url=security_base_url)
     set_security_admin_client(admin_client)
+
+    # One async OAuth client — reused across all evidence uploads (token mint)
+    oauth_client = SecurityOAuthClient(
+        base_url=security_base_url,
+        client_id=security_client_id,
+        client_secret=security_client_secret,
+    )
+    set_security_oauth_client(oauth_client)
+
+    # One sync DI client — reused across all evidence uploads.
+    # Plain def handlers run in FastAPI's threadpool; a sync client is correct here.
+    di_client = DiClient(base_url=di_base_url)
+    set_di_client(di_client)
 
     # Verify DB round-trip time — warn if > 5 ms (cross-region Neon)
     _check_db_rtt()
 
-    logger.info("audit_core_startup_complete", security_base_url=security_base_url)
+    logger.info(
+        "audit_core_startup_complete",
+        security_base_url=security_base_url,
+        di_base_url=di_base_url,
+    )
 
     yield
 
-    # Graceful shutdown — close async HTTP client pools
+    # Graceful shutdown — close all HTTP client pools before SIGTERM kills the process
     await admin_client.aclose()
+    await oauth_client.aclose()
+    di_client.close()
     clear_security_admin_client()
+    clear_security_oauth_client()
+    clear_di_client()
     logger.info("audit_core_shutdown_complete")
 
 

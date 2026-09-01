@@ -3,9 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Iterator
-from typing import Annotated
 from uuid import UUID
+from typing import Annotated
 
 import structlog
 from fastapi import APIRouter, Depends, File, Form, Header, Request, UploadFile, status
@@ -15,7 +14,7 @@ from sqlalchemy import Connection, Engine, text
 from audit_core.authorization import authorize
 from audit_core.business_assignments import require_business_scope
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import get_engine, get_principal
+from audit_core.dependencies import get_di_client, get_engine, get_principal, get_security_oauth_client
 from audit_core.di_client import DiClient, DiClientError, DiDocument
 from audit_core.errors import AuditCoreError, ConflictError, NotFoundError
 from audit_core.observability import get_correlation_id
@@ -37,28 +36,6 @@ class EvidenceResponse(BaseModel):
     processingStatus: str
     verificationStatus: str | None
     createdAtUtc: str
-
-
-def get_security_oauth_client() -> Iterator[SecurityOAuthClient]:
-    base_url = os.environ.get("SECURITY_BASE_URL", "").strip()
-    client_id = os.environ.get("SECURITY_CLIENT_ID", "").strip()
-    client_secret = os.environ.get("SECURITY_CLIENT_SECRET", "")
-    if not base_url or not client_id or not client_secret:
-        raise RuntimeError("Security ServiceIntegration is not configured")
-    with SecurityOAuthClient(
-        base_url=base_url,
-        client_id=client_id,
-        client_secret=client_secret,
-    ) as client:
-        yield client
-
-
-def get_di_client() -> Iterator[DiClient]:
-    base_url = os.environ.get("DI_BASE_URL", "").strip()
-    if not base_url:
-        raise RuntimeError("DI integration is not configured")
-    with DiClient(base_url=base_url) as client:
-        yield client
 
 
 def _journey_context(connection: Connection, tenant_id: str, journey_id: UUID):
@@ -582,8 +559,6 @@ def upload_journey_evidence(
     evidence_purpose: Annotated[str, Form(alias="evidencePurpose", min_length=1, max_length=160)],
     principal: Annotated[Principal, Depends(get_principal)],
     engine: Annotated[Engine, Depends(get_engine)],
-    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
-    di_client: Annotated[DiClient, Depends(get_di_client)],
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
     requirement_key: Annotated[
         str | None, Form(alias="requirementKey", max_length=120)
@@ -596,6 +571,10 @@ def upload_journey_evidence(
     content = file.file.read()
     filename = file.filename or "evidence"
     content_type = file.content_type or "application/octet-stream"
+
+    # Retrieve lifespan singletons — no TLS re-handshake, no new connection pool
+    security_client: SecurityOAuthClient = get_security_oauth_client()
+    di_client: DiClient = get_di_client()
 
     logger.info(
         "evidence_upload_started",

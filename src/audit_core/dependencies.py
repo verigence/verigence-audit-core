@@ -12,6 +12,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import Connection, Engine, create_engine, text
 
 from audit_core.authorization import AuthorizationError
+from audit_core.di_client import DiClient
 from audit_core.security import (
     HumanPrincipal,
     Principal,
@@ -22,6 +23,7 @@ from audit_core.security_integration import (
     SecurityAdminClient,
     SecurityAdminContext,
     SecurityAdminError,
+    SecurityOAuthClient,
 )
 
 logger = structlog.get_logger(__name__)
@@ -29,11 +31,14 @@ logger = structlog.get_logger(__name__)
 _bearer = HTTPBearer(auto_error=False)
 
 # ---------------------------------------------------------------------------
-# Module-level singleton for the Security admin client.
-# Set by lifespan in main.py; never None once the app is running.
+# Module-level singletons — set by lifespan in main.py, never None once running.
 # ---------------------------------------------------------------------------
 _security_admin_client: SecurityAdminClient | None = None
+_security_oauth_client: SecurityOAuthClient | None = None
+_di_client: DiClient | None = None
 
+
+# --- SecurityAdminClient ---
 
 def set_security_admin_client(client: SecurityAdminClient) -> None:
     """Called once by lifespan on startup."""
@@ -52,6 +57,48 @@ def get_security_admin_client() -> SecurityAdminClient:
         raise RuntimeError("SecurityAdminClient is not initialised — lifespan not run")
     return _security_admin_client
 
+
+# --- SecurityOAuthClient ---
+
+def set_security_oauth_client(client: SecurityOAuthClient) -> None:
+    """Called once by lifespan on startup."""
+    global _security_oauth_client
+    _security_oauth_client = client
+
+
+def clear_security_oauth_client() -> None:
+    """Called by lifespan on shutdown."""
+    global _security_oauth_client
+    _security_oauth_client = None
+
+
+def get_security_oauth_client() -> SecurityOAuthClient:
+    if _security_oauth_client is None:
+        raise RuntimeError("SecurityOAuthClient is not initialised — lifespan not run")
+    return _security_oauth_client
+
+
+# --- DiClient ---
+
+def set_di_client(client: DiClient) -> None:
+    """Called once by lifespan on startup."""
+    global _di_client
+    _di_client = client
+
+
+def clear_di_client() -> None:
+    """Called by lifespan on shutdown."""
+    global _di_client
+    _di_client = None
+
+
+def get_di_client() -> DiClient:
+    if _di_client is None:
+        raise RuntimeError("DiClient is not initialised — lifespan not run")
+    return _di_client
+
+
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class HumanAdminRequest:
