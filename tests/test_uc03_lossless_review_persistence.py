@@ -240,4 +240,4 @@ def test_0051_migration_reuses_generic_table_and_preserves_v1_compatibility() ->
     assert "ADD COLUMN confidence_scale" in migration
     assert "uq_journey_document_extracted_fields_v2_fact" in migration
     assert "CREATE TABLE" not in migration
-    assert "No fake legacy UUIDs are manufactured" in migration
+    assert "no fake legacy UUIDs are manufactured" in migration
