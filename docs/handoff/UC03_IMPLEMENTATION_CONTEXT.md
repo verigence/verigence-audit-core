@@ -1,4 +1,4 @@
-# UC03 Implementation Context — Lossless Reviewed DI Persistence
+# UC03 Implementation Context — Post-Delivery Final Source of Truth
 
 ## Mandatory read-first prompt
 
@@ -7,110 +7,204 @@
 > Do not reconstruct decisions from chat history.  
 > Work only within the approved activity scope below.  
 > Verify before claiming. Use `UNKNOWN` when evidence is missing.  
-> Do not broaden into unrelated repositories/files, do not recursively rescan completed work, and do not make drive-by changes.  
-> If a path is unproductive, pivot to the next direct evidence source.  
+> Do not broaden into unrelated repositories/files or recursively rescan completed work.  
 > Do not merge or deploy unless separately approved.
 
 ## Activity
 
-- Stabilization step: `Step 1 — approved Audit Core persistence implementation unit`
+- Stabilization step: `Step 1 — approved Audit Core final-source implementation`
 - Repository: `verigence-audit-core`
-- Implementation branch: `fix/uc03-persist-all-di-fields-booking-delivery-v2`
-- Branch starting SHA: `724ddbc4ed11ec82195763d9b10a6f9f339bb729` (`dev` at approval re-anchor)
-- Approved write scope: lossless durable Audit Core persistence of every non-null/non-empty DI field participating in UC03 Booking or Delivery Review; retain original DI provenance; persist reviewed/effective value; keep existing typed business projections as the additional operational projection layer; remove confirmation blockers that discard/block accepted fields solely because no typed owner exists; add focused schema/API/tests required for that invariant.
-- Approval reference/date: user explicitly approved `Approved: Audit Core implementation` on 2026-09-01, then clarified that any non-empty/non-null DI value must be updated/persisted in Audit Core.
+- Implementation branch: `fix/uc03-post-delivery-final-source-v1`
+- Branch starting SHA: `10701bf9968968d0efe4920b9230c2ed2664bd5f`
+- Approval reference/date: user explicitly approved `Approved: Audit Core final-source implementation` on 2026-09-01.
 - Merge approval: **NOT GRANTED**
 - Deploy approval: **NOT GRANTED**
 
 ## Final invariant to implement
 
-For each UC03 Booking or Delivery document reviewed from DI, every non-null/non-empty DI field has a durable Audit Core representation after Review. An unchanged field retains the original DI value as the effective reviewed value. A changed field retains original DI value/provenance and stores the confirmed effective value. An unknown/unmapped field is not silently dropped and is not required to invent a typed business owner. Existing approved typed owners continue to receive the effective value in addition to the generic durable representation. Document/fact identity and stage provenance remain traceable, including repeated documents and multiple documents of the same type.
+After Booking Review and Delivery Review are both VERIFIED, Audit Core can commit durable post-Delivery final-source rows for approved **document-derived scalar** report/business attributes without re-reading live DI as final business state. Each committed row retains exact reviewed-field/document/fact provenance and a stable resolved value snapshot.
+
+Typed/source-system outputs continue to come directly from their existing Audit Core business owners; they are not duplicated into the resolution ledger. Repeated Payments/Receipts and multiple Invoice documents remain distinct collections/documents and are not collapsed into scalar winners. The final report remains blocked until the post-Delivery rule-run boundary completes successfully.
+
+## Authoritative business inputs
+
+The user supplied the final report field list and corresponding Final Source of Truth list directly. That business-source list is authoritative at label level.
+
+Examples:
+
+- DMS Invoice Date/Number -> `Tax Invoice — DMS`;
+- Delivery Date -> `Gate Pass`;
+- Customer/KYC outputs -> `Customer KYC (PAN, Aadhaar, address proof)`;
+- Type of customer / Model / Model Variant -> `Booking & Retail Dump`;
+- registration outputs -> `RTO Paper`;
+- chassis -> `Tax Invoice — DMS`;
+- Finance Type -> `Bank DO`;
+- Bank Name -> `Bank Statement`;
+- First receipt date -> `Money Receipt`;
+- actual Insurance -> `Insurance Cover Note`;
+- actual Accessories -> `Accessory Invoice — Tally / bookkeeping software`;
+- actual EW -> `EW Tally Invoice`;
+- many actual discounts -> `Customer Ledger`.
+
+`NA` means the output is not document-derived; it does not mean no value.
+
+The active contract is 122 physical rows, 113 labelled outputs excluding two `-` separators, and 81 unique non-separator labels. This supersedes the earlier unverified 152-field assumption.
+
+Technical DI/canonical keys not proven by current Audit Core evidence remain `UNKNOWN` and must fail closed. Do not invent aliases.
 
 ## Verified current state
 
-- VERIFIED FACT: `migrations/versions/0031_uc03_generic_di_review_fields.py` created `auditcore.journey_document_extracted_fields`, but its present legacy constraints require `evidence_id` and UUID `source_fact_ref`; current V2 facts do not always provide those identifiers.
-- VERIFIED FACT: `src/audit_core/uc03_pc_generic_review.py` currently writes only human-corrected fields and deliberately leaves unchanged `extracted_value` / confidence unpersisted.
-- VERIFIED FACT: `src/audit_core/uc03_booking_review_decisions.py` currently blocks an accepted unmapped/raw field when no typed Core owner exists and records `rawDiValuesCopied: False`.
-- VERIFIED FACT: `migrations/versions/0048_uc03_di_core_field_persistence.py` plus `src/audit_core/uc03_v2_review_materialization.py` provide typed persistence for known Booking Form / PAN / Aadhaar / Dealer Receipt fields only; they are not a lossless generic DI-field layer.
-- VERIFIED FACT: `src/audit_core/uc03_document_review_v2.py` exposes current Booking + Delivery DI facts; the post-Delivery source-comparison route is read-only and does not commit reviewed Delivery values.
-- VERIFIED FACT: current V2 `DiFact` provides `canonical_field_id`, `field_key`, `value`, `confidence_score`, `version_no`, page/evidence data, but not the legacy UUID `source_fact_ref`.
-- VERIFIED FACT: `record_attribute_resolution(...)` permits null owning-domain/reference values, so a supported review/provenance fact does not need a fabricated typed owner.
-- VERIFIED FACT: Payment stage/linkage is already implemented by migration `0041_uc03_journey_stage_linkage.py`; do not reopen that defect without contradictory evidence.
+- `journey_document_extracted_fields` is the durable reviewed-field layer for BOOKING and DELIVERY after migration `0051`.
+- `journey_attribute_resolutions` already supports `POST_DELIVERY`, one resolution per Journey/stage/attribute, selected-source provenance, resolution rule/mapping version, optional owning domain/reference, actor/time, and append-only runtime semantics.
+- Before `0052` it had no stable final value snapshot and no direct reference to the selected reviewed-field row.
+- Existing `/audit/source-comparison` computes transient values and remains read-only.
+- `journey_stage_states` already supports `POST_DELIVERY` with audit state/status.
+- `workflow_tasks` already provides idempotent task lifecycle/retry/dead-letter behavior; no generic rule-run table is needed.
+- `audit_evaluations` / findings already provide rule-result structures.
+- Existing typed domains cover Booking, Customer, Product/Vehicle, Registration, Finance, Insurance, Addons, Trade-In, Commercial lines, Discounts and repeated Payments.
+- Current report contract does not require a typed repeated Invoice entity.
+- Typed/source-system report fields such as `Booking & Retail Dump` outputs already have existing typed owners and must not be duplicated into final-resolution rows.
 
 ## Exact gap / root cause
 
-- GAP: Audit Core does not currently guarantee durable representation of every non-null/non-empty DI field after Booking Review, and Delivery Review has no equivalent durable commit path.
-- GAP: accepted unknown/unmapped V2 fields can block Booking confirmation solely because they lack a typed owner.
-- ROOT CAUSE: earlier implementation optimized for DI-owned raw facts plus selected typed projections/corrections, while the governing stabilization invariant requires lossless reviewed-field persistence in Audit Core as well as typed projection.
-- ROOT CAUSE: the legacy generic table schema is not fully compatible with current V2 identifiers/stage provenance and therefore needs the smallest backward-compatible extension rather than a parallel table.
+- GAP: no durable post-Delivery final value snapshot existed for document-derived scalar outputs.
+- GAP: the resolution ledger could not directly point to the reviewed Audit Core row selected as final source.
+- GAP: current transient resolver does not carry Booking/Delivery stage identity and must not be reused unchanged as final business precedence.
+- ROOT CAUSE: the existing comparison flow predates the durable reviewed-field persistence/final-report source contract.
+
+## Approved data-model change
+
+Reuse `journey_attribute_resolutions`. Add only:
+
+1. `resolved_value_snapshot` — JSON value snapshot selected at finalization;
+2. nullable `source_reviewed_field_id` — reference to `journey_document_extracted_fields.extracted_field_id` for new document-derived `POST_DELIVERY` resolution rows.
+
+The column is nullable only for backward compatibility with pre-0052 rows. New document-derived final-source rows must populate it.
+
+Do **not** relax existing DI document/field/fact identity requirements. Do **not** create ledger rows for typed/source-system outputs. Do not create another generic final-value/report table.
 
 ## Files / structures allowed to change
 
-- `auditcore.journey_document_extracted_fields` through one additive/backward-compatible Alembic migration.
-- `src/audit_core/uc03_di_core_persistence.py` as the shared lossless persistence helper.
-- `src/audit_core/uc03_pc_generic_review.py` only as needed to make the legacy/direct Review path lossless without breaking its contract.
-- `src/audit_core/uc03_booking_review_decisions.py` only as needed to persist all Booking reviewed fields and remove typed-owner-only blocking.
-- `src/audit_core/uc03_document_review_v2.py` and/or one narrowly scoped UC03 Delivery Review module only if required to add a proper Delivery review commit action; do not make GET endpoints mutate state.
-- Existing typed materialization files only where a minimal compatibility call is required; do not redesign typed domains.
-- Relevant UC03 tests and OpenAPI contract tests.
-- `docs/handoff/UC03_STABILIZATION_CHECKPOINT.md` and this context for recovery updates.
+- one additive Alembic migration after current head;
+- narrow final-source persistence/policy/command modules;
+- router registration/OpenAPI only for additive final-source confirm/read endpoints;
+- existing workflow task helper only where minimal reuse/integration is required;
+- focused UC03 migration/API/resolution/report-contract tests;
+- `docs/handoff/UC03_STABILIZATION_CHECKPOINT.md` and this context.
 
 ## Files / areas explicitly not to touch
 
-- Security unless separately approved.
-- `verigence-di` and `verigence-web` in this implementation unit.
-- unrelated UC01/UC02 modules.
-- unrelated global infrastructure / CI/CD / observability.
-- dependencies unless separately approved.
-- rule-engine internals.
-- final-report implementation, final-source-resolution platform design, or unrelated schema cleanup.
-- canonical alias values that are not already authoritative in repository contracts/catalogues.
-- existing Journey/Booking/Delivery/Payment cardinality unless direct contradictory evidence appears.
+- `verigence-di`, `verigence-web`, Security;
+- unrelated UC01/UC02 code;
+- dependency upgrades or CI/CD redesign;
+- rule-engine evaluator internals;
+- canonical alias values not already authoritative in Audit Core;
+- Payment/Invoice cardinality redesign;
+- generic report persistence table;
+- new Invoice table.
 
-## Data-model rule
+## Final-source command boundary
 
-Reuse `journey_document_extracted_fields`; do not create a second generic raw/effective-field table unless direct implementation evidence proves the existing structure cannot be safely extended. Preserve V1/legacy rows. Use existing typed Customer/Booking/Vehicle/Commercial/Payment/etc. structures only where explicit owners already exist. Unknown fields survive generically rather than forcing speculative domain columns.
+Design target:
 
-## Document identity rule
+`POST /v2/tenants/{tenant_id}/journeys/{journey_id}/audit/final-source/confirm`
 
-Persist actual DI document identity and original classified document type. Repeated documents and multiple documents of the same type remain distinct by document/fact identity. Canonical alias normalization is a separate verified concern; do not invent alias keys in this unit and do not let alias uncertainty cause field loss.
+Responsibilities:
+
+1. authorize Journey/project scope;
+2. If-Match + aggregate lock;
+3. require Booking Review VERIFIED;
+4. require Delivery Review VERIFIED;
+5. idempotency;
+6. load durable reviewed Booking/Delivery rows only; no DI call;
+7. resolve only document-derived scalar outputs whose business source and technical document/field mapping are both authoritative;
+8. fail closed before any final-source write when required technical mappings remain unresolved;
+9. preflight all candidate disagreements before inserting the first final resolution;
+10. persist `POST_DELIVERY` resolutions with reviewed-field reference + stable snapshot;
+11. expose status/readiness without mutating the existing comparison GET.
+
+Typed/source-system report outputs are read later from their existing domain owners rather than inserted into `journey_attribute_resolutions`.
+
+## Candidate rules
+
+- Read only reviewed rows with non-null `effective_value`.
+- For each stage/document/field, use the latest persisted reviewed fact version.
+- If no legitimate current source exists, record the attribute as missing; do not manufacture a value.
+- If multiple legitimate current sources agree, choose deterministic provenance only; this is not a business-precedence rule.
+- If legitimate current sources disagree, fail closed. Confidence, stage and recency must not choose the business winner unless an explicit later contract says so.
+- Unknown/unmapped reviewed fields remain durable but are not guessed into a final report attribute.
+
+## Repeated collections
+
+Do not scalar-resolve:
+
+- Payments/Receipts;
+- multiple Invoice documents;
+- other genuinely repeated business/document collections.
+
+The two payment/reconciliation report blocks require aggregation rules; exact arithmetic is still `UNKNOWN` and is not to be invented in this implementation.
 
 ## Acceptance tests
 
-The activity is not `FIXED` until final-state tests pass.
+### Migration / ledger
 
-- Booking: DI supplies N populated fields; Review confirms; DB contains durable rows for all N populated fields, including unknown/unmapped fields.
-- Booking unchanged value: original DI value and effective reviewed value are both durable with exact DI document/canonical-field/fact-version provenance.
-- Booking accepted unknown field: confirmation succeeds without a fabricated typed owner; value remains durable generically; no unintended typed mutation occurs.
-- Legacy/direct Review: unchanged non-empty fields are no longer silently omitted; corrections preserve original value plus confirmed effective value.
-- Delivery: after an explicit Delivery Review commit, every populated Delivery DI field is durable with `DELIVERY` provenance; repeated documents/same-type documents remain distinct.
-- Rejected values retain original DI provenance and do not project into typed business owners; exact effective-value semantics must follow the confirmed Review contract.
-- Existing typed Booking Form / identity / receipt projections continue to pass their regression tests.
-- Database migration is backward-compatible with existing legacy generic rows and current V2 field identifiers.
-- DB-level test verifies no populated accepted field is silently lost.
+- existing resolution rows remain valid;
+- `resolved_value_snapshot` persists exact selected reviewed effective value;
+- selected reviewed-field FK cannot cross tenant/Journey;
+- existing DI source NOT NULL constraints remain unchanged;
+- runtime append-only behavior remains.
 
-## Implementation discipline
+### Finalization gates
 
-For each coherent implementation unit report only:
+- fails if Booking Review != VERIFIED once technical mapping gate is clear;
+- fails if Delivery Review != VERIFIED once technical mapping gate is clear;
+- current unresolved technical mappings return `MAPPING_BLOCKED` / conflict with no partial write;
+- stale Delivery If-Match fails;
+- idempotent replay returns same committed result;
+- concurrent conflicting finalization cannot create a second winner set.
 
-- `CHANGED:`
-- `WHY:`
-- `VERIFIED:`
-- `REMAINING:`
+### Source selection
 
-Use `IMPLEMENTED` until DB/end-to-end acceptance passes. Do not claim `FIXED` from unit tests alone.
+- uses persisted reviewed effective values, not live DI;
+- obsolete fact versions are not compared as current sources;
+- rejected/no-effective reviewed fields are ineligible;
+- unknown/unmapped reviewed fields remain durable but are not guessed into a report attribute;
+- unresolved technical canonical mapping fails closed;
+- source disagreement does not resolve by confidence/stage/recency.
+
+### Repeated data
+
+- multiple payments remain multiple rows;
+- multiple invoices/same-type invoices remain distinct documents;
+- finalization never merges/deletes sibling repeated records.
+
+### Rule/report gate
+
+- final-source commit will create/reuse exactly one post-Delivery rule task per finalization version/effect key in the next coherent unit;
+- readiness remains false while rule task is not successfully completed;
+- report readiness becomes true only after successful rule task + POST_DELIVERY audit completion;
+- rule evaluator internals are not implemented here.
+
+## Implementation sequence
+
+1. resolution-ledger additive migration + helper tests;
+2. durable candidate/source adapter for only proven Audit Core mappings;
+3. final-source confirm/read command + tests;
+4. workflow task/readiness wiring + tests;
+5. report-contract ownership/shape tests that do not invent unresolved payment formulas/DI aliases;
+6. CI + fresh migration + full pytest;
+7. update checkpoint and stop for merge approval.
 
 ## Stop / escalation conditions
 
-STOP and request a decision when:
+STOP and mark `UNKNOWN` when:
 
-- a required reviewed effective-value behaviour is not present in the governing Master/source or existing Review contract;
-- implementing Delivery requires Web or DI changes in this unit;
-- a Security change appears necessary;
-- compatibility impact is materially larger than the small extension described above;
-- a new generic persistence table appears necessary rather than extending the existing one;
-- exact canonical document aliases would have to be invented.
+- a business source label requires a DI canonical key not proven in Audit Core;
+- exact report arithmetic would have to be invented;
+- a new table/domain appears necessary beyond the approved additive ledger extension;
+- implementation would require DI/Web/Security changes;
+- rule-engine internals would have to be designed.
 
 ## Recovery checkpoint
 
-If interrupted, update `UC03_STABILIZATION_CHECKPOINT.md` with branch/SHA, completed coherent units, tests actually run/results, blockers/UNKNOWN, and exact next action. Then resume there rather than rescanning.
+After each coherent unit update `UC03_STABILIZATION_CHECKPOINT.md` with branch/SHA, changes, tests actually run/results, remaining UNKNOWN/blockers, and exact next action.

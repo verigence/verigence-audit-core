@@ -1,125 +1,170 @@
 # UC03 Stabilization — Current Checkpoint
 
 Last updated: 2026-09-01  
-Current activity: **Step 1 — lossless Booking + Delivery reviewed-DI persistence completed and CI-verified**  
+Current activity: **Step 1 — approved Audit Core final-source implementation; Units 1–3 CI/DB verified; STOPPED at merge approval gate**  
 Repository: **`verigence-audit-core` only**  
-Implementation branch: `fix/uc03-persist-all-di-fields-booking-delivery-v2`  
-Base `dev` SHA: `724ddbc4ed11ec82195763d9b10a6f9f339bb729`  
-Latest application/test SHA before this checkpoint-only commit: `10c29da3a372ec4dee9369b4e9bc3e705bff456c`  
-PR: **#135 — UC03: persist all reviewed DI fields for Booking and Delivery**  
-Merge status: **MERGE TO `dev` EXPLICITLY APPROVED BY USER on 2026-09-01; merge only after final PR CI remains green.**
+Implementation branch: `fix/uc03-post-delivery-final-source-v1`  
+Branch starting `dev` SHA: `10701bf9968968d0efe4920b9230c2ed2664bd5f`  
+Latest application/test SHA before this checkpoint commit: `6617e86c9d2ef191f8e5919c4675c5597e66931e`  
+Draft verification PR: **#136 — `UC03: post-delivery final source implementation`**  
+Mode: **WRITE APPROVED for final-source scope; merge/deploy NOT approved**
 
 ## Recovery order
 
 Read `UC03_STABILIZATION_MASTER.md` → this checkpoint → `UC03_STABILIZATION_PLAN.md` → `UC03_IMPLEMENTATION_CONTEXT.md` → continue from `NEXT ACTION`.
 
-Do not reconstruct completed work from chat history or broadly rescan repositories.
+Do not reconstruct completed work from chat history or broadly rescan completed repositories.
 
 ## Locked business decisions
 
 - One Journey; Booking and Delivery are stages of that Journey.
-- Persist Booking document-derived facts at Booking Review and Delivery document-derived facts at Delivery Review.
-- **Every non-null/non-empty DI field participating in Review must have durable Audit Core representation after Review, even without a typed owner.**
-- Unchanged reviewed value: effective value = DI extracted value.
-- Changed reviewed value: preserve original DI value/provenance and persist confirmed effective value.
-- Rejected Booking value: preserve original DI provenance; do not create an accepted effective/typed business mutation.
-- Existing typed Audit Core business owners remain the operational projection layer where explicitly supported.
-- Unknown/new fields survive generically; do not create speculative typed columns.
-- Repeated documents and multiple same-type documents remain distinct by DI document/fact identity.
-- Exact canonical aliases must come from authoritative contracts/catalogues; never invent aliases.
+- Booking facts persist at Booking Review; Delivery facts persist at Delivery Review.
+- Every populated reviewed DI field remains durable in Audit Core.
+- Repeated Payments/Receipts and repeated/multiple Invoice documents remain distinct.
+- Final report uses the user-supplied business Final Source of Truth list; `NA` means non-document-derived.
+- Exact technical DI aliases/keys must be authoritative; never invent them.
+- Final report is blocked until post-Delivery final-source resolution + successful post-Delivery rule run.
+- Current authoritative report contract supersedes the earlier 152-field assumption: 122 physical rows, 113 labelled outputs excluding two `-` separators, 81 unique non-separator labels.
+- Current report does not require a typed repeated Invoice table.
+- Typed/source-system report fields remain existing typed owners and are not duplicated into the final-resolution ledger.
 
-## Completed implementation
+## Completed baseline on `dev`
 
-### Unit 1 — common lossless persistence foundation
+PR #135 is merged/deployed and verified:
 
-**Status: IMPLEMENTED + CI/DB VERIFIED**
+- merge `ab0cf4c6a3e97cf70e482d0afdb6ae4c0ada6dd1`;
+- live baseline `10701bf9968968d0efe4920b9230c2ed2664bd5f`;
+- migration through `0051`: PASS;
+- Ruff: PASS;
+- pytest: 366 passed;
+- Railway DEV deployment/fresh verification/smoke: PASS.
 
-- Migration `0051_uc03_lossless_review_fields.py` extends existing `auditcore.journey_document_extracted_fields`; no parallel generic field table.
-- Adds Booking/Delivery stage provenance, V2 canonical-field identity, source document type, reviewed effective value, confidence scale, modification flag, reviewed actor/time.
-- Legacy `evidence_id` / `source_fact_ref` become nullable only where V2 truthfully lacks them.
-- V2 identity is Journey + stage + DI document + canonical field + fact version.
-- Existing V1 identity/upsert remains supported.
-- `uc03_di_core_persistence.py` provides shared `ReviewedDiField` and `persist_reviewed_di_fields(...)`.
-- Valid `0` / `False` values survive; empty/null unchanged fields are skipped; confidence values are not guessed or rescaled.
+Do not reopen the completed lossless Booking/Delivery reviewed-field persistence baseline without contradictory evidence.
 
-### Unit 2 — legacy/direct Booking Review
+## Approved final-source implementation scope
 
-**Status: IMPLEMENTED + CI VERIFIED**
+User approved **`Approved: Audit Core final-source implementation`** on 2026-09-01.
 
-- `uc03_pc_generic_review.py` now persists every populated reviewed field generically before best-effort typed projection.
-- Unchanged values persist original = effective.
-- Corrections persist original + modified/effective value.
-- `storedFieldCount` represents all persisted reviewed fields; correction count remains separate.
-- Only human-modified fields continue to emit correction events.
+Allowed:
 
-### Unit 3 — Booking V2 Review Confirm
+1. additive `journey_attribute_resolutions` extension;
+2. persisted final-source resolver using authoritative business-source policy where technical mappings are proven;
+3. additive final-source confirm/read API with authorization, If-Match, idempotency and aggregate locking;
+4. reuse existing typed business/commercial structures;
+5. post-Delivery workflow task/readiness gate;
+6. focused migration/API/resolution/repeated-payment/report-contract tests;
+7. checkpoint/context updates.
 
-**Status: IMPLEMENTED + CI VERIFIED**
+Not allowed:
 
-- Booking V2 confirm persists every current populated DI field generically with `stage_code='BOOKING'` before typed materialization.
-- Existing decision keys determine accepted/rejected effective-value semantics; no new review semantics were invented.
-- Accepted unknown/unmapped fields no longer fail solely because no typed Core owner exists.
-- Supported fields may retain reference-only resolution with null owning domain/reference when no approved typed owner exists.
-- Rejected mapped/raw fields keep original DI provenance but no accepted effective value/typed projection.
-- Existing stale-decision, pending/failed extraction, If-Match, idempotency, aggregate locking and typed projections remain.
-
-### Unit 4 — Delivery V2 Review Confirm
-
-**Status: IMPLEMENTED + CI VERIFIED**
-
-- Added explicit `POST /v2/tenants/{tenant_id}/journeys/{journey_id}/delivery/review/confirm`.
-- Existing `/audit/source-comparison` remains GET/read-only; no state mutation was added to GET.
-- Confirm requires Delivery submitted, `pc_verification_status='PENDING'`, no pending/failed Delivery extraction, If-Match, idempotency, authorization and aggregate locking.
-- Loads Delivery-stage DI documents only and persists every populated field through the shared helper with `stage_code='DELIVERY'`.
-- No typed-owner requirement or invented canonical aliases.
-- Delivery PC verification advances to `VERIFIED` only after field persistence succeeds.
-- Workflow event contains safe counts/metadata, not raw field values.
-- Added focused route/order/state tests in `tests/test_uc03_delivery_review_confirm.py`.
-
-## CI evidence
-
-PR #135 CI run **#1140**, head `10c29da3a372ec4dee9369b4e9bc3e705bff456c`, completed successfully:
-
-- package build: **PASS**;
-- `ruff check src tests migrations`: **PASS**;
-- fresh PostgreSQL `alembic upgrade head`: **PASS**, including `0051_uc03_lossless_review_fields`; exactly one Alembic head;
-- pytest: **366 passed, 1 unrelated Starlette/httpx deprecation warning, 18.04s**.
-
-The immediately preceding CI run #1139 failed only on Ruff import formatting in the newly added Delivery module; migration and tests were skipped in that run. The import formatting was corrected and run #1140 passed fully. Do not hide or reinterpret that history.
-
-## Scope boundaries retained
-
-This completed persistence unit did **not** implement:
-
-- DI or Web changes;
-- Security redesign/change;
+- DI/Web/Security changes;
+- invented aliases/field mappings;
 - rule-engine internals;
-- final-report generation;
-- speculative Invoice/domain redesign;
-- invented canonical aliases;
-- persisted final post-Delivery source-of-truth snapshot.
+- new generic final/report table;
+- Invoice table;
+- Payment redesign;
+- merge/deploy without separate approval.
 
-## Remaining Step-1 items
+## Completed implementation units
 
-Still OPEN / UNKNOWN where stated:
+### Unit 1 — final-resolution ledger foundation
 
-1. persisted final source-of-truth/resolution model after Booking-vs-Delivery comparison;
-2. exact final-report workbook field contract and Audit Core owner mapping;
-3. whether a typed repeated Invoice collection is genuinely required — **UNKNOWN pending workbook/business-owner mapping**;
-4. complete canonical document alias/family implementation across current modules;
-5. minimal rule-run status/reference placeholder before final report generation.
+**Status: IMPLEMENTED / CI + FRESH-DB VERIFIED**
 
-Do not silently close these because reviewed-field persistence is complete.
+- Added additive migration file `0052_uc03_final_source_resolution.py` with final Alembic revision ID `0052_uc03_final_source`.
+- Reused `journey_attribute_resolutions`; no new table.
+- Added `resolved_value_snapshot jsonb` and nullable `source_reviewed_field_id`.
+- Added tenant+Journey-safe FK to `journey_document_extracted_fields`.
+- Kept existing DI source NOT NULL requirements unchanged.
+- Added `uc03_final_source_persistence.py` for document-derived POST_DELIVERY winner persistence.
+- Final snapshot is loaded from durable reviewed `effective_value`, never live DI.
+- Typed/source-system report fields stay in typed owners; the earlier draft that duplicated them into the ledger was removed before CI.
+- Focused persistence/migration tests passed in full CI.
+
+### Unit 2 — final-source policy + confirm/read API
+
+**Status: IMPLEMENTED / CI VERIFIED**
+
+- Added `uc03_final_source_policy.py`.
+- Executable policy contains only technical document/field pairs already proven by current Audit Core evidence.
+- Disputed/unverified mappings are explicit `UNRESOLVED_TECHNICAL_POLICIES`; no fuzzy aliases are executable.
+- Added additive final-source GET + confirm POST and registered the router in `main.py`.
+- Command uses `_scope`, Delivery If-Match, Journey advisory aggregate lock and existing idempotency infrastructure.
+- Command imports/calls no DI client and reads only durable Audit Core reviewed state.
+- Candidate query selects the latest persisted reviewed fact version per stage/document/field before cross-source comparison.
+- Legitimate current sources that disagree fail closed; confidence, stage and recency do not choose a winner.
+- Agreeing sources may use deterministic provenance selection because the business value is identical.
+- Every configured source is preflighted before the first resolution insert, preventing partial winner sets on disagreement.
+- Existing POST_DELIVERY finalization causes conflict rather than a second winner set; idempotent replay remains handled by the existing idempotency record.
+- GET reports `NOT_READY`, `MAPPING_BLOCKED`, `READY` or `CONFIRMED` and exposes unresolved technical mapping summaries.
+
+CURRENT FAIL-CLOSED STATE:
+
+- `UNRESOLVED_TECHNICAL_POLICIES` is intentionally non-empty because Audit Core cannot prove several DI canonical document/field keys.
+- Therefore the POST currently returns mapping-incomplete conflict before final-source mutation. This is intentional, not a stub or guessed mapping.
+- Step 2 DI contract validation is required to clear those mappings later.
+
+### Unit 3 — post-Delivery rule task + report-readiness gate
+
+**Status: IMPLEMENTED / CI + DB-LIFECYCLE VERIFIED**
+
+- Added `uc03_post_delivery_rule_gate.py`.
+- Reuses existing `create_workflow_task_once()` and workflow task lifecycle; no new rule-run table or evaluator implementation.
+- Final-source commit creates/reuses exactly one `UC03_POST_DELIVERY_RULE_RUN` task using effect key `Journey + finalization version` after the POST_DELIVERY stage is created and before the final-source workflow event is appended.
+- Task uses workflow type `UC03_POST_DELIVERY_AUDIT`, process area `POST_DELIVERY`, and preserves Journey dealer/outlet scope.
+- Final-source GET exposes POST_DELIVERY audit state/status, rule task id/status/effect key and `reportReady`.
+- `reportReady` is true only when the rule task is `COMPLETED` and POST_DELIVERY `audit_state='COMPLETE'`; pending/retry/failure/dead-letter states remain false.
+- Added a narrow future-worker completion boundary that validates Journey/process/task identity and active lease, records attempt `SUCCEEDED`, clears lease/retry/error state, appends `WORKER_COMPLETED`, then marks POST_DELIVERY audit COMPLETE.
+- `NO_FLAGS` vs `FLAGS_RAISED` is derived from persisted findings joined through `audit_evaluations.process_area='POST_DELIVERY'`.
+- No rule evaluation, DI access or Web/Security change was added.
+- DB-backed lifecycle test passed in full CI: task create/reuse, READY not-ready gate, worker claim/start/complete, POST_DELIVERY completion, `NO_FLAGS`, `reportReady=true`, attempt `SUCCEEDED`, and single task/workflow instance.
+
+## Verification evidence
+
+Draft PR #136 was opened **only to trigger CI**; it remains draft and unmerged.
+
+### CI attempt 1 — run `33536352239`
+
+- Build: PASS.
+- Ruff: PASS.
+- Fresh PostgreSQL migration: FAIL at Alembic version bookkeeping after applying `0052` DDL.
+- Root cause: revision ID `0052_uc03_final_source_resolution` exceeded existing `alembic_version.version_num varchar(32)`.
+- Pytest: skipped because migration failed.
+- Deployment: skipped.
+
+Correction:
+
+- Shortened only the Alembic revision identifier to `0052_uc03_final_source`; migration behavior/schema remained unchanged.
+
+### CI attempt 2 — run `33536633900`, application/test SHA `6617e86c9d2ef191f8e5919c4675c5597e66931e`
+
+- Build package: **PASS**.
+- Ruff `ruff check src tests migrations`: **PASS — All checks passed**.
+- Fresh PostgreSQL `alembic upgrade head`: **PASS**, single head `0052_uc03_final_source`.
+- Full pytest with `DATABASE_URL`: **PASS — 383 passed, 1 warning in 22.66s**.
+- The warning is the existing Starlette/httpx TestClient deprecation warning; no test failure.
+- Railway DEV deployment job: **SKIPPED**.
+- Security diagnosis job: **SKIPPED**.
+- No merge or deployment was performed.
+
+## Remaining UNKNOWN / fail-closed items
+
+These are not implementation failures and were deliberately not guessed:
+
+- exact DI canonical technical keys and field keys not already proven in Audit Core;
+- exact arithmetic formulas for the two payment/reconciliation report blocks;
+- exact selection/concatenation semantics for multiple PC/TL/PMO remarks.
 
 ## NEXT ACTION
 
-1. Allow the checkpoint-only commit to complete PR CI.
-2. If green, merge PR #135 to `dev` as explicitly approved by the user.
-3. Verify the post-merge `dev` CI result. Repository CI automatically deploys a tested `dev` push to Railway DEV; record that outcome rather than manually changing deployment behavior.
-4. After `dev` is healthy, begin the next Audit Core stabilization unit with **post-Delivery final source-of-truth persistence**: define the smallest durable resolution/snapshot contract that consumes Booking + Delivery reviewed values and does not re-read volatile DI as the final business state.
-5. In parallel with that design, verify the supplied final-report workbook field/owner mapping before deciding whether any typed repeated Invoice entity is actually necessary.
-6. Only after Audit Core Step-1 gaps are closed should Step 2 revalidate DI contracts and then Web integration.
+**STOP — explicit merge approval required.**
+
+Current implementation branch and draft PR are CI-green for the approved Audit Core final-source scope. Do not merge PR #136 and do not deploy until separately approved.
+
+If merge is approved, merge PR #136 into `dev` only. Deployment still requires separate explicit approval unless the user explicitly grants both actions.
+
+Do not enter DI or Web as part of this branch.
 
 ## Anti-stuck rule
 
-If a direct path does not answer the current evidence question after a small number of attempts, mark it `UNKNOWN` and pivot. Do not recursively rescan completed repositories.
+If future work resumes and a direct path does not answer the current evidence question after a small number of attempts, mark it `UNKNOWN` and pivot. Do not recursively rescan completed repositories.
