@@ -28,6 +28,10 @@ from audit_core.uc03_final_source_policy import (
     UNRESOLVED_TECHNICAL_POLICIES,
     ReviewedSourcePolicy,
 )
+from audit_core.uc03_post_delivery_rule_gate import (
+    ensure_post_delivery_rule_task,
+    post_delivery_rule_gate_status,
+)
 
 router = APIRouter(
     prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}",
@@ -61,6 +65,12 @@ class FinalSourceStatusResponse(BaseModel):
     deliveryReviewStatus: str
     aggregateVersion: int
     resolutionCount: int
+    postDeliveryAuditState: str
+    postDeliveryAuditStatus: str
+    ruleTaskId: UUID | None = None
+    ruleTaskStatus: str | None = None
+    ruleTaskEffectKey: str | None = None
+    reportReady: bool = False
     technicalGaps: list[FinalSourceTechnicalGap] = Field(default_factory=list)
     resolutions: list[FinalSourceResolution] = Field(default_factory=list)
 
@@ -70,6 +80,8 @@ class FinalSourceConfirmResponse(BaseModel):
     status: Literal["CONFIRMED"] = "CONFIRMED"
     aggregateVersion: int
     resolvedAttributeCount: int
+    ruleTaskId: UUID
+    reportReady: Literal[False] = False
     missingAttributes: list[str] = Field(default_factory=list)
 
 
@@ -115,7 +127,9 @@ def _review_status(row: dict[str, Any] | None) -> str:
     return str(row.get("pc_verification_status") or "PENDING")
 
 
-def _require_verified_reviews(states: dict[str, dict[str, Any]]) -> tuple[int, int]:
+def _require_verified_reviews(
+    states: dict[str, dict[str, Any]],
+) -> tuple[int, int]:
     booking = states.get("BOOKING")
     delivery = states.get("DELIVERY")
     booking_status = _review_status(booking)
@@ -124,13 +138,19 @@ def _require_verified_reviews(states: dict[str, dict[str, Any]]) -> tuple[int, i
         raise ConflictError(
             error_code="VAC-CONFLICT-010",
             title="Booking Review is not verified",
-            detail="Complete Booking Review before confirming the post-Delivery final source.",
+            detail=(
+                "Complete Booking Review before confirming the post-Delivery "
+                "final source."
+            ),
         )
     if delivery_status != "VERIFIED":
         raise ConflictError(
             error_code="VAC-CONFLICT-010",
             title="Delivery Review is not verified",
-            detail="Complete Delivery Review before confirming the post-Delivery final source.",
+            detail=(
+                "Complete Delivery Review before confirming the post-Delivery "
+                "final source."
+            ),
         )
     assert booking is not None and delivery is not None
     return int(booking["version_no"]), int(delivery["version_no"])
@@ -148,7 +168,9 @@ def _mapping_blocked_error() -> ConflictError:
     )
 
 
-def _candidate_conditions(policy: ReviewedSourcePolicy) -> tuple[str, dict[str, Any]]:
+def _candidate_conditions(
+    policy: ReviewedSourcePolicy,
+) -> tuple[str, dict[str, Any]]:
     clauses: list[str] = []
     params: dict[str, Any] = {}
     for index, (document_type_key, field_key) in enumerate(policy.technical_pairs):
@@ -159,7 +181,9 @@ def _candidate_conditions(policy: ReviewedSourcePolicy) -> tuple[str, dict[str, 
         params[f"document_type_{index}"] = document_type_key
         params[f"field_key_{index}"] = field_key
     if not clauses:
-        raise RuntimeError(f"Final-source policy {policy.attribute_key} has no technical pairs")
+        raise RuntimeError(
+            f"Final-source policy {policy.attribute_key} has no technical pairs"
+        )
     return " OR ".join(clauses), params
 
 
@@ -195,7 +219,12 @@ def _reviewed_candidates(
 
 
 def _normalized_value(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
 
 
 def _choose_candidate(
@@ -204,7 +233,9 @@ def _choose_candidate(
 ) -> dict[str, Any] | None:
     if not candidates:
         return None
-    distinct_values = {_normalized_value(row["effective_value"]) for row in candidates}
+    distinct_values = {
+        _normalized_value(row["effective_value"]) for row in candidates
+    }
     if len(distinct_values) > 1:
         raise ConflictError(
             error_code="VAC-CONFLICT-015",
@@ -216,9 +247,8 @@ def _choose_candidate(
             ),
         )
 
-    # When current legitimate sources agree, deterministic provenance selection is
-    # safe because it does not change the business value. This is deliberately not
-    # a precedence rule for disagreement.
+    # Deterministic provenance is safe only when all current legitimate sources
+    # already agree on the business value. This is not a disagreement precedence.
     return min(
         candidates,
         key=lambda row: (
@@ -375,7 +405,9 @@ def _resolution_rows(
     return [dict(row) for row in rows]
 
 
-def _resolution_models(rows: list[dict[str, Any]]) -> list[FinalSourceResolution]:
+def _resolution_models(
+    rows: list[dict[str, Any]],
+) -> list[FinalSourceResolution]:
     return [
         FinalSourceResolution(
             attributeKey=str(row["attribute_key"]),
@@ -401,7 +433,10 @@ def _resolution_models(rows: list[dict[str, Any]]) -> list[FinalSourceResolution
 def get_final_source_status(
     tenant_id: str,
     journey_id: UUID,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    human_principal: Annotated[
+        HumanPrincipal,
+        Depends(get_human_principal),
+    ],
     authorization_client: Annotated[
         SecurityAuthorizationClient,
         Depends(get_security_authorization_client),
@@ -423,24 +458,25 @@ def get_final_source_status(
     )
     booking_status = _review_status(states.get("BOOKING"))
     delivery_status = _review_status(states.get("DELIVERY"))
-    rows = _resolution_rows(connection, tenant_id=tenant_id, journey_id=journey_id)
-    post_state = connection.execute(
-        text(
-            """
-            SELECT version_no
-            FROM auditcore.journey_stage_states
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code='POST_DELIVERY'
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one_or_none()
+    rows = _resolution_rows(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+    )
+    gate = post_delivery_rule_gate_status(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+    )
 
-    if post_state is not None:
-        status: Literal["NOT_READY", "MAPPING_BLOCKED", "READY", "CONFIRMED"] = (
-            "CONFIRMED"
-        )
-        version = int(post_state["version_no"])
+    if int(gate["postDeliveryVersion"]) > 0:
+        status: Literal[
+            "NOT_READY",
+            "MAPPING_BLOCKED",
+            "READY",
+            "CONFIRMED",
+        ] = "CONFIRMED"
+        version = int(gate["postDeliveryVersion"])
     elif booking_status != "VERIFIED" or delivery_status != "VERIFIED":
         status = "NOT_READY"
         version = int((states.get("DELIVERY") or {}).get("version_no") or 0)
@@ -458,23 +494,38 @@ def get_final_source_status(
         deliveryReviewStatus=delivery_status,
         aggregateVersion=version,
         resolutionCount=len(rows),
+        postDeliveryAuditState=str(gate["postDeliveryAuditState"]),
+        postDeliveryAuditStatus=str(gate["postDeliveryAuditStatus"]),
+        ruleTaskId=gate["ruleTaskId"],
+        ruleTaskStatus=gate["ruleTaskStatus"],
+        ruleTaskEffectKey=gate["ruleTaskEffectKey"],
+        reportReady=bool(gate["reportReady"]),
         technicalGaps=_technical_gaps(),
         resolutions=_resolution_models(rows),
     )
 
 
-@router.post("/audit/final-source/confirm", response_model=FinalSourceConfirmResponse)
+@router.post(
+    "/audit/final-source/confirm",
+    response_model=FinalSourceConfirmResponse,
+)
 def confirm_final_source(
     tenant_id: str,
     journey_id: UUID,
     request: Request,
     response: Response,
-    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
+    if_match: Annotated[
+        str,
+        Header(alias="If-Match", min_length=1, max_length=64),
+    ],
     idempotency_key: Annotated[
         str,
         Header(alias="Idempotency-Key", min_length=8, max_length=200),
     ],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    human_principal: Annotated[
+        HumanPrincipal,
+        Depends(get_human_principal),
+    ],
     authorization_client: Annotated[
         SecurityAuthorizationClient,
         Depends(get_security_authorization_client),
@@ -491,13 +542,17 @@ def confirm_final_source(
     expected_delivery_version = _parse_if_match(if_match)
     correlation_id = get_correlation_id(request)
 
-    # Technical source mappings are static/versioned configuration. Fail before the
-    # idempotency command/transaction mutates any final-source state.
+    # Static/versioned technical source gaps fail before the idempotency command
+    # can mutate any final-source or workflow state.
     if UNRESOLVED_TECHNICAL_POLICIES:
         raise _mapping_blocked_error()
 
     def execute() -> dict[str, Any]:
-        _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
+        _aggregate_lock(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+        )
         states = _review_stage_states(
             connection,
             tenant_id=tenant_id,
@@ -522,11 +577,13 @@ def confirm_final_source(
             raise ConflictError(
                 error_code="VAC-CONFLICT-010",
                 title="Final source is already confirmed",
-                detail="The post-Delivery final source has already been committed.",
+                detail=(
+                    "The post-Delivery final source has already been committed."
+                ),
             )
 
-        # Resolve every policy before inserting the first final row so source
-        # disagreement can never leave a partial winner set in this transaction.
+        # Resolve every configured source before the first final-row insert so a
+        # disagreement cannot leave a partial winner set in this transaction.
         selected, missing = _preflight_final_sources(
             connection,
             tenant_id=tenant_id,
@@ -540,7 +597,9 @@ def confirm_final_source(
                 tenant_id=tenant_id,
                 journey_id=journey_id,
                 attribute_key=policy.attribute_key,
-                source_reviewed_field_id=UUID(str(candidate["extracted_field_id"])),
+                source_reviewed_field_id=UUID(
+                    str(candidate["extracted_field_id"])
+                ),
                 actor_id=human_principal.subject,
                 resolution_rule=policy.resolution_rule,
             )
@@ -550,6 +609,13 @@ def confirm_final_source(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
+        )
+        rule_task_id = ensure_post_delivery_rule_task(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            finalization_version=aggregate_version,
+            correlation_id=correlation_id,
         )
         _append_final_source_event(
             connection,
@@ -568,6 +634,8 @@ def confirm_final_source(
             "status": "CONFIRMED",
             "aggregateVersion": aggregate_version,
             "resolvedAttributeCount": len(resolved_keys),
+            "ruleTaskId": str(rule_task_id),
+            "reportReady": False,
             "missingAttributes": missing,
         }
 
@@ -576,7 +644,9 @@ def confirm_final_source(
         tenant_id=tenant_id,
         operation_key=f"uc03.final-source.confirm:{journey_id}",
         idempotency_key=idempotency_key,
-        request_payload={"expectedDeliveryVersion": expected_delivery_version},
+        request_payload={
+            "expectedDeliveryVersion": expected_delivery_version,
+        },
         execute=execute,
     )
     response.headers["ETag"] = f'"{body["aggregateVersion"]}"'
