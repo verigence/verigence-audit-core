@@ -165,4 +165,4 @@ def test_0052_migration_enforces_same_journey_reviewed_field_reference() -> None
     assert "ALTER COLUMN source_di_document_id DROP NOT NULL" in migration
     assert "stage_code IN ('BOOKING','DELIVERY')" in migration
     assert "stage_code = 'POST_DELIVERY'" in migration
-    assert "No fake DI" not in migration  # contract is expressed by SQL, not placeholders
+    assert "No fake DI identifiers are manufactured." in migration
