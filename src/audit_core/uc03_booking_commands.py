@@ -521,6 +521,7 @@ def start_booking(
             execute=execute,
         )
     _set_etag(response, body)
+    logger.info("booking_started", journey_id=str(journey_id), tenant_id=tenant_id, actor_id=human_principal.subject)
     return BookingCommandResponse.model_validate(body)
 
 
@@ -639,6 +640,7 @@ def close_booking_no_delivery(
             execute=execute,
         )
     _set_etag(response, body)
+    logger.info("booking_closed_no_delivery", journey_id=str(journey_id), tenant_id=tenant_id, reason_code=reason_code)
     return BookingCommandResponse.model_validate(body)
 
 
@@ -754,6 +756,7 @@ def cancel_booking(
             execute=execute,
         )
     _set_etag(response, body)
+    logger.info("booking_cancelled", journey_id=str(journey_id), tenant_id=tenant_id, reason_code=reason_code)
     return BookingCommandResponse.model_validate(body)
 
 
@@ -886,4 +889,5 @@ def mark_duplicate_booking(
             execute=execute,
         )
     _set_etag(response, body)
+    logger.info("booking_marked_duplicate", journey_id=str(journey_id), tenant_id=tenant_id, actor_id=human_principal.subject)
     return BookingCommandResponse.model_validate(body)
