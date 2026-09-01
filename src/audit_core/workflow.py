@@ -8,6 +8,7 @@ import structlog
 from sqlalchemy import Connection, text
 
 from audit_core.errors import AuditCoreError, NotFoundError
+from audit_core.telemetry import record_metric
 
 logger = structlog.get_logger(__name__)
 
@@ -586,6 +587,7 @@ def recover_stale_worker_tasks(
             task_id=str(row["workflow_task_id"]),
             tenant_id=tenant_id,
         )
+        record_metric("audit_core.workflow.stale_recovered")
     return [row["workflow_task_id"] for row in rows]
 
 

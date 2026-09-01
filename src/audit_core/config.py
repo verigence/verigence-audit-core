@@ -24,6 +24,7 @@ class Settings:
     observability_enabled: bool = field(default=False)
     success_events_enabled: bool = field(default=True)
     trace_spans_enabled: bool = field(default=False)
+    slow_request_threshold_ms: float = field(default=2000.0)
     observability_export_timeout_seconds: float = field(default=2.0)
     observability_batch_delay_ms: int = field(default=1000)
     observability_max_queue_size: int = field(default=2048)
@@ -108,6 +109,11 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         ),
         trace_spans_enabled=(
             source.get("AUDIT_CORE_TRACE_SPANS_ENABLED", "false").strip().lower() == "true"
+        ),
+        slow_request_threshold_ms=_positive_float(
+            source,
+            "AUDIT_CORE_SLOW_REQUEST_THRESHOLD_MS",
+            2000.0,
         ),
         observability_export_timeout_seconds=_positive_float(
             source,

@@ -108,6 +108,18 @@ def install_observability(app: FastAPI) -> None:
                         status_code=status_code,
                         duration_ms=round(duration_ms, 2),
                     )
+                if status_code < 400:
+                    from audit_core.config import load_settings as _load_settings
+                    _threshold = _load_settings().slow_request_threshold_ms
+                    if duration_ms > _threshold:
+                        logger.warning(
+                            "http_request_slow",
+                            method=request.method,
+                            path=request.url.path,
+                            status_code=status_code,
+                            duration_ms=round(duration_ms, 2),
+                            threshold_ms=_threshold,
+                        )
 
 
 def log_dependency(
