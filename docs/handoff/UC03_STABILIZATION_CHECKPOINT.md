@@ -94,22 +94,39 @@ Verified findings:
 - Invoices are repeatable documents and must not be collapsed to one global `final invoice`; whether a typed repeated Invoice owner is needed remains **UNKNOWN** pending report/rule ownership;
 - legacy Status/Delivery Date/Audit fields should come from workflow/event/audit owners, not source-resolution rows.
 
-### Unit C — canonical document normalization concrete gap
+### Unit C — canonical document identity / alias assessment
 
-**Status: VERIFIED GAP / exact DI emitted key UNKNOWN**
+**Status: INVESTIGATED; VERIFIED GAPS identified; exact DI aliases remain UNKNOWN**
 
-The default Audit Core Delivery catalogue uses:
+Recorded in:
 
-- requirement key `insurance_cover_note`;
-- document type key `insurance_cover`.
+`docs/uc-003-booking-delivery-audit/UC03_CANONICAL_DOCUMENT_IDENTITY_ASSESSMENT_2026-09-01.md`
 
-Current attribute mapping for Insurance Amount prioritizes `insurance_cover_note` / `insurance_policy` before Booking Form/Docket.
+Verified runtime behavior:
 
-The V2 Review resolver uses the DI `classifiedDocumentTypeKey` (or stored classified key) as the candidate document type.
+- V2 capture reconciles DI `classifiedDocumentTypeKey` to requirement `document_type_key` by exact equality;
+- the current runtime does not consult `document_capture_v2_source_truth_rules` during capture reconciliation;
+- Review uses the classified key as the candidate source key;
+- typed materializers also contain their own document-type constants/sets.
 
-Therefore Insurance exposes a concrete canonical-key mismatch risk. Which exact insurance key DI currently emits is **UNKNOWN in Audit Core-only Step 1**. Do not invent an alias.
+Family assessment:
 
-Migration `0036_uc03_document_capture_v2` already contains `document_capture_v2_source_truth_rules`; reuse/authoritative seeding is preferred over introducing another alias table.
+- Booking Docket/Form: **VERIFIED GAP** — published `booking_docket`; typed materializer expects `booking_form`; resolver accepts both;
+- PAN: **ALIGNED canonical / alias UNKNOWN** — `pan_card` aligned; `pan` is extra unverified alias;
+- Aadhaar: **ALIGNED**;
+- Customer DMS Invoice: **ALIGNED canonical**;
+- Tally Tax Invoice: **ALIGNED canonical / extra aliases UNKNOWN**;
+- Wholesale Invoice: **ALIGNED catalogue; per-attribute final-source use UNKNOWN**;
+- Cost Sheet: **ALIGNED**;
+- Insurance: **VERIFIED GAP** — published document type `insurance_cover`; resolver uses `insurance_cover_note` / `insurance_policy`;
+- Payment/Dealer Receipt: **VERIFIED GAP** — Booking `minimum_booking_payment_proof`, Delivery `payment_receipt`, but typed receipt path expects `dealer_receipt`.
+
+Corrected design conclusion:
+
+- `document_capture_v2_source_truth_rules` can be a reuse candidate for **attribute-level final-source policy**;
+- it is not currently a runtime alias normalizer and current evidence does not prove it is sufficient as the sole cross-module document alias master;
+- prefer one authoritative canonical DI/catalogue document key contract and align Audit Core catalogue/resolver/materializers to it;
+- do not create another alias table until Step 2 proves existing cross-module catalogue/source-truth structures cannot represent the contract.
 
 ### Unit D — final-report artifact verification
 
@@ -138,28 +155,32 @@ Therefore still `UNKNOWN`:
 - Do not assume confidence is business authority; it is extraction-quality evidence.
 - Do not assume one final Invoice or one Invoice per Journey.
 - Do not treat the 123-field matrix as the final 152-field report workbook; it is a provisional capture/source inventory.
+- Do not treat `document_capture_v2_source_truth_rules` as an already-working canonical alias mechanism; current capture reconciliation does not consume it.
 
 ## Remaining Step-1 items
 
-1. finish Audit Core canonical alias/family assessment using only authoritative current catalogue/contract evidence;
-2. produce the consolidated Step-1 gap/design package: reuse vs extension vs genuinely new structures, database/API impact, implementation sequence and acceptance tests;
-3. identify/obtain the actual 152-field final-report workbook and map every output to typed/resolved/repeated/computed ownership;
-4. retain typed repeated Invoice structure as **UNKNOWN** until #3 or an approved rule proves it necessary;
-5. freeze exact overlapping-source precedence only where authoritative evidence exists; leave the rest `UNKNOWN` for the later DI/business contract-validation step rather than guessing.
+1. produce the consolidated Step-1 gap/design package: reuse vs extension vs genuinely new structures, database/API impact, implementation sequence and acceptance tests;
+2. identify/obtain the actual 152-field final-report workbook and map every output to typed/resolved/repeated/computed ownership;
+3. retain typed repeated Invoice structure as **UNKNOWN** until #2 or an approved rule proves it necessary;
+4. freeze exact overlapping-source precedence only where authoritative evidence exists; leave the rest `UNKNOWN` for the later DI/business contract-validation step rather than guessing.
 
 ## NEXT ACTION
 
-**One evidence question only:** complete the Audit Core canonical document identity/alias assessment for the document families already used by current `ATTRIBUTE_SPECS` and the published Booking/Delivery requirement catalogue.
+**One investigation/design unit only:** consolidate the completed Audit Core Step-1 evidence into a single implementation-ready gap/design package without writing schema/application code.
 
-Specifically:
+The package must state:
 
-1. compare current requirement keys, `document_type_key` values and resolver source-priority keys for Booking Form/Docket, PAN/Aadhaar, Invoice families, Cost Sheet and Insurance;
-2. classify each family as `ALIGNED`, `VERIFIED GAP`, or `UNKNOWN` without reading DI yet;
-3. determine whether existing `document_capture_v2_source_truth_rules` can be reused as the sole normalization structure;
-4. update this checkpoint after that unit;
-5. then consolidate the Step-1 design package and expose the genuine external blocker: the actual 152-field final-report workbook / unresolved authoritative mapping values.
+1. structures to reuse unchanged;
+2. structures requiring the smallest extension;
+3. genuinely new structures, if any;
+4. exact verified canonical-identity gaps and what remains `UNKNOWN`;
+5. final-source confirm API/database impact at design level;
+6. rule-run/report readiness gate at design level;
+7. acceptance-test plan;
+8. implementation sequence and rollback boundaries;
+9. explicit external blockers — especially the actual 152-field final-report workbook and exact DI canonical/source mapping values.
 
-Do **not** enter DI or Web, and do not write migration/application code, until the current Step-1 investigation/design gate is closed and separate approval is received.
+Then update this checkpoint and stop before implementation approval. Do **not** enter DI or Web and do not write migration/application code in this unit.
 
 ## Anti-stuck rule
 
