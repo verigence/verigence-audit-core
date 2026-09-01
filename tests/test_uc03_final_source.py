@@ -14,6 +14,7 @@ from audit_core.uc03_final_source import (
     _choose_candidate,
     _require_verified_reviews,
     confirm_final_source,
+    get_final_source_status,
     router,
 )
 from audit_core.uc03_final_source_policy import ReviewedSourcePolicy
@@ -29,7 +30,13 @@ def _policy() -> ReviewedSourcePolicy:
     )
 
 
-def _candidate(*, value, stage="BOOKING", document_type="pan_card", field="pan_name"):
+def _candidate(
+    *,
+    value,
+    stage="BOOKING",
+    document_type="pan_card",
+    field="pan_name",
+):
     return {
         "extracted_field_id": uuid4(),
         "stage_code": stage,
@@ -46,7 +53,8 @@ def test_final_source_routes_are_additive_get_and_post() -> None:
     status_routes = [
         route
         for route in router.routes
-        if isinstance(route, APIRoute) and route.path.endswith("/audit/final-source")
+        if isinstance(route, APIRoute)
+        and route.path.endswith("/audit/final-source")
     ]
     confirm_routes = [
         route
@@ -118,7 +126,11 @@ def test_disagreeing_legitimate_sources_fail_closed() -> None:
         _choose_candidate(
             _policy(),
             [
-                _candidate(value="Customer A", document_type="pan_card", field="pan_name"),
+                _candidate(
+                    value="Customer A",
+                    document_type="pan_card",
+                    field="pan_name",
+                ),
                 _candidate(
                     value="Customer B",
                     stage="DELIVERY",
@@ -155,17 +167,36 @@ def test_confirm_fails_mapping_closed_before_idempotent_or_resolution_writes() -
     assert "_mapping_blocked_error()" in source
 
 
-def test_confirm_preflights_all_sources_before_first_resolution_insert() -> None:
+def test_confirm_preflights_and_creates_rule_task_after_final_stage() -> None:
     source = inspect.getsource(confirm_final_source)
 
     assert source.index("_preflight_final_sources(") < source.index(
         "record_post_delivery_reviewed_resolution("
+    )
+    assert source.index("_create_post_delivery_stage(") < source.index(
+        "ensure_post_delivery_rule_task("
+    )
+    assert source.index("ensure_post_delivery_rule_task(") < source.index(
+        "_append_final_source_event("
     )
     assert "_aggregate_lock(" in source
     assert "_require_verified_reviews(states)" in source
     assert "expected_delivery_version = _parse_if_match(if_match)" in source
     assert "execute_idempotent_json_command(" in source
     assert "_existing_finalization(" in source
+    assert '"ruleTaskId": str(rule_task_id)' in source
+    assert '"reportReady": False' in source
+
+
+def test_final_source_status_exposes_persisted_rule_and_report_gate() -> None:
+    source = inspect.getsource(get_final_source_status)
+
+    assert "post_delivery_rule_gate_status(" in source
+    assert "postDeliveryAuditState" in source
+    assert "postDeliveryAuditStatus" in source
+    assert "ruleTaskId" in source
+    assert "ruleTaskStatus" in source
+    assert "reportReady" in source
 
 
 def test_final_source_command_uses_durable_core_only_not_di() -> None:
