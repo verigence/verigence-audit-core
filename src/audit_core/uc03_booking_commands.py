@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, Header, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Connection, text
@@ -26,6 +27,9 @@ from audit_core.security_authorization import (
     SecurityAuthorizationError,
     get_security_authorization_client,
 )
+from audit_core.telemetry import trace_span
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/journeys/{journey_id}/booking",
@@ -448,11 +452,12 @@ def start_booking(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> BookingCommandResponse:
-    _authorize_security(
-        authorization_client,
-        human_principal=human_principal,
-        tenant_id=tenant_id,
-    )
+    with trace_span("booking.authorize", correlation_id=get_correlation_id(request)):
+        _authorize_security(
+            authorization_client,
+            human_principal=human_principal,
+            tenant_id=tenant_id,
+        )
     set_tenant_context(connection, tenant_id)
     context = _journey_context(
         connection,
@@ -506,14 +511,15 @@ def start_booking(
         )
         return _build_response(row, event_id=event_id)
 
-    body, _ = execute_idempotent_json_command(
-        connection,
-        tenant_id=tenant_id,
-        operation_key=f"uc03.booking.start:{journey_id}",
-        idempotency_key=idempotency_key,
-        request_payload={"expectedVersion": expected_version},
-        execute=execute,
-    )
+    with trace_span("booking.execute", correlation_id=correlation_id):
+        body, _ = execute_idempotent_json_command(
+            connection,
+            tenant_id=tenant_id,
+            operation_key=f"uc03.booking.start:{journey_id}",
+            idempotency_key=idempotency_key,
+            request_payload={"expectedVersion": expected_version},
+            execute=execute,
+        )
     _set_etag(response, body)
     return BookingCommandResponse.model_validate(body)
 
@@ -537,11 +543,12 @@ def close_booking_no_delivery(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> BookingCommandResponse:
-    _authorize_security(
-        authorization_client,
-        human_principal=human_principal,
-        tenant_id=tenant_id,
-    )
+    with trace_span("booking.authorize", correlation_id=get_correlation_id(request)):
+        _authorize_security(
+            authorization_client,
+            human_principal=human_principal,
+            tenant_id=tenant_id,
+        )
     set_tenant_context(connection, tenant_id)
     context = _journey_context(
         connection,
@@ -618,18 +625,19 @@ def close_booking_no_delivery(
         )
         return _build_response(row, event_id=event_id)
 
-    body, _ = execute_idempotent_json_command(
-        connection,
-        tenant_id=tenant_id,
-        operation_key=f"uc03.booking.close-no-delivery:{journey_id}",
-        idempotency_key=idempotency_key,
-        request_payload={
-            "expectedVersion": expected_version,
-            **payload.model_dump(mode="json"),
-            "closeReasonCode": reason_code,
-        },
-        execute=execute,
-    )
+    with trace_span("booking.execute", correlation_id=correlation_id):
+        body, _ = execute_idempotent_json_command(
+            connection,
+            tenant_id=tenant_id,
+            operation_key=f"uc03.booking.close-no-delivery:{journey_id}",
+            idempotency_key=idempotency_key,
+            request_payload={
+                "expectedVersion": expected_version,
+                **payload.model_dump(mode="json"),
+                "closeReasonCode": reason_code,
+            },
+            execute=execute,
+        )
     _set_etag(response, body)
     return BookingCommandResponse.model_validate(body)
 
@@ -653,11 +661,12 @@ def cancel_booking(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> BookingCommandResponse:
-    _authorize_security(
-        authorization_client,
-        human_principal=human_principal,
-        tenant_id=tenant_id,
-    )
+    with trace_span("booking.authorize", correlation_id=get_correlation_id(request)):
+        _authorize_security(
+            authorization_client,
+            human_principal=human_principal,
+            tenant_id=tenant_id,
+        )
     set_tenant_context(connection, tenant_id)
     context = _journey_context(
         connection,
@@ -731,18 +740,19 @@ def cancel_booking(
         )
         return _build_response(row, event_id=event_id)
 
-    body, _ = execute_idempotent_json_command(
-        connection,
-        tenant_id=tenant_id,
-        operation_key=f"uc03.booking.cancel:{journey_id}",
-        idempotency_key=idempotency_key,
-        request_payload={
-            "expectedVersion": expected_version,
-            **payload.model_dump(mode="json"),
-            "closeReasonCode": reason_code,
-        },
-        execute=execute,
-    )
+    with trace_span("booking.execute", correlation_id=correlation_id):
+        body, _ = execute_idempotent_json_command(
+            connection,
+            tenant_id=tenant_id,
+            operation_key=f"uc03.booking.cancel:{journey_id}",
+            idempotency_key=idempotency_key,
+            request_payload={
+                "expectedVersion": expected_version,
+                **payload.model_dump(mode="json"),
+                "closeReasonCode": reason_code,
+            },
+            execute=execute,
+        )
     _set_etag(response, body)
     return BookingCommandResponse.model_validate(body)
 
@@ -766,11 +776,12 @@ def mark_duplicate_booking(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> BookingCommandResponse:
-    _authorize_security(
-        authorization_client,
-        human_principal=human_principal,
-        tenant_id=tenant_id,
-    )
+    with trace_span("booking.authorize", correlation_id=get_correlation_id(request)):
+        _authorize_security(
+            authorization_client,
+            human_principal=human_principal,
+            tenant_id=tenant_id,
+        )
     set_tenant_context(connection, tenant_id)
     context = _journey_context(
         connection,
@@ -862,16 +873,17 @@ def mark_duplicate_booking(
         )
         return _build_response(row, event_id=event_id, flag_id=flag_id)
 
-    body, _ = execute_idempotent_json_command(
-        connection,
-        tenant_id=tenant_id,
-        operation_key=f"uc03.booking.mark-duplicate:{journey_id}",
-        idempotency_key=idempotency_key,
-        request_payload={
-            "expectedVersion": expected_version,
-            **payload.model_dump(mode="json"),
-        },
-        execute=execute,
-    )
+    with trace_span("booking.execute", correlation_id=correlation_id):
+        body, _ = execute_idempotent_json_command(
+            connection,
+            tenant_id=tenant_id,
+            operation_key=f"uc03.booking.mark-duplicate:{journey_id}",
+            idempotency_key=idempotency_key,
+            request_payload={
+                "expectedVersion": expected_version,
+                **payload.model_dump(mode="json"),
+            },
+            execute=execute,
+        )
     _set_etag(response, body)
     return BookingCommandResponse.model_validate(body)
