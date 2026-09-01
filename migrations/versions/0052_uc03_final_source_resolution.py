@@ -1,6 +1,6 @@
 """Extend UC03 attribute resolutions for durable post-Delivery final source.
 
-Revision ID: 0052_uc03_final_source_resolution
+Revision ID: 0052_uc03_final_source
 Revises: 0051_uc03_lossless_review_fields
 Create Date: 2026-09-01
 
@@ -15,7 +15,7 @@ source-identity requirements therefore remain unchanged.
 """
 from alembic import op
 
-revision = "0052_uc03_final_source_resolution"
+revision = "0052_uc03_final_source"
 down_revision = "0051_uc03_lossless_review_fields"
 branch_labels = None
 depends_on = None
