@@ -61,34 +61,43 @@ class SecurityOperatingRoleMutation:
 
 
 class SecurityAdminClient:
-    """Human-admin client that always forwards the initiating Security bearer token."""
+    """Human-admin async client that always forwards the initiating Security bearer token.
+
+    Must be created once (e.g. in lifespan) and reused across requests.
+    Use aclose() or the async context manager to release the connection pool.
+    """
 
     def __init__(
         self,
         *,
         base_url: str,
         timeout_seconds: float = 5.0,
-        transport: httpx.BaseTransport | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         if not base_url.strip():
             raise ValueError("Security base URL is required")
-        self._client = httpx.Client(
+        self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
-            timeout=timeout_seconds,
+            timeout=httpx.Timeout(
+                connect=2.0,
+                read=timeout_seconds,
+                write=timeout_seconds,
+                pool=2.0,
+            ),
             transport=transport,
         )
 
-    def close(self) -> None:
-        self._client.close()
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
-    def __enter__(self) -> Self:
+    async def __aenter__(self) -> Self:
         return self
 
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        self.close()
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        await self.aclose()
 
-    def get_admin_context(self, *, human_bearer_token: str) -> SecurityAdminContext:
-        payload = self._request_json(
+    async def get_admin_context(self, *, human_bearer_token: str) -> SecurityAdminContext:
+        payload = await self._request_json(
             "GET",
             "/security/v1/platform/admin-context",
             human_bearer_token=human_bearer_token,
@@ -132,14 +141,14 @@ class SecurityAdminClient:
             admin_scopes=tuple(scopes),
         )
 
-    def create_tenant(
+    async def create_tenant(
         self,
         *,
         human_bearer_token: str,
         tenant_name: str,
         idempotency_key: str,
     ) -> SecurityTenant:
-        payload = self._request_json(
+        payload = await self._request_json(
             "POST",
             "/security/v1/platform/tenants",
             human_bearer_token=human_bearer_token,
@@ -151,26 +160,26 @@ class SecurityAdminClient:
             raise SecurityAdminError("Security Tenant create response has invalid shape")
         return self._tenant_from_payload(payload, requested_tenant_id=tenant_id)
 
-    def get_tenant(
+    async def get_tenant(
         self,
         *,
         human_bearer_token: str,
         tenant_id: str,
     ) -> SecurityTenant:
-        payload = self._request_json(
+        payload = await self._request_json(
             "GET",
             f"/security/v1/platform/tenants/{tenant_id}",
             human_bearer_token=human_bearer_token,
         )
         return self._tenant_from_payload(payload, requested_tenant_id=tenant_id)
 
-    def activate_tenant(
+    async def activate_tenant(
         self,
         *,
         human_bearer_token: str,
         tenant_id: str,
     ) -> SecurityTenant:
-        payload = self._request_json(
+        payload = await self._request_json(
             "POST",
             f"/security/v1/platform/tenants/{tenant_id}/activate",
             human_bearer_token=human_bearer_token,
@@ -207,7 +216,7 @@ class SecurityAdminClient:
             status=tenant_status,
         )
 
-    def list_global_users(
+    async def list_global_users(
         self,
         *,
         human_bearer_token: str,
@@ -223,7 +232,7 @@ class SecurityAdminClient:
         }
         if search:
             params["search"] = search
-        payload = self._request_json_list(
+        payload = await self._request_json_list(
             "GET",
             "/security/v1/platform/users",
             human_bearer_token=human_bearer_token,
@@ -257,7 +266,7 @@ class SecurityAdminClient:
             )
         return tuple(users)
 
-    def set_operating_role(
+    async def set_operating_role(
         self,
         *,
         human_bearer_token: str,
@@ -265,7 +274,7 @@ class SecurityAdminClient:
         user_id: str,
         role_key: str,
     ) -> SecurityOperatingRoleMutation:
-        payload = self._request_json(
+        payload = await self._request_json(
             "PUT",
             f"/security/v1/tenants/{tenant_id}/users/{user_id}/operating-role",
             human_bearer_token=human_bearer_token,
@@ -273,14 +282,14 @@ class SecurityAdminClient:
         )
         return self._operating_role_mutation(payload)
 
-    def remove_operating_role(
+    async def remove_operating_role(
         self,
         *,
         human_bearer_token: str,
         tenant_id: str,
         user_id: str,
     ) -> SecurityOperatingRoleMutation:
-        payload = self._request_json(
+        payload = await self._request_json(
             "DELETE",
             f"/security/v1/tenants/{tenant_id}/users/{user_id}/operating-role",
             human_bearer_token=human_bearer_token,
@@ -312,7 +321,7 @@ class SecurityAdminClient:
             role_key=role_key,
         )
 
-    def _request_json(
+    async def _request_json(
         self,
         method: str,
         path: str,
@@ -322,7 +331,7 @@ class SecurityAdminClient:
         json_body: dict[str, object] | None = None,
         params: dict[str, str | int] | None = None,
     ) -> dict[str, Any]:
-        payload = self._request_payload(
+        payload = await self._request_payload(
             method,
             path,
             human_bearer_token=human_bearer_token,
@@ -334,7 +343,7 @@ class SecurityAdminClient:
             raise SecurityAdminError("Security administrative response has invalid shape")
         return payload
 
-    def _request_json_list(
+    async def _request_json_list(
         self,
         method: str,
         path: str,
@@ -342,7 +351,7 @@ class SecurityAdminClient:
         human_bearer_token: str,
         params: dict[str, str | int] | None = None,
     ) -> list[Any]:
-        payload = self._request_payload(
+        payload = await self._request_payload(
             method,
             path,
             human_bearer_token=human_bearer_token,
@@ -352,7 +361,7 @@ class SecurityAdminClient:
             raise SecurityAdminError("Security administrative response has invalid shape")
         return payload
 
-    def _request_payload(
+    async def _request_payload(
         self,
         method: str,
         path: str,
@@ -368,7 +377,7 @@ class SecurityAdminClient:
         if headers:
             request_headers.update(headers)
         try:
-            response = self._client.request(
+            response = await self._client.request(
                 method,
                 path,
                 headers=request_headers,
@@ -395,11 +404,10 @@ class SecurityAdminClient:
 
 
 class SecurityOAuthClient:
-    """Security v2 ServiceIntegration token client.
+    """Security v2 ServiceIntegration token async client.
 
-    ServiceIntegration is platform-global in Phase 1. A machine caller requests a
-    target-module audience from POST /security/v1/service/token; no Tenant scope,
-    permission list, delegated human token, or legacy OAuth grant is sent.
+    Must be created once (e.g. in lifespan) and reused across requests.
+    Use aclose() or the async context manager to release the connection pool.
     """
 
     def __init__(
@@ -409,27 +417,32 @@ class SecurityOAuthClient:
         client_id: str,
         client_secret: str,
         timeout_seconds: float = 5.0,
-        transport: httpx.BaseTransport | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         if not base_url.strip() or not client_id.strip() or not client_secret:
             raise ValueError("Security service-token base URL and client credentials are required")
-        self._client = httpx.Client(
+        self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             auth=(client_id, client_secret),
-            timeout=timeout_seconds,
+            timeout=httpx.Timeout(
+                connect=2.0,
+                read=timeout_seconds,
+                write=timeout_seconds,
+                pool=2.0,
+            ),
             transport=transport,
         )
 
-    def close(self) -> None:
-        self._client.close()
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
-    def __enter__(self) -> Self:
+    async def __aenter__(self) -> Self:
         return self
 
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        self.close()
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        await self.aclose()
 
-    def get_service_token(self, *, audience: str) -> str:
+    async def get_service_token(self, *, audience: str) -> str:
         requested_audience = audience.strip()
         if not requested_audience:
             raise ValueError("audience is required")
@@ -438,7 +451,7 @@ class SecurityOAuthClient:
             audience=requested_audience,
         )
         try:
-            response = self._client.post(
+            response = await self._client.post(
                 "/security/v1/service/token",
                 data={"audience": requested_audience},
             )

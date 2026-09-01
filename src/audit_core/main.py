@@ -1,3 +1,8 @@
+import os
+import time
+from contextlib import asynccontextmanager
+
+import structlog
 from fastapi import FastAPI
 
 from audit_core import role_mappings
@@ -10,6 +15,11 @@ from audit_core.crm_api import router as crm_router
 from audit_core.customers import router as customer_router
 from audit_core.daily_operations_api import router as daily_operations_router
 from audit_core.dealers import router as dealer_router
+from audit_core.dependencies import (
+    _check_db_rtt,
+    clear_security_admin_client,
+    set_security_admin_client,
+)
 from audit_core.di_project_master_proxy import router as di_project_master_proxy_router
 from audit_core.errors import install_error_handlers
 from audit_core.escalations_api import router as escalation_router
@@ -29,11 +39,39 @@ from audit_core.projects import router as project_router
 from audit_core.readiness import router as readiness_router
 from audit_core.reference_data import router as reference_data_router
 from audit_core.role_mapping_policy import install_role_mapping_policy
+from audit_core.security_integration import SecurityAdminClient
 from audit_core.tasks_api import router as task_router
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
+logger = structlog.get_logger(__name__)
+
 install_role_mapping_policy(role_mappings)
 role_mapping_router = role_mappings.router
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Start-up: create shared async HTTP clients, verify DB RTT.
+    Shut-down: drain and close all clients so Railway SIGTERM completes cleanly.
+    """
+    security_base_url = os.environ.get("SECURITY_BASE_URL", "").strip()
+    if not security_base_url:
+        raise RuntimeError("SECURITY_BASE_URL is required")
+
+    admin_client = SecurityAdminClient(base_url=security_base_url)
+    set_security_admin_client(admin_client)
+
+    # Verify DB round-trip time — warn if > 5 ms (cross-region Neon)
+    _check_db_rtt()
+
+    logger.info("audit_core_startup_complete", security_base_url=security_base_url)
+
+    yield
+
+    # Graceful shutdown — close async HTTP client pools
+    await admin_client.aclose()
+    clear_security_admin_client()
+    logger.info("audit_core_shutdown_complete")
 
 
 def create_app() -> FastAPI:
@@ -44,6 +82,7 @@ def create_app() -> FastAPI:
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=_lifespan,
     )
     install_error_handlers(application)
     install_observability(application)
