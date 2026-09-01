@@ -84,6 +84,7 @@ from audit_core.uc03_document_capture_v2_rules import (
 )
 from audit_core.uc03_document_review_v2 import router as uc03_document_review_v2_router
 from audit_core.uc03_fast_work_items import router as uc03_fast_work_items_router
+from audit_core.uc03_final_source import router as uc03_final_source_router
 from audit_core.uc03_identity_business_date import install_uc03_identity_business_date
 from audit_core.uc03_identity_business_date import (
     router as uc03_identity_business_date_router,
@@ -174,6 +175,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_sku_candidates_router)
     application.include_router(uc03_document_capture_v2_router)
     application.include_router(uc03_document_review_v2_router)
+    application.include_router(uc03_final_source_router)
     application.include_router(uc03_pc_booking_documents_router)
     application.include_router(uc03_pc_direct_review_router)
     application.include_router(uc03_pc_generic_review_router)
