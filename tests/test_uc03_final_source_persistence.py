@@ -6,7 +6,6 @@ import pytest
 
 from audit_core.uc03_final_source_persistence import (
     record_post_delivery_reviewed_resolution,
-    record_post_delivery_typed_resolution,
 )
 
 
@@ -104,52 +103,7 @@ def test_reviewed_resolution_rejects_field_from_another_or_unaccepted_journey() 
     assert len(connection.calls) == 1
 
 
-def test_typed_resolution_uses_owner_without_fake_di_identity_and_keeps_zero() -> None:
-    resolution_id = uuid4()
-    connection = _Connection(_ScalarResult(resolution_id))
-
-    result = record_post_delivery_typed_resolution(
-        connection,
-        tenant_id="tenant-a",
-        journey_id=uuid4(),
-        attribute_key="customer_type",
-        resolved_value=0,
-        actor_id="pc-1",
-        resolution_rule="FINAL_REPORT_SOURCE_BOOKING_RETAIL_DUMP",
-        owning_domain_key="CUSTOMER",
-        owning_record_reference="customer-1",
-    )
-
-    assert result == resolution_id
-    sql, params = connection.calls[0]
-    assert "NULL, NULL" in sql
-    assert "source_reviewed_field_id" in sql
-    assert json.loads(params["resolved_value_snapshot"]) == 0
-    assert params["owning_domain_key"] == "CUSTOMER"
-    assert params["owning_record_reference"] == "customer-1"
-
-
-@pytest.mark.parametrize("value", [None, ""])
-def test_typed_resolution_requires_populated_value(value) -> None:
-    connection = _Connection()
-
-    with pytest.raises(ValueError, match="populated value"):
-        record_post_delivery_typed_resolution(
-            connection,
-            tenant_id="tenant-a",
-            journey_id=uuid4(),
-            attribute_key="customer_type",
-            resolved_value=value,
-            actor_id="pc-1",
-            resolution_rule="FINAL_REPORT_SOURCE_BOOKING_RETAIL_DUMP",
-            owning_domain_key="CUSTOMER",
-            owning_record_reference="customer-1",
-        )
-
-    assert connection.calls == []
-
-
-def test_0052_migration_enforces_same_journey_reviewed_field_reference() -> None:
+def test_0052_migration_is_additive_and_enforces_same_journey_reference() -> None:
     migration = (
         Path(__file__).parents[1]
         / "migrations"
@@ -162,7 +116,5 @@ def test_0052_migration_enforces_same_journey_reviewed_field_reference() -> None
     assert (
         "FOREIGN KEY (tenant_id, journey_id, source_reviewed_field_id)" in migration
     )
-    assert "ALTER COLUMN source_di_document_id DROP NOT NULL" in migration
-    assert "stage_code IN ('BOOKING','DELIVERY')" in migration
-    assert "stage_code = 'POST_DELIVERY'" in migration
-    assert "No fake DI identifiers are manufactured." in migration
+    assert "ALTER COLUMN source_di_document_id DROP NOT NULL" not in migration
+    assert "typed/source-system report fields remain in their existing domain owners" in migration
