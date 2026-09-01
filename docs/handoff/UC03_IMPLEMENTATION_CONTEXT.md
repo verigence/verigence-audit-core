@@ -22,7 +22,9 @@
 
 ## Final invariant to implement
 
-After Booking Review and Delivery Review are both VERIFIED, Audit Core can commit a durable post-Delivery final source for each approved scalar report/business attribute without re-reading live DI as final business state. The committed result must retain exact source provenance and a stable final value snapshot. Repeated Payments/Receipts and multiple Invoice documents remain distinct collections/documents and are not collapsed into scalar winners. The final report remains blocked until the post-Delivery rule-run boundary completes successfully.
+After Booking Review and Delivery Review are both VERIFIED, Audit Core can commit durable post-Delivery final-source rows for approved **document-derived scalar** report/business attributes without re-reading live DI as final business state. Each committed row retains exact reviewed-field/document/fact provenance and a stable resolved value snapshot.
+
+Typed/source-system outputs continue to come directly from their existing Audit Core business owners; they are not duplicated into the resolution ledger. Repeated Payments/Receipts and multiple Invoice documents remain distinct collections/documents and are not collapsed into scalar winners. The final report remains blocked until the post-Delivery rule-run boundary completes successfully.
 
 ## Authoritative business inputs
 
@@ -46,24 +48,27 @@ Examples:
 
 `NA` means the output is not document-derived; it does not mean no value.
 
+The active contract is 122 physical rows, 113 labelled outputs excluding two `-` separators, and 81 unique non-separator labels. This supersedes the earlier unverified 152-field assumption.
+
 Technical DI/canonical keys not proven by current Audit Core evidence remain `UNKNOWN` and must fail closed. Do not invent aliases.
 
 ## Verified current state
 
 - `journey_document_extracted_fields` is the durable reviewed-field layer for BOOKING and DELIVERY after migration `0051`.
 - `journey_attribute_resolutions` already supports `POST_DELIVERY`, one resolution per Journey/stage/attribute, selected-source provenance, resolution rule/mapping version, optional owning domain/reference, actor/time, and append-only runtime semantics.
-- It is currently reference-only: it has no stable final value snapshot and no direct reference to the selected reviewed-field row.
+- Before `0052` it had no stable final value snapshot and no direct reference to the selected reviewed-field row.
 - Existing `/audit/source-comparison` computes transient values and remains read-only.
 - `journey_stage_states` already supports `POST_DELIVERY` with audit state/status.
 - `workflow_tasks` already provides idempotent task lifecycle/retry/dead-letter behavior; no generic rule-run table is needed.
 - `audit_evaluations` / findings already provide rule-result structures.
 - Existing typed domains cover Booking, Customer, Product/Vehicle, Registration, Finance, Insurance, Addons, Trade-In, Commercial lines, Discounts and repeated Payments.
 - Current report contract does not require a typed repeated Invoice entity.
+- Typed/source-system report fields such as `Booking & Retail Dump` outputs already have existing typed owners and must not be duplicated into final-resolution rows.
 
 ## Exact gap / root cause
 
-- GAP: no durable post-Delivery final value snapshot exists.
-- GAP: the resolution ledger cannot directly point to the reviewed Audit Core row selected as final source.
+- GAP: no durable post-Delivery final value snapshot existed for document-derived scalar outputs.
+- GAP: the resolution ledger could not directly point to the reviewed Audit Core row selected as final source.
 - GAP: current transient resolver does not carry Booking/Delivery stage identity and must not be reused unchanged as final business precedence.
 - ROOT CAUSE: the existing comparison flow predates the durable reviewed-field persistence/final-report source contract.
 
@@ -72,17 +77,16 @@ Technical DI/canonical keys not proven by current Audit Core evidence remain `UN
 Reuse `journey_attribute_resolutions`. Add only:
 
 1. `resolved_value_snapshot` — JSON value snapshot selected at finalization;
-2. nullable `source_reviewed_field_id` — reference to `journey_document_extracted_fields.extracted_field_id` when the selected source is a reviewed DI field.
+2. nullable `source_reviewed_field_id` — reference to `journey_document_extracted_fields.extracted_field_id` for new document-derived `POST_DELIVERY` resolution rows.
 
-`source_reviewed_field_id` MUST be nullable because some approved final sources are typed/source-system data (`Booking & Retail Dump` etc.). For those rows, existing owning-domain/reference plus the resolved snapshot represents the source.
+The column is nullable only for backward compatibility with pre-0052 rows. New document-derived final-source rows must populate it.
 
-Do not create another generic final-value/report table.
+Do **not** relax existing DI document/field/fact identity requirements. Do **not** create ledger rows for typed/source-system outputs. Do not create another generic final-value/report table.
 
 ## Files / structures allowed to change
 
 - one additive Alembic migration after current head;
-- existing attribute-resolution helper/module;
-- one narrowly scoped final-source resolver/command module if needed;
+- narrow final-source persistence/policy/command modules;
 - router registration/OpenAPI only for additive final-source confirm/read endpoints;
 - existing workflow task helper only where minimal reuse/integration is required;
 - focused UC03 migration/API/resolution/report-contract tests;
@@ -112,12 +116,23 @@ Responsibilities:
 3. require Booking Review VERIFIED;
 4. require Delivery Review VERIFIED;
 5. idempotency;
-6. load durable reviewed Booking/Delivery rows plus approved typed/source-system values;
-7. resolve only using authoritative business-source mappings whose technical mapping is already proven;
-8. fail closed for unresolved technical mappings;
-9. persist `POST_DELIVERY` resolutions with snapshot and optional reviewed-field reference;
-10. create/reuse one post-Delivery workflow task;
-11. expose readiness/status without mutating the existing comparison GET.
+6. load durable reviewed Booking/Delivery rows only; no DI call;
+7. resolve only document-derived scalar outputs whose business source and technical document/field mapping are both authoritative;
+8. fail closed before any final-source write when required technical mappings remain unresolved;
+9. preflight all candidate disagreements before inserting the first final resolution;
+10. persist `POST_DELIVERY` resolutions with reviewed-field reference + stable snapshot;
+11. expose status/readiness without mutating the existing comparison GET.
+
+Typed/source-system report outputs are read later from their existing domain owners rather than inserted into `journey_attribute_resolutions`.
+
+## Candidate rules
+
+- Read only reviewed rows with non-null `effective_value`.
+- For each stage/document/field, use the latest persisted reviewed fact version.
+- If no legitimate current source exists, record the attribute as missing; do not manufacture a value.
+- If multiple legitimate current sources agree, choose deterministic provenance only; this is not a business-precedence rule.
+- If legitimate current sources disagree, fail closed. Confidence, stage and recency must not choose the business winner unless an explicit later contract says so.
+- Unknown/unmapped reviewed fields remain durable but are not guessed into a final report attribute.
 
 ## Repeated collections
 
@@ -134,27 +149,28 @@ The two payment/reconciliation report blocks require aggregation rules; exact ar
 ### Migration / ledger
 
 - existing resolution rows remain valid;
-- `resolved_value_snapshot` persists exact selected value;
-- reviewed-field reference is nullable;
-- when present it cannot cross tenant/Journey;
-- runtime append-only behavior remains;
-- source-system/typed resolution can persist without a reviewed-field reference.
+- `resolved_value_snapshot` persists exact selected reviewed effective value;
+- selected reviewed-field FK cannot cross tenant/Journey;
+- existing DI source NOT NULL constraints remain unchanged;
+- runtime append-only behavior remains.
 
 ### Finalization gates
 
-- fails if Booking Review != VERIFIED;
-- fails if Delivery Review != VERIFIED;
-- stale If-Match fails;
+- fails if Booking Review != VERIFIED once technical mapping gate is clear;
+- fails if Delivery Review != VERIFIED once technical mapping gate is clear;
+- current unresolved technical mappings return `MAPPING_BLOCKED` / conflict with no partial write;
+- stale Delivery If-Match fails;
 - idempotent replay returns same committed result;
 - concurrent conflicting finalization cannot create a second winner set.
 
 ### Source selection
 
 - uses persisted reviewed effective values, not live DI;
+- obsolete fact versions are not compared as current sources;
 - rejected/no-effective reviewed fields are ineligible;
 - unknown/unmapped reviewed fields remain durable but are not guessed into a report attribute;
 - unresolved technical canonical mapping fails closed;
-- typed/source-system source can be snapshotted with null reviewed-field ref.
+- source disagreement does not resolve by confidence/stage/recency.
 
 ### Repeated data
 
@@ -164,7 +180,7 @@ The two payment/reconciliation report blocks require aggregation rules; exact ar
 
 ### Rule/report gate
 
-- final-source commit creates/reuses exactly one post-Delivery rule task per finalization version/effect key;
+- final-source commit will create/reuse exactly one post-Delivery rule task per finalization version/effect key in the next coherent unit;
 - readiness remains false while rule task is not successfully completed;
 - report readiness becomes true only after successful rule task + POST_DELIVERY audit completion;
 - rule evaluator internals are not implemented here.
