@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from typing import Annotated, Any
 from uuid import UUID
@@ -33,6 +32,10 @@ from audit_core.uc03_booking_receipt_capture import (
     _RECEIPT_CAPTURE_MAP,
     _RECEIPT_DOCUMENT_TYPE,
     _write_receipt_capture,
+)
+from audit_core.uc03_di_core_persistence import (
+    ReviewedDiField,
+    persist_reviewed_di_fields,
 )
 from audit_core.uc03_pc_booking_documents import _current_linked_evidence
 from audit_core.uc03_pc_direct_review import _existing_review_event
@@ -103,8 +106,8 @@ def _stored_field_count(
                 FROM auditcore.journey_document_extracted_fields
                 WHERE tenant_id=:tenant_id
                   AND journey_id=:journey_id
+                  AND stage_code='BOOKING'
                   AND di_document_id=:document_id
-                  AND modified_value IS NOT NULL
                 """
             ),
             {
@@ -123,57 +126,42 @@ def _store_fields(
     journey_id: UUID,
     evidence_id: UUID,
     document_id: UUID,
+    document_type_key: str,
     actor_id: str,
     fields: list[DirectExtractedField],
-) -> None:
-    """Persist human corrections only; unchanged DI machine facts remain in DI."""
+) -> int:
+    """Persist every populated direct-review DI field before typed projection."""
 
-    corrected_fields = [field for field in fields if field.modifiedValue is not None]
-    if not corrected_fields:
-        return
-    rows = [
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "evidence_id": evidence_id,
-            "document_id": document_id,
-            "source_fact_ref": field.sourceFactRef,
-            "source_fact_version": field.sourceFactVersion,
-            "field_key": field.fieldKey.strip().lower(),
-            "modified_value": json.dumps(field.modifiedValue, default=str),
-            "modified_by_actor_id": actor_id,
-        }
-        for field in corrected_fields
+    reviewed_fields = [
+        ReviewedDiField(
+            document_id=document_id,
+            field_key=field.fieldKey.strip().lower(),
+            source_fact_version=field.sourceFactVersion,
+            evidence_id=evidence_id,
+            source_fact_ref=field.sourceFactRef,
+            source_document_type_key=document_type_key,
+            extracted_value=field.extractedValue,
+            modified_value=field.modifiedValue,
+            effective_value=(
+                field.modifiedValue
+                if field.modifiedValue is not None
+                else field.extractedValue
+            ),
+            confidence_score=field.confidenceScore,
+            confidence_scale=(
+                "UNIT_INTERVAL" if field.confidenceScore is not None else None
+            ),
+            is_modified=field.modifiedValue is not None,
+        )
+        for field in fields
     ]
-    connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.journey_document_extracted_fields (
-                tenant_id, journey_id, evidence_id, di_document_id,
-                source_fact_ref, source_fact_version, field_key,
-                extracted_value, modified_value, confidence_score,
-                modified_by_actor_id, modified_at_utc
-            ) VALUES (
-                :tenant_id, :journey_id, :evidence_id, :document_id,
-                :source_fact_ref, :source_fact_version, :field_key,
-                NULL, CAST(:modified_value AS jsonb), NULL,
-                :modified_by_actor_id, now()
-            )
-            ON CONFLICT (
-                tenant_id, journey_id, di_document_id,
-                source_fact_ref, source_fact_version
-            ) DO UPDATE SET
-                evidence_id=EXCLUDED.evidence_id,
-                field_key=EXCLUDED.field_key,
-                extracted_value=NULL,
-                modified_value=EXCLUDED.modified_value,
-                confidence_score=NULL,
-                modified_by_actor_id=EXCLUDED.modified_by_actor_id,
-                modified_at_utc=EXCLUDED.modified_at_utc,
-                updated_at_utc=now()
-            """
-        ),
-        rows,
+    return persist_reviewed_di_fields(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code="BOOKING",
+        actor_id=actor_id,
+        fields=reviewed_fields,
     )
 
 
@@ -291,12 +279,13 @@ def submit_direct_document_field_review(
 
         evidence_id: UUID = linked["evidence_id"]
         document_type_key = str(linked["document_type_key"] or "").strip().lower()
-        _store_fields(
+        stored_count = _store_fields(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
             evidence_id=evidence_id,
             document_id=payload.documentId,
+            document_type_key=document_type_key,
             actor_id=human_principal.subject,
             fields=payload.fields,
         )
@@ -370,11 +359,12 @@ def submit_direct_document_field_review(
                 "requirementRef": str(payload.requirementRef),
                 "documentId": str(payload.documentId),
                 "reviewedFieldCount": len(payload.fields),
+                "storedFieldCount": stored_count,
                 "storedCorrectionCount": modified_count,
                 "modifiedFieldCount": modified_count,
                 "projectedFieldCount": projected_count,
                 "projectionFailureCount": projection_failure_count,
-                "rawDiValuesCopied": False,
+                "rawDiValuesCopied": True,
             },
             aggregate_version=next_version,
         )
@@ -402,7 +392,7 @@ def submit_direct_document_field_review(
             "documentId": str(payload.documentId),
             "aggregateVersion": next_version,
             "reviewEventId": str(review_event_id),
-            "storedFieldCount": modified_count,
+            "storedFieldCount": stored_count,
             "modifiedFieldCount": modified_count,
             "projectedFieldCount": projected_count,
             "projectionFailureCount": projection_failure_count,
