@@ -22,7 +22,10 @@ from audit_core.security_integration import SecurityOAuthClient
 from audit_core.uc03_booking_capture import _scope
 from audit_core.uc03_booking_commands import _aggregate_lock, _parse_if_match
 from audit_core.uc03_delivery_commands import _append_delivery_event
-from audit_core.uc03_di_core_persistence import ReviewedDiField, persist_reviewed_di_fields
+from audit_core.uc03_di_core_persistence import (
+    ReviewedDiField,
+    persist_reviewed_di_fields,
+)
 
 
 class DeliveryReviewV2ConfirmResponse(BaseModel):
