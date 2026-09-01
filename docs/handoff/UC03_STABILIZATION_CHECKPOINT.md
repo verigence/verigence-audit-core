@@ -6,7 +6,7 @@ Mode: **WRITE APPROVED only for the exact Audit Core scope in `UC03_IMPLEMENTATI
 Current repository: **`verigence-audit-core` only**  
 Implementation branch: `fix/uc03-persist-all-di-fields-booking-delivery-v2`  
 Branch starting SHA: `724ddbc4ed11ec82195763d9b10a6f9f339bb729` (current `dev` at re-anchor)  
-Latest application/test implementation SHA: `f1b0fd57490c1e6fcc92468cb9d853d001967392`  
+Latest application/test implementation SHA: `9d295e8eb7155f15673944b94df7065bc15e7581`  
 Previous stabilization branch: `fix/uc03-persist-all-di-fields-booking-delivery` — superseded for application work because it was 9 commits behind current `dev`; its governance files were restored byte-for-byte onto this branch.
 
 ## 1. Read-first instruction
@@ -67,37 +67,37 @@ Do not reopen the installer-wiring defect unless new contradictory evidence appe
 
 Migration `0031_uc03_generic_di_review_fields.py` created `auditcore.journey_document_extracted_fields` with DI document/fact lineage, extracted/modified JSON values, confidence and modification actor/time.
 
-Current `src/audit_core/uc03_pc_generic_review.py` deliberately stores only fields with a human modification. For those rows it writes `extracted_value=NULL` and `confidence_score=NULL`; unchanged DI values are omitted.
+Baseline `src/audit_core/uc03_pc_generic_review.py` deliberately stored only fields with a human modification. For those rows it wrote `extracted_value=NULL` and `confidence_score=NULL`; unchanged DI values were omitted.
 
-Therefore current legacy/direct Review does not satisfy the governing lossless persistence invariant.
+This was a verified gap and is now addressed in implementation Unit 2 on this branch; DB/CI execution evidence remains pending.
 
 ### 3.4 Current V2 identifiers do not fit the legacy table unchanged
 
 **VERIFIED FACT**
 
-Current V2 `DiFact` exposes `canonical_field_id`, `field_key`, `value`, `confidence_score`, `version_no`, page and evidence region, but not the legacy UUID `source_fact_ref` required by the existing generic table.
+Current V2 `DiFact` exposes `canonical_field_id`, `field_key`, `value`, `confidence_score`, `version_no`, page and evidence region, but not the legacy UUID `source_fact_ref` required by the original generic table.
 
-Current V2 document review can also have no legacy `evidence_id`, while the legacy generic table currently requires one.
+Current V2 document review can also have no legacy `evidence_id`, while the original generic table required one.
 
-Current V2 confidence is presented on the Review contract on the 0–100 scale, while the legacy generic table's existing confidence constraint was designed around 0–1.
+Current V2 confidence is presented on the Review contract on the 0–100 scale, while the original generic table's existing confidence constraint was designed around 0–1.
 
-**SMALLEST SAFE DIRECTION:** extend the existing generic table backward-compatibly for current V2 identifiers/stage provenance rather than introduce a second parallel generic field table.
+**IMPLEMENTED DIRECTION in Unit 1:** extend the existing generic table backward-compatibly for current V2 identifiers/stage provenance rather than introduce a second parallel generic field table. Execution evidence remains pending.
 
-### 3.5 Booking typed reviewed-value persistence exists but is not lossless
+### 3.5 Booking typed reviewed-value persistence exists but is not lossless on baseline
 
 **VERIFIED FACT**
 
 Migration `0048_uc03_di_core_field_persistence.py` and `src/audit_core/uc03_v2_review_materialization.py` persist known Booking Form, PAN, Aadhaar and Dealer Receipt reviewed values and project supported values into existing business structures.
 
-That layer is intentionally typed/known-field oriented and must remain the additional business projection layer, not the generic lossless layer.
+That layer is intentionally typed/known-field oriented and remains the additional business projection layer, not the generic lossless layer.
 
-Current Booking V2 confirm also:
+Baseline Booking V2 confirm still:
 
 - blocks an accepted unmapped/raw field when it has no typed Core owner;
 - can block a supported mapped field when no concrete typed owner is returned;
 - records `rawDiValuesCopied: False`.
 
-This conflicts with the governing stabilization invariant that unknown/new populated fields must survive Audit Core Review persistence.
+This remains the next implementation gap.
 
 ### 3.6 Reference-only resolution can exist without a fake typed owner
 
@@ -238,42 +238,69 @@ Application/test SHA: `f1b0fd57490c1e6fcc92468cb9d853d001967392`
 **CHANGED:**
 
 - Added `0051_uc03_lossless_review_fields.py` extending the existing `journey_document_extracted_fields` table rather than creating a second generic store.
-- V2-compatible persistence now has explicit `stage_code`, original document type, canonical field ID, reviewed `effective_value`, confidence scale, modification flag, and review actor/time.
+- V2-compatible persistence has explicit `stage_code`, original document type, canonical field ID, reviewed `effective_value`, confidence scale, modification flag, and review actor/time.
 - Legacy `evidence_id` and `source_fact_ref` are nullable only so truthful V2 identity can be stored; existing V1 identity and unique key remain.
 - Added a partial V2 unique index using Journey + stage + DI document + canonical field + fact version, preserving repeated documents and same-type document cardinality.
 - Expanded confidence storage without guessing/rescaling and records `UNIT_INTERVAL` vs `PERCENT` explicitly.
-- Extended `uc03_di_core_persistence.py` with shared `ReviewedDiField` + `persist_reviewed_di_fields(...)` lossless persistence helper and retained the actor-context installer through a lazy import to avoid future import cycles.
-- Added focused tests covering zero/false retention, empty/null filtering, unknown V2 fields without typed owners, corrections preserving original+effective values, rejected-source provenance without effective value, no-guessed identity/scale, and migration reuse/no-second-table contract.
+- Extended `uc03_di_core_persistence.py` with shared `ReviewedDiField` + `persist_reviewed_di_fields(...)` and retained actor-context installation via lazy import.
+- Added focused persistence-contract tests.
 
 **WHY:**
 
-Current V1/V2 paths could not durably represent every reviewed non-empty DI value in one existing table. The extension is the smallest reusable foundation required before wiring Booking and Delivery Review commits.
+The baseline could not durably represent every reviewed non-empty DI value in one existing table. The extension is the smallest reusable foundation required before wiring Booking and Delivery Review commits.
 
 **VERIFIED:**
 
 - Source inspection confirms the migration is linear from `0050_uc03_commercial_components` and creates no new table.
 - Source inspection confirms the helper retains valid `0`/`False`, skips only unchanged empty/null values, and routes legacy vs V2 identity through separate truthful conflict keys.
-- Existing `test_uc03_review_confirm_actor_context.py` remains compatible with the lazy `_original_review_scope` mechanism.
-- GitHub has no workflow run for this direct branch and no commit statuses/checks were posted for the implementation SHA. Therefore **pytest, migration execution, DB compatibility and CI remain UNVERIFIED**, not assumed green.
+- Existing actor-context test remains compatible with lazy `_original_review_scope`.
+- GitHub has no workflow run/status checks for this direct branch. Therefore pytest, migration execution, DB compatibility and CI remain **UNVERIFIED**.
 
-**REMAINING:**
+### Unit 2 — legacy/direct Booking Review lossless wiring
 
-- Run focused tests/DB migration when an executable CI/local DB path is available.
-- Wire legacy/direct Booking Review to call the shared helper for all populated fields.
-- Wire Booking V2 confirm to lossless persistence and remove typed-owner-only blockers while retaining typed projections.
+**Status: IMPLEMENTED / SOURCE-VERIFIED; CI/DB TEST EVIDENCE NOT YET AVAILABLE**  
+Application/test SHA: `9d295e8eb7155f15673944b94df7065bc15e7581`
+
+**CHANGED:**
+
+- `uc03_pc_generic_review.py` now sends every direct-review field through `persist_reviewed_di_fields(...)` before typed projection instead of writing corrections only.
+- Unchanged populated fields persist original DI value as reviewed effective value.
+- Corrected fields persist original DI value, modified value and confirmed effective value with modification metadata.
+- Existing direct-review confidence remains explicitly `UNIT_INTERVAL`; no scale guessing/rescaling is introduced.
+- Existing typed projection remains best-effort and still runs after durable generic persistence.
+- `storedFieldCount` now represents all generically persisted populated/reviewed fields instead of only corrections; modified count remains separate.
+- Review workflow metadata records `rawDiValuesCopied=True` and field/correction/projection counts only; no raw PII is added to the safe payload.
+- Updated direct-review tests to require lossless forwarding and preserve correction-event-only semantics.
+
+**WHY:**
+
+The baseline path silently omitted unchanged DI values, directly violating the locked stabilization invariant.
+
+**VERIFIED:**
+
+- Source inspection confirms `_store_fields(...)` builds original/effective/correction values for every supplied direct field and calls the common persistence helper with `stage_code='BOOKING'`.
+- Source inspection confirms `_store_fields(...)` executes before `_project_known_field(...)`, so typed projection failure cannot be the reason a populated DI field disappears from the generic reviewed-field store.
+- Existing correction workflow events remain conditional on `modifiedValue is not None`; no repetitive approval events were introduced.
+- Repository code search did not surface another indexed contract relying on the old `storedFieldCount == modifiedFieldCount` or `rawDiValuesCopied=False` semantics.
+- No CI/DB execution evidence exists yet; **TESTED/FIXED is not claimed**.
+
+**REMAINING across Units 1–2:**
+
+- Execute focused pytest/migration/DB assertions when an executable CI/local DB path is available.
+- Wire Booking V2 confirm to generic persistence and remove typed-owner-only blockers while retaining stale-decision and typed projection behavior.
 - Add explicit Delivery Review commit and DB/end-to-end acceptance coverage.
 
 ## 9. NEXT ACTION
 
 **Current target: `verigence-audit-core` only. WRITE APPROVED for the lossless reviewed-DI persistence unit; NO MERGE / NO DEPLOY.**
 
-Continue from Unit 1; do not rescan completed evidence:
+Continue from Unit 2; do not rescan completed evidence:
 
-1. wire `uc03_pc_generic_review.py` to persist every populated direct-review field using the shared helper, preserving original + modified/effective values and existing typed projections;
-2. update focused legacy/direct Review tests to enforce lossless storage semantics;
-3. source-verify and checkpoint that coherent unit;
-4. then wire Booking V2 confirm to generic persistence, remove typed-owner-only blockers, preserve typed projection and stale-decision logic;
-5. add the smallest explicit Delivery Review commit path that persists Delivery fields without mutating GET behavior;
+1. inspect only the Booking V2 confirm helper boundaries needed to construct field-level acceptance/rejection from the already-resolved current documents/decisions;
+2. persist every populated Booking V2 DI field generically before typed materialization, with accepted fields receiving effective value and rejected fields retaining original provenance without typed projection;
+3. remove typed-owner-only blockers for accepted unknown/unmapped fields and supported reference-only fields; do not weaken stale-decision/pending-failed/If-Match/idempotency checks;
+4. update focused Booking V2 tests, source-verify and checkpoint that unit;
+5. then add the smallest explicit Delivery Review commit path that persists Delivery fields without mutating GET behavior;
 6. run focused regression/DB tests when executable evidence is available and update this checkpoint with actual results;
 7. stop before merge/deploy and before moving to DI/Web.
 
