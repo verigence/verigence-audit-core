@@ -1,11 +1,12 @@
 # UC03 Stabilization — Current Checkpoint
 
 Last updated: 2026-09-01  
-Current activity: **Step 1 — approved Audit Core final-source implementation; Units 1–3 implemented/source-verified**  
+Current activity: **Step 1 — approved Audit Core final-source implementation; Units 1–3 CI/DB verified; STOPPED at merge approval gate**  
 Repository: **`verigence-audit-core` only**  
 Implementation branch: `fix/uc03-post-delivery-final-source-v1`  
 Branch starting `dev` SHA: `10701bf9968968d0efe4920b9230c2ed2664bd5f`  
-Latest application/test SHA before this checkpoint commit: `0f0076660680e7a6ead9dee49d1984453d497dfc`  
+Latest application/test SHA before this checkpoint commit: `6617e86c9d2ef191f8e5919c4675c5597e66931e`  
+Draft verification PR: **#136 — `UC03: post-delivery final source implementation`**  
 Mode: **WRITE APPROVED for final-source scope; merge/deploy NOT approved**
 
 ## Recovery order
@@ -68,9 +69,9 @@ Not allowed:
 
 ### Unit 1 — final-resolution ledger foundation
 
-**Status: IMPLEMENTED / SOURCE-VERIFIED; NOT YET CI/DB-TESTED**
+**Status: IMPLEMENTED / CI + FRESH-DB VERIFIED**
 
-- Added additive migration `0052_uc03_final_source_resolution.py`.
+- Added additive migration file `0052_uc03_final_source_resolution.py` with final Alembic revision ID `0052_uc03_final_source`.
 - Reused `journey_attribute_resolutions`; no new table.
 - Added `resolved_value_snapshot jsonb` and nullable `source_reviewed_field_id`.
 - Added tenant+Journey-safe FK to `journey_document_extracted_fields`.
@@ -78,11 +79,11 @@ Not allowed:
 - Added `uc03_final_source_persistence.py` for document-derived POST_DELIVERY winner persistence.
 - Final snapshot is loaded from durable reviewed `effective_value`, never live DI.
 - Typed/source-system report fields stay in typed owners; the earlier draft that duplicated them into the ledger was removed before CI.
-- Added focused persistence/migration tests.
+- Focused persistence/migration tests passed in full CI.
 
 ### Unit 2 — final-source policy + confirm/read API
 
-**Status: IMPLEMENTED / SOURCE-VERIFIED; NOT YET CI/DB-TESTED**
+**Status: IMPLEMENTED / CI VERIFIED**
 
 - Added `uc03_final_source_policy.py`.
 - Executable policy contains only technical document/field pairs already proven by current Audit Core evidence.
@@ -105,71 +106,65 @@ CURRENT FAIL-CLOSED STATE:
 
 ### Unit 3 — post-Delivery rule task + report-readiness gate
 
-**Status: IMPLEMENTED / SOURCE-VERIFIED; NOT YET CI/DB-TESTED**
-
-CHANGED:
+**Status: IMPLEMENTED / CI + DB-LIFECYCLE VERIFIED**
 
 - Added `uc03_post_delivery_rule_gate.py`.
 - Reuses existing `create_workflow_task_once()` and workflow task lifecycle; no new rule-run table or evaluator implementation.
-- Final-source commit now creates/reuses exactly one `UC03_POST_DELIVERY_RULE_RUN` task using effect key `Journey + finalization version` after the POST_DELIVERY stage is created and before the final-source workflow event is appended.
-- The task uses workflow type `UC03_POST_DELIVERY_AUDIT`, process area `POST_DELIVERY`, and preserves Journey dealer/outlet scope.
-- Final-source GET now exposes:
-  - POST_DELIVERY audit state/status;
-  - rule task id/status/effect key;
-  - `reportReady`.
-- `reportReady` is true only when the rule task is `COMPLETED` **and** POST_DELIVERY `audit_state='COMPLETE'`; all pending/retry/failure/dead-letter states remain false automatically.
-- Added a narrow future-worker completion boundary that:
-  - requires the correct Journey/process/task identity;
-  - requires an active worker lease while task is IN_PROGRESS;
-  - records the workflow attempt as `SUCCEEDED`;
-  - clears lease/retry/error state;
-  - appends `WORKER_COMPLETED`;
-  - marks POST_DELIVERY audit COMPLETE only after the task succeeds;
-  - derives `NO_FLAGS` vs `FLAGS_RAISED` from persisted findings joined through `audit_evaluations.process_area='POST_DELIVERY'`.
+- Final-source commit creates/reuses exactly one `UC03_POST_DELIVERY_RULE_RUN` task using effect key `Journey + finalization version` after the POST_DELIVERY stage is created and before the final-source workflow event is appended.
+- Task uses workflow type `UC03_POST_DELIVERY_AUDIT`, process area `POST_DELIVERY`, and preserves Journey dealer/outlet scope.
+- Final-source GET exposes POST_DELIVERY audit state/status, rule task id/status/effect key and `reportReady`.
+- `reportReady` is true only when the rule task is `COMPLETED` and POST_DELIVERY `audit_state='COMPLETE'`; pending/retry/failure/dead-letter states remain false.
+- Added a narrow future-worker completion boundary that validates Journey/process/task identity and active lease, records attempt `SUCCEEDED`, clears lease/retry/error state, appends `WORKER_COMPLETED`, then marks POST_DELIVERY audit COMPLETE.
+- `NO_FLAGS` vs `FLAGS_RAISED` is derived from persisted findings joined through `audit_evaluations.process_area='POST_DELIVERY'`.
 - No rule evaluation, DI access or Web/Security change was added.
+- DB-backed lifecycle test passed in full CI: task create/reuse, READY not-ready gate, worker claim/start/complete, POST_DELIVERY completion, `NO_FLAGS`, `reportReady=true`, attempt `SUCCEEDED`, and single task/workflow instance.
 
-SOURCE CORRECTIONS DURING UNIT 3:
+## Verification evidence
 
-- Initial draft manually queried/created the task; replaced with the repository's existing `create_workflow_task_once()` idempotent/effect-key boundary.
-- Initial draft assumed `audit_findings.stage_code`; current schema does not provide that column. Finding scope is now derived through the persisted Audit Evaluation `process_area`.
-- Existing schema permits successful attempt result `SUCCEEDED`; Unit 3 uses that schema value rather than copying an unrelated Booking helper's `SUCCESS` literal. Booking rule code was not changed in this scope.
+Draft PR #136 was opened **only to trigger CI**; it remains draft and unmerged.
 
-TESTS ADDED/UPDATED:
+### CI attempt 1 — run `33536352239`
 
-- final-source confirm source-order test proves preflight → resolution writes → POST_DELIVERY stage → rule-task creation → workflow event;
-- final-source GET contract test proves rule/audit/report-readiness projection;
-- rule effect key is finalization-version scoped;
-- source test proves use of existing workflow reliability helper and no evaluator/DI dependency;
-- DB-backed lifecycle test creates/reuses one task, verifies READY is not report-ready, claims/starts/completes through the worker boundary, verifies POST_DELIVERY `NO_FLAGS`, verifies `reportReady=true`, verifies attempt `SUCCEEDED`, and verifies one task + one workflow instance.
+- Build: PASS.
+- Ruff: PASS.
+- Fresh PostgreSQL migration: FAIL at Alembic version bookkeeping after applying `0052` DDL.
+- Root cause: revision ID `0052_uc03_final_source_resolution` exceeded existing `alembic_version.version_num varchar(32)`.
+- Pytest: skipped because migration failed.
+- Deployment: skipped.
 
-NOT YET VERIFIED:
+Correction:
 
-- Ruff;
-- full pytest;
-- fresh PostgreSQL migration through `0052`;
-- actual DB execution of the new focused lifecycle/FK tests;
-- CI.
+- Shortened only the Alembic revision identifier to `0052_uc03_final_source`; migration behavior/schema remained unchanged.
+
+### CI attempt 2 — run `33536633900`, application/test SHA `6617e86c9d2ef191f8e5919c4675c5597e66931e`
+
+- Build package: **PASS**.
+- Ruff `ruff check src tests migrations`: **PASS — All checks passed**.
+- Fresh PostgreSQL `alembic upgrade head`: **PASS**, single head `0052_uc03_final_source`.
+- Full pytest with `DATABASE_URL`: **PASS — 383 passed, 1 warning in 22.66s**.
+- The warning is the existing Starlette/httpx TestClient deprecation warning; no test failure.
+- Railway DEV deployment job: **SKIPPED**.
+- Security diagnosis job: **SKIPPED**.
+- No merge or deployment was performed.
 
 ## Remaining UNKNOWN / fail-closed items
+
+These are not implementation failures and were deliberately not guessed:
 
 - exact DI canonical technical keys and field keys not already proven in Audit Core;
 - exact arithmetic formulas for the two payment/reconciliation report blocks;
 - exact selection/concatenation semantics for multiple PC/TL/PMO remarks.
 
-Do not invent these.
-
 ## NEXT ACTION
 
-**Verification only — do not broaden implementation.**
+**STOP — explicit merge approval required.**
 
-1. trigger the repository CI against `fix/uc03-post-delivery-final-source-v1` without merge/deploy;
-2. require CI to execute Ruff, fresh PostgreSQL `alembic upgrade head`, and full pytest with `DATABASE_URL`;
-3. inspect and fix only failures attributable to the approved final-source changes;
-4. when green, update this checkpoint with exact migration/Ruff/pytest/CI results and latest SHA;
-5. stop for explicit merge approval.
+Current implementation branch and draft PR are CI-green for the approved Audit Core final-source scope. Do not merge PR #136 and do not deploy until separately approved.
 
-Do not enter DI or Web. Do not merge/deploy.
+If merge is approved, merge PR #136 into `dev` only. Deployment still requires separate explicit approval unless the user explicitly grants both actions.
+
+Do not enter DI or Web as part of this branch.
 
 ## Anti-stuck rule
 
-If a direct path does not answer the current evidence question after a small number of attempts, mark it `UNKNOWN` and pivot. Do not recursively rescan completed repositories.
+If future work resumes and a direct path does not answer the current evidence question after a small number of attempts, mark it `UNKNOWN` and pivot. Do not recursively rescan completed repositories.
