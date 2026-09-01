@@ -28,6 +28,10 @@ from audit_core.uc03_booking_commands import (
     _append_workflow_event,
     _parse_if_match,
 )
+from audit_core.uc03_di_core_persistence import (
+    ReviewedDiField,
+    persist_reviewed_di_fields,
+)
 from audit_core.uc03_v2_review_materialization import (
     materialize_reviewed_di_business_values,
     receipt_document_ordinals,
@@ -439,32 +443,61 @@ def _raw_review_key(
     return f"raw:{field.fieldKey}"
 
 
-def _assert_accepted_raw_fields_have_core_owner(
-    unmapped: list[review_v2.ReviewV2UnmappedField],
+def _document_field_review_key(
+    document: review_v2.ReviewV2Document,
+    field: review_v2.ReviewV2Field,
+    *,
+    receipt_ordinals: dict[UUID, int],
+) -> str:
+    spec = review_v2.spec_for_field(field.fieldKey)
+    if spec is not None:
+        return f"attribute:{spec.attribute_key}"
+    if str(document.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE:
+        return receipt_review_key(receipt_ordinals[document.documentId], field.fieldKey)
+    return f"raw:{field.fieldKey}"
+
+
+def _lossless_reviewed_fields(
+    documents: list[review_v2.ReviewV2Document],
     *,
     rejected_keys: set[str],
-) -> None:
-    receipt_ids = [
-        field.documentId
-        for field in unmapped
-        if str(field.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE
-    ]
-    receipt_ordinals = receipt_document_ordinals(receipt_ids)
-    for field in unmapped:
-        if not _has_value(field.value):
-            continue
-        if _raw_review_key(field, receipt_ordinals=receipt_ordinals) in rejected_keys:
-            continue
-        owner = reviewed_field_core_owner(
-            document_type_key=field.documentTypeKey,
-            field_key=field.fieldKey,
-            document_id=field.documentId,
-        )
-        if owner is None:
-            raise _missing_core_owner_error(
-                field_key=field.fieldKey,
-                document_type_key=field.documentTypeKey,
+) -> list[ReviewedDiField]:
+    receipt_ordinals = receipt_document_ordinals(
+        [
+            document.documentId
+            for document in documents
+            if str(document.documentTypeKey or "").strip().lower()
+            == _RECEIPT_DOCUMENT_TYPE
+        ]
+    )
+    reviewed: list[ReviewedDiField] = []
+    for document in documents:
+        for field in document.fields:
+            review_key = _document_field_review_key(
+                document,
+                field,
+                receipt_ordinals=receipt_ordinals,
             )
+            rejected = review_key in rejected_keys
+            reviewed.append(
+                ReviewedDiField(
+                    document_id=document.documentId,
+                    evidence_id=document.evidenceId,
+                    source_canonical_field_id=field.canonicalFieldId,
+                    source_document_type_key=document.documentTypeKey,
+                    field_key=field.fieldKey,
+                    source_fact_version=field.sourceFactVersion,
+                    extracted_value=field.value,
+                    effective_value=field.value,
+                    effective_value_is_set=not rejected,
+                    confidence_score=field.confidenceScore,
+                    confidence_scale=(
+                        "PERCENT" if field.confidenceScore is not None else None
+                    ),
+                    is_modified=False,
+                )
+            )
+    return reviewed
 
 
 def confirm_booking_review_v2_with_decisions(
@@ -548,10 +581,6 @@ def confirm_booking_review_v2_with_decisions(
     rejected_keys = {
         key for key, decision in decisions.items() if decision == "REJECTED"
     }
-    _assert_accepted_raw_fields_have_core_owner(
-        unmapped,
-        rejected_keys=rejected_keys,
-    )
     correlation_id = get_correlation_id(request)
 
     def execute() -> dict[str, Any]:
@@ -587,6 +616,18 @@ def confirm_booking_review_v2_with_decisions(
                 detail="This Booking Review has already been completed.",
             )
 
+        stored_field_count = persist_reviewed_di_fields(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code="BOOKING",
+            actor_id=human_principal.subject,
+            fields=_lossless_reviewed_fields(
+                documents,
+                rejected_keys=rejected_keys,
+            ),
+        )
+
         applied: list[str] = []
         conflicts: list[str] = []
         rejected_attributes: list[str] = []
@@ -621,19 +662,16 @@ def confirm_booking_review_v2_with_decisions(
                 source_evidence_id=source.evidenceId,
             )
 
+            owning_domain_key: str | None = None
+            owning_record_reference: str | None = None
             if application is None:
                 typed_owner = reviewed_field_core_owner(
                     document_type_key=source.documentTypeKey,
                     field_key=source.fieldKey,
                     document_id=source.documentId,
                 )
-                if typed_owner is None:
-                    raise _missing_core_owner_error(
-                        field_key=source.fieldKey,
-                        document_type_key=source.documentTypeKey,
-                        attribute_key=attribute.attributeKey,
-                    )
-                owning_domain_key, owning_record_reference = typed_owner
+                if typed_owner is not None:
+                    owning_domain_key, owning_record_reference = typed_owner
             else:
                 owning_domain_key, owning_record_reference, application_status = application
                 if application_status == "CONFLICT":
@@ -694,11 +732,12 @@ def confirm_booking_review_v2_with_decisions(
             correlation_id=correlation_id,
             safe_payload={
                 "resolvedAttributeCount": resolved_count,
+                "storedFieldCount": stored_field_count,
                 "appliedAttributeKeys": sorted(applied),
                 "conflictAttributeKeys": sorted(conflicts),
                 "rejectedReviewKeys": sorted(rejected_keys),
                 **materialization,
-                "rawDiValuesCopied": False,
+                "rawDiValuesCopied": True,
             },
             aggregate_version=next_version,
         )
