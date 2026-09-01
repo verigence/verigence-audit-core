@@ -404,10 +404,14 @@ class SecurityAdminClient:
 
 
 class SecurityOAuthClient:
-    """Security v2 ServiceIntegration token async client.
+    """Security v2 ServiceIntegration token client.
+
+    Holds both a sync and async connection pool so it can serve plain-def
+    (threadpool) handlers via get_service_token_sync() and async handlers
+    via get_service_token().
 
     Must be created once (e.g. in lifespan) and reused across requests.
-    Use aclose() or the async context manager to release the connection pool.
+    Use aclose() at shutdown to drain both pools.
     """
 
     def __init__(
@@ -418,23 +422,41 @@ class SecurityOAuthClient:
         client_secret: str,
         timeout_seconds: float = 5.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        sync_transport: httpx.BaseTransport | None = None,
     ) -> None:
         if not base_url.strip() or not client_id.strip() or not client_secret:
             raise ValueError("Security service-token base URL and client credentials are required")
-        self._client = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"),
-            auth=(client_id, client_secret),
-            timeout=httpx.Timeout(
-                connect=2.0,
-                read=timeout_seconds,
-                write=timeout_seconds,
-                pool=2.0,
-            ),
+        _timeout = httpx.Timeout(
+            connect=2.0,
+            read=timeout_seconds,
+            write=timeout_seconds,
+            pool=2.0,
+        )
+        _base = base_url.rstrip("/")
+        _auth = (client_id, client_secret)
+        # Async pool — used by async def callers
+        self._async_client = httpx.AsyncClient(
+            base_url=_base,
+            auth=_auth,
+            timeout=_timeout,
             transport=transport,
         )
+        # Sync pool — used by plain def handlers running in FastAPI's threadpool
+        self._sync_client = httpx.Client(
+            base_url=_base,
+            auth=_auth,
+            timeout=_timeout,
+            transport=sync_transport,
+        )
+
+    def close(self) -> None:
+        """Close the sync connection pool."""
+        self._sync_client.close()
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        """Close both connection pools. Call from lifespan shutdown."""
+        self._sync_client.close()
+        await self._async_client.aclose()
 
     async def __aenter__(self) -> Self:
         return self
@@ -442,52 +464,67 @@ class SecurityOAuthClient:
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
         await self.aclose()
 
-    async def get_service_token(self, *, audience: str) -> str:
+    def get_service_token(self, *, audience: str) -> str:
+        """Synchronous token mint — call from plain def (threadpool) handlers."""
         requested_audience = audience.strip()
         if not requested_audience:
             raise ValueError("audience is required")
-        logger.debug(
-            "security_service_token_start",
-            audience=requested_audience,
-        )
+        logger.debug("security_service_token_start", audience=requested_audience)
         try:
-            response = await self._client.post(
+            response = self._sync_client.post(
                 "/security/v1/service/token",
                 data={"audience": requested_audience},
             )
         except httpx.HTTPError as exc:
             logger.warning("security_service_token_failed", reason="endpoint_unavailable")
             raise SecurityTokenError("Security service-token endpoint is unavailable") from exc
+        return _parse_service_token_response(response, requested_audience)
 
-        if response.status_code != 200:
-            error = _safe_service_error(response)
-            logger.warning(
-                "security_service_token_failed",
-                http_status=response.status_code,
-                error=error,
-                audience=requested_audience,
-            )
-            raise SecurityTokenError(
-                f"Security service-token request denied with HTTP {response.status_code}: {error}"
-            )
-
+    async def get_service_token_async(self, *, audience: str) -> str:
+        """Asynchronous token mint — call from async def handlers."""
+        requested_audience = audience.strip()
+        if not requested_audience:
+            raise ValueError("audience is required")
+        logger.debug("security_service_token_start", audience=requested_audience)
         try:
-            payload: Any = response.json()
-        except ValueError as exc:
-            raise SecurityTokenError("Security service-token response is not valid JSON") from exc
-        if not isinstance(payload, dict):
-            raise SecurityTokenError("Security service-token response has invalid shape")
+            response = await self._async_client.post(
+                "/security/v1/service/token",
+                data={"audience": requested_audience},
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("security_service_token_failed", reason="endpoint_unavailable")
+            raise SecurityTokenError("Security service-token endpoint is unavailable") from exc
+        return _parse_service_token_response(response, requested_audience)
 
-        access_token = payload.get("accessToken")
-        token_type = payload.get("tokenType")
-        returned_audience = payload.get("audience")
-        if not isinstance(access_token, str) or not access_token:
-            raise SecurityTokenError("Security service-token response has no accessToken")
-        if token_type != "Bearer":
-            raise SecurityTokenError("Security service-token response has invalid tokenType")
-        if returned_audience != requested_audience:
-            raise SecurityTokenError("Security service-token response audience mismatch")
-        return access_token
+
+def _parse_service_token_response(response: httpx.Response, requested_audience: str) -> str:
+    if response.status_code != 200:
+        error = _safe_service_error(response)
+        logger.warning(
+            "security_service_token_failed",
+            http_status=response.status_code,
+            error=error,
+            audience=requested_audience,
+        )
+        raise SecurityTokenError(
+            f"Security service-token request denied with HTTP {response.status_code}: {error}"
+        )
+    try:
+        payload: Any = response.json()
+    except ValueError as exc:
+        raise SecurityTokenError("Security service-token response is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise SecurityTokenError("Security service-token response has invalid shape")
+    access_token = payload.get("accessToken")
+    token_type = payload.get("tokenType")
+    returned_audience = payload.get("audience")
+    if not isinstance(access_token, str) or not access_token:
+        raise SecurityTokenError("Security service-token response has no accessToken")
+    if token_type != "Bearer":
+        raise SecurityTokenError("Security service-token response has invalid tokenType")
+    if returned_audience != requested_audience:
+        raise SecurityTokenError("Security service-token response audience mismatch")
+    return access_token
 
 
 def _safe_service_error(response: httpx.Response) -> str:
