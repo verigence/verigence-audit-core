@@ -51,6 +51,48 @@ PROVEN_REVIEWED_SOURCE_POLICIES: tuple[ReviewedSourcePolicy, ...] = (
         technical_pairs=(("customer_invoice_dms", "tcs_amount"),),
         resolution_rule="FINAL_REPORT_TAX_INVOICE_DMS_TCS",
     ),
+    ReviewedSourcePolicy(
+        attribute_key="dms_invoice_date",
+        report_field="DMS Invoice Date",
+        business_source_label="Tax Invoice — DMS",
+        technical_pairs=(("customer_invoice_dms", "invoice_date"),),
+        resolution_rule="FINAL_REPORT_TAX_INVOICE_DMS_DATE",
+    ),
+    ReviewedSourcePolicy(
+        attribute_key="dms_invoice_number",
+        report_field="DMS Invoice Number",
+        business_source_label="Tax Invoice — DMS",
+        technical_pairs=(("customer_invoice_dms", "invoice_number"),),
+        resolution_rule="FINAL_REPORT_TAX_INVOICE_DMS_NUMBER",
+    ),
+    ReviewedSourcePolicy(
+        attribute_key="delivery_date",
+        report_field="Delivery Date",
+        business_source_label="Gate Pass",
+        technical_pairs=(("gate_pass", "delivery_date"),),
+        resolution_rule="FINAL_REPORT_GATE_PASS_DELIVERY_DATE",
+    ),
+    ReviewedSourcePolicy(
+        attribute_key="gstin",
+        report_field="GST",
+        business_source_label="GST Certificate",
+        technical_pairs=(("gst_certificate", "gstin"),),
+        resolution_rule="FINAL_REPORT_GST_CERTIFICATE_GSTIN",
+    ),
+    ReviewedSourcePolicy(
+        attribute_key="new_car_chassis_number",
+        report_field="New Car Chasiss No.",
+        business_source_label="Tax Invoice — DMS",
+        technical_pairs=(("customer_invoice_dms", "chassis_number"),),
+        resolution_rule="FINAL_REPORT_TAX_INVOICE_DMS_CHASSIS",
+    ),
+    ReviewedSourcePolicy(
+        attribute_key="bank_name",
+        report_field="Bank Name",
+        business_source_label="Bank Statement",
+        technical_pairs=(("bank_statement", "bank_name"),),
+        resolution_rule="FINAL_REPORT_BANK_STATEMENT_BANK_NAME",
+    ),
 )
 
 
@@ -62,21 +104,6 @@ UNRESOLVED_TECHNICAL_POLICIES: tuple[UnresolvedTechnicalPolicy, ...] = (
         "Booking Date",
         "Minimum Booking Amount payment proof",
         "receipt document identity is fragmented across current Audit Core paths",
-    ),
-    UnresolvedTechnicalPolicy(
-        "DMS Invoice Date",
-        "Tax Invoice — DMS",
-        "authoritative DI invoice-date field key is not proven in Audit Core",
-    ),
-    UnresolvedTechnicalPolicy(
-        "DMS Invoice Number",
-        "Tax Invoice — DMS",
-        "authoritative DI invoice-number field key is not proven in Audit Core",
-    ),
-    UnresolvedTechnicalPolicy(
-        "Delivery Date",
-        "Gate Pass",
-        "authoritative Gate Pass delivery-date field key is not proven",
     ),
     UnresolvedTechnicalPolicy(
         "Pincode",
@@ -99,11 +126,6 @@ UNRESOLVED_TECHNICAL_POLICIES: tuple[UnresolvedTechnicalPolicy, ...] = (
         "published booking_docket vs runtime booking_form identity is unresolved",
     ),
     UnresolvedTechnicalPolicy(
-        "GST",
-        "GST Certificate",
-        "authoritative GST report field key is not proven",
-    ),
-    UnresolvedTechnicalPolicy(
         "Deal Type",
         "Booking Docket (Sales Contract)",
         "authoritative Booking Docket deal-type field key is not proven",
@@ -119,19 +141,9 @@ UNRESOLVED_TECHNICAL_POLICIES: tuple[UnresolvedTechnicalPolicy, ...] = (
         "RTO Paper canonical document family and field keys require Step-2 validation",
     ),
     UnresolvedTechnicalPolicy(
-        "New Car Chasiss No.",
-        "Tax Invoice — DMS",
-        "authoritative DMS invoice chassis field key is not proven",
-    ),
-    UnresolvedTechnicalPolicy(
         "Finance Type",
         "Bank DO",
         "Bank DO canonical document/field mapping is not proven",
-    ),
-    UnresolvedTechnicalPolicy(
-        "Bank Name",
-        "Bank Statement",
-        "Bank Statement canonical document/field mapping is not proven",
     ),
     UnresolvedTechnicalPolicy(
         "Exchange (Y/N)",
