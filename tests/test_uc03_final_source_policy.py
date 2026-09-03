@@ -22,6 +22,7 @@ def test_proven_policy_registry_contains_only_exact_audit_core_contract_keys() -
     assert ("gst_certificate", "gstin") in pairs
     assert ("customer_invoice_dms", "chassis_number") in pairs
     assert ("bank_statement", "bank_name") in pairs
+    assert ("booking_docket", "customer_phone") in pairs
 
     # Disputed/unverified aliases must not silently enter the executable registry.
     assert not any(document_type == "booking_form" for document_type, _ in pairs)
@@ -42,6 +43,7 @@ def test_newly_proven_final_report_policies_use_exact_validated_pairs() -> None:
         "GST": (("gst_certificate", "gstin"),),
         "New Car Chasiss No.": (("customer_invoice_dms", "chassis_number"),),
         "Bank Name": (("bank_statement", "bank_name"),),
+        "Contact No": (("booking_docket", "customer_phone"),),
     }
 
     for report_field, technical_pairs in expected.items():
@@ -71,6 +73,7 @@ def test_unresolved_registry_keeps_only_still_unproven_canonical_gaps_explicit()
         "GST",
         "New Car Chasiss No.",
         "Bank Name",
+        "Contact No",
     }
     assert unresolved_report_fields.isdisjoint(newly_proven)
 

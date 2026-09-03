@@ -93,6 +93,13 @@ PROVEN_REVIEWED_SOURCE_POLICIES: tuple[ReviewedSourcePolicy, ...] = (
         technical_pairs=(("bank_statement", "bank_name"),),
         resolution_rule="FINAL_REPORT_BANK_STATEMENT_BANK_NAME",
     ),
+    ReviewedSourcePolicy(
+        attribute_key="contact_number",
+        report_field="Contact No",
+        business_source_label="Booking Docket (Sales Contract)",
+        technical_pairs=(("booking_docket", "customer_phone"),),
+        resolution_rule="FINAL_REPORT_BOOKING_DOCKET_CONTACT_NO",
+    ),
 )
 
 
@@ -119,11 +126,6 @@ UNRESOLVED_TECHNICAL_POLICIES: tuple[UnresolvedTechnicalPolicy, ...] = (
         "KYC State",
         "Customer KYC (PAN, Aadhaar, address proof)",
         "authoritative split KYC state field mapping is not proven",
-    ),
-    UnresolvedTechnicalPolicy(
-        "Contact No",
-        "Booking Docket (Sales Contract)",
-        "published booking_docket vs runtime booking_form identity is unresolved",
     ),
     UnresolvedTechnicalPolicy(
         "Deal Type",
