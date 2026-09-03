@@ -128,6 +128,55 @@ PROVEN_REVIEWED_SOURCE_POLICIES: tuple[ReviewedSourcePolicy, ...] = (
         technical_pairs=(("booking_docket", "dsa_commission_amount"),),
         resolution_rule="FINAL_REPORT_BOOKING_DOCKET_DSA_COMMISSION",
     ),
+    ReviewedSourcePolicy(
+        attribute_key="registration_number",
+        report_field="Registration Number",
+        business_source_label="RTO Paper",
+        technical_pairs=(("rto_challan", "registration_number"),),
+        resolution_rule="FINAL_REPORT_RTO_REGISTRATION_NUMBER",
+    ),
+    ReviewedSourcePolicy(
+        attribute_key="registration_state",
+        report_field="Registration State",
+        business_source_label="RTO Paper",
+        technical_pairs=(("rto_challan", "registration_state"),),
+        resolution_rule="FINAL_REPORT_RTO_REGISTRATION_STATE",
+    ),
+    ReviewedSourcePolicy(
+        attribute_key="registration_territory",
+        report_field="Territory Categorization",
+        business_source_label="RTO Paper",
+        technical_pairs=(("rto_challan", "registration_territory"),),
+        resolution_rule="FINAL_REPORT_RTO_REGISTRATION_TERRITORY",
+    ),
+    ReviewedSourcePolicy(
+        attribute_key="registration_district",
+        report_field="Registration District",
+        business_source_label="RTO Paper",
+        technical_pairs=(("rto_challan", "registration_district"),),
+        resolution_rule="FINAL_REPORT_RTO_REGISTRATION_DISTRICT",
+    ),
+    ReviewedSourcePolicy(
+        attribute_key="ex_showroom_amount",
+        report_field="Ex Showroom (Actual)",
+        business_source_label="RTO Paper",
+        technical_pairs=(("rto_challan", "ex_showroom_amount"),),
+        resolution_rule="FINAL_REPORT_RTO_EX_SHOWROOM_ACTUAL",
+    ),
+    ReviewedSourcePolicy(
+        attribute_key="registration_type",
+        report_field="Registration Type",
+        business_source_label="RTO Paper",
+        technical_pairs=(("rto_challan", "registration_type"),),
+        resolution_rule="FINAL_REPORT_RTO_REGISTRATION_TYPE",
+    ),
+    ReviewedSourcePolicy(
+        attribute_key="hp_charges_amount",
+        report_field="HP Charges (Actual)",
+        business_source_label="RTO Paper",
+        technical_pairs=(("rto_challan", "hp_charges_amount"),),
+        resolution_rule="FINAL_REPORT_RTO_HP_CHARGES_ACTUAL",
+    ),
 )
 
 
@@ -156,19 +205,9 @@ UNRESOLVED_TECHNICAL_POLICIES: tuple[UnresolvedTechnicalPolicy, ...] = (
         "authoritative split KYC state field mapping is not proven",
     ),
     UnresolvedTechnicalPolicy(
-        "Registration Number / State / Territory / District",
-        "RTO Paper",
-        "RTO Paper canonical document family and field keys require Step-2 validation",
-    ),
-    UnresolvedTechnicalPolicy(
         "Finance Type",
         "Bank DO",
         "Bank DO canonical document/field mapping is not proven",
-    ),
-    UnresolvedTechnicalPolicy(
-        "Ex Showroom / Registration Type / HP Charges (Actual)",
-        "RTO Paper",
-        "RTO Paper commercial field mapping is not proven",
     ),
     UnresolvedTechnicalPolicy(
         "Insurance (Actual)",
