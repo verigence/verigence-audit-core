@@ -15,6 +15,9 @@ def test_proven_policy_registry_contains_only_exact_audit_core_contract_keys() -
     assert ("aadhaar", "aadhaar_name") in pairs
     assert ("aadhaar", "aadhaar_number") in pairs
     assert ("pan_card", "pan_number") in pairs
+    assert ("aadhaar", "address_pincode") in pairs
+    assert ("aadhaar", "address_district") in pairs
+    assert ("aadhaar", "address_state") in pairs
     assert ("customer_invoice_dms", "tcs_amount") in pairs
     assert ("customer_invoice_dms", "invoice_date") in pairs
     assert ("customer_invoice_dms", "invoice_number") in pairs
@@ -34,6 +37,7 @@ def test_proven_policy_registry_contains_only_exact_audit_core_contract_keys() -
     assert ("rto_challan", "ex_showroom_amount") in pairs
     assert ("rto_challan", "registration_type") in pairs
     assert ("rto_challan", "hp_charges_amount") in pairs
+    assert ("insurance_cover", "premium_amount") in pairs
 
     # Disputed/unverified aliases must not silently enter the executable registry.
     assert not any(document_type == "booking_form" for document_type, _ in pairs)
@@ -49,6 +53,9 @@ def test_newly_proven_final_report_policies_use_exact_validated_pairs() -> None:
     policies = {policy.report_field: policy for policy in PROVEN_REVIEWED_SOURCE_POLICIES}
 
     expected = {
+        "Pincode": (("aadhaar", "address_pincode"),),
+        "KYC District": (("aadhaar", "address_district"),),
+        "KYC State": (("aadhaar", "address_state"),),
         "DMS Invoice Date": (("customer_invoice_dms", "invoice_date"),),
         "DMS Invoice Number": (("customer_invoice_dms", "invoice_number"),),
         "Delivery Date": (("gate_pass", "delivery_date"),),
@@ -67,6 +74,7 @@ def test_newly_proven_final_report_policies_use_exact_validated_pairs() -> None:
         "Ex Showroom (Actual)": (("rto_challan", "ex_showroom_amount"),),
         "Registration Type": (("rto_challan", "registration_type"),),
         "HP Charges (Actual)": (("rto_challan", "hp_charges_amount"),),
+        "Insurance (Actual)": (("insurance_cover", "premium_amount"),),
     }
 
     for report_field, technical_pairs in expected.items():
@@ -94,6 +102,26 @@ def test_rto_report_fields_are_independent_scalar_policies() -> None:
     assert all(policy.technical_pairs[0][0] == "rto_challan" for policy in rto_policies)
 
 
+def test_kyc_address_policies_are_explicit_aadhaar_values_without_aliases() -> None:
+    policies = {policy.report_field: policy for policy in PROVEN_REVIEWED_SOURCE_POLICIES}
+
+    assert policies["Pincode"].attribute_key == "pincode"
+    assert policies["KYC District"].attribute_key == "kyc_district"
+    assert policies["KYC State"].attribute_key == "kyc_state"
+    assert policies["Pincode"].technical_pairs == (("aadhaar", "address_pincode"),)
+    assert policies["KYC District"].technical_pairs == (("aadhaar", "address_district"),)
+    assert policies["KYC State"].technical_pairs == (("aadhaar", "address_state"),)
+
+
+def test_insurance_actual_uses_published_insurance_cover_premium_only() -> None:
+    policies = {policy.report_field: policy for policy in PROVEN_REVIEWED_SOURCE_POLICIES}
+    insurance = policies["Insurance (Actual)"]
+
+    assert insurance.attribute_key == "insurance_actual_amount"
+    assert insurance.business_source_label == "Insurance Cover Note"
+    assert insurance.technical_pairs == (("insurance_cover", "premium_amount"),)
+
+
 def test_unresolved_registry_keeps_only_still_unproven_canonical_gaps_explicit() -> None:
     rendered = "\n".join(
         f"{item.report_field}|{item.business_source_label}|{item.reason}"
@@ -104,12 +132,15 @@ def test_unresolved_registry_keeps_only_still_unproven_canonical_gaps_explicit()
     }
 
     assert "RTO Paper" not in rendered
-    assert "Insurance Cover Note" in rendered
+    assert "Insurance Cover Note" not in rendered
     assert "Customer Ledger" in rendered
     assert "Bank DO" in rendered
     assert "Minimum Booking Amount payment proof" in rendered
 
     newly_proven = {
+        "Pincode",
+        "KYC District",
+        "KYC State",
         "DMS Invoice Date",
         "DMS Invoice Number",
         "Delivery Date",
@@ -128,6 +159,7 @@ def test_unresolved_registry_keeps_only_still_unproven_canonical_gaps_explicit()
         "Ex Showroom (Actual)",
         "Registration Type",
         "HP Charges (Actual)",
+        "Insurance (Actual)",
     }
     assert unresolved_report_fields.isdisjoint(newly_proven)
 
