@@ -45,6 +45,27 @@ PROVEN_REVIEWED_SOURCE_POLICIES: tuple[ReviewedSourcePolicy, ...] = (
         resolution_rule="FINAL_REPORT_CUSTOMER_KYC_PAN",
     ),
     ReviewedSourcePolicy(
+        attribute_key="pincode",
+        report_field="Pincode",
+        business_source_label="Customer KYC (PAN, Aadhaar, address proof)",
+        technical_pairs=(("aadhaar", "address_pincode"),),
+        resolution_rule="FINAL_REPORT_CUSTOMER_KYC_PINCODE",
+    ),
+    ReviewedSourcePolicy(
+        attribute_key="kyc_district",
+        report_field="KYC District",
+        business_source_label="Customer KYC (PAN, Aadhaar, address proof)",
+        technical_pairs=(("aadhaar", "address_district"),),
+        resolution_rule="FINAL_REPORT_CUSTOMER_KYC_DISTRICT",
+    ),
+    ReviewedSourcePolicy(
+        attribute_key="kyc_state",
+        report_field="KYC State",
+        business_source_label="Customer KYC (PAN, Aadhaar, address proof)",
+        technical_pairs=(("aadhaar", "address_state"),),
+        resolution_rule="FINAL_REPORT_CUSTOMER_KYC_STATE",
+    ),
+    ReviewedSourcePolicy(
         attribute_key="booking_tcs_amount",
         report_field="TCS (Actual)",
         business_source_label="Tax Invoice — DMS",
@@ -177,6 +198,13 @@ PROVEN_REVIEWED_SOURCE_POLICIES: tuple[ReviewedSourcePolicy, ...] = (
         technical_pairs=(("rto_challan", "hp_charges_amount"),),
         resolution_rule="FINAL_REPORT_RTO_HP_CHARGES_ACTUAL",
     ),
+    ReviewedSourcePolicy(
+        attribute_key="insurance_actual_amount",
+        report_field="Insurance (Actual)",
+        business_source_label="Insurance Cover Note",
+        technical_pairs=(("insurance_cover", "premium_amount"),),
+        resolution_rule="FINAL_REPORT_INSURANCE_COVER_PREMIUM_ACTUAL",
+    ),
 )
 
 
@@ -190,29 +218,9 @@ UNRESOLVED_TECHNICAL_POLICIES: tuple[UnresolvedTechnicalPolicy, ...] = (
         "receipt document identity is fragmented across current Audit Core paths",
     ),
     UnresolvedTechnicalPolicy(
-        "Pincode",
-        "Customer KYC (PAN, Aadhaar, address proof)",
-        "authoritative split KYC pincode field mapping is not proven",
-    ),
-    UnresolvedTechnicalPolicy(
-        "KYC District",
-        "Customer KYC (PAN, Aadhaar, address proof)",
-        "authoritative split KYC district field mapping is not proven",
-    ),
-    UnresolvedTechnicalPolicy(
-        "KYC State",
-        "Customer KYC (PAN, Aadhaar, address proof)",
-        "authoritative split KYC state field mapping is not proven",
-    ),
-    UnresolvedTechnicalPolicy(
         "Finance Type",
         "Bank DO",
         "Bank DO canonical document/field mapping is not proven",
-    ),
-    UnresolvedTechnicalPolicy(
-        "Insurance (Actual)",
-        "Insurance Cover Note",
-        "catalogue insurance_cover vs resolver insurance_cover_note/policy identity is unresolved",
     ),
     UnresolvedTechnicalPolicy(
         "Accessories (Actual)",
