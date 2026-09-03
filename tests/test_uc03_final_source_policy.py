@@ -23,6 +23,10 @@ def test_proven_policy_registry_contains_only_exact_audit_core_contract_keys() -
     assert ("customer_invoice_dms", "chassis_number") in pairs
     assert ("bank_statement", "bank_name") in pairs
     assert ("booking_docket", "customer_phone") in pairs
+    assert ("booking_docket", "deal_type") in pairs
+    assert ("booking_docket", "out_of_scope_reasons") in pairs
+    assert ("booking_docket", "exchange_applicable") in pairs
+    assert ("booking_docket", "dsa_commission_amount") in pairs
 
     # Disputed/unverified aliases must not silently enter the executable registry.
     assert not any(document_type == "booking_form" for document_type, _ in pairs)
@@ -44,6 +48,10 @@ def test_newly_proven_final_report_policies_use_exact_validated_pairs() -> None:
         "New Car Chasiss No.": (("customer_invoice_dms", "chassis_number"),),
         "Bank Name": (("bank_statement", "bank_name"),),
         "Contact No": (("booking_docket", "customer_phone"),),
+        "Deal Type": (("booking_docket", "deal_type"),),
+        "Out of scope reasons": (("booking_docket", "out_of_scope_reasons"),),
+        "Exchange (Y/N)": (("booking_docket", "exchange_applicable"),),
+        "DSA Commsission": (("booking_docket", "dsa_commission_amount"),),
     }
 
     for report_field, technical_pairs in expected.items():
@@ -59,7 +67,6 @@ def test_unresolved_registry_keeps_only_still_unproven_canonical_gaps_explicit()
         item.report_field for item in UNRESOLVED_TECHNICAL_POLICIES
     }
 
-    assert "Booking Docket" in rendered
     assert "RTO Paper" in rendered
     assert "Insurance Cover Note" in rendered
     assert "Customer Ledger" in rendered
@@ -74,6 +81,10 @@ def test_unresolved_registry_keeps_only_still_unproven_canonical_gaps_explicit()
         "New Car Chasiss No.",
         "Bank Name",
         "Contact No",
+        "Deal Type",
+        "Out of scope reasons",
+        "Exchange (Y/N)",
+        "DSA Commsission",
     }
     assert unresolved_report_fields.isdisjoint(newly_proven)
 
