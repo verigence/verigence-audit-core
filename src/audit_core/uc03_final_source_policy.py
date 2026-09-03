@@ -208,15 +208,16 @@ PROVEN_REVIEWED_SOURCE_POLICIES: tuple[ReviewedSourcePolicy, ...] = (
 )
 
 
-# These business source decisions are approved, but the technical Audit Core/DI
-# mapping is not yet authoritative. The final-source command must fail closed while
-# any of these remain instead of converting presentation labels into guessed keys.
+# Typed/source-system values do not belong in the reviewed-document resolution
+# registry. In particular, Booking Date is already owned by Audit Core's typed
+# audit-case record; Minimum Booking Amount evidence feeds receipt/payment facts,
+# not the typed booking date.
+#
+# The entries below are only document-derived business outputs whose approved
+# business source is known but whose exact technical DI mapping is still unproven.
+# The final-source command must fail closed while any of these remain instead of
+# converting presentation labels into guessed keys.
 UNRESOLVED_TECHNICAL_POLICIES: tuple[UnresolvedTechnicalPolicy, ...] = (
-    UnresolvedTechnicalPolicy(
-        "Booking Date",
-        "Minimum Booking Amount payment proof",
-        "receipt document identity is fragmented across current Audit Core paths",
-    ),
     UnresolvedTechnicalPolicy(
         "Finance Type",
         "Bank DO",
@@ -225,16 +226,16 @@ UNRESOLVED_TECHNICAL_POLICIES: tuple[UnresolvedTechnicalPolicy, ...] = (
     UnresolvedTechnicalPolicy(
         "Accessories (Actual)",
         "Accessory Invoice — Tally / bookkeeping software",
-        "authoritative accessory-invoice field mapping is not proven",
+        "authoritative accessory-invoice field mapping/aggregation semantics are not proven",
     ),
     UnresolvedTechnicalPolicy(
         "EW (Actual)",
         "EW Tally Invoice",
-        "authoritative EW invoice document/field mapping is not proven",
+        "authoritative Tally-specific EW invoice identity/field mapping is not proven",
     ),
     UnresolvedTechnicalPolicy(
         "RSA / Fast tag / Actual discounts / deal totals",
         "Customer Ledger",
-        "Customer Ledger field contract for final report values is not proven",
+        "Customer Ledger field contract and row-level source ownership are not proven",
     ),
 )
