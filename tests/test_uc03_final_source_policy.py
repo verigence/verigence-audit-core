@@ -134,6 +134,17 @@ def test_booking_date_is_typed_owner_not_document_resolution_policy() -> None:
     assert "Booking Date" not in unresolved_fields
 
 
+def test_first_receipt_date_remains_fail_closed_on_money_receipt_identity() -> None:
+    unresolved = {
+        policy.report_field: policy for policy in UNRESOLVED_TECHNICAL_POLICIES
+    }
+
+    first_receipt = unresolved["First receipt date"]
+    assert first_receipt.business_source_label == "Money Receipt"
+    assert "document identity" in first_receipt.reason
+    assert "receipt-date field mapping" in first_receipt.reason
+
+
 def test_unresolved_registry_keeps_only_still_unproven_canonical_gaps_explicit() -> None:
     rendered = "\n".join(
         f"{item.report_field}|{item.business_source_label}|{item.reason}"
@@ -146,6 +157,7 @@ def test_unresolved_registry_keeps_only_still_unproven_canonical_gaps_explicit()
     assert "RTO Paper" not in rendered
     assert "Insurance Cover Note" not in rendered
     assert "Minimum Booking Amount payment proof" not in rendered
+    assert "Money Receipt" in rendered
     assert "Customer Ledger" in rendered
     assert "Bank DO" in rendered
     assert "aggregation semantics" in rendered
@@ -177,6 +189,7 @@ def test_unresolved_registry_keeps_only_still_unproven_canonical_gaps_explicit()
         "Booking Date",
     }
     assert unresolved_report_fields.isdisjoint(newly_proven)
+    assert "First receipt date" in unresolved_report_fields
 
 
 def test_every_executable_policy_has_business_label_rule_and_exact_pairs() -> None:
