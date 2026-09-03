@@ -122,6 +122,18 @@ def test_insurance_actual_uses_published_insurance_cover_premium_only() -> None:
     assert insurance.technical_pairs == (("insurance_cover", "premium_amount"),)
 
 
+def test_booking_date_is_typed_owner_not_document_resolution_policy() -> None:
+    executable_fields = {
+        policy.report_field for policy in PROVEN_REVIEWED_SOURCE_POLICIES
+    }
+    unresolved_fields = {
+        policy.report_field for policy in UNRESOLVED_TECHNICAL_POLICIES
+    }
+
+    assert "Booking Date" not in executable_fields
+    assert "Booking Date" not in unresolved_fields
+
+
 def test_unresolved_registry_keeps_only_still_unproven_canonical_gaps_explicit() -> None:
     rendered = "\n".join(
         f"{item.report_field}|{item.business_source_label}|{item.reason}"
@@ -133,9 +145,11 @@ def test_unresolved_registry_keeps_only_still_unproven_canonical_gaps_explicit()
 
     assert "RTO Paper" not in rendered
     assert "Insurance Cover Note" not in rendered
+    assert "Minimum Booking Amount payment proof" not in rendered
     assert "Customer Ledger" in rendered
     assert "Bank DO" in rendered
-    assert "Minimum Booking Amount payment proof" in rendered
+    assert "aggregation semantics" in rendered
+    assert "Tally-specific EW invoice identity" in rendered
 
     newly_proven = {
         "Pincode",
@@ -160,6 +174,7 @@ def test_unresolved_registry_keeps_only_still_unproven_canonical_gaps_explicit()
         "Registration Type",
         "HP Charges (Actual)",
         "Insurance (Actual)",
+        "Booking Date",
     }
     assert unresolved_report_fields.isdisjoint(newly_proven)
 
