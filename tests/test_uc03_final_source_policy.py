@@ -27,6 +27,13 @@ def test_proven_policy_registry_contains_only_exact_audit_core_contract_keys() -
     assert ("booking_docket", "out_of_scope_reasons") in pairs
     assert ("booking_docket", "exchange_applicable") in pairs
     assert ("booking_docket", "dsa_commission_amount") in pairs
+    assert ("rto_challan", "registration_number") in pairs
+    assert ("rto_challan", "registration_state") in pairs
+    assert ("rto_challan", "registration_territory") in pairs
+    assert ("rto_challan", "registration_district") in pairs
+    assert ("rto_challan", "ex_showroom_amount") in pairs
+    assert ("rto_challan", "registration_type") in pairs
+    assert ("rto_challan", "hp_charges_amount") in pairs
 
     # Disputed/unverified aliases must not silently enter the executable registry.
     assert not any(document_type == "booking_form" for document_type, _ in pairs)
@@ -35,6 +42,7 @@ def test_proven_policy_registry_contains_only_exact_audit_core_contract_keys() -
     assert not any(document_type == "dealer_receipt" for document_type, _ in pairs)
     assert not any(document_type == "tax_invoice" for document_type, _ in pairs)
     assert not any(document_type == "tax_invoice_dms" for document_type, _ in pairs)
+    assert not any(document_type == "vehicle_rc" for document_type, _ in pairs)
 
 
 def test_newly_proven_final_report_policies_use_exact_validated_pairs() -> None:
@@ -52,10 +60,38 @@ def test_newly_proven_final_report_policies_use_exact_validated_pairs() -> None:
         "Out of scope reasons": (("booking_docket", "out_of_scope_reasons"),),
         "Exchange (Y/N)": (("booking_docket", "exchange_applicable"),),
         "DSA Commsission": (("booking_docket", "dsa_commission_amount"),),
+        "Registration Number": (("rto_challan", "registration_number"),),
+        "Registration State": (("rto_challan", "registration_state"),),
+        "Territory Categorization": (("rto_challan", "registration_territory"),),
+        "Registration District": (("rto_challan", "registration_district"),),
+        "Ex Showroom (Actual)": (("rto_challan", "ex_showroom_amount"),),
+        "Registration Type": (("rto_challan", "registration_type"),),
+        "HP Charges (Actual)": (("rto_challan", "hp_charges_amount"),),
     }
 
     for report_field, technical_pairs in expected.items():
         assert policies[report_field].technical_pairs == technical_pairs
+
+
+def test_rto_report_fields_are_independent_scalar_policies() -> None:
+    rto_policies = [
+        policy
+        for policy in PROVEN_REVIEWED_SOURCE_POLICIES
+        if policy.business_source_label == "RTO Paper"
+    ]
+
+    assert len(rto_policies) == 7
+    assert {policy.attribute_key for policy in rto_policies} == {
+        "registration_number",
+        "registration_state",
+        "registration_territory",
+        "registration_district",
+        "ex_showroom_amount",
+        "registration_type",
+        "hp_charges_amount",
+    }
+    assert all(len(policy.technical_pairs) == 1 for policy in rto_policies)
+    assert all(policy.technical_pairs[0][0] == "rto_challan" for policy in rto_policies)
 
 
 def test_unresolved_registry_keeps_only_still_unproven_canonical_gaps_explicit() -> None:
@@ -67,7 +103,7 @@ def test_unresolved_registry_keeps_only_still_unproven_canonical_gaps_explicit()
         item.report_field for item in UNRESOLVED_TECHNICAL_POLICIES
     }
 
-    assert "RTO Paper" in rendered
+    assert "RTO Paper" not in rendered
     assert "Insurance Cover Note" in rendered
     assert "Customer Ledger" in rendered
     assert "Bank DO" in rendered
@@ -85,6 +121,13 @@ def test_unresolved_registry_keeps_only_still_unproven_canonical_gaps_explicit()
         "Out of scope reasons",
         "Exchange (Y/N)",
         "DSA Commsission",
+        "Registration Number",
+        "Registration State",
+        "Territory Categorization",
+        "Registration District",
+        "Ex Showroom (Actual)",
+        "Registration Type",
+        "HP Charges (Actual)",
     }
     assert unresolved_report_fields.isdisjoint(newly_proven)
 
