@@ -100,6 +100,34 @@ PROVEN_REVIEWED_SOURCE_POLICIES: tuple[ReviewedSourcePolicy, ...] = (
         technical_pairs=(("booking_docket", "customer_phone"),),
         resolution_rule="FINAL_REPORT_BOOKING_DOCKET_CONTACT_NO",
     ),
+    ReviewedSourcePolicy(
+        attribute_key="deal_type",
+        report_field="Deal Type",
+        business_source_label="Booking Docket (Sales Contract)",
+        technical_pairs=(("booking_docket", "deal_type"),),
+        resolution_rule="FINAL_REPORT_BOOKING_DOCKET_DEAL_TYPE",
+    ),
+    ReviewedSourcePolicy(
+        attribute_key="out_of_scope_reasons",
+        report_field="Out of scope reasons",
+        business_source_label="Booking Docket (Sales Contract)",
+        technical_pairs=(("booking_docket", "out_of_scope_reasons"),),
+        resolution_rule="FINAL_REPORT_BOOKING_DOCKET_OUT_OF_SCOPE_REASONS",
+    ),
+    ReviewedSourcePolicy(
+        attribute_key="exchange_applicable",
+        report_field="Exchange (Y/N)",
+        business_source_label="Booking Docket (Sales Contract)",
+        technical_pairs=(("booking_docket", "exchange_applicable"),),
+        resolution_rule="FINAL_REPORT_BOOKING_DOCKET_EXCHANGE_APPLICABLE",
+    ),
+    ReviewedSourcePolicy(
+        attribute_key="dsa_commission_amount",
+        report_field="DSA Commsission",
+        business_source_label="Booking Docket (Sales Contract)",
+        technical_pairs=(("booking_docket", "dsa_commission_amount"),),
+        resolution_rule="FINAL_REPORT_BOOKING_DOCKET_DSA_COMMISSION",
+    ),
 )
 
 
@@ -128,16 +156,6 @@ UNRESOLVED_TECHNICAL_POLICIES: tuple[UnresolvedTechnicalPolicy, ...] = (
         "authoritative split KYC state field mapping is not proven",
     ),
     UnresolvedTechnicalPolicy(
-        "Deal Type",
-        "Booking Docket (Sales Contract)",
-        "authoritative Booking Docket deal-type field key is not proven",
-    ),
-    UnresolvedTechnicalPolicy(
-        "Out of scope reasons",
-        "Booking Docket (Sales Contract)",
-        "authoritative Booking Docket out-of-scope field key is not proven",
-    ),
-    UnresolvedTechnicalPolicy(
         "Registration Number / State / Territory / District",
         "RTO Paper",
         "RTO Paper canonical document family and field keys require Step-2 validation",
@@ -146,16 +164,6 @@ UNRESOLVED_TECHNICAL_POLICIES: tuple[UnresolvedTechnicalPolicy, ...] = (
         "Finance Type",
         "Bank DO",
         "Bank DO canonical document/field mapping is not proven",
-    ),
-    UnresolvedTechnicalPolicy(
-        "Exchange (Y/N)",
-        "Booking Docket (Sales Contract)",
-        "published booking_docket vs runtime booking_form identity is unresolved",
-    ),
-    UnresolvedTechnicalPolicy(
-        "DSA Commsission",
-        "Booking Docket (Sales Contract)",
-        "authoritative DSA commission field key is not proven",
     ),
     UnresolvedTechnicalPolicy(
         "Ex Showroom / Registration Type / HP Charges (Actual)",
