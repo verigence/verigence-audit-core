@@ -140,6 +140,30 @@ def _correction_map(
     return result
 
 
+def _validate_mapped_corrections(
+    attributes: list[review_v2.ReviewV2Attribute],
+    corrections: dict[tuple[UUID, str, str, int], ReviewFieldCorrection],
+) -> None:
+    for attribute in attributes:
+        source = attribute.resolvedSource
+        if source is None:
+            continue
+        correction = corrections.get(_source_target(source))
+        if correction is None:
+            continue
+        value = correction.effectiveValue
+        if value is None or (isinstance(value, str) and not value.strip()):
+            raise ConflictError(
+                error_code="VAC-CONFLICT-013",
+                title="Reviewed value cannot be projected",
+                detail=(
+                    f"Mapped attribute '{attribute.attributeKey}' cannot be confirmed "
+                    "with an empty effective value because its Audit Core projection "
+                    "would be lost."
+                ),
+            )
+
+
 def _duplicate_raw_field_keys(
     documents: list[review_v2.ReviewV2Document],
 ) -> set[str]:
@@ -331,23 +355,23 @@ def confirm_booking_review_v2_effective_values(
         str,
         Header(alias="Idempotency-Key", min_length=8, max_length=200),
     ],
-    payload: ReviewConfirmCommand | None = None,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)] = None,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
     authorization_client: Annotated[
         SecurityAuthorizationClient,
         Depends(get_security_authorization_client),
-    ] = None,
-    connection: Annotated[Connection, Depends(get_connection)] = None,
-    engine: Annotated[Engine, Depends(get_engine)] = None,
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+    engine: Annotated[Engine, Depends(get_engine)],
     security_client: Annotated[
         SecurityOAuthClient,
         Depends(get_security_oauth_client),
-    ] = None,
-    di_client: Annotated[review_v2.DiClient, Depends(get_di_client)] = None,
+    ],
+    di_client: Annotated[review_v2.DiClient, Depends(get_di_client)],
     v2_client: Annotated[
         review_v2.DiCaptureV2Client,
         Depends(review_v2.get_di_capture_v2_client),
-    ] = None,
+    ],
+    payload: ReviewConfirmCommand | None = None,
 ) -> booking_review.BookingReviewV2ConfirmWithDecisionsResponse:
     context = booking_review._scope(
         connection,
@@ -405,6 +429,7 @@ def confirm_booking_review_v2_effective_values(
     }
     command = payload or ReviewConfirmCommand()
     corrections = _correction_map(documents, command.corrections)
+    _validate_mapped_corrections(attributes, corrections)
     corrected_documents = _corrected_documents(documents, corrections)
     corrected_attributes = _corrected_attributes(attributes, corrections)
     correlation_id = get_correlation_id(request)
@@ -604,23 +629,23 @@ def confirm_delivery_review_v2_effective_values(
         str,
         Header(alias="Idempotency-Key", min_length=8, max_length=200),
     ],
-    payload: ReviewConfirmCommand | None = None,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)] = None,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
     authorization_client: Annotated[
         SecurityAuthorizationClient,
         Depends(get_security_authorization_client),
-    ] = None,
-    connection: Annotated[Connection, Depends(get_connection)] = None,
-    engine: Annotated[Engine, Depends(get_engine)] = None,
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+    engine: Annotated[Engine, Depends(get_engine)],
     security_client: Annotated[
         SecurityOAuthClient,
         Depends(get_security_oauth_client),
-    ] = None,
-    di_client: Annotated[review_v2.DiClient, Depends(get_di_client)] = None,
+    ],
+    di_client: Annotated[review_v2.DiClient, Depends(get_di_client)],
     v2_client: Annotated[
         review_v2.DiCaptureV2Client,
         Depends(review_v2.get_di_capture_v2_client),
-    ] = None,
+    ],
+    payload: ReviewConfirmCommand | None = None,
 ) -> delivery_review.DeliveryReviewV2ConfirmResponse:
     context = booking_review._scope(
         connection,
