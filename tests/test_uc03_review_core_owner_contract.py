@@ -1,22 +1,29 @@
-import inspect
 from uuid import uuid4
 
+import pytest
 from fastapi.routing import APIRoute
 
+from audit_core import uc03_booking_review_decisions as decisions
 from audit_core import uc03_document_review_v2 as review_v2
+from audit_core import uc03_v2_review_materialization as materialization
+from audit_core.errors import ConflictError
+from audit_core.uc03_booking_commercial_components import (
+    install_uc03_booking_commercial_components,
+)
 from audit_core.uc03_booking_review_decisions import (
     BookingReviewV2ConfirmWithDecisionsResponse,
     _lossless_reviewed_fields,
-    confirm_booking_review_v2_with_decisions,
     install_uc03_booking_review_decisions,
 )
-from audit_core.uc03_v2_review_materialization import (
-    _AADHAAR_FIELDS,
-    _BOOKING_FORM_FIELDS,
-    _PAN_FIELDS,
-    _RECEIPT_FIELDS,
-    reviewed_field_core_owner,
+from audit_core.uc03_strict_review_core_ownership import (
+    install_uc03_strict_review_core_ownership,
 )
+
+
+def _install_contract() -> None:
+    install_uc03_booking_commercial_components()
+    install_uc03_booking_review_decisions()
+    install_uc03_strict_review_core_ownership()
 
 
 def _document(
@@ -48,7 +55,7 @@ def _document(
 
 
 def test_active_review_confirm_contract_is_decision_aware() -> None:
-    install_uc03_booking_review_decisions()
+    _install_contract()
     confirm_routes = [
         route
         for route in review_v2.router.routes
@@ -61,54 +68,76 @@ def test_active_review_confirm_contract_is_decision_aware() -> None:
     assert confirm_routes[0].response_model is BookingReviewV2ConfirmWithDecisionsResponse
 
 
-def test_every_supported_review_field_has_typed_core_owner() -> None:
+def test_every_supported_booking_source_field_has_typed_core_owner() -> None:
+    _install_contract()
     document_id = uuid4()
 
-    for field_key in _BOOKING_FORM_FIELDS:
-        assert reviewed_field_core_owner(
-            document_type_key="booking_form",
-            field_key=field_key,
-            document_id=document_id,
-        ) is not None
-    for field_key in _PAN_FIELDS:
-        assert reviewed_field_core_owner(
+    # Booking Form and Booking Docket are alternate evidence for the same Booking
+    # business owner. Every configured Booking field must be typed for both.
+    for document_type in ("booking_form", "booking_docket"):
+        for field_key in materialization._BOOKING_FORM_FIELDS:
+            assert materialization.reviewed_field_core_owner(
+                document_type_key=document_type,
+                field_key=field_key,
+                document_id=document_id,
+            ) is not None
+
+    for field_key in materialization._PAN_FIELDS:
+        assert materialization.reviewed_field_core_owner(
             document_type_key="pan",
             field_key=field_key,
             document_id=document_id,
         ) is not None
-    for field_key in _AADHAAR_FIELDS:
-        assert reviewed_field_core_owner(
+    for field_key in materialization._AADHAAR_FIELDS:
+        assert materialization.reviewed_field_core_owner(
             document_type_key="aadhaar",
             field_key=field_key,
             document_id=document_id,
         ) is not None
-    for field_key in _RECEIPT_FIELDS:
-        assert reviewed_field_core_owner(
+    for field_key in materialization._RECEIPT_FIELDS:
+        assert materialization.reviewed_field_core_owner(
             document_type_key="dealer_receipt",
             field_key=field_key,
             document_id=document_id,
         ) is not None
 
 
-def test_unknown_review_field_has_no_typed_core_owner_but_is_generically_persistable() -> None:
-    document = _document("future_unowned_business_field")
-    document_id = document.documentId
+def test_booking_docket_unique_fields_are_first_class_review_attributes() -> None:
+    _install_contract()
+    for field_key in (
+        "deal_type",
+        "out_of_scope_reasons",
+        "dsa_commission_amount",
+    ):
+        spec = review_v2.spec_for_field(field_key)
+        assert spec is not None
+        assert spec.mapping_status == "SUPPORTED"
+        assert "BOOKING" in spec.stages
 
-    assert reviewed_field_core_owner(
+
+def test_unknown_accepted_booking_field_fails_before_generic_provenance_copy() -> None:
+    _install_contract()
+    document = _document("future_unowned_business_field")
+    reviewed = _lossless_reviewed_fields([document], rejected_keys=set())
+
+    assert len(reviewed) == 1
+    assert reviewed[0].effective_value_is_set is True
+    assert materialization.reviewed_field_core_owner(
         document_type_key="booking_form",
         field_key="future_unowned_business_field",
-        document_id=document_id,
+        document_id=document.documentId,
     ) is None
 
-    reviewed = _lossless_reviewed_fields([document], rejected_keys=set())
-    assert len(reviewed) == 1
-    field = reviewed[0]
-    assert field.document_id == document_id
-    assert field.field_key == "future_unowned_business_field"
-    assert field.extracted_value == "accepted-value"
-    assert field.effective_value == "accepted-value"
-    assert field.effective_value_is_set is True
-    assert field.confidence_scale == "PERCENT"
+    with pytest.raises(ConflictError) as raised:
+        decisions.persist_reviewed_di_fields(
+            object(),
+            tenant_id="tenant-1",
+            journey_id=uuid4(),
+            stage_code="BOOKING",
+            actor_id="reviewer-1",
+            fields=reviewed,
+        )
+    assert raised.value.error_code == "VAC-CONFLICT-013"
 
 
 def test_rejected_unknown_field_keeps_original_without_effective_value() -> None:
@@ -138,10 +167,8 @@ def test_rejected_mapped_attribute_keeps_source_without_effective_value() -> Non
     assert reviewed[0].effective_value_is_set is False
 
 
-def test_booking_confirm_no_longer_requires_typed_owner_for_every_accepted_field() -> None:
-    source = inspect.getsource(confirm_booking_review_v2_with_decisions)
-    assert "_assert_accepted_raw_fields_have_core_owner" not in source
-    assert "persist_reviewed_di_fields(" in source
-    assert 'stage_code="BOOKING"' in source
-    assert '"rawDiValuesCopied": True' in source
-    assert "if typed_owner is not None" in source
+def test_booking_confirm_installs_strict_owner_guard() -> None:
+    _install_contract()
+    assert decisions.persist_reviewed_di_fields.__name__ == (
+        "persist_reviewed_di_fields_with_owner_guard"
+    )
