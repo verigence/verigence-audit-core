@@ -139,12 +139,17 @@ def test_pan_di_contract_has_core_review_owner_for_every_field() -> None:
 
 
 def test_aadhaar_di_contract_has_core_review_owner_for_every_field() -> None:
+    # Mirrors verigence-di Aadhaar v1.2, including the three address components
+    # that DI only emits when they are explicitly identifiable on the document.
     assert _AADHAAR_FIELDS == {
         "aadhaar_number",
         "aadhaar_name",
         "date_of_birth",
         "gender",
         "aadhaar_address",
+        "address_pincode",
+        "address_state",
+        "address_district",
         "aadhaar_relationship_type",
         "aadhaar_relationship_name",
     }
