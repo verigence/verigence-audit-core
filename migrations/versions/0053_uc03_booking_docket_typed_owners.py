@@ -1,7 +1,7 @@
 """Add typed Audit Core owners for Booking Docket-only reviewed fields.
 
 Revision ID: 0053
-Revises: 0052
+Revises: 0052_uc03_final_source
 Create Date: 2026-09-04
 
 Booking Form and Booking Docket are both UC03 Booking sales-contract evidence.
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0053"
-down_revision = "0052"
+down_revision = "0052_uc03_final_source"
 branch_labels = None
 depends_on = None
 
