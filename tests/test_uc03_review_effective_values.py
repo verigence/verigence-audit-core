@@ -80,6 +80,33 @@ def test_pc_correction_keeps_original_di_value_and_changes_only_effective_value(
     assert unchanged_field.is_modified is False
 
 
+def test_n_extracted_m_modified_contract_is_lossless() -> None:
+    documents = [
+        _document(field_key="field_a", value="A"),
+        _document(field_key="field_b", value=0),
+        _document(field_key="field_c", value=False),
+    ]
+    corrections = _correction_map(
+        documents,
+        [_correction(documents[1], value=125)],
+    )
+
+    reviewed = _reviewed_fields(documents, corrections)
+
+    assert len(reviewed) == 3
+    assert sum(field.is_modified for field in reviewed) == 1
+    by_key = {field.field_key: field for field in reviewed}
+    assert by_key["field_a"].extracted_value == "A"
+    assert by_key["field_a"].effective_value == "A"
+    assert by_key["field_b"].extracted_value == 0
+    assert by_key["field_b"].modified_value == 125
+    assert by_key["field_b"].effective_value == 125
+    assert by_key["field_c"].extracted_value is False
+    assert by_key["field_c"].effective_value is False
+    assert all(field.source_canonical_field_id for field in reviewed)
+    assert all(field.source_fact_version == 1 for field in reviewed)
+
+
 def test_correction_must_match_current_document_canonical_field_and_fact_version() -> None:
     document = _document(field_key="future_field", value="DI")
     field = document.fields[0]
