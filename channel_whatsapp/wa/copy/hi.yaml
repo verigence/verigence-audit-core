@@ -1,0 +1,31 @@
+# welcome to Verigence — Hindi copy
+welcome: |
+  Verigence में आपका स्वागत है! 👋
+  मैं आपको डील दस्तावेज़ जल्दी जमा करने में मदद करूंगा।
+  बेहतर गुणवत्ता के लिए दस्तावेज़ *फ़ाइल* के रूप में भेजें (फ़ोटो नहीं)।
+binding_success: "✅ आपका WhatsApp अब आपके Verigence खाते से जुड़ गया है।"
+binding_expired: "❌ वह सत्यापन कोड समाप्त हो गया है। नया कोड मांगें।"
+binding_invalid: "❌ वह कोड मान्य नहीं है। दोबारा खोजें।"
+file_received: "📄 फ़ाइल {seq} मिली। अंतिम फ़ाइल के 90 सेकंड बाद प्रोसेस होगा।"
+bundle_processing: "⏳ सभी फ़ाइलें मिल गईं। जमा प्रक्रिया जारी है…"
+deal_confirm_header: "नई डील मिली"
+deal_confirm_body: |
+  *बुकिंग:* {booking_number}
+  *मॉडल:* {model}
+  क्या यह सही है?
+deal_confirm_yes: "✅ हाँ"
+deal_confirm_no: "❌ नहीं"
+deal_confirmed: "✅ डील पुष्टि हो गई। बुकिंग *{booking_number}* से जोड़ा जाएगा।"
+gaps_header: "📋 जमा सारांश"
+gaps_complete: "✅ बुकिंग *{booking_number}* के सभी आवश्यक दस्तावेज़ प्राप्त हो गए हैं।"
+gaps_missing: |
+  ✅ अब तक मिले:
+  {received_list}
+  
+  ⚠️ अभी चाहिए:
+  {missing_list}
+retake_request: "⚠️ *{doc_type}* स्पष्ट नहीं पढ़ा जा सका। कृपया *फ़ाइल* के रूप में दोबारा भेजें।"
+escalated: "आपकी जमा समीक्षा के लिए फ्लैग कर दी गई है। आपके दस्तावेज़ सुरक्षित हैं।"
+parked_sla: "⚠️ प्रोसेसिंग में अधिक समय लग रहा है। आपके दस्तावेज़ सुरक्षित हैं।"
+error_unknown: "कुछ गलत हो गया। संदर्भ: {correlation_id}"
+unregistered: "आपका WhatsApp नंबर Verigence में पंजीकृत नहीं है। अपने सुपरवाइज़र से खाता सेट अप करवाएं।"

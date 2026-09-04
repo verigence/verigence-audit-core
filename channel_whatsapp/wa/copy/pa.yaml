@@ -1,0 +1,30 @@
+# welcome to Verigence — Punjabi copy
+welcome: |
+  Verigence ਵਿੱਚ ਤੁਹਾਡਾ ਸੁਆਗਤ ਹੈ! 👋
+  ਮੈਂ ਤੁਹਾਨੂੰ ਡੀਲ ਦਸਤਾਵੇਜ़ ਜਲਦੀ ਜਮਾ ਕਰਨ ਵਿੱਚ ਮਦਦ ਕਰਾਂਗਾ।
+binding_success: "✅ ਤੁਹਾਡਾ WhatsApp ਹੁਣ Verigence ਖਾਤੇ ਨਾਲ ਜੁੜ ਗਿਆ ਹੈ।"
+binding_expired: "❌ ਉਹ ਵੇਰੀਫਿਕੇਸ਼ਨ ਕੋਡ ਖਤਮ ਹੋ ਗਿਆ ਹੈ। ਨਵਾਂ ਕੋਡ ਮੰਗੋ।"
+binding_invalid: "❌ ਉਹ ਕੋਡ ਮਾਨਤਾ ਪ੍ਰਾਪਤ ਨਹੀਂ ਹੈ।"
+file_received: "📄 ਫਾਇਲ {seq} ਮਿਲੀ। 90 ਸਕਿੰਟ ਬਾਅਦ ਪ੍ਰੋਸੈੱਸ ਹੋਵੇਗਾ।"
+bundle_processing: "⏳ ਸਾਰੀਆਂ ਫਾਇਲਾਂ ਮਿਲ ਗਈਆਂ ਨੇ। ਜਮਾਂ ਪ੍ਰਕਿਰਿਆ ਜਾਰੀ ਹੈ…"
+deal_confirm_header: "ਨਵੀਂ ਡੀਲ ਮਿਲੀ"
+deal_confirm_body: |
+  *ਬੁਕਿੰਗ:* {booking_number}
+  *ਮਾਡਲ:* {model}
+  ਕੀ ਇਹ ਸਹੀ ਹੈ?
+deal_confirm_yes: "✅ ਹਾਂ"
+deal_confirm_no: "❌ ਨਹੀਂ"
+deal_confirmed: "✅ ਡੀਲ ਪੁਸ਼ਟੀ ਹੋ ਗਈ। ਬੁਕਿੰਗ *{booking_number}* ਨਾਲ ਜੋੜੇ ਜਾਣਗੇ।"
+gaps_header: "📋 ਜਮਾੰ ਸੰਖੇਪੇ"
+gaps_complete: "✅ ਬੁਕਿੰਗ *{booking_number}* ਲਈ ਸਾਰੇ ਲੋੜੀਂਦੇ ਦਸਤਾਵੇਜ़ ਮਿਲ ਗਏ ਹਨ।"
+gaps_missing: |
+  ✅ ਹੁਣ ਤੱਕ ਮਿਲੇ:
+  {received_list}
+  
+  ⚠️ ਅਜੇ ਲੋੜੀਂਦੇ:
+  {missing_list}
+retake_request: "⚠️ *{doc_type}* ਸਪੱਸ਼ਟ ਨਹੀਂ ਪੜਿਆ ਜਾ ਸਕਿਆ। ਕਿਰਪਾ *ਫਾਇਲ* ਵਜੋਂ ਦੁਬਾਰਾ ਭੇਜੋ।"
+escalated: "ਤੁਹਾਡੀ ਜਮਾੰ ਸਮੀਖਿਆ ਲਈ ਫ੍ਲੈਗ ਕੀਤੀ ਗਈ ਹੈ। ਦਸਤਾਵੇਜ़ ਸੁਰੱਖਿਅਤ ਹਨ।"
+parked_sla: "⚠️ ਪ੍ਰੋਸੈੱਸਿੰਗ ਵਿੱਚ ਉਮੀਦ ਤੋਂ ਵੱਧ ਸਮਾਂ ਲੱਗ ਰਿਹਾ ਹੈ। ਦਸਤਾਵੇਜ़ ਸੁਰੱਖਿਅਤ ਹਨ।"
+error_unknown: "ਕੁਝ ਸਮੱਸਿਆ ਆਈ। ਹਵਾਲਾ: {correlation_id}"
+unregistered: "ਤੁਹਾਡਾ WhatsApp ਨੰਬਰ Verigence ਵਿੱਚ ਰਜਿਸਟਰ ਨਹੀਂ ਹੈ। ਸੁਪਰਵਾਈਜ़ਰ ਤੋਂ ਖਾਤਾ ਸੈੱਟ ਅੱਪ ਕਰਵਾਓ।"

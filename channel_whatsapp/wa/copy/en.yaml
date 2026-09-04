@@ -1,0 +1,50 @@
+# welcome to Verigence — English copy
+welcome: |
+  Welcome to Verigence! 👋
+  I'll help you submit deal documents quickly.
+  
+  Please send your documents as *files* (not photos) for best quality.
+  Send all files for one deal, then wait — I'll process them together.
+
+binding_success: "✅ Your WhatsApp is now linked to your Verigence account. You're ready to submit documents."
+binding_expired: "❌ That verification code has expired. Please request a new one from your supervisor."
+binding_invalid: "❌ That code isn’t recognised. Please double-check and try again."
+file_received: "📄 Got it! File {seq} received. Keep sending — I'll wait 90 seconds after your last file."
+bundle_processing: "⏳ All files received. Processing your submission now…"
+deal_confirm_header: "New deal found"
+deal_confirm_body: |
+  I found a booking for:
+  *Booking:* {booking_number}
+  *Model:* {model}
+  
+  Is this correct?
+deal_confirm_yes: "✅ Yes, that's right"
+deal_confirm_no: "❌ No, that's different"
+deal_confirmed: "✅ Deal confirmed. I'll link all your documents to booking *{booking_number}*."
+gaps_header: "📋 Submission Summary"
+gaps_complete: "✅ All required documents received for booking *{booking_number}*. Your audit trail is complete."
+gaps_missing: |
+  ✅ Received so far:
+  {received_list}
+  
+  ⚠️ Still needed:
+  {missing_list}
+  
+  Please send the missing documents when ready.
+retake_request: |
+  ⚠️ The *{doc_type}* could not be read clearly.
+  Please resend it as a *file* (not a photo) for better quality.
+escalated: |
+  I’ve flagged your submission for review.
+  A team leader will contact you shortly.
+  Your documents have been saved.
+parked_sla: |
+  ⚠️ Processing is taking longer than expected.
+  Your documents are safely saved and a team leader has been notified.
+error_unknown: |
+  Something went wrong processing your submission.
+  Please try again or contact your supervisor.
+  Reference: {correlation_id}
+unregistered: |
+  Your WhatsApp number isn’t registered with Verigence yet.
+  Please ask your supervisor to set up your account.
