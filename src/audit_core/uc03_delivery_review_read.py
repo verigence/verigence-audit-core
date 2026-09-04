@@ -7,6 +7,8 @@ from fastapi import Depends
 from pydantic import BaseModel
 from sqlalchemy import Connection, Engine
 
+from audit_core import uc03_delivery_capture_v2 as delivery_capture_v2
+from audit_core import uc03_document_capture_v2 as booking_capture_v2
 from audit_core import uc03_document_review_v2 as review_v2
 from audit_core.dependencies import get_connection, get_engine, get_human_principal
 from audit_core.errors import ConflictError
@@ -32,6 +34,63 @@ class DeliveryReviewV2Response(BaseModel):
     attributes: list[review_v2.ReviewV2Attribute]
     unmappedFields: list[review_v2.ReviewV2UnmappedField]
     documents: list[review_v2.ReviewV2Document]
+
+
+def get_booking_capture_local_v2(
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> booking_capture_v2.BookingCaptureV2Response:
+    """Return the durable Audit Core Booking capture state without waiting on DI.
+
+    DI reconciliation remains available on the existing /booking/capture endpoint and is
+    triggered best-effort by the Web client after first paint. Opening the capture screen
+    must never depend on DI response latency.
+    """
+    booking_capture_v2._authorize_booking(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    return booking_capture_v2._build_local_capture_response(
+        journey_id=journey_id,
+        requirements=booking_capture_v2._base_requirements(connection, tenant_id, journey_id),
+        declaration_rows=booking_capture_v2._declarations(connection, tenant_id, journey_id),
+        audit_documents=booking_capture_v2._linked_documents(connection, tenant_id, journey_id),
+    )
+
+
+def get_delivery_capture_local_v2(
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> delivery_capture_v2.DeliveryCaptureV2Response:
+    """Return durable Delivery capture state without a synchronous DI dependency."""
+    state = delivery_capture_v2._authorize_delivery(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    return delivery_capture_v2._build_local_delivery_capture_response(
+        journey_id=journey_id,
+        requirements=delivery_capture_v2._delivery_requirements(connection, tenant_id, journey_id),
+        audit_documents=delivery_capture_v2._linked_delivery_documents(connection, tenant_id, journey_id),
+        submitted=state.get("capture_completed_at_utc") is not None,
+    )
 
 
 def get_delivery_review_v2(
@@ -107,6 +166,18 @@ def get_delivery_review_v2(
 def install_uc03_delivery_review_read() -> None:
     if getattr(review_v2, "_delivery_review_read_installed", False):
         return
+    review_v2.router.add_api_route(
+        "/booking/capture-local",
+        get_booking_capture_local_v2,
+        methods=["GET"],
+        response_model=booking_capture_v2.BookingCaptureV2Response,
+    )
+    review_v2.router.add_api_route(
+        "/delivery/capture-local",
+        get_delivery_capture_local_v2,
+        methods=["GET"],
+        response_model=delivery_capture_v2.DeliveryCaptureV2Response,
+    )
     review_v2.router.add_api_route(
         "/delivery/review",
         get_delivery_review_v2,
