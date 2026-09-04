@@ -147,12 +147,19 @@ def install_uc03_v2_capture_business_rules() -> None:
     from audit_core.uc03_review_effective_values import (
         install_uc03_review_effective_values,
     )
+    from audit_core.uc03_strict_review_core_ownership import (
+        install_uc03_strict_review_core_ownership,
+    )
 
     # Register the complete Booking Form extraction contract before Review routes
     # handle any request. This extends existing Core owners; it creates no new table.
     install_uc03_booking_commercial_components()
     install_uc03_booking_review_decisions()
     install_uc03_di_core_persistence()
+    # Review Confirm is fail-closed: generic DI provenance is not a substitute for
+    # an explicit typed Audit Core business owner. Booking Docket shares the same
+    # typed Booking business owner as Booking Form.
+    install_uc03_strict_review_core_ownership()
     install_uc03_delivery_review_confirm()
     install_uc03_delivery_review_read()
     install_uc03_review_effective_values()
