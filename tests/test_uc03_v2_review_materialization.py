@@ -6,6 +6,7 @@ from audit_core.uc03_document_review_v2 import (
     ReviewV2Field,
     ReviewV2UnmappedField,
 )
+from audit_core.uc03_strict_review_core_ownership import _DOCKET_ONLY_FIELDS
 from audit_core.uc03_v2_review_materialization import (
     _AADHAAR_FIELDS,
     _BOOKING_FORM_FIELDS,
@@ -61,9 +62,13 @@ def _receipt_unmapped(document_id, *, amount: str, confidence: float):
 
 
 def test_booking_form_di_contract_has_core_review_owner_for_every_field() -> None:
-    # Mirrors verigence-di booking_form schema v1.5 exactly. This test must change
-    # whenever DI adds/removes a Booking Form extraction field.
-    assert set(_BOOKING_FORM_FIELDS) == {
+    # Mirrors verigence-di booking_form schema v1.5 exactly. The strict Core-owner
+    # installer reuses the same typed Booking owner for Booking Docket and therefore
+    # extends the runtime owner field set with Docket-only keys. Those keys are not
+    # part of the Booking Form DI contract and are excluded from this source-contract
+    # assertion; they have separate Docket coverage in the strict-owner tests.
+    booking_form_fields = set(_BOOKING_FORM_FIELDS) - set(_DOCKET_ONLY_FIELDS)
+    assert booking_form_fields == {
         "dealer_name",
         "dealer_branch",
         "booking_reference_number",
