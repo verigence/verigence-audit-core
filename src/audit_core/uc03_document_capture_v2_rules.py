@@ -128,6 +128,9 @@ def _apply_capture_business_rules(
 def install_uc03_v2_capture_business_rules() -> None:
     """Install additive V2-only capture/review rules without changing V1 behavior."""
 
+    from audit_core.uc03_aadhaar_address_core_ownership import (
+        install_uc03_aadhaar_address_core_ownership,
+    )
     from audit_core.uc03_booking_commercial_components import (
         install_uc03_booking_commercial_components,
     )
@@ -160,6 +163,9 @@ def install_uc03_v2_capture_business_rules() -> None:
     # an explicit typed Audit Core business owner. Booking Docket shares the same
     # typed Booking business owner as Booking Form.
     install_uc03_strict_review_core_ownership()
+    # Aadhaar v1.2 added explicit pincode/state/district extraction after the first
+    # typed identity owner was created. Extend that same owner before Review traffic.
+    install_uc03_aadhaar_address_core_ownership()
     install_uc03_delivery_review_confirm()
     install_uc03_delivery_review_read()
     install_uc03_review_effective_values()
