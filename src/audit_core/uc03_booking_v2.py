@@ -356,13 +356,17 @@ def submit_booking_v2(
             text(
                 """
                 UPDATE auditcore.journey_stage_states
-                SET business_status='BOOKING_IN_PROGRESS',
+                SET business_status='BOOKING_CLOSED',
+                    closure_disposition='PROCEED_TO_DELIVERY',
                     audit_state=CASE
                         WHEN audit_state='NOT_STARTED' THEN 'IN_PROGRESS'
                         ELSE audit_state
                     END,
                     capture_completed_at_utc=now(),
                     pc_verification_status='PENDING',
+                    business_completed_at_utc=now(),
+                    closed_at_utc=now(),
+                    closed_by_actor_id=:actor_id,
                     latest_activity_at_utc=now(),
                     updated_at_utc=now(),
                     version_no=:version
@@ -373,6 +377,7 @@ def submit_booking_v2(
             {
                 "tenant_id": tenant_id,
                 "journey_id": journey_id,
+                "actor_id": human_principal.subject,
                 "version": next_version,
             },
         )
@@ -392,7 +397,9 @@ def submit_booking_v2(
                 "customerType": values["customerType"],
                 "tradeIn": command.tradeIn,
                 "gstBenefit": command.gstBenefit,
-                "bookingBusinessStatusChanged": False,
+                "bookingBusinessStatusChanged": True,
+                "bookingBusinessStatus": "BOOKING_CLOSED",
+                "closureDisposition": "PROCEED_TO_DELIVERY",
             },
             aggregate_version=next_version,
         )
