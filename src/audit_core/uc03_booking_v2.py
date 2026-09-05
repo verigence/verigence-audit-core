@@ -33,7 +33,6 @@ from audit_core.uc03_booking_details import (
 )
 from audit_core.uc03_document_capture_v2 import (
     _base_requirements,
-    _build_local_capture_response,
     _capture_phase_state,
     _declarations,
     _linked_documents,
@@ -44,12 +43,14 @@ router = APIRouter(
     tags=["uc03-booking-v2"],
 )
 
+_IDENTITY_MARKERS = ("PAN", "AADHAAR", "AADHAR")
+
 
 class BookingSubmitV2Response(BaseModel):
     journeyId: UUID
     phase: Literal["BOOKING"] = "BOOKING"
-    status: Literal["COMPLETED"] = "COMPLETED"
-    pcVerificationStatus: Literal["PENDING"] = "PENDING"
+    status: Literal["IN_PROGRESS", "COMPLETED"]
+    pcVerificationStatus: Literal["PENDING"] | None = None
     aggregateVersion: int
 
 
@@ -113,6 +114,56 @@ def _validate_declaration_alignment(
                 title="Booking details conflict with Documents",
                 detail="Corporate ID availability must match the answer captured on Documents.",
             )
+
+
+def _is_identity_requirement(requirement: dict[str, Any]) -> bool:
+    searchable = (
+        f"{requirement.get('requirement_key', '')} "
+        f"{requirement.get('document_type_key', '')}"
+    ).upper()
+    return any(marker in searchable for marker in _IDENTITY_MARKERS)
+
+
+def _mandatory_booking_documents_complete(
+    requirements: list[dict[str, Any]],
+    documents: list[dict[str, Any]],
+) -> bool:
+    """Return whether the minimum mandatory Booking document set is complete.
+
+    Missing documents remain non-blocking for the capture journey. This helper is
+    deliberately separate from ``canContinue`` and is used only to derive the PC
+    business status. A requirement counts as present only after V2 has a CLASSIFIED
+    document linked to it. PAN/Aadhaar retain the existing one-of identity rule.
+    """
+
+    required = [
+        requirement
+        for requirement in requirements
+        if str(requirement.get("requirement_level") or "").upper() == "REQUIRED"
+    ]
+    classified_keys = {
+        str(document["requirement_key"])
+        for document in documents
+        if str(document.get("capture_status") or "").upper() == "CLASSIFIED"
+        and document.get("requirement_key")
+    }
+
+    identity_required = [
+        requirement for requirement in required if _is_identity_requirement(requirement)
+    ]
+    ordinary_required = [
+        requirement for requirement in required if not _is_identity_requirement(requirement)
+    ]
+
+    ordinary_complete = not any(
+        str(requirement["requirement_key"]) not in classified_keys
+        for requirement in ordinary_required
+    )
+    identity_complete = not identity_required or any(
+        str(requirement["requirement_key"]) in classified_keys
+        for requirement in identity_required
+    )
+    return ordinary_complete and identity_complete
 
 
 def _validated_details(
@@ -319,23 +370,17 @@ def submit_booking_v2(
             raise ConflictError(
                 error_code="VAC-CONFLICT-004",
                 title="Booking capture is complete",
-                detail="Booking V2 capture has already been submitted.",
+                detail="Booking V2 capture has already been completed.",
             )
 
         declarations = _declarations(connection, tenant_id, journey_id)
         _validate_declaration_alignment(command, declarations)
-        local_capture = _build_local_capture_response(
-            journey_id=journey_id,
-            requirements=_base_requirements(connection, tenant_id, journey_id),
-            declaration_rows=declarations,
-            audit_documents=_linked_documents(connection, tenant_id, journey_id),
+        requirements = _base_requirements(connection, tenant_id, journey_id)
+        documents = _linked_documents(connection, tenant_id, journey_id)
+        mandatory_documents_complete = _mandatory_booking_documents_complete(
+            requirements,
+            documents,
         )
-        if not local_capture.canContinue:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-004",
-                title="Booking document capture is incomplete",
-                detail="Required classifications or applicability decisions are still pending.",
-            )
 
         values = _validated_details(
             connection,
@@ -352,17 +397,41 @@ def submit_booking_v2(
         )
 
         next_version = expected_version + 1
+        business_status = (
+            "BOOKING_CLOSED" if mandatory_documents_complete else "BOOKING_IN_PROGRESS"
+        )
+        closure_disposition = (
+            "PROCEED_TO_DELIVERY" if mandatory_documents_complete else None
+        )
+        pc_verification_status = "PENDING" if mandatory_documents_complete else None
+
         connection.execute(
             text(
                 """
                 UPDATE auditcore.journey_stage_states
-                SET business_status='BOOKING_IN_PROGRESS',
+                SET business_status=:business_status,
+                    closure_disposition=:closure_disposition,
                     audit_state=CASE
                         WHEN audit_state='NOT_STARTED' THEN 'IN_PROGRESS'
                         ELSE audit_state
                     END,
-                    capture_completed_at_utc=now(),
-                    pc_verification_status='PENDING',
+                    capture_completed_at_utc=CASE
+                        WHEN :mandatory_documents_complete THEN now()
+                        ELSE NULL
+                    END,
+                    pc_verification_status=:pc_verification_status,
+                    business_completed_at_utc=CASE
+                        WHEN :mandatory_documents_complete THEN now()
+                        ELSE NULL
+                    END,
+                    closed_at_utc=CASE
+                        WHEN :mandatory_documents_complete THEN now()
+                        ELSE NULL
+                    END,
+                    closed_by_actor_id=CASE
+                        WHEN :mandatory_documents_complete THEN :actor_id
+                        ELSE NULL
+                    END,
                     latest_activity_at_utc=now(),
                     updated_at_utc=now(),
                     version_no=:version
@@ -373,7 +442,12 @@ def submit_booking_v2(
             {
                 "tenant_id": tenant_id,
                 "journey_id": journey_id,
+                "actor_id": human_principal.subject,
                 "version": next_version,
+                "business_status": business_status,
+                "closure_disposition": closure_disposition,
+                "pc_verification_status": pc_verification_status,
+                "mandatory_documents_complete": mandatory_documents_complete,
             },
         )
         _append_workflow_event(
@@ -388,16 +462,21 @@ def submit_booking_v2(
             correlation_id=get_correlation_id(request),
             safe_payload={
                 "capturePath": "V2_SINGLE_SUBMIT",
-                "pcVerificationStatus": "PENDING",
+                "mandatoryDocumentsComplete": mandatory_documents_complete,
+                "pcVerificationStatus": pc_verification_status,
                 "customerType": values["customerType"],
                 "tradeIn": command.tradeIn,
                 "gstBenefit": command.gstBenefit,
-                "bookingBusinessStatusChanged": False,
+                "bookingBusinessStatusChanged": True,
+                "bookingBusinessStatus": business_status,
+                "closureDisposition": closure_disposition,
             },
             aggregate_version=next_version,
         )
         return BookingSubmitV2Response(
             journeyId=journey_id,
+            status="COMPLETED" if mandatory_documents_complete else "IN_PROGRESS",
+            pcVerificationStatus=pc_verification_status,
             aggregateVersion=next_version,
         ).model_dump(mode="json")
 
