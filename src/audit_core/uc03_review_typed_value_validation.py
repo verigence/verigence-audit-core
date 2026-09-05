@@ -1,12 +1,12 @@
 """Validate reviewed DI values against their typed Audit Core contracts.
 
-DI deliberately preserves a raw machine value when normalization fails.  Review must
-therefore not mark a high-confidence value READY merely because the OCR confidence is
-high when the value cannot be persisted by its known typed Audit Core owner.
+DI deliberately preserves a raw machine value when normalization fails. Review must
+therefore not mark a high-confidence value READY merely because OCR confidence is high
+when the value cannot be persisted by its known typed Audit Core owner.
 
 This module keeps the raw DI value visible and auditable, marks such values as
 NEEDS_REVIEW for both Booking and Delivery, and fails Confirm before any persistence
-when an invalid typed value is still accepted unchanged.  The PC can then correct or
+when an invalid typed value is still accepted unchanged. The PC can then correct or
 reject that value; no value is silently coerced or discarded.
 """
 from __future__ import annotations
@@ -16,6 +16,7 @@ from typing import Any
 
 from audit_core import uc03_booking_capture as booking_capture
 from audit_core import uc03_booking_review_decisions as booking_review
+from audit_core import uc03_delivery_review_confirm as delivery_review
 from audit_core import uc03_document_review_v2 as review_v2
 from audit_core import uc03_review_effective_values as effective_values
 from audit_core import uc03_v2_review_materialization as materialization
@@ -26,14 +27,21 @@ from audit_core.uc03_di_core_persistence import ReviewedDiField
 _installed = False
 _original_review_document: Callable[..., review_v2.ReviewV2Document] | None = None
 _original_booking_persist: Callable[..., int] | None = None
+_original_delivery_persist: Callable[..., int] | None = None
 _original_effective_persist: Callable[..., int] | None = None
 
 
 def _typed_kind(field_key: str) -> str | None:
     key = str(field_key).strip().lower()
-    if key in materialization._BOOKING_DECIMAL_FIELDS or key in materialization._RECEIPT_DECIMAL_FIELDS:
+    if (
+        key in materialization._BOOKING_DECIMAL_FIELDS
+        or key in materialization._RECEIPT_DECIMAL_FIELDS
+    ):
         return "DECIMAL"
-    if key in materialization._BOOKING_DATE_FIELDS or key in materialization._RECEIPT_DATE_FIELDS:
+    if (
+        key in materialization._BOOKING_DATE_FIELDS
+        or key in materialization._RECEIPT_DATE_FIELDS
+    ):
         return "DATE"
     if key in materialization._BOOKING_BOOLEAN_FIELDS:
         return "BOOLEAN"
@@ -75,7 +83,10 @@ def mark_typed_invalid_fields_for_review(
     return document
 
 
-def _review_document_with_typed_validation(*args: Any, **kwargs: Any) -> review_v2.ReviewV2Document:
+def _review_document_with_typed_validation(
+    *args: Any,
+    **kwargs: Any,
+) -> review_v2.ReviewV2Document:
     if _original_review_document is None:
         raise RuntimeError("UC03 typed Review validation installer is not initialized")
     return mark_typed_invalid_fields_for_review(_original_review_document(*args, **kwargs))
@@ -116,6 +127,13 @@ def _validated_booking_persist(*args: Any, **kwargs: Any) -> int:
     return _original_booking_persist(*args, **kwargs)
 
 
+def _validated_delivery_persist(*args: Any, **kwargs: Any) -> int:
+    if _original_delivery_persist is None:
+        raise RuntimeError("UC03 typed Review validation installer is not initialized")
+    validate_reviewed_field_types(list(kwargs.get("fields") or []))
+    return _original_delivery_persist(*args, **kwargs)
+
+
 def _validated_effective_persist(*args: Any, **kwargs: Any) -> int:
     if _original_effective_persist is None:
         raise RuntimeError("UC03 typed Review validation installer is not initialized")
@@ -127,17 +145,21 @@ def install_uc03_review_typed_value_validation() -> None:
     """Install shared Review read validation and pre-persistence type validation."""
 
     global _installed
-    global _original_review_document, _original_booking_persist, _original_effective_persist
+    global _original_review_document
+    global _original_booking_persist, _original_delivery_persist, _original_effective_persist
     if _installed:
         return
 
     _original_review_document = review_v2._review_document
     review_v2._review_document = _review_document_with_typed_validation  # type: ignore[assignment]
 
-    # Booking Review and the effective-value route both keep direct module bindings
-    # to the persistence function. Patch both so validation runs before any writes.
+    # These modules keep direct bindings to the persistence function. Patch every
+    # active Booking/Delivery Confirm path so validation occurs before any writes.
     _original_booking_persist = booking_review.persist_reviewed_di_fields
     booking_review.persist_reviewed_di_fields = _validated_booking_persist  # type: ignore[assignment]
+
+    _original_delivery_persist = delivery_review.persist_reviewed_di_fields
+    delivery_review.persist_reviewed_di_fields = _validated_delivery_persist  # type: ignore[assignment]
 
     _original_effective_persist = effective_values.persist_reviewed_di_fields
     effective_values.persist_reviewed_di_fields = _validated_effective_persist  # type: ignore[assignment]
