@@ -22,6 +22,10 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.security_integration import SecurityOAuthClient
+from audit_core.uc03_attribute_resolution import (
+    apply_supported_operational_attribute,
+    record_attribute_resolution,
+)
 from audit_core.uc03_booking_capture import _scope
 from audit_core.uc03_booking_commands import (
     _aggregate_lock,
@@ -650,7 +654,7 @@ def confirm_booking_review_v2_with_decisions(
                 )
 
             resolved_count += 1
-            application = review_v2.apply_supported_operational_attribute(
+            application = apply_supported_operational_attribute(
                 connection,
                 tenant_id=tenant_id,
                 journey_id=journey_id,
@@ -679,7 +683,7 @@ def confirm_booking_review_v2_with_decisions(
 
             applied.append(attribute.attributeKey)
             if spec.mapping_status == "SUPPORTED":
-                review_v2.record_attribute_resolution(
+                record_attribute_resolution(
                     connection,
                     tenant_id=tenant_id,
                     journey_id=journey_id,
