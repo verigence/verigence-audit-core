@@ -12,14 +12,14 @@ from audit_core.uc03_review_value_normalization import (
 
 def test_reviewed_decimal_accepts_numeric_scalars_and_indian_currency_text() -> None:
     cases = (
-        (500000, Decimal("500000")),
+        (500000, Decimal(500000)),
         (500000.25, Decimal("500000.25")),
-        ("500000", Decimal("500000")),
-        ("5,00,000", Decimal("500000")),
-        ("₹ 5,00,000", Decimal("500000")),
-        ("INR 5,00,000", Decimal("500000")),
-        ("Rs. 5,00,000/-", Decimal("500000")),
-        ("5,00,000 INR", Decimal("500000")),
+        ("500000", Decimal(500000)),
+        ("5,00,000", Decimal(500000)),
+        ("₹ 5,00,000", Decimal(500000)),
+        ("INR 5,00,000", Decimal(500000)),
+        ("Rs. 5,00,000/-", Decimal(500000)),
+        ("5,00,000 INR", Decimal(500000)),
     )
 
     for value, expected in cases:
@@ -38,6 +38,6 @@ def test_reviewed_decimal_rejects_semantically_non_numeric_values(value) -> None
 def test_runtime_installer_updates_shared_uc03_decimal_boundary() -> None:
     install_uc03_review_value_normalization()
 
-    assert uc03_booking_capture._as_decimal("₹ 5,00,000", "TRADE_IN_ACTUAL_VALUE") == Decimal(
-        "500000"
-    )
+    assert uc03_booking_capture._as_decimal(
+        "₹ 5,00,000", "TRADE_IN_ACTUAL_VALUE"
+    ) == Decimal(500000)
