@@ -155,14 +155,15 @@ def _mandatory_booking_documents_complete(
         requirement for requirement in required if not _is_identity_requirement(requirement)
     ]
 
-    if any(str(requirement["requirement_key"]) not in classified_keys for requirement in ordinary_required):
-        return False
-    if identity_required and not any(
+    ordinary_complete = not any(
+        str(requirement["requirement_key"]) not in classified_keys
+        for requirement in ordinary_required
+    )
+    identity_complete = not identity_required or any(
         str(requirement["requirement_key"]) in classified_keys
         for requirement in identity_required
-    ):
-        return False
-    return True
+    )
+    return ordinary_complete and identity_complete
 
 
 def _validated_details(
