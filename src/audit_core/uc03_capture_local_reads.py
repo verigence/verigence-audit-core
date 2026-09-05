@@ -12,6 +12,7 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.uc03_booking_capture import _scope
 from audit_core.uc03_delivery_capture_v2 import (
     DeliveryCaptureV2Response,
     _authorize_delivery,
@@ -21,9 +22,9 @@ from audit_core.uc03_delivery_capture_v2 import (
 )
 from audit_core.uc03_document_capture_v2 import (
     BookingCaptureV2Response,
-    _authorize_booking,
     _base_requirements,
     _build_local_capture_response,
+    _capture_phase_state,
     _declarations,
     _linked_documents,
 )
@@ -45,12 +46,21 @@ def get_booking_capture_local_v2(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> BookingCaptureV2Response:
-    _authorize_booking(
+    # This endpoint is a durable read model used to open existing Booking details.
+    # It must remain readable after Booking completion/closure. The active-state
+    # guard belongs only on capture/extraction mutations, not on a read-only view.
+    _scope(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
+    )
+    _capture_phase_state(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        for_update=False,
     )
     return _build_local_capture_response(
         journey_id=journey_id,
