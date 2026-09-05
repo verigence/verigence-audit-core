@@ -106,7 +106,9 @@ from audit_core.uc03_review_value_normalization import (
 from audit_core.uc03_sku_candidates import router as uc03_sku_candidates_router
 from audit_core.uc03_tl_scope_alignment import install_tl_scope_alignment
 from audit_core.uc03_tl_supervisory import router as uc03_tl_supervisory_router
-from audit_core.uc03_work_item_enrichment import router as uc03_work_item_enrichment_router
+from audit_core.uc03_work_item_enrichment import (
+    router as uc03_work_item_enrichment_router,
+)
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
 install_role_mapping_policy(role_mappings)
