@@ -100,6 +100,9 @@ from audit_core.uc03_pc_direct_review import router as uc03_pc_direct_review_rou
 from audit_core.uc03_pc_generic_review import router as uc03_pc_generic_review_router
 from audit_core.uc03_pc_verification import router as uc03_pc_verification_router
 from audit_core.uc03_project_context import router as uc03_project_context_router
+from audit_core.uc03_review_typed_value_validation import (
+    install_uc03_review_typed_value_validation,
+)
 from audit_core.uc03_sku_candidates import router as uc03_sku_candidates_router
 from audit_core.uc03_tl_scope_alignment import install_tl_scope_alignment
 from audit_core.uc03_tl_supervisory import router as uc03_tl_supervisory_router
@@ -114,6 +117,7 @@ install_uc03_customer_mobile_pii()
 install_uc03_booking_receipt_capture()
 install_tl_scope_alignment()
 install_uc03_v2_capture_business_rules()
+install_uc03_review_typed_value_validation()
 role_mapping_router = role_mappings.router
 mahindra_master_router = mahindra_masters.router
 
