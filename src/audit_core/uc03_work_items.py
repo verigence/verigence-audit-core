@@ -27,6 +27,8 @@ class StageSummary(BaseModel):
     auditState: str
     auditStatus: str
     businessDate: date | None
+    captureCompletedAtUtc: datetime | None
+    pcVerificationStatus: str | None
 
 
 class WorkItem(BaseModel):
@@ -167,12 +169,16 @@ def _row_to_item(row, *, project_name: str) -> WorkItem:
             auditState=row["booking_audit_state"],
             auditStatus=row["booking_audit_status"],
             businessDate=row["booking_business_date"],
+            captureCompletedAtUtc=row["booking_capture_completed_at_utc"],
+            pcVerificationStatus=row["booking_pc_verification_status"],
         ),
         delivery=StageSummary(
             businessStatus=row["delivery_business_status"],
             auditState=row["delivery_audit_state"],
             auditStatus=row["delivery_audit_status"],
             businessDate=row["delivery_business_date"],
+            captureCompletedAtUtc=row["delivery_capture_completed_at_utc"],
+            pcVerificationStatus=row["delivery_pc_verification_status"],
         ),
         openFlagCount=int(row["open_flag_count"]),
         totalFlagCount=int(row["total_flag_count"]),
@@ -307,6 +313,8 @@ def list_work_items(
                         COALESCE(bs.business_status, b.actual_status_code) AS booking_business_status,
                         COALESCE(bs.audit_state, 'NOT_STARTED') AS booking_audit_state,
                         COALESCE(bs.audit_status, 'NOT_EVALUATED') AS booking_audit_status,
+                        bs.capture_completed_at_utc AS booking_capture_completed_at_utc,
+                        bs.pc_verification_status AS booking_pc_verification_status,
                         COALESCE(
                             b.booking_date,
                             (bs.first_started_at_utc AT TIME ZONE :timezone_name)::date,
@@ -315,6 +323,8 @@ def list_work_items(
                         COALESCE(ds.business_status, dl.actual_delivery_status_code) AS delivery_business_status,
                         COALESCE(ds.audit_state, 'NOT_STARTED') AS delivery_audit_state,
                         COALESCE(ds.audit_status, 'NOT_EVALUATED') AS delivery_audit_status,
+                        ds.capture_completed_at_utc AS delivery_capture_completed_at_utc,
+                        ds.pc_verification_status AS delivery_pc_verification_status,
                         COALESCE(
                             (dl.actual_delivered_at AT TIME ZONE :timezone_name)::date,
                             (ds.first_started_at_utc AT TIME ZONE :timezone_name)::date,
