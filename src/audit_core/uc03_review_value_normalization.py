@@ -12,8 +12,9 @@ error rather than being guessed or converted to zero.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable
+from typing import Any
 
 from audit_core import uc03_booking_capture
 from audit_core.errors import AuditCoreError
