@@ -178,6 +178,8 @@ def list_first_work_items_fast(
                         COALESCE(bs.business_status, b.actual_status_code) AS booking_business_status,
                         COALESCE(bs.audit_state, 'NOT_STARTED') AS booking_audit_state,
                         COALESCE(bs.audit_status, 'NOT_EVALUATED') AS booking_audit_status,
+                        bs.capture_completed_at_utc AS booking_capture_completed_at_utc,
+                        bs.pc_verification_status AS booking_pc_verification_status,
                         COALESCE(
                             b.booking_date,
                             (bs.first_started_at_utc AT TIME ZONE pc.timezone_name)::date,
@@ -186,6 +188,8 @@ def list_first_work_items_fast(
                         COALESCE(ds.business_status, dl.actual_delivery_status_code) AS delivery_business_status,
                         COALESCE(ds.audit_state, 'NOT_STARTED') AS delivery_audit_state,
                         COALESCE(ds.audit_status, 'NOT_EVALUATED') AS delivery_audit_status,
+                        ds.capture_completed_at_utc AS delivery_capture_completed_at_utc,
+                        ds.pc_verification_status AS delivery_pc_verification_status,
                         COALESCE(
                             (dl.actual_delivered_at AT TIME ZONE pc.timezone_name)::date,
                             (ds.first_started_at_utc AT TIME ZONE pc.timezone_name)::date,
