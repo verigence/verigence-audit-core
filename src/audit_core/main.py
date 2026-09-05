@@ -106,6 +106,9 @@ from audit_core.uc03_review_value_normalization import (
 from audit_core.uc03_sku_candidates import router as uc03_sku_candidates_router
 from audit_core.uc03_tl_scope_alignment import install_tl_scope_alignment
 from audit_core.uc03_tl_supervisory import router as uc03_tl_supervisory_router
+from audit_core.uc03_work_item_enrichment import (
+    router as uc03_work_item_enrichment_router,
+)
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
 
 install_role_mapping_policy(role_mappings)
@@ -169,6 +172,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_project_context_router)
     application.include_router(attendance_context_router)
     application.include_router(uc03_fast_work_items_router)
+    application.include_router(uc03_work_item_enrichment_router)
     application.include_router(uc03_work_items_router)
     application.include_router(uc03_journey_search_router)
     application.include_router(uc03_tl_supervisory_router)
