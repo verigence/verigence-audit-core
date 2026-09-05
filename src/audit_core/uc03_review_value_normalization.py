@@ -18,8 +18,8 @@ from typing import Any, Callable
 from audit_core import uc03_booking_capture
 from audit_core.errors import AuditCoreError
 
-_CURRENCY_PREFIX = re.compile(r"^(?:₹|INR\b|RS\.?\b)\s*", re.IGNORECASE)
-_CURRENCY_SUFFIX = re.compile(r"\s*(?:INR\b|RS\.?\b|/-)\s*$", re.IGNORECASE)
+_CURRENCY_PREFIX = re.compile(r"^(?:₹|INR\b|RS(?:\.|\b))\s*", re.IGNORECASE)
+_CURRENCY_SUFFIX = re.compile(r"\s*(?:INR\b|RS(?:\.|\b)|/-)\s*$", re.IGNORECASE)
 _NUMERIC = re.compile(r"^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$")
 
 _installed = False
