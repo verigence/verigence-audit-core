@@ -1,8 +1,9 @@
 from uuid import UUID
 
 from audit_core.security import HumanPrincipal
-from audit_core.uc03_capture_local_reads import get_booking_capture_local_v2
-
+from audit_core.uc03_capture_local_reads import (
+    get_booking_capture_local_v2,
+)
 
 JOURNEY_ID = UUID("11111111-1111-1111-1111-111111111111")
 
