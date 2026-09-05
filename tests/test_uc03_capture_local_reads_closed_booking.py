@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from audit_core import uc03_capture_local_reads as reads
+import audit_core.uc03_capture_local_reads as reads
 from audit_core.security import HumanPrincipal
 
 
