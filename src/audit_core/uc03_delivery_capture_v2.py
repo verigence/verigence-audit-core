@@ -31,6 +31,7 @@ from audit_core.uc03_document_capture_v2 import (
     _candidate_type_keys,
     _ensure_di_context,
     _human_actor_id,
+    _requirement_refs_by_document_type_key,
     get_di_capture_v2_client,
     get_di_client,
     get_security_oauth_client,
@@ -114,7 +115,8 @@ def _delivery_requirements(
     rows = connection.execute(
         text(
             """
-            SELECT jdr.requirement_key, jdr.document_type_key,
+            SELECT jdr.journey_document_requirement_id AS requirement_ref,
+                   jdr.requirement_key, jdr.document_type_key,
                    jdr.requirement_level, jdr.requirement_status,
                    COALESCE(p.display_label, jdr.requirement_key) AS display_label,
                    COALESCE(p.condition_key, jdr.condition_snapshot->>'conditionKey') AS condition_key,
@@ -140,7 +142,8 @@ def _delivery_requirements(
     extensions = connection.execute(
         text(
             """
-            SELECT requirement_key,
+            SELECT NULL::uuid AS requirement_ref,
+                   requirement_key,
                    extension_document_type_key AS document_type_key,
                    extension_requirement_level AS requirement_level,
                    'PENDING' AS requirement_status,
@@ -458,6 +461,9 @@ def create_delivery_upload_intents_v2(
             external_context_ref=context_ref,
             phase="DELIVERY",
             candidate_document_type_keys=_candidate_type_keys(requirements),
+            requirement_refs_by_document_type_key=(
+                _requirement_refs_by_document_type_key(requirements)
+            ),
             files=[item.model_dump() for item in command.files],
         )
     except DiCaptureV2Error as exc:
