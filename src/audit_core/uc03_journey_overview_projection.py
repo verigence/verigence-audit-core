@@ -253,56 +253,6 @@ def _documents(
     return documents
 
 
-def _payments(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-) -> list[dict[str, Any]]:
-    rows = connection.execute(
-        text(
-            """
-            SELECT
-                payment_id AS "paymentId",
-                payment_at_utc AS "paymentAtUtc",
-                amount AS "amount",
-                currency_code AS "currencyCode",
-                payment_method_code AS "paymentMethodCode",
-                payment_reference AS "paymentReference",
-                receipt_number AS "receiptNumber",
-                receipt_date AS "receiptDate",
-                actual_status_code AS "actualStatusCode",
-                status_source AS "sourceKind",
-                source_evidence_id AS "sourceEvidenceId",
-                source_di_document_id AS "sourceDocumentId",
-                payment_stage AS "paymentStage",
-                receipt_dealer_name AS "dealerName",
-                receipt_dealer_gstin AS "dealerGstin",
-                receipt_customer_name AS "customerName",
-                receipt_customer_phone AS "customerPhone",
-                payment_reference_date AS "paymentReferenceDate",
-                receipt_bank_name AS "bankName",
-                receipt_bank_location AS "bankLocation",
-                receipt_booking_reference AS "bookingReference",
-                receipt_remarks AS "remarks",
-                receipt_amount_in_words AS "amountInWords"
-            FROM auditcore.payments
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-            ORDER BY receipt_date NULLS LAST, payment_at_utc NULLS LAST,
-                     created_at_utc, payment_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().all()
-    result: list[dict[str, Any]] = []
-    for row in rows:
-        item = dict(row)
-        if item.get("customerPhone"):
-            item["customerPhone"] = _masked_phone(item["customerPhone"])
-        result.append(item)
-    return result
-
-
 def _receipts(
     connection: Connection,
     *,
@@ -456,11 +406,9 @@ def get_journey_overview_projection(
     booking["reviewedValues"] = reviewed_booking
     data["booking"] = booking or None
 
-    data["payments"] = _payments(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-    )
+    # Preserve the established JourneyOverview payments contract. V2 receipt detail
+    # is additive in the dedicated receipts collection below, so existing consumers
+    # do not gain or lose fields unexpectedly.
     data["receipts"] = _receipts(
         connection,
         tenant_id=tenant_id,
