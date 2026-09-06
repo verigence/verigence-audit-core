@@ -1,6 +1,8 @@
 import inspect
 
-from audit_core.uc03_simplified_booking_flow import create_booking_journey_first_reference
+from audit_core.uc03_simplified_booking_flow import (
+    create_booking_journey_first_reference,
+)
 
 
 def test_simplified_booking_create_never_updates_append_only_workflow_events() -> None:
