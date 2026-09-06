@@ -164,7 +164,7 @@ def upgrade() -> None:
                 max(value) FILTER (WHERE lower(field_key) IN ('chassis_number','chassis_no') AND rn=1) AS chassis_number,
                 max(value) FILTER (WHERE lower(field_key)='dms_reference' AND rn=1) AS dms_reference,
                 max(value) FILTER (WHERE lower(field_key) IN ('invoice_reference','invoice_number','dms_invoice_number') AND rn=1) AS invoice_reference,
-                max(evidence_id) FILTER (WHERE rn=1) AS source_evidence_id
+                (max(evidence_id::text) FILTER (WHERE rn=1))::uuid AS source_evidence_id
             FROM ranked
             GROUP BY tenant_id, journey_id
         )
@@ -288,7 +288,7 @@ def upgrade() -> None:
                 max(value) FILTER (WHERE field_key='insurer_name' AND rn=1) AS insurer_name,
                 max(value) FILTER (WHERE field_key='policy_number' AND rn=1) AS policy_reference,
                 max(value) FILTER (WHERE field_key='premium_amount' AND rn=1) AS premium_text,
-                max(evidence_id) FILTER (WHERE rn=1) AS source_evidence_id
+                (max(evidence_id::text) FILTER (WHERE rn=1))::uuid AS source_evidence_id
             FROM fields
             GROUP BY tenant_id, journey_id
         ),
@@ -350,7 +350,7 @@ def upgrade() -> None:
                 tenant_id,
                 journey_id,
                 di_document_id,
-                max(evidence_id) AS evidence_id,
+                max(evidence_id::text)::uuid AS evidence_id,
                 max(effective_value #>> '{}') FILTER (WHERE lower(field_key)='receipt_number') AS receipt_number,
                 max(effective_value #>> '{}') FILTER (WHERE lower(field_key)='receipt_date') AS receipt_date_text,
                 max(effective_value #>> '{}') FILTER (WHERE lower(field_key)='amount_paid') AS amount_text,
