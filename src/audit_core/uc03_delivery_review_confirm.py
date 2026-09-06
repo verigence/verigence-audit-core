@@ -22,6 +22,9 @@ from audit_core.security_integration import SecurityOAuthClient
 from audit_core.uc03_booking_capture import _scope
 from audit_core.uc03_booking_commands import _aggregate_lock, _parse_if_match
 from audit_core.uc03_delivery_commands import _append_delivery_event
+from audit_core.uc03_delivery_review_materialization import (
+    materialize_reviewed_delivery_business_values,
+)
 from audit_core.uc03_di_core_persistence import (
     ReviewedDiField,
     persist_reviewed_di_fields,
@@ -210,6 +213,17 @@ def confirm_delivery_review_v2(
             actor_id=human_principal.subject,
             fields=_lossless_delivery_fields(documents),
         )
+        # Canonical materialization is part of the same transaction and must succeed
+        # before Review can become VERIFIED.  This closes the old gap where Delivery
+        # DI was preserved only as provenance while Journey 360's business tables
+        # remained empty.
+        materialization = materialize_reviewed_delivery_business_values(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            documents=documents,
+            actor_id=human_principal.subject,
+        )
         next_version = expected_version + 1
         connection.execute(
             text(
@@ -242,6 +256,7 @@ def confirm_delivery_review_v2(
             safe_payload={
                 "storedFieldCount": stored_field_count,
                 "rawDiValuesCopied": True,
+                "canonicalMaterialization": materialization,
             },
             aggregate_version=next_version,
         )
