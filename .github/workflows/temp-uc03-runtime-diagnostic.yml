@@ -1,0 +1,46 @@
+name: TEMP UC03 runtime diagnostic
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/temp-uc03-runtime-diagnostic.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      TARGET_CORRELATION_ID: 1d717be2-4657-40d2-81bd-5156ead702d9
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      - name: Find exact failed request in DEV runtime logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway logs --service "$AUDIT_SERVICE" --latest --lines 1500 > /tmp/audit.log
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          target = os.environ['TARGET_CORRELATION_ID']
+          lines = Path('/tmp/audit.log').read_text(errors='replace').splitlines()
+          hits = [i for i, line in enumerate(lines) if target in line]
+          if not hits:
+              print('TARGET_CORRELATION_NOT_FOUND')
+              raise SystemExit(2)
+          seen = set()
+          for hit in hits:
+              for i in range(max(0, hit-4), min(len(lines), hit+5)):
+                  if i not in seen:
+                      print(lines[i])
+                      seen.add(i)
+          PY
