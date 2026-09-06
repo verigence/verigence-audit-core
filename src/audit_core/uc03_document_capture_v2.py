@@ -211,9 +211,6 @@ def _authorize_booking(
         human_principal=human_principal,
         authorization_client=authorization_client,
     )
-    # Capture reads, upload intents, finalize, delete and declarations are not
-    # Booking aggregate commands. They must not hold journey_stage_states FOR UPDATE
-    # while Security/DI work is in flight; that causes polling/finalize lock contention.
     state = _capture_phase_state(
         connection,
         tenant_id=tenant_id,
@@ -228,7 +225,8 @@ def _base_requirements(connection: Connection, tenant_id: str, journey_id: UUID)
     rows = connection.execute(
         text(
             """
-            SELECT jdr.requirement_key, jdr.document_type_key,
+            SELECT jdr.journey_document_requirement_id AS requirement_ref,
+                   jdr.requirement_key, jdr.document_type_key,
                    jdr.requirement_level, jdr.requirement_status,
                    COALESCE(p.display_label, jdr.requirement_key) AS display_label,
                    COALESCE(p.condition_key, jdr.condition_snapshot->>'conditionKey') AS condition_key,
@@ -254,7 +252,8 @@ def _base_requirements(connection: Connection, tenant_id: str, journey_id: UUID)
     extensions = connection.execute(
         text(
             """
-            SELECT requirement_key,
+            SELECT NULL::uuid AS requirement_ref,
+                   requirement_key,
                    extension_document_type_key AS document_type_key,
                    extension_requirement_level AS requirement_level,
                    'PENDING' AS requirement_status,
@@ -350,6 +349,26 @@ def _ensure_di_context(
 
 def _candidate_type_keys(requirements: list[dict[str, Any]]) -> list[str]:
     return list(dict.fromkeys(str(row["document_type_key"]) for row in requirements if row.get("document_type_key")))
+
+
+def _requirement_refs_by_document_type_key(
+    requirements: list[dict[str, Any]],
+) -> dict[str, str]:
+    """Map DI classification keys to the exact pinned Audit Core requirement.
+
+    DI does not know the document type until classification.  Persisting this map
+    with the upload lets DI bind the accepted type to the correct requirement before
+    extraction is queued, so the existing DI -> Audit Core evidence callback can run
+    both before and after Booking submission.
+    """
+
+    result: dict[str, str] = {}
+    for row in requirements:
+        document_type_key = row.get("document_type_key")
+        requirement_ref = row.get("requirement_ref")
+        if document_type_key and requirement_ref:
+            result.setdefault(str(document_type_key), str(requirement_ref))
+    return result
 
 
 def _reconcile_documents(
@@ -576,10 +595,6 @@ def _read_capture(
     declaration_rows = _declarations(connection, tenant_id, journey_id)
     audit_documents = _linked_documents(connection, tenant_id, journey_id)
 
-    # A brand-new Booking has no DI-linked documents. Its checklist is entirely
-    # determined by Audit Core's pinned requirement profile plus V2 policy, so do not
-    # block first paint on Security-for-DI, Subject creation, storage-context creation,
-    # or a DI list call. DI is initialized lazily when the first upload is requested.
     if not audit_documents:
         return _build_local_capture_response(
             journey_id=journey_id,
@@ -797,6 +812,9 @@ def create_booking_upload_intents_v2(
             external_context_ref=context_ref,
             phase="BOOKING",
             candidate_document_type_keys=_candidate_type_keys(requirements),
+            requirement_refs_by_document_type_key=(
+                _requirement_refs_by_document_type_key(requirements)
+            ),
             files=[item.model_dump() for item in command.files],
         )
     except DiCaptureV2Error as exc:
