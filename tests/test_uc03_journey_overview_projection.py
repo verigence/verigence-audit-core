@@ -9,6 +9,8 @@ from audit_core.uc03_journey_overview_projection import (
     _receipts,
     _reviewed_booking_projection,
     _reviewed_legal_name,
+)
+from audit_core.uc03_journey_overview_projection import (
     router as projection_router,
 )
 
