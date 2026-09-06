@@ -1,6 +1,6 @@
 name: TEMP UC03 runtime diagnostic
 
-# third push targets the last successful DEV deployment explicitly
+# fourth push captures the exact 4-second failure window from the known good deployment
 on:
   push:
     branches: [dev]
@@ -19,16 +19,15 @@ jobs:
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       AUDIT_SERVICE: verigence-audit-core
       TARGET_DEPLOYMENT_ID: 1baa3d5d-351e-4e32-bc9d-ea0fa296f1ec
-      TARGET_CORRELATION_ID: 1d717be2-4657-40d2-81bd-5156ead702d9
     steps:
       - uses: actions/checkout@v4
       - name: Install Railway CLI
         run: npm install --global @railway/cli
-      - name: Find exact failed request in DEV runtime logs
+      - name: Capture exact DEV failure window
         shell: bash
         run: |
           set -euo pipefail
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
-          railway logs "$TARGET_DEPLOYMENT_ID" --service "$AUDIT_SERVICE" --lines 2000 --filter "$TARGET_CORRELATION_ID" > /tmp/audit.log
+          railway logs "$TARGET_DEPLOYMENT_ID" --service "$AUDIT_SERVICE" --since '2026-09-06T13:44:10Z' --until '2026-09-06T13:44:14Z' > /tmp/audit.log
           cat /tmp/audit.log
           test -s /tmp/audit.log
