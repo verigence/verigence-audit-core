@@ -140,6 +140,9 @@ def install_uc03_v2_capture_business_rules() -> None:
     from audit_core.uc03_booking_rule_trigger import (
         install_uc03_booking_review_rule_trigger,
     )
+    from audit_core.uc03_confidence_review_policy import (
+        install_uc03_confidence_review_policy,
+    )
     from audit_core.uc03_delivery_review_confirm import (
         install_uc03_delivery_review_confirm,
     )
@@ -170,6 +173,9 @@ def install_uc03_v2_capture_business_rules() -> None:
     install_uc03_delivery_review_read()
     install_uc03_review_effective_values()
     install_uc03_booking_review_rule_trigger()
+    # Install last because it deliberately overrides legacy mismatch/manual-review
+    # gates and the final effective-value Booking confirm route.
+    install_uc03_confidence_review_policy()
     if getattr(capture_v2, "_gst_corporate_exclusivity_installed", False):
         return
 
