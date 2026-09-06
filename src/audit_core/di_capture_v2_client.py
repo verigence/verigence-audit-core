@@ -48,6 +48,7 @@ class DiCaptureV2Client:
         phase: str,
         candidate_document_type_keys: list[str],
         files: list[dict[str, Any]],
+        requirement_refs_by_document_type_key: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         return self._request(
             "POST",
@@ -57,6 +58,9 @@ class DiCaptureV2Client:
             json={
                 "phase": phase,
                 "candidateDocumentTypeKeys": candidate_document_type_keys,
+                "requirementRefsByDocumentTypeKey": (
+                    requirement_refs_by_document_type_key or {}
+                ),
                 "files": files,
             },
         )
