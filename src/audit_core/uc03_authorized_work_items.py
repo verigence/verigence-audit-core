@@ -11,7 +11,7 @@ from sqlalchemy import Connection, text
 from audit_core.authorization import AuthorizationError
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_human_principal
-from audit_core.errors import DependencyUnavailableError, NotFoundError
+from audit_core.errors import DependencyUnavailableError, NotFoundError, ValidationError
 from audit_core.security import HumanPrincipal, Principal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
@@ -36,6 +36,13 @@ class LandingMetrics(BaseModel):
 class DashboardBootstrap(BaseModel):
     metrics: LandingMetrics
     workItems: WorkItemPage
+
+
+class Uc03PcStats(BaseModel):
+    bookingsCompleted: int
+    deliveriesCompleted: int
+    bookingsInProgress: int
+    deliveriesInProgress: int
 
 
 def _authorize_workspace(
@@ -194,6 +201,146 @@ def get_landing_metrics(
         needsAttention=int(row["needs_attention"]),
         auditFlags=int(row["audit_flags"]),
         auditInProgress=int(row["audit_in_progress"]),
+    )
+
+
+@router.get("/pc-stats", response_model=Uc03PcStats)
+def get_pc_stats(
+    tenant_id: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+    from_date: Annotated[date, Query(alias="from")],
+    to_date: Annotated[date, Query(alias="to")],
+    outlet_id: Annotated[UUID | None, Query(alias="outletId")] = None,
+) -> Uc03PcStats:
+    """Return completed vs in-progress Booking/Delivery counters for a date window.
+
+    ``bookingsInProgress`` / ``deliveriesInProgress`` use the exact same definition
+    as ``/landing-metrics`` (point-in-time). ``bookingsCompleted`` /
+    ``deliveriesCompleted`` count stages whose ``business_completed_at_utc`` falls
+    on a date in ``[from, to]`` (inclusive) interpreted in the Project timezone.
+    The scope is the actor's current business assignment, optionally narrowed to a
+    single Outlet, identical to the other landing surfaces.
+    """
+
+    if from_date > to_date:
+        raise ValidationError(detail="`from` must be on or before `to`.")
+
+    _authorize_workspace(
+        authorization_client,
+        human_principal=human_principal,
+        tenant_id=tenant_id,
+    )
+    set_tenant_context(connection, tenant_id)
+    project = connection.execute(
+        text(
+            """
+            SELECT timezone_name
+            FROM auditcore.projects
+            WHERE tenant_id = :tenant_id AND project_status = 'ACTIVE'
+            """
+        ),
+        {"tenant_id": tenant_id},
+    ).mappings().one_or_none()
+    if project is None:
+        raise NotFoundError(
+            error_code="VAC-NF-001",
+            title="Project not found",
+            detail="Active Project not found for the requested tenant.",
+        )
+
+    row = connection.execute(
+        text(
+            """
+            WITH scoped AS (
+                SELECT j.journey_id
+                FROM auditcore.journeys j
+                WHERE j.tenant_id = :tenant_id
+                  AND (
+                        CAST(:outlet_id AS uuid) IS NULL
+                        OR j.outlet_id = CAST(:outlet_id AS uuid)
+                  )
+                  AND EXISTS (
+                        SELECT 1
+                        FROM auditcore.business_assignments ba
+                        WHERE ba.tenant_id = j.tenant_id
+                          AND ba.security_actor_id = :actor_id
+                          AND ba.assignment_status = 'ACTIVE'
+                          AND ba.effective_from <= now()
+                          AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+                          AND (
+                                ba.dealer_id IS NULL
+                                OR (
+                                    ba.dealer_id = j.dealer_id
+                                    AND (ba.outlet_id IS NULL OR ba.outlet_id = j.outlet_id)
+                                )
+                          )
+                  )
+            ),
+            stage_projection AS (
+                SELECT
+                    s.journey_id,
+                    COALESCE(bs.business_status, b.actual_status_code) AS booking_status,
+                    COALESCE(ds.business_status, d.actual_delivery_status_code) AS delivery_status,
+                    bs.business_completed_at_utc AS booking_completed_at,
+                    ds.business_completed_at_utc AS delivery_completed_at
+                FROM scoped s
+                LEFT JOIN auditcore.bookings b
+                  ON b.tenant_id = :tenant_id AND b.journey_id = s.journey_id
+                LEFT JOIN auditcore.deliveries d
+                  ON d.tenant_id = :tenant_id AND d.journey_id = s.journey_id
+                LEFT JOIN auditcore.journey_stage_states bs
+                  ON bs.tenant_id = :tenant_id
+                 AND bs.journey_id = s.journey_id
+                 AND bs.stage_code = 'BOOKING'
+                LEFT JOIN auditcore.journey_stage_states ds
+                  ON ds.tenant_id = :tenant_id
+                 AND ds.journey_id = s.journey_id
+                 AND ds.stage_code = 'DELIVERY'
+            ),
+            bounds AS (
+                SELECT
+                    (CAST(:from_date AS date))::timestamp
+                        AT TIME ZONE COALESCE(:tz, 'UTC') AS start_ts,
+                    (CAST(:to_date AS date) + 1)::timestamp
+                        AT TIME ZONE COALESCE(:tz, 'UTC') AS end_ts
+            )
+            SELECT
+                count(*) FILTER (
+                    WHERE booking_completed_at >= (SELECT start_ts FROM bounds)
+                      AND booking_completed_at <  (SELECT end_ts FROM bounds)
+                ) AS bookings_completed,
+                count(*) FILTER (
+                    WHERE delivery_completed_at >= (SELECT start_ts FROM bounds)
+                      AND delivery_completed_at <  (SELECT end_ts FROM bounds)
+                ) AS deliveries_completed,
+                count(*) FILTER (
+                    WHERE booking_status IN ('BOOKING_STARTED', 'BOOKING_IN_PROGRESS')
+                ) AS bookings_in_progress,
+                count(*) FILTER (
+                    WHERE delivery_status IN ('DELIVERY_STARTED', 'DELIVERY_IN_PROGRESS')
+                ) AS deliveries_in_progress
+            FROM stage_projection
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "actor_id": human_principal.subject,
+            "outlet_id": outlet_id,
+            "from_date": from_date,
+            "to_date": to_date,
+            "tz": project["timezone_name"],
+        },
+    ).mappings().one()
+    return Uc03PcStats(
+        bookingsCompleted=int(row["bookings_completed"]),
+        deliveriesCompleted=int(row["deliveries_completed"]),
+        bookingsInProgress=int(row["bookings_in_progress"]),
+        deliveriesInProgress=int(row["deliveries_in_progress"]),
     )
 
 
