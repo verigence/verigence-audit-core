@@ -12,15 +12,23 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
+from fastapi import Depends, Header, Request, Response
 from sqlalchemy import Connection, text
 
 from audit_core import uc03_booking_capture as booking_capture
 from audit_core import uc03_journey_reviewed_details as reviewed_details
 from audit_core import uc03_v2_review_materialization as materialization
-from audit_core.errors import AuditCoreError
+from audit_core.dependencies import get_connection, get_human_principal
+from audit_core.errors import AuditCoreError, DependencyUnavailableError
+from audit_core.evidence import get_di_client, get_security_oauth_client
+from audit_core.security import HumanPrincipal
+from audit_core.security_authorization import (
+    SecurityAuthorizationClient,
+    get_security_authorization_client,
+)
 from audit_core.uc03_attribute_mapping import spec_for_field
 from audit_core.uc03_attribute_resolution import apply_supported_operational_attribute
 
@@ -310,6 +318,132 @@ def materialize_machine_booking_values(
     }
 
 
+def _v2_booking_document_ids(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+) -> list[UUID]:
+    """Return only V2 capture documents eligible for the pre-submit race check."""
+
+    return list(
+        connection.execute(
+            text(
+                """
+                SELECT DISTINCT e.di_document_id
+                FROM auditcore.evidence e
+                JOIN auditcore.document_capture_v2_documents d
+                  ON d.tenant_id=e.tenant_id
+                 AND d.journey_id=e.journey_id
+                 AND d.di_document_id=e.di_document_id
+                WHERE e.tenant_id=:tenant_id AND e.journey_id=:journey_id
+                  AND e.association_status='ACTIVE'
+                  AND e.di_document_id IS NOT NULL
+                  AND d.stage_code='BOOKING'
+                  AND d.capture_status <> 'SUPERSEDED'
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalars().all()
+    )
+
+
+def close_booking_ready_with_lazy_v2_sync(
+    tenant_id: str,
+    journey_id: UUID,
+    request: Request,
+    response: Response,
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=8, max_length=200),
+    ],
+    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient,
+        Depends(get_security_authorization_client),
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+):
+    """Submit Booking without making DI availability a business-process dependency.
+
+    Only current V2-capture documents participate in the pre-submit race check. DI
+    clients are acquired lazily, so legacy evidence and an unavailable DI service do
+    not turn an otherwise ready Booking into a 500. The durable callback remains the
+    source of eventual post-submit synchronization.
+    """
+
+    from audit_core import uc03_confidence_review_policy as confidence_policy
+
+    confidence_policy.booking_review._scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    document_ids = _v2_booking_document_ids(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+    )
+    if document_ids:
+        security_provider = None
+        di_provider = None
+        try:
+            security_provider = get_security_oauth_client()
+            security_client = next(security_provider)
+            di_provider = get_di_client()
+            di_client = next(di_provider)
+            for document_id in document_ids:
+                try:
+                    confidence_policy._sync_booking_document(
+                        connection,
+                        tenant_id=tenant_id,
+                        journey_id=journey_id,
+                        document_id=document_id,
+                        service_id="audit-core",
+                        security_client=security_client,
+                        di_client=di_client,
+                        bump_version=False,
+                    )
+                except DependencyUnavailableError:
+                    logger.warning(
+                        "uc03_booking_pre_submit_di_sync_unavailable",
+                        extra={
+                            "tenant_id": tenant_id,
+                            "journey_id": str(journey_id),
+                            "document_id": str(document_id),
+                        },
+                    )
+        except RuntimeError as exc:
+            logger.warning(
+                "uc03_booking_pre_submit_di_clients_unavailable",
+                extra={
+                    "tenant_id": tenant_id,
+                    "journey_id": str(journey_id),
+                    "reason": str(exc),
+                },
+            )
+        finally:
+            if di_provider is not None:
+                di_provider.close()
+            if security_provider is not None:
+                security_provider.close()
+
+    return booking_capture.close_booking_ready(
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        request=request,
+        response=response,
+        idempotency_key=idempotency_key,
+        if_match=if_match,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        connection=connection,
+    )
+
+
 def install_uc03_post_extraction_materialization() -> None:
     """Run canonical projection after every successful DI->Core document sync."""
 
@@ -343,4 +477,11 @@ def install_uc03_post_extraction_materialization() -> None:
         return fact_count
 
     confidence_policy._sync_booking_document = wrapped  # type: ignore[assignment]
+    confidence_policy._replace_route(
+        booking_capture.router,
+        suffix="/booking/close-ready",
+        method="POST",
+        endpoint=close_booking_ready_with_lazy_v2_sync,
+        response_model=booking_capture.BookingCommandResponse,
+    )
     confidence_policy._post_extraction_materialization_installed = True
