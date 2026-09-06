@@ -30,12 +30,12 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.uc03_booking_capture import _require_active_booking, _scope
 from audit_core.uc03_booking_commands import (
     _aggregate_lock,
     _append_workflow_event,
     _parse_if_match,
 )
-from audit_core.uc03_booking_capture import _require_active_booking, _scope
 from audit_core.uc03_confidence_review_policy import _unreviewed_low_confidence_count
 from audit_core.uc03_document_capture_v2 import (
     _base_requirements,
