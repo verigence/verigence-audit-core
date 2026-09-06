@@ -13,6 +13,7 @@ from audit_core.observability import (
 )
 from audit_core.otel import attach_business_context
 from audit_core.security import SecurityTokenError
+from audit_core.security_integration import SecurityTokenUnavailableError
 
 logger = structlog.get_logger(__name__)
 
@@ -118,6 +119,18 @@ def install_error_handlers(app: FastAPI) -> None:
             status_code=401,
             title="Authentication required",
             detail="A valid Security access token is required.",
+        )
+
+    @app.exception_handler(SecurityTokenUnavailableError)
+    async def service_token_unavailable(
+        request: Request, exc: SecurityTokenUnavailableError
+    ) -> JSONResponse:
+        return _problem(
+            request,
+            error_code="VAC-SYS-002",
+            status_code=503,
+            title="Service temporarily unavailable",
+            detail="Document processing authorization is temporarily unavailable. Please try again.",
         )
 
     @app.exception_handler(AuthorizationError)
