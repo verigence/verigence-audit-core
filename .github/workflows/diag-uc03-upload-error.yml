@@ -1,0 +1,39 @@
+name: Diagnose UC03 upload VAC-SYS-001
+
+on:
+  push:
+    branches:
+      - diag/uc03-upload-vac-sys-001-20260906
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      ERROR_REFERENCE: 6bdf9f87-5c09-4a2a-a739-63df3ecc8a17
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      - name: Link DEV Audit Core
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+      - name: Find request failure
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway logs --service "$AUDIT_SERVICE" --lines 5000 > /tmp/runtime.log 2>&1 || true
+          echo "=== exact reference ==="
+          grep -F -C 20 "$ERROR_REFERENCE" /tmp/runtime.log || true
+          echo "=== nearby VAC-SYS-001 / upload / exception signals ==="
+          grep -Ei -C 8 'VAC-SYS-001|upload-intents|/booking/.*/finalize|document.*upload|Traceback|Exception|ERROR' /tmp/runtime.log | tail -n 500 || true
+          if ! grep -Fq "$ERROR_REFERENCE" /tmp/runtime.log; then
+            echo "REFERENCE_NOT_FOUND_IN_LAST_5000_LINES"
+          fi
