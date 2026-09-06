@@ -150,6 +150,9 @@ def install_uc03_v2_capture_business_rules() -> None:
         install_uc03_delivery_review_read,
     )
     from audit_core.uc03_di_core_persistence import install_uc03_di_core_persistence
+    from audit_core.uc03_post_extraction_materialization import (
+        install_uc03_post_extraction_materialization,
+    )
     from audit_core.uc03_review_effective_values import (
         install_uc03_review_effective_values,
     )
@@ -179,9 +182,11 @@ def install_uc03_v2_capture_business_rules() -> None:
     # Populate Core evidence identity before the final confidence-only policy builds
     # source rows and evidence-linked review/correction findings.
     install_uc03_review_evidence_link_patch()
-    # Install last because it deliberately overrides legacy mismatch/manual-review
-    # gates and the final effective-value Booking confirm route.
+    # Confidence controls review, never persistence. Install the confidence policy
+    # first, then wrap its DI synchronization so every confirmed fact is projected
+    # into canonical Core immediately, including facts that arrive after submit.
     install_uc03_confidence_review_policy()
+    install_uc03_post_extraction_materialization()
     if getattr(capture_v2, "_gst_corporate_exclusivity_installed", False):
         return
 
