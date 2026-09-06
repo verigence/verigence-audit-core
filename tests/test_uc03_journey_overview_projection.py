@@ -64,7 +64,7 @@ def test_reviewed_booking_projection_only_uses_unambiguous_values() -> None:
     assert "vehicle_model" not in projection
 
 
-def test_reviewed_legal_name_does_not_guess_across_conflicting_identity_documents() -> None:
+def test_reviewed_legal_name_prefers_pan_then_aadhaar() -> None:
     assert _reviewed_legal_name(
         [
             {"pan_name": "Test Customer", "aadhaar_name": None},
@@ -76,7 +76,10 @@ def test_reviewed_legal_name_does_not_guess_across_conflicting_identity_document
             {"pan_name": "Test Customer", "aadhaar_name": None},
             {"pan_name": None, "aadhaar_name": "Different Customer"},
         ]
-    ) is None
+    ) == "Test Customer"
+    assert _reviewed_legal_name(
+        [{"pan_name": None, "aadhaar_name": "Aadhaar Customer"}]
+    ) == "Aadhaar Customer"
 
 
 def test_masked_phone_never_reconstructs_full_contact() -> None:

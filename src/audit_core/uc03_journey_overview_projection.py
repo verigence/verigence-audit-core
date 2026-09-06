@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends
 from pydantic import Field
 from sqlalchemy import Connection, text
 
+from audit_core import uc03_journey_reviewed_details as reviewed_details
 from audit_core import uc03_journey_search as legacy
 from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.security import HumanPrincipal
@@ -23,6 +24,8 @@ router = APIRouter(
 
 class JourneyOverviewProjectionResponse(legacy.JourneyOverviewResponse):
     receipts: list[dict[str, Any]] = Field(default_factory=list)
+    reviewedFields: list[dict[str, Any]] = Field(default_factory=list)
+    resolvedReviewedValues: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 _BOOKING_REVIEW_FIELDS = (
@@ -169,13 +172,25 @@ def _reviewed_booking_projection(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _reviewed_legal_name(rows: list[dict[str, Any]]) -> str | None:
-    names: list[dict[str, Any]] = []
-    for row in rows:
-        value = row.get("pan_name") or row.get("aadhaar_name")
-        if value is not None and str(value).strip():
-            names.append({"name": value})
-    value = _unambiguous(names, "name")
-    return str(value) if value is not None else None
+    """Resolve legal name from KYC, using PAN then Aadhaar as the tie-break."""
+
+    for field in ("pan_name", "aadhaar_name"):
+        for row in rows:
+            value = row.get(field)
+            if value is not None and str(value).strip():
+                return str(value)
+    return None
+
+
+def _resolved_value(
+    resolved: dict[str, dict[str, Any]],
+    semantic_key: str,
+) -> Any | None:
+    item = resolved.get(semantic_key)
+    if not item:
+        return None
+    value = item.get("value")
+    return value if value is not None and value != "" else None
 
 
 def _documents(
@@ -346,7 +361,7 @@ def get_journey_overview_projection(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> JourneyOverviewProjectionResponse:
-    """Project the current V2 Journey state without reading raw DI business facts."""
+    """Project Journey 360 from Audit Core, including every reviewed DI field."""
 
     base = legacy.get_journey_overview(
         tenant_id=tenant_id,
@@ -367,6 +382,30 @@ def get_journey_overview_projection(
     journey["deliveryPcVerificationStatus"] = review_statuses.get("DELIVERY")
     data["journey"] = journey
 
+    # Read the complete reviewed-field set from Audit Core, never directly from DI.
+    # The resolver marks KYC as customer truth and Delivery as the winner over
+    # Booking for every other overlapping semantic fact while retaining all sources.
+    raw_reviewed_fields = reviewed_details.load_reviewed_field_details(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+    )
+    reviewed_fields, resolved_reviewed = (
+        reviewed_details.annotate_and_resolve_reviewed_fields(raw_reviewed_fields)
+    )
+    full_contact = legacy._can_read_full_contact(
+        authorization_client,
+        human_principal=human_principal,
+        tenant_id=tenant_id,
+    )
+    reviewed_details.mask_contact_fields(
+        reviewed_fields,
+        resolved_reviewed,
+        full_contact=full_contact,
+    )
+    data["reviewedFields"] = reviewed_fields
+    data["resolvedReviewedValues"] = resolved_reviewed
+
     reviewed_booking_rows = _reviewed_booking_rows(
         connection,
         tenant_id=tenant_id,
@@ -375,7 +414,16 @@ def get_journey_overview_projection(
     reviewed_booking = _reviewed_booking_projection(reviewed_booking_rows)
 
     customer = dict(data["customer"])
-    if not customer.get("legalName"):
+    resolved_customer_name = resolved_reviewed.get("customer_name")
+    if (
+        resolved_customer_name
+        and str(resolved_customer_name.get("documentTypeKey") or "").casefold()
+        in reviewed_details.KYC_DOCUMENT_TYPES
+        and resolved_customer_name.get("value") not in (None, "")
+    ):
+        customer["legalName"] = resolved_customer_name["value"]
+        customer["legalNameStatus"] = "DOCUMENT_VERIFIED"
+    elif not customer.get("legalName"):
         customer["legalName"] = _reviewed_legal_name(
             _reviewed_identity_rows(
                 connection,
@@ -383,12 +431,32 @@ def get_journey_overview_projection(
                 journey_id=journey_id,
             )
         )
+
     if not customer.get("emailReference") and reviewed_booking.get("customer_email"):
         customer["emailReference"] = reviewed_booking["customer_email"]
     if not customer.get("mobileNumber"):
         customer["mobileNumber"] = _masked_phone(
             reviewed_booking.get("customer_phone") or customer.get("mobileLast4")
         )
+
+    # Add the resolved KYC detail to the Customer projection so the primary card
+    # and the full reviewed-data section tell the same story.
+    customer_identity_fields = {
+        "dateOfBirth": "customer_date_of_birth",
+        "gender": "customer_gender",
+        "address": "customer_address",
+        "panNumber": "pan",
+        "aadhaarNumber": "aadhaar_number",
+        "relationshipType": "customer_relationship_type",
+        "relationshipName": "customer_relationship_name",
+        "pincode": "pincode",
+        "kycState": "kyc_state",
+        "kycDistrict": "kyc_district",
+    }
+    for destination, semantic in customer_identity_fields.items():
+        value = _resolved_value(resolved_reviewed, semantic)
+        if value is not None:
+            customer[destination] = value
     data["customer"] = customer
 
     booking = dict(data.get("booking") or {})
@@ -403,6 +471,19 @@ def get_journey_overview_projection(
     for destination, source in fallback_fields.items():
         if not booking.get(destination) and reviewed_booking.get(source) is not None:
             booking[destination] = reviewed_booking[source]
+
+    # Vehicle/product facts can legitimately be re-established by Delivery
+    # documents. Use the resolved reviewed value even when Booking already had a
+    # value, because Delivery is the user's declared final-stage precedence.
+    for destination, semantic in (
+        ("modelName", "model"),
+        ("variantName", "variant"),
+        ("colourName", "color"),
+    ):
+        value = _resolved_value(resolved_reviewed, semantic)
+        if value is not None:
+            booking[destination] = value
+
     booking["reviewedValues"] = reviewed_booking
     data["booking"] = booking or None
 
