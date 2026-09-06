@@ -1,6 +1,5 @@
 from uuid import uuid4
 
-import pytest
 from fastapi.routing import APIRoute
 
 from audit_core import uc03_booking_review_decisions as decisions
