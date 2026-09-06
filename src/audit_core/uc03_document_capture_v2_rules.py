@@ -153,6 +153,9 @@ def install_uc03_v2_capture_business_rules() -> None:
     from audit_core.uc03_review_effective_values import (
         install_uc03_review_effective_values,
     )
+    from audit_core.uc03_review_evidence_link_patch import (
+        install_uc03_review_evidence_link_patch,
+    )
     from audit_core.uc03_strict_review_core_ownership import (
         install_uc03_strict_review_core_ownership,
     )
@@ -173,6 +176,9 @@ def install_uc03_v2_capture_business_rules() -> None:
     install_uc03_delivery_review_read()
     install_uc03_review_effective_values()
     install_uc03_booking_review_rule_trigger()
+    # Populate Core evidence identity before the final confidence-only policy builds
+    # source rows and evidence-linked review/correction findings.
+    install_uc03_review_evidence_link_patch()
     # Install last because it deliberately overrides legacy mismatch/manual-review
     # gates and the final effective-value Booking confirm route.
     install_uc03_confidence_review_policy()
