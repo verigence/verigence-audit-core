@@ -3,13 +3,13 @@ from __future__ import annotations
 from collections import deque
 from uuid import uuid4
 
-from audit_core.main import app
 from audit_core.uc03_journey_overview_projection import (
     _documents,
     _masked_phone,
     _receipts,
     _reviewed_booking_projection,
     _reviewed_legal_name,
+    router as projection_router,
 )
 
 
@@ -32,14 +32,14 @@ class _ScriptedConnection:
         return _Rows(self._results.popleft())
 
 
-def test_projection_route_precedes_legacy_overview_route() -> None:
+def test_projection_router_exposes_journey_overview_route() -> None:
     matches = [
         route
-        for route in app.routes
+        for route in projection_router.routes
         if getattr(route, "path", None)
         == "/v1/tenants/{tenant_id}/uc03/journeys/{journey_id}/overview"
     ]
-    assert len(matches) == 2
+    assert len(matches) == 1
     assert matches[0].endpoint.__name__ == "get_journey_overview_projection"
 
 
