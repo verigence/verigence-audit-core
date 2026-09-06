@@ -6,7 +6,6 @@ from fastapi.routing import APIRoute
 from audit_core import uc03_booking_review_decisions as decisions
 from audit_core import uc03_document_review_v2 as review_v2
 from audit_core import uc03_v2_review_materialization as materialization
-from audit_core.errors import ConflictError
 from audit_core.uc03_booking_commercial_components import (
     install_uc03_booking_commercial_components,
 )
@@ -115,7 +114,7 @@ def test_booking_docket_unique_fields_are_first_class_review_attributes() -> Non
         assert "BOOKING" in spec.stages
 
 
-def test_unknown_accepted_booking_field_fails_before_generic_provenance_copy() -> None:
+def test_unknown_accepted_booking_field_uses_lossless_audit_core_owner() -> None:
     _install_contract()
     document = _document("future_unowned_business_field")
     reviewed = _lossless_reviewed_fields([document], rejected_keys=set())
@@ -126,18 +125,7 @@ def test_unknown_accepted_booking_field_fails_before_generic_provenance_copy() -
         document_type_key="booking_form",
         field_key="future_unowned_business_field",
         document_id=document.documentId,
-    ) is None
-
-    with pytest.raises(ConflictError) as raised:
-        decisions.persist_reviewed_di_fields(
-            object(),
-            tenant_id="tenant-1",
-            journey_id=uuid4(),
-            stage_code="BOOKING",
-            actor_id="reviewer-1",
-            fields=reviewed,
-        )
-    assert raised.value.error_code == "VAC-CONFLICT-013"
+    ) == ("REVIEWED_DI_FIELD", str(document.documentId))
 
 
 def test_rejected_unknown_field_keeps_original_without_effective_value() -> None:
