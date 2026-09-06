@@ -2,15 +2,14 @@
 
 Approved authority: UC03_SIMPLIFICATION_DECISION_2026-09-06.md (C-01..C-07).
 
-This patch deliberately keeps the existing DI/R2 structure intact.  It removes the
+This patch deliberately keeps the existing DI/R2 structure intact. It removes the
 PC customer-name dependency, uses the generated Journey ID in the existing customer
 reference/display slot, and lets Review submit Booking without the removed manual
-Booking Details payload.  Existing DI-populated canonical values are never replaced
+Booking Details payload. Existing DI-populated canonical values are never replaced
 by NULL/manual placeholders.
 """
 from __future__ import annotations
 
-import json
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -134,29 +133,11 @@ def create_booking_journey_first_reference(
             "journey_reference": journey_reference,
         },
     )
-    connection.execute(
-        text(
-            """
-            UPDATE auditcore.journey_workflow_events
-            SET safe_payload = CAST(:safe_payload AS jsonb)
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code='BOOKING' AND event_type='BOOKING_CREATED'
-              AND idempotency_key=:idempotency_key
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "idempotency_key": idempotency_key,
-            "safe_payload": json.dumps(
-                {
-                    "outletId": str(payload.outletId),
-                    "customerNameCaptured": False,
-                    "captureReference": "JOURNEY_ID",
-                }
-            ),
-        },
-    )
+
+    # journey_workflow_events is append-only by schema contract. The previous
+    # implementation attempted to rewrite BOOKING_CREATED.safe_payload here, which
+    # is rejected by both the append-only trigger and runtime privileges and surfaced
+    # to the user as VAC-SYS-001. Never mutate an existing workflow event.
     return create_booking.CreateBookingResponse.model_validate(body)
 
 
