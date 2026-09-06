@@ -1,13 +1,14 @@
-"""Fail Booking Review closed unless every accepted DI field has a Core owner.
+"""Keep every accepted Booking Review DI field in an Audit Core owner.
 
 UC03 Review previously regressed to treating the lossless
-``journey_document_extracted_fields`` provenance copy as sufficient persistence.
-That table is provenance, not the business owner.  This installer restores the
-contract that an accepted populated DI field must have an explicit typed Audit
-Core owner before Review Confirm can succeed.
+``journey_document_extracted_fields`` copy as optional provenance.  For Journey
+Details it is also the durable Audit Core owner for reviewed DI fields whose richer
+typed business owner is not yet defined.  Proven Booking/PAN/Aadhaar/receipt fields
+still materialize into their existing typed owners; every other accepted reviewed
+field falls back to the reviewed-field owner instead of being rejected or lost.
 
-It also makes ``booking_docket`` use the same typed Booking business owner as
-``booking_form``.  Both document types are alternate sales-contract evidence for
+``booking_docket`` continues to use the same typed Booking business owner as
+``booking_form``. Both document types are alternate sales-contract evidence for
 the same UC03 Booking business attributes.
 """
 from __future__ import annotations
@@ -104,11 +105,22 @@ def _install_docket_typed_owner() -> None:
             and normalized_field in materialization._BOOKING_FORM_FIELDS
         ):
             return "BOOKING_FORM_REVIEW_VALUE", str(document_id)
-        return original_owner(
+
+        typed_owner = original_owner(
             document_type_key=document_type_key,
             field_key=field_key,
             document_id=document_id,
         )
+        if typed_owner is not None:
+            return typed_owner
+
+        # Every accepted DI business field must survive Review Confirm in Audit
+        # Core even when a richer domain projection has not been implemented yet.
+        # journey_document_extracted_fields is the durable reviewed-field owner and
+        # is what Journey Details reads for complete DI coverage.
+        if document_type and normalized_field:
+            return "REVIEWED_DI_FIELD", str(document_id)
+        return None
 
     materialization.reviewed_field_core_owner = reviewed_field_core_owner  # type: ignore[assignment]
     # Booking Review imported the helper directly, so update that live binding too.
@@ -189,7 +201,8 @@ def _install_owner_guard() -> None:
         if stage_code == "BOOKING":
             for field in fields:
                 # Rejected fields intentionally have no effective accepted value and
-                # are retained only as immutable DI provenance; they need no owner.
+                # are retained as immutable DI extraction history; they need no
+                # accepted-value owner.
                 if not field.effective_value_is_set or not has_persistable_value(
                     field.effective_value
                 ):
@@ -220,7 +233,7 @@ def _install_owner_guard() -> None:
 
 
 def install_uc03_strict_review_core_ownership() -> None:
-    """Install typed Booking/Docket ownership and accepted-field fail-closed guard."""
+    """Install typed owners plus the lossless reviewed-DI fallback owner."""
 
     global _installed
     if _installed:
