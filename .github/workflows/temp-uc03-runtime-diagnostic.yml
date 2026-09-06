@@ -1,6 +1,6 @@
 name: TEMP UC03 runtime diagnostic
 
-# fourth push captures the exact 4-second failure window from the known good deployment
+# fifth push captures safe system_error classifications from the known good deployment
 on:
   push:
     branches: [dev]
@@ -23,11 +23,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Railway CLI
         run: npm install --global @railway/cli
-      - name: Capture exact DEV failure window
+      - name: Capture safe system error classifications
         shell: bash
         run: |
           set -euo pipefail
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
-          railway logs "$TARGET_DEPLOYMENT_ID" --service "$AUDIT_SERVICE" --since '2026-09-06T13:44:10Z' --until '2026-09-06T13:44:14Z' > /tmp/audit.log
+          railway logs "$TARGET_DEPLOYMENT_ID" --service "$AUDIT_SERVICE" --lines 2000 --filter 'system_error' > /tmp/audit.log
           cat /tmp/audit.log
           test -s /tmp/audit.log
