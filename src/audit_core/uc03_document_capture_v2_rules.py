@@ -159,6 +159,9 @@ def install_uc03_v2_capture_business_rules() -> None:
     from audit_core.uc03_review_evidence_link_patch import (
         install_uc03_review_evidence_link_patch,
     )
+    from audit_core.uc03_simplified_booking_flow import (
+        install_uc03_simplified_booking_flow,
+    )
     from audit_core.uc03_strict_review_core_ownership import (
         install_uc03_strict_review_core_ownership,
     )
@@ -187,6 +190,10 @@ def install_uc03_v2_capture_business_rules() -> None:
     # into canonical Core immediately, including facts that arrive after submit.
     install_uc03_confidence_review_policy()
     install_uc03_post_extraction_materialization()
+    # 06-Sep-2026 authority: remove customer-name/manual-details dependencies and
+    # make Review the final Booking submission step. Install last so it wins the
+    # intentional route overrides while retaining the confidence/materialization stack.
+    install_uc03_simplified_booking_flow()
     if getattr(capture_v2, "_gst_corporate_exclusivity_installed", False):
         return
 
