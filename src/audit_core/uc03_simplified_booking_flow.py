@@ -41,6 +41,9 @@ from audit_core.uc03_document_capture_v2 import (
     _capture_phase_state,
     _linked_documents,
 )
+from audit_core.uc03_simplified_create_atomic import (
+    execute_simplified_create_booking_atomic,
+)
 
 
 class SimplifiedCreateBookingCommand(BaseModel):
@@ -93,51 +96,24 @@ def create_booking_journey_first_reference(
         outlet_id=payload.outletId,
     )
 
-    # Keep the proven atomic create path and relational Customer FK. No human-entered
-    # identity is needed. Before the transaction returns, replace the internal
-    # placeholder with the immutable generated Journey ID so the existing DI/R2
-    # storage-context code receives Journey ID in the former customer-name slot.
+    # The Journey UUID is generated inside the same atomic SQL statement before
+    # Customer insert. It is therefore the Customer reference from row creation;
+    # no post-create Customer mutation is needed or permitted.
     request_payload = {
         "outletId": str(payload.outletId),
         "referenceMode": "JOURNEY_ID",
     }
-    body = create_booking._execute_create_booking_atomic(
+    body = execute_simplified_create_booking_atomic(
         connection,
         tenant_id=tenant_id,
         context=context,
-        customer_name="PENDING_JOURNEY_REFERENCE",
         actor_id=human_principal.subject,
         idempotency_key=idempotency_key,
         request_payload=request_payload,
     )
-    journey_id = UUID(str(body["journeyId"]))
-    customer_id = UUID(str(body["customerId"]))
-    journey_reference = str(journey_id)
 
-    connection.execute(
-        text(
-            """
-            UPDATE auditcore.customers
-            SET display_name=:journey_reference,
-                updated_at_utc=now(),
-                version_no=CASE
-                    WHEN display_name=:journey_reference THEN version_no
-                    ELSE version_no + 1
-                END
-            WHERE tenant_id=:tenant_id AND customer_id=:customer_id
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "customer_id": customer_id,
-            "journey_reference": journey_reference,
-        },
-    )
-
-    # journey_workflow_events is append-only by schema contract. The previous
-    # implementation attempted to rewrite BOOKING_CREATED.safe_payload here, which
-    # is rejected by both the append-only trigger and runtime privileges and surfaced
-    # to the user as VAC-SYS-001. Never mutate an existing workflow event.
+    # journey_workflow_events remains append-only; BOOKING_CREATED is written once
+    # as part of the same atomic create statement.
     return create_booking.CreateBookingResponse.model_validate(body)
 
 
