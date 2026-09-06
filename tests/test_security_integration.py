@@ -14,6 +14,7 @@ from audit_core.security_integration import (
     SecurityAdminClient,
     SecurityOAuthClient,
     SecurityTokenError,
+    SecurityTokenUnavailableError,
 )
 
 ISSUER = "verigence-security"
@@ -109,6 +110,68 @@ def test_service_token_uses_canonical_v2_endpoint_and_di_audience(
     assert "tenant_id" not in claims
     assert "permissions" not in claims
     assert controlled_security.audiences == ["di"]
+
+
+def test_service_token_is_cached_per_audience(
+    controlled_security: ControlledSecurity,
+) -> None:
+    with _client(controlled_security) as security_client:
+        first = security_client.get_service_token(audience="di")
+        second = security_client.get_service_token(audience="di")
+
+    assert first == second
+    assert controlled_security.audiences == ["di"]
+
+
+def test_service_token_retries_transient_transport_failure() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ReadTimeout("temporary Security timeout", request=request)
+        return httpx.Response(
+            200,
+            json={
+                "accessToken": "signed-token",
+                "tokenType": "Bearer",
+                "expiresIn": 60,
+                "audience": "di",
+            },
+        )
+
+    with SecurityOAuthClient(
+        base_url="https://security.test",
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        transport=httpx.MockTransport(handler),
+    ) as security_client:
+        assert security_client.get_service_token(audience="di") == "signed-token"
+
+    assert attempts == 2
+
+
+def test_service_token_reports_dependency_unavailable_after_retry() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ReadTimeout("Security remains unavailable", request=request)
+
+    with (
+        SecurityOAuthClient(
+            base_url="https://security.test",
+            client_id=CLIENT_ID,
+            client_secret=CLIENT_SECRET,
+            transport=httpx.MockTransport(handler),
+        ) as security_client,
+        pytest.raises(SecurityTokenUnavailableError, match="endpoint is unavailable"),
+    ):
+        security_client.get_service_token(audience="di")
+
+    assert attempts == 2
 
 
 def test_service_token_is_audience_bound(

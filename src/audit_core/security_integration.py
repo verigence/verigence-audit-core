@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, Self
 
 import httpx
@@ -8,9 +10,17 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
+_SERVICE_TOKEN_MAX_ATTEMPTS = 2
+_SERVICE_TOKEN_RETRY_BACKOFF_SECONDS = 0.15
+_SERVICE_TOKEN_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
 
 class SecurityTokenError(RuntimeError):
     """Security did not issue the requested ServiceIntegration access token."""
+
+
+class SecurityTokenUnavailableError(SecurityTokenError):
+    """Security service-token endpoint is temporarily unavailable."""
 
 
 class SecurityAdminError(RuntimeError):
@@ -435,6 +445,8 @@ class SecurityOAuthClient:
             timeout=timeout_seconds,
             transport=transport,
         )
+        self._token_cache: dict[str, tuple[float, str]] = {}
+        self._token_cache_lock = Lock()
 
     def close(self) -> None:
         self._client.close()
@@ -449,48 +461,139 @@ class SecurityOAuthClient:
         requested_audience = audience.strip()
         if not requested_audience:
             raise ValueError("audience is required")
-        logger.debug(
-            "security_service_token_start",
-            audience=requested_audience,
-        )
-        try:
-            response = self._client.post(
-                "/security/v1/service/token",
-                data={"audience": requested_audience},
-            )
-        except httpx.HTTPError as exc:
-            logger.warning("security_service_token_failed", reason="endpoint_unavailable")
-            raise SecurityTokenError("Security service-token endpoint is unavailable") from exc
 
-        if response.status_code != 200:
-            error = _safe_service_error(response)
-            logger.warning(
-                "security_service_token_failed",
-                http_status=response.status_code,
-                error=error,
+        # The client is process-cached by callers. Reuse Security's own audience-bound
+        # token until shortly before its reported expiry instead of requesting a new
+        # token for every document finalize call. The token is memory-only.
+        with self._token_cache_lock:
+            cached = self._cached_service_token(requested_audience)
+            if cached is not None:
+                logger.debug(
+                    "security_service_token_cache_hit",
+                    audience=requested_audience,
+                )
+                return cached
+
+            access_token, expires_in = self._request_service_token(requested_audience)
+            self._remember_service_token(
                 audience=requested_audience,
+                access_token=access_token,
+                expires_in=expires_in,
             )
-            raise SecurityTokenError(
-                f"Security service-token request denied with HTTP {response.status_code}: {error}"
-            )
+            return access_token
 
-        try:
-            payload: Any = response.json()
-        except ValueError as exc:
-            raise SecurityTokenError("Security service-token response is not valid JSON") from exc
-        if not isinstance(payload, dict):
-            raise SecurityTokenError("Security service-token response has invalid shape")
-
-        access_token = payload.get("accessToken")
-        token_type = payload.get("tokenType")
-        returned_audience = payload.get("audience")
-        if not isinstance(access_token, str) or not access_token:
-            raise SecurityTokenError("Security service-token response has no accessToken")
-        if token_type != "Bearer":
-            raise SecurityTokenError("Security service-token response has invalid tokenType")
-        if returned_audience != requested_audience:
-            raise SecurityTokenError("Security service-token response audience mismatch")
+    def _cached_service_token(self, audience: str) -> str | None:
+        cached = self._token_cache.get(audience)
+        if cached is None:
+            return None
+        expires_at, access_token = cached
+        if expires_at <= time.monotonic():
+            self._token_cache.pop(audience, None)
+            return None
         return access_token
+
+    def _remember_service_token(
+        self,
+        *,
+        audience: str,
+        access_token: str,
+        expires_in: int | None,
+    ) -> None:
+        if expires_in is None:
+            return
+        lifetime = float(expires_in)
+        # Keep a conservative skew so a token is never deliberately reused at expiry.
+        skew = min(60.0, max(1.0, lifetime * 0.10))
+        cache_ttl = lifetime - skew
+        if cache_ttl <= 0:
+            return
+        self._token_cache[audience] = (time.monotonic() + cache_ttl, access_token)
+
+    def _request_service_token(self, requested_audience: str) -> tuple[str, int | None]:
+        for attempt in range(1, _SERVICE_TOKEN_MAX_ATTEMPTS + 1):
+            logger.debug(
+                "security_service_token_start",
+                audience=requested_audience,
+                attempt=attempt,
+            )
+            try:
+                response = self._client.post(
+                    "/security/v1/service/token",
+                    data={"audience": requested_audience},
+                )
+            except httpx.HTTPError as exc:
+                logger.warning(
+                    "security_service_token_failed",
+                    reason="endpoint_unavailable",
+                    audience=requested_audience,
+                    attempt=attempt,
+                )
+                if attempt < _SERVICE_TOKEN_MAX_ATTEMPTS:
+                    time.sleep(_SERVICE_TOKEN_RETRY_BACKOFF_SECONDS)
+                    continue
+                raise SecurityTokenUnavailableError(
+                    "Security service-token endpoint is unavailable"
+                ) from exc
+
+            if (
+                response.status_code in _SERVICE_TOKEN_RETRYABLE_STATUS_CODES
+                and attempt < _SERVICE_TOKEN_MAX_ATTEMPTS
+            ):
+                logger.warning(
+                    "security_service_token_failed",
+                    reason="retryable_http_status",
+                    http_status=response.status_code,
+                    audience=requested_audience,
+                    attempt=attempt,
+                )
+                time.sleep(_SERVICE_TOKEN_RETRY_BACKOFF_SECONDS)
+                continue
+
+            if response.status_code != 200:
+                error = _safe_service_error(response)
+                logger.warning(
+                    "security_service_token_failed",
+                    http_status=response.status_code,
+                    error=error,
+                    audience=requested_audience,
+                    attempt=attempt,
+                )
+                if response.status_code in _SERVICE_TOKEN_RETRYABLE_STATUS_CODES:
+                    raise SecurityTokenUnavailableError(
+                        f"Security service-token endpoint returned HTTP {response.status_code}"
+                    )
+                raise SecurityTokenError(
+                    f"Security service-token request denied with HTTP {response.status_code}: {error}"
+                )
+
+            try:
+                payload: Any = response.json()
+            except ValueError as exc:
+                raise SecurityTokenError(
+                    "Security service-token response is not valid JSON"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise SecurityTokenError("Security service-token response has invalid shape")
+
+            access_token = payload.get("accessToken")
+            token_type = payload.get("tokenType")
+            returned_audience = payload.get("audience")
+            expires_in = payload.get("expiresIn")
+            if not isinstance(access_token, str) or not access_token:
+                raise SecurityTokenError("Security service-token response has no accessToken")
+            if token_type != "Bearer":
+                raise SecurityTokenError("Security service-token response has invalid tokenType")
+            if returned_audience != requested_audience:
+                raise SecurityTokenError("Security service-token response audience mismatch")
+            if expires_in is not None and (
+                not isinstance(expires_in, int)
+                or isinstance(expires_in, bool)
+                or expires_in <= 0
+            ):
+                raise SecurityTokenError("Security service-token response has invalid expiresIn")
+            return access_token, expires_in
+
+        raise AssertionError("service-token retry loop exhausted without a result")
 
 
 def _safe_service_error(response: httpx.Response) -> str:

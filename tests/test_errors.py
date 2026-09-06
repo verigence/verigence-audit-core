@@ -9,6 +9,7 @@ from audit_core.errors import (
     install_error_handlers,
 )
 from audit_core.security import SecurityTokenError
+from audit_core.security_integration import SecurityTokenUnavailableError
 
 
 def _app() -> FastAPI:
@@ -22,6 +23,10 @@ def _app() -> FastAPI:
     @app.get("/auth")
     def auth() -> None:
         raise SecurityTokenError("raw token failure")
+
+    @app.get("/service-token-unavailable")
+    def service_token_unavailable() -> None:
+        raise SecurityTokenUnavailableError("raw downstream token endpoint failure")
 
     @app.get("/not-found")
     def not_found() -> None:
@@ -57,6 +62,7 @@ def _app() -> FastAPI:
     [
         ("/validation/not-an-int", 400, "VAC-VAL-001"),
         ("/auth", 401, "VAC-AUTH-001"),
+        ("/service-token-unavailable", 503, "VAC-SYS-002"),
         ("/not-found", 404, "VAC-NF-001"),
         ("/conflict", 409, "VAC-CONFLICT-001"),
         ("/dependency", 503, "VAC-SYS-002"),
