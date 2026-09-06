@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+import inspect
+from uuid import uuid4
+
+from audit_core import uc03_delivery_review_materialization as materialization
+from audit_core.uc03_delivery_review_confirm import confirm_delivery_review_v2
+from audit_core.uc03_document_review_v2 import ReviewV2Document, ReviewV2Field
+
+
+def _field(field_key: str, value, *, confidence: float = 99.0) -> ReviewV2Field:
+    return ReviewV2Field(
+        canonicalFieldId=str(uuid4()),
+        fieldKey=field_key,
+        value=value,
+        confidenceScore=confidence,
+        sourceFactVersion=1,
+        reviewState="READY",
+    )
+
+
+def _document(document_type: str, fields: list[ReviewV2Field]) -> ReviewV2Document:
+    document_id = uuid4()
+    return ReviewV2Document(
+        documentId=document_id,
+        label=document_type,
+        documentTypeKey=document_type,
+        originalFilename=f"{document_id}.pdf",
+        processingStatus="PROCESSED",
+        extractionState="READY",
+        fields=fields,
+    )
+
+
+def test_delivery_order_contract_materializes_exact_chassis_field_only() -> None:
+    document = _document(
+        "delivery_order_cover",
+        [
+            _field("chassis", "SHOULD-NOT-MATCH", confidence=100.0),
+            _field("chassis_no", "MA1ABC123", confidence=95.0),
+        ],
+    )
+
+    selected = materialization._best_field(
+        [document],
+        materialization._CHASSIS_FIELD_KEYS,
+        source_priority=materialization._VEHICLE_SOURCE_PRIORITY,
+    )
+
+    assert selected is not None
+    assert selected[1].fieldKey == "chassis_no"
+    assert selected[1].value == "MA1ABC123"
+
+
+def test_invoice_source_precedes_delivery_order_for_vehicle_identifier() -> None:
+    delivery_order = _document(
+        "delivery_order_cover",
+        [_field("chassis_no", "DO-CHASSIS", confidence=99.0)],
+    )
+    invoice = _document(
+        "customer_invoice_dms",
+        [_field("chassis_number", "INV-CHASSIS", confidence=93.0)],
+    )
+
+    selected = materialization._best_field(
+        [delivery_order, invoice],
+        materialization._CHASSIS_FIELD_KEYS,
+        source_priority=materialization._VEHICLE_SOURCE_PRIORITY,
+    )
+
+    assert selected is not None
+    assert selected[0].documentTypeKey == "customer_invoice_dms"
+    assert selected[1].value == "INV-CHASSIS"
+
+
+def test_delivery_insurance_mapping_matches_di_insurance_cover_contract() -> None:
+    assert materialization._INSURANCE_DOCUMENT_TYPE == "insurance_cover"
+    assert materialization._INSURANCE_FIELDS == {
+        "insurer_name": "insurer_name",
+        "policy_number": "policy_reference",
+        "premium_amount": "actual_premium_amount",
+    }
+    assert materialization._REGISTRATION_FIELD_KEYS == (
+        "registration_number",
+        "insured_vehicle_reg",
+    )
+
+
+def test_delivery_business_materializer_calls_all_canonical_projections(monkeypatch) -> None:
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        materialization,
+        "materialize_delivery_vehicle",
+        lambda *args, **kwargs: calls.append("vehicle") or 2,
+    )
+    monkeypatch.setattr(
+        materialization,
+        "materialize_delivery_registration",
+        lambda *args, **kwargs: calls.append("registration") or 1,
+    )
+    monkeypatch.setattr(
+        materialization,
+        "materialize_delivery_insurance",
+        lambda *args, **kwargs: calls.append("insurance") or 3,
+    )
+    monkeypatch.setattr(
+        materialization,
+        "materialize_delivery_commercial_lines",
+        lambda *args, **kwargs: calls.append("commercials") or 4,
+    )
+    monkeypatch.setattr(
+        materialization,
+        "materialize_delivery_receipts",
+        lambda *args, **kwargs: calls.append("receipts")
+        or {
+            "reviewRowsWritten": 1,
+            "created": 1,
+            "updated": 0,
+            "unchanged": 0,
+            "skippedWithoutAmount": 0,
+        },
+    )
+
+    result = materialization.materialize_reviewed_delivery_business_values(
+        object(),
+        tenant_id="tenant-a",
+        journey_id=uuid4(),
+        documents=[],
+        actor_id="reviewer-a",
+    )
+
+    assert calls == ["vehicle", "registration", "insurance", "commercials", "receipts"]
+    assert result["vehicleFields"] == 2
+    assert result["registrationFields"] == 1
+    assert result["insuranceFields"] == 3
+    assert result["commercialLines"] == 4
+    assert result["receiptPaymentsCreated"] == 1
+
+
+def test_delivery_review_materializes_before_marking_stage_verified() -> None:
+    source = inspect.getsource(confirm_delivery_review_v2)
+    materialize_at = source.index("materialize_reviewed_delivery_business_values(")
+    verified_at = source.index("pc_verification_status='VERIFIED'")
+
+    assert materialize_at < verified_at
