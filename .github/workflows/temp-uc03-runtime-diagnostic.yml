@@ -1,6 +1,6 @@
 name: TEMP UC03 runtime diagnostic
 
-# fifth push captures safe system_error classifications from the known good deployment
+# sixth push extracts only safe traceback/classification lines around the known failure
 on:
   push:
     branches: [dev]
@@ -23,11 +23,26 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Railway CLI
         run: npm install --global @railway/cli
-      - name: Capture safe system error classifications
+      - name: Extract safe traceback context
         shell: bash
         run: |
           set -euo pipefail
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
-          railway logs "$TARGET_DEPLOYMENT_ID" --service "$AUDIT_SERVICE" --lines 2000 --filter 'system_error' > /tmp/audit.log
-          cat /tmp/audit.log
-          test -s /tmp/audit.log
+          railway logs "$TARGET_DEPLOYMENT_ID" --service "$AUDIT_SERVICE" --lines 5000 > /tmp/all.log
+          python - <<'PY'
+          from pathlib import Path
+          lines=Path('/tmp/all.log').read_text(errors='replace').splitlines()
+          needles=('ProgrammingError','UndefinedColumn','UndefinedTable','InsufficientPrivilege','permission denied','does not exist','column ','relation ','trigger ','Traceback','File "/app','File "/opt','psycopg.errors','sqlalchemy.exc')
+          out=[]
+          for i,line in enumerate(lines):
+              if '13:44:12' not in line and not any(n.lower() in line.lower() for n in needles):
+                  continue
+              # Never print parameter-value dumps, auth headers, or bearer material.
+              low=line.lower()
+              if 'parameters' in low or 'authorization' in low or 'bearer ' in low or 'token=' in low:
+                  continue
+              out.append(line)
+          print('\n'.join(out[-160:]))
+          if not any('ProgrammingError' in x for x in out):
+              raise SystemExit(2)
+          PY
