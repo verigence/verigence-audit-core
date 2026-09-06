@@ -1,0 +1,56 @@
+name: TEMP UC03 Journey overview diagnostic
+
+on:
+  push:
+    branches: [diag/uc03-journey-overview-20260906]
+    paths:
+      - '.github/workflows/temp-uc03-overview-diagnostic.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      - name: Capture latest UC03 Journey overview requests
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway deployment list --service "$AUDIT_SERVICE" --limit 20 --json >/tmp/deployments.json
+          deployment_id="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/deployments.json').read_text())
+          for row in rows:
+              if row.get('status') == 'SUCCESS':
+                  print(row['id'])
+                  break
+          PY
+          )"
+          test -n "$deployment_id"
+          railway logs "$deployment_id" --service "$AUDIT_SERVICE" --lines 6000 > /tmp/all.log
+          python - <<'PY'
+          from pathlib import Path
+          lines=Path('/tmp/all.log').read_text(errors='replace').splitlines()
+          hits=[]
+          for line in lines:
+              low=line.lower()
+              if '/uc03/journeys/' in low and '/overview' in low:
+                  # request logs contain only safe path/status/correlation metadata
+                  if 'authorization' not in low and 'bearer ' not in low and 'token=' not in low:
+                      hits.append(line)
+          print('\n'.join(hits[-30:]))
+          if not hits:
+              print('NO_OVERVIEW_REQUEST_FOUND')
+              raise SystemExit(2)
+          PY
