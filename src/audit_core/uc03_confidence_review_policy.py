@@ -890,6 +890,18 @@ def _sync_booking_document(
                 "low_count": low_count,
             },
         )
+
+    # Surface the low-confidence fields as a per-document MANUAL_VERIFICATION
+    # finding the PC can work straight from the Review Queue (never raises).
+    from audit_core.uc03_manual_verification import sync_manual_verification_findings
+
+    sync_manual_verification_findings(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code="BOOKING",
+        correlation_id="",
+    )
     return len(facts)
 
 
