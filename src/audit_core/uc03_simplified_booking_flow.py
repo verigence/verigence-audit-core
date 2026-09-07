@@ -283,12 +283,18 @@ def submit_booking_from_review(
             aggregateVersion=next_version,
         ).model_dump(mode="json")
 
+    # The idempotency key is scoped to journey+action only — not to expectedVersion.
+    # Including the version in request_payload would cause retries with a refreshed
+    # version (after a Refresh Review) to bypass the cache and re-execute, producing
+    # a second VAC-CONFLICT-005 on the fresh version when the first execution had
+    # already committed. The If-Match check inside execute() is the sole concurrency
+    # guard; the stored payload is audit evidence only.
     body, _ = execute_idempotent_json_command(
         connection,
         tenant_id=tenant_id,
         operation_key=f"uc03.booking-v2.simplified-submit:{journey_id}",
         idempotency_key=idempotency_key,
-        request_payload={"expectedVersion": expected_version, "details": None},
+        request_payload={"details": None},
         execute=execute,
     )
     response.headers["ETag"] = f'"{body["aggregateVersion"]}"'
