@@ -152,6 +152,29 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Uc03WorkItemPage'}
         default: {$ref: '#/components/responses/ProblemResponse'}
+  /tenants/{tenantId}/uc03/pc-stats:
+    get:
+      operationId: getUc03PcStats
+      description: >-
+        Returns Process Coordinator throughput for a date window: Bookings and Deliveries
+        completed within [from, to] inclusive (business_completed_at_utc interpreted in the
+        Project timezone), plus the same point-in-time in-progress counters as landing-metrics.
+        The Security human JWT proves identity only; Audit Core obtains a synchronous Security
+        authorization decision for audit.journey.read and then enforces current
+        business_assignments Dealer/Outlet scope. outletId optionally narrows the counters to a
+        single Outlet. This is a read-only reporting counter and holds no server state.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - {name: from, in: query, required: true, schema: {type: string, format: date}}
+        - {name: to, in: query, required: true, schema: {type: string, format: date}}
+        - {name: outletId, in: query, required: false, schema: {type: string, format: uuid}}
+      responses:
+        '200':
+          description: UC03 PC throughput counters
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Uc03PcStats'}
+        default: {$ref: '#/components/responses/ProblemResponse'}
   # UC03_C1_BOOKING_CONTRACT
   /tenants/{tenantId}/journeys/{journeyId}/booking/start:
     post:
@@ -650,6 +673,20 @@ components:
           type: integer
           minimum: 0
           description: OPEN and ACKNOWLEDGED finding count in the authorized Project scope.
+    Uc03PcStats:
+      type: object
+      required: [bookingsCompleted, deliveriesCompleted, bookingsInProgress, deliveriesInProgress]
+      properties:
+        bookingsCompleted:
+          type: integer
+          minimum: 0
+          description: Bookings whose stage completed within [from, to] in the Project timezone.
+        deliveriesCompleted:
+          type: integer
+          minimum: 0
+          description: Deliveries whose stage completed within [from, to] in the Project timezone.
+        bookingsInProgress: {type: integer, minimum: 0}
+        deliveriesInProgress: {type: integer, minimum: 0}
     Uc03StageSummary:
       type: object
       required: [businessStatus, auditState, auditStatus, businessDate]
