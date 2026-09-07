@@ -351,6 +351,7 @@ def test_review_queue_routes_by_role_and_supports_scope(audit_setup):
     tl_mine = _client().get(f"{_queue(audit_setup)}?scope=MINE").json()["items"]
     tl_item = next(item for item in tl_mine if item["flagId"] == violation["flagId"])
     assert tl_item["isMine"] is True
+    assert tl_item["version"] == 1
     assert "ACCEPT" in tl_item["permittedActions"]
     assert doc_gap["flagId"] not in {item["flagId"] for item in tl_mine}
 
