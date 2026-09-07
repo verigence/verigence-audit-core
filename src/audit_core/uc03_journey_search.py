@@ -627,11 +627,15 @@ def get_journey_overview(
                 jp.variant_name_snapshot AS "variantName",
                 jp.colour_code_snapshot AS "colourCode",
                 jp.colour_name_snapshot AS "colourName",
-                jp.selection_source AS "selectionSource"
+                jp.selection_source AS "selectionSource",
+                jp.selection_status AS "selectionStatus",
+                s.sku_code AS "skuCode"
             FROM auditcore.bookings b
             LEFT JOIN auditcore.journey_products jp
               ON jp.tenant_id = b.tenant_id
              AND jp.journey_id = b.journey_id
+            LEFT JOIN auditcore.product_skus s
+              ON s.product_sku_id = jp.product_sku_id
             WHERE b.tenant_id = :tenant_id
               AND b.journey_id = :journey_id
             """
