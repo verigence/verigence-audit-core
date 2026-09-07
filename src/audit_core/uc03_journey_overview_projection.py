@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -26,6 +27,7 @@ class JourneyOverviewProjectionResponse(legacy.JourneyOverviewResponse):
     receipts: list[dict[str, Any]] = Field(default_factory=list)
     reviewedFields: list[dict[str, Any]] = Field(default_factory=list)
     resolvedReviewedValues: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    skuPricing: dict[str, Any] | None = Field(default=None)
 
 
 _BOOKING_REVIEW_FIELDS = (
@@ -347,6 +349,197 @@ def _receipts(
     return result
 
 
+def _to_decimal(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except InvalidOperation:
+        return None
+
+
+def _sku_pricing_panel(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    reviewed_booking: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Build a master-vs-booking price comparison panel for the Journey 360 view.
+
+    Returns None when the journey has no resolved SKU yet (no journey_products row).
+    When a SKU is resolved, returns a dict with two sides:
+      - master*   : values read directly from the effective price-list master
+      - booking*  : values extracted from the Booking Form evidence (DI-reviewed)
+    and deviation amounts/percentages for numeric fields that are present on both sides.
+    """
+
+    sku_row = connection.execute(
+        text(
+            """
+            SELECT
+                jp.product_sku_id,
+                jp.model_name_snapshot    AS model_name,
+                jp.variant_name_snapshot  AS variant_name,
+                jp.colour_name_snapshot   AS colour_name,
+                jp.selection_status,
+                jp.selection_method,
+                s.sku_code,
+                b.price_list_id
+            FROM auditcore.journey_products jp
+            JOIN auditcore.product_skus s
+              ON s.product_sku_id = jp.product_sku_id
+            LEFT JOIN auditcore.bookings b
+              ON b.tenant_id = jp.tenant_id
+             AND b.journey_id = jp.journey_id
+            WHERE jp.tenant_id=:tenant_id AND jp.journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
+
+    if sku_row is None:
+        return None
+
+    product_sku_id = sku_row["product_sku_id"]
+
+    # Fetch all active price-list items for this SKU so we can show a per-component
+    # breakdown (ex-showroom, insurance, registration, accessories, etc.) as well as
+    # a master total.  We use the most recently published version that is still active.
+    master_items = connection.execute(
+        text(
+            """
+            SELECT
+                pli.component_key,
+                pli.standard_amount,
+                pli.currency_code,
+                plv.price_list_version_id,
+                plv.version_no,
+                plv.currency_code AS plan_currency
+            FROM auditcore.price_list_items pli
+            JOIN auditcore.price_list_versions plv
+              ON plv.tenant_id = pli.tenant_id
+             AND plv.price_list_version_id = pli.price_list_version_id
+            WHERE pli.tenant_id=:tenant_id
+              AND pli.product_sku_id=:product_sku_id
+              AND plv.lifecycle_status='PUBLISHED'
+              AND (
+                  :price_list_id::uuid IS NULL
+                  OR plv.price_list_id = :price_list_id::uuid
+              )
+            ORDER BY plv.effective_from DESC, plv.version_no DESC, pli.component_key
+            LIMIT 100
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "product_sku_id": product_sku_id,
+            "price_list_id": str(sku_row["price_list_id"]) if sku_row["price_list_id"] else None,
+        },
+    ).mappings().all()
+
+    if not master_items:
+        return None
+
+    # Group by version — take only rows belonging to the first (latest) version.
+    first_version_id = str(master_items[0]["price_list_version_id"])
+    active_items = [r for r in master_items if str(r["price_list_version_id"]) == first_version_id]
+
+    master_components: list[dict[str, Any]] = []
+    master_total = Decimal(0)
+    currency = str(active_items[0]["plan_currency"]).upper()
+    for item in active_items:
+        amount = _to_decimal(item["standard_amount"])
+        if amount is None:
+            continue
+        master_total += amount
+        master_components.append({
+            "componentKey": str(item["component_key"]),
+            "masterAmount": float(amount),
+            "currencyCode": currency,
+        })
+
+    # ---------- Booking-side amounts from reviewed Booking Form evidence ----------
+    # Field names match the keys written by uc03_review_value_normalization to
+    # booking_form_review_values.
+    booking_ex_showroom = _to_decimal(reviewed_booking.get("ex_showroom_price"))
+    booking_insurance   = _to_decimal(reviewed_booking.get("insurance_amount"))
+    booking_registration = _to_decimal(reviewed_booking.get("registration_charges"))
+    booking_road_tax    = _to_decimal(reviewed_booking.get("road_tax_amount"))
+    booking_tcs         = _to_decimal(reviewed_booking.get("tcs_amount"))
+    booking_rsa         = _to_decimal(reviewed_booking.get("rsa_amount"))
+    booking_warranty    = _to_decimal(reviewed_booking.get("additional_warranty_amount"))
+    booking_accessories = _to_decimal(reviewed_booking.get("accessories_cost"))
+    booking_other       = _to_decimal(reviewed_booking.get("other_charges"))
+    booking_discount    = _to_decimal(reviewed_booking.get("discount_amount"))
+    booking_bonus       = _to_decimal(reviewed_booking.get("bonus_amount"))
+    booking_total_price = _to_decimal(reviewed_booking.get("total_price"))
+    booking_net_amount  = _to_decimal(reviewed_booking.get("net_amount"))
+
+    # Enrich master_components with the matching booking-side amount where the key maps.
+    _BOOKING_COMPONENT_MAP: dict[str, Decimal | None] = {
+        "ex_showroom_price": booking_ex_showroom,
+        "insurance_amount":  booking_insurance,
+        "registration_charges": booking_registration,
+        "road_tax_amount":   booking_road_tax,
+        "tcs_amount":        booking_tcs,
+        "rsa_amount":        booking_rsa,
+        "additional_warranty_amount": booking_warranty,
+        "accessories_cost":  booking_accessories,
+        "other_charges":     booking_other,
+    }
+    for component in master_components:
+        key = component["componentKey"]
+        booking_val = _BOOKING_COMPONENT_MAP.get(key)
+        if booking_val is not None:
+            component["bookingAmount"] = float(booking_val)
+            master_val = Decimal(str(component["masterAmount"]))
+            dev = booking_val - master_val
+            component["deviationAmount"] = float(dev.quantize(Decimal("0.01")))
+            component["deviationPercent"] = (
+                float((dev / master_val * Decimal(100)).quantize(Decimal("0.01")))
+                if master_val != 0
+                else None
+            )
+        else:
+            component["bookingAmount"] = None
+            component["deviationAmount"] = None
+            component["deviationPercent"] = None
+
+    # Top-level total deviation (master_total vs booking total_price)
+    total_deviation: float | None = None
+    total_deviation_pct: float | None = None
+    if booking_total_price is not None and master_total != 0:
+        dev_total = booking_total_price - master_total
+        total_deviation = float(dev_total.quantize(Decimal("0.01")))
+        total_deviation_pct = float(
+            (dev_total / master_total * Decimal(100)).quantize(Decimal("0.01"))
+        )
+
+    return {
+        "skuCode": str(sku_row["sku_code"]),
+        "modelName": sku_row["model_name"],
+        "variantName": sku_row["variant_name"],
+        "colourName": sku_row["colour_name"],
+        "selectionStatus": str(sku_row["selection_status"]),
+        "selectionMethod": str(sku_row["selection_method"]) if sku_row["selection_method"] else None,
+        "priceListVersionId": first_version_id,
+        "currencyCode": currency,
+        # Master totals
+        "masterTotalAmount": float(master_total),
+        "masterComponents": master_components,
+        # Booking totals (from Booking Form DI evidence)
+        "bookingTotalPrice": float(booking_total_price) if booking_total_price is not None else None,
+        "bookingNetAmount": float(booking_net_amount) if booking_net_amount is not None else None,
+        "bookingExShowroom": float(booking_ex_showroom) if booking_ex_showroom is not None else None,
+        "bookingDiscount": float(booking_discount) if booking_discount is not None else None,
+        "bookingBonus": float(booking_bonus) if booking_bonus is not None else None,
+        # Deviation summary (master total vs booking total)
+        "totalDeviationAmount": total_deviation,
+        "totalDeviationPercent": total_deviation_pct,
+    }
+
+
 @router.get(
     "/journeys/{journey_id}/overview",
     response_model=JourneyOverviewProjectionResponse,
@@ -501,5 +694,11 @@ def get_journey_overview_projection(
         tenant_id=tenant_id,
         journey_id=journey_id,
         review_statuses=review_statuses,
+    )
+    data["skuPricing"] = _sku_pricing_panel(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        reviewed_booking=reviewed_booking,
     )
     return JourneyOverviewProjectionResponse.model_validate(data)
