@@ -103,6 +103,7 @@ from audit_core.uc03_pc_direct_review import router as uc03_pc_direct_review_rou
 from audit_core.uc03_pc_generic_review import router as uc03_pc_generic_review_router
 from audit_core.uc03_pc_verification import router as uc03_pc_verification_router
 from audit_core.uc03_project_context import router as uc03_project_context_router
+from audit_core.uc03_review_queue import router as uc03_review_queue_router
 from audit_core.uc03_review_value_normalization import (
     install_uc03_review_value_normalization,
 )
@@ -206,6 +207,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_delivery_documents_router)
     application.include_router(uc03_document_assessments_router)
     application.include_router(uc03_audit_router)
+    application.include_router(uc03_review_queue_router)
     application.include_router(readiness_router)
     application.include_router(project_activation_router)
     application.include_router(mahindra_upload_state_router)
