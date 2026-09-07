@@ -227,10 +227,12 @@ def _create_flag(setup, *, key: str = "flag-create-0001"):
     return response
 
 
-def _create_flag_category(setup, *, category: str, key: str, severity: str = "HIGH"):
+def _create_flag_category(
+    setup, *, category: str, key: str, severity: str = "HIGH", if_match: str = '"1"'
+):
     response = _client().post(
         f"{_base(setup)}/flags",
-        headers={"Idempotency-Key": key, "If-Match": '"1"'},
+        headers={"Idempotency-Key": key, "If-Match": if_match},
         json={
             "stage": "BOOKING",
             "category": category,
@@ -331,10 +333,10 @@ def _queue(setup) -> str:
 
 def test_review_queue_routes_by_role_and_supports_scope(audit_setup):
     violation = _create_flag_category(
-        audit_setup, category="COMMERCIAL_EXCEPTION", key="q-violation-01"
+        audit_setup, category="COMMERCIAL_EXCEPTION", key="q-violation-01", if_match='"1"'
     )
     doc_gap = _create_flag_category(
-        audit_setup, category="DOCUMENT_EXCEPTION", key="q-docgap-01"
+        audit_setup, category="DOCUMENT_EXCEPTION", key="q-docgap-01", if_match='"2"'
     )
 
     # PC sees the document gap (theirs), not the violation

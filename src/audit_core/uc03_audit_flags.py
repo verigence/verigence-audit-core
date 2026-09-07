@@ -1195,13 +1195,14 @@ def act_on_flag(
                 UPDATE auditcore.audit_findings
                 SET finding_status=:status,
                     resolution_reason=CASE
-                        WHEN :action IN ('RESOLVE','VOID','ACCEPT','REJECT') THEN :reason
+                        WHEN :action IN ('RESOLVE','VOID','ACCEPT','REJECT')
+                            THEN CAST(:reason AS text)
                         WHEN :action='REOPEN' THEN NULL
                         ELSE resolution_reason
                     END,
                     disposition=CASE
                         WHEN :action='REOPEN' THEN NULL
-                        WHEN :disposition IS NOT NULL THEN :disposition
+                        WHEN :set_disposition THEN CAST(:disposition AS varchar)
                         ELSE disposition
                     END,
                     updated_at_utc=now(), version_no=version_no+1
@@ -1214,6 +1215,7 @@ def act_on_flag(
                 "status": next_status,
                 "action": payload.action,
                 "reason": reason,
+                "set_disposition": disposition is not None,
                 "disposition": disposition,
             },
         )
