@@ -28,6 +28,7 @@ from audit_core.uc03_booking_commands import (
     _append_workflow_event,
     _stage_state,
 )
+from audit_core.uc03_finding_classification import resolve_classification
 from audit_core.uc03_pc_generic_review import (
     DirectExtractedField,
     _project_known_field,
@@ -810,12 +811,14 @@ def _create_reupload_finding(
                 tenant_id, journey_id, finding_type_code, severity,
                 finding_status, title, description, created_by_actor_id,
                 correlation_id, stage_code, origin_kind, origin_actor_id,
-                origin_role_snapshot, rule_key, blocking_completion
+                origin_role_snapshot, rule_key, blocking_completion,
+                finding_class, owner_role_code, sla_due_at_utc
             ) VALUES (
                 :tenant_id, :journey_id, 'DOCUMENT_EXCEPTION', 'MEDIUM',
                 'OPEN', 'Team Lead requested document re-upload', :description,
                 :actor_id, :correlation_id, 'BOOKING', 'HUMAN', :actor_id,
-                'TL', 'TL_DOCUMENT_REUPLOAD_REQUEST', false
+                'TL', 'TL_DOCUMENT_REUPLOAD_REQUEST', false,
+                :finding_class, :owner_role_code, :sla_due_at_utc
             ) RETURNING audit_finding_id
             """
         ),
@@ -825,6 +828,14 @@ def _create_reupload_finding(
             "description": reason.strip(),
             "actor_id": actor_id,
             "correlation_id": correlation_id,
+            **resolve_classification(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                rule_key="TL_DOCUMENT_REUPLOAD_REQUEST",
+                finding_type_code="DOCUMENT_EXCEPTION",
+                severity="MEDIUM",
+            ),
         },
     ).scalar_one()
     connection.execute(

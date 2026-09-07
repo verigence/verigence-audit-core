@@ -13,6 +13,7 @@ from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_principal
 from audit_core.errors import AuditCoreError, ConflictError, NotFoundError
 from audit_core.security import Principal
+from audit_core.uc03_finding_classification import resolve_classification
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["findings"])
 
@@ -322,17 +323,27 @@ def create_finding(
             journey_id=journey_id,
             evaluation_id=payload.auditEvaluationId,
         )
+    routing = resolve_classification(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        rule_key=None,
+        finding_type_code=payload.findingTypeCode,
+        severity=payload.severity,
+    )
     finding_id = connection.execute(
         text(
             """
             INSERT INTO auditcore.audit_findings (
                 tenant_id, journey_id, audit_evaluation_id, finding_type_code,
                 severity, title, description, expected_summary,
-                observed_summary, created_by_actor_id
+                observed_summary, created_by_actor_id,
+                finding_class, owner_role_code, sla_due_at_utc
             ) VALUES (
                 :tenant_id, :journey_id, :evaluation_id, :finding_type_code,
                 :severity, :title, :description, :expected_summary,
-                :observed_summary, :actor_id
+                :observed_summary, :actor_id,
+                :finding_class, :owner_role_code, :sla_due_at_utc
             ) RETURNING audit_finding_id
             """
         ),
@@ -347,6 +358,7 @@ def create_finding(
             "expected_summary": payload.expectedSummary,
             "observed_summary": payload.observedSummary,
             "actor_id": principal.subject,
+            **routing,
         },
     ).scalar_one()
     for link in payload.evidence:

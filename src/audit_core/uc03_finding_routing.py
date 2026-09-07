@@ -123,20 +123,25 @@ def _rule_stem(rule_key: str | None) -> str:
     return rule_key.split(":", 1)[0].strip().upper()
 
 
-def classify_finding(rule_key: str | None, finding_type_code: str | None) -> FindingClass:
-    """Best-effort finding class. rule_key wins; finding_type_code is the fallback."""
+def classify_by_rule_key(rule_key: str | None) -> FindingClass | None:
+    """Class implied by the rule that raised the finding, or None if the rule is unknown."""
     stem = _rule_stem(rule_key)
-    if stem:
-        if stem in _DOCUMENT_GAP_RULE_PREFIXES:
-            return "DOCUMENT_GAP"
-        if stem in _DATA_GAP_RULE_PREFIXES:
-            return "DATA_GAP"
-        if stem in _VIOLATION_RULE_PREFIXES:
-            return "VIOLATION"
-        # rule-engine findings: "RE_<CODE>", "RE_<...>_MISSING" is a document gap
-        if stem.startswith("RE_"):
-            return "DOCUMENT_GAP" if stem.endswith("_MISSING") else "VIOLATION"
+    if not stem:
+        return None
+    if stem in _DOCUMENT_GAP_RULE_PREFIXES:
+        return "DOCUMENT_GAP"
+    if stem in _DATA_GAP_RULE_PREFIXES:
+        return "DATA_GAP"
+    if stem in _VIOLATION_RULE_PREFIXES:
+        return "VIOLATION"
+    # rule-engine findings: "RE_<CODE>", "RE_<...>_MISSING" is a document gap
+    if stem.startswith("RE_"):
+        return "DOCUMENT_GAP" if stem.endswith("_MISSING") else "VIOLATION"
+    return None
 
+
+def classify_by_type(finding_type_code: str | None) -> FindingClass | None:
+    """Class implied by the finding_type_code alone, or None if the type is unknown."""
     kind = (finding_type_code or "").strip().upper()
     if kind in _DOCUMENT_GAP_TYPES:
         return "DOCUMENT_GAP"
@@ -144,7 +149,21 @@ def classify_finding(rule_key: str | None, finding_type_code: str | None) -> Fin
         return "DATA_GAP"
     if kind in _VIOLATION_TYPES:
         return "VIOLATION"
-    return DEFAULT_CLASS
+    return None
+
+
+def classify_finding(rule_key: str | None, finding_type_code: str | None) -> FindingClass:
+    """Best-effort finding class. rule_key wins; finding_type_code is the fallback.
+
+    Falls back to DEFAULT_CLASS (VIOLATION → human review) when neither is known.
+    ``uc03_finding_classification.resolve_classification`` layers the DB-backed
+    finding_type registry on top of this and records genuinely unknown types.
+    """
+    return (
+        classify_by_rule_key(rule_key)
+        or classify_by_type(finding_type_code)
+        or DEFAULT_CLASS
+    )
 
 
 # ── SLA policy ──────────────────────────────────────────────────────────────────

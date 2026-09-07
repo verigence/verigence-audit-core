@@ -6,6 +6,8 @@ import pytest
 
 from audit_core.uc03_finding_routing import (
     class_profile,
+    classify_by_rule_key,
+    classify_by_type,
     classify_finding,
     escalation_level,
     permitted_actions,
@@ -39,6 +41,21 @@ BASE = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
 )
 def test_classify_finding(rule_key, finding_type, expected) -> None:
     assert classify_finding(rule_key, finding_type) == expected
+
+
+def test_classify_by_rule_key_returns_none_for_unknown_rules() -> None:
+    assert classify_by_rule_key("BK_PAN_PRESENT") == "DOCUMENT_GAP"
+    assert classify_by_rule_key("RE_PRICE_BOOKING_VS_INVOICE") == "VIOLATION"
+    assert classify_by_rule_key("RE_NDC_MISSING") == "DOCUMENT_GAP"
+    assert classify_by_rule_key("SOME_UNKNOWN_RULE") is None
+    assert classify_by_rule_key(None) is None
+
+
+def test_classify_by_type_returns_none_for_unknown_types() -> None:
+    assert classify_by_type("DOCUMENT_EXCEPTION") == "DOCUMENT_GAP"
+    assert classify_by_type("COMMERCIAL_EXCEPTION") == "VIOLATION"
+    assert classify_by_type("TOTALLY_MADE_UP") is None
+    assert classify_by_type(None) is None
 
 
 def test_class_profile_owners_and_modes() -> None:

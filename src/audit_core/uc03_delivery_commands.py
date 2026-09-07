@@ -28,12 +28,7 @@ from audit_core.uc03_booking_commands import (
     _require_expected_version,
     _set_etag,
 )
-from audit_core.uc03_finding_routing import (
-    class_profile,
-    classify_finding,
-    resolve_sla_policy,
-    sla_due_at,
-)
+from audit_core.uc03_finding_classification import resolve_classification
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/journeys/{journey_id}/delivery",
@@ -221,53 +216,6 @@ def _set_stage_flag_status(
     )
 
 
-def _journey_policy_settings(
-    connection: Connection, *, tenant_id: str, journey_id: UUID
-) -> dict[str, Any]:
-    row = connection.execute(
-        text(
-            """
-            SELECT ppv.policy_settings
-            FROM auditcore.journeys j
-            LEFT JOIN auditcore.project_policy_versions ppv
-              ON ppv.tenant_id = j.tenant_id
-             AND ppv.policy_version_id = j.policy_version_id
-            WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).scalar_one_or_none()
-    return row if isinstance(row, dict) else {}
-
-
-def _finding_routing_values(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-    rule_key: str | None,
-    finding_type: str | None,
-    severity: str,
-) -> dict[str, Any]:
-    """finding_class / owner_role_code / sla_due_at_utc for a new finding."""
-    finding_class = classify_finding(rule_key, finding_type)
-    owner_role = class_profile(finding_class).owner_role
-    policy = resolve_sla_policy(
-        _journey_policy_settings(connection, tenant_id=tenant_id, journey_id=journey_id)
-    )
-    due_at = sla_due_at(
-        datetime.now(UTC),
-        finding_class=finding_class,
-        severity=severity,
-        policy=policy,
-    )
-    return {
-        "finding_class": finding_class,
-        "owner_role_code": owner_role,
-        "sla_due_at_utc": due_at,
-    }
-
-
 def _machine_flag(
     connection: Connection,
     *,
@@ -311,12 +259,12 @@ def _machine_flag(
         )
         return existing
 
-    routing = _finding_routing_values(
+    routing = resolve_classification(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
         rule_key=rule_key,
-        finding_type=finding_type,
+        finding_type_code=finding_type,
         severity=severity,
     )
     finding_id = connection.execute(
