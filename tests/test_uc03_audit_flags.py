@@ -227,6 +227,138 @@ def _create_flag(setup, *, key: str = "flag-create-0001"):
     return response
 
 
+def _create_flag_category(
+    setup, *, category: str, key: str, severity: str = "HIGH", if_match: str = '"1"'
+):
+    response = _client().post(
+        f"{_base(setup)}/flags",
+        headers={"Idempotency-Key": key, "If-Match": if_match},
+        json={
+            "stage": "BOOKING",
+            "category": category,
+            "severity": severity,
+            "summary": f"{category} raised",
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["flag"]
+
+
+# ── finding routing / SLA / adjudication ────────────────────────────────────────
+
+def test_violation_flag_is_routed_to_tl_with_sla(audit_setup):
+    flag = _create_flag_category(
+        audit_setup, category="COMMERCIAL_EXCEPTION", key="route-violation-01"
+    )
+    assert flag["findingClass"] == "VIOLATION"
+    assert flag["resolutionMode"] == "ADJUDICATED"
+    assert flag["ownerRoleCode"] == "TL"
+    assert flag["slaDueAtUtc"] is not None
+    assert flag["escalationLevel"] == 0
+    assert flag["overdue"] is False
+    # PC raised it but may only comment
+    assert flag["permittedActions"] == ["REMARK"]
+
+
+def test_document_gap_flag_is_routed_to_pc(audit_setup):
+    flag = _create_flag_category(
+        audit_setup, category="DOCUMENT_EXCEPTION", key="route-docgap-01"
+    )
+    assert flag["findingClass"] == "DOCUMENT_GAP"
+    assert flag["resolutionMode"] == "SELF_SERVICE"
+    assert flag["ownerRoleCode"] == "PC"
+    assert "RESOLVE" in flag["permittedActions"]
+
+
+def test_tl_accepts_violation_and_records_confirmed_breach(audit_setup):
+    flag = _create_flag_category(
+        audit_setup, category="COMMERCIAL_EXCEPTION", key="adj-accept-01"
+    )
+    _set_role(audit_setup, "TL")
+    accepted = _client().post(
+        f"{_base(audit_setup)}/flags/{flag['flagId']}/actions",
+        headers={"Idempotency-Key": "adj-accept-act-01", "If-Match": '"1"'},
+        json={"action": "ACCEPT", "resolutionReason": "Discount exceeds policy — breach"},
+    )
+    assert accepted.status_code == 200, accepted.text
+    body = accepted.json()["flag"]
+    assert body["status"] == "RESOLVED"
+    assert body["disposition"] == "CONFIRMED_BREACH"
+
+
+def test_tl_rejects_violation_and_records_not_a_breach(audit_setup):
+    flag = _create_flag_category(
+        audit_setup, category="COMMERCIAL_EXCEPTION", key="adj-reject-01"
+    )
+    _set_role(audit_setup, "TL")
+    rejected = _client().post(
+        f"{_base(audit_setup)}/flags/{flag['flagId']}/actions",
+        headers={"Idempotency-Key": "adj-reject-act-01", "If-Match": '"1"'},
+        json={"action": "REJECT", "resolutionReason": "Within approved deviation"},
+    )
+    assert rejected.status_code == 200, rejected.text
+    assert rejected.json()["flag"]["disposition"] == "NOT_A_BREACH"
+
+
+def test_accept_is_rejected_for_a_document_gap(audit_setup):
+    flag = _create_flag_category(
+        audit_setup, category="DOCUMENT_EXCEPTION", key="adj-wrongclass-01"
+    )
+    _set_role(audit_setup, "TL")
+    denied = _client().post(
+        f"{_base(audit_setup)}/flags/{flag['flagId']}/actions",
+        headers={"Idempotency-Key": "adj-wrongclass-act-01", "If-Match": '"1"'},
+        json={"action": "ACCEPT", "resolutionReason": "n/a"},
+    )
+    assert denied.status_code == 403
+
+
+def test_pc_cannot_resolve_a_violation(audit_setup):
+    flag = _create_flag_category(
+        audit_setup, category="COMMERCIAL_EXCEPTION", key="adj-pcblock-01"
+    )
+    denied = _client().post(
+        f"{_base(audit_setup)}/flags/{flag['flagId']}/actions",
+        headers={"Idempotency-Key": "adj-pcblock-act-01", "If-Match": '"1"'},
+        json={"action": "RESOLVE", "resolutionReason": "n/a"},
+    )
+    assert denied.status_code == 403
+
+
+# ── cross-journey review queue ──────────────────────────────────────────────────
+
+def _queue(setup) -> str:
+    return f"/v1/tenants/{setup['tenant_id']}/uc03/review-queue"
+
+
+def test_review_queue_routes_by_role_and_supports_scope(audit_setup):
+    violation = _create_flag_category(
+        audit_setup, category="COMMERCIAL_EXCEPTION", key="q-violation-01", if_match='"1"'
+    )
+    doc_gap = _create_flag_category(
+        audit_setup, category="DOCUMENT_EXCEPTION", key="q-docgap-01", if_match='"2"'
+    )
+
+    # PC sees the document gap (theirs), not the violation
+    pc_all = _client().get(f"{_queue(audit_setup)}").json()
+    pc_ids = {item["flagId"] for item in pc_all["items"]}
+    assert doc_gap["flagId"] in pc_ids
+    assert violation["flagId"] not in pc_ids
+    assert "PC" in pc_all["roles"]
+
+    # TL sees the violation (theirs) and can Accept / Reject it
+    _set_role(audit_setup, "TL")
+    tl_mine = _client().get(f"{_queue(audit_setup)}?scope=MINE").json()["items"]
+    tl_item = next(item for item in tl_mine if item["flagId"] == violation["flagId"])
+    assert tl_item["isMine"] is True
+    assert "ACCEPT" in tl_item["permittedActions"]
+    assert doc_gap["flagId"] not in {item["flagId"] for item in tl_mine}
+
+    summary = _client().get(f"{_queue(audit_setup)}/summary").json()
+    assert summary["mine"] >= 1
+    assert summary["byClass"].get("VIOLATION", 0) >= 1
+
+
 def test_pc_flag_create_is_idempotent_and_preserves_provenance(audit_setup):
     response = _create_flag(audit_setup)
     body = response.json()
@@ -577,12 +709,17 @@ def test_summary_exposes_role_capabilities_without_client_side_authority(audit_s
     pc = _client().get(f"{_base(audit_setup)}/audit-summary")
     assert pc.status_code == 200
     assert "RAISE" in pc.json()["permittedActions"]
-    assert "RESOLVE" not in pc.json()["permittedActions"]
+    # A PC may close their own data / document gap, but never adjudicate:
+    assert "RESOLVE" in pc.json()["permittedActions"]
+    assert "ACCEPT" not in pc.json()["permittedActions"]
+    assert "REJECT" not in pc.json()["permittedActions"]
+    assert "ACKNOWLEDGE" not in pc.json()["permittedActions"]
 
     _set_role(audit_setup, "TL")
     tl = _client().get(f"{_base(audit_setup)}/audit-summary")
     assert tl.status_code == 200
     assert "RESOLVE" in tl.json()["permittedActions"]
+    assert "ACCEPT" in tl.json()["permittedActions"]
     assert "VOID" not in tl.json()["permittedActions"]
 
     _set_role(audit_setup, "EXECUTIVE")

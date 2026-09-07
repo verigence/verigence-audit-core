@@ -27,6 +27,14 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_booking_commands import _journey_context
+from audit_core.uc03_finding_routing import (
+    class_profile,
+    classify_finding,
+    escalation_level,
+    permitted_actions,
+    resolve_sla_policy,
+    sla_due_at,
+)
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/journeys/{journey_id}/uc03",
@@ -34,7 +42,9 @@ router = APIRouter(
 )
 
 StageCode = Literal["BOOKING", "DELIVERY"]
-FlagAction = Literal["ACKNOWLEDGE", "REVIEW", "RESOLVE", "REOPEN", "VOID"]
+FlagAction = Literal[
+    "ACKNOWLEDGE", "REVIEW", "RESOLVE", "REOPEN", "VOID", "ACCEPT", "REJECT"
+]
 
 _HUMAN_FLAG_CATEGORIES = {
     "PHYSICAL_OBSERVATION",
@@ -55,6 +65,8 @@ _PERMISSION_BY_OPERATION = {
     "REMARK": "audit.finding.update",
     "ACKNOWLEDGE": "audit.review.decide",
     "REVIEW": "audit.review.decide",
+    "ACCEPT": "audit.review.decide",
+    "REJECT": "audit.review.decide",
     "RESOLVE": "audit.finding.resolve",
     "REOPEN": "audit.finding.resolve",
     "VOID": "audit.finding.resolve",
@@ -67,7 +79,12 @@ _DEFAULT_ROLE_POLICY: dict[str, set[str]] = {
     "REMARK": {"PC", "TL", "PM", "EXECUTIVE"},
     "ACKNOWLEDGE": {"TL", "PM", "EXECUTIVE"},
     "REVIEW": {"TL", "PM", "EXECUTIVE"},
-    "RESOLVE": {"TL", "PM", "EXECUTIVE"},
+    # Accept / Reject a VIOLATION: TL first, PM on escalation.
+    "ACCEPT": {"TL", "PM", "EXECUTIVE"},
+    "REJECT": {"TL", "PM", "EXECUTIVE"},
+    # A self-serve DATA_GAP / DOCUMENT_GAP is resolved by its PC owner; TL/PM may
+    # also close it. Adjudicated findings never take the plain RESOLVE path.
+    "RESOLVE": {"PC", "TL", "PM", "EXECUTIVE"},
     "REOPEN": {"TL", "PM", "EXECUTIVE"},
     # TL/PM void is configurable in the catalog; the conservative Phase-1 default
     # is Executive only unless the published Project policy overrides it.
@@ -97,7 +114,7 @@ class FlagLifecycleCommand(BaseModel):
 
     @model_validator(mode="after")
     def require_reason_for_terminal_or_reopen(self):
-        if self.action in {"RESOLVE", "REOPEN", "VOID"}:
+        if self.action in {"RESOLVE", "REOPEN", "VOID", "ACCEPT", "REJECT"}:
             reason = (self.resolutionReason or self.remarks or "").strip()
             if not reason:
                 raise ValueError("A reason is required for resolve, reopen, or void actions")
@@ -137,6 +154,15 @@ class FlagView(BaseModel):
     version: int
     createdAtUtc: datetime
     updatedAtUtc: datetime
+    # ── routing / SLA ───────────────────────────────────────────────
+    findingClass: str | None
+    resolutionMode: str | None
+    ownerRoleCode: str | None
+    disposition: str | None
+    slaDueAtUtc: datetime | None
+    escalationLevel: int
+    overdue: bool
+    permittedActions: list[str] = Field(default_factory=list)
 
 
 class FlagMutationResponse(BaseModel):
@@ -362,7 +388,8 @@ def _finding(
                    finding_status, title, description, expected_summary,
                    observed_summary, resolution_reason, stage_code, origin_kind,
                    origin_actor_id, origin_role_snapshot, rule_key, rule_version_id,
-                   blocking_completion, version_no, created_at_utc, updated_at_utc
+                   blocking_completion, version_no, created_at_utc, updated_at_utc,
+                   finding_class, owner_role_code, sla_due_at_utc, disposition
             FROM auditcore.audit_findings
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
               AND audit_finding_id=:flag_id
@@ -540,7 +567,30 @@ def _evidence_count(connection: Connection, *, tenant_id: str, flag_id: UUID) ->
     )
 
 
-def _flag_view(connection: Connection, *, tenant_id: str, row) -> FlagView:
+def _flag_view(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    row,
+    role: str,
+    policy,
+    now: datetime | None = None,
+) -> FlagView:
+    moment = now or datetime.now(UTC)
+    finding_class = row["finding_class"] or classify_finding(
+        row["rule_key"], row["finding_type_code"]
+    )
+    profile = class_profile(finding_class)
+    owner_role = row["owner_role_code"] or profile.owner_role
+    due_at = row["sla_due_at_utc"]
+    if due_at is None:
+        due_at = sla_due_at(
+            row["created_at_utc"],
+            finding_class=finding_class,
+            severity=row["severity"],
+            policy=policy,
+        )
+    level = escalation_level(due_at, moment, policy)
     return FlagView(
         flagId=row["audit_finding_id"],
         stage=row["stage_code"],
@@ -565,7 +615,29 @@ def _flag_view(connection: Connection, *, tenant_id: str, row) -> FlagView:
         version=int(row["version_no"]),
         createdAtUtc=row["created_at_utc"],
         updatedAtUtc=row["updated_at_utc"],
+        findingClass=finding_class,
+        resolutionMode=profile.resolution_mode,
+        ownerRoleCode=owner_role,
+        disposition=row["disposition"],
+        slaDueAtUtc=due_at,
+        escalationLevel=level,
+        overdue=moment > due_at if due_at is not None else False,
+        permittedActions=permitted_actions(
+            finding_class=finding_class,
+            role=role,
+            finding_status=row["finding_status"],
+        ),
     )
+
+
+_FLAG_LIST_COLUMNS = """
+    audit_finding_id, journey_id, finding_type_code, severity,
+    finding_status, title, description, expected_summary,
+    observed_summary, resolution_reason, stage_code, origin_kind,
+    origin_actor_id, origin_role_snapshot, rule_key, rule_version_id,
+    blocking_completion, version_no, created_at_utc, updated_at_utc,
+    finding_class, owner_role_code, sla_due_at_utc, disposition
+"""
 
 
 def _list_flags(
@@ -574,6 +646,8 @@ def _list_flags(
     tenant_id: str,
     journey_id: UUID,
     stage_code: str | None,
+    role: str,
+    policy,
 ) -> list[FlagView]:
     stage_filter = " AND stage_code=:stage_code" if stage_code is not None else ""
     parameters: dict[str, Any] = {
@@ -584,16 +658,9 @@ def _list_flags(
         parameters["stage_code"] = stage_code
     rows = connection.execute(
         text(
-            """
-            SELECT audit_finding_id, journey_id, finding_type_code, severity,
-                   finding_status, title, description, expected_summary,
-                   observed_summary, resolution_reason, stage_code, origin_kind,
-                   origin_actor_id, origin_role_snapshot, rule_key, rule_version_id,
-                   blocking_completion, version_no, created_at_utc, updated_at_utc
-            FROM auditcore.audit_findings
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code IN ('BOOKING','DELIVERY')
-            """
+            f"SELECT {_FLAG_LIST_COLUMNS} FROM auditcore.audit_findings "
+            "WHERE tenant_id=:tenant_id AND journey_id=:journey_id "
+            "AND stage_code IN ('BOOKING','DELIVERY')"
             + stage_filter
             + """
             ORDER BY
@@ -606,7 +673,11 @@ def _list_flags(
         ),
         parameters,
     ).mappings().all()
-    return [_flag_view(connection, tenant_id=tenant_id, row=row) for row in rows]
+    now = datetime.now(UTC)
+    return [
+        _flag_view(connection, tenant_id=tenant_id, row=row, role=role, policy=policy, now=now)
+        for row in rows
+    ]
 
 
 def _stage_summary(
@@ -665,12 +736,22 @@ def _role_permitted_actions(context: dict[str, Any]) -> list[str]:
         "REMARK",
         "ACKNOWLEDGE",
         "REVIEW",
+        "ACCEPT",
+        "REJECT",
         "RESOLVE",
         "REOPEN",
         "VOID",
         "COMPLETE_AUDIT",
     ]
     return [operation for operation in operations if role in _policy_roles(context, operation)]
+
+
+def _view_context(context: dict[str, Any]) -> tuple[str, Any]:
+    """(operating role, resolved SLA policy) for building FlagViews."""
+    return (
+        _normalize_role(context["operating_role"]),
+        resolve_sla_policy(context.get("policy_settings")),
+    )
 
 
 def _highest_open_severity(flags: list[FlagView]) -> str | None:
@@ -680,11 +761,21 @@ def _highest_open_severity(flags: list[FlagView]) -> str | None:
     return max(active, key=lambda value: _SEVERITY_ORDER.get(value, 0))
 
 
+# action → disposition written on the finding when it terminates.
+_ACTION_DISPOSITION: dict[str, str] = {
+    "RESOLVE": "FIXED",
+    "ACCEPT": "CONFIRMED_BREACH",
+    "REJECT": "NOT_A_BREACH",
+}
+
+
 def _transition(action: FlagAction, current_status: str) -> str:
     allowed: dict[str, tuple[set[str], str]] = {
         "ACKNOWLEDGE": ({"OPEN"}, "ACKNOWLEDGED"),
         "REVIEW": ({"OPEN", "ACKNOWLEDGED"}, "ACKNOWLEDGED"),
         "RESOLVE": ({"OPEN", "ACKNOWLEDGED"}, "RESOLVED"),
+        "ACCEPT": ({"OPEN", "ACKNOWLEDGED"}, "RESOLVED"),
+        "REJECT": ({"OPEN", "ACKNOWLEDGED"}, "RESOLVED"),
         "REOPEN": ({"RESOLVED"}, "OPEN"),
         "VOID": ({"OPEN", "ACKNOWLEDGED", "RESOLVED"}, "VOIDED"),
     }
@@ -779,11 +870,14 @@ def get_audit_summary(
         human_principal=human_principal,
         authorization_client=authorization_client,
     )
+    role, policy = _view_context(context)
     flags = _list_flags(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
         stage_code=None,
+        role=role,
+        policy=policy,
     )
     return AuditSummaryView(
         journeyId=journey_id,
@@ -820,7 +914,7 @@ def list_flags(
     ] = None,
     connection: Annotated[Connection, Depends(get_connection)] = None,
 ) -> list[FlagView]:
-    _scope(
+    context = _scope(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
@@ -828,11 +922,14 @@ def list_flags(
         human_principal=human_principal,
         authorization_client=authorization_client,
     )
+    role, policy = _view_context(context)
     return _list_flags(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
         stage_code=stage,
+        role=role,
+        policy=policy,
     )
 
 
@@ -893,6 +990,15 @@ def create_flag(
             journey_id=journey_id,
             evidence_ids=payload.evidenceIds,
         )
+        _, sla_policy = _view_context(context)
+        finding_class = classify_finding(None, category)
+        owner_role = class_profile(finding_class).owner_role
+        due_at = sla_due_at(
+            datetime.now(UTC),
+            finding_class=finding_class,
+            severity=severity,
+            policy=sla_policy,
+        )
         flag_id = connection.execute(
             text(
                 """
@@ -900,12 +1006,14 @@ def create_flag(
                     tenant_id, journey_id, finding_type_code, severity,
                     finding_status, title, description, created_by_actor_id,
                     correlation_id, stage_code, origin_kind, origin_actor_id,
-                    origin_role_snapshot, blocking_completion
+                    origin_role_snapshot, blocking_completion,
+                    finding_class, owner_role_code, sla_due_at_utc
                 ) VALUES (
                     :tenant_id, :journey_id, :category, :severity,
                     'OPEN', :title, :description, :actor_id,
                     :correlation_id, :stage_code, 'HUMAN', :actor_id,
-                    :actor_role, false
+                    :actor_role, false,
+                    :finding_class, :owner_role, :sla_due_at
                 ) RETURNING audit_finding_id
                 """
             ),
@@ -920,6 +1028,9 @@ def create_flag(
                 "correlation_id": correlation_id,
                 "stage_code": payload.stage,
                 "actor_role": context["operating_role"],
+                "finding_class": finding_class,
+                "owner_role": owner_role,
+                "sla_due_at": due_at,
             },
         ).scalar_one()
         _link_evidence(
@@ -967,8 +1078,11 @@ def create_flag(
             journey_id=journey_id,
             flag_id=flag_id,
         )
+        role, policy = _view_context(context)
         return {
-            "flag": _flag_view(connection, tenant_id=tenant_id, row=row).model_dump(mode="json"),
+            "flag": _flag_view(
+                connection, tenant_id=tenant_id, row=row, role=role, policy=policy
+            ).model_dump(mode="json"),
             "eventId": str(event_id),
             "aggregateVersion": next_version,
         }
@@ -1032,6 +1146,33 @@ def act_on_flag(
                 title="Audit flag version conflict",
                 detail="The flag changed since it was loaded. Refresh and retry the action.",
             )
+        finding_class = row["finding_class"] or classify_finding(
+            row["rule_key"], row["finding_type_code"]
+        )
+        resolution_mode = class_profile(finding_class).resolution_mode
+        # Accept / Reject are verdicts on a rule breach — only for adjudicated
+        # findings (VIOLATION). A data / document gap is fixed, not adjudicated.
+        if payload.action in {"ACCEPT", "REJECT"} and resolution_mode != "ADJUDICATED":
+            raise AuthorizationError(
+                error_code="VAC-AUTH-005",
+                status_code=403,
+                title=(
+                    f"{payload.action.title()} is not available for a "
+                    f"{finding_class.replace('_', ' ').lower()}"
+                ),
+            )
+        # A PC may close their own data / document gap, but never a VIOLATION —
+        # that needs a TL / PM verdict.
+        if (
+            payload.action == "RESOLVE"
+            and _normalize_role(context["operating_role"]) == "PC"
+            and resolution_mode == "ADJUDICATED"
+        ):
+            raise AuthorizationError(
+                error_code="VAC-AUTH-005",
+                status_code=403,
+                title="A violation must be accepted or rejected by a Team Lead or PM",
+            )
         next_status = _transition(payload.action, row["finding_status"])
         _validate_evidence(
             connection,
@@ -1047,15 +1188,22 @@ def act_on_flag(
             purpose=f"FLAG_{payload.action}",
         )
         reason = (payload.resolutionReason or payload.remarks or "").strip() or None
+        disposition = _ACTION_DISPOSITION.get(payload.action)
         connection.execute(
             text(
                 """
                 UPDATE auditcore.audit_findings
                 SET finding_status=:status,
                     resolution_reason=CASE
-                        WHEN :action IN ('RESOLVE','VOID') THEN :reason
+                        WHEN :action IN ('RESOLVE','VOID','ACCEPT','REJECT')
+                            THEN CAST(:reason AS text)
                         WHEN :action='REOPEN' THEN NULL
                         ELSE resolution_reason
+                    END,
+                    disposition=CASE
+                        WHEN :action='REOPEN' THEN NULL
+                        WHEN :set_disposition THEN CAST(:disposition AS varchar)
+                        ELSE disposition
                     END,
                     updated_at_utc=now(), version_no=version_no+1
                 WHERE tenant_id=:tenant_id AND audit_finding_id=:flag_id
@@ -1067,6 +1215,8 @@ def act_on_flag(
                 "status": next_status,
                 "action": payload.action,
                 "reason": reason,
+                "set_disposition": disposition is not None,
+                "disposition": disposition,
             },
         )
         event_id = _append_finding_event(
@@ -1114,8 +1264,11 @@ def act_on_flag(
             journey_id=journey_id,
             flag_id=flag_id,
         )
+        role, policy = _view_context(context)
         return {
-            "flag": _flag_view(connection, tenant_id=tenant_id, row=updated).model_dump(mode="json"),
+            "flag": _flag_view(
+                connection, tenant_id=tenant_id, row=updated, role=role, policy=policy
+            ).model_dump(mode="json"),
             "eventId": str(event_id),
         }
 
@@ -1236,8 +1389,11 @@ def add_flag_remark(
             journey_id=journey_id,
             flag_id=flag_id,
         )
+        role, policy = _view_context(context)
         return {
-            "flag": _flag_view(connection, tenant_id=tenant_id, row=updated).model_dump(mode="json"),
+            "flag": _flag_view(
+                connection, tenant_id=tenant_id, row=updated, role=role, policy=policy
+            ).model_dump(mode="json"),
             "eventId": str(event_id),
         }
 
