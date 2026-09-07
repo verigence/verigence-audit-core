@@ -26,6 +26,7 @@ from audit_core.uc03_booking_review_decisions import (
     confirm_booking_review_v2_with_decisions,
 )
 from audit_core.uc03_delivery_commands import _machine_flag
+from audit_core.uc03_rule_engine_findings import run_rule_engine_phase
 from audit_core.workflow import claim_worker_task, get_workflow_task, start_worker_task
 from audit_core.workflow_reliability import create_workflow_task_once
 
@@ -448,6 +449,11 @@ def run_booking_review_rule_task(
             journey_id=str(journey_id),
             task_id=str(workflow_task_id),
         )
+
+    # Cross-document anomaly rules run in the rule-engine service. Best-effort and
+    # independent of the checkpoint rules above — dormant unless RULE_ENGINE_BASE_URL
+    # is configured; never raises.
+    run_rule_engine_phase(engine, tenant_id, journey_id, "BOOKING", "BOOKING", correlation_id)
 
 
 def confirm_booking_review_v2_and_trigger_rules(

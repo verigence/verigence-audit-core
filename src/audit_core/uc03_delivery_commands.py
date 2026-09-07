@@ -6,12 +6,12 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, Engine, text
 
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import get_connection, get_human_principal
+from audit_core.dependencies import get_connection, get_engine, get_human_principal
 from audit_core.errors import AuditCoreError, ConflictError, NotFoundError
 from audit_core.idempotency import execute_idempotent_json_command
 from audit_core.observability import get_correlation_id
@@ -1131,6 +1131,7 @@ def complete_delivery(
     journey_id: UUID,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
     idempotency_key: Annotated[
         str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
     ],
@@ -1140,6 +1141,7 @@ def complete_delivery(
         SecurityAuthorizationClient, Depends(get_security_authorization_client)
     ],
     connection: Annotated[Connection, Depends(get_connection)],
+    engine: Annotated[Engine, Depends(get_engine)],
 ) -> DeliveryCommandResponse:
     _authorize_security(
         authorization_client,
@@ -1274,6 +1276,22 @@ def complete_delivery(
         execute=execute,
     )
     _set_etag(response, body)
+
+    # Cross-document anomaly rules for the DELIVERY phase run in the rule-engine
+    # service after the response is sent. Best-effort; dormant unless
+    # RULE_ENGINE_BASE_URL is configured; never affects delivery completion.
+    # Local import: uc03_rule_engine_findings imports _machine_flag from this module.
+    from audit_core.uc03_rule_engine_findings import run_rule_engine_phase
+
+    background_tasks.add_task(
+        run_rule_engine_phase,
+        engine,
+        tenant_id,
+        journey_id,
+        "DELIVERY",
+        "DELIVERY",
+        correlation_id,
+    )
     return DeliveryCommandResponse.model_validate(body)
 
 
