@@ -60,6 +60,7 @@ class QueueItem(BaseModel):
     category: str | None
     severity: str
     status: str
+    version: int
     title: str
     description: str | None
     ownerRoleCode: str
@@ -142,9 +143,9 @@ def _actor_roles(connection: Connection, *, tenant_id: str, actor_id: str) -> li
 _QUEUE_SQL = """
     SELECT
         f.audit_finding_id, f.journey_id, f.stage_code, f.finding_type_code,
-        f.severity, f.finding_status, f.title, f.description, f.rule_key,
-        f.origin_kind, f.created_at_utc, f.finding_class, f.owner_role_code,
-        f.sla_due_at_utc, f.disposition,
+        f.severity, f.finding_status, f.version_no, f.title, f.description,
+        f.rule_key, f.origin_kind, f.created_at_utc, f.finding_class,
+        f.owner_role_code, f.sla_due_at_utc, f.disposition,
         j.journey_reference,
         c.display_name AS customer_name,
         d.dealer_name,
@@ -232,6 +233,7 @@ def _load_queue(
             category=row["finding_type_code"],
             severity=row["severity"],
             status=row["finding_status"],
+            version=int(row["version_no"]),
             title=row["title"],
             description=row["description"],
             ownerRoleCode=owner_role,
