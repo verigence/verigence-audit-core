@@ -622,7 +622,7 @@ def materialize_reviewed_booking_form_values(
                 )
             discount_applications_written += discounts
             journey_addons_written += addons
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 "uc03_reconciliation_projection_failed journey_id=%s",
                 str(journey_id),
