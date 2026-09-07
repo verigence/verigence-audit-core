@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 from uuid import UUID
@@ -98,6 +99,37 @@ _COMMERCIAL_LINE_FIELDS = {
     "booking_amount_paid",
     "balance_amount",
 }
+
+# Reviewed Booking Form money fields -> canonical audit taxonomy for the
+# reconciliation projections. The raw field stays in commercial_lines (the
+# reviewed-value store); these tables are the per-discount / per-addon view the
+# audit rules reconcile against masters. Standard/master amounts are resolved
+# later (rule engine or human PUT /commercials), never guessed here.
+_DISCOUNT_KEY_BY_FIELD: dict[str, str] = {
+    "discount_amount": "TOTAL",
+    "sales_discount_amount": "SALES",
+    "buffer_discount_amount": "BUFFER",
+    "exchange_discount_amount": "EXCHANGE",
+    "corporate_discount_amount": "CORPORATE",
+    "loyalty_discount_amount": "LOYALTY",
+    "inhouse_insurance_discount_amount": "INHOUSE_INSURANCE",
+    "mr_discount_amount": "MR",
+    "oem_referral_discount_amount": "OEM_REFERRAL",
+    "other_discount_amount": "OTHER",
+    "free_accessory_discount_amount": "FREE_ACCESSORY",
+}
+_ADDON_TYPE_BY_FIELD: dict[str, str] = {
+    "extended_warranty_amount": "EXTENDED_WARRANTY",
+    "additional_warranty_amount": "ADDITIONAL_WARRANTY",
+    "accessories_cost": "ACCESSORIES_TOTAL",
+    "essential_kit_amount": "ESSENTIAL_KIT",
+    "genuine_accessories_amount": "GENUINE_ACCESSORIES",
+    "non_genuine_accessories_amount": "NON_GENUINE_ACCESSORIES",
+    "service_package_amount": "SERVICE_PACKAGE",
+    "rsa_amount": "RSA",
+    "fastag_amount": "FASTAG",
+}
+_MATERIALIZATION_ORIGIN = "BOOKING_FORM_MATERIALIZATION"
 
 _PAN_FIELDS = {
     "pan_number",
@@ -342,6 +374,192 @@ def _materialize_commercial_lines(
     return written
 
 
+def _upsert_evidence_discount_application(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    discount_key: str,
+    amount: Any,
+    evidence_id: UUID | None,
+) -> None:
+    existing_id = connection.execute(
+        text(
+            """
+            SELECT discount_application_id
+            FROM auditcore.discount_applications
+            WHERE tenant_id = :tenant_id
+              AND journey_id = :journey_id
+              AND discount_key = :discount_key
+              AND actual_source_kind = 'EVIDENCE'
+            ORDER BY created_at_utc DESC
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "discount_key": discount_key},
+    ).scalar_one_or_none()
+    details = json.dumps({"origin": _MATERIALIZATION_ORIGIN})
+    if existing_id is None:
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.discount_applications (
+                    tenant_id, journey_id, discount_key,
+                    actual_discount_amount, actual_source_kind,
+                    source_evidence_id, details
+                ) VALUES (
+                    :tenant_id, :journey_id, :discount_key,
+                    :amount, 'EVIDENCE', :evidence_id, CAST(:details AS jsonb)
+                )
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "discount_key": discount_key,
+                "amount": amount,
+                "evidence_id": evidence_id,
+                "details": details,
+            },
+        )
+        return
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.discount_applications
+            SET actual_discount_amount = :amount,
+                actual_source_kind = 'EVIDENCE',
+                source_evidence_id = :evidence_id,
+                details = CAST(:details AS jsonb),
+                updated_at_utc = now()
+            WHERE tenant_id = :tenant_id
+              AND discount_application_id = :application_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "application_id": existing_id,
+            "amount": amount,
+            "evidence_id": evidence_id,
+            "details": details,
+        },
+    )
+
+
+def _upsert_evidence_journey_addon(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    addon_type_code: str,
+    amount: Any,
+    evidence_id: UUID | None,
+) -> None:
+    existing_id = connection.execute(
+        text(
+            """
+            SELECT journey_addon_id
+            FROM auditcore.journey_addons
+            WHERE tenant_id = :tenant_id
+              AND journey_id = :journey_id
+              AND addon_type_code = :addon_type_code
+              AND source_kind = 'EVIDENCE'
+            ORDER BY created_at_utc DESC
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "addon_type_code": addon_type_code},
+    ).scalar_one_or_none()
+    details = json.dumps({"origin": _MATERIALIZATION_ORIGIN})
+    if existing_id is None:
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.journey_addons (
+                    tenant_id, journey_id, addon_type_code,
+                    actual_amount, source_kind, source_evidence_id, details
+                ) VALUES (
+                    :tenant_id, :journey_id, :addon_type_code,
+                    :amount, 'EVIDENCE', :evidence_id, CAST(:details AS jsonb)
+                )
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "addon_type_code": addon_type_code,
+                "amount": amount,
+                "evidence_id": evidence_id,
+                "details": details,
+            },
+        )
+        return
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.journey_addons
+            SET actual_amount = :amount,
+                source_kind = 'EVIDENCE',
+                source_evidence_id = :evidence_id,
+                details = CAST(:details AS jsonb),
+                updated_at_utc = now()
+            WHERE tenant_id = :tenant_id
+              AND journey_addon_id = :addon_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "addon_id": existing_id,
+            "amount": amount,
+            "evidence_id": evidence_id,
+            "details": details,
+        },
+    )
+
+
+def _materialize_reconciliation_projections(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    evidence_id: UUID | None,
+    values: dict[str, Any],
+) -> tuple[int, int]:
+    """Project reviewed Booking Form money fields into the per-discount and
+    per-addon reconciliation tables. Best-effort: the caller runs this inside a
+    SAVEPOINT so a failure never rolls back the Review Confirm."""
+
+    discounts_written = 0
+    addons_written = 0
+    for field_key, discount_key in _DISCOUNT_KEY_BY_FIELD.items():
+        amount = values.get(field_key)
+        if amount is None:
+            continue
+        _upsert_evidence_discount_application(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            discount_key=discount_key,
+            amount=amount,
+            evidence_id=evidence_id,
+        )
+        discounts_written += 1
+    for field_key, addon_type_code in _ADDON_TYPE_BY_FIELD.items():
+        amount = values.get(field_key)
+        if amount is None:
+            continue
+        _upsert_evidence_journey_addon(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            addon_type_code=addon_type_code,
+            amount=amount,
+            evidence_id=evidence_id,
+        )
+        addons_written += 1
+    return discounts_written, addons_written
+
+
 def materialize_reviewed_booking_form_values(
     connection: Connection,
     *,
@@ -353,6 +571,8 @@ def materialize_reviewed_booking_form_values(
 ) -> dict[str, int]:
     documents_written = 0
     commercial_lines_written = 0
+    discount_applications_written = 0
+    journey_addons_written = 0
     for document in documents:
         if (
             str(document.documentTypeKey or "").strip().lower()
@@ -391,9 +611,28 @@ def materialize_reviewed_booking_form_values(
             evidence_id=document.evidenceId,
             values=values,
         )
+        try:
+            with connection.begin_nested():
+                discounts, addons = _materialize_reconciliation_projections(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    evidence_id=document.evidenceId,
+                    values=values,
+                )
+            discount_applications_written += discounts
+            journey_addons_written += addons
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "uc03_reconciliation_projection_failed journey_id=%s",
+                str(journey_id),
+                exc_info=True,
+            )
     return {
         "documents": documents_written,
         "commercialLines": commercial_lines_written,
+        "discountApplications": discount_applications_written,
+        "journeyAddons": journey_addons_written,
     }
 
 
