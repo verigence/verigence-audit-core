@@ -28,6 +28,7 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.telemetry import trace_span
+from audit_core.uc03_finding_classification import resolve_classification
 
 logger = structlog.get_logger(__name__)
 
@@ -386,12 +387,14 @@ def _insert_duplicate_flag(
                 tenant_id, journey_id, finding_type_code, severity,
                 finding_status, title, description, created_by_actor_id,
                 correlation_id, stage_code, origin_kind, origin_actor_id,
-                origin_role_snapshot, rule_key, blocking_completion
+                origin_role_snapshot, rule_key, blocking_completion,
+                finding_class, owner_role_code, sla_due_at_utc
             ) VALUES (
                 :tenant_id, :journey_id, 'DUPLICATE_BOOKING', 'HIGH',
                 'OPEN', 'Duplicate Booking', :description, :created_by_actor_id,
                 :correlation_id, 'BOOKING', 'MACHINE', NULL,
-                'SYSTEM', :rule_key, false
+                'SYSTEM', :rule_key, false,
+                :finding_class, :owner_role_code, :sla_due_at_utc
             )
             RETURNING audit_finding_id
             """
@@ -403,6 +406,14 @@ def _insert_duplicate_flag(
             "created_by_actor_id": actor_id,
             "correlation_id": correlation_id,
             "rule_key": _DUPLICATE_RULE_KEY,
+            **resolve_classification(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                rule_key=_DUPLICATE_RULE_KEY,
+                finding_type_code="DUPLICATE_BOOKING",
+                severity="HIGH",
+            ),
         },
     ).scalar_one()
     connection.execute(

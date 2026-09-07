@@ -43,6 +43,7 @@ from audit_core.security_authorization import (
 from audit_core.security_integration import SecurityOAuthClient, SecurityTokenError
 from audit_core.uc03_booking_commands import _aggregate_lock, _parse_if_match
 from audit_core.uc03_di_core_persistence import persist_reviewed_di_fields
+from audit_core.uc03_finding_classification import resolve_classification
 from audit_core.uc03_v2_review_materialization import (
     materialize_reviewed_di_business_values,
     reviewed_field_core_owner,
@@ -451,6 +452,14 @@ def _ensure_post_submit_review_flag(
     if _find_review_flag(connection, tenant_id=tenant_id, evidence_id=evidence_id):
         return False
 
+    routing = resolve_classification(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        rule_key=_REVIEW_FLAG_RULE,
+        finding_type_code="DOCUMENT_EXCEPTION",
+        severity="INFO",
+    )
     finding_id = connection.execute(
         text(
             """
@@ -459,12 +468,13 @@ def _ensure_post_submit_review_flag(
                 finding_status, title, description,
                 created_by_actor_id, stage_code, origin_kind,
                 origin_actor_id, origin_role_snapshot, rule_key,
-                blocking_completion
+                blocking_completion, finding_class, owner_role_code, sla_due_at_utc
             ) VALUES (
                 :tenant_id, :journey_id, 'DOCUMENT_EXCEPTION', 'INFO',
                 'OPEN', 'DI extraction requires PC review', :description,
                 :service_id, 'BOOKING', 'RULE',
-                :service_id, 'SYSTEM', :rule_key, false
+                :service_id, 'SYSTEM', :rule_key, false,
+                :finding_class, :owner_role_code, :sla_due_at_utc
             )
             RETURNING audit_finding_id
             """
@@ -479,6 +489,7 @@ def _ensure_post_submit_review_flag(
             ),
             "service_id": service_id,
             "rule_key": _REVIEW_FLAG_RULE,
+            **routing,
         },
     ).scalar_one()
     connection.execute(
@@ -600,6 +611,14 @@ def _raise_tl_correction_info(
     if not corrections:
         return
     field_keys = sorted({correction.fieldKey for correction in corrections})
+    routing = resolve_classification(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        rule_key=_TL_CORRECTION_RULE,
+        finding_type_code="DOCUMENT_EXCEPTION",
+        severity="INFO",
+    )
     finding_id = connection.execute(
         text(
             """
@@ -608,12 +627,13 @@ def _raise_tl_correction_info(
                 finding_status, title, description,
                 created_by_actor_id, stage_code, origin_kind,
                 origin_actor_id, origin_role_snapshot, rule_key,
-                blocking_completion
+                blocking_completion, finding_class, owner_role_code, sla_due_at_utc
             ) VALUES (
                 :tenant_id, :journey_id, 'DOCUMENT_EXCEPTION', 'INFO',
                 'OPEN', 'PC corrected DI data after Booking submission', :description,
                 :actor_id, 'BOOKING', 'HUMAN',
-                :actor_id, :actor_role, :rule_key, false
+                :actor_id, :actor_role, :rule_key, false,
+                :finding_class, :owner_role_code, :sla_due_at_utc
             )
             RETURNING audit_finding_id
             """
@@ -629,6 +649,7 @@ def _raise_tl_correction_info(
             "actor_id": actor_id,
             "actor_role": actor_role,
             "rule_key": _TL_CORRECTION_RULE,
+            **routing,
         },
     ).scalar_one()
     for evidence_id in sorted(

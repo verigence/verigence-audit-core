@@ -45,6 +45,7 @@ from audit_core.uc03_document_assessments import (
     _assessment_row,
     _effective_applicability,
 )
+from audit_core.uc03_finding_classification import resolve_classification
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/journeys/{journey_id}",
@@ -1613,12 +1614,14 @@ def create_booking_flag(
                     tenant_id, journey_id, finding_type_code, severity,
                     finding_status, title, description, created_by_actor_id,
                     correlation_id, stage_code, origin_kind, origin_actor_id,
-                    origin_role_snapshot, blocking_completion
+                    origin_role_snapshot, blocking_completion,
+                    finding_class, owner_role_code, sla_due_at_utc
                 ) VALUES (
                     :tenant_id, :journey_id, :category, :severity,
                     'OPEN', :title, :description, :actor_id,
                     :correlation_id, 'BOOKING', 'HUMAN', :actor_id,
-                    :actor_role, false
+                    :actor_role, false,
+                    :finding_class, :owner_role_code, :sla_due_at_utc
                 ) RETURNING audit_finding_id
                 """
             ),
@@ -1632,6 +1635,14 @@ def create_booking_flag(
                 "actor_id": human_principal.subject,
                 "actor_role": context["operating_role"],
                 "correlation_id": correlation_id,
+                **resolve_classification(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    rule_key=None,
+                    finding_type_code=category,
+                    severity=severity,
+                ),
             },
         ).scalar_one()
         connection.execute(

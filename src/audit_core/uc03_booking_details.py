@@ -27,6 +27,7 @@ from audit_core.uc03_booking_commands import (
     _require_expected_version,
     _stage_state,
 )
+from audit_core.uc03_finding_classification import resolve_classification
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/journeys/{journey_id}/booking/details",
@@ -605,6 +606,14 @@ def _record_machine_observation(
     ).scalar_one_or_none()
     if existing is not None:
         return existing
+    routing = resolve_classification(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        rule_key=rule_key,
+        finding_type_code="DOCUMENT_EXCEPTION",
+        severity="INFO",
+    )
     finding_id = connection.execute(
         text(
             """
@@ -612,12 +621,14 @@ def _record_machine_observation(
                 tenant_id, journey_id, finding_type_code, severity,
                 finding_status, title, description, created_by_actor_id,
                 correlation_id, stage_code, origin_kind, origin_actor_id,
-                origin_role_snapshot, rule_key, blocking_completion
+                origin_role_snapshot, rule_key, blocking_completion,
+                finding_class, owner_role_code, sla_due_at_utc
             ) VALUES (
                 :tenant_id, :journey_id, 'DOCUMENT_EXCEPTION', 'INFO',
                 'OPEN', :title, :description, NULL,
                 :correlation_id, 'BOOKING', 'MACHINE', NULL,
-                'SYSTEM', :rule_key, false
+                'SYSTEM', :rule_key, false,
+                :finding_class, :owner_role_code, :sla_due_at_utc
             ) RETURNING audit_finding_id
             """
         ),
@@ -628,6 +639,7 @@ def _record_machine_observation(
             "description": description,
             "correlation_id": correlation_id,
             "rule_key": rule_key,
+            **routing,
         },
     ).scalar_one()
     connection.execute(
