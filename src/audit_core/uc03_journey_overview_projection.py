@@ -10,12 +10,18 @@ from sqlalchemy import Connection, text
 
 from audit_core import uc03_journey_reviewed_details as reviewed_details
 from audit_core import uc03_journey_search as legacy
+from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.uc03_masters_alignment import (
+    commercial_key_for_price_component,
+    registration_basis,
+)
+from audit_core.uc03_model_resolution import sync_model_resolution
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/uc03",
@@ -445,16 +451,27 @@ def _sku_pricing_panel(
     first_version_id = str(master_items[0]["price_list_version_id"])
     active_items = [r for r in master_items if str(r["price_list_version_id"]) == first_version_id]
 
+    # An OEM price row carries both REGISTRATION_INDIVIDUAL and REGISTRATION_CORPORATE;
+    # only the one that matches the buyer's basis counts toward the master total.
+    _basis = registration_basis(
+        customer_type_code=reviewed_booking.get("customer_type"),
+        registration_type_code=reviewed_booking.get("registration_type"),
+    )
+    _skip_reg = "REGISTRATION_CORPORATE" if _basis == "INDIVIDUAL" else "REGISTRATION_INDIVIDUAL"
+
     master_components: list[dict[str, Any]] = []
     master_total = Decimal(0)
     currency = str(active_items[0]["plan_currency"]).upper()
     for item in active_items:
+        component_key = str(item["component_key"]).strip().upper()
+        if component_key == _skip_reg:
+            continue
         amount = _to_decimal(item["standard_amount"])
         if amount is None:
             continue
         master_total += amount
         master_components.append({
-            "componentKey": str(item["component_key"]),
+            "componentKey": component_key,
             "masterAmount": float(amount),
             "currencyCode": currency,
         })
@@ -476,7 +493,11 @@ def _sku_pricing_panel(
     booking_total_price = _to_decimal(reviewed_booking.get("total_price"))
     booking_net_amount  = _to_decimal(reviewed_booking.get("net_amount"))
 
-    # Enrich master_components with the matching booking-side amount where the key maps.
+    # Enrich master_components with the matching booking-side amount.
+    # The OEM price list keys components as EX_SHOWROOM / INSURANCE /
+    # REGISTRATION_INDIVIDUAL / ... ; the reviewed booking uses ex_showroom_price
+    # / insurance_amount / registration_charges / ... — bridged by
+    # uc03_masters_alignment (deterministic, explicit).
     _BOOKING_COMPONENT_MAP: dict[str, Decimal | None] = {
         "ex_showroom_price": booking_ex_showroom,
         "insurance_amount":  booking_insurance,
@@ -487,10 +508,12 @@ def _sku_pricing_panel(
         "additional_warranty_amount": booking_warranty,
         "accessories_cost":  booking_accessories,
         "other_charges":     booking_other,
+        "fastag_amount":     _to_decimal(reviewed_booking.get("fastag_amount")),
     }
     for component in master_components:
-        key = component["componentKey"]
-        booking_val = _BOOKING_COMPONENT_MAP.get(key)
+        oem_key = component["componentKey"]
+        commercial_key = commercial_key_for_price_component(oem_key, basis=_basis)
+        booking_val = _BOOKING_COMPONENT_MAP.get(commercial_key) if commercial_key else None
         if booking_val is not None:
             component["bookingAmount"] = float(booking_val)
             master_val = Decimal(str(component["masterAmount"]))
@@ -555,6 +578,13 @@ def get_journey_overview_projection(
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> JourneyOverviewProjectionResponse:
     """Project Journey 360 from Audit Core, including every reviewed DI field."""
+
+    # Self-heal on read: resolve the SKU against the OEM price masters (or raise
+    # MODEL_NOT_IDENTIFIED) so the Deal panel and findings below reflect it.
+    set_tenant_context(connection, tenant_id)
+    sync_model_resolution(
+        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=""
+    )
 
     base = legacy.get_journey_overview(
         tenant_id=tenant_id,

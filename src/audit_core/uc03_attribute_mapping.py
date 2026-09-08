@@ -46,7 +46,27 @@ class AttributeCandidate:
 
 _B = ("booking_form", "booking_docket")
 _ID = ("pan_card", "pan", "aadhaar")
-_INVOICE = ("customer_invoice_dms", "tax_invoice_tally", "tax_invoice_dms", "tax_invoice")
+# Every dealer invoice (vehicle tax / retail / accessories / EW) is one DI
+# document type `invoice` (the classifier can't separate them); the older
+# tenant-DMS invoice keys stay for back-compat.
+_INVOICE = (
+    "invoice",
+    "customer_invoice_dms",
+    "tax_invoice_tally",
+    "tax_invoice_dms",
+    "tax_invoice",
+)
+# The dealer's own deal sheet — authoritative for the discounts actually applied,
+# below a GST invoice for the priced components.
+_DEAL_SHEET = ("dealer_accounts_statement",)
+# Government RTO receipt — authoritative for registration / road-tax / permit fees.
+_RTO = ("rto_tax_receipt",)
+
+# Invoice-first precedence for every commercial / discount / total value: a
+# reviewed invoice value wins over the booking form (the booking form is the
+# fallback until the invoice is extracted). Order within: GST invoice, then the
+# deal sheet, then the booking form.
+_COMMERCIAL_SOURCES = _INVOICE + _DEAL_SHEET + _B
 
 
 # Explicit UC03 mappings. Nothing here relies on fuzzy English-label matching.
@@ -174,7 +194,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Model",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"vehicle_model"}),
-        source_priority=_B + _INVOICE,
+        source_priority=_INVOICE + _DEAL_SHEET + _B,
     ),
     AttributeSpec(
         attribute_key="variant",
@@ -182,7 +202,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Variant",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"vehicle_variant"}),
-        source_priority=_B + _INVOICE,
+        source_priority=_INVOICE + _DEAL_SHEET + _B,
     ),
     AttributeSpec(
         attribute_key="color",
@@ -190,7 +210,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Color",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"vehicle_color"}),
-        source_priority=_B + _INVOICE,
+        source_priority=_INVOICE + _DEAL_SHEET + _B,
     ),
     AttributeSpec(
         attribute_key="sku_code",
@@ -252,7 +272,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Ex-Showroom Price",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"ex_showroom_price"}),
-        source_priority=_B + ("cost_sheet",) + _INVOICE,
+        source_priority=_INVOICE + ("cost_sheet",) + _DEAL_SHEET + _B,
     ),
     AttributeSpec(
         attribute_key="booking_tcs_amount",
@@ -260,7 +280,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="TCS",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"tcs_amount"}),
-        source_priority=_B + _INVOICE,
+        source_priority=_COMMERCIAL_SOURCES,
     ),
     AttributeSpec(
         attribute_key="booking_registration_charges",
@@ -268,7 +288,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Registration Charges",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"registration_charges"}),
-        source_priority=_B,
+        source_priority=_RTO + _INVOICE + _DEAL_SHEET + _B,
     ),
     AttributeSpec(
         attribute_key="booking_road_tax_amount",
@@ -276,7 +296,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Road Tax",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"road_tax_amount"}),
-        source_priority=_B,
+        source_priority=_RTO + _INVOICE + _DEAL_SHEET + _B,
     ),
     AttributeSpec(
         attribute_key="booking_road_tax_registration_combined",
@@ -284,7 +304,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Road Tax / Registration (combined source value)",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"road_tax_registration"}),
-        source_priority=_B,
+        source_priority=_RTO + _INVOICE + _DEAL_SHEET + _B,
     ),
     AttributeSpec(
         attribute_key="booking_insurance_amount",
@@ -292,7 +312,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Insurance Amount",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"insurance_amount"}),
-        source_priority=("insurance_cover_note", "insurance_policy") + _B,
+        source_priority=("insurance_cover_note", "insurance_policy", "insurance_cover") + _INVOICE + _DEAL_SHEET + _B,
     ),
     AttributeSpec(
         attribute_key="booking_rsa_amount",
@@ -300,7 +320,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="RSA Amount",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"rsa_amount"}),
-        source_priority=_B,
+        source_priority=_COMMERCIAL_SOURCES,
     ),
     AttributeSpec(
         attribute_key="booking_accessories_cost",
@@ -308,7 +328,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Accessories",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"accessories_cost"}),
-        source_priority=_B,
+        source_priority=_COMMERCIAL_SOURCES,
     ),
     AttributeSpec(
         attribute_key="booking_additional_warranty_amount",
@@ -316,7 +336,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Additional Warranty",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"additional_warranty_amount"}),
-        source_priority=_B,
+        source_priority=_COMMERCIAL_SOURCES,
     ),
     AttributeSpec(
         attribute_key="booking_other_charges",
@@ -324,7 +344,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Other Charges",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"other_charges"}),
-        source_priority=_B,
+        source_priority=_COMMERCIAL_SOURCES,
     ),
     AttributeSpec(
         attribute_key="booking_total_price",
@@ -332,7 +352,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Total Price",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"total_price"}),
-        source_priority=_B + _INVOICE,
+        source_priority=_COMMERCIAL_SOURCES,
     ),
     AttributeSpec(
         attribute_key="booking_discount_amount",
@@ -340,7 +360,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Discount",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"discount_amount"}),
-        source_priority=_B + _INVOICE,
+        source_priority=_COMMERCIAL_SOURCES,
     ),
     AttributeSpec(
         attribute_key="booking_bonus_amount",
@@ -348,7 +368,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Bonus",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"bonus_amount"}),
-        source_priority=_B,
+        source_priority=_COMMERCIAL_SOURCES,
     ),
     AttributeSpec(
         attribute_key="booking_net_amount",
@@ -356,7 +376,7 @@ ATTRIBUTE_SPECS: tuple[AttributeSpec, ...] = (
         label="Net Amount",
         stages=("BOOKING", "DELIVERY"),
         field_keys=frozenset({"net_amount"}),
-        source_priority=_B + _INVOICE,
+        source_priority=_COMMERCIAL_SOURCES,
     ),
     AttributeSpec(
         attribute_key="booking_amount_paid",
