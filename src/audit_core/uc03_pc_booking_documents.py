@@ -71,10 +71,17 @@ router = APIRouter(tags=["uc03-pc-booking-documents"])
 _DI_AUDIENCE = "di"
 _AUDIT_SERVICE_AUDIENCE = "audit"
 # Requirement keys that accept more than one active evidence row (partial
-# payments, multiple receipts) rather than the newest superseding the last.
-# Delivery's payment-receipt requirement (0017/0022) needs the same treatment
-# as Booking's now that this callback handles both process areas.
-_REPEATABLE_REQUIREMENT_KEYS = {"booking_payment_receipt", "payment_receipt"}
+# payments, multiple receipts, multi-page/multi-period bank statements)
+# rather than the newest superseding the last. Delivery's payment-receipt
+# requirement (0017/0022) needs the same treatment as Booking's now that this
+# callback handles both process areas; the bank-statement requirement
+# (0070) is repeatable for the same reason on both stages.
+_REPEATABLE_REQUIREMENT_KEYS = {
+    "booking_payment_receipt",
+    "payment_receipt",
+    "booking_bank_statement",
+    "delivery_bank_statement",
+}
 
 
 class BookingUploadRequirement(BaseModel):

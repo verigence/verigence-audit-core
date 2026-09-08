@@ -826,6 +826,13 @@ def _stage_completion_blockers(
             WHERE jdr.tenant_id=:tenant_id AND jdr.journey_id=:journey_id
               AND upper(jdr.process_area)=:stage_code
               AND jdr.requirement_status <> 'NOT_APPLICABLE'
+              -- Only requirements sourced from the published checklist profile
+              -- (document_requirement_item_id set) go through PC declaration.
+              -- A requirement registered directly on the journey outside that
+              -- profile (bank_statement_extract, 0070) is just another
+              -- document type DI can classify against -- upload/classify/
+              -- extract/reconcile, no "do you have this" checklist question.
+              AND jdr.document_requirement_item_id IS NOT NULL
               AND COALESCE(jda.answer, 'UNANSWERED')='UNANSWERED'
             """
         ),

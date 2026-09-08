@@ -155,7 +155,7 @@ def sync_document_confirmation_status(
                 rule_key=rule_key,
                 finding_type=_DOCUMENT_MISSING_TYPE,
                 severity="MEDIUM",
-                title=f"Document could not be processed: {document_label}",
+                title=f"Document Not Found: {document_label}",
                 description=(
                     f"Document Intelligence could not process {document_label} -- "
                     "the file may be unreadable, corrupt, or the wrong document. "
