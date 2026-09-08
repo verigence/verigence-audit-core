@@ -31,7 +31,11 @@ logger = logging.getLogger(__name__)
 
 _DELIVERY_ORDER_DOCUMENT_TYPE = "delivery_order_cover"
 _INSURANCE_DOCUMENT_TYPE = "insurance_cover"
-_RECEIPT_DOCUMENT_TYPE = "dealer_receipt"
+# Delivery's own default requirement (0017/0022) registers its receipt
+# requirement's document_type_key as "payment_receipt", not Booking's
+# "dealer_receipt" -- both must be accepted here or a Delivery receipt
+# classified under its own registered type would never materialize a Payment.
+_RECEIPT_DOCUMENT_TYPES = frozenset({"dealer_receipt", "payment_receipt"})
 
 # These are exact DI field keys, not fuzzy text matches.  ``chassis_no`` is the
 # field emitted by verigence-di's delivery_order_cover schema.  The other keys are
@@ -571,7 +575,7 @@ def materialize_delivery_receipts(
         document
         for document in _ready_documents(documents)
         if str(getattr(document, "documentTypeKey", "") or "").strip().casefold()
-        == _RECEIPT_DOCUMENT_TYPE
+        in _RECEIPT_DOCUMENT_TYPES
         and booking_materialization._has_reviewable_receipt_value(document)
     ]
     ordinals = booking_materialization.receipt_document_ordinals(

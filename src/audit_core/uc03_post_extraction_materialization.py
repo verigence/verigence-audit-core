@@ -457,6 +457,12 @@ def install_uc03_post_extraction_materialization() -> None:
         fact_count = original(*args, **kwargs)
         if fact_count <= 0:
             return fact_count
+        # _sync_booking_document now runs for Delivery documents too (stage_code
+        # is read off the requirement, not assumed) and materializes Delivery's
+        # own canonical tables itself before returning -- this booking-typed
+        # projection only applies when the just-synced document was Booking's.
+        if str(kwargs.get("stage_code", "BOOKING")).upper() != "BOOKING":
+            return fact_count
         connection: Connection = args[0] if args else kwargs["connection"]
         tenant_id = str(kwargs["tenant_id"])
         journey_id = kwargs["journey_id"]

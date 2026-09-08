@@ -156,9 +156,10 @@ def _unreviewed_low_confidence_count(
     tenant_id: str,
     journey_id: UUID,
     document_id: UUID | None = None,
+    stage_code: str = "BOOKING",
 ) -> int:
     document_clause = "AND di_document_id=:document_id" if document_id is not None else ""
-    params: dict[str, Any] = {"tenant_id": tenant_id, "journey_id": journey_id}
+    params: dict[str, Any] = {"tenant_id": tenant_id, "journey_id": journey_id, "stage_code": stage_code}
     if document_id is not None:
         params["document_id"] = document_id
     return int(
@@ -169,7 +170,7 @@ def _unreviewed_low_confidence_count(
                 FROM auditcore.journey_document_extracted_fields
                 WHERE tenant_id=:tenant_id
                   AND journey_id=:journey_id
-                  AND stage_code='BOOKING'
+                  AND stage_code=:stage_code
                   {document_clause}
                   AND reviewed_at_utc IS NULL
                   AND extracted_value IS NOT NULL
@@ -311,6 +312,7 @@ def _machine_upsert_fact(
     document_id: UUID,
     document_type_key: str | None,
     fact: Any,
+    stage_code: str = "BOOKING",
 ) -> bool:
     canonical = str(fact.canonical_field_id or "").strip()
     if not canonical:
@@ -321,7 +323,7 @@ def _machine_upsert_fact(
             SELECT extracted_value, confidence_score, confidence_scale
             FROM auditcore.journey_document_extracted_fields
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code='BOOKING' AND di_document_id=:document_id
+              AND stage_code=:stage_code AND di_document_id=:document_id
               AND source_canonical_field_id=:canonical
               AND source_fact_version=:fact_version
             """
@@ -329,6 +331,7 @@ def _machine_upsert_fact(
         {
             "tenant_id": tenant_id,
             "journey_id": journey_id,
+            "stage_code": stage_code,
             "document_id": document_id,
             "canonical": canonical,
             "fact_version": int(fact.version_no),
@@ -360,7 +363,7 @@ def _machine_upsert_fact(
                 reviewed_by_actor_id, reviewed_at_utc
             ) VALUES (
                 :tenant_id, :journey_id, :evidence_id, :document_id,
-                NULL, :fact_version, 'BOOKING',
+                NULL, :fact_version, :stage_code,
                 :document_type_key, :canonical, :field_key,
                 CAST(:value AS jsonb), NULL, CAST(:value AS jsonb),
                 :confidence, :confidence_scale, false,
@@ -388,6 +391,7 @@ def _machine_upsert_fact(
         {
             "tenant_id": tenant_id,
             "journey_id": journey_id,
+            "stage_code": stage_code,
             "evidence_id": evidence_id,
             "document_id": document_id,
             "fact_version": int(fact.version_no),
@@ -756,7 +760,16 @@ def _sync_booking_document(
     security_client: SecurityOAuthClient,
     di_client: DiClient,
     bump_version: bool,
+    stage_code: str = "BOOKING",
 ) -> int:
+    """The one per-document sync pipeline: DI status -> DOCUMENT_MISSING ->
+    durable fact copy -> MANUAL_VERIFICATION -> stage-specific rules/triggers
+    (SKU resolution is Booking-only; payment reconciliation and canonical
+    materialization apply to both). ``stage_code`` is read off the calling
+    requirement's process_area, never assumed -- Booking and Delivery run the
+    identical pipeline; the only branches are ones a document type genuinely
+    doesn't apply to (a Delivery document has no vehicle model to resolve a
+    SKU against)."""
     link = connection.execute(
         text(
             """
@@ -822,7 +835,7 @@ def _sync_booking_document(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
-        stage_code="BOOKING",
+        stage_code=stage_code,
         document_id=document_id,
         confirmation_status=document.confirmation_status,
         document_label=_friendly_label(
@@ -861,6 +874,7 @@ def _sync_booking_document(
             document_id=document_id,
             document_type_key=document_type_key,
             fact=fact,
+            stage_code=stage_code,
         ) or changed
 
     low_count = _unreviewed_low_confidence_count(
@@ -868,16 +882,24 @@ def _sync_booking_document(
         tenant_id=tenant_id,
         journey_id=journey_id,
         document_id=document_id,
+        stage_code=stage_code,
     )
-    finding_created = _ensure_post_submit_review_flag(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        evidence_id=link["evidence_id"],
-        document_id=document_id,
-        service_id=service_id,
-        low_confidence_count=low_count,
-    )
+    # The post-submit "DI extraction requires PC review" INFO flag is a
+    # Booking-only mechanism today (_ensure_post_submit_review_flag reads
+    # Booking's own review-state table); Delivery's equivalent doesn't exist
+    # yet, so this stays gated rather than silently mis-checking Booking's
+    # submission state against a Delivery document.
+    finding_created = False
+    if stage_code == "BOOKING":
+        finding_created = _ensure_post_submit_review_flag(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            evidence_id=link["evidence_id"],
+            document_id=document_id,
+            service_id=service_id,
+            low_confidence_count=low_count,
+        )
 
     if changed or finding_created:
         status = "PENDING" if low_count else None
@@ -897,12 +919,13 @@ def _sync_booking_document(
                     latest_activity_at_utc=now(), updated_at_utc=now()
                     {', version_no=version_no+1' if bump_version else ''}
                 WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND stage_code='BOOKING'
+                  AND stage_code=:stage_code
                 """
             ),
             {
                 "tenant_id": tenant_id,
                 "journey_id": journey_id,
+                "stage_code": stage_code,
                 "verification_status": status,
                 "low_count": low_count,
             },
@@ -916,111 +939,56 @@ def _sync_booking_document(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
-        stage_code="BOOKING",
+        stage_code=stage_code,
         correlation_id="",
     )
 
-    # Resolve the booking's SKU against the OEM price masters, or raise a
-    # MODEL_NOT_IDENTIFIED finding for the PC (never raises). A repeated
-    # internal failure (as opposed to the expected 0/many-match outcome,
-    # which MODEL_NOT_IDENTIFIED already covers) escalates to the PC too.
-    from audit_core.uc03_async_sync_tasks import (
-        reconcile_payments_with_escalation,
-        sync_model_resolution_with_escalation,
-    )
+    from audit_core.uc03_async_sync_tasks import reconcile_payments_with_escalation
 
-    sync_model_resolution_with_escalation(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        correlation_id="",
-    )
+    if stage_code == "BOOKING":
+        # Resolve the booking's SKU against the OEM price masters, or raise a
+        # MODEL_NOT_IDENTIFIED finding for the PC (never raises). Booking-only
+        # -- a Delivery document has no vehicle model to resolve a SKU against.
+        # A repeated internal failure (as opposed to the expected 0/many-match
+        # outcome, which MODEL_NOT_IDENTIFIED already covers) escalates too.
+        from audit_core.uc03_async_sync_tasks import (
+            sync_model_resolution_with_escalation,
+        )
+
+        sync_model_resolution_with_escalation(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            correlation_id="",
+        )
 
     # A receipt or bank statement just confirming is exactly when a fresh
     # reconciliation pass has something new to match -- run it here instead
     # of waiting for PC Verify/Submit or the next Overview read. Scoped to
-    # these two document types so unrelated documents (PAN, RTO, insurance...)
-    # don't pay for a no-op reconciliation pass.
-    if document_type_key in ("dealer_receipt", "bank_statement_extract"):
+    # these document types so unrelated documents (PAN, RTO, insurance...)
+    # don't pay for a no-op reconciliation pass. Booking's receipt document
+    # type is dealer_receipt; Delivery's is payment_receipt (0017/0022).
+    if document_type_key in ("dealer_receipt", "payment_receipt", "bank_statement_extract"):
         reconcile_payments_with_escalation(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
-            stage_code="BOOKING",
+            stage_code=stage_code,
             correlation_id="",
         )
+
+    if stage_code == "DELIVERY" and changed:
+        from audit_core.uc03_delivery_post_extraction_materialization import (
+            materialize_delivery_documents_from_durable_store,
+        )
+
+        materialize_delivery_documents_from_durable_store(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+        )
+
     return len(facts)
-
-
-def _sync_delivery_document_status(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-    document_id: UUID,
-    document_type_key: str | None,
-    security_client: SecurityOAuthClient,
-    di_client: DiClient,
-) -> None:
-    """Delivery's minimal counterpart to _sync_booking_document: track this one
-    document's own confirmation outcome (DOCUMENT_MISSING on failure, resolved
-    on a later clean confirm) without pulling facts or materializing.
-
-    Delivery's full per-document durable-capture + materialization pipeline
-    (the Delivery equivalent of _machine_upsert_fact / materialize_machine_
-    booking_values) is a separate, tracked follow-up -- unlike Booking's
-    per-document materializer, Delivery's existing materialize_reviewed_
-    delivery_business_values resolves cross-document source priority (which
-    invoice wins for the vehicle VIN, say) from the *list of documents it is
-    given*, not from durable state re-read fresh each call. Feeding it one
-    newly-confirmed document at a time would silently drop that priority
-    logic; feeding it the full always-current document set safely needs it
-    rebuilt from journey_document_extracted_fields the way Booking's resolver
-    already is. Never raises (best-effort, same as every other producer here).
-    """
-    try:
-        journey = connection.execute(
-            text(
-                """
-                SELECT customer_id, dealer_id, outlet_id
-                FROM auditcore.journeys
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).mappings().one_or_none()
-        if journey is None:
-            return
-        token = security_client.get_service_token(audience=_DI_AUDIENCE)
-        context_ref = _external_context_ref(journey_id=journey_id, customer_id=journey["customer_id"])
-        document = di_client.get_audit_document(
-            token=token,
-            tenant_id=tenant_id,
-            external_context_ref=context_ref,
-            document_id=str(document_id),
-        )
-    except (SecurityTokenError, DiClientError):
-        logger.warning(
-            "uc03_delivery_document_status_sync_unavailable",
-            tenant_id=tenant_id,
-            journey_id=str(journey_id),
-            document_id=str(document_id),
-        )
-        return
-
-    from audit_core.uc03_async_sync_tasks import sync_document_confirmation_status
-    from audit_core.uc03_manual_verification import _friendly_label
-
-    sync_document_confirmation_status(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        stage_code="DELIVERY",
-        document_id=document_id,
-        confirmation_status=document.confirmation_status,
-        document_label=_friendly_label(document.document_type_key or document_type_key, document_id),
-        correlation_id="",
-    )
 
 
 def acknowledge_booking_document_link_with_auto_sync(
@@ -1046,35 +1014,23 @@ def acknowledge_booking_document_link_with_auto_sync(
         service_id=service_principal.subject,
         requirement_ref=payload.requirementRef,
     )
-    # This callback now accepts Booking and Delivery requirements alike (the
-    # requirement row says which -- see migration 0068); the evidence link
-    # itself is created for both. _sync_booking_document's own machinery
-    # (journey_stage_states, MANUAL_VERIFICATION, SKU resolution) is still
-    # Booking-specific throughout, so only run it for a Booking requirement
-    # here. Delivery's equivalent per-document sync is a separate, tracked
-    # follow-up -- this deliberately does not silently write Booking-shaped
-    # updates against a Delivery document.
-    if str(discovered["process_area"]).upper() == "BOOKING":
-        _sync_booking_document(
-            connection,
-            tenant_id=str(discovered["tenant_id"]),
-            journey_id=discovered["journey_id"],
-            document_id=payload.documentId,
-            service_id=service_principal.subject,
-            security_client=security_client,
-            di_client=di_client,
-            bump_version=True,
-        )
-    else:
-        _sync_delivery_document_status(
-            connection,
-            tenant_id=str(discovered["tenant_id"]),
-            journey_id=discovered["journey_id"],
-            document_id=payload.documentId,
-            document_type_key=discovered.get("document_type_key"),
-            security_client=security_client,
-            di_client=di_client,
-        )
+    # One pipeline, stage as data: this callback accepts Booking and Delivery
+    # requirements alike (the requirement row says which -- see migration
+    # 0068), and _sync_booking_document runs the identical sync for either --
+    # DI status -> DOCUMENT_MISSING -> durable fact copy -> MANUAL_VERIFICATION
+    # -> stage-appropriate rules (SKU resolution is Booking-only; payment
+    # reconciliation and canonical materialization run for both).
+    _sync_booking_document(
+        connection,
+        tenant_id=str(discovered["tenant_id"]),
+        journey_id=discovered["journey_id"],
+        document_id=payload.documentId,
+        service_id=service_principal.subject,
+        security_client=security_client,
+        di_client=di_client,
+        bump_version=True,
+        stage_code=str(discovered["process_area"]).upper(),
+    )
     return response
 
 
