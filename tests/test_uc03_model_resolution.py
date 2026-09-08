@@ -194,10 +194,12 @@ def _seed_price_list(c, *, model: str, variant: str, components: dict[str, str])
              "VALUES (:t, :c, 'OEM') RETURNING price_list_id"),
         {"t": tenant_id, "c": f"PL{uuid4().hex[:8]}"},
     ).scalar_one()
+    # A trigger forbids mutating price_list_items unless the version is DRAFT —
+    # so insert the items first, then publish.
     plv_id = c.execute(
         text("INSERT INTO auditcore.price_list_versions "
              "(tenant_id, price_list_id, version_no, lifecycle_status, effective_from) "
-             "VALUES (:t, :pl, 1, 'PUBLISHED', CURRENT_DATE - 45) RETURNING price_list_version_id"),
+             "VALUES (:t, :pl, 1, 'DRAFT', CURRENT_DATE - 45) RETURNING price_list_version_id"),
         {"t": tenant_id, "pl": pl_id},
     ).scalar_one()
     for key, amount in components.items():
@@ -207,6 +209,11 @@ def _seed_price_list(c, *, model: str, variant: str, components: dict[str, str])
                  "VALUES (:t, :plv, :sku, :k, :a)"),
             {"t": tenant_id, "plv": plv_id, "sku": sku_id, "k": key, "a": amount},
         )
+    c.execute(
+        text("UPDATE auditcore.price_list_versions SET lifecycle_status='PUBLISHED' "
+             "WHERE tenant_id=:t AND price_list_version_id=:plv"),
+        {"t": tenant_id, "plv": plv_id},
+    )
     return sku_id
 
 
