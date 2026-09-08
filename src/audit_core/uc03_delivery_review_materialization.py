@@ -21,6 +21,7 @@ from sqlalchemy import Connection, text
 from audit_core import uc03_booking_capture
 from audit_core import uc03_v2_review_materialization as booking_materialization
 from audit_core.uc03_attribute_mapping import spec_for_field
+from audit_core.uc03_invoice_materialization import materialize_reviewed_invoices
 
 logger = logging.getLogger(__name__)
 
@@ -715,6 +716,13 @@ def materialize_reviewed_delivery_business_values(
         journey_id=journey_id,
         documents=documents,
     )
+    invoices = materialize_reviewed_invoices(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        documents=documents,
+        actor_id=actor_id,
+    )
     commercial_lines = materialize_delivery_commercial_lines(
         connection,
         tenant_id=tenant_id,
@@ -732,6 +740,9 @@ def materialize_reviewed_delivery_business_values(
         "vehicleFields": vehicle_fields,
         "registrationFields": registration_fields,
         "insuranceFields": insurance_fields,
+        "invoicesMaterialized": invoices["invoices"],
+        "invoiceCommercialLines": invoices["commercialLines"],
+        "invoiceDiscountApplications": invoices["discountApplications"],
         "commercialLines": commercial_lines,
         "receiptDocuments": receipts["reviewRowsWritten"],
         "receiptPaymentsCreated": receipts["created"],
