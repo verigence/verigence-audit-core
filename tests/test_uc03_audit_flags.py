@@ -615,6 +615,51 @@ def test_blocking_flag_prevents_audit_completion_until_resolved(audit_setup):
     assert completed.status_code == 200, completed.text
 
 
+def test_non_checklist_requirement_does_not_block_audit_completion(audit_setup):
+    # bank_statement_extract (0070) is registered directly on the journey
+    # (document_requirement_item_id=NULL) rather than sourced from the
+    # published checklist profile -- it's just another document type DI can
+    # classify against, not a "does this apply" declaration question. An
+    # unanswered row like this must never block audit completion the way an
+    # unanswered checklist item (document_requirement_item_id set) does.
+    # (audit_setup's booking-start already snapshots it via the Booking
+    # trigger -- this insert is belt-and-suspenders / ON CONFLICT DO NOTHING
+    # so the test still proves the point even if that snapshot changes.)
+    with audit_setup["engine"].begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.journey_document_requirements (
+                    tenant_id, journey_id, document_requirement_item_id,
+                    requirement_key, document_type_key, process_area,
+                    requirement_level, requirement_status, condition_snapshot
+                ) VALUES (
+                    :tenant_id, :journey_id, NULL,
+                    'booking_bank_statement', 'bank_statement_extract', 'BOOKING',
+                    'OPTIONAL', 'PENDING', '{}'::jsonb
+                )
+                ON CONFLICT (tenant_id, journey_id, requirement_key) DO NOTHING
+                """
+            ),
+            {
+                "tenant_id": audit_setup["tenant_id"],
+                "journey_id": audit_setup["journey_id"],
+            },
+        )
+
+    summary = _client().get(f"{_base(audit_setup)}/audit-summary")
+    assert summary.status_code == 200
+    completed = _client().post(
+        f"{_base(audit_setup)}/stages/BOOKING/audit/complete",
+        headers={
+            "Idempotency-Key": "booking-audit-non-checklist",
+            "If-Match": f'"{summary.json()["booking"]["aggregateVersion"]}"',
+        },
+        json={},
+    )
+    assert completed.status_code == 200, completed.text
+
+
 def test_machine_provenance_and_full_timeline_are_user_safe(audit_setup):
     with audit_setup["engine"].begin() as connection:
         flag_id = connection.execute(
