@@ -171,50 +171,57 @@ def journey():
     engine.dispose()
 
 
-def _seed_price_list(c, *, model: str, variant: str, components: dict[str, str]):
-    """One SKU + one published price-list version for the fixture's OEM/tenant."""
+def _seed_price_list(c, skus: list[dict]):
+    """One published price-list version holding every SKU in ``skus``.
+
+    Each entry: {"model": str, "variant": str | None, "components": {key: amount}}.
+    Returns the list of product_sku_id in the same order.
+    """
     tenant_id, oem_id = c.tenant_id, c.oem_id
-    model_id = c.execute(
-        text("INSERT INTO auditcore.product_models (oem_id, model_code, model_name) "
-             "VALUES (:o, :mc, :mn) RETURNING model_id"),
-        {"o": oem_id, "mc": f"M{uuid4().hex[:8]}", "mn": model},
-    ).scalar_one()
-    variant_id = c.execute(
-        text("INSERT INTO auditcore.product_variants (model_id, variant_code, variant_name) "
-             "VALUES (:m, :vc, :vn) RETURNING variant_id"),
-        {"m": model_id, "vc": f"V{uuid4().hex[:8]}", "vn": variant},
-    ).scalar_one()
-    sku_id = c.execute(
-        text("INSERT INTO auditcore.product_skus (oem_id, model_id, variant_id, sku_code) "
-             "VALUES (:o, :m, :v, :sc) RETURNING product_sku_id"),
-        {"o": oem_id, "m": model_id, "v": variant_id, "sc": f"SKU{uuid4().hex[:10]}"},
-    ).scalar_one()
     pl_id = c.execute(
         text("INSERT INTO auditcore.price_lists (tenant_id, price_list_code, price_list_name) "
              "VALUES (:t, :c, 'OEM') RETURNING price_list_id"),
         {"t": tenant_id, "c": f"PL{uuid4().hex[:8]}"},
     ).scalar_one()
     # A trigger forbids mutating price_list_items unless the version is DRAFT —
-    # so insert the items first, then publish.
+    # insert every item first, then publish.
     plv_id = c.execute(
         text("INSERT INTO auditcore.price_list_versions "
              "(tenant_id, price_list_id, version_no, lifecycle_status, effective_from) "
              "VALUES (:t, :pl, 1, 'DRAFT', CURRENT_DATE - 45) RETURNING price_list_version_id"),
         {"t": tenant_id, "pl": pl_id},
     ).scalar_one()
-    for key, amount in components.items():
-        c.execute(
-            text("INSERT INTO auditcore.price_list_items "
-                 "(tenant_id, price_list_version_id, product_sku_id, component_key, standard_amount) "
-                 "VALUES (:t, :plv, :sku, :k, :a)"),
-            {"t": tenant_id, "plv": plv_id, "sku": sku_id, "k": key, "a": amount},
-        )
+    sku_ids = []
+    for entry in skus:
+        model_id = c.execute(
+            text("INSERT INTO auditcore.product_models (oem_id, model_code, model_name) "
+                 "VALUES (:o, :mc, :mn) RETURNING model_id"),
+            {"o": oem_id, "mc": f"M{uuid4().hex[:8]}", "mn": entry["model"]},
+        ).scalar_one()
+        variant_id = c.execute(
+            text("INSERT INTO auditcore.product_variants (model_id, variant_code, variant_name) "
+                 "VALUES (:m, :vc, :vn) RETURNING variant_id"),
+            {"m": model_id, "vc": f"V{uuid4().hex[:8]}", "vn": entry.get("variant") or "BASE"},
+        ).scalar_one()
+        sku_id = c.execute(
+            text("INSERT INTO auditcore.product_skus (oem_id, model_id, variant_id, sku_code) "
+                 "VALUES (:o, :m, :v, :sc) RETURNING product_sku_id"),
+            {"o": oem_id, "m": model_id, "v": variant_id, "sc": f"SKU{uuid4().hex[:10]}"},
+        ).scalar_one()
+        sku_ids.append(sku_id)
+        for key, amount in entry["components"].items():
+            c.execute(
+                text("INSERT INTO auditcore.price_list_items "
+                     "(tenant_id, price_list_version_id, product_sku_id, component_key, standard_amount) "
+                     "VALUES (:t, :plv, :sku, :k, :a)"),
+                {"t": tenant_id, "plv": plv_id, "sku": sku_id, "k": key, "a": amount},
+            )
     c.execute(
         text("UPDATE auditcore.price_list_versions SET lifecycle_status='PUBLISHED' "
              "WHERE tenant_id=:t AND price_list_version_id=:plv"),
         {"t": tenant_id, "plv": plv_id},
     )
-    return sku_id
+    return sku_ids
 
 
 def _set_journey_product(c, model, variant):
@@ -247,11 +254,11 @@ def _open_model_flags(c) -> int:
 
 def test_integration_resolves_and_pins_sku(journey) -> None:
     c = journey
-    _seed_price_list(
-        c, model="SCORPIO N", variant="Z8L",
-        components={"EX_SHOWROOM": "1600000", "INSURANCE": "60000",
-                    "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "220000"},
-    )
+    _seed_price_list(c, [{
+        "model": "SCORPIO N", "variant": "Z8L",
+        "components": {"EX_SHOWROOM": "1600000", "INSURANCE": "60000",
+                       "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "220000"},
+    }])
     _set_journey_product(c, "Scorpio N", "Z8L")
     _set_commercial(c, "ex_showroom_price", "1600000")
     _set_commercial(c, "total_price", "1830000")  # 1.6M + 60k + 170k (individual)
@@ -279,17 +286,15 @@ def test_integration_resolves_and_pins_sku(journey) -> None:
 
 def test_integration_resolves_via_ex_showroom_when_total_ambiguous(journey) -> None:
     c = journey
-    _seed_price_list(
-        c, model="THAR", variant="LX",
-        components={"EX_SHOWROOM": "1500000", "INSURANCE": "60000",
-                    "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "200000"},
-    )
-    _seed_price_list(
-        c, model="THAR", variant="AX",
-        components={"EX_SHOWROOM": "1400000", "INSURANCE": "160000",
-                    "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "200000"},
-    )
-    # both variants total 1,730,000 individual — only ex-showroom disambiguates
+    # both THAR variants total 1,730,000 individual — only ex-showroom disambiguates
+    _seed_price_list(c, [
+        {"model": "THAR", "variant": "LX",
+         "components": {"EX_SHOWROOM": "1500000", "INSURANCE": "60000",
+                        "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "200000"}},
+        {"model": "THAR", "variant": "AX",
+         "components": {"EX_SHOWROOM": "1400000", "INSURANCE": "160000",
+                        "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "200000"}},
+    ])
     _set_journey_product(c, "Thar", None)
     _set_commercial(c, "ex_showroom_price", "1400000")
     _set_commercial(c, "total_price", "1730000")
@@ -304,11 +309,11 @@ def test_integration_resolves_via_ex_showroom_when_total_ambiguous(journey) -> N
 
 def test_integration_raises_flag_when_no_match(journey) -> None:
     c = journey
-    _seed_price_list(
-        c, model="THAR ROXX", variant="AX",
-        components={"EX_SHOWROOM": "1400000", "REGISTRATION_INDIVIDUAL": "150000",
-                    "REGISTRATION_CORPORATE": "180000"},
-    )
+    _seed_price_list(c, [{
+        "model": "THAR ROXX", "variant": "AX",
+        "components": {"EX_SHOWROOM": "1400000", "REGISTRATION_INDIVIDUAL": "150000",
+                       "REGISTRATION_CORPORATE": "180000"},
+    }])
     _set_journey_product(c, "Scorpio N", "Z8L")  # not in the price list
     _set_commercial(c, "ex_showroom_price", "1600000")
     _set_commercial(c, "total_price", "1830000")
@@ -334,11 +339,11 @@ def test_integration_raises_flag_when_no_match(journey) -> None:
 
 def test_integration_flag_resolves_when_model_confirmed(journey) -> None:
     c = journey
-    sku_id = _seed_price_list(
-        c, model="XUV 7XO", variant="AX7L",
-        components={"EX_SHOWROOM": "2000000", "REGISTRATION_INDIVIDUAL": "200000",
-                    "REGISTRATION_CORPORATE": "240000"},
-    )
+    (sku_id,) = _seed_price_list(c, [{
+        "model": "XUV 7XO", "variant": "AX7L",
+        "components": {"EX_SHOWROOM": "2000000", "REGISTRATION_INDIVIDUAL": "200000",
+                       "REGISTRATION_CORPORATE": "240000"},
+    }])
     _set_journey_product(c, "Wrong Model", None)
     _set_commercial(c, "ex_showroom_price", "2000000")
     mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
