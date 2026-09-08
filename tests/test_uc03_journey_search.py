@@ -511,6 +511,16 @@ def test_journey_overview_returns_booking_delivery_and_multiple_payments(journey
     assert body["registration"]["registrationNumber"] == "CH01AB1234"
     assert len(body["payments"]) == 2
     assert "paymentStage" not in body["payments"][0]
+    # P5 additive projection fields
+    assert "bookingPcVerificationStatus" in body["journey"]
+    assert "bookingCaptureCompletedAtUtc" in body["journey"]
+    assert "deliveryPcVerificationStatus" in body["journey"]
+    for finding in body["findings"]:
+        assert "ruleKey" in finding
+        assert "findingClass" in finding
+        assert "slaDueAtUtc" in finding
+        assert "ownerRoleCode" in finding
+        assert "disposition" in finding
 
 
 def test_out_of_scope_overview_does_not_disclose_journey(journey_search_setup) -> None:
