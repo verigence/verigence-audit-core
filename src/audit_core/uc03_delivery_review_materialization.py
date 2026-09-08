@@ -22,6 +22,10 @@ from audit_core import uc03_booking_capture
 from audit_core import uc03_v2_review_materialization as booking_materialization
 from audit_core.uc03_attribute_mapping import spec_for_field
 from audit_core.uc03_invoice_materialization import materialize_reviewed_invoices
+from audit_core.uc03_payment_reconciliation import (
+    materialize_reviewed_bank_statements,
+    reconcile_payments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -736,6 +740,16 @@ def materialize_reviewed_delivery_business_values(
         documents=documents,
         actor_id=actor_id,
     )
+    bank_lines = materialize_reviewed_bank_statements(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        documents=documents,
+        actor_id=actor_id,
+    )
+    reconciliation = reconcile_payments(
+        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id="",
+    )
     result = {
         "vehicleFields": vehicle_fields,
         "registrationFields": registration_fields,
@@ -744,6 +758,8 @@ def materialize_reviewed_delivery_business_values(
         "invoiceCommercialLines": invoices["commercialLines"],
         "invoiceDiscountApplications": invoices["discountApplications"],
         "commercialLines": commercial_lines,
+        "bankStatementLines": bank_lines,
+        "paymentReconciliation": reconciliation,
         "receiptDocuments": receipts["reviewRowsWritten"],
         "receiptPaymentsCreated": receipts["created"],
         "receiptPaymentsUpdated": receipts["updated"],

@@ -24,6 +24,7 @@ from audit_core.uc03_masters_alignment import (
     registration_basis,
 )
 from audit_core.uc03_model_resolution import sync_model_resolution
+from audit_core.uc03_payment_reconciliation import reconcile_payments
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/uc03",
@@ -36,6 +37,7 @@ class JourneyOverviewProjectionResponse(legacy.JourneyOverviewResponse):
     reviewedFields: list[dict[str, Any]] = Field(default_factory=list)
     resolvedReviewedValues: dict[str, dict[str, Any]] = Field(default_factory=dict)
     skuPricing: dict[str, Any] | None = Field(default=None)
+    bankStatementLines: list[dict[str, Any]] = Field(default_factory=list)
 
 
 _BOOKING_REVIEW_FIELDS = (
@@ -308,12 +310,26 @@ def _receipts(
                 r.amount_in_words AS "amountInWords",
                 d.original_filename AS "originalFilename",
                 COALESCE(d.stage_code, 'BOOKING') AS "stageCode",
-                COALESCE(d.capture_status, 'CLASSIFIED') AS "captureStatus"
+                COALESCE(d.capture_status, 'CLASSIFIED') AS "captureStatus",
+                m.match_status AS "bankMatchStatus",
+                m.match_method AS "bankMatchMethod",
+                m.bank_statement_line_id AS "bankMatchLineId",
+                bl.reference_no AS "bankMatchLineReference",
+                bl.transaction_date AS "bankMatchLineDate"
             FROM auditcore.dealer_receipt_review_values r
             LEFT JOIN auditcore.document_capture_v2_documents d
               ON d.tenant_id=r.tenant_id
              AND d.journey_id=r.journey_id
              AND d.di_document_id=r.source_di_document_id
+            LEFT JOIN auditcore.payments p
+              ON p.tenant_id=r.tenant_id
+             AND p.journey_id=r.journey_id
+             AND p.source_di_document_id=r.source_di_document_id
+            LEFT JOIN auditcore.payment_bank_matches m
+              ON m.tenant_id=p.tenant_id AND m.payment_id=p.payment_id
+            LEFT JOIN auditcore.bank_statement_lines bl
+              ON bl.tenant_id=m.tenant_id
+             AND bl.bank_statement_line_id=m.bank_statement_line_id
             WHERE r.tenant_id=:tenant_id AND r.journey_id=:journey_id
             ORDER BY r.reviewed_at_utc, r.dealer_receipt_review_value_id
             """
@@ -328,6 +344,22 @@ def _receipts(
         item["reviewStatus"] = "VERIFIED"
         if item.get("customerPhone"):
             item["customerPhone"] = _masked_phone(item["customerPhone"])
+        status = item.pop("bankMatchStatus", None)
+        method = item.pop("bankMatchMethod", None)
+        line_id = item.pop("bankMatchLineId", None)
+        line_ref = item.pop("bankMatchLineReference", None)
+        line_date = item.pop("bankMatchLineDate", None)
+        item["bankMatch"] = (
+            {
+                "status": status,
+                "method": method,
+                "lineId": str(line_id) if line_id is not None else None,
+                "lineReference": line_ref,
+                "lineDate": line_date,
+            }
+            if status is not None
+            else None
+        )
         result.append(item)
 
     pending_rows = connection.execute(
@@ -353,8 +385,63 @@ def _receipts(
         if str(item["documentId"]) in reviewed_ids:
             continue
         item["reviewStatus"] = review_statuses.get(str(item.get("stageCode")), "PENDING")
+        item["bankMatch"] = None
         result.append(item)
     return result
+
+
+def _bank_statement_lines(
+    connection: Connection, *, tenant_id: str, journey_id: UUID
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        text(
+            """
+            SELECT
+                bl.bank_statement_line_id AS "bankStatementLineId",
+                bl.source_di_document_id  AS "documentId",
+                bl.bank_name              AS "bankName",
+                bl.account_number         AS "accountNumber",
+                bl.transaction_date       AS "transactionDate",
+                bl.value_date             AS "valueDate",
+                bl.transaction_description AS "description",
+                bl.reference_no           AS "referenceNo",
+                bl.counterparty_name      AS "counterpartyName",
+                bl.debit_amount           AS "debitAmount",
+                bl.credit_amount          AS "creditAmount",
+                bl.running_balance        AS "runningBalance",
+                bl.manually_flagged       AS "manuallyFlagged",
+                m.payment_id              AS "matchedPaymentId",
+                m.match_status            AS "matchStatus"
+            FROM auditcore.bank_statement_lines bl
+            LEFT JOIN auditcore.payment_bank_matches m
+              ON m.tenant_id=bl.tenant_id
+             AND m.bank_statement_line_id=bl.bank_statement_line_id
+             AND m.match_status='MATCHED'
+            WHERE bl.tenant_id=:tenant_id AND bl.journey_id=:journey_id
+            ORDER BY bl.transaction_date NULLS LAST, bl.bank_statement_line_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        if item.get("accountNumber"):
+            item["accountNumber"] = _mask_account(str(item["accountNumber"]))
+        matched_payment = item.pop("matchedPaymentId", None)
+        item["matchedPaymentId"] = str(matched_payment) if matched_payment is not None else None
+        item["bankStatementLineId"] = str(item["bankStatementLineId"])
+        if item.get("documentId") is not None:
+            item["documentId"] = str(item["documentId"])
+        out.append(item)
+    return out
+
+
+def _mask_account(value: str) -> str:
+    digits = value.strip()
+    if len(digits) <= 4:
+        return digits
+    return f"{'X' * (len(digits) - 4)}{digits[-4:]}"
 
 
 def _to_decimal(value: Any) -> Decimal | None:
@@ -649,6 +736,9 @@ def get_journey_overview_projection(
     sync_model_resolution(
         connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=""
     )
+    reconcile_payments(
+        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=""
+    )
 
     base = legacy.get_journey_overview(
         tenant_id=tenant_id,
@@ -795,5 +885,10 @@ def get_journey_overview_projection(
         tenant_id=tenant_id,
         journey_id=journey_id,
         reviewed_booking=reviewed_booking,
+    )
+    data["bankStatementLines"] = _bank_statement_lines(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
     )
     return JourneyOverviewProjectionResponse.model_validate(data)

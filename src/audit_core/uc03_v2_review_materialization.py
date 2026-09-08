@@ -1170,6 +1170,10 @@ def materialize_reviewed_di_business_values(
     # A retail / proforma invoice can be captured at Booking; project it with the
     # same invoice-first precedence used at Delivery.
     from audit_core.uc03_invoice_materialization import materialize_reviewed_invoices
+    from audit_core.uc03_payment_reconciliation import (
+        materialize_reviewed_bank_statements,
+        reconcile_payments,
+    )
 
     invoices = materialize_reviewed_invoices(
         connection,
@@ -1178,12 +1182,24 @@ def materialize_reviewed_di_business_values(
         documents=documents,
         actor_id=actor_id,
     )
+    bank_lines = materialize_reviewed_bank_statements(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        documents=documents,
+        actor_id=actor_id,
+    )
+    reconciliation = reconcile_payments(
+        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=""
+    )
     return {
         "bookingFormDocuments": booking["documents"],
         "commercialLines": booking["commercialLines"],
         "invoicesMaterialized": invoices["invoices"],
         "invoiceCommercialLines": invoices["commercialLines"],
         "invoiceDiscountApplications": invoices["discountApplications"],
+        "bankStatementLines": bank_lines,
+        "paymentReconciliation": reconciliation,
         "identityDocuments": identities,
         "receiptDocuments": receipts["reviewRowsWritten"],
         "receiptPaymentsCreated": receipts["created"],
