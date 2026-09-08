@@ -46,6 +46,38 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e '.[test,lint]'
 
+      - name: Verify requirements.txt matches pyproject.toml
+        # Railway's Railpack builder installs the deployed service from
+        # requirements.txt, not pyproject.toml — CI only ever installs from
+        # pyproject.toml, so the two can silently drift (this is exactly how
+        # pdfplumber went missing from a live deploy while every CI run stayed
+        # green). Fail fast the moment the two dependency lists disagree.
+        run: |
+          python - <<'PY'
+          import sys
+          import tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              pyproject_deps = set(tomllib.load(f)["project"]["dependencies"])
+
+          with open("requirements.txt", encoding="utf-8") as f:
+              requirements = {line.strip() for line in f if line.strip() and not line.startswith("#")}
+
+          missing = pyproject_deps - requirements
+          extra = requirements - pyproject_deps
+          if missing or extra:
+              if missing:
+                  print("In pyproject.toml but missing from requirements.txt (Railway will not install these):")
+                  for dep in sorted(missing):
+                      print(f"  - {dep}")
+              if extra:
+                  print("In requirements.txt but not in pyproject.toml dependencies:")
+                  for dep in sorted(extra):
+                      print(f"  - {dep}")
+              sys.exit(1)
+          print(f"requirements.txt matches pyproject.toml ({len(pyproject_deps)} dependencies).")
+          PY
+
       - name: Build package
         run: python -m pip wheel . --no-deps --wheel-dir dist
 
