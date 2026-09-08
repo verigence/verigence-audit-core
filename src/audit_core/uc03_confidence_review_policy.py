@@ -902,6 +902,17 @@ def _sync_booking_document(
         stage_code="BOOKING",
         correlation_id="",
     )
+
+    # Resolve the booking's SKU against the OEM price masters, or raise a
+    # MODEL_NOT_IDENTIFIED finding for the PC (never raises).
+    from audit_core.uc03_model_resolution import sync_model_resolution
+
+    sync_model_resolution(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        correlation_id="",
+    )
     return len(facts)
 
 
