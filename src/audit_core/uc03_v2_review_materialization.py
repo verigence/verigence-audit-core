@@ -152,6 +152,75 @@ _RECEIPT_FIELDS = tuple(_RECEIPT_CAPTURE_MAP)
 _RECEIPT_DATE_FIELDS = {"receipt_date", "payment_reference_date"}
 _RECEIPT_DECIMAL_FIELDS = {"amount_paid"}
 
+# DI generalized-invoice schema (verigence-di schemas/invoice.py) document types
+# and their full field-key set. Materialized by uc03_invoice_materialization.
+_INVOICE_DOCUMENT_TYPES = frozenset(
+    {
+        "tax_invoice_tally",
+        "customer_invoice_dms",
+        "wholesale_invoice",
+        "invoice_generic",
+        "accessory_invoice_dms",
+        "accessory_invoice_tally",
+        "ew_invoice",
+        "rsa_invoice",
+        "tax_invoice",
+        "tax_invoice_dms",
+        "customer_invoice_dms_v2",
+    }
+)
+_INVOICE_REVIEW_FIELDS = frozenset(
+    {
+        "invoice_purpose",
+        "invoice_nature",
+        "invoice_heading_as_printed",
+        "source_system",
+        "issuer_role",
+        "invoice_number",
+        "invoice_date",
+        "seller_name",
+        "seller_gstin",
+        "seller_address",
+        "buyer_name",
+        "buyer_customer_id",
+        "buyer_gstin",
+        "buyer_gstin_status",
+        "buyer_address",
+        "financed_by",
+        "gross_amount_before_discount",
+        "invoice_discount_amount",
+        "taxable_amount",
+        "cgst_rate",
+        "cgst_amount",
+        "sgst_rate",
+        "sgst_amount",
+        "igst_rate",
+        "igst_amount",
+        "cess_amount",
+        "tcs_amount",
+        "round_off_amount",
+        "grand_total_amount",
+        "amount_in_words",
+        "narration",
+        "line_items",
+        "vehicle_description_raw",
+        "sku_code",
+        "model_name_raw",
+        "variant_raw",
+        "vin_number",
+        "chassis_number",
+        "engine_number",
+        "key_number",
+        "vehicle_color",
+        "vehicle_registration_number",
+        "vehicle_hsn_code",
+        "plan_name",
+        "coverage_start_date",
+        "coverage_end_date",
+        "tenure_months",
+    }
+)
+
 
 def reviewed_field_core_owner(
     *,
@@ -181,6 +250,8 @@ def reviewed_field_core_owner(
         return "CUSTOMER_IDENTITY_REVIEW_VALUE", str(document_id)
     if document_type == _RECEIPT_DOCUMENT_TYPE and normalized_field in _RECEIPT_FIELDS:
         return "DEALER_RECEIPT_REVIEW_VALUE", str(document_id)
+    if document_type in _INVOICE_DOCUMENT_TYPES and normalized_field in _INVOICE_REVIEW_FIELDS:
+        return "INVOICE_REVIEW_VALUE", str(document_id)
     return None
 
 
@@ -1096,9 +1167,23 @@ def materialize_reviewed_di_business_values(
         rejected_review_keys=rejected_review_keys,
         actor_id=actor_id,
     )
+    # A retail / proforma invoice can be captured at Booking; project it with the
+    # same invoice-first precedence used at Delivery.
+    from audit_core.uc03_invoice_materialization import materialize_reviewed_invoices
+
+    invoices = materialize_reviewed_invoices(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        documents=documents,
+        actor_id=actor_id,
+    )
     return {
         "bookingFormDocuments": booking["documents"],
         "commercialLines": booking["commercialLines"],
+        "invoicesMaterialized": invoices["invoices"],
+        "invoiceCommercialLines": invoices["commercialLines"],
+        "invoiceDiscountApplications": invoices["discountApplications"],
         "identityDocuments": identities,
         "receiptDocuments": receipts["reviewRowsWritten"],
         "receiptPaymentsCreated": receipts["created"],

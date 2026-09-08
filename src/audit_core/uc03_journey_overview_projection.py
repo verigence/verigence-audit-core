@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any
 from uuid import UUID
@@ -365,33 +366,66 @@ def _to_decimal(value: Any) -> Decimal | None:
         return None
 
 
+def _discount_origin(row: dict[str, Any]) -> str:
+    details = row.get("details")
+    if isinstance(details, str):
+        try:
+            details = json.loads(details)
+        except ValueError:
+            details = {}
+    if isinstance(details, dict):
+        return str(details.get("origin") or "")
+    return ""
+
+
+def _actual_source_rank(row: dict[str, Any]) -> int:
+    """Precedence for the *given* discount amount: an invoice beats the booking
+    form, which beats the reconciliation's own COALESCE fill."""
+    origin = _discount_origin(row)
+    if origin == "INVOICE_MATERIALIZATION":
+        return 0
+    if str(row.get("sourceKind") or "").upper() == "EVIDENCE":
+        return 1
+    if origin == "DEAL_RECONCILIATION" or str(row.get("sourceKind") or "").upper() == "CALCULATED":
+        return 2
+    return 3
+
+
 def _collapse_discounts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """One row per discount. ``uc03_deal_reconciliation`` writes canonical-keyed
-    CALCULATED rows carrying both entitled + given; the older evidence-only
-    materialiser writes legacy-keyed rows carrying only the given amount. Prefer
-    the CALCULATED row and fold any legacy actual onto it."""
-    by_key: dict[str, dict[str, Any]] = {}
+    """One row per discount key. ``uc03_deal_reconciliation`` writes a canonical
+    CALCULATED row carrying the entitled amount; ``uc03_invoice_materialization``
+    and the booking-form materialiser write the given amount (invoice wins). Keep
+    the entitled/standard side from the reconciliation row and take the given side
+    from the strongest source."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
     for row in rows:
         canonical = canonical_discount_key(str(row.get("discountKey") or ""))
-        current = by_key.get(canonical)
-        is_calc = str(row.get("sourceKind") or "").upper() == "CALCULATED"
-        if current is None:
-            merged = dict(row)
-            merged["discountKey"] = canonical
-            by_key[canonical] = merged
-            continue
-        current_is_calc = str(current.get("sourceKind") or "").upper() == "CALCULATED"
-        if is_calc and not current_is_calc:
-            actual = current.get("actualDiscountAmount")
-            merged = dict(row)
-            merged["discountKey"] = canonical
-            if merged.get("actualDiscountAmount") is None and actual is not None:
-                merged["actualDiscountAmount"] = actual
-            by_key[canonical] = merged
-        elif not is_calc and current_is_calc:
-            if current.get("actualDiscountAmount") is None and row.get("actualDiscountAmount") is not None:
-                current["actualDiscountAmount"] = row.get("actualDiscountAmount")
-    return list(by_key.values())
+        if canonical not in grouped:
+            grouped[canonical] = []
+            order.append(canonical)
+        grouped[canonical].append(row)
+
+    collapsed: list[dict[str, Any]] = []
+    for canonical in order:
+        bucket = grouped[canonical]
+        standard_carrier = next(
+            (r for r in bucket if r.get("standardEligibleAmount") is not None), bucket[0]
+        )
+        actual_carrier = min(
+            (r for r in bucket if r.get("actualDiscountAmount") is not None),
+            key=_actual_source_rank,
+            default=None,
+        )
+        merged = dict(standard_carrier)
+        merged["discountKey"] = canonical
+        if actual_carrier is not None:
+            merged["actualDiscountAmount"] = actual_carrier.get("actualDiscountAmount")
+            if _actual_source_rank(actual_carrier) < _actual_source_rank(standard_carrier):
+                merged["sourceKind"] = actual_carrier.get("sourceKind")
+                merged["sourceEvidenceId"] = actual_carrier.get("sourceEvidenceId")
+        collapsed.append(merged)
+    return collapsed
 
 
 def _sku_pricing_panel(
