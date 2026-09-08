@@ -45,8 +45,10 @@ from audit_core.discount_schemes import (
 )
 from audit_core.errors import NotFoundError, ValidationError
 from audit_core.oem_master_parsers import (
+    PRICE_COMPONENT_KEYS,
     MasterParseError,
     ParseResult,
+    PriceRow,
     parse_master,
 )
 from audit_core.price_lists import (
@@ -168,106 +170,188 @@ def _resolve_models(
 
 
 # ── catalogue upserts ───────────────────────────────────────────────────────────
-def _ensure_oem_model(
-    connection: Connection, *, oem_id: UUID, model_name: str
-) -> UUID:
-    code = _slug_model(model_name)[:100]
-    existing = connection.execute(
-        text(
-            "SELECT model_id FROM auditcore.product_models "
-            "WHERE oem_id = :oem_id AND model_code = :code"
-        ),
-        {"oem_id": oem_id, "code": code},
-    ).scalar_one_or_none()
-    if existing is not None:
-        return existing
-    return connection.execute(
-        text(
-            "INSERT INTO auditcore.product_models (oem_id, model_code, model_name) "
-            "VALUES (:oem_id, :code, :name) RETURNING model_id"
-        ),
-        {"oem_id": oem_id, "code": code, "name": model_name.strip()[:200]},
-    ).scalar_one()
-
-
-def _ensure_variant(
-    connection: Connection, *, model_id: UUID, variant_name: str, basis: str, attrs: dict[str, Any]
-) -> UUID:
-    suffix = "" if basis == "STANDARD" else f"__{basis[:3]}"
-    code = (_slug_model(variant_name)[:110] + suffix)[:120]
-    display = (
-        variant_name.strip()
-        if basis == "STANDARD"
-        else f"{variant_name.strip()} ({basis.title()})"
-    )[:240]
-    existing = connection.execute(
-        text(
-            "SELECT variant_id FROM auditcore.product_variants "
-            "WHERE model_id = :model_id AND variant_code = :code"
-        ),
-        {"model_id": model_id, "code": code},
-    ).scalar_one_or_none()
-    if existing is not None:
-        return existing
-    return connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.product_variants (
-                model_id, variant_code, variant_name, fuel_powertrain, transmission,
-                body_type, attributes
-            ) VALUES (
-                :model_id, :code, :name, :fuel, :transmission, :body_type,
-                CAST(:attributes AS jsonb)
-            ) RETURNING variant_id
-            """
-        ),
-        {
-            "model_id": model_id,
-            "code": code,
-            "name": display,
-            "fuel": attrs.get("fuel"),
-            "transmission": attrs.get("transmission"),
-            "body_type": attrs.get("bodyType"),
-            "attributes": json.dumps(attrs),
-        },
-    ).scalar_one()
-
-
-def _ensure_sku(
+# A native consolidated price list is 300+ rows; issuing one SELECT/INSERT per row
+# (or worse, per row per price component) is enough sequential round trips to
+# exceed the edge proxy's request timeout. Every ``_bulk_ensure_*`` helper below
+# resolves its whole catalogue in a small, fixed number of round trips: one SELECT
+# to load everything that already exists for this OEM, then at most one multi-row
+# INSERT (chunked) for whatever is missing.
+def _chunked_insert_returning(
     connection: Connection,
     *,
-    oem_id: UUID,
-    model_id: UUID,
-    variant_id: UUID,
-    sku_code: str,
-) -> UUID:
-    sku_code = sku_code[:160]
+    table: str,
+    columns: list[str],
+    rows: list[dict[str, Any]],
+    returning: list[str],
+    jsonb_columns: frozenset[str] = frozenset(),
+    chunk_size: int = 500,
+) -> list[dict[str, Any]]:
+    """INSERT ``rows`` as a small number of multi-row statements (one per chunk),
+    each with its own placeholders — never string-interpolates a value. ``table``,
+    ``columns`` and ``returning`` are internal identifiers, never user input."""
+    if not rows:
+        return []
+    out: list[dict[str, Any]] = []
+    for start in range(0, len(rows), chunk_size):
+        chunk = rows[start : start + chunk_size]
+        params: dict[str, Any] = {}
+        values_sql: list[str] = []
+        for i, row in enumerate(chunk):
+            placeholders = []
+            for col in columns:
+                key = f"{col}_{i}"
+                params[key] = row[col]
+                placeholders.append(f"CAST(:{key} AS jsonb)" if col in jsonb_columns else f":{key}")
+            values_sql.append(f"({', '.join(placeholders)})")
+        sql = f"INSERT INTO auditcore.{table} ({', '.join(columns)}) VALUES {', '.join(values_sql)}"
+        if returning:
+            sql += f" RETURNING {', '.join(returning)}"
+        result = connection.execute(text(sql), params)
+        if returning:
+            out.extend(dict(r) for r in result.mappings().all())
+    return out
+
+
+def _bulk_ensure_models(
+    connection: Connection, *, oem_id: UUID, model_names: list[str]
+) -> dict[str, UUID]:
+    """model_name -> model_id, for every name in ``model_names``. One SELECT for
+    the OEM's whole existing model catalogue, one batched INSERT for the rest."""
+    unique_names = list(dict.fromkeys(model_names))
+    code_by_name = {name: _slug_model(name)[:100] for name in unique_names}
+
+    existing = connection.execute(
+        text("SELECT model_code, model_id FROM auditcore.product_models WHERE oem_id = :oem_id"),
+        {"oem_id": oem_id},
+    ).all()
+    id_by_code: dict[str, UUID] = {row[0]: row[1] for row in existing}
+
+    to_insert: dict[str, str] = {}  # code -> model_name, first name for a given code wins
+    for name in unique_names:
+        code = code_by_name[name]
+        if code not in id_by_code and code not in to_insert:
+            to_insert[code] = name
+
+    inserted = _chunked_insert_returning(
+        connection,
+        table="product_models",
+        columns=["oem_id", "model_code", "model_name"],
+        rows=[
+            {"oem_id": oem_id, "model_code": code, "model_name": name.strip()[:200]}
+            for code, name in to_insert.items()
+        ],
+        returning=["model_code", "model_id"],
+    )
+    for row in inserted:
+        id_by_code[row["model_code"]] = row["model_id"]
+
+    return {name: id_by_code[code_by_name[name]] for name in unique_names}
+
+
+def _bulk_ensure_variants(
+    connection: Connection, *, entries: list[tuple[UUID, str, str, dict[str, Any]]]
+) -> dict[tuple[UUID, str], UUID]:
+    """(model_id, variant_code) -> variant_id for every ``(model_id, code, display_name,
+    attrs)`` entry. One SELECT across every model involved, one batched INSERT."""
+    model_ids = list({model_id for model_id, *_ in entries})
+    if not model_ids:
+        return {}
+
     existing = connection.execute(
         text(
-            "SELECT product_sku_id, model_id, variant_id FROM auditcore.product_skus "
-            "WHERE oem_id = :oem_id AND sku_code = :sku_code"
+            "SELECT model_id, variant_code, variant_id FROM auditcore.product_variants "
+            "WHERE model_id = ANY(:model_ids)"
         ),
-        {"oem_id": oem_id, "sku_code": sku_code},
-    ).mappings().one_or_none()
-    if existing is not None:
-        if existing["model_id"] != model_id or existing["variant_id"] != variant_id:
-            raise ValidationError(
-                detail=f"SKU '{sku_code}' already maps to a different model/variant."
-            )
-        return existing["product_sku_id"]
-    return connection.execute(
+        {"model_ids": model_ids},
+    ).all()
+    id_by_key: dict[tuple[UUID, str], UUID] = {(row[0], row[1]): row[2] for row in existing}
+
+    to_insert: dict[tuple[UUID, str], dict[str, Any]] = {}
+    for model_id, code, display_name, attrs in entries:
+        key = (model_id, code)
+        if key not in id_by_key and key not in to_insert:
+            to_insert[key] = {
+                "model_id": model_id,
+                "variant_code": code,
+                "variant_name": display_name,
+                "fuel_powertrain": attrs.get("fuel"),
+                "transmission": attrs.get("transmission"),
+                "body_type": attrs.get("bodyType"),
+                "attributes": json.dumps(attrs),
+            }
+
+    inserted = _chunked_insert_returning(
+        connection,
+        table="product_variants",
+        columns=[
+            "model_id", "variant_code", "variant_name", "fuel_powertrain",
+            "transmission", "body_type", "attributes",
+        ],
+        rows=list(to_insert.values()),
+        returning=["model_id", "variant_code", "variant_id"],
+        jsonb_columns=frozenset({"attributes"}),
+    )
+    for row in inserted:
+        id_by_key[(row["model_id"], row["variant_code"])] = row["variant_id"]
+
+    return id_by_key
+
+
+def _bulk_ensure_skus(
+    connection: Connection, *, oem_id: UUID, entries: list[tuple[str, UUID, UUID]]
+) -> dict[str, UUID]:
+    """sku_code -> product_sku_id for every ``(sku_code, model_id, variant_id)``
+    entry, raising on the same "already maps to a different model/variant"
+    conflict the old per-row ``_ensure_sku`` raised — checked both against the
+    OEM's existing catalogue and against the rest of this same upload."""
+    existing = connection.execute(
         text(
-            """
-            INSERT INTO auditcore.product_skus (
-                oem_id, model_id, variant_id, sku_code, attributes
-            ) VALUES (
-                :oem_id, :model_id, :variant_id, :sku_code,
-                jsonb_build_object('source', 'OEM_NATIVE_PRICE_LIST')
-            ) RETURNING product_sku_id
-            """
+            "SELECT sku_code, product_sku_id, model_id, variant_id "
+            "FROM auditcore.product_skus WHERE oem_id = :oem_id"
         ),
-        {"oem_id": oem_id, "model_id": model_id, "variant_id": variant_id, "sku_code": sku_code},
-    ).scalar_one()
+        {"oem_id": oem_id},
+    ).all()
+    by_code: dict[str, tuple[UUID, UUID, UUID]] = {row[0]: (row[1], row[2], row[3]) for row in existing}
+
+    id_by_code: dict[str, UUID] = {}
+    to_insert: dict[str, dict[str, Any]] = {}
+    for sku_code, model_id, variant_id in entries:
+        found = by_code.get(sku_code)
+        if found is not None:
+            existing_sku_id, existing_model_id, existing_variant_id = found
+            if existing_model_id != model_id or existing_variant_id != variant_id:
+                raise ValidationError(
+                    detail=f"SKU '{sku_code}' already maps to a different model/variant."
+                )
+            id_by_code[sku_code] = existing_sku_id
+            continue
+        queued = to_insert.get(sku_code)
+        if queued is not None:
+            if queued["model_id"] != model_id or queued["variant_id"] != variant_id:
+                raise ValidationError(
+                    detail=f"SKU '{sku_code}' already maps to a different model/variant."
+                )
+            continue
+        to_insert[sku_code] = {
+            "oem_id": oem_id,
+            "model_id": model_id,
+            "variant_id": variant_id,
+            "sku_code": sku_code,
+            "attributes": json.dumps({"source": "OEM_NATIVE_PRICE_LIST"}),
+        }
+
+    inserted = _chunked_insert_returning(
+        connection,
+        table="product_skus",
+        columns=["oem_id", "model_id", "variant_id", "sku_code", "attributes"],
+        rows=list(to_insert.values()),
+        returning=["sku_code", "product_sku_id"],
+        jsonb_columns=frozenset({"attributes"}),
+    )
+    for row in inserted:
+        id_by_code[row["sku_code"]] = row["product_sku_id"]
+
+    return id_by_code
 
 
 # ── price list ingestion ────────────────────────────────────────────────────────
@@ -320,15 +404,31 @@ def ingest_price_list(
         actor_id=actor_id,
     )
 
-    sku_ids: dict[str, UUID] = {}
-    for row in parsed.price_rows:
-        model_id = _ensure_oem_model(connection, oem_id=oem_id, model_name=row.model_name)
-        variant_id = _ensure_variant(
-            connection,
-            model_id=model_id,
-            variant_name=row.variant_name,
-            basis=row.registration_basis,
-            attrs={
+    rows = parsed.price_rows
+
+    # 1) models — one lookup + one batched insert for every distinct model name.
+    model_id_by_name = _bulk_ensure_models(
+        connection, oem_id=oem_id, model_names=[row.model_name for row in rows]
+    )
+
+    # 2) variants — same shape, scoped to the models involved.
+    def _variant_code(row: PriceRow) -> str:
+        suffix = "" if row.registration_basis == "STANDARD" else f"__{row.registration_basis[:3]}"
+        return (_slug_model(row.variant_name)[:110] + suffix)[:120]
+
+    def _variant_display(row: PriceRow) -> str:
+        return (
+            row.variant_name.strip()
+            if row.registration_basis == "STANDARD"
+            else f"{row.variant_name.strip()} ({row.registration_basis.title()})"
+        )[:240]
+
+    variant_entries = [
+        (
+            model_id_by_name[row.model_name],
+            _variant_code(row),
+            _variant_display(row),
+            {
                 "fuel": row.fuel,
                 "transmission": row.transmission,
                 "drive": row.drive,
@@ -337,46 +437,58 @@ def ingest_price_list(
                 "sourceSheet": row.source_sheet,
             },
         )
+        for row in rows
+    ]
+    variant_id_by_key = _bulk_ensure_variants(connection, entries=variant_entries)
+
+    # 3) SKUs — same shape, with the existing cross-model/variant conflict guard.
+    def _sku_code(row: PriceRow) -> str:
         suffix = "" if row.registration_basis == "STANDARD" else f"::{row.registration_basis[:3]}"
-        sku_code = f"{_slug_model(row.model_name)}::{row.variant_name}{suffix}"
-        sku_id = _ensure_sku(
-            connection, oem_id=oem_id, model_id=model_id, variant_id=variant_id, sku_code=sku_code
-        )
-        sku_ids[sku_code] = sku_id
-        for component_key, amount in row.components.items():
-            connection.execute(
-                text(
-                    """
-                    INSERT INTO auditcore.price_list_items (
-                        tenant_id, price_list_version_id, product_sku_id,
-                        component_key, standard_amount, metadata
-                    ) VALUES (
-                        :tenant_id, :version_id, :sku_id, :component_key, :amount,
-                        CAST(:metadata AS jsonb)
-                    )
-                    """
-                ),
+        return f"{_slug_model(row.model_name)}::{row.variant_name}{suffix}"[:160]
+
+    sku_codes = [_sku_code(row) for row in rows]
+    sku_entries = [
+        (sku_code, model_id_by_name[row.model_name], variant_id_by_key[(model_id_by_name[row.model_name], _variant_code(row))])
+        for row, sku_code in zip(rows, sku_codes)
+    ]
+    sku_id_by_code = _bulk_ensure_skus(connection, oem_id=oem_id, entries=sku_entries)
+
+    # 4) price_list_items — every component of every row in one batched insert.
+    item_rows = [
+        {
+            "tenant_id": tenant_id,
+            "price_list_version_id": version_id,
+            "product_sku_id": sku_id_by_code[sku_code],
+            "component_key": component_key,
+            "standard_amount": amount,
+            "metadata": json.dumps(
                 {
-                    "tenant_id": tenant_id,
-                    "version_id": version_id,
-                    "sku_id": sku_id,
-                    "component_key": component_key,
-                    "amount": amount,
-                    "metadata": json.dumps(
-                        {
-                            "source": "OEM_NATIVE_PRICE_LIST",
-                            "category": row.category,
-                            "onRoadIndividual": str(row.onroad_individual),
-                            "onRoadCorporate": str(row.onroad_corporate),
-                        }
-                    ),
-                },
-            )
+                    "source": "OEM_NATIVE_PRICE_LIST",
+                    "category": row.category,
+                    "onRoadIndividual": str(row.onroad_individual),
+                    "onRoadCorporate": str(row.onroad_corporate),
+                }
+            ),
+        }
+        for row, sku_code in zip(rows, sku_codes)
+        for component_key, amount in row.components.items()
+    ]
+    _chunked_insert_returning(
+        connection,
+        table="price_list_items",
+        columns=[
+            "tenant_id", "price_list_version_id", "product_sku_id",
+            "component_key", "standard_amount", "metadata",
+        ],
+        rows=item_rows,
+        returning=[],
+        jsonb_columns=frozenset({"metadata"}),
+    )
 
     publish_price_list_version(
         connection, tenant_id=tenant_id, price_list_version_id=version_id, actor_id=actor_id
     )
-    return version_id, sku_ids
+    return version_id, sku_id_by_code
 
 
 # ── discount ingestion ──────────────────────────────────────────────────────────
@@ -765,21 +877,62 @@ def ingest_corporate_policy(
         actor_id=actor_id,
     )
 
-    # company registry — full replace for this OEM
+    # company registry — full replace for this OEM. The registry can run to
+    # hundreds/thousands of companies; upsert it in a handful of chunked
+    # multi-row statements rather than one round trip per company.
     connection.execute(
         text("DELETE FROM auditcore.corporate_privilege_registry WHERE oem_code = :oem_code"),
         {"oem_code": oem_code},
     )
-    for company in parsed.corporate_companies:
+    _bulk_upsert_corporate_companies(
+        connection,
+        rows=[
+            {
+                "oem_code": oem_code,
+                "corporate_code": company.corporate_code[:60],
+                "corporate_name": company.corporate_name[:400],
+                "corporate_type": (company.corporate_type or None) and company.corporate_type[:200],
+                "privilege_category": company.privilege_category,
+                "source_upload_id": upload_id,
+                "effective_from": effective_from,
+            }
+            for company in parsed.corporate_companies
+        ],
+    )
+    summary["companies"] = len(parsed.corporate_companies)
+    return summary
+
+
+def _bulk_upsert_corporate_companies(
+    connection: Connection, *, rows: list[dict[str, Any]], chunk_size: int = 500
+) -> None:
+    if not rows:
+        return
+    # a single multi-row INSERT ... ON CONFLICT cannot affect the same conflict
+    # target twice; keep the last row for a repeated (oem_code, corporate_code),
+    # matching the previous sequential upsert's "last one wins" behaviour.
+    deduped: dict[tuple[str, str], dict[str, Any]] = {
+        (row["oem_code"], row["corporate_code"]): row for row in rows
+    }
+    rows = list(deduped.values())
+    columns = [
+        "oem_code", "corporate_code", "corporate_name", "corporate_type",
+        "privilege_category", "source_upload_id", "effective_from",
+    ]
+    for start in range(0, len(rows), chunk_size):
+        chunk = rows[start : start + chunk_size]
+        params: dict[str, Any] = {}
+        values_sql: list[str] = []
+        for i, row in enumerate(chunk):
+            placeholders = [f":{col}_{i}" for col in columns]
+            for col in columns:
+                params[f"{col}_{i}"] = row[col]
+            values_sql.append(f"({', '.join(placeholders)})")
         connection.execute(
             text(
-                """
-                INSERT INTO auditcore.corporate_privilege_registry (
-                    oem_code, corporate_code, corporate_name, corporate_type,
-                    privilege_category, source_upload_id, effective_from
-                ) VALUES (
-                    :oem_code, :code, :name, :ctype, :category, :upload_id, :eff
-                )
+                f"""
+                INSERT INTO auditcore.corporate_privilege_registry ({', '.join(columns)})
+                VALUES {', '.join(values_sql)}
                 ON CONFLICT (oem_code, corporate_code) DO UPDATE SET
                     corporate_name = EXCLUDED.corporate_name,
                     corporate_type = EXCLUDED.corporate_type,
@@ -788,34 +941,45 @@ def ingest_corporate_policy(
                     effective_from = EXCLUDED.effective_from
                 """
             ),
-            {
-                "oem_code": oem_code,
-                "code": company.corporate_code[:60],
-                "name": company.corporate_name[:400],
-                "ctype": (company.corporate_type or None) and company.corporate_type[:200],
-                "category": company.privilege_category,
-                "upload_id": upload_id,
-                "eff": effective_from,
-            },
+            params,
         )
-    summary["companies"] = len(parsed.corporate_companies)
-    return summary
 
 
 # ── preview builder ─────────────────────────────────────────────────────────────
+_PRICE_COMPONENT_PREVIEW_LABELS: dict[str, str] = {
+    "EX_SHOWROOM": "exShowroom",
+    "TCS": "tcs",
+    "INSURANCE": "insurance",
+    "EXT_WARRANTY_4TH_YR": "extWarranty4thYr",
+    "EXT_WARRANTY_4TH_5TH_YR": "extWarranty4th5thYr",
+    "ACCESSORIES_KIT": "accessoriesKit",
+    "RSA_1YR": "rsa1Yr",
+    "FASTAG": "fastag",
+    "REGISTRATION_INDIVIDUAL": "registrationIndividual",
+    "REGISTRATION_CORPORATE": "registrationCorporate",
+}
+
+
 def _build_preview(parsed: ParseResult, kind: str) -> dict[str, Any]:
     row_counts: dict[str, Any] = dict(parsed.meta)
     sample: list[dict[str, Any]] = []
     if kind == "PRICE_LIST":
         row_counts["priceRows"] = len(parsed.price_rows)
+        # Every price component that will be written to price_list_items on
+        # Publish, not just Ex-Showroom — an admin must be able to see the whole
+        # line-item breakdown before publishing, not only the headline price.
         sample = [
             {
                 "model": r.model_name,
                 "variant": r.variant_name,
                 "category": r.category,
                 "registrationBasis": r.registration_basis,
-                "exShowroom": str(r.components["EX_SHOWROOM"]),
+                **{
+                    _PRICE_COMPONENT_PREVIEW_LABELS[key]: str(r.components[key])
+                    for key in PRICE_COMPONENT_KEYS
+                },
                 "onRoadIndividual": str(r.onroad_individual),
+                "onRoadCorporate": str(r.onroad_corporate),
             }
             for r in parsed.price_rows[:25]
         ]

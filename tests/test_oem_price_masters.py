@@ -14,12 +14,15 @@ from openpyxl import Workbook
 from sqlalchemy import create_engine, text
 
 from audit_core.oem_master_parsers import (
+    CorporateBenefitRow,
+    CorporateCompany,
     DiscountRow,
     ParseResult,
     parse_price_list,
 )
 from audit_core.oem_price_masters import (
     _project_oem,
+    ingest_corporate_policy,
     ingest_discount_document,
     ingest_price_list,
 )
@@ -204,3 +207,56 @@ def test_discount_ingest_and_tombstone(connection) -> None:
     by_code = {r["scheme_code"]: r["n"] for r in live_benefits}
     scorpio = next(c for c in by_code if "SCORPIO" in c)
     assert by_code[scorpio] == 0  # tombstoned: latest version carries no benefit
+
+
+def test_corporate_policy_batches_large_company_registry(connection) -> None:
+    # A company list can run to hundreds/thousands of rows — this exercises the
+    # batched upsert (chunk_size=500 default) across a chunk boundary, plus a
+    # duplicate corporate_code within one file (last one must win, matching the
+    # old sequential upsert's semantics) and full-replace on re-upload.
+    tenant_id = connection.tenant_id
+    project = _project_oem(connection, tenant_id)
+    ingest_price_list(
+        connection, tenant_id=tenant_id, oem_id=project["oem_id"],
+        effective_from=date(2026, 9, 3),
+        parsed=parse_price_list(_price_bytes(("THAR ROXX", "MX1 PMT 2WD", 1_000_000))),
+        actor_id="admin",
+    )
+
+    parsed = ParseResult(kind="CORPORATE_POLICY")
+    parsed.corporate_benefits = [
+        CorporateBenefitRow(1, "Z", "Thar Roxx", Decimal(10000), Decimal(5000), Decimal(15000)),
+    ]
+    parsed.corporate_companies = [
+        CorporateCompany(f"CORP-{i:04d}", f"Company {i}", "PSU", "Z") for i in range(600)
+    ]
+    parsed.corporate_companies.append(CorporateCompany("CORP-0000", "Company 0 Renamed", "PSU", "Z"))
+
+    summary = ingest_corporate_policy(
+        connection, tenant_id=tenant_id, oem_id=project["oem_id"], oem_code="MAHINDRA",
+        effective_from=date(2026, 9, 3), parsed=parsed, upload_id=uuid4(), actor_id="admin",
+    )
+    assert summary["published"] == 1
+    assert summary["companies"] == 601
+
+    rows = connection.execute(
+        text("SELECT corporate_code, corporate_name FROM auditcore.corporate_privilege_registry "
+             "WHERE oem_code = 'MAHINDRA' ORDER BY corporate_code"),
+    ).mappings().all()
+    assert len(rows) == 600  # the duplicate code collapsed to one row
+    by_corp_code = {r["corporate_code"]: r["corporate_name"] for r in rows}
+    assert by_corp_code["CORP-0000"] == "Company 0 Renamed"  # last one wins
+    assert by_corp_code["CORP-0599"] == "Company 599"
+
+    # re-upload fully replaces the registry
+    parsed2 = ParseResult(kind="CORPORATE_POLICY")
+    parsed2.corporate_benefits = parsed.corporate_benefits
+    parsed2.corporate_companies = [CorporateCompany("CORP-0000", "Only Company Left", "PSU", "Z")]
+    ingest_corporate_policy(
+        connection, tenant_id=tenant_id, oem_id=project["oem_id"], oem_code="MAHINDRA",
+        effective_from=date(2026, 10, 1), parsed=parsed2, upload_id=uuid4(), actor_id="admin",
+    )
+    remaining = connection.execute(
+        text("SELECT count(*) FROM auditcore.corporate_privilege_registry WHERE oem_code='MAHINDRA'")
+    ).scalar_one()
+    assert remaining == 1
