@@ -191,27 +191,6 @@ def _unreviewed_low_confidence_count(
     )
 
 
-def _pending_proposal_count(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-) -> int:
-    return int(
-        connection.execute(
-            text(
-                """
-                SELECT count(*)
-                FROM auditcore.journey_capture_proposals
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND stage_code='BOOKING' AND proposal_status='PENDING'
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).scalar_one()
-    )
-
-
 def _completion_summary(
     connection: Connection,
     tenant_id: str,
@@ -282,11 +261,6 @@ def _completion_summary(
             }
         )
 
-    pending_proposals = _pending_proposal_count(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-    )
     return {
         "ready": not blockers,
         "blockers": blockers,
@@ -298,8 +272,11 @@ def _completion_summary(
             or item["evidenceId"]
             or item["requirementStatus"] in {"SATISFIED", "WAIVED", "NOT_APPLICABLE"}
         ),
-        # Kept for existing clients as an informational count only.
-        "pendingProposalCount": pending_proposals,
+        # Confirmed (Phase 0 investigation) that no current client reads this
+        # field -- it counted rows in the retired V1 journey_capture_proposals
+        # flow. Kept in the response shape for API-contract stability, but no
+        # longer costs a query on every workspace read.
+        "pendingProposalCount": 0,
         "blockingFlagCount": blocking_flags,
         "lowConfidenceReviewCount": low_confidence,
     }
