@@ -115,6 +115,83 @@ def _resolve_failure(
     )
 
 
+_DOCUMENT_MISSING_TYPE = "DOCUMENT_MISSING"
+
+
+def _document_missing_rule_key(stage_code: StageCode, document_id: UUID) -> str:
+    return f"{_DOCUMENT_MISSING_TYPE}:{stage_code}:{document_id}"
+
+
+def sync_document_confirmation_status(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    stage_code: StageCode,
+    document_id: UUID,
+    confirmation_status: str | None,
+    document_label: str,
+    correlation_id: str,
+) -> None:
+    """Raise DOCUMENT_MISSING the moment DI reports a non-retryable extraction
+    failure for a document; resolve it the moment that same requirement's
+    active document confirms cleanly (a reupload, or DI succeeding on retry).
+
+    This is deliberately independent of whether facts get pulled/materialized
+    -- it only tracks the document's own confirmation outcome, so it applies
+    uniformly to both stages regardless of how far each stage's materialization
+    pipeline reaches. Idempotent; never raises (best-effort, same as every
+    other producer here).
+    """
+    try:
+        rule_key = _document_missing_rule_key(stage_code, document_id)
+        status = str(confirmation_status or "").upper()
+        if status == "NOT_CONFIRMED":
+            _machine_flag(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                stage_code=stage_code,
+                rule_key=rule_key,
+                finding_type=_DOCUMENT_MISSING_TYPE,
+                severity="MEDIUM",
+                title=f"Document could not be processed: {document_label}",
+                description=(
+                    f"Document Intelligence could not process {document_label} -- "
+                    "the file may be unreadable, corrupt, or the wrong document. "
+                    "Re-upload it to replace this one."
+                ),
+                correlation_id=correlation_id,
+                safe_payload={"diDocumentId": str(document_id)},
+                blocking_completion=False,
+            )
+        elif status == "CONFIRMED":
+            finding_id = connection.execute(
+                text(
+                    """
+                    SELECT audit_finding_id
+                    FROM auditcore.audit_findings
+                    WHERE tenant_id=:t AND journey_id=:j AND rule_key=:r
+                      AND finding_status IN ('OPEN','ACKNOWLEDGED')
+                    """
+                ),
+                {"t": tenant_id, "j": journey_id, "r": rule_key},
+            ).scalar_one_or_none()
+            if finding_id is not None:
+                _resolve_finding(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    stage_code=stage_code,
+                    finding_id=finding_id,
+                    actor_id=None,
+                    correlation_id=correlation_id,
+                    note="Document later processed successfully.",
+                )
+    except Exception:
+        logger.warning("sync_document_confirmation_status failed", exc_info=True)
+
+
 def sync_model_resolution_with_escalation(
     connection: Connection,
     *,
@@ -184,5 +261,6 @@ def reconcile_payments_with_escalation(
 
 __all__ = [
     "reconcile_payments_with_escalation",
+    "sync_document_confirmation_status",
     "sync_model_resolution_with_escalation",
 ]
