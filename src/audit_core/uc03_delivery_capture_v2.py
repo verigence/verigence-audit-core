@@ -31,6 +31,7 @@ from audit_core.uc03_document_capture_v2 import (
     _candidate_type_keys,
     _ensure_di_context,
     _human_actor_id,
+    _log_di_capture_v2_failure,
     _requirement_refs_by_document_type_key,
     get_di_capture_v2_client,
     get_di_client,
@@ -368,6 +369,10 @@ def _read_delivery_capture(
             phase="DELIVERY",
         )
     except DiCaptureV2Error as exc:
+        _log_di_capture_v2_failure(
+            operation="list_documents", exc=exc, tenant_id=tenant_id,
+            journey_id=journey_id, context_ref=context_ref,
+        )
         raise DependencyUnavailableError(
             detail="Delivery document status is temporarily unavailable."
         ) from exc
@@ -467,6 +472,10 @@ def create_delivery_upload_intents_v2(
             files=[item.model_dump() for item in command.files],
         )
     except DiCaptureV2Error as exc:
+        _log_di_capture_v2_failure(
+            operation="create_upload_intents", exc=exc, tenant_id=tenant_id,
+            journey_id=journey_id, context_ref=context_ref,
+        )
         raise DependencyUnavailableError(
             detail="Delivery document upload could not be prepared."
         ) from exc
@@ -574,6 +583,10 @@ def finalize_delivery_document_v2(
             document_id=str(document_id),
         )
     except DiCaptureV2Error as exc:
+        _log_di_capture_v2_failure(
+            operation="finalize_document", exc=exc, tenant_id=tenant_id,
+            journey_id=journey_id, context_ref=context_ref,
+        )
         raise DependencyUnavailableError(
             detail="Uploaded Delivery document could not be finalized."
         ) from exc
@@ -634,6 +647,10 @@ def delete_delivery_document_v2(
             document_id=str(document_id),
         )
     except DiCaptureV2Error as exc:
+        _log_di_capture_v2_failure(
+            operation="delete_document", exc=exc, tenant_id=tenant_id,
+            journey_id=journey_id, context_ref=context_ref,
+        )
         raise DependencyUnavailableError(
             detail="Delivery document could not be deleted safely."
         ) from exc

@@ -5,6 +5,7 @@ from functools import lru_cache
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, Header, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Connection, Engine, text
@@ -36,6 +37,29 @@ from audit_core.uc03_booking_commands import (
 
 router = APIRouter(prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}", tags=["uc03-document-capture-v2"])
 _DI_AUDIENCE = "di"
+logger = structlog.get_logger(__name__)
+
+
+def _log_di_capture_v2_failure(
+    *,
+    operation: str,
+    exc: DiCaptureV2Error,
+    tenant_id: str,
+    journey_id: UUID,
+    context_ref: str,
+) -> None:
+    # DI's real status/detail never reach Web (VAC-SYS-002's message is
+    # deliberately generic) — log them here so a Railway log search is enough
+    # to diagnose a live failure instead of only "dependency unavailable".
+    logger.warning(
+        "di_capture_v2_request_failed",
+        operation=operation,
+        di_status_code=exc.status_code,
+        di_detail=exc.detail,
+        tenant_id=tenant_id,
+        journey_id=str(journey_id),
+        external_context_ref=context_ref,
+    )
 
 
 class CaptureV2Declaration(BaseModel):
@@ -642,6 +666,10 @@ def _read_capture(
             phase="BOOKING",
         )
     except DiCaptureV2Error as exc:
+        _log_di_capture_v2_failure(
+            operation="list_documents", exc=exc, tenant_id=tenant_id,
+            journey_id=journey_id, context_ref=context_ref,
+        )
         raise DependencyUnavailableError(
             detail="Document capture status is temporarily unavailable."
         ) from exc
@@ -841,6 +869,10 @@ def create_booking_upload_intents_v2(
             files=[item.model_dump() for item in command.files],
         )
     except DiCaptureV2Error as exc:
+        _log_di_capture_v2_failure(
+            operation="create_upload_intents", exc=exc, tenant_id=tenant_id,
+            journey_id=journey_id, context_ref=context_ref,
+        )
         raise DependencyUnavailableError(detail="Document upload could not be prepared.") from exc
 
     results: list[UploadIntentResult] = []
@@ -927,6 +959,10 @@ def finalize_booking_document_v2(
             document_id=str(document_id),
         )
     except DiCaptureV2Error as exc:
+        _log_di_capture_v2_failure(
+            operation="finalize_document", exc=exc, tenant_id=tenant_id,
+            journey_id=journey_id, context_ref=context_ref,
+        )
         raise DependencyUnavailableError(detail="Uploaded document could not be finalized.") from exc
     return FinalizeResponse(documentId=document_id, state=str(payload["state"]))
 
@@ -982,6 +1018,10 @@ def delete_booking_document_v2(
             document_id=str(document_id),
         )
     except DiCaptureV2Error as exc:
+        _log_di_capture_v2_failure(
+            operation="delete_document", exc=exc, tenant_id=tenant_id,
+            journey_id=journey_id, context_ref=context_ref,
+        )
         raise DependencyUnavailableError(detail="Document could not be deleted safely.") from exc
     connection.execute(
         text(
