@@ -814,6 +814,23 @@ def _sync_booking_document(
             "confirmation": document.confirmation_status,
         },
     )
+
+    from audit_core.uc03_async_sync_tasks import sync_document_confirmation_status
+    from audit_core.uc03_manual_verification import _friendly_label
+
+    sync_document_confirmation_status(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code="BOOKING",
+        document_id=document_id,
+        confirmation_status=document.confirmation_status,
+        document_label=_friendly_label(
+            document.document_type_key or link["document_type_key"], document_id
+        ),
+        correlation_id="",
+    )
+
     if str(document.confirmation_status or "").upper() != "CONFIRMED":
         return 0
 
@@ -935,6 +952,77 @@ def _sync_booking_document(
     return len(facts)
 
 
+def _sync_delivery_document_status(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    document_id: UUID,
+    document_type_key: str | None,
+    security_client: SecurityOAuthClient,
+    di_client: DiClient,
+) -> None:
+    """Delivery's minimal counterpart to _sync_booking_document: track this one
+    document's own confirmation outcome (DOCUMENT_MISSING on failure, resolved
+    on a later clean confirm) without pulling facts or materializing.
+
+    Delivery's full per-document durable-capture + materialization pipeline
+    (the Delivery equivalent of _machine_upsert_fact / materialize_machine_
+    booking_values) is a separate, tracked follow-up -- unlike Booking's
+    per-document materializer, Delivery's existing materialize_reviewed_
+    delivery_business_values resolves cross-document source priority (which
+    invoice wins for the vehicle VIN, say) from the *list of documents it is
+    given*, not from durable state re-read fresh each call. Feeding it one
+    newly-confirmed document at a time would silently drop that priority
+    logic; feeding it the full always-current document set safely needs it
+    rebuilt from journey_document_extracted_fields the way Booking's resolver
+    already is. Never raises (best-effort, same as every other producer here).
+    """
+    try:
+        journey = connection.execute(
+            text(
+                """
+                SELECT customer_id, dealer_id, outlet_id
+                FROM auditcore.journeys
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).mappings().one_or_none()
+        if journey is None:
+            return
+        token = security_client.get_service_token(audience=_DI_AUDIENCE)
+        context_ref = _external_context_ref(journey_id=journey_id, customer_id=journey["customer_id"])
+        document = di_client.get_audit_document(
+            token=token,
+            tenant_id=tenant_id,
+            external_context_ref=context_ref,
+            document_id=str(document_id),
+        )
+    except (SecurityTokenError, DiClientError):
+        logger.warning(
+            "uc03_delivery_document_status_sync_unavailable",
+            tenant_id=tenant_id,
+            journey_id=str(journey_id),
+            document_id=str(document_id),
+        )
+        return
+
+    from audit_core.uc03_async_sync_tasks import sync_document_confirmation_status
+    from audit_core.uc03_manual_verification import _friendly_label
+
+    sync_document_confirmation_status(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code="DELIVERY",
+        document_id=document_id,
+        confirmation_status=document.confirmation_status,
+        document_label=_friendly_label(document.document_type_key or document_type_key, document_id),
+        correlation_id="",
+    )
+
+
 def acknowledge_booking_document_link_with_auto_sync(
     payload: pc_documents.BookingDocumentLinkCommand,
     service_principal: Annotated[
@@ -976,6 +1064,16 @@ def acknowledge_booking_document_link_with_auto_sync(
             security_client=security_client,
             di_client=di_client,
             bump_version=True,
+        )
+    else:
+        _sync_delivery_document_status(
+            connection,
+            tenant_id=str(discovered["tenant_id"]),
+            journey_id=discovered["journey_id"],
+            document_id=payload.documentId,
+            document_type_key=discovered.get("document_type_key"),
+            security_client=security_client,
+            di_client=di_client,
         )
     return response
 

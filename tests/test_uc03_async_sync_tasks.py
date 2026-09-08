@@ -141,6 +141,52 @@ def test_payment_reconciliation_failure_raises_finding_under_its_own_stage(monke
     assert finding["owner_role_code"] == "PC"
 
 
+def test_not_confirmed_document_raises_document_missing_for_pc(journey) -> None:
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    document_id = uuid4()
+    ast_module.sync_document_confirmation_status(
+        journey, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
+        document_id=document_id, confirmation_status="NOT_CONFIRMED",
+        document_label="Insurance Cover", correlation_id="corr-1",
+    )
+    rule_key = f"DOCUMENT_MISSING:DELIVERY:{document_id}"
+    finding = _open_finding(journey, tenant_id=tenant_id, journey_id=journey_id, rule_key=rule_key)
+    assert finding is not None
+    assert finding["finding_class"] == "DATA_GAP"
+    assert finding["owner_role_code"] == "PC"
+
+
+def test_document_missing_resolves_when_the_same_document_later_confirms(journey) -> None:
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    document_id = uuid4()
+    ast_module.sync_document_confirmation_status(
+        journey, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
+        document_id=document_id, confirmation_status="NOT_CONFIRMED",
+        document_label="Booking Form", correlation_id="corr-1",
+    )
+    rule_key = f"DOCUMENT_MISSING:BOOKING:{document_id}"
+    assert _open_finding(journey, tenant_id=tenant_id, journey_id=journey_id, rule_key=rule_key) is not None
+
+    ast_module.sync_document_confirmation_status(
+        journey, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
+        document_id=document_id, confirmation_status="CONFIRMED",
+        document_label="Booking Form", correlation_id="corr-2",
+    )
+    assert _open_finding(journey, tenant_id=tenant_id, journey_id=journey_id, rule_key=rule_key) is None
+
+
+def test_pending_confirmation_status_raises_nothing(journey) -> None:
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    document_id = uuid4()
+    ast_module.sync_document_confirmation_status(
+        journey, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
+        document_id=document_id, confirmation_status="PENDING",
+        document_label="Booking Form", correlation_id="corr-1",
+    )
+    rule_key = f"DOCUMENT_MISSING:BOOKING:{document_id}"
+    assert _open_finding(journey, tenant_id=tenant_id, journey_id=journey_id, rule_key=rule_key) is None
+
+
 def test_expected_outcomes_never_raise_a_failure_finding(monkeypatch, journey) -> None:
     tenant_id, journey_id = journey.tenant_id, journey.journey_id
     monkeypatch.setattr(
