@@ -177,6 +177,8 @@ def _sku_rows_for_version(
             WHERE pli.tenant_id = :tenant_id
               AND pli.price_list_version_id = :plv
               AND s.is_active = true
+              AND pm.is_active = true
+              AND pv.is_active = true
             GROUP BY s.product_sku_id, s.sku_code, pm.model_name, pv.variant_name, c.colour_name
             """
         ),

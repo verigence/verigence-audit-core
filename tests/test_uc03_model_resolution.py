@@ -101,44 +101,103 @@ def test_no_price_data_returns_empty() -> None:
 
 # ── integration ──────────────────────────────────────────────────────────────
 @pytest.fixture
-def env():
+def journey():
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         pytest.skip("DATABASE_URL is required for model-resolution integration tests")
-    return create_engine(database_url)
+    engine = create_engine(database_url)
+    suffix = uuid4().hex[:10]
+    tenant_id = f"tenant-mr-{suffix}"
+    with engine.begin() as c:
+        category_id = c.execute(
+            text("INSERT INTO auditcore.product_categories (category_code, category_name) "
+                 "VALUES (:c, 'V') RETURNING product_category_id"),
+            {"c": f"MR-CAT-{suffix}"},
+        ).scalar_one()
+        oem_id = c.execute(
+            text("INSERT INTO auditcore.oems (oem_code, oem_name) VALUES (:c, 'O') RETURNING oem_id"),
+            {"c": f"MR-OEM-{suffix}"},
+        ).scalar_one()
+        c.execute(
+            text("""INSERT INTO auditcore.projects
+                (tenant_id, project_code, project_name, oem_id, product_category_id,
+                 effective_start_date, timezone_name, project_status)
+                VALUES (:t, :pc, 'MR', :o, :cat, CURRENT_DATE - 60, 'Asia/Kolkata', 'ACTIVE')"""),
+            {"t": tenant_id, "pc": f"MR-{suffix}", "o": oem_id, "cat": category_id},
+        )
+        dealer_id = c.execute(
+            text("INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
+                 "VALUES (:t, :c, 'D') RETURNING dealer_id"),
+            {"t": tenant_id, "c": f"MR-D-{suffix}"},
+        ).scalar_one()
+        outlet_id = c.execute(
+            text("INSERT INTO auditcore.dealer_outlets (tenant_id, dealer_id, outlet_code, outlet_name) "
+                 "VALUES (:t, :d, :c, 'O') RETURNING outlet_id"),
+            {"t": tenant_id, "d": dealer_id, "c": f"MR-O-{suffix}"},
+        ).scalar_one()
+        customer_id = c.execute(
+            text("""INSERT INTO auditcore.customers
+                (tenant_id, dealer_id, outlet_id, customer_type_code, display_name)
+                VALUES (:t, :d, :o, 'INDIVIDUAL', 'C') RETURNING customer_id"""),
+            {"t": tenant_id, "d": dealer_id, "o": outlet_id},
+        ).scalar_one()
+        journey_id = c.execute(
+            text("""INSERT INTO auditcore.journeys
+                (tenant_id, dealer_id, outlet_id, customer_id, journey_reference)
+                VALUES (:t, :d, :o, :cu, :r) RETURNING journey_id"""),
+            {"t": tenant_id, "d": dealer_id, "o": outlet_id, "cu": customer_id, "r": f"MR-J-{suffix}"},
+        ).scalar_one()
+        c.execute(
+            text("INSERT INTO auditcore.bookings (tenant_id, journey_id, booking_date) "
+                 "VALUES (:t, :j, CURRENT_DATE - 10)"),
+            {"t": tenant_id, "j": journey_id},
+        )
+        c.execute(
+            text("""INSERT INTO auditcore.journey_stage_states
+                (tenant_id, journey_id, stage_code, business_status, audit_state, audit_status,
+                 first_started_at_utc, latest_activity_at_utc, version_no)
+                VALUES (:t, :j, 'BOOKING', 'BOOKING_IN_PROGRESS', 'IN_PROGRESS', 'NOT_EVALUATED',
+                        now(), now(), 1)"""),
+            {"t": tenant_id, "j": journey_id},
+        )
+    engine.dispose()
+    engine = create_engine(database_url)
+    with engine.begin() as c:
+        c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        c.tenant_id = tenant_id  # type: ignore[attr-defined]
+        c.journey_id = journey_id  # type: ignore[attr-defined]
+        c.oem_id = oem_id  # type: ignore[attr-defined]
+        yield c
+    engine.dispose()
 
 
-def _seed_price_list(c, tenant_id: str, *, model: str, variant: str, components: dict[str, str]):
-    """Minimal OEM-style price list: one SKU, one published version."""
-    cat = c.execute(
-        text("INSERT INTO auditcore.product_categories (category_code, category_name) "
-             "VALUES (:cc, :cn) RETURNING category_id"),
-        {"cc": f"C{uuid4().hex[:6]}", "cn": "PV"},
-    ).scalar_one()
+def _seed_price_list(c, *, model: str, variant: str, components: dict[str, str]):
+    """One SKU + one published price-list version for the fixture's OEM/tenant."""
+    tenant_id, oem_id = c.tenant_id, c.oem_id
     model_id = c.execute(
-        text("INSERT INTO auditcore.product_models (category_id, model_code, model_name, is_active) "
-             "VALUES (:cat, :mc, :mn, true) RETURNING model_id"),
-        {"cat": cat, "mc": f"M{uuid4().hex[:6]}", "mn": model},
+        text("INSERT INTO auditcore.product_models (oem_id, model_code, model_name) "
+             "VALUES (:o, :mc, :mn) RETURNING model_id"),
+        {"o": oem_id, "mc": f"M{uuid4().hex[:8]}", "mn": model},
     ).scalar_one()
     variant_id = c.execute(
-        text("INSERT INTO auditcore.product_variants (model_id, variant_code, variant_name, is_active) "
-             "VALUES (:m, :vc, :vn, true) RETURNING variant_id"),
-        {"m": model_id, "vc": f"V{uuid4().hex[:6]}", "vn": variant},
+        text("INSERT INTO auditcore.product_variants (model_id, variant_code, variant_name) "
+             "VALUES (:m, :vc, :vn) RETURNING variant_id"),
+        {"m": model_id, "vc": f"V{uuid4().hex[:8]}", "vn": variant},
     ).scalar_one()
     sku_id = c.execute(
-        text("INSERT INTO auditcore.product_skus (model_id, variant_id, sku_code, is_active) "
-             "VALUES (:m, :v, :sc, true) RETURNING product_sku_id"),
-        {"m": model_id, "v": variant_id, "sc": f"SKU{uuid4().hex[:8]}"},
+        text("INSERT INTO auditcore.product_skus (oem_id, model_id, variant_id, sku_code) "
+             "VALUES (:o, :m, :v, :sc) RETURNING product_sku_id"),
+        {"o": oem_id, "m": model_id, "v": variant_id, "sc": f"SKU{uuid4().hex[:10]}"},
     ).scalar_one()
     pl_id = c.execute(
         text("INSERT INTO auditcore.price_lists (tenant_id, price_list_code, price_list_name) "
-             "VALUES (:t, :c, :n) RETURNING price_list_id"),
-        {"t": tenant_id, "c": f"PL{uuid4().hex[:6]}", "n": "OEM"},
+             "VALUES (:t, :c, 'OEM') RETURNING price_list_id"),
+        {"t": tenant_id, "c": f"PL{uuid4().hex[:8]}"},
     ).scalar_one()
     plv_id = c.execute(
         text("INSERT INTO auditcore.price_list_versions "
              "(tenant_id, price_list_id, version_no, lifecycle_status, effective_from) "
-             "VALUES (:t, :pl, 1, 'PUBLISHED', CURRENT_DATE - 30) RETURNING price_list_version_id"),
+             "VALUES (:t, :pl, 1, 'PUBLISHED', CURRENT_DATE - 45) RETURNING price_list_version_id"),
         {"t": tenant_id, "pl": pl_id},
     ).scalar_one()
     for key, amount in components.items():
@@ -151,129 +210,147 @@ def _seed_price_list(c, tenant_id: str, *, model: str, variant: str, components:
     return sku_id
 
 
-@pytest.fixture
-def journey(env):
-    engine = env
-    suffix = uuid4().hex[:10]
-    tenant_id = f"tenant-mr-{suffix}"
-    with engine.begin() as c:
-        c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
-        c.execute(
-            text("INSERT INTO auditcore.projects (tenant_id, project_name, project_status, timezone_name) "
-                 "VALUES (:t, :n, 'ACTIVE', 'Asia/Kolkata')"),
-            {"t": tenant_id, "n": f"P {suffix}"},
-        )
-        dealer_id = uuid4()
-        c.execute(
-            text("INSERT INTO auditcore.dealers (tenant_id, dealer_id, dealer_name) VALUES (:t,:d,:n)"),
-            {"t": tenant_id, "d": dealer_id, "n": "D"},
-        )
-        outlet_id = uuid4()
-        c.execute(
-            text("INSERT INTO auditcore.dealer_outlets (tenant_id, dealer_id, outlet_id, outlet_name) "
-                 "VALUES (:t,:d,:o,:n)"),
-            {"t": tenant_id, "d": dealer_id, "o": outlet_id, "n": "O"},
-        )
-        customer_id = uuid4()
-        c.execute(
-            text("INSERT INTO auditcore.customers (tenant_id, customer_id, display_name) "
-                 "VALUES (:t,:c,:n)"),
-            {"t": tenant_id, "c": customer_id, "n": "Cust"},
-        )
-        journey_id = uuid4()
-        c.execute(
-            text("INSERT INTO auditcore.journeys (tenant_id, journey_id, customer_id, dealer_id, outlet_id) "
-                 "VALUES (:t,:j,:c,:d,:o)"),
-            {"t": tenant_id, "j": journey_id, "c": customer_id, "d": dealer_id, "o": outlet_id},
-        )
-        c.execute(
-            text("INSERT INTO auditcore.bookings (tenant_id, journey_id, booking_date) "
-                 "VALUES (:t,:j,CURRENT_DATE - 5)"),
-            {"t": tenant_id, "j": journey_id},
-        )
-    return {"engine": engine, "tenant_id": tenant_id, "journey_id": journey_id}
-
-
-def _set_journey_product(c, tid, jid, model, variant):
+def _set_journey_product(c, model, variant):
     c.execute(
         text("INSERT INTO auditcore.journey_products "
              "(tenant_id, journey_id, model_name_snapshot, variant_name_snapshot, selection_source) "
-             "VALUES (:t,:j,:m,:v,'EVIDENCE')"),
-        {"t": tid, "j": jid, "m": model, "v": variant},
+             "VALUES (:t, :j, :m, :v, 'EVIDENCE')"),
+        {"t": c.tenant_id, "j": c.journey_id, "m": model, "v": variant},
     )
 
 
-def _set_commercial(c, tid, jid, key, amount):
+def _set_commercial(c, key, amount):
     c.execute(
         text("INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, actual_amount) "
-             "VALUES (:t,:j,:k,:a) ON CONFLICT (tenant_id, journey_id, component_key) "
+             "VALUES (:t, :j, :k, :a) ON CONFLICT (tenant_id, journey_id, component_key) "
              "DO UPDATE SET actual_amount = EXCLUDED.actual_amount"),
-        {"t": tid, "j": jid, "k": key, "a": amount},
+        {"t": c.tenant_id, "j": c.journey_id, "k": key, "a": amount},
     )
+
+
+def _open_model_flags(c) -> int:
+    return c.execute(
+        text("SELECT count(*) FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j "
+             "AND finding_type_code='MODEL_NOT_IDENTIFIED' "
+             "AND finding_status IN ('OPEN','ACKNOWLEDGED')"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
 
 
 def test_integration_resolves_and_pins_sku(journey) -> None:
-    e, tid, jid = journey["engine"], journey["tenant_id"], journey["journey_id"]
-    with e.begin() as c:
-        c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
-        _seed_price_list(
-            c, tid, model="SCORPIO N", variant="Z8L",
-            components={"EX_SHOWROOM": "1600000", "INSURANCE": "60000",
-                        "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "220000"},
-        )
-        _set_journey_product(c, tid, jid, "Scorpio N", "Z8L")
-        _set_commercial(c, tid, jid, "ex_showroom_price", "1600000")
-        _set_commercial(c, tid, jid, "total_price", "1830000")  # 1.6M + 60k + 170k
+    c = journey
+    _seed_price_list(
+        c, model="SCORPIO N", variant="Z8L",
+        components={"EX_SHOWROOM": "1600000", "INSURANCE": "60000",
+                    "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "220000"},
+    )
+    _set_journey_product(c, "Scorpio N", "Z8L")
+    _set_commercial(c, "ex_showroom_price", "1600000")
+    _set_commercial(c, "total_price", "1830000")  # 1.6M + 60k + 170k (individual)
 
-    with e.begin() as c:
-        c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
-        result = mr.sync_model_resolution(c, tenant_id=tid, journey_id=jid, correlation_id="")
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
     assert result.get("resolved") is True
 
-    with e.connect() as c:
-        c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
-        sku = c.execute(
-            text("SELECT product_sku_id, selection_status FROM auditcore.journey_products "
-                 "WHERE tenant_id=:t AND journey_id=:j"),
-            {"t": tid, "j": jid},
-        ).mappings().one()
-        assert sku["product_sku_id"] is not None
-        assert sku["selection_status"] == "CONFIRMED"
-        flags = c.execute(
-            text("SELECT count(*) FROM auditcore.audit_findings "
-                 "WHERE tenant_id=:t AND journey_id=:j AND finding_type_code='MODEL_NOT_IDENTIFIED' "
-                 "AND finding_status IN ('OPEN','ACKNOWLEDGED')"),
-            {"t": tid, "j": jid},
-        ).scalar_one()
-        assert flags == 0
+    sku = c.execute(
+        text("SELECT product_sku_id, selection_status FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one()
+    assert sku["product_sku_id"] is not None
+    assert sku["selection_status"] == "CONFIRMED"
+    assert _open_model_flags(c) == 0
+
+    # idempotent: a second sync on an already-resolved journey is a no-op
+    again = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert again.get("resolved") is True
+
+
+def test_integration_resolves_via_ex_showroom_when_total_ambiguous(journey) -> None:
+    c = journey
+    _seed_price_list(
+        c, model="THAR", variant="LX",
+        components={"EX_SHOWROOM": "1500000", "INSURANCE": "60000",
+                    "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "200000"},
+    )
+    _seed_price_list(
+        c, model="THAR", variant="AX",
+        components={"EX_SHOWROOM": "1400000", "INSURANCE": "160000",
+                    "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "200000"},
+    )
+    # both variants total 1,730,000 individual — only ex-showroom disambiguates
+    _set_journey_product(c, "Thar", None)
+    _set_commercial(c, "ex_showroom_price", "1400000")
+    _set_commercial(c, "total_price", "1730000")
+
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("resolved") is True
+    assert result.get("matchStage") == "EX_SHOWROOM"
+    assert _open_model_flags(c) == 0
 
 
 def test_integration_raises_flag_when_no_match(journey) -> None:
-    e, tid, jid = journey["engine"], journey["tenant_id"], journey["journey_id"]
-    with e.begin() as c:
-        c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
-        _seed_price_list(
-            c, tid, model="THAR ROXX", variant="AX",
-            components={"EX_SHOWROOM": "1400000", "REGISTRATION_INDIVIDUAL": "150000",
-                        "REGISTRATION_CORPORATE": "180000"},
-        )
-        _set_journey_product(c, tid, jid, "Scorpio N", "Z8L")  # not in the list
-        _set_commercial(c, tid, jid, "ex_showroom_price", "1600000")
-        _set_commercial(c, tid, jid, "total_price", "1830000")
+    c = journey
+    _seed_price_list(
+        c, model="THAR ROXX", variant="AX",
+        components={"EX_SHOWROOM": "1400000", "REGISTRATION_INDIVIDUAL": "150000",
+                    "REGISTRATION_CORPORATE": "180000"},
+    )
+    _set_journey_product(c, "Scorpio N", "Z8L")  # not in the price list
+    _set_commercial(c, "ex_showroom_price", "1600000")
+    _set_commercial(c, "total_price", "1830000")
 
-    with e.begin() as c:
-        c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
-        r1 = mr.sync_model_resolution(c, tenant_id=tid, journey_id=jid, correlation_id="")
-        r2 = mr.sync_model_resolution(c, tenant_id=tid, journey_id=jid, correlation_id="")
+    r1 = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    r2 = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
     assert r1.get("raised") is True
     assert r2.get("raised") is True  # idempotent
+    assert _open_model_flags(c) == 1  # one open finding despite two sync calls
 
-    with e.connect() as c:
-        c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
-        flags = c.execute(
-            text("SELECT count(*) FROM auditcore.audit_findings "
-                 "WHERE tenant_id=:t AND journey_id=:j AND finding_type_code='MODEL_NOT_IDENTIFIED' "
-                 "AND finding_status='OPEN'"),
-            {"t": tid, "j": jid},
-        ).scalar_one()
-        assert flags == 1  # one open finding despite two sync calls
+    ft = c.execute(
+        text("SELECT finding_class, owner_role_code FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND finding_type_code='MODEL_NOT_IDENTIFIED'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one()
+    assert ft["finding_class"] == "DATA_GAP"
+    assert ft["owner_role_code"] == "PC"
+
+
+def test_integration_flag_resolves_when_model_confirmed(journey) -> None:
+    c = journey
+    sku_id = _seed_price_list(
+        c, model="XUV 7XO", variant="AX7L",
+        components={"EX_SHOWROOM": "2000000", "REGISTRATION_INDIVIDUAL": "200000",
+                    "REGISTRATION_CORPORATE": "240000"},
+    )
+    _set_journey_product(c, "Wrong Model", None)
+    _set_commercial(c, "ex_showroom_price", "2000000")
+    mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert _open_model_flags(c) == 1
+
+    # PC corrects the model on journey_products; next sync resolves + closes the flag
+    c.execute(
+        text("UPDATE auditcore.journey_products SET model_name_snapshot='XUV 7XO' "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    )
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("resolved") is True
+    assert _open_model_flags(c) == 0
+    pinned = c.execute(
+        text("SELECT product_sku_id FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert pinned == sku_id
