@@ -5,7 +5,9 @@ from audit_core.security import HumanPrincipal
 from audit_core.uc03_document_capture_v2 import (
     _build_capture_response,
     _build_local_capture_response,
+    _candidate_type_keys,
     _human_actor_id,
+    _requirement_refs_by_document_type_key,
 )
 
 JOURNEY_ID = UUID("11111111-1111-1111-1111-111111111111")
@@ -209,6 +211,25 @@ def test_v2_actor_id_uses_human_principal_subject() -> None:
 
 def test_v2_completion_route_is_additive() -> None:
     assert "/v2/tenants/{tenant_id}/journeys/{journey_id}/booking/complete" in app.openapi()["paths"]
+
+
+def test_booking_docket_requirement_sends_canonical_booking_form_to_di() -> None:
+    # DI's schema + Core materialisation both key on "booking_form"; the legacy
+    # "booking_docket" requirement type must be sent to DI as "booking_form" so
+    # the sales contract is extracted against the real Booking Form schema.
+    requirements = [
+        {"document_type_key": "booking_docket"},
+        {"document_type_key": "pan_card"},
+    ]
+    assert _candidate_type_keys(requirements) == ["booking_form", "pan_card"]
+
+
+def test_requirement_ref_map_accepts_both_booking_keys() -> None:
+    refs = _requirement_refs_by_document_type_key(
+        [{"document_type_key": "booking_docket", "requirement_ref": "req-1"}]
+    )
+    assert refs["booking_docket"] == "req-1"
+    assert refs["booking_form"] == "req-1"
 
 
 def test_local_completion_check_uses_reconciled_classified_links() -> None:
