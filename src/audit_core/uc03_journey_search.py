@@ -670,8 +670,10 @@ def get_journey_overview(
                 discount_key AS "discountKey",
                 standard_eligible_amount AS "standardEligibleAmount",
                 actual_discount_amount AS "actualDiscountAmount",
+                eligibility_result AS "eligibilityResult",
                 actual_source_kind AS "sourceKind",
-                source_evidence_id AS "sourceEvidenceId"
+                source_evidence_id AS "sourceEvidenceId",
+                details AS "details"
             FROM auditcore.discount_applications
             WHERE tenant_id = :tenant_id AND journey_id = :journey_id
             ORDER BY discount_key, discount_application_id

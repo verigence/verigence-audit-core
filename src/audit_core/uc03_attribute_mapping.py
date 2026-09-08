@@ -46,21 +46,23 @@ class AttributeCandidate:
 
 _B = ("booking_form", "booking_docket")
 _ID = ("pan_card", "pan", "aadhaar")
-# Every dealer invoice (vehicle tax / retail / accessories / EW) is one DI
-# document type `invoice` (the classifier can't separate them); the older
-# tenant-DMS invoice keys stay for back-compat.
+# Vehicle-sale GST invoices (DI `dev` document types). The generalized-invoice
+# schema classifies a tax vs retail invoice via `invoice_nature`, so both land on
+# the same keys. Legacy tenant-DMS keys kept for back-compat.
 _INVOICE = (
-    "invoice",
-    "customer_invoice_dms",
     "tax_invoice_tally",
-    "tax_invoice_dms",
+    "customer_invoice_dms",
+    "wholesale_invoice",
+    "invoice_generic",
+    "customer_invoice_dms_v2",
     "tax_invoice",
 )
-# The dealer's own deal sheet — authoritative for the discounts actually applied,
-# below a GST invoice for the priced components.
-_DEAL_SHEET = ("dealer_accounts_statement",)
-# Government RTO receipt — authoritative for registration / road-tax / permit fees.
-_RTO = ("rto_tax_receipt",)
+# The dealer's own deal sheet / Tally ledger — authoritative for the discounts
+# actually applied, below a GST invoice for the priced components.
+# `dealer_accounts_statement` is a forward reference (schema not built yet).
+_DEAL_SHEET = ("dealer_accounts_statement", "customer_ledger")
+# Government RTO fee document — authoritative for registration / road-tax / permit.
+_RTO = ("rto_challan", "rto_tax_receipt")
 
 # Invoice-first precedence for every commercial / discount / total value: a
 # reviewed invoice value wins over the booking form (the booking form is the

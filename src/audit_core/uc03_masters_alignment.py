@@ -165,6 +165,28 @@ LEGACY_DISCOUNT_KEY_TO_CANONICAL: dict[str, str] = {
     "OEM_REFERRAL":      "OTHER_SCHEME",
 }
 
+# reviewed *actual* discount field -> the OEM benefit_key it corresponds to.
+# The full set of booking-form discount fields that the DI schema extracts.
+DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY: dict[str, str] = {
+    "discount_amount":                  "CASH_DISCOUNT",
+    "sales_discount_amount":            "CASH_DISCOUNT",
+    "consumer_offer_amount":            "CASH_DISCOUNT",
+    "oem_discount_amount":              "CASH_DISCOUNT",
+    "exchange_discount_amount":         "EXCHANGE_BONUS",
+    "exchange_claim_amount":            "EXCHANGE_BONUS",
+    "bonus_amount":                     "EXCHANGE_BONUS",
+    "corporate_discount_amount":        "CORPORATE_PRIVILEGE",
+    "corporate_offer_amount":           "CORPORATE_PRIVILEGE",
+    "loyalty_discount_amount":          "WELCOME_BONUS",
+    "inhouse_insurance_discount_amount": "INSURANCE",
+    "free_accessory_discount_amount":   "ACCESSORIES_KIT",
+    "buffer_discount_amount":           "ADDITIONAL_DISCOUNT",
+    "cash_discount_amount":             "ADDITIONAL_DISCOUNT",
+    "mr_discount_amount":               "OTHER_SCHEME",
+    "oem_referral_discount_amount":     "OTHER_SCHEME",
+    "other_discount_amount":            "OTHER_SCHEME",
+}
+
 # OEM scheme_category -> the canonical discount keys it can grant.  Used to pick
 # which applicable scheme's benefit backs a given canonical discount key.
 SCHEME_CATEGORY_DISCOUNT_KEYS: dict[str, frozenset[str]] = {
@@ -187,6 +209,7 @@ def canonical_discount_key(raw_key: str) -> str:
 
 __all__ = [
     "CANONICAL_DISCOUNT_KEYS",
+    "DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY",
     "DISCOUNT_ACTUAL_FIELD_TO_CANONICAL_KEY",
     "LEGACY_DISCOUNT_KEY_TO_CANONICAL",
     "PRICE_COMPONENT_TO_COMMERCIAL_KEY",

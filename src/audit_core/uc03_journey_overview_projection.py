@@ -18,6 +18,7 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_masters_alignment import (
+    canonical_discount_key,
     commercial_key_for_price_component,
     registration_basis,
 )
@@ -364,6 +365,35 @@ def _to_decimal(value: Any) -> Decimal | None:
         return None
 
 
+def _collapse_discounts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per discount. ``uc03_deal_reconciliation`` writes canonical-keyed
+    CALCULATED rows carrying both entitled + given; the older evidence-only
+    materialiser writes legacy-keyed rows carrying only the given amount. Prefer
+    the CALCULATED row and fold any legacy actual onto it."""
+    by_key: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        canonical = canonical_discount_key(str(row.get("discountKey") or ""))
+        current = by_key.get(canonical)
+        is_calc = str(row.get("sourceKind") or "").upper() == "CALCULATED"
+        if current is None:
+            merged = dict(row)
+            merged["discountKey"] = canonical
+            by_key[canonical] = merged
+            continue
+        current_is_calc = str(current.get("sourceKind") or "").upper() == "CALCULATED"
+        if is_calc and not current_is_calc:
+            actual = current.get("actualDiscountAmount")
+            merged = dict(row)
+            merged["discountKey"] = canonical
+            if merged.get("actualDiscountAmount") is None and actual is not None:
+                merged["actualDiscountAmount"] = actual
+            by_key[canonical] = merged
+        elif not is_calc and current_is_calc:
+            if current.get("actualDiscountAmount") is None and row.get("actualDiscountAmount") is not None:
+                current["actualDiscountAmount"] = row.get("actualDiscountAmount")
+    return list(by_key.values())
+
+
 def _sku_pricing_panel(
     connection: Connection,
     *,
@@ -594,6 +624,7 @@ def get_journey_overview_projection(
         connection=connection,
     )
     data = base.model_dump()
+    data["discounts"] = _collapse_discounts(data.get("discounts") or [])
     review_statuses = _stage_review_statuses(
         connection,
         tenant_id=tenant_id,

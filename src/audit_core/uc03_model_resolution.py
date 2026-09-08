@@ -335,6 +335,17 @@ def _resolve_open_flag(
     return len(open_ids)
 
 
+def _run_deal_reconciliation(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
+) -> None:
+    """Materialise price + discount standards for a resolved SKU (never raises)."""
+    from audit_core.uc03_deal_reconciliation import sync_deal_reconciliation
+
+    sync_deal_reconciliation(
+        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
+    )
+
+
 # ── producer ──────────────────────────────────────────────────────────────────
 def sync_model_resolution(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
@@ -347,6 +358,9 @@ def sync_model_resolution(
 
         if inputs["product_sku_id"] is not None:
             resolved = _resolve_open_flag(
+                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
+            )
+            _run_deal_reconciliation(
                 connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
             )
             return {"resolved": True, "flagsResolved": resolved}
@@ -390,7 +404,9 @@ def sync_model_resolution(
             _resolve_open_flag(
                 connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
             )
-            # P2: sync_deal_reconciliation(...) materialises standards here.
+            _run_deal_reconciliation(
+                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
+            )
             return {"resolved": True, "skuCode": matched[0]["sku_code"], "matchStage": stage}
 
         multiple = len(matched) > 1
