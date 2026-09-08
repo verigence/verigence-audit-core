@@ -21,6 +21,7 @@ from sqlalchemy import Connection, text
 from audit_core import uc03_booking_capture
 from audit_core import uc03_v2_review_materialization as booking_materialization
 from audit_core.uc03_attribute_mapping import spec_for_field
+from audit_core.uc03_document_registry import is_receipt_document_type
 from audit_core.uc03_invoice_materialization import materialize_reviewed_invoices
 from audit_core.uc03_payment_reconciliation import (
     materialize_reviewed_bank_statements,
@@ -31,11 +32,6 @@ logger = logging.getLogger(__name__)
 
 _DELIVERY_ORDER_DOCUMENT_TYPE = "delivery_order_cover"
 _INSURANCE_DOCUMENT_TYPE = "insurance_cover"
-# Delivery's own default requirement (0017/0022) registers its receipt
-# requirement's document_type_key as "payment_receipt", not Booking's
-# "dealer_receipt" -- both must be accepted here or a Delivery receipt
-# classified under its own registered type would never materialize a Payment.
-_RECEIPT_DOCUMENT_TYPES = frozenset({"dealer_receipt", "payment_receipt"})
 
 # These are exact DI field keys, not fuzzy text matches.  ``chassis_no`` is the
 # field emitted by verigence-di's delivery_order_cover schema.  The other keys are
@@ -574,8 +570,7 @@ def materialize_delivery_receipts(
     receipt_documents = [
         document
         for document in _ready_documents(documents)
-        if str(getattr(document, "documentTypeKey", "") or "").strip().casefold()
-        in _RECEIPT_DOCUMENT_TYPES
+        if is_receipt_document_type(getattr(document, "documentTypeKey", None))
         and booking_materialization._has_reviewable_receipt_value(document)
     ]
     ordinals = booking_materialization.receipt_document_ordinals(

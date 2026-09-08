@@ -28,14 +28,13 @@ from audit_core.uc03_di_core_persistence import (
     ReviewedDiField,
     persist_reviewed_di_fields,
 )
+from audit_core.uc03_document_registry import is_receipt_document_type
 from audit_core.uc03_v2_review_materialization import (
     materialize_reviewed_di_business_values,
     receipt_document_ordinals,
     receipt_review_key,
     reviewed_field_core_owner,
 )
-
-_RECEIPT_DOCUMENT_TYPE = "dealer_receipt"
 
 
 class ReviewFieldCorrection(BaseModel):
@@ -172,7 +171,7 @@ def _duplicate_raw_field_keys(
 ) -> set[str]:
     document_ids: dict[str, set[UUID]] = {}
     for document in documents:
-        if str(document.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE:
+        if is_receipt_document_type(document.documentTypeKey):
             continue
         for field in document.fields:
             if review_v2.spec_for_field(field.fieldKey) is not None:
@@ -196,7 +195,7 @@ def _general_raw_review_items(
 
     documents_by_field: dict[str, set[UUID]] = {}
     for field in unmapped:
-        if str(field.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE:
+        if is_receipt_document_type(field.documentTypeKey):
             continue
         documents_by_field.setdefault(field.fieldKey, set()).add(field.documentId)
     duplicate_keys = {
@@ -206,7 +205,7 @@ def _general_raw_review_items(
     }
 
     for field in unmapped:
-        if str(field.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE:
+        if is_receipt_document_type(field.documentTypeKey):
             receipt_grouped.setdefault((field.documentId, field.fieldKey), []).append(field)
             receipt_document_ids.append(field.documentId)
         elif field.fieldKey in duplicate_keys:
@@ -249,7 +248,7 @@ def _booking_review_key(
     spec = review_v2.spec_for_field(field.fieldKey)
     if spec is not None:
         return f"attribute:{spec.attribute_key}"
-    if str(document.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE:
+    if is_receipt_document_type(document.documentTypeKey):
         return receipt_review_key(receipt_ordinals[document.documentId], field.fieldKey)
     if field.fieldKey.strip() in duplicate_raw_keys:
         return f"raw:{document.documentId}:{field.fieldKey.strip()}"
@@ -267,8 +266,7 @@ def _reviewed_fields(
         [
             document.documentId
             for document in documents
-            if str(document.documentTypeKey or "").strip().lower()
-            == _RECEIPT_DOCUMENT_TYPE
+            if is_receipt_document_type(document.documentTypeKey)
         ]
     )
     duplicate_raw_keys = _duplicate_raw_field_keys(documents)

@@ -36,6 +36,7 @@ from audit_core.uc03_di_core_persistence import (
     ReviewedDiField,
     persist_reviewed_di_fields,
 )
+from audit_core.uc03_document_registry import is_receipt_document_type
 from audit_core.uc03_v2_review_materialization import (
     materialize_reviewed_di_business_values,
     receipt_document_ordinals,
@@ -45,7 +46,6 @@ from audit_core.uc03_v2_review_materialization import (
 
 DecisionValue = Literal["ACCEPTED", "REJECTED"]
 ReviewKind = Literal["ATTRIBUTE", "RAW_FIELD"]
-_RECEIPT_DOCUMENT_TYPE = "dealer_receipt"
 
 
 class BookingReviewDecisionCommand(BaseModel):
@@ -184,7 +184,7 @@ def _raw_review_items(
     receipt_document_ids: list[UUID] = []
 
     for field in unmapped:
-        if str(field.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE:
+        if is_receipt_document_type(field.documentTypeKey):
             receipt_grouped.setdefault((field.documentId, field.fieldKey), []).append(field)
             receipt_document_ids.append(field.documentId)
         else:
@@ -442,7 +442,7 @@ def _raw_review_key(
     *,
     receipt_ordinals: dict[UUID, int],
 ) -> str:
-    if str(field.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE:
+    if is_receipt_document_type(field.documentTypeKey):
         return receipt_review_key(receipt_ordinals[field.documentId], field.fieldKey)
     return f"raw:{field.fieldKey}"
 
@@ -456,7 +456,7 @@ def _document_field_review_key(
     spec = review_v2.spec_for_field(field.fieldKey)
     if spec is not None:
         return f"attribute:{spec.attribute_key}"
-    if str(document.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE:
+    if is_receipt_document_type(document.documentTypeKey):
         return receipt_review_key(receipt_ordinals[document.documentId], field.fieldKey)
     return f"raw:{field.fieldKey}"
 
@@ -470,8 +470,7 @@ def _lossless_reviewed_fields(
         [
             document.documentId
             for document in documents
-            if str(document.documentTypeKey or "").strip().lower()
-            == _RECEIPT_DOCUMENT_TYPE
+            if is_receipt_document_type(document.documentTypeKey)
         ]
     )
     reviewed: list[ReviewedDiField] = []

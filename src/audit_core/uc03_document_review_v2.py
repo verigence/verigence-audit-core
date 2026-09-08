@@ -34,6 +34,7 @@ from audit_core.uc03_document_capture_v2 import (
     _reconcile_documents,
     get_di_capture_v2_client,
 )
+from audit_core.uc03_document_registry import is_receipt_document_type
 
 router = APIRouter(
     prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}",
@@ -42,7 +43,6 @@ router = APIRouter(
 
 _REVIEW_THRESHOLD = 92.0
 _FAILED_PROCESSING = {"FAILED", "ERROR", "REJECTED"}
-_RECEIPT_DOCUMENT_TYPE = "dealer_receipt"
 
 
 class ReviewV2Field(BaseModel):
@@ -376,7 +376,7 @@ def _build_attributes(
     for document in documents:
         receipt_scoped = (
             "BOOKING" in stages
-            and str(document.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE
+            and is_receipt_document_type(document.documentTypeKey)
         )
         for field in document.fields:
             spec = None if receipt_scoped else spec_for_field(field.fieldKey)

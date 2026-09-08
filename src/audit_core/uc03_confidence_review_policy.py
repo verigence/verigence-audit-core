@@ -44,6 +44,7 @@ from audit_core.security_authorization import (
 from audit_core.security_integration import SecurityOAuthClient, SecurityTokenError
 from audit_core.uc03_booking_commands import _aggregate_lock, _parse_if_match
 from audit_core.uc03_di_core_persistence import persist_reviewed_di_fields
+from audit_core.uc03_document_registry import is_reconciliation_trigger_document_type
 from audit_core.uc03_finding_classification import resolve_classification
 from audit_core.uc03_v2_review_materialization import (
     materialize_reviewed_di_business_values,
@@ -986,7 +987,7 @@ def _sync_booking_document(
     # these document types so unrelated documents (PAN, RTO, insurance...)
     # don't pay for a no-op reconciliation pass. Booking's receipt document
     # type is dealer_receipt; Delivery's is payment_receipt (0017/0022).
-    if document_type_key in ("dealer_receipt", "payment_receipt", "bank_statement_extract"):
+    if is_reconciliation_trigger_document_type(document_type_key):
         reconcile_payments_with_escalation(
             connection,
             tenant_id=tenant_id,
