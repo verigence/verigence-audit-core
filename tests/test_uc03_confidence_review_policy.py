@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from uuid import uuid4
 
 from audit_core import uc03_document_review_v2 as review_v2
@@ -7,6 +8,7 @@ from audit_core.uc03_confidence_review_policy import (
     REVIEW_THRESHOLD_PERCENT,
     _build_raw_review_item,
     _field_review_state,
+    acknowledge_booking_document_link_with_auto_sync,
     requires_pc_review,
 )
 
@@ -62,3 +64,16 @@ def test_any_low_confidence_source_creates_pc_review_work() -> None:
     )
     assert item is not None
     assert item.decision_required is True
+
+
+def test_document_link_webhook_defers_sync_to_a_background_task() -> None:
+    # DI's own client enforces a hard 5s timeout on this callback -- a
+    # consistent timeout retried indefinitely against the same document was
+    # observed live. The webhook must acknowledge the link and return
+    # immediately; the DI fact fetch / durable copy / SKU resolution /
+    # reconciliation / materialization pipeline runs afterward, off the
+    # response path, regardless of how slow it gets.
+    source = inspect.getsource(acknowledge_booking_document_link_with_auto_sync)
+    assert "background_tasks.add_task(" in source
+    assert "_run_sync_booking_document_task" in source
+    assert "_sync_booking_document(" not in source
