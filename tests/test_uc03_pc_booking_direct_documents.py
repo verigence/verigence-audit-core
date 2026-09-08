@@ -67,6 +67,23 @@ def test_repeatable_review_accepts_any_active_document_for_requirement() -> None
     assert "association_status='ACTIVE'" in source
 
 
+def test_delivery_payment_receipt_is_also_repeatable() -> None:
+    # DI's document-link callback is not Booking-specific -- it now accepts
+    # Delivery requirements too (see 0068), so Delivery's own payment-receipt
+    # requirement key needs the same "don't supersede" treatment Booking's does.
+    assert _is_repeatable_requirement("payment_receipt") is True
+
+
+def test_document_link_callback_is_not_hardcoded_to_booking() -> None:
+    # The requirement row says which process area a document belongs to; the
+    # callback must not assume Booking. Asserts against the actual SQL rather
+    # than behaviour so a future refactor can't silently reintroduce the
+    # hardcode without touching this string.
+    source = inspect.getsource(acknowledge_booking_document_link).replace(" ", "").replace("\n", "")
+    assert "process_area)IN('BOOKING','DELIVERY')" in source
+    assert "process_area)='BOOKING'" not in source
+
+
 def test_confidence_is_transport_provenance_and_accepts_native_di_scale() -> None:
     field = _field(confidence=0.82)
     assert field.sourceConfidence == 0.82

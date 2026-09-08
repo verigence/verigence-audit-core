@@ -70,7 +70,11 @@ router = APIRouter(tags=["uc03-pc-booking-documents"])
 
 _DI_AUDIENCE = "di"
 _AUDIT_SERVICE_AUDIENCE = "audit"
-_REPEATABLE_REQUIREMENT_KEYS = {"booking_payment_receipt"}
+# Requirement keys that accept more than one active evidence row (partial
+# payments, multiple receipts) rather than the newest superseding the last.
+# Delivery's payment-receipt requirement (0017/0022) needs the same treatment
+# as Booking's now that this callback handles both process areas.
+_REPEATABLE_REQUIREMENT_KEYS = {"booking_payment_receipt", "payment_receipt"}
 
 
 class BookingUploadRequirement(BaseModel):
@@ -362,10 +366,11 @@ def _discover_requirement_for_callback(
             """
             SELECT tenant_id, journey_id, journey_document_requirement_id,
                    requirement_key, document_type_key, requirement_level,
-                   requirement_status, condition_snapshot
+                   requirement_status, condition_snapshot,
+                   upper(process_area) AS process_area
             FROM auditcore.journey_document_requirements
             WHERE journey_document_requirement_id=:requirement_ref
-              AND upper(process_area)='BOOKING'
+              AND upper(process_area) IN ('BOOKING','DELIVERY')
             """
         ),
         {"requirement_ref": requirement_ref},
@@ -373,8 +378,8 @@ def _discover_requirement_for_callback(
     if row is None:
         raise NotFoundError(
             error_code="VAC-NF-006",
-            title="Booking document requirement not found",
-            detail="The supplied requirementRef is not an active Booking document requirement.",
+            title="Document requirement not found",
+            detail="The supplied requirementRef is not an active Booking or Delivery document requirement.",
         )
     return row
 
@@ -411,12 +416,19 @@ def acknowledge_booking_document_link(
     journey_id: UUID = discovered["journey_id"]
     set_tenant_context(connection, tenant_id)
 
+    # Stage is data, not routing: this callback is DI telling Audit Core "this
+    # document is linked to this requirement" -- DI has no notion of Booking vs
+    # Delivery, and neither should this handler. The requirement row itself
+    # already says which process area it belongs to; everything downstream
+    # (evidence.process_area, the assessment row, which rules/triggers fire)
+    # reads that value instead of assuming one.
     requirement = connection.execute(
         text(
             """
             SELECT jdr.journey_document_requirement_id, jdr.requirement_key,
                    jdr.document_type_key, jdr.requirement_level,
                    jdr.requirement_status, jdr.condition_snapshot,
+                   upper(jdr.process_area) AS process_area,
                    j.customer_id, j.document_requirement_profile_version_id
             FROM auditcore.journey_document_requirements jdr
             JOIN auditcore.journeys j
@@ -424,7 +436,7 @@ def acknowledge_booking_document_link(
             WHERE jdr.tenant_id=:tenant_id
               AND jdr.journey_id=:journey_id
               AND jdr.journey_document_requirement_id=:requirement_ref
-              AND upper(jdr.process_area)='BOOKING'
+              AND upper(jdr.process_area) IN ('BOOKING','DELIVERY')
             FOR UPDATE OF jdr
             """
         ),
@@ -436,6 +448,7 @@ def acknowledge_booking_document_link(
     ).mappings().one()
     applicability_state, applicability_reason = _require_callback_applicable(requirement)
     customer_id: UUID = requirement["customer_id"]
+    process_area: str = requirement["process_area"]
     repeatable = _is_repeatable_requirement(requirement["requirement_key"])
 
     subject_id = _subject_mapping(
@@ -543,7 +556,7 @@ def acknowledge_booking_document_link(
                     :tenant_id, :journey_id, :customer_id,
                     :requirement_ref,
                     :subject_id, :document_id,
-                    :document_type_key, 'BOOKING_DOCUMENT', 'BOOKING',
+                    :document_type_key, :evidence_purpose, :process_area,
                     'ACTIVE', :supersedes_evidence_id,
                     :service_id, NULL
                 )
@@ -558,6 +571,8 @@ def acknowledge_booking_document_link(
                 "subject_id": subject_id,
                 "document_id": payload.documentId,
                 "document_type_key": requirement["document_type_key"],
+                "evidence_purpose": f"{process_area}_DOCUMENT",
+                "process_area": process_area,
                 "supersedes_evidence_id": prior_evidence_id,
                 "service_id": service_principal.subject,
             },
@@ -576,7 +591,7 @@ def acknowledge_booking_document_link(
                 applicability_state, applicability_reason,
                 evidence_id
             ) VALUES (
-                :tenant_id, :journey_id, 'BOOKING',
+                :tenant_id, :journey_id, :process_area,
                 :requirement_ref, :requirement_key,
                 :profile_version_id,
                 :applicability_state, :applicability_reason,
@@ -592,6 +607,7 @@ def acknowledge_booking_document_link(
         {
             "tenant_id": tenant_id,
             "journey_id": journey_id,
+            "process_area": process_area,
             "requirement_ref": payload.requirementRef,
             "requirement_key": requirement["requirement_key"],
             "profile_version_id": requirement["document_requirement_profile_version_id"],
