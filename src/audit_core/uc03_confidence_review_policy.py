@@ -904,15 +904,34 @@ def _sync_booking_document(
     )
 
     # Resolve the booking's SKU against the OEM price masters, or raise a
-    # MODEL_NOT_IDENTIFIED finding for the PC (never raises).
-    from audit_core.uc03_model_resolution import sync_model_resolution
+    # MODEL_NOT_IDENTIFIED finding for the PC (never raises). A repeated
+    # internal failure (as opposed to the expected 0/many-match outcome,
+    # which MODEL_NOT_IDENTIFIED already covers) escalates to the PC too.
+    from audit_core.uc03_async_sync_tasks import (
+        reconcile_payments_with_escalation,
+        sync_model_resolution_with_escalation,
+    )
 
-    sync_model_resolution(
+    sync_model_resolution_with_escalation(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
         correlation_id="",
     )
+
+    # A receipt or bank statement just confirming is exactly when a fresh
+    # reconciliation pass has something new to match -- run it here instead
+    # of waiting for PC Verify/Submit or the next Overview read. Scoped to
+    # these two document types so unrelated documents (PAN, RTO, insurance...)
+    # don't pay for a no-op reconciliation pass.
+    if document_type_key in ("dealer_receipt", "bank_statement_extract"):
+        reconcile_payments_with_escalation(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code="BOOKING",
+            correlation_id="",
+        )
     return len(facts)
 
 
@@ -939,16 +958,25 @@ def acknowledge_booking_document_link_with_auto_sync(
         service_id=service_principal.subject,
         requirement_ref=payload.requirementRef,
     )
-    _sync_booking_document(
-        connection,
-        tenant_id=str(discovered["tenant_id"]),
-        journey_id=discovered["journey_id"],
-        document_id=payload.documentId,
-        service_id=service_principal.subject,
-        security_client=security_client,
-        di_client=di_client,
-        bump_version=True,
-    )
+    # This callback now accepts Booking and Delivery requirements alike (the
+    # requirement row says which -- see migration 0068); the evidence link
+    # itself is created for both. _sync_booking_document's own machinery
+    # (journey_stage_states, MANUAL_VERIFICATION, SKU resolution) is still
+    # Booking-specific throughout, so only run it for a Booking requirement
+    # here. Delivery's equivalent per-document sync is a separate, tracked
+    # follow-up -- this deliberately does not silently write Booking-shaped
+    # updates against a Delivery document.
+    if str(discovered["process_area"]).upper() == "BOOKING":
+        _sync_booking_document(
+            connection,
+            tenant_id=str(discovered["tenant_id"]),
+            journey_id=discovered["journey_id"],
+            document_id=payload.documentId,
+            service_id=service_principal.subject,
+            security_client=security_client,
+            di_client=di_client,
+            bump_version=True,
+        )
     return response
 
 
