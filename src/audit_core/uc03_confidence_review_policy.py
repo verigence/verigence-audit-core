@@ -16,7 +16,7 @@ from typing import Annotated, Any
 from uuid import UUID
 
 import structlog
-from fastapi import Depends, Header, Request, Response
+from fastapi import BackgroundTasks, Depends, Header, Request, Response
 from fastapi.routing import APIRoute
 from sqlalchemy import Connection, Engine, text
 
@@ -25,6 +25,7 @@ from audit_core import uc03_booking_review_decisions as booking_review
 from audit_core import uc03_document_review_v2 as review_v2
 from audit_core import uc03_pc_booking_documents as pc_documents
 from audit_core import uc03_review_effective_values as effective_values
+from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_engine, get_human_principal
 from audit_core.di_client import DiClient, DiClientError
 from audit_core.errors import ConflictError, DependencyUnavailableError, NotFoundError
@@ -991,6 +992,58 @@ def _sync_booking_document(
     return len(facts)
 
 
+def _run_sync_booking_document_task(
+    engine: Engine,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    document_id: UUID,
+    service_id: str,
+    stage_code: str,
+) -> None:
+    """Background execution of _sync_booking_document for the DI document-link
+    webhook. DI's own client enforces a hard 5s timeout on that call (a
+    consistent timeout on the same document, retried indefinitely, is the
+    signature seen live). Acknowledging the link itself is already fast (a
+    few inserts); everything _sync_booking_document does after that -- a DI
+    facts fetch, durable copy, MANUAL_VERIFICATION, SKU resolution,
+    reconciliation, Delivery materialization -- has no such guarantee, and
+    only grows as more steps accumulate. Running it here, after the webhook
+    has already responded, means a slow moment costs a beat of eventual
+    consistency, never DI's retry budget.
+    """
+    security_provider = get_security_oauth_client()
+    di_provider = get_di_client()
+    try:
+        security_client = next(security_provider)
+        di_client = next(di_provider)
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            _sync_booking_document(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                document_id=document_id,
+                service_id=service_id,
+                security_client=security_client,
+                di_client=di_client,
+                bump_version=True,
+                stage_code=stage_code,
+            )
+    except Exception:
+        logger.warning(
+            "uc03_document_link_background_sync_failed",
+            tenant_id=tenant_id,
+            journey_id=str(journey_id),
+            document_id=str(document_id),
+            stage_code=stage_code,
+            exc_info=True,
+        )
+    finally:
+        di_provider.close()
+        security_provider.close()
+
+
 def acknowledge_booking_document_link_with_auto_sync(
     payload: pc_documents.BookingDocumentLinkCommand,
     service_principal: Annotated[
@@ -998,11 +1051,8 @@ def acknowledge_booking_document_link_with_auto_sync(
         Depends(pc_documents.require_audit_service_principal),
     ],
     connection: Annotated[Connection, Depends(get_connection)],
-    security_client: Annotated[
-        SecurityOAuthClient,
-        Depends(get_security_oauth_client),
-    ],
-    di_client: Annotated[DiClient, Depends(get_di_client)],
+    engine: Annotated[Engine, Depends(get_engine)],
+    background_tasks: BackgroundTasks,
 ) -> pc_documents.BookingDocumentLinkResponse:
     response = pc_documents.acknowledge_booking_document_link(
         payload=payload,
@@ -1019,16 +1069,17 @@ def acknowledge_booking_document_link_with_auto_sync(
     # 0068), and _sync_booking_document runs the identical sync for either --
     # DI status -> DOCUMENT_MISSING -> durable fact copy -> MANUAL_VERIFICATION
     # -> stage-appropriate rules (SKU resolution is Booking-only; payment
-    # reconciliation and canonical materialization run for both).
-    _sync_booking_document(
-        connection,
+    # reconciliation and canonical materialization run for both). Deferred to
+    # a background task (see _run_sync_booking_document_task) so this
+    # webhook -- bound by DI's own 5s client timeout -- always responds as
+    # soon as the link itself is acknowledged.
+    background_tasks.add_task(
+        _run_sync_booking_document_task,
+        engine,
         tenant_id=str(discovered["tenant_id"]),
         journey_id=discovered["journey_id"],
         document_id=payload.documentId,
         service_id=service_principal.subject,
-        security_client=security_client,
-        di_client=di_client,
-        bump_version=True,
         stage_code=str(discovered["process_area"]).upper(),
     )
     return response
