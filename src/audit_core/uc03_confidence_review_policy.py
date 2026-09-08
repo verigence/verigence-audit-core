@@ -770,7 +770,24 @@ def _sync_booking_document(
     requirement's process_area, never assumed -- Booking and Delivery run the
     identical pipeline; the only branches are ones a document type genuinely
     doesn't apply to (a Delivery document has no vehicle model to resolve a
-    SKU against)."""
+    SKU against).
+
+    Serialized per journey via an advisory transaction lock: multiple
+    documents for the same journey can confirm close together (a normal
+    upload batch, or several async callbacks landing at once now that the
+    document-link webhook responds immediately -- see
+    _run_sync_booking_document_task), each writing the same
+    journey_stage_states / evidence rows. Racing them was observed live as
+    ``QueryCanceled: canceling statement due to statement timeout`` under
+    row-lock contention; the lock makes them queue instead of collide. Safe
+    to acquire repeatedly within the same transaction (Postgres advisory
+    locks are re-entrant per session), so the pre-submit gate's per-document
+    loop -- all inside one connection/transaction -- pays for it once.
+    """
+    connection.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+        {"lock_key": f"uc03-document-sync:{tenant_id}:{journey_id}"},
+    )
     link = connection.execute(
         text(
             """
@@ -1011,6 +1028,18 @@ def _run_sync_booking_document_task(
     only grows as more steps accumulate. Running it here, after the webhook
     has already responded, means a slow moment costs a beat of eventual
     consistency, never DI's retry budget.
+
+    Deferring to the background also means DI can now fire this webhook far
+    faster than before (each call used to be held open by all the work this
+    now does afterward, which throttled how quickly retries piled up). Several
+    documents for the same journey confirming close together previously ran
+    as separate, mostly-sequential requests; now they can spawn genuinely
+    concurrent background tasks, all writing the same journey_stage_states /
+    evidence rows -- exactly the kind of row-lock contention that shows up
+    live as ``QueryCanceled: canceling statement due to statement timeout``.
+    An advisory transaction lock keyed per journey serializes them instead of
+    letting them race: at most one document's sync runs for a given journey
+    at a time, everything else waits its turn rather than lock-contending.
     """
     security_provider = get_security_oauth_client()
     di_provider = get_di_client()

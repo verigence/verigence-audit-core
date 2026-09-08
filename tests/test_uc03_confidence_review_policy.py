@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 from uuid import uuid4
 
+import audit_core.uc03_confidence_review_policy as confidence_policy
 from audit_core import uc03_document_review_v2 as review_v2
 from audit_core.uc03_confidence_review_policy import (
     REVIEW_THRESHOLD_PERCENT,
@@ -77,3 +78,35 @@ def test_document_link_webhook_defers_sync_to_a_background_task() -> None:
     assert "background_tasks.add_task(" in source
     assert "_run_sync_booking_document_task" in source
     assert "_sync_booking_document(" not in source
+
+
+def test_sync_booking_document_serializes_per_journey_with_an_advisory_lock() -> None:
+    # Multiple documents for the same journey can now confirm close together
+    # -- an upload batch, or several background syncs firing in quick
+    # succession once the webhook responds immediately (see
+    # _run_sync_booking_document_task) -- all writing the same
+    # journey_stage_states/evidence rows. Racing them was observed live as a
+    # Postgres statement-timeout under row-lock contention; this lock must
+    # be the very first thing the pipeline does, before it touches any of
+    # those rows, so concurrent callers queue instead of colliding.
+    #
+    # Read straight from the source file rather than inspect.getsource() on
+    # the live name: install_uc03_post_extraction_materialization() (a
+    # different, unrelated monkey-patch) reassigns
+    # confidence_policy._sync_booking_document at app startup, and whichever
+    # test file's TestClient(app) happens to run first during collection
+    # decides whether a plain `from ... import _sync_booking_document` here
+    # captures the original function or that wrapper -- order-dependent
+    # either way, so don't rely on the live object at all.
+    source_file = inspect.getsourcefile(confidence_policy)
+    assert source_file is not None
+    with open(source_file) as f:
+        module_source = f.read()
+    start = module_source.index("\ndef _sync_booking_document(")
+    end = module_source.index("\ndef ", start + 1)
+    function_source = module_source[start:end]
+    assert "pg_advisory_xact_lock" in function_source
+    assert (
+        function_source.index("pg_advisory_xact_lock")
+        < function_source.index("FROM auditcore.evidence")
+    )
