@@ -347,8 +347,26 @@ def _ensure_di_context(
     return context_ref, token
 
 
+# Audit Core's capture-requirement master carries the legacy key ``booking_docket``
+# for the Booking Form / OTF, but DI's extraction schema, the DI V2 classifier and
+# Core's own reviewed-value materialisation (``_BOOKING_FORM_DOCUMENT_TYPE``) all use
+# ``booking_form``.  Send/accept the canonical key so the sales contract is extracted
+# against the real Booking Form field set instead of the generic fallback schema.
+_DOCUMENT_TYPE_ALIASES: dict[str, str] = {"booking_docket": "booking_form"}
+
+
+def _canonical_document_type(key: str) -> str:
+    return _DOCUMENT_TYPE_ALIASES.get(key, key)
+
+
 def _candidate_type_keys(requirements: list[dict[str, Any]]) -> list[str]:
-    return list(dict.fromkeys(str(row["document_type_key"]) for row in requirements if row.get("document_type_key")))
+    return list(
+        dict.fromkeys(
+            _canonical_document_type(str(row["document_type_key"]))
+            for row in requirements
+            if row.get("document_type_key")
+        )
+    )
 
 
 def _requirement_refs_by_document_type_key(
@@ -368,6 +386,7 @@ def _requirement_refs_by_document_type_key(
         requirement_ref = row.get("requirement_ref")
         if document_type_key and requirement_ref:
             result.setdefault(str(document_type_key), str(requirement_ref))
+            result.setdefault(_canonical_document_type(str(document_type_key)), str(requirement_ref))
     return result
 
 
@@ -381,7 +400,11 @@ def _reconcile_documents(
 ) -> None:
     type_to_requirement: dict[str, str] = {}
     for requirement in requirements:
-        type_to_requirement.setdefault(str(requirement["document_type_key"]), str(requirement["requirement_key"]))
+        raw_key = str(requirement["document_type_key"])
+        requirement_key = str(requirement["requirement_key"])
+        # bind a classification of either the legacy or the canonical type
+        type_to_requirement.setdefault(raw_key, requirement_key)
+        type_to_requirement.setdefault(_canonical_document_type(raw_key), requirement_key)
 
     for item in di_documents:
         document_id = UUID(str(item["documentId"]))
