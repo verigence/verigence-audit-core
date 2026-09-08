@@ -353,13 +353,16 @@ def _materialize_discount_standards(
                     standard_eligible_amount, actual_discount_amount,
                     eligibility_result, actual_source_kind, details
                 )
-                SELECT :tenant_id, :journey_id, :discount_key,
-                       NULL, :actual, 'NOT_ELIGIBLE', :calc,
+                SELECT CAST(:tenant_id AS varchar), CAST(:journey_id AS uuid),
+                       CAST(:discount_key AS varchar),
+                       CAST(NULL AS numeric), CAST(:actual AS numeric),
+                       'NOT_ELIGIBLE', CAST(:calc AS varchar),
                        CAST(:details AS jsonb)
                 WHERE NOT EXISTS (
                     SELECT 1 FROM auditcore.discount_applications
-                    WHERE tenant_id = :tenant_id AND journey_id = :journey_id
-                      AND discount_key = :discount_key
+                    WHERE tenant_id = CAST(:tenant_id AS varchar)
+                      AND journey_id = CAST(:journey_id AS uuid)
+                      AND discount_key = CAST(:discount_key AS varchar)
                 )
                 """
             ),
