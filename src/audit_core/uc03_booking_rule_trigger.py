@@ -42,7 +42,13 @@ def _requirement_snapshot(
             """
             SELECT jdr.requirement_key, jdr.requirement_level,
                    jdr.requirement_status,
-                   COALESCE(jda.answer, 'UNANSWERED') AS answer
+                   COALESCE(jda.answer, 'UNANSWERED') AS answer,
+                   EXISTS (
+                       SELECT 1 FROM auditcore.evidence e
+                       WHERE e.tenant_id=jdr.tenant_id
+                         AND e.journey_document_requirement_id=jdr.journey_document_requirement_id
+                         AND e.association_status='ACTIVE'
+                   ) AS has_evidence
             FROM auditcore.journey_document_requirements jdr
             LEFT JOIN auditcore.journey_document_assessments jda
               ON jda.tenant_id=jdr.tenant_id
@@ -63,8 +69,25 @@ def _requirement_snapshot(
 
 
 def _requirement_satisfied(row: dict[str, Any]) -> bool:
+    # journey_document_requirements.requirement_status is never actually
+    # transitioned to SATISFIED for Booking anywhere in the current codebase
+    # (Delivery has its own explicit per-document answer/evidence endpoint
+    # that does this; Booking's V2 "upload everything" flow never asks the
+    # PC to explicitly answer a per-document applicability question, so
+    # journey_document_assessments.answer stays UNANSWERED forever too).
+    # This checkpoint-rule engine went unreachable (shadowed route) until it
+    # was wired up live this session, which is why this gap was never
+    # observed before: every requirement with real, active evidence linked
+    # was flagged outstanding regardless of how thoroughly the PC reviewed
+    # it. Booking's actual Submit gate (_mandatory_booking_documents_complete
+    # in uc03_booking_v2.py) already treats a classified, linked document as
+    # sufficient rather than requiring an explicit answer -- matching that
+    # here too, in addition to (not instead of) the explicit-answer path in
+    # case a future flow starts using it.
+    if row.get("has_evidence"):
+        return True
     return (
-        str(row.get("requirement_status") or "").upper() == "SATISFIED"
+        str(row.get("requirement_status") or "").upper() in ("SATISFIED", "WAIVED")
         and str(row.get("answer") or "UNANSWERED").upper() == "YES"
     )
 
