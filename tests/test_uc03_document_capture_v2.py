@@ -224,12 +224,19 @@ def test_booking_docket_requirement_sends_canonical_booking_form_to_di() -> None
     assert _candidate_type_keys(requirements) == ["booking_form", "pan_card"]
 
 
-def test_requirement_ref_map_accepts_both_booking_keys() -> None:
-    refs = _requirement_refs_by_document_type_key(
-        [{"document_type_key": "booking_docket", "requirement_ref": "req-1"}]
-    )
-    assert refs["booking_docket"] == "req-1"
-    assert refs["booking_form"] == "req-1"
+def test_requirement_ref_map_uses_only_the_canonical_key() -> None:
+    # Regression test: this map feeds DI's create_upload_intents call alongside
+    # candidate_document_type_keys (_candidate_type_keys, always canonical). DI
+    # rejects the whole request with "Requirement-ref mapping contains a
+    # non-candidate document type." if this map has a key outside the candidate
+    # list -- a live production failure on every single Booking upload, because
+    # this map used to also carry the legacy "booking_docket" key, which is
+    # never a candidate once _candidate_type_keys canonicalizes it away.
+    requirements = [{"document_type_key": "booking_docket", "requirement_ref": "req-1"}]
+    refs = _requirement_refs_by_document_type_key(requirements)
+
+    assert refs == {"booking_form": "req-1"}
+    assert set(refs) <= set(_candidate_type_keys(requirements))
 
 
 def test_local_completion_check_uses_reconciled_classified_links() -> None:
