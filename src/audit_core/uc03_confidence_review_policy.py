@@ -43,6 +43,7 @@ from audit_core.security_authorization import (
 )
 from audit_core.security_integration import SecurityOAuthClient, SecurityTokenError
 from audit_core.uc03_booking_commands import _aggregate_lock, _parse_if_match
+from audit_core.uc03_booking_rule_trigger import schedule_booking_checkpoint_rules
 from audit_core.uc03_di_core_persistence import persist_reviewed_di_fields
 from audit_core.uc03_document_registry import is_reconciliation_trigger_document_type
 from audit_core.uc03_finding_classification import resolve_classification
@@ -1050,6 +1051,32 @@ def _run_sync_booking_document_task(
         di_provider.close()
         security_provider.close()
 
+    # Async by construction, matching this pipeline's own philosophy: a
+    # document confirming is what should evaluate Booking checkpoint rules
+    # and the external rule-engine phase, not the PC remembering to click
+    # Confirm. schedule_booking_checkpoint_rules opens its own connection and
+    # runs only after the sync above has already committed, so it always
+    # evaluates the just-synced data, never a stale pre-commit snapshot.
+    # Booking-only for now (see uc03_booking_rule_trigger.py); Delivery has
+    # no equivalent checkpoint-rule set yet.
+    if stage_code == "BOOKING":
+        try:
+            schedule_booking_checkpoint_rules(
+                engine,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                correlation_id="",
+                trigger="ASYNC_DOCUMENT_SYNC",
+            )
+        except Exception:
+            logger.warning(
+                "uc03_booking_checkpoint_rule_schedule_failed",
+                tenant_id=tenant_id,
+                journey_id=str(journey_id),
+                document_id=str(document_id),
+                exc_info=True,
+            )
+
 
 def acknowledge_booking_document_link_with_auto_sync(
     payload: pc_documents.BookingDocumentLinkCommand,
@@ -1284,6 +1311,7 @@ def confirm_booking_review_v2_confidence_policy(
     journey_id: UUID,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
     if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
     idempotency_key: Annotated[
         str,
@@ -1565,6 +1593,21 @@ def confirm_booking_review_v2_confidence_policy(
         execute=execute,
     )
     response.headers["ETag"] = f'"{body["aggregateVersion"]}"'
+    # Safety net, not the trigger -- the async document-sync path (see
+    # _run_sync_booking_document_task) already schedules this per document
+    # confirmation. Scheduling it again here, keyed on the current aggregate
+    # version, costs nothing when nothing changed (create_workflow_task_once
+    # returns the existing task, which run_booking_review_rule_task then
+    # no-ops on) and catches a PC correction made at confirm itself, which
+    # bumps the version through this path alone.
+    background_tasks.add_task(
+        schedule_booking_checkpoint_rules,
+        engine,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        correlation_id=get_correlation_id(request),
+        trigger="PC_BOOKING_ATTRIBUTE_REVIEW_CONFIRMED",
+    )
     return booking_review.BookingReviewV2ConfirmWithDecisionsResponse.model_validate(body)
 
 

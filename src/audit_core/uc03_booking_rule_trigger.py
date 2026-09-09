@@ -1,30 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal
+from typing import Any, Literal
 from uuid import UUID
 
 import structlog
-from fastapi import BackgroundTasks, Depends, Header, Request, Response
-from fastapi.routing import APIRoute
 from sqlalchemy import Connection, Engine, text
 
-from audit_core import uc03_document_review_v2 as review_v2
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import get_connection, get_engine, get_human_principal
-from audit_core.evidence import get_di_client, get_security_oauth_client
-from audit_core.observability import get_correlation_id
-from audit_core.security import HumanPrincipal
-from audit_core.security_authorization import (
-    SecurityAuthorizationClient,
-    get_security_authorization_client,
-)
-from audit_core.security_integration import SecurityOAuthClient
 from audit_core.uc03_booking_commands import _append_workflow_event
-from audit_core.uc03_booking_review_decisions import (
-    BookingReviewV2ConfirmWithDecisionsResponse,
-    confirm_booking_review_v2_with_decisions,
-)
 from audit_core.uc03_delivery_commands import _machine_flag
 from audit_core.uc03_rule_engine_findings import run_rule_engine_phase
 from audit_core.workflow import claim_worker_task, get_workflow_task, start_worker_task
@@ -238,7 +222,7 @@ def _complete_worker_task(
         text(
             """
             UPDATE auditcore.workflow_task_attempts
-            SET ended_at_utc=now(), attempt_result='SUCCESS'
+            SET ended_at_utc=now(), attempt_result='SUCCEEDED'
             WHERE tenant_id=:tenant_id
               AND workflow_task_id=:task_id
               AND attempt_no=:attempt_no
@@ -456,112 +440,97 @@ def run_booking_review_rule_task(
     run_rule_engine_phase(engine, tenant_id, journey_id, "BOOKING", "BOOKING", correlation_id)
 
 
-def confirm_booking_review_v2_and_trigger_rules(
+def schedule_booking_checkpoint_rules(
+    engine: Engine,
+    *,
     tenant_id: str,
     journey_id: UUID,
-    background_tasks: BackgroundTasks,
-    request: Request,
-    response: Response,
-    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
-    idempotency_key: Annotated[
-        str,
-        Header(alias="Idempotency-Key", min_length=8, max_length=200),
-    ],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-    engine: Annotated[Engine, Depends(get_engine)],
-    security_client: Annotated[
-        SecurityOAuthClient,
-        Depends(get_security_oauth_client),
-    ],
-    di_client: Annotated[review_v2.DiClient, Depends(get_di_client)],
-    v2_client: Annotated[
-        review_v2.DiCaptureV2Client,
-        Depends(review_v2.get_di_capture_v2_client),
-    ],
-) -> BookingReviewV2ConfirmWithDecisionsResponse:
-    result = confirm_booking_review_v2_with_decisions(
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        request=request,
-        response=response,
-        if_match=if_match,
-        idempotency_key=idempotency_key,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        connection=connection,
-        engine=engine,
-        security_client=security_client,
-        di_client=di_client,
-        v2_client=v2_client,
-    )
+    correlation_id: str,
+    trigger: str,
+) -> None:
+    """Evaluate Booking checkpoint rules + the external rule-engine phase for
+    the journey's CURRENT aggregate version, deduped per version.
 
-    journey = connection.execute(
-        text(
-            """
-            SELECT dealer_id, outlet_id
-            FROM auditcore.journeys
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one()
-    correlation_id = get_correlation_id(request)
-    effect_key = (
-        f"uc03.booking.review-rule-evaluation:{journey_id}:"
-        f"{result.aggregateVersion}"
-    )
-    task_id = create_workflow_task_once(
-        connection,
-        tenant_id=tenant_id,
-        effect_key=effect_key,
-        journey_id=journey_id,
-        workflow_type=_WORKFLOW_TYPE,
-        process_area="BOOKING",
-        task_type=_TASK_TYPE,
-        dealer_id=journey["dealer_id"],
-        outlet_id=journey["outlet_id"],
-        task_payload={
-            "trigger": "PC_BOOKING_ATTRIBUTE_REVIEW_CONFIRMED",
-            "aggregateVersion": result.aggregateVersion,
-        },
-        correlation_id=correlation_id,
-    )
-    background_tasks.add_task(
-        run_booking_review_rule_task,
+    Async by design, matching the document-sync pipeline's own philosophy
+    (see _sync_booking_document): rule evaluation must not depend on the PC
+    remembering to click Confirm. This is called from three places --
+    - the DI document-link webhook's background sync, every time a document
+      confirms (the primary trigger: fully async, fires whether or not the
+      PC has looked at the Booking since);
+    - PC Review Confirm, as a final safety net, exactly like Submit is a
+      safety net for document sync rather than the trigger;
+    each call reads the journey's current journey_stage_states.version_no
+    and keys the workflow task's effect_key on it
+    (uc03.booking.review-rule-evaluation:{journey_id}:{version}), so several
+    calls for the same unchanged version collapse to the one task
+    create_workflow_task_once already returns, and a version bump (a new
+    document synced, or a PC correction at confirm) always gets a fresh
+    evaluation. Opens its own connection deliberately -- callers must invoke
+    this only after their own transaction has committed, never nested inside
+    one, or it would evaluate rules against not-yet-visible data.
+    """
+
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        state = connection.execute(
+            text(
+                """
+                SELECT version_no
+                FROM auditcore.journey_stage_states
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND stage_code='BOOKING'
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).mappings().one_or_none()
+        if state is None:
+            return
+        aggregate_version = int(state["version_no"])
+
+        journey = connection.execute(
+            text(
+                """
+                SELECT dealer_id, outlet_id
+                FROM auditcore.journeys
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).mappings().one()
+
+        effect_key = f"uc03.booking.review-rule-evaluation:{journey_id}:{aggregate_version}"
+        task_id = create_workflow_task_once(
+            connection,
+            tenant_id=tenant_id,
+            effect_key=effect_key,
+            journey_id=journey_id,
+            workflow_type=_WORKFLOW_TYPE,
+            process_area="BOOKING",
+            task_type=_TASK_TYPE,
+            dealer_id=journey["dealer_id"],
+            outlet_id=journey["outlet_id"],
+            task_payload={"trigger": trigger, "aggregateVersion": aggregate_version},
+            correlation_id=correlation_id,
+        )
+
+    run_booking_review_rule_task(
         engine,
         tenant_id,
         journey_id,
         task_id,
         correlation_id,
-        result.aggregateVersion,
+        aggregate_version,
     )
-    return result
 
 
-def install_uc03_booking_review_rule_trigger() -> None:
-    """Run Booking checkpoint rules after a successful V2 Review confirmation."""
-
-    if getattr(review_v2, "_booking_review_rule_trigger_installed", False):
-        return
-    retained = []
-    for route in review_v2.router.routes:
-        if (
-            isinstance(route, APIRoute)
-            and route.path.endswith("/booking/review/confirm")
-            and "POST" in route.methods
-        ):
-            continue
-        retained.append(route)
-    review_v2.router.routes[:] = retained
-    review_v2.router.add_api_route(
-        "/booking/review/confirm",
-        confirm_booking_review_v2_and_trigger_rules,
-        methods=["POST"],
-        response_model=BookingReviewV2ConfirmWithDecisionsResponse,
-    )
-    review_v2._booking_review_rule_trigger_installed = True
+# confirm_booking_review_v2_and_trigger_rules and
+# install_uc03_booking_review_rule_trigger removed: install_uc03_confidence_
+# review_policy's later _replace_route call always discarded this route
+# registration anyway (confirmed: confirm_booking_review_v2_confidence_policy
+# is the actually-live handler and never called run_booking_review_rule_task
+# or run_rule_engine_phase -- the Booking checkpoint rules and the external
+# rule-engine call were silently never firing on a live Review confirm).
+# schedule_booking_checkpoint_rules above replaces both: it's called
+# directly from the live confirm handler and from the async document-sync
+# path, not installed via a route that a later installer can silently win
+# over.

@@ -137,9 +137,6 @@ def install_uc03_v2_capture_business_rules() -> None:
     from audit_core.uc03_booking_review_decisions import (
         install_uc03_booking_review_decisions,
     )
-    from audit_core.uc03_booking_rule_trigger import (
-        install_uc03_booking_review_rule_trigger,
-    )
     from audit_core.uc03_confidence_review_policy import (
         install_uc03_confidence_review_policy,
     )
@@ -184,7 +181,16 @@ def install_uc03_v2_capture_business_rules() -> None:
     # own routes for the same paths, included earlier in main.py -- confirmed
     # by the "Duplicate Operation ID" warning FastAPI raised on every test run.
     install_uc03_review_effective_values()
-    install_uc03_booking_review_rule_trigger()
+    # install_uc03_booking_review_rule_trigger() removed (Phase 0 monkeypatch
+    # removal): its /booking/review/confirm route registration was always
+    # discarded by install_uc03_confidence_review_policy's later
+    # _replace_route call anyway -- the Booking checkpoint rules and the
+    # external rule-engine call it scheduled were silently never firing on a
+    # live confirm. Fixed by moving that scheduling into
+    # schedule_booking_checkpoint_rules, called directly from the live
+    # confirm handler (uc03_confidence_review_policy.py) and from the async
+    # document-sync path, instead of a route another installer can silently
+    # win over.
     # Populate Core evidence identity before the final confidence-only policy builds
     # source rows and evidence-linked review/correction findings.
     install_uc03_review_evidence_link_patch()
