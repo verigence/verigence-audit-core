@@ -17,7 +17,6 @@ from uuid import UUID
 
 import structlog
 from fastapi import BackgroundTasks, Depends, Header, Request, Response
-from fastapi.routing import APIRoute
 from sqlalchemy import Connection, Engine, text
 
 from audit_core import uc03_booking_capture as booking_capture
@@ -1101,6 +1100,10 @@ def _run_sync_booking_document_task(
             )
 
 
+@pc_documents.router.post(
+    "/v1/internal/di/booking-document-links",
+    response_model=pc_documents.BookingDocumentLinkResponse,
+)
 def acknowledge_booking_document_link_with_auto_sync(
     payload: pc_documents.BookingDocumentLinkCommand,
     service_principal: Annotated[
@@ -1142,6 +1145,7 @@ def acknowledge_booking_document_link_with_auto_sync(
     return response
 
 
+@review_v2.router.get("/booking/review", response_model=review_v2.BookingReviewV2Response)
 def get_booking_review_v2_confidence_policy(
     tenant_id: str,
     journey_id: UUID,
@@ -1220,6 +1224,9 @@ def get_booking_review_v2_confidence_policy(
     )
 
 
+@review_v2.router.post(
+    "/booking/review/decision", response_model=booking_review.BookingReviewDecision
+)
 def set_booking_review_decision_confidence_policy(
     tenant_id: str,
     journey_id: UUID,
@@ -1329,6 +1336,10 @@ def set_booking_review_decision_confidence_policy(
     return booking_review._decision_model(dict(row))
 
 
+@review_v2.router.post(
+    "/booking/review/confirm",
+    response_model=booking_review.BookingReviewV2ConfirmWithDecisionsResponse,
+)
 def confirm_booking_review_v2_confidence_policy(
     tenant_id: str,
     journey_id: UUID,
@@ -1639,34 +1650,14 @@ def confirm_booking_review_v2_confidence_policy(
 # extraction_materialization's own later _replace_route call for the same
 # path always discarded it in favor of close_booking_ready_with_lazy_v2_sync
 # (uc03_post_extraction_materialization.py), which is now decorated directly
-# instead. Removing the _replace_route call below (which pointed at this
-# function) means this module no longer fights over that route at all.
+# instead.
 
-
-def _replace_route(
-    router: Any,
-    *,
-    suffix: str,
-    method: str,
-    endpoint: Any,
-    response_model: Any,
-) -> None:
-    retained = []
-    for route in router.routes:
-        if (
-            isinstance(route, APIRoute)
-            and route.path.endswith(suffix)
-            and method in route.methods
-        ):
-            continue
-        retained.append(route)
-    router.routes[:] = retained
-    router.add_api_route(
-        suffix,
-        endpoint,
-        methods=[method],
-        response_model=response_model,
-    )
+# _replace_route itself removed too: every route it used to swap in
+# (GET /booking/review, POST /booking/review/decision, POST /booking/review/
+# confirm, POST /v1/internal/di/booking-document-links, POST /booking/
+# close-ready) is now a direct @router decorator on the function that
+# actually wins, so nothing in this module needs to mutate a router's route
+# list after the fact anymore.
 
 
 def install_uc03_confidence_review_policy() -> None:
@@ -1683,32 +1674,19 @@ def install_uc03_confidence_review_policy() -> None:
     booking_review._build_raw_review_item = _build_raw_review_item  # type: ignore[assignment]
     booking_capture._completion_summary = _completion_summary  # type: ignore[assignment]
 
-    _replace_route(
-        review_v2.router,
-        suffix="/booking/review",
-        method="GET",
-        endpoint=get_booking_review_v2_confidence_policy,
-        response_model=review_v2.BookingReviewV2Response,
-    )
-    _replace_route(
-        review_v2.router,
-        suffix="/booking/review/decision",
-        method="POST",
-        endpoint=set_booking_review_decision_confidence_policy,
-        response_model=booking_review.BookingReviewDecision,
-    )
-    _replace_route(
-        review_v2.router,
-        suffix="/booking/review/confirm",
-        method="POST",
-        endpoint=confirm_booking_review_v2_confidence_policy,
-        response_model=booking_review.BookingReviewV2ConfirmWithDecisionsResponse,
-    )
-    _replace_route(
-        pc_documents.router,
-        suffix="/v1/internal/di/booking-document-links",
-        method="POST",
-        endpoint=acknowledge_booking_document_link_with_auto_sync,
-        response_model=pc_documents.BookingDocumentLinkResponse,
-    )
+    # The four _replace_route calls that used to live here (GET /booking/review,
+    # POST /booking/review/decision, POST /booking/review/confirm, POST
+    # /v1/internal/di/booking-document-links) are gone (Phase 0 monkeypatch
+    # removal): get_booking_review_v2_confidence_policy,
+    # set_booking_review_decision_confidence_policy,
+    # confirm_booking_review_v2_confidence_policy, and
+    # acknowledge_booking_document_link_with_auto_sync are now decorated
+    # directly at their definitions above instead. The five attribute
+    # patches above this comment stay -- unlike the routes, they exist
+    # because of a genuine circular import (uc03_booking_capture.py and
+    # uc03_document_review_v2.py can't import this module back), not just
+    # unwired composition; untangling them needs the module split already
+    # planned for Phase 1 (uc03_confidence_review_policy.py splitting into
+    # the generic sync pipeline vs. booking-review-decision-specific logic),
+    # not a quick fix here.
     review_v2._confidence_review_policy_installed = True

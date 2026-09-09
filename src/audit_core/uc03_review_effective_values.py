@@ -30,7 +30,6 @@ from audit_core.uc03_di_core_persistence import (
 )
 from audit_core.uc03_document_registry import is_receipt_document_type
 from audit_core.uc03_v2_review_materialization import (
-    materialize_reviewed_di_business_values,
     receipt_document_ordinals,
     receipt_review_key,
     reviewed_field_core_owner,
@@ -346,278 +345,13 @@ def _corrected_attributes(
     return corrected
 
 
-def confirm_booking_review_v2_effective_values(
-    tenant_id: str,
-    journey_id: UUID,
-    request: Request,
-    response: Response,
-    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
-    idempotency_key: Annotated[
-        str,
-        Header(alias="Idempotency-Key", min_length=8, max_length=200),
-    ],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-    engine: Annotated[Engine, Depends(get_engine)],
-    security_client: Annotated[
-        SecurityOAuthClient,
-        Depends(get_security_oauth_client),
-    ],
-    di_client: Annotated[review_v2.DiClient, Depends(get_di_client)],
-    v2_client: Annotated[
-        review_v2.DiCaptureV2Client,
-        Depends(review_v2.get_di_capture_v2_client),
-    ],
-    payload: ReviewConfirmCommand | None = None,
-) -> booking_review.BookingReviewV2ConfirmWithDecisionsResponse:
-    context = booking_review._scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    expected_version = _parse_if_match(if_match)
-    _, documents, attributes, unmapped = review_v2._booking_review_data(
-        connection=connection,
-        engine=engine,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        security_client=security_client,
-        di_client=di_client,
-        v2_client=v2_client,
-    )
-    if any(document.extractionState == "PENDING" for document in documents):
-        raise ConflictError(
-            error_code="VAC-CONFLICT-011",
-            title="Documents are not ready for review",
-            detail="Document Intelligence is still preparing one or more Booking documents.",
-        )
-    if any(document.extractionState == "FAILED" for document in documents):
-        raise ConflictError(
-            error_code="VAC-CONFLICT-011",
-            title="Document processing requires follow-up",
-            detail="One or more Booking documents failed processing and require follow-up.",
-        )
-
-    items = booking_review._current_review_items(attributes, unmapped)
-    decisions = booking_review._current_decisions(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        items=items,
-    )
-    required_keys = sorted(
-        item.review_key for item in items.values() if item.decision_required
-    )
-    missing_keys = [key for key in required_keys if key not in decisions]
-    if missing_keys:
-        raise ConflictError(
-            error_code="VAC-CONFLICT-012",
-            title="Review decisions are pending",
-            detail=(
-                f"{len(missing_keys)} extracted value"
-                f"{'s' if len(missing_keys) != 1 else ''} still require Accept or Reject."
-            ),
-        )
-
-    rejected_keys = {
-        key for key, decision in decisions.items() if decision == "REJECTED"
-    }
-    command = payload or ReviewConfirmCommand()
-    corrections = _correction_map(documents, command.corrections)
-    _validate_mapped_corrections(attributes, corrections)
-    corrected_documents = _corrected_documents(documents, corrections)
-    corrected_attributes = _corrected_attributes(attributes, corrections)
-    correlation_id = get_correlation_id(request)
-
-    def execute() -> dict[str, Any]:
-        _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
-        state = connection.execute(
-            text(
-                """
-                SELECT capture_completed_at_utc, pc_verification_status, version_no
-                FROM auditcore.journey_stage_states
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND stage_code='BOOKING'
-                FOR UPDATE
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).mappings().one_or_none()
-        if state is None or state["capture_completed_at_utc"] is None:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-010",
-                title="Booking capture has not been submitted",
-                detail="Submit Booking before completing Review.",
-            )
-        if int(state["version_no"]) != expected_version:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-005",
-                title="Booking version conflict",
-                detail="Booking changed since Review was loaded. Refresh Review and try again.",
-            )
-        if str(state["pc_verification_status"] or "PENDING") != "PENDING":
-            raise ConflictError(
-                error_code="VAC-CONFLICT-010",
-                title="Booking Review is not pending",
-                detail="This Booking Review has already been completed.",
-            )
-
-        stored_field_count = persist_reviewed_di_fields(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            stage_code="BOOKING",
-            actor_id=human_principal.subject,
-            fields=_reviewed_fields(
-                documents,
-                corrections,
-                rejected_keys=rejected_keys,
-            ),
-        )
-
-        applied: list[str] = []
-        conflicts: list[str] = []
-        rejected_attributes: list[str] = []
-        resolved_count = 0
-        for attribute in corrected_attributes:
-            source = attribute.resolvedSource
-            if source is None or attribute.resolvedValue is None:
-                continue
-            review_key = f"attribute:{attribute.attributeKey}"
-            if review_key in rejected_keys:
-                rejected_attributes.append(attribute.attributeKey)
-                continue
-
-            spec = review_v2.spec_for_field(source.fieldKey)
-            if spec is None or spec.attribute_key != attribute.attributeKey:
-                raise booking_review._missing_core_owner_error(
-                    field_key=source.fieldKey,
-                    document_type_key=source.documentTypeKey,
-                    attribute_key=attribute.attributeKey,
-                )
-
-            resolved_count += 1
-            application = review_v2.apply_supported_operational_attribute(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                spec=spec,
-                value=attribute.resolvedValue,
-                actor_id=human_principal.subject,
-                source_document_type_key=source.documentTypeKey,
-                source_field_key=source.fieldKey,
-                source_evidence_id=source.evidenceId,
-            )
-
-            owning_domain_key: str | None = None
-            owning_record_reference: str | None = None
-            if application is None:
-                typed_owner = reviewed_field_core_owner(
-                    document_type_key=source.documentTypeKey,
-                    field_key=source.fieldKey,
-                    document_id=source.documentId,
-                )
-                if typed_owner is not None:
-                    owning_domain_key, owning_record_reference = typed_owner
-            else:
-                owning_domain_key, owning_record_reference, application_status = application
-                if application_status == "CONFLICT":
-                    conflicts.append(attribute.attributeKey)
-
-            applied.append(attribute.attributeKey)
-            if spec.mapping_status == "SUPPORTED":
-                review_v2.record_attribute_resolution(
-                    connection,
-                    tenant_id=tenant_id,
-                    journey_id=journey_id,
-                    stage_code="BOOKING",
-                    spec=spec,
-                    source_di_document_id=source.documentId,
-                    source_evidence_id=source.evidenceId,
-                    source_canonical_field_id=source.canonicalFieldId,
-                    source_field_key=source.fieldKey,
-                    source_fact_version=source.sourceFactVersion,
-                    source_document_type_key=source.documentTypeKey,
-                    actor_id=human_principal.subject,
-                    owning_domain_key=owning_domain_key,
-                    owning_record_reference=owning_record_reference,
-                )
-
-        materialization = materialize_reviewed_di_business_values(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            documents=corrected_documents,
-            rejected_review_keys=rejected_keys,
-            actor_id=human_principal.subject,
-        )
-
-        next_version = expected_version + 1
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.journey_stage_states
-                SET pc_verification_status='VERIFIED',
-                    latest_activity_at_utc=now(),
-                    updated_at_utc=now(),
-                    version_no=:version
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND stage_code='BOOKING'
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id, "version": next_version},
-        )
-        booking_review._append_workflow_event(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            event_type="PC_BOOKING_ATTRIBUTE_REVIEW_CONFIRMED",
-            source_kind="HUMAN",
-            actor_id=human_principal.subject,
-            actor_role_snapshot=context["operating_role"],
-            idempotency_key=f"{idempotency_key}:review-confirmed",
-            correlation_id=correlation_id,
-            safe_payload={
-                "resolvedAttributeCount": resolved_count,
-                "storedFieldCount": stored_field_count,
-                "modifiedFieldCount": len(corrections),
-                "appliedAttributeKeys": sorted(applied),
-                "conflictAttributeKeys": sorted(conflicts),
-                "rejectedReviewKeys": sorted(rejected_keys),
-                **materialization,
-                "rawDiValuesCopied": True,
-            },
-            aggregate_version=next_version,
-        )
-        return {
-            "journeyId": str(journey_id),
-            "pcVerificationStatus": "VERIFIED",
-            "aggregateVersion": next_version,
-            "resolvedAttributeCount": resolved_count,
-            "appliedAttributes": sorted(applied),
-            "conflictAttributes": sorted(conflicts),
-            "rejectedAttributes": sorted(rejected_attributes),
-        }
-
-    body, _ = execute_idempotent_json_command(
-        connection,
-        tenant_id=tenant_id,
-        operation_key=f"uc03.booking.attribute-review.confirm:{journey_id}",
-        idempotency_key=idempotency_key,
-        request_payload={
-            "expectedVersion": expected_version,
-            "corrections": command.model_dump(mode="json")["corrections"],
-        },
-        execute=execute,
-    )
-    response.headers["ETag"] = f'"{body["aggregateVersion"]}"'
-    return booking_review.BookingReviewV2ConfirmWithDecisionsResponse.model_validate(body)
+# confirm_booking_review_v2_effective_values removed (Phase 0 monkeypatch
+# removal): confirmed dead in production even before this change --
+# install_uc03_confidence_review_policy ran after install_uc03_review_
+# effective_values in the original chain, so its own confirm_booking_
+# review_v2_confidence_policy always won this route in the end anyway.
+# confirm_delivery_review_v2_effective_values below is untouched --
+# Delivery's /delivery/review/confirm has no equivalent later swap.
 
 
 def confirm_delivery_review_v2_effective_values(
@@ -829,11 +563,11 @@ def install_uc03_review_effective_values() -> None:
     if getattr(review_v2, "_review_effective_values_installed", False):
         return
     booking_review._raw_review_items = _general_raw_review_items
-    _replace_confirm_route(
-        "/booking/review/confirm",
-        confirm_booking_review_v2_effective_values,
-        booking_review.BookingReviewV2ConfirmWithDecisionsResponse,
-    )
+    # POST /booking/review/confirm registration removed here (Phase 0
+    # monkeypatch removal): see the removal note above
+    # confirm_delivery_review_v2_effective_values -- confirm_booking_
+    # review_v2_confidence_policy is decorated directly on this route in
+    # uc03_confidence_review_policy.py instead.
     _replace_confirm_route(
         "/delivery/review/confirm",
         confirm_delivery_review_v2_effective_values,

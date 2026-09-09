@@ -402,10 +402,12 @@ def _require_callback_applicable(requirement) -> tuple[str, str | None]:
     return state, reason
 
 
-@router.post(
-    "/v1/internal/di/booking-document-links",
-    response_model=BookingDocumentLinkResponse,
-)
+# No @router decorator: uc03_confidence_review_policy.py's
+# acknowledge_booking_document_link_with_auto_sync is decorated directly on
+# this same router for this same path (POST /v1/internal/di/booking-
+# document-links) -- it calls this function at the start of its own body
+# (as pc_documents.acknowledge_booking_document_link), so this stays plain
+# library code rather than a second, competing registration.
 def acknowledge_booking_document_link(
     payload: BookingDocumentLinkCommand,
     service_principal: Annotated[

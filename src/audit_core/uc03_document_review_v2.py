@@ -686,65 +686,12 @@ def _booking_review_data(
     return requirements, documents, attributes, unmapped
 
 
-@router.get("/booking/review", response_model=BookingReviewV2Response)
-def get_booking_review_v2(
-    tenant_id: str,
-    journey_id: UUID,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
-    connection: Annotated[Connection, Depends(get_connection)],
-    engine: Annotated[Engine, Depends(get_engine)],
-    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
-    di_client: Annotated[DiClient, Depends(get_di_client)],
-    v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
-) -> BookingReviewV2Response:
-    _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    capture_submitted, verification_status, aggregate_version = _submission_state(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-    )
-    if not capture_submitted:
-        raise ConflictError(
-            error_code="VAC-CONFLICT-010",
-            title="Booking capture has not been submitted",
-            detail="Submit Booking Details before opening Review.",
-        )
-
-    requirements, documents, attributes, unmapped = _booking_review_data(
-        connection=connection,
-        engine=engine,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        security_client=security_client,
-        di_client=di_client,
-        v2_client=v2_client,
-    )
-    needs_review = sum(1 for attribute in attributes if attribute.resolvedValue is not None and attribute.reviewState == "NEEDS_REVIEW")
-    pending = any(document.extractionState == "PENDING" for document in documents)
-    return BookingReviewV2Response(
-        journeyId=journey_id,
-        captureSubmitted=True,
-        pcVerificationStatus=verification_status,
-        aggregateVersion=aggregate_version,
-        processingPending=pending,
-        needsReviewCount=needs_review,
-        attributes=attributes,
-        unmappedFields=unmapped,
-        documents=documents,
-        missingDeclarations=_missing_declarations(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            requirements=requirements,
-        ),
-    )
+# get_booking_review_v2 removed (Phase 0 monkeypatch removal): confirmed
+# dead (no callers anywhere, not even as a plain function) -- its route was
+# always discarded by install_uc03_confidence_review_policy's later
+# _replace_route call. get_booking_review_v2_confidence_policy
+# (uc03_confidence_review_policy.py) is the live handler, now decorated
+# directly on this router's GET /booking/review instead.
 
 
 @router.get("/audit/source-comparison", response_model=AuditSourceComparisonV2Response)
