@@ -936,6 +936,26 @@ def _sync_booking_document(
             correlation_id="",
         )
 
+        # Intimation Date + corporate/exchange/scrappage discount evidence,
+        # data-driven off the Booking Form's own extracted values -- not the
+        # PC's own applicability declaration. Booking-only, and scoped to the
+        # Booking Form itself (booking_docket is the pre-#173 legacy key for
+        # the same document).
+        from audit_core.uc03_document_capture_v2 import _canonical_document_type
+
+        if document_type_key and _canonical_document_type(document_type_key) == "booking_form":
+            from audit_core.uc03_booking_confirmation_rules import (
+                record_booking_form_intimation_and_discount_evidence,
+            )
+
+            record_booking_form_intimation_and_discount_evidence(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                document_id=document_id,
+                correlation_id="",
+            )
+
     # A receipt or bank statement just confirming is exactly when a fresh
     # reconciliation pass has something new to match -- run it here instead
     # of waiting for PC Verify/Submit or the next Overview read. Scoped to
@@ -980,6 +1000,21 @@ def _sync_booking_document(
             journey_id=str(journey_id),
             fact_count=len(facts),
             **result,
+        )
+
+    # Booking Confirmed is data-driven off cumulative payments, independent of
+    # PC Submit/Review -- must run after materialize_machine_booking_values
+    # above, which is what freshly upserts this receipt into auditcore.payments.
+    if stage_code == "BOOKING" and is_reconciliation_trigger_document_type(document_type_key):
+        from audit_core.uc03_booking_confirmation_rules import (
+            evaluate_minimum_booking_payment,
+        )
+
+        evaluate_minimum_booking_payment(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            correlation_id="",
         )
 
     return len(facts)
