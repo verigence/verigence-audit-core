@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from decimal import Decimal
 from uuid import uuid4
@@ -171,10 +172,35 @@ def journey():
     engine.dispose()
 
 
+@pytest.fixture
+def mahindra_journey(journey):
+    """Same fixture as ``journey``, but the project's OEM is repointed at the
+    *real*, globally-seeded MAHINDRA oem_id (every fresh DB seeds this row —
+    see migration 0009) instead of the fixture's own throwaway dummy OEM.
+
+    The attribute-decomposition fallback reads ``oem_model_aliases`` and its
+    vocabulary by ``oem_code``, both of which only exist for real OEM codes.
+    """
+    c = journey
+    mahindra_oem_id = c.execute(
+        text("SELECT oem_id FROM auditcore.oems WHERE oem_code = 'MAHINDRA'")
+    ).scalar_one()
+    c.execute(
+        text("UPDATE auditcore.projects SET oem_id = :o WHERE tenant_id = :t"),
+        {"o": mahindra_oem_id, "t": c.tenant_id},
+    )
+    c.oem_id = mahindra_oem_id  # type: ignore[attr-defined]
+    return c
+
+
 def _seed_price_list(c, skus: list[dict]):
     """One published price-list version holding every SKU in ``skus``.
 
-    Each entry: {"model": str, "variant": str | None, "components": {key: amount}}.
+    Each entry: {"model": str, "variant": str | None, "components": {key: amount},
+    "fuel": str | None, "transmission": str | None, "drive": str | None,
+    "seater": str | None} — the last four mirror the structured attributes
+    ``oem_price_masters.py`` actually populates from the OEM's own price-list
+    columns, used by the attribute-decomposition fallback.
     Returns the list of product_sku_id in the same order.
     """
     tenant_id, oem_id = c.tenant_id, c.oem_id
@@ -199,9 +225,21 @@ def _seed_price_list(c, skus: list[dict]):
             {"o": oem_id, "mc": f"M{uuid4().hex[:8]}", "mn": entry["model"]},
         ).scalar_one()
         variant_id = c.execute(
-            text("INSERT INTO auditcore.product_variants (model_id, variant_code, variant_name) "
-                 "VALUES (:m, :vc, :vn) RETURNING variant_id"),
-            {"m": model_id, "vc": f"V{uuid4().hex[:8]}", "vn": entry.get("variant") or "BASE"},
+            text(
+                "INSERT INTO auditcore.product_variants "
+                "(model_id, variant_code, variant_name, fuel_powertrain, transmission, attributes) "
+                "VALUES (:m, :vc, :vn, :fuel, :trans, CAST(:attrs AS jsonb)) RETURNING variant_id"
+            ),
+            {
+                "m": model_id,
+                "vc": f"V{uuid4().hex[:8]}",
+                "vn": entry.get("variant") or "BASE",
+                "fuel": entry.get("fuel"),
+                "trans": entry.get("transmission"),
+                "attrs": json.dumps(
+                    {k: v for k, v in {"drive": entry.get("drive"), "seater": entry.get("seater")}.items() if v}
+                ),
+            },
         ).scalar_one()
         sku_id = c.execute(
             text("INSERT INTO auditcore.product_skus (oem_id, model_id, variant_id, sku_code) "
@@ -366,3 +404,101 @@ def test_integration_flag_resolves_when_model_confirmed(journey) -> None:
         {"t": c.tenant_id, "j": c.journey_id},
     ).scalar_one()
     assert pinned == sku_id
+
+
+# ── attribute-decomposition fallback (real Booking Form / master shapes) ────
+def test_integration_resolves_scorpio_n_z8s_from_folded_booking_form_text(mahindra_journey) -> None:
+    """Reproduces a live production finding verbatim: the Booking Form's
+    'Model & Variant' line folds trim + fuel + transmission + drive + seating
+    into the model/variant snapshot text exactly as extracted
+    ('SCORPIO N Z8 (S)' / 'DAT 2WD 7STR'), which never equals the master's
+    own model_name ('SCORPIO N') as a whole string. Sibling variants are
+    seeded too, mirroring the real ingested master, to prove the fallback
+    picks the one that actually matches every supplied attribute."""
+    c = mahindra_journey
+    z8s_diesel_at, *_ = _seed_price_list(c, [
+        {"model": "SCORPIO N", "variant": "Z8 S D AT 2WD 7 STR BS6.2 - N",
+         "fuel": "DIESEL", "transmission": "AT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "1600000"}},
+        {"model": "SCORPIO N", "variant": "Z8T D AT 2WD 7 STR BS6.2 - N",
+         "fuel": "DIESEL", "transmission": "AT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "1650000"}},
+        {"model": "SCORPIO N", "variant": "Z8 S G AT 2WD 7 STR BS6.2 - N",
+         "fuel": "PETROL", "transmission": "AT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "1550000"}},
+        {"model": "NEW SCORPIO N", "variant": "Z8 S D AT 2WD 7 STR BS6.2 - Refresh",
+         "fuel": "DIESEL", "transmission": "AT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "1700000"}},
+    ])
+    _set_journey_product(c, "SCORPIO N Z8 (S)", "DAT 2WD 7STR")
+
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("resolved") is True
+    assert result.get("matchStage") == "ATTRIBUTE_DECOMPOSITION"
+
+    row = c.execute(
+        text("SELECT product_sku_id, selection_status FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one()
+    assert row["product_sku_id"] == z8s_diesel_at
+    assert row["selection_status"] == "CONFIRMED"
+    assert _open_model_flags(c) == 0
+
+
+def test_integration_resolves_xuv_7xo_ax7l_from_folded_booking_form_text(mahindra_journey) -> None:
+    """Second real sample: 'XUV-7XO' / 'AX-7L(D) AT 2WD 7STR'. Also proves
+    the AWD sibling (same trim residue, different drivetrain) is correctly
+    excluded once the Booking Form states the drivetrain explicitly."""
+    c = mahindra_journey
+    ax7l_2wd, *_ = _seed_price_list(c, [
+        {"model": "XUV 7XO", "variant": "AX7L DSL AT 7 STR",
+         "fuel": "DIESEL", "transmission": "AT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "2000000"}},
+        {"model": "XUV 7XO", "variant": "AX7L DSL AT AWD 7 STR",
+         "fuel": "DIESEL", "transmission": "AT", "drive": "AWD", "seater": "7",
+         "components": {"EX_SHOWROOM": "2100000"}},
+        {"model": "XUV 7XO", "variant": "AX7T DSL AT 7 STR",
+         "fuel": "DIESEL", "transmission": "AT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "2050000"}},
+    ])
+    _set_journey_product(c, "XUV-7XO", "AX-7L(D) AT 2WD 7STR")
+
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("resolved") is True
+    assert result.get("matchStage") == "ATTRIBUTE_DECOMPOSITION"
+
+    pinned = c.execute(
+        text("SELECT product_sku_id FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert pinned == ax7l_2wd
+    assert _open_model_flags(c) == 0
+
+
+def test_integration_still_raises_when_decomposition_also_ambiguous(mahindra_journey) -> None:
+    """Dealer wrote only the model and bare trim, no fuel/transmission/drive/
+    seater at all -- both diesel-AT and diesel-MT SKUs remain plausible, so
+    this must still raise MODEL_NOT_IDENTIFIED rather than silently guess."""
+    c = mahindra_journey
+    _seed_price_list(c, [
+        {"model": "SCORPIO N", "variant": "Z8T D AT 2WD 7 STR BS6.2 - N",
+         "fuel": "DIESEL", "transmission": "AT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "1650000"}},
+        {"model": "SCORPIO N", "variant": "Z8T D MT 2WD 7 STR BS6.2 - N",
+         "fuel": "DIESEL", "transmission": "MT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "1600000"}},
+    ])
+    _set_journey_product(c, "SCORPIO N Z8T", None)
+
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("raised") is True
+    assert result.get("matchStage") == "ATTRIBUTE_DECOMPOSITION"
+    assert result.get("candidateCount") == 2
