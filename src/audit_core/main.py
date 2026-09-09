@@ -1,3 +1,5 @@
+import asyncio
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -14,6 +16,7 @@ from audit_core.crm_api import router as crm_router
 from audit_core.customers import router as customer_router
 from audit_core.daily_operations_api import router as daily_operations_router
 from audit_core.dealers import router as dealer_router
+from audit_core.dependencies import get_engine
 from audit_core.di_project_master_proxy import router as di_project_master_proxy_router
 from audit_core.errors import install_error_handlers
 from audit_core.escalations_api import router as escalation_router
@@ -117,6 +120,10 @@ from audit_core.uc03_work_item_enrichment import (
     router as uc03_work_item_enrichment_router,
 )
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
+from audit_core.workflow_stale_task_recovery import (
+    DEFAULT_SWEEP_INTERVAL_SECONDS,
+    run_stale_worker_task_recovery_loop,
+)
 
 install_role_mapping_policy(role_mappings)
 install_native_workbook_parser(mahindra_masters)
@@ -147,7 +154,23 @@ _CORS_EXPOSE_HEADERS = ["ETag", "X-Correlation-ID", "X-Trace-ID"]
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
     warm_runtime_dependencies()
-    yield
+    sweep_interval = float(
+        os.environ.get(
+            "STALE_WORKER_TASK_SWEEP_INTERVAL_SECONDS",
+            str(DEFAULT_SWEEP_INTERVAL_SECONDS),
+        )
+    )
+    sweep_task = asyncio.create_task(
+        run_stale_worker_task_recovery_loop(get_engine(), interval_seconds=sweep_interval)
+    )
+    try:
+        yield
+    finally:
+        sweep_task.cancel()
+        try:
+            await sweep_task
+        except asyncio.CancelledError:
+            pass
 
 
 def create_app() -> FastAPI:
