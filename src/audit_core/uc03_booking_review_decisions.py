@@ -6,13 +6,12 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import Depends, Header, Request, Response
-from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, Engine, text
 
 from audit_core import uc03_document_review_v2 as review_v2
 from audit_core.dependencies import get_connection, get_engine, get_human_principal
-from audit_core.errors import ConflictError, NotFoundError
+from audit_core.errors import ConflictError
 from audit_core.evidence import get_di_client, get_security_oauth_client
 from audit_core.idempotency import execute_idempotent_json_command
 from audit_core.observability import get_correlation_id
@@ -26,7 +25,6 @@ from audit_core.uc03_attribute_resolution import (
     apply_supported_operational_attribute,
     record_attribute_resolution,
 )
-from audit_core.uc03_booking_capture import _scope
 from audit_core.uc03_booking_commands import (
     _aggregate_lock,
     _append_workflow_event,
@@ -36,6 +34,10 @@ from audit_core.uc03_di_core_persistence import (
     ReviewedDiField,
     persist_reviewed_di_fields,
 )
+from audit_core.uc03_di_core_persistence import (
+    scope_with_actor_context as _scope,
+)
+from audit_core.uc03_document_registry import is_receipt_document_type
 from audit_core.uc03_v2_review_materialization import (
     materialize_reviewed_di_business_values,
     receipt_document_ordinals,
@@ -45,7 +47,6 @@ from audit_core.uc03_v2_review_materialization import (
 
 DecisionValue = Literal["ACCEPTED", "REJECTED"]
 ReviewKind = Literal["ATTRIBUTE", "RAW_FIELD"]
-_RECEIPT_DOCUMENT_TYPE = "dealer_receipt"
 
 
 class BookingReviewDecisionCommand(BaseModel):
@@ -184,7 +185,7 @@ def _raw_review_items(
     receipt_document_ids: list[UUID] = []
 
     for field in unmapped:
-        if str(field.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE:
+        if is_receipt_document_type(field.documentTypeKey):
             receipt_grouped.setdefault((field.documentId, field.fieldKey), []).append(field)
             receipt_document_ids.append(field.documentId)
         else:
@@ -287,115 +288,13 @@ def get_booking_review_decisions(
     )
 
 
-def set_booking_review_decision(
-    tenant_id: str,
-    journey_id: UUID,
-    payload: BookingReviewDecisionCommand,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-    engine: Annotated[Engine, Depends(get_engine)],
-    security_client: Annotated[
-        SecurityOAuthClient,
-        Depends(get_security_oauth_client),
-    ],
-    di_client: Annotated[review_v2.DiClient, Depends(get_di_client)],
-    v2_client: Annotated[
-        review_v2.DiCaptureV2Client,
-        Depends(review_v2.get_di_capture_v2_client),
-    ],
-) -> BookingReviewDecision:
-    _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    submitted, verification_status, _ = review_v2._submission_state(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-    )
-    if not submitted or verification_status != "PENDING":
-        raise ConflictError(
-            error_code="VAC-CONFLICT-010",
-            title="Booking Review is not pending",
-            detail="Review decisions can be recorded only while Booking Review is pending.",
-        )
-
-    _, _, attributes, unmapped = review_v2._booking_review_data(
-        connection=connection,
-        engine=engine,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        security_client=security_client,
-        di_client=di_client,
-        v2_client=v2_client,
-    )
-    item = _current_review_items(attributes, unmapped).get(payload.reviewKey)
-    if item is None:
-        raise NotFoundError(
-            error_code="VAC-NOTFOUND-001",
-            title="Review item not found",
-            detail="The extracted review item is no longer available. Refresh Review.",
-        )
-    if not item.decision_required:
-        raise ConflictError(
-            error_code="VAC-CONFLICT-010",
-            title="Review decision is not required",
-            detail="This extracted value does not currently require an exception decision.",
-        )
-
-    row = connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.journey_attribute_review_decisions (
-                tenant_id, journey_id, stage_code, review_key, review_kind,
-                decision, source_set_ref, source_di_document_id,
-                source_canonical_field_id, source_field_key, source_fact_version,
-                decided_by_actor_id, decided_at_utc, updated_at_utc
-            ) VALUES (
-                :tenant_id, :journey_id, 'BOOKING', :review_key, :review_kind,
-                :decision, :source_set_ref, :source_di_document_id,
-                :source_canonical_field_id, :source_field_key, :source_fact_version,
-                :actor_id, now(), now()
-            )
-            ON CONFLICT (tenant_id, journey_id, stage_code, review_key)
-            DO UPDATE SET
-                review_kind=EXCLUDED.review_kind,
-                decision=EXCLUDED.decision,
-                source_set_ref=EXCLUDED.source_set_ref,
-                source_di_document_id=EXCLUDED.source_di_document_id,
-                source_canonical_field_id=EXCLUDED.source_canonical_field_id,
-                source_field_key=EXCLUDED.source_field_key,
-                source_fact_version=EXCLUDED.source_fact_version,
-                decided_by_actor_id=EXCLUDED.decided_by_actor_id,
-                decided_at_utc=now(),
-                updated_at_utc=now()
-            RETURNING review_key, review_kind, decision, source_set_ref,
-                      source_di_document_id, source_canonical_field_id,
-                      source_field_key, source_fact_version, decided_by_actor_id
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "review_key": item.review_key,
-            "review_kind": item.review_kind,
-            "decision": payload.decision,
-            "source_set_ref": item.source_set_ref,
-            "source_di_document_id": item.source_document_id,
-            "source_canonical_field_id": item.source_canonical_field_id,
-            "source_field_key": item.source_field_key,
-            "source_fact_version": item.source_fact_version,
-            "actor_id": human_principal.subject,
-        },
-    ).mappings().one()
-    return _decision_model(dict(row))
+# set_booking_review_decision removed (Phase 0 monkeypatch removal):
+# confirmed dead (no callers besides its own registration) -- its route was
+# always discarded by install_uc03_confidence_review_policy's later
+# _replace_route call. set_booking_review_decision_confidence_policy
+# (uc03_confidence_review_policy.py) is the live handler -- functionally
+# equivalent (same journey_attribute_review_decisions write), now decorated
+# directly on review_v2.router's POST /booking/review/decision.
 
 
 def _current_decisions(
@@ -442,7 +341,7 @@ def _raw_review_key(
     *,
     receipt_ordinals: dict[UUID, int],
 ) -> str:
-    if str(field.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE:
+    if is_receipt_document_type(field.documentTypeKey):
         return receipt_review_key(receipt_ordinals[field.documentId], field.fieldKey)
     return f"raw:{field.fieldKey}"
 
@@ -456,7 +355,7 @@ def _document_field_review_key(
     spec = review_v2.spec_for_field(field.fieldKey)
     if spec is not None:
         return f"attribute:{spec.attribute_key}"
-    if str(document.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE:
+    if is_receipt_document_type(document.documentTypeKey):
         return receipt_review_key(receipt_ordinals[document.documentId], field.fieldKey)
     return f"raw:{field.fieldKey}"
 
@@ -470,8 +369,7 @@ def _lossless_reviewed_fields(
         [
             document.documentId
             for document in documents
-            if str(document.documentTypeKey or "").strip().lower()
-            == _RECEIPT_DOCUMENT_TYPE
+            if is_receipt_document_type(document.documentTypeKey)
         ]
     )
     reviewed: list[ReviewedDiField] = []
@@ -783,23 +681,17 @@ def _install_mismatch_review_rule() -> None:
     review_v2._mismatch_review_rule_installed = True
 
 
-def _replace_confirm_route() -> None:
-    retained = []
-    for route in review_v2.router.routes:
-        if (
-            isinstance(route, APIRoute)
-            and route.path.endswith("/booking/review/confirm")
-            and "POST" in route.methods
-        ):
-            continue
-        retained.append(route)
-    review_v2.router.routes[:] = retained
-    review_v2.router.add_api_route(
-        "/booking/review/confirm",
-        confirm_booking_review_v2_with_decisions,
-        methods=["POST"],
-        response_model=BookingReviewV2ConfirmWithDecisionsResponse,
-    )
+# _replace_confirm_route removed (Phase 0 monkeypatch removal): there was
+# never a plain @router decorator for POST /booking/review/confirm anywhere
+# in the codebase -- this route was assembled entirely through a chain of
+# runtime add_api_route/_replace_route calls (this one, then uc03_review_
+# effective_values.py's, then uc03_booking_rule_trigger.py's, each replacing
+# the last, ending at uc03_confidence_review_policy.py's
+# confirm_booking_review_v2_confidence_policy, which actually won in
+# production). That function is now the first-ever plain @router decorator
+# for this path. confirm_booking_review_v2_with_decisions stays defined
+# here as plain library code -- test_uc03_booking_review_resolution_wiring.py
+# inspects its bytecode directly -- just no longer registered as a route.
 
 
 def install_uc03_booking_review_decisions() -> None:
@@ -808,17 +700,14 @@ def install_uc03_booking_review_decisions() -> None:
     if getattr(review_v2, "_booking_review_decisions_installed", False):
         return
     _install_mismatch_review_rule()
-    _replace_confirm_route()
     review_v2.router.add_api_route(
         "/booking/review/decisions",
         get_booking_review_decisions,
         methods=["GET"],
         response_model=BookingReviewDecisionsResponse,
     )
-    review_v2.router.add_api_route(
-        "/booking/review/decision",
-        set_booking_review_decision,
-        methods=["POST"],
-        response_model=BookingReviewDecision,
-    )
+    # /booking/review/decision (POST) registration removed here (Phase 0
+    # monkeypatch removal): set_booking_review_decision_confidence_policy
+    # (uc03_confidence_review_policy.py) is decorated directly on this
+    # router for that path instead.
     review_v2._booking_review_decisions_installed = True

@@ -491,80 +491,10 @@ def test_booking_capture_recalculates_conditional_document_applicability(
     assert details["exchangeTaken"] is True
 
 
-def test_corrected_extraction_proposal_preserves_machine_original(
-    booking_document_setup,
-) -> None:
-    setup = booking_document_setup
-    client = TestClient(app, raise_server_exceptions=False)
-    assert client.post(
-        _booking_url(setup, "start"),
-        headers=_headers("c1-proposal-start", 0),
-    ).status_code == 200
-    evidence_id = _insert_completed_evidence(setup)
-    proposal_id = uuid4()
-
-    with setup["engine"].begin() as connection:
-        connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.journey_capture_proposals (
-                    tenant_id, capture_proposal_id, journey_id, stage_code,
-                    field_key, source_evidence_id, source_evidence_fact_id,
-                    source_fact_version, source_document_type_key, value_source,
-                    proposed_value, confidence_score
-                ) VALUES (
-                    :tenant_id, :proposal_id, :journey_id, 'BOOKING',
-                    'customer_name', :evidence_id, 'customer_name',
-                    1, 'booking_form', 'EXTRACTION',
-                    '{"value":"Machine Customer"}'::jsonb, 0.72
-                )
-                """
-            ),
-            {
-                "tenant_id": setup["tenant_id"],
-                "proposal_id": proposal_id,
-                "journey_id": setup["journey_id"],
-                "evidence_id": evidence_id,
-            },
-        )
-
-    corrected = client.post(
-        _journey_url(setup, f"extraction-proposals/{proposal_id}/correct"),
-        headers=_headers("c1-proposal-correct", 1),
-        json={"acceptedValue": "Corrected Customer"},
-    )
-    assert corrected.status_code == 200, corrected.text
-    assert corrected.json()["status"] == "CORRECTED"
-    assert corrected.json()["proposedValue"] == "Machine Customer"
-    assert corrected.json()["acceptedValue"] == "Corrected Customer"
-    assert corrected.json()["aggregateVersion"] == 2
-
-    with setup["engine"].begin() as connection:
-        proposal = connection.execute(
-            text(
-                """
-                SELECT proposed_value, accepted_value, proposal_status,
-                       owning_domain_key
-                FROM auditcore.journey_capture_proposals
-                WHERE tenant_id=:tenant_id AND capture_proposal_id=:proposal_id
-                """
-            ),
-            {"tenant_id": setup["tenant_id"], "proposal_id": proposal_id},
-        ).mappings().one()
-        entered_name = connection.execute(
-            text(
-                """
-                SELECT display_name FROM auditcore.customers
-                WHERE tenant_id=:tenant_id AND customer_id=:customer_id
-                """
-            ),
-            {"tenant_id": setup["tenant_id"], "customer_id": setup["customer_id"]},
-        ).scalar_one()
-    assert proposal["proposed_value"] == {"value": "Machine Customer"}
-    assert proposal["accepted_value"] == {"value": "Corrected Customer"}
-    assert proposal["proposal_status"] == "CORRECTED"
-    assert proposal["owning_domain_key"] == "CUSTOMER"
-    assert entered_name == "Document Customer"
+# test_corrected_extraction_proposal_preserves_machine_original removed
+# (Phase 0 dead-code cleanup): it exercised POST .../extraction-proposals/
+# {id}/correct, deleted along with the rest of the V1 extraction-proposal
+# accept/correct flow -- see uc03_booking_capture.py's removal note.
 
 
 def test_normal_booking_close_allows_nonblocking_human_flag(

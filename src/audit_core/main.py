@@ -1,8 +1,17 @@
+import asyncio
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+# Import-time side effect, not unused: uc03_post_extraction_materialization.py
+# decorates close_booking_ready_with_lazy_v2_sync directly onto
+# uc03_booking_capture_router (POST /booking/close-ready) at module load,
+# instead of a startup-time install_*() route swap. Explicit here so that
+# side effect isn't only an incidental consequence of some other module's
+# transitive import order.
+import audit_core.uc03_post_extraction_materialization  # noqa: F401
 from audit_core import mahindra_masters, role_mappings
 from audit_core.attendance_context import router as attendance_context_router
 from audit_core.audit_review import router as audit_review_router
@@ -14,6 +23,7 @@ from audit_core.crm_api import router as crm_router
 from audit_core.customers import router as customer_router
 from audit_core.daily_operations_api import router as daily_operations_router
 from audit_core.dealers import router as dealer_router
+from audit_core.dependencies import get_engine
 from audit_core.di_project_master_proxy import router as di_project_master_proxy_router
 from audit_core.errors import install_error_handlers
 from audit_core.escalations_api import router as escalation_router
@@ -65,8 +75,6 @@ from audit_core.uc03_booking_integrations import (
     router as uc03_booking_integrations_router,
 )
 from audit_core.uc03_booking_part1 import router as uc03_booking_part1_router
-from audit_core.uc03_booking_receipt_capture import install_uc03_booking_receipt_capture
-from audit_core.uc03_booking_review import router as uc03_booking_review_router
 from audit_core.uc03_booking_v2 import router as uc03_booking_v2_router
 from audit_core.uc03_capture_local_reads import (
     router as uc03_capture_local_reads_router,
@@ -119,6 +127,10 @@ from audit_core.uc03_work_item_enrichment import (
     router as uc03_work_item_enrichment_router,
 )
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
+from audit_core.workflow_stale_task_recovery import (
+    DEFAULT_SWEEP_INTERVAL_SECONDS,
+    run_stale_worker_task_recovery_loop,
+)
 
 install_role_mapping_policy(role_mappings)
 install_native_workbook_parser(mahindra_masters)
@@ -126,7 +138,8 @@ install_native_effective_date(mahindra_masters)
 install_dealer_policy_scope(mahindra_masters)
 install_uc03_identity_business_date()
 install_uc03_customer_mobile_pii()
-install_uc03_booking_receipt_capture()
+# install_uc03_booking_receipt_capture() removed (Phase 0 dead-code cleanup):
+# it monkeypatched the now-deleted V1 extraction-proposal accept/correct flow.
 install_tl_scope_alignment()
 install_uc03_v2_capture_business_rules()
 install_uc03_review_value_normalization()
@@ -148,7 +161,23 @@ _CORS_EXPOSE_HEADERS = ["ETag", "X-Correlation-ID", "X-Trace-ID"]
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
     warm_runtime_dependencies()
-    yield
+    sweep_interval = float(
+        os.environ.get(
+            "STALE_WORKER_TASK_SWEEP_INTERVAL_SECONDS",
+            str(DEFAULT_SWEEP_INTERVAL_SECONDS),
+        )
+    )
+    sweep_task = asyncio.create_task(
+        run_stale_worker_task_recovery_loop(get_engine(), interval_seconds=sweep_interval)
+    )
+    try:
+        yield
+    finally:
+        sweep_task.cancel()
+        try:
+            await sweep_task
+        except asyncio.CancelledError:
+            pass
 
 
 def create_app() -> FastAPI:
@@ -206,7 +235,9 @@ def create_app() -> FastAPI:
     application.include_router(uc03_booking_evidence_router)
     application.include_router(uc03_booking_evidence_details_router)
     application.include_router(uc03_booking_details_router)
-    application.include_router(uc03_booking_review_router)
+    # uc03_booking_review_router removed (Phase 0 dead-code cleanup): its one
+    # route, POST .../booking/details/review/{evidence_id}/approve-editable,
+    # gated the retired V1 proposal flow and had zero callers and zero tests.
     application.include_router(uc03_delivery_router)
     application.include_router(uc03_delivery_capture_v2_router)
     application.include_router(uc03_delivery_documents_router)

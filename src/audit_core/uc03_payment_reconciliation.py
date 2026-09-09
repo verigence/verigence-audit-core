@@ -28,11 +28,11 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_document_registry import is_bank_statement_document_type
 from audit_core.uc03_v2_review_materialization import _upsert_review_value_row
 
 logger = logging.getLogger(__name__)
 
-_BANK_STATEMENT_DOCUMENT_TYPE = "bank_statement_extract"
 _SYSTEM_ACTOR = "system:bank-reconciliation"
 _FINDING_TYPE = "PAYMENT_UNVERIFIED"
 _RULE_PREFIX = "PAYMENT_BANK_UNMATCHED"
@@ -159,7 +159,7 @@ def materialize_reviewed_bank_statements(
 ) -> int:
     written = 0
     for document in documents:
-        if str(getattr(document, "documentTypeKey", "") or "").strip().lower() != _BANK_STATEMENT_DOCUMENT_TYPE:
+        if not is_bank_statement_document_type(getattr(document, "documentTypeKey", None)):
             continue
         if str(getattr(document, "extractionState", "")).upper() != "READY":
             continue

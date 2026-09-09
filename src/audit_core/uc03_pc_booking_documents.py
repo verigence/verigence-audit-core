@@ -59,10 +59,10 @@ from audit_core.uc03_booking_commands import (
 )
 from audit_core.uc03_booking_receipt_capture import (
     _RECEIPT_CAPTURE_MAP,
-    _RECEIPT_DOCUMENT_TYPE,
     _write_receipt_capture,
 )
 from audit_core.uc03_document_assessments import _effective_applicability
+from audit_core.uc03_document_registry import is_receipt_document_type
 
 logger = structlog.get_logger(__name__)
 
@@ -199,7 +199,7 @@ def _applicability(requirement: dict[str, Any]) -> tuple[str, str | None]:
 
 def _capture_eligible_field_keys(document_type_key: str) -> list[str]:
     normalized = document_type_key.strip().lower()
-    if normalized == _RECEIPT_DOCUMENT_TYPE:
+    if is_receipt_document_type(normalized):
         return sorted(_RECEIPT_CAPTURE_MAP)
     supported = _SUPPORTED_PROPOSAL_FIELDS.get(normalized, set())
     return sorted(field for field in supported if field in _PROPOSAL_CAPTURE_MAP)
@@ -402,10 +402,12 @@ def _require_callback_applicable(requirement) -> tuple[str, str | None]:
     return state, reason
 
 
-@router.post(
-    "/v1/internal/di/booking-document-links",
-    response_model=BookingDocumentLinkResponse,
-)
+# No @router decorator: uc03_confidence_review_policy.py's
+# acknowledge_booking_document_link_with_auto_sync is decorated directly on
+# this same router for this same path (POST /v1/internal/di/booking-
+# document-links) -- it calls this function at the start of its own body
+# (as pc_documents.acknowledge_booking_document_link), so this stays plain
+# library code rather than a second, competing registration.
 def acknowledge_booking_document_link(
     payload: BookingDocumentLinkCommand,
     service_principal: Annotated[
@@ -797,7 +799,7 @@ def submit_booking_document_extraction_decisions(
         document_type_key = str(linked["document_type_key"] or "").strip().lower()
         allowed_source_fields = (
             set(_RECEIPT_CAPTURE_MAP)
-            if document_type_key == _RECEIPT_DOCUMENT_TYPE
+            if is_receipt_document_type(document_type_key)
             else _SUPPORTED_PROPOSAL_FIELDS.get(document_type_key, set())
         )
         evidence_id: UUID = linked["evidence_id"]
@@ -808,7 +810,7 @@ def submit_booking_document_extraction_decisions(
             source_field_key = field.fieldKey.strip().lower()
             receipt_capture_key = (
                 _RECEIPT_CAPTURE_MAP.get(source_field_key)
-                if document_type_key == _RECEIPT_DOCUMENT_TYPE
+                if is_receipt_document_type(document_type_key)
                 else None
             )
             normal_capture_key = _PROPOSAL_CAPTURE_MAP.get(source_field_key)

@@ -12,14 +12,11 @@ from sqlalchemy import Connection, text
 
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_human_principal
-from audit_core.di_client import DiClient, DiClientError
 from audit_core.errors import (
     AuditCoreError,
     ConflictError,
-    DependencyUnavailableError,
     NotFoundError,
 )
-from audit_core.evidence import get_di_client, get_security_oauth_client
 from audit_core.idempotency import execute_idempotent_json_command
 from audit_core.observability import get_correlation_id
 from audit_core.security import HumanPrincipal
@@ -27,7 +24,6 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
-from audit_core.security_integration import SecurityOAuthClient, SecurityTokenError
 from audit_core.uc03_booking_commands import (
     BookingCommandResponse,
     _aggregate_lock,
@@ -1065,425 +1061,27 @@ def record_booking_capture(
     return body
 
 
-def _proposal_row(connection: Connection, tenant_id: str, journey_id: UUID, proposal_id: UUID):
-    row = connection.execute(
-        text(
-            """
-            SELECT capture_proposal_id, field_key, source_evidence_id,
-                   proposed_value, proposal_status, accepted_value, version_no
-            FROM auditcore.journey_capture_proposals
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code='BOOKING' AND capture_proposal_id=:proposal_id
-            FOR UPDATE
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id, "proposal_id": proposal_id},
-    ).mappings().one_or_none()
-    if row is None:
-        raise NotFoundError(
-            error_code="VAC-NF-014",
-            title="Extraction proposal not found",
-            detail="The Booking extraction proposal was not found.",
-        )
-    return row
+# _proposal_row, _decide_proposal, accept_extraction_proposal and
+# correct_extraction_proposal removed (Phase 0 dead-code cleanup): the
+# accept/correct routes had no live frontend caller (BookingWorkspacePage,
+# their only caller, is unreachable -- no route mounts it), and
+# uc03_booking_receipt_capture.py's install_uc03_booking_receipt_capture()
+# monkeypatched _decide_proposal to add receipt-field support -- removed
+# together with that installer since neither half is reachable without the
+# other. The only remaining writer of journey_capture_proposals rows
+# (uc03_booking_integrations.py's refresh_booking_extraction_strict) is
+# itself dead code (no caller, no test) -- so this whole table is now fully
+# retired end to end, a candidate to drop outright in the Phase 4 schema
+# squash rather than migrate forward.
 
 
-def _decide_proposal(
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-    proposal_id: UUID,
-    payload: ProposalDecision,
-    corrected: bool,
-    request: Request,
-    response: Response,
-    idempotency_key: str,
-    if_match: str,
-    human_principal: HumanPrincipal,
-    authorization_client: SecurityAuthorizationClient,
-    connection: Connection,
-) -> dict[str, Any]:
-    context = _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    expected_version = _parse_if_match(if_match)
-    correlation_id = get_correlation_id(request)
-
-    def execute() -> dict[str, Any]:
-        _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
-        state = _stage_state(connection, tenant_id=tenant_id, journey_id=journey_id)
-        _require_expected_version(state, expected_version)
-        _require_active_booking(state)
-        proposal = _proposal_row(connection, tenant_id, journey_id, proposal_id)
-        if proposal["proposal_status"] != "PENDING":
-            raise ConflictError(
-                error_code="VAC-CONFLICT-008",
-                title="Extraction proposal already decided",
-                detail="Refresh the Booking before deciding this extraction proposal.",
-            )
-        capture_key = _PROPOSAL_CAPTURE_MAP.get(proposal["field_key"])
-        if capture_key is None:
-            raise AuditCoreError(
-                error_code="VAC-VAL-002",
-                status_code=422,
-                title="Proposal requires configured master resolution",
-                detail="This extracted field cannot be accepted until its typed-domain/master mapping is configured.",
-            )
-        machine_value = proposal["proposed_value"]
-        if isinstance(machine_value, dict) and "value" in machine_value:
-            machine_value = machine_value["value"]
-        accepted_value = payload.acceptedValue if corrected else machine_value
-        if corrected and payload.acceptedValue is None:
-            raise AuditCoreError(
-                error_code="VAC-VAL-002",
-                status_code=422,
-                title="Business validation failed",
-                detail="A corrected proposal requires acceptedValue.",
-            )
-        domain, record_reference = _write_typed_capture(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            field_key=capture_key,
-            value=accepted_value,
-            source_evidence_id=proposal["source_evidence_id"],
-        )
-        applicability_changes = _resolve_booking_applicability(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-        )
-        status_value = "CORRECTED" if corrected else "ACCEPTED"
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.journey_capture_proposals
-                SET proposal_status=:status,
-                    accepted_value=CAST(:accepted_value AS jsonb),
-                    accepted_by_actor_id=:actor_id,
-                    accepted_by_role=:actor_role,
-                    accepted_at_utc=now(),
-                    owning_domain_key=:domain,
-                    owning_record_reference=:record_reference,
-                    version_no=version_no+1,
-                    updated_at_utc=now()
-                WHERE tenant_id=:tenant_id AND capture_proposal_id=:proposal_id
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "proposal_id": proposal_id,
-                "status": status_value,
-                "accepted_value": json.dumps({"value": accepted_value}, default=str),
-                "actor_id": human_principal.subject,
-                "actor_role": context["operating_role"],
-                "domain": domain,
-                "record_reference": record_reference,
-            },
-        )
-        next_version = int(state["version_no"]) + 1
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.journey_stage_states
-                SET business_status='BOOKING_IN_PROGRESS',
-                    audit_state=CASE WHEN audit_state='NOT_STARTED' THEN 'IN_PROGRESS' ELSE audit_state END,
-                    latest_activity_at_utc=now(), updated_at_utc=now(), version_no=:version
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND stage_code='BOOKING'
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id, "version": next_version},
-        )
-        event_id = _append_workflow_event(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            event_type="EXTRACTION_PROPOSAL_CORRECTED" if corrected else "EXTRACTION_PROPOSAL_ACCEPTED",
-            source_kind="HUMAN",
-            actor_id=human_principal.subject,
-            actor_role_snapshot=context["operating_role"],
-            idempotency_key=idempotency_key,
-            correlation_id=correlation_id,
-            safe_payload={
-                "proposalId": str(proposal_id),
-                "fieldKey": proposal["field_key"],
-                "sourceEvidenceId": str(proposal["source_evidence_id"]),
-                "owningDomainKey": domain,
-                "machineValuePreserved": True,
-                "applicabilityChanges": applicability_changes,
-            },
-            aggregate_version=next_version,
-        )
-        return {
-            "journeyId": str(journey_id),
-            "proposalId": str(proposal_id),
-            "fieldKey": proposal["field_key"],
-            "status": status_value,
-            "proposedValue": machine_value,
-            "acceptedValue": accepted_value,
-            "owningDomainKey": domain,
-            "owningRecordReference": record_reference,
-            "aggregateVersion": next_version,
-            "eventId": str(event_id),
-        }
-
-    body, _ = execute_idempotent_json_command(
-        connection,
-        tenant_id=tenant_id,
-        operation_key=f"uc03.booking.proposal.{'correct' if corrected else 'accept'}:{proposal_id}",
-        idempotency_key=idempotency_key,
-        request_payload={
-            "expectedVersion": expected_version,
-            "proposalId": str(proposal_id),
-            "payload": payload.model_dump(mode="json"),
-        },
-        execute=execute,
-    )
-    _set_etag(response, body)
-    return body
-
-
-@router.post("/extraction-proposals/{proposal_id}/accept")
-def accept_extraction_proposal(
-    tenant_id: str,
-    journey_id: UUID,
-    proposal_id: UUID,
-    payload: ProposalDecision,
-    request: Request,
-    response: Response,
-    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
-    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> dict[str, Any]:
-    return _decide_proposal(
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        proposal_id=proposal_id,
-        payload=payload,
-        corrected=False,
-        request=request,
-        response=response,
-        idempotency_key=idempotency_key,
-        if_match=if_match,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        connection=connection,
-    )
-
-
-@router.post("/extraction-proposals/{proposal_id}/correct")
-def correct_extraction_proposal(
-    tenant_id: str,
-    journey_id: UUID,
-    proposal_id: UUID,
-    payload: ProposalDecision,
-    request: Request,
-    response: Response,
-    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
-    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> dict[str, Any]:
-    return _decide_proposal(
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        proposal_id=proposal_id,
-        payload=payload,
-        corrected=True,
-        request=request,
-        response=response,
-        idempotency_key=idempotency_key,
-        if_match=if_match,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        connection=connection,
-    )
-
-
-@router.post("/booking/extraction/refresh", response_model=ExtractionRefreshResponse)
-def refresh_booking_extraction(
-    tenant_id: str,
-    journey_id: UUID,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
-    di_client: Annotated[DiClient, Depends(get_di_client)],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> ExtractionRefreshResponse:
-    _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    state = _stage_state(connection, tenant_id=tenant_id, journey_id=journey_id)
-    _require_active_booking(state)
-    evidence_rows = connection.execute(
-        text(
-            """
-            SELECT e.evidence_id, e.di_subject_id, e.di_document_id,
-                   e.document_type_key
-            FROM auditcore.evidence e
-            LEFT JOIN auditcore.journey_document_requirements jdr
-              ON jdr.tenant_id=e.tenant_id
-             AND jdr.journey_document_requirement_id=e.journey_document_requirement_id
-            WHERE e.tenant_id=:tenant_id AND e.journey_id=:journey_id
-              AND e.association_status='ACTIVE'
-              AND (jdr.process_area IS NULL OR upper(jdr.process_area)='BOOKING')
-            ORDER BY e.linked_at_utc, e.evidence_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().all()
-    refreshed = 0
-    created = 0
-    failed = 0
-    try:
-        token = security_client.get_service_token(audience=_DI_AUDIENCE)
-    except SecurityTokenError as exc:
-        raise DependencyUnavailableError(
-            detail="Document processing is temporarily unavailable. Please try again."
-        ) from exc
-
-    for evidence in evidence_rows:
-        if evidence["di_subject_id"] is None or evidence["di_document_id"] is None:
-            continue
-        try:
-            document = di_client.get_document(
-                token=token,
-                tenant_id=tenant_id,
-                subject_id=str(evidence["di_subject_id"]),
-                document_id=str(evidence["di_document_id"]),
-            )
-            processing = (document.processing_status or "PENDING").upper()
-            connection.execute(
-                text(
-                    """
-                    UPDATE auditcore.evidence
-                    SET processing_status_cache=:processing,
-                        verification_status_cache=:verification,
-                        confirmation_status_cache=:confirmation,
-                        cache_updated_at_utc=now()
-                    WHERE tenant_id=:tenant_id AND evidence_id=:evidence_id
-                    """
-                ),
-                {
-                    "tenant_id": tenant_id,
-                    "evidence_id": evidence["evidence_id"],
-                    "processing": processing,
-                    "verification": document.verification_state,
-                    "confirmation": document.confirmation_status,
-                },
-            )
-            refreshed += 1
-            if processing not in _TERMINAL_PROCESSING_STATUSES:
-                continue
-            facts = di_client.get_document_facts(
-                token=token,
-                tenant_id=tenant_id,
-                subject_id=str(evidence["di_subject_id"]),
-                document_id=str(evidence["di_document_id"]),
-            )
-            document_type = (
-                document.document_type_key or evidence["document_type_key"] or ""
-            ).strip().lower()
-            supported = _SUPPORTED_PROPOSAL_FIELDS.get(document_type, set())
-            for fact in facts:
-                if fact.field_key not in supported:
-                    continue
-                connection.execute(
-                    text(
-                        """
-                        UPDATE auditcore.journey_capture_proposals
-                        SET proposal_status='SUPERSEDED', updated_at_utc=now()
-                        WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                          AND stage_code='BOOKING' AND source_evidence_id=:evidence_id
-                          AND field_key=:field_key AND proposal_status='PENDING'
-                          AND source_fact_version < :fact_version
-                        """
-                    ),
-                    {
-                        "tenant_id": tenant_id,
-                        "journey_id": journey_id,
-                        "evidence_id": evidence["evidence_id"],
-                        "field_key": fact.field_key,
-                        "fact_version": fact.version_no,
-                    },
-                )
-                result = connection.execute(
-                    text(
-                        """
-                        INSERT INTO auditcore.journey_capture_proposals (
-                            tenant_id, journey_id, stage_code, field_key,
-                            source_evidence_id, source_evidence_fact_id,
-                            source_fact_version, source_document_type_key,
-                            value_source, proposed_value, confidence_score,
-                            owning_domain_key
-                        ) VALUES (
-                            :tenant_id, :journey_id, 'BOOKING', :field_key,
-                            :evidence_id, :fact_id, :fact_version,
-                            :document_type, :value_source,
-                            CAST(:proposed_value AS jsonb), :confidence,
-                            :owning_domain
-                        )
-                        ON CONFLICT (
-                            tenant_id, source_evidence_id, source_evidence_fact_id,
-                            source_fact_version
-                        ) DO NOTHING
-                        """
-                    ),
-                    {
-                        "tenant_id": tenant_id,
-                        "journey_id": journey_id,
-                        "field_key": fact.field_key,
-                        "evidence_id": evidence["evidence_id"],
-                        "fact_id": fact.canonical_field_id,
-                        "fact_version": fact.version_no,
-                        "document_type": document_type,
-                        "value_source": fact.value_source,
-                        "proposed_value": json.dumps({"value": fact.value}, default=str),
-                        "confidence": fact.confidence_score,
-                        "owning_domain": _PROPOSAL_CAPTURE_MAP.get(fact.field_key),
-                    },
-                )
-                if result.rowcount:
-                    created += 1
-        except DiClientError:
-            failed += 1
-            connection.execute(
-                text(
-                    """
-                    UPDATE auditcore.evidence
-                    SET processing_status_cache='FAILED', cache_updated_at_utc=now()
-                    WHERE tenant_id=:tenant_id AND evidence_id=:evidence_id
-                    """
-                ),
-                {"tenant_id": tenant_id, "evidence_id": evidence["evidence_id"]},
-            )
-    return ExtractionRefreshResponse(
-        journeyId=journey_id,
-        refreshedDocuments=refreshed,
-        createdProposals=created,
-        failedDocuments=failed,
-        aggregateVersion=int(state["version_no"]),
-    )
+# refresh_booking_extraction removed (Phase 0 dead-code cleanup): shadowed by
+# uc03_booking_integrations.py's identical POST /booking/extraction/refresh
+# route (registered first in main.py, so this one never received a request),
+# had zero callers anywhere in verigence-web or verigence-audit-core, and no
+# test referenced it by name. ExtractionRefreshResponse stays defined here --
+# uc03_booking_integrations.py's live refresh_booking_extraction_strict
+# imports it.
 
 
 @router.get("/processing-status")
@@ -1726,7 +1324,11 @@ def create_booking_flag(
     return body
 
 
-@router.post("/booking/close-ready", response_model=BookingCommandResponse)
+# No @router decorator: uc03_post_extraction_materialization.py's
+# close_booking_ready_with_lazy_v2_sync is decorated directly on this same
+# router for this same path (POST /booking/close-ready) -- it calls this
+# function at the end of its own body, so this stays plain library code
+# rather than a second, competing registration on the router.
 def close_booking_ready(
     tenant_id: str,
     journey_id: UUID,
@@ -1835,7 +1437,13 @@ def close_booking_ready(
     return BookingCommandResponse.model_validate(body)
 
 
-@router.get("/uc03-workspace")
+# No @router decorator: uc03_booking_integrations.py's `/uc03-workspace` route
+# (get_booking_workspace_with_typed_exchange) is registered on an identical
+# path/router-prefix and included in main.py *before* this router, so a
+# decorated duplicate here would never actually receive a request -- Starlette
+# matches first-registered-wins. This function is kept as plain library code:
+# uc03_booking_integrations.py imports it directly as `_base_workspace` and
+# builds its typed response on top of it.
 def get_booking_workspace(
     tenant_id: str,
     journey_id: UUID,

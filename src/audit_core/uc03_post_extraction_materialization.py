@@ -15,15 +15,16 @@ from types import SimpleNamespace
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import Depends, Header, Request, Response
+from fastapi import BackgroundTasks, Depends, Header, Request, Response
 from sqlalchemy import Connection, text
 
 from audit_core import uc03_booking_capture as booking_capture
 from audit_core import uc03_journey_reviewed_details as reviewed_details
 from audit_core import uc03_v2_review_materialization as materialization
-from audit_core.dependencies import get_connection, get_human_principal
+from audit_core.dependencies import get_connection, get_engine, get_human_principal
 from audit_core.errors import AuditCoreError, DependencyUnavailableError
 from audit_core.evidence import get_di_client, get_security_oauth_client
+from audit_core.observability import get_correlation_id
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
@@ -31,6 +32,7 @@ from audit_core.security_authorization import (
 )
 from audit_core.uc03_attribute_mapping import spec_for_field
 from audit_core.uc03_attribute_resolution import apply_supported_operational_attribute
+from audit_core.uc03_booking_rule_trigger import schedule_booking_checkpoint_rules
 
 logger = logging.getLogger(__name__)
 
@@ -348,11 +350,23 @@ def _v2_booking_document_ids(
     )
 
 
+# Decorated directly on booking_capture.router (Phase 0 monkeypatch removal):
+# this used to be installed via install_uc03_post_extraction_materialization's
+# _replace_route call, discarding uc03_booking_capture.py's own undecorated
+# close_booking_ready (kept there as plain library code -- this function calls
+# through to it below). Registering the route here, at plain import time
+# (main.py imports this module directly, before create_app() builds the app),
+# means the decorator always wins outright instead of a startup-time swap
+# needing to discard a competing registration first.
+@booking_capture.router.post(
+    "/booking/close-ready", response_model=booking_capture.BookingCommandResponse
+)
 def close_booking_ready_with_lazy_v2_sync(
     tenant_id: str,
     journey_id: UUID,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
     idempotency_key: Annotated[
         str,
         Header(alias="Idempotency-Key", min_length=8, max_length=200),
@@ -431,6 +445,20 @@ def close_booking_ready_with_lazy_v2_sync(
             if security_provider is not None:
                 security_provider.close()
 
+    # Same safety net as PC Review Confirm (see confirm_booking_review_v2_
+    # confidence_policy): Submit is where the pre-submit loop above may have
+    # just synced a document that never made it through the async webhook
+    # path, so schedule checkpoint-rule evaluation here too. Keyed on the
+    # current aggregate version like every other caller, so this is a cheap
+    # no-op whenever the async trigger already covered it.
+    background_tasks.add_task(
+        schedule_booking_checkpoint_rules,
+        get_engine(),
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        correlation_id=get_correlation_id(request),
+        trigger="BOOKING_SUBMIT",
+    )
     return booking_capture.close_booking_ready(
         tenant_id=tenant_id,
         journey_id=journey_id,
@@ -444,50 +472,10 @@ def close_booking_ready_with_lazy_v2_sync(
     )
 
 
-def install_uc03_post_extraction_materialization() -> None:
-    """Run canonical projection after every successful DI->Core document sync."""
-
-    from audit_core import uc03_confidence_review_policy as confidence_policy
-
-    if getattr(confidence_policy, "_post_extraction_materialization_installed", False):
-        return
-    original = confidence_policy._sync_booking_document
-
-    def wrapped(*args: Any, **kwargs: Any) -> int:
-        fact_count = original(*args, **kwargs)
-        if fact_count <= 0:
-            return fact_count
-        # _sync_booking_document now runs for Delivery documents too (stage_code
-        # is read off the requirement, not assumed) and materializes Delivery's
-        # own canonical tables itself before returning -- this booking-typed
-        # projection only applies when the just-synced document was Booking's.
-        if str(kwargs.get("stage_code", "BOOKING")).upper() != "BOOKING":
-            return fact_count
-        connection: Connection = args[0] if args else kwargs["connection"]
-        tenant_id = str(kwargs["tenant_id"])
-        journey_id = kwargs["journey_id"]
-        result = materialize_machine_booking_values(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-        )
-        logger.info(
-            "uc03_post_extraction_materialized",
-            extra={
-                "tenant_id": tenant_id,
-                "journey_id": str(journey_id),
-                "fact_count": fact_count,
-                **result,
-            },
-        )
-        return fact_count
-
-    confidence_policy._sync_booking_document = wrapped  # type: ignore[assignment]
-    confidence_policy._replace_route(
-        booking_capture.router,
-        suffix="/booking/close-ready",
-        method="POST",
-        endpoint=close_booking_ready_with_lazy_v2_sync,
-        response_model=booking_capture.BookingCommandResponse,
-    )
-    confidence_policy._post_extraction_materialization_installed = True
+# install_uc03_post_extraction_materialization removed (Phase 0 monkeypatch
+# removal): its two jobs are both done directly now instead --
+# materialize_machine_booking_values is called inline from
+# uc03_confidence_review_policy._sync_booking_document (symmetric with how
+# Delivery's own materialization already ran inline there), and
+# close_booking_ready_with_lazy_v2_sync is decorated directly above instead
+# of being swapped in via _replace_route.

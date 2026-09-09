@@ -137,21 +137,11 @@ def install_uc03_v2_capture_business_rules() -> None:
     from audit_core.uc03_booking_review_decisions import (
         install_uc03_booking_review_decisions,
     )
-    from audit_core.uc03_booking_rule_trigger import (
-        install_uc03_booking_review_rule_trigger,
-    )
     from audit_core.uc03_confidence_review_policy import (
         install_uc03_confidence_review_policy,
     )
     from audit_core.uc03_delivery_review_confirm import (
         install_uc03_delivery_review_confirm,
-    )
-    from audit_core.uc03_delivery_review_read import (
-        install_uc03_delivery_review_read,
-    )
-    from audit_core.uc03_di_core_persistence import install_uc03_di_core_persistence
-    from audit_core.uc03_post_extraction_materialization import (
-        install_uc03_post_extraction_materialization,
     )
     from audit_core.uc03_review_effective_values import (
         install_uc03_review_effective_values,
@@ -170,7 +160,10 @@ def install_uc03_v2_capture_business_rules() -> None:
     # handle any request. This extends existing Core owners; it creates no new table.
     install_uc03_booking_commercial_components()
     install_uc03_booking_review_decisions()
-    install_uc03_di_core_persistence()
+    # install_uc03_di_core_persistence() removed (Phase 0 monkeypatch removal):
+    # uc03_booking_review_decisions.py now imports uc03_di_core_persistence.
+    # scope_with_actor_context directly as its own _scope, instead of that
+    # name being reassigned at startup.
     # Review Confirm is fail-closed: generic DI provenance is not a substitute for
     # an explicit typed Audit Core business owner. Booking Docket shares the same
     # typed Booking business owner as Booking Form.
@@ -179,9 +172,22 @@ def install_uc03_v2_capture_business_rules() -> None:
     # typed identity owner was created. Extend that same owner before Review traffic.
     install_uc03_aadhaar_address_core_ownership()
     install_uc03_delivery_review_confirm()
-    install_uc03_delivery_review_read()
+    # install_uc03_delivery_review_read() removed (Phase 0 dead-code cleanup):
+    # its two added routes (/booking/capture-local, /delivery/capture-local on
+    # review_v2.router) were always shadowed by uc03_capture_local_reads.py's
+    # own routes for the same paths, included earlier in main.py -- confirmed
+    # by the "Duplicate Operation ID" warning FastAPI raised on every test run.
     install_uc03_review_effective_values()
-    install_uc03_booking_review_rule_trigger()
+    # install_uc03_booking_review_rule_trigger() removed (Phase 0 monkeypatch
+    # removal): its /booking/review/confirm route registration was always
+    # discarded by install_uc03_confidence_review_policy's later
+    # _replace_route call anyway -- the Booking checkpoint rules and the
+    # external rule-engine call it scheduled were silently never firing on a
+    # live confirm. Fixed by moving that scheduling into
+    # schedule_booking_checkpoint_rules, called directly from the live
+    # confirm handler (uc03_confidence_review_policy.py) and from the async
+    # document-sync path, instead of a route another installer can silently
+    # win over.
     # Populate Core evidence identity before the final confidence-only policy builds
     # source rows and evidence-linked review/correction findings.
     install_uc03_review_evidence_link_patch()
@@ -189,7 +195,12 @@ def install_uc03_v2_capture_business_rules() -> None:
     # first, then wrap its DI synchronization so every confirmed fact is projected
     # into canonical Core immediately, including facts that arrive after submit.
     install_uc03_confidence_review_policy()
-    install_uc03_post_extraction_materialization()
+    # install_uc03_post_extraction_materialization() removed (Phase 0 monkeypatch
+    # removal): materialize_machine_booking_values is now called inline from
+    # uc03_confidence_review_policy._sync_booking_document, and
+    # close_booking_ready_with_lazy_v2_sync is decorated directly on
+    # booking_capture.router in that module -- registered by importing it
+    # (see main.py), not by an install function.
     # 06-Sep-2026 authority: remove customer-name/manual-details dependencies and
     # make Review the final Booking submission step. Install last so it wins the
     # intentional route overrides while retaining the confidence/materialization stack.

@@ -7,6 +7,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core import uc03_booking_capture as booking_capture
 from audit_core.db import set_security_actor_context
 
 StageCode = Literal["BOOKING", "DELIVERY"]
@@ -270,38 +271,25 @@ def persist_reviewed_di_fields(
     return len(legacy_rows) + len(v2_rows)
 
 
-_installed = False
-_original_review_scope: Any | None = None
-
-
-def _scope_with_actor_context(
+def scope_with_actor_context(
     connection: Connection,
     *args: Any,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Preserve the authenticated Review actor in transaction-local DB context."""
+    """uc03_booking_capture._scope, plus preserving the authenticated Review
+    actor in transaction-local DB context.
 
-    if _original_review_scope is None:
-        raise RuntimeError("UC03 Review persistence installer is not initialized")
-    context = _original_review_scope(connection, *args, **kwargs)
+    Phase 0: this used to be installed by reassigning
+    uc03_booking_review_decisions._scope at app startup
+    (install_uc03_di_core_persistence). Call sites that need the actor
+    context now import and call this directly instead -- explicit
+    composition per the redesign's principle 4, not a startup-time patch of
+    another module's name.
+    """
+
+    context = booking_capture._scope(connection, *args, **kwargs)
     human_principal = kwargs.get("human_principal")
     if human_principal is None:
         raise RuntimeError("UC03 Review scope requires an authenticated human principal")
     set_security_actor_context(connection, human_principal.subject)
     return context
-
-
-def install_uc03_di_core_persistence() -> None:
-    """Install Review actor context; field persistence is invoked explicitly."""
-
-    global _installed, _original_review_scope
-    if _installed:
-        return
-
-    # Lazy import prevents a cycle when Booking Review imports the shared
-    # persistence helper from this module.
-    from audit_core import uc03_booking_review_decisions as review_decisions
-
-    _original_review_scope = review_decisions._scope
-    review_decisions._scope = _scope_with_actor_context
-    _installed = True
