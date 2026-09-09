@@ -146,9 +146,6 @@ def install_uc03_v2_capture_business_rules() -> None:
     from audit_core.uc03_delivery_review_confirm import (
         install_uc03_delivery_review_confirm,
     )
-    from audit_core.uc03_delivery_review_read import (
-        install_uc03_delivery_review_read,
-    )
     from audit_core.uc03_di_core_persistence import install_uc03_di_core_persistence
     from audit_core.uc03_post_extraction_materialization import (
         install_uc03_post_extraction_materialization,
@@ -179,7 +176,11 @@ def install_uc03_v2_capture_business_rules() -> None:
     # typed identity owner was created. Extend that same owner before Review traffic.
     install_uc03_aadhaar_address_core_ownership()
     install_uc03_delivery_review_confirm()
-    install_uc03_delivery_review_read()
+    # install_uc03_delivery_review_read() removed (Phase 0 dead-code cleanup):
+    # its two added routes (/booking/capture-local, /delivery/capture-local on
+    # review_v2.router) were always shadowed by uc03_capture_local_reads.py's
+    # own routes for the same paths, included earlier in main.py -- confirmed
+    # by the "Duplicate Operation ID" warning FastAPI raised on every test run.
     install_uc03_review_effective_values()
     install_uc03_booking_review_rule_trigger()
     # Populate Core evidence identity before the final confidence-only policy builds

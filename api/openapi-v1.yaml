@@ -281,39 +281,6 @@ paths:
       responses:
         '200': {description: Typed Booking capture recorded, content: {application/json: {schema: {type: object, additionalProperties: true}}}}
         default: {$ref: '#/components/responses/ProblemResponse'}
-  /tenants/{tenantId}/journeys/{journeyId}/extraction-proposals/{proposalId}/accept:
-    post:
-      operationId: acceptUc03BookingExtractionProposal
-      parameters:
-        - $ref: '#/components/parameters/TenantId'
-        - $ref: '#/components/parameters/JourneyId'
-        - $ref: '#/components/parameters/IdempotencyKey'
-        - {name: proposalId, in: path, required: true, schema: {type: string, format: uuid}}
-        - {name: If-Match, in: header, required: true, schema: {type: string, minLength: 1, maxLength: 64}}
-      requestBody:
-        content:
-          application/json:
-            schema: {type: object, properties: {acceptedValue: {}}}
-      responses:
-        '200': {description: Proposal accepted into its approved typed domain with provenance retained, content: {application/json: {schema: {type: object, additionalProperties: true}}}}
-        default: {$ref: '#/components/responses/ProblemResponse'}
-  /tenants/{tenantId}/journeys/{journeyId}/extraction-proposals/{proposalId}/correct:
-    post:
-      operationId: correctUc03BookingExtractionProposal
-      parameters:
-        - $ref: '#/components/parameters/TenantId'
-        - $ref: '#/components/parameters/JourneyId'
-        - $ref: '#/components/parameters/IdempotencyKey'
-        - {name: proposalId, in: path, required: true, schema: {type: string, format: uuid}}
-        - {name: If-Match, in: header, required: true, schema: {type: string, minLength: 1, maxLength: 64}}
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: {type: object, required: [acceptedValue], properties: {acceptedValue: {}}}
-      responses:
-        '200': {description: Human correction recorded while immutable machine original/source version remain provenance, content: {application/json: {schema: {type: object, additionalProperties: true}}}}
-        default: {$ref: '#/components/responses/ProblemResponse'}
   /tenants/{tenantId}/journeys/{journeyId}/booking/extraction/refresh:
     post:
       operationId: refreshUc03BookingExtraction

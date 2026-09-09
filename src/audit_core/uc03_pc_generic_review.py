@@ -30,13 +30,13 @@ from audit_core.uc03_booking_commands import (
 )
 from audit_core.uc03_booking_receipt_capture import (
     _RECEIPT_CAPTURE_MAP,
-    _RECEIPT_DOCUMENT_TYPE,
     _write_receipt_capture,
 )
 from audit_core.uc03_di_core_persistence import (
     ReviewedDiField,
     persist_reviewed_di_fields,
 )
+from audit_core.uc03_document_registry import is_receipt_document_type
 from audit_core.uc03_pc_booking_documents import _current_linked_evidence
 from audit_core.uc03_pc_direct_review import _existing_review_event
 
@@ -179,7 +179,7 @@ def _project_known_field(
     source_field_key = field.fieldKey.strip().lower()
     receipt_capture_key = (
         _RECEIPT_CAPTURE_MAP.get(source_field_key)
-        if document_type_key == _RECEIPT_DOCUMENT_TYPE
+        if is_receipt_document_type(document_type_key)
         else None
     )
     value = field.modifiedValue if field.modifiedValue is not None else field.extractedValue

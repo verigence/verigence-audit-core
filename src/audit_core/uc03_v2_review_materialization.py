@@ -9,10 +9,8 @@ from sqlalchemy import Connection, text
 
 from audit_core import uc03_booking_capture
 from audit_core.uc03_attribute_mapping import spec_for_field
-from audit_core.uc03_booking_receipt_capture import (
-    _RECEIPT_CAPTURE_MAP,
-    _RECEIPT_DOCUMENT_TYPE,
-)
+from audit_core.uc03_booking_receipt_capture import _RECEIPT_CAPTURE_MAP
+from audit_core.uc03_document_registry import is_receipt_document_type
 
 logger = logging.getLogger(__name__)
 
@@ -248,7 +246,7 @@ def reviewed_field_core_owner(
         and normalized_field in _AADHAAR_FIELDS
     ):
         return "CUSTOMER_IDENTITY_REVIEW_VALUE", str(document_id)
-    if document_type == _RECEIPT_DOCUMENT_TYPE and normalized_field in _RECEIPT_FIELDS:
+    if is_receipt_document_type(document_type) and normalized_field in _RECEIPT_FIELDS:
         return "DEALER_RECEIPT_REVIEW_VALUE", str(document_id)
     if document_type in _INVOICE_DOCUMENT_TYPES and normalized_field in _INVOICE_REVIEW_FIELDS:
         return "INVOICE_REVIEW_VALUE", str(document_id)
@@ -984,7 +982,7 @@ def materialize_reviewed_booking_receipts(
     receipt_documents = [
         document
         for document in documents
-        if str(document.documentTypeKey or "").strip().lower() == _RECEIPT_DOCUMENT_TYPE
+        if is_receipt_document_type(document.documentTypeKey)
         and str(document.extractionState).upper() == "READY"
         and _has_reviewable_receipt_value(document)
     ]

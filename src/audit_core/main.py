@@ -65,7 +65,6 @@ from audit_core.uc03_booking_integrations import (
     router as uc03_booking_integrations_router,
 )
 from audit_core.uc03_booking_part1 import router as uc03_booking_part1_router
-from audit_core.uc03_booking_receipt_capture import install_uc03_booking_receipt_capture
 from audit_core.uc03_booking_review import router as uc03_booking_review_router
 from audit_core.uc03_booking_v2 import router as uc03_booking_v2_router
 from audit_core.uc03_capture_local_reads import (
@@ -126,7 +125,8 @@ install_native_effective_date(mahindra_masters)
 install_dealer_policy_scope(mahindra_masters)
 install_uc03_identity_business_date()
 install_uc03_customer_mobile_pii()
-install_uc03_booking_receipt_capture()
+# install_uc03_booking_receipt_capture() removed (Phase 0 dead-code cleanup):
+# it monkeypatched the now-deleted V1 extraction-proposal accept/correct flow.
 install_tl_scope_alignment()
 install_uc03_v2_capture_business_rules()
 install_uc03_review_value_normalization()

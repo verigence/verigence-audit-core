@@ -31,9 +31,9 @@ from audit_core.uc03_booking_commands import (
 )
 from audit_core.uc03_booking_receipt_capture import (
     _RECEIPT_CAPTURE_MAP,
-    _RECEIPT_DOCUMENT_TYPE,
     _write_receipt_capture,
 )
+from audit_core.uc03_document_registry import is_receipt_document_type
 from audit_core.uc03_pc_booking_documents import (
     BookingExtractionFieldDecision,
     _current_linked_evidence,
@@ -321,7 +321,7 @@ def submit_direct_document_review(
         document_type_key = str(linked["document_type_key"] or "").strip().lower()
         allowed_source_fields = (
             set(_RECEIPT_CAPTURE_MAP)
-            if document_type_key == _RECEIPT_DOCUMENT_TYPE
+            if is_receipt_document_type(document_type_key)
             else _SUPPORTED_PROPOSAL_FIELDS.get(document_type_key, set())
         )
         evidence_id: UUID = linked["evidence_id"]
@@ -334,7 +334,7 @@ def submit_direct_document_review(
             source_field_key = field.fieldKey.strip().lower()
             receipt_capture_key = (
                 _RECEIPT_CAPTURE_MAP.get(source_field_key)
-                if document_type_key == _RECEIPT_DOCUMENT_TYPE
+                if is_receipt_document_type(document_type_key)
                 else None
             )
             normal_capture_key = _PROPOSAL_CAPTURE_MAP.get(source_field_key)
