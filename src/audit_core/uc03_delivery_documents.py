@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -276,53 +277,143 @@ def _registration_by_dealer(
     return str(value).strip().casefold() == "dealer"
 
 
+def _resolve_condition(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, condition_key: str
+) -> bool | None:
+    """Resolve one Delivery conditionKey to True/False, or None while its
+    authoritative fact isn't known yet. The one place both the broad
+    per-journey recompute (_resolve_known_applicability, used by the read
+    endpoints) and the webhook's own single-row resolution (see
+    resolve_requirement_applicability_if_conditional) look up a condition,
+    so a new condition family only ever needs adding here once.
+    """
+    key = condition_key.strip().lower()
+    if key in ("exchangetaken", "exchange_taken"):
+        details = connection.execute(
+            text(
+                """
+                SELECT details FROM auditcore.trade_in_cases
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one_or_none()
+        return details.get("exchangeTaken") if isinstance(details, dict) else None
+    if key == "accessoriestaken":
+        return _commercial_amount_taken(
+            connection, tenant_id=tenant_id, journey_id=journey_id, component_key="accessories_cost"
+        )
+    if key == "extendedwarrantytaken":
+        return _commercial_amount_taken(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            component_key="additional_warranty_amount",
+        )
+    if key == "rsataken":
+        return _commercial_amount_taken(
+            connection, tenant_id=tenant_id, journey_id=journey_id, component_key="rsa_amount"
+        )
+    if key == "registrationbydealer":
+        return _registration_by_dealer(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return None
+
+
+def _apply_resolved_applicability(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    requirement_id: UUID,
+    condition_key: str,
+    snapshot: dict[str, Any],
+    resolved: bool,
+) -> dict[str, Any]:
+    state = "APPLICABLE" if resolved else "NOT_APPLICABLE"
+    snapshot = dict(snapshot)
+    snapshot["applicabilityState"] = state
+    snapshot["applicabilityReason"] = f"{condition_key}={'Yes' if resolved else 'No'}"
+    new_status = "PENDING" if resolved else "NOT_APPLICABLE"
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.journey_document_requirements
+            SET requirement_status=:requirement_status,
+                condition_snapshot=CAST(:snapshot AS jsonb),
+                updated_at_utc=now()
+            WHERE tenant_id=:tenant_id
+              AND journey_document_requirement_id=:requirement_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "requirement_id": requirement_id,
+            "requirement_status": new_status,
+            "snapshot": json.dumps(snapshot),
+        },
+    )
+    return {"requirement_status": new_status, "condition_snapshot": snapshot}
+
+
+def resolve_requirement_applicability_if_conditional(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    requirement: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Resolve applicability for exactly the ONE Delivery requirement row the
+    caller already holds -- never re-selects or re-locks the rest of the
+    journey's conditional requirements.
+
+    _resolve_known_applicability's own ``SELECT ... FOR UPDATE`` (no row
+    filter beyond the journey) is fine from the read endpoints it was built
+    for, called once per page view. Calling it from the DI document-link
+    webhook too (every callback, for every document, including retries) made
+    every single callback for a journey lock its *entire* conditional
+    requirement set -- confirmed live as `QueryCanceled: canceling statement
+    due to statement timeout ... while locking tuple ... in relation
+    "journey_document_requirements"` once 15 Delivery documents were
+    uploaded together and DI's retries started overlapping. The webhook
+    already holds an exclusive lock on the one row it needs (``FOR UPDATE OF
+    jdr`` in acknowledge_booking_document_link) -- resolving and updating
+    only that row needs no additional lock at all.
+    """
+    if str(requirement.get("requirement_level") or "").upper() != "CONDITIONAL":
+        return None
+    snapshot = dict(requirement.get("condition_snapshot") or {})
+    condition_key = str(snapshot.get("conditionKey") or "").strip().lower()
+    resolved = _resolve_condition(
+        connection, tenant_id=tenant_id, journey_id=journey_id, condition_key=condition_key
+    )
+    if not isinstance(resolved, bool):
+        return None
+    previous_state = str(snapshot.get("applicabilityState") or "UNRESOLVED")
+    target_state = "APPLICABLE" if resolved else "NOT_APPLICABLE"
+    target_reason = f"{condition_key}={'Yes' if resolved else 'No'}"
+    if previous_state == target_state and snapshot.get("applicabilityReason") == target_reason:
+        return None
+    return _apply_resolved_applicability(
+        connection,
+        tenant_id=tenant_id,
+        requirement_id=requirement["journey_document_requirement_id"],
+        condition_key=condition_key,
+        snapshot=snapshot,
+        resolved=resolved,
+    )
+
+
 def _resolve_known_applicability(
     connection: Connection,
     *,
     tenant_id: str,
     journey_id: UUID,
 ) -> list[dict[str, str]]:
-    """Resolve conditional Delivery document requirements whose authoritative
-    fact already exists, self-healing on every read rather than depending on
-    a human happening to have loaded this list first -- the DI document-link
-    webhook rejects a callback for a requirement stuck UNRESOLVED (see
-    uc03_pc_booking_documents._require_callback_applicable), and nothing
-    besides this function and its callers ever moves a Delivery conditional
-    requirement out of UNRESOLVED. Every additional conditionKey covered here
-    is one more class of Delivery document DI can actually confirm instead
-    of retrying a 409 forever.
+    """Resolve every conditional Delivery document requirement for this
+    journey whose authoritative fact already exists. Used by the read/
+    verification endpoints (called once per page view); the DI document-link
+    webhook uses resolve_requirement_applicability_if_conditional instead,
+    scoped to the single row it already holds -- see that function's
+    docstring for why calling this one from the webhook caused a live
+    lock-contention incident.
     """
-    details = connection.execute(
-        text(
-            """
-            SELECT details FROM auditcore.trade_in_cases
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).scalar_one_or_none()
-    exchange_taken = details.get("exchangeTaken") if isinstance(details, dict) else None
-
-    # Each resolver is looked up lazily (only when a requirement actually
-    # needs it) since most journeys won't have every condition family.
-    resolvers: dict[str, Any] = {
-        "exchangetaken": lambda: exchange_taken,
-        "exchange_taken": lambda: exchange_taken,
-        "accessoriestaken": lambda: _commercial_amount_taken(
-            connection, tenant_id=tenant_id, journey_id=journey_id, component_key="accessories_cost"
-        ),
-        "extendedwarrantytaken": lambda: _commercial_amount_taken(
-            connection, tenant_id=tenant_id, journey_id=journey_id,
-            component_key="additional_warranty_amount",
-        ),
-        "rsataken": lambda: _commercial_amount_taken(
-            connection, tenant_id=tenant_id, journey_id=journey_id, component_key="rsa_amount"
-        ),
-        "registrationbydealer": lambda: _registration_by_dealer(
-            connection, tenant_id=tenant_id, journey_id=journey_id
-        ),
-    }
-
     rows = connection.execute(
         text(
             """
@@ -341,43 +432,29 @@ def _resolve_known_applicability(
     for row in rows:
         snapshot = dict(row["condition_snapshot"] or {})
         condition_key = str(snapshot.get("conditionKey") or "").strip().lower()
-        resolver = resolvers.get(condition_key)
-        if resolver is None:
-            continue
-        resolved = resolver()
+        resolved = _resolve_condition(
+            connection, tenant_id=tenant_id, journey_id=journey_id, condition_key=condition_key
+        )
         if not isinstance(resolved, bool):
             continue
-        state = "APPLICABLE" if resolved else "NOT_APPLICABLE"
         previous = str(snapshot.get("applicabilityState") or "UNRESOLVED")
-        reason = f"{condition_key}={'Yes' if resolved else 'No'}"
-        if previous == state and snapshot.get("applicabilityReason") == reason:
+        target_reason = f"{condition_key}={'Yes' if resolved else 'No'}"
+        if previous == ("APPLICABLE" if resolved else "NOT_APPLICABLE") and snapshot.get("applicabilityReason") == target_reason:
             continue
-        snapshot["applicabilityState"] = state
-        snapshot["applicabilityReason"] = reason
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.journey_document_requirements
-                SET requirement_status=:requirement_status,
-                    condition_snapshot=CAST(:snapshot AS jsonb),
-                    updated_at_utc=now()
-                WHERE tenant_id=:tenant_id
-                  AND journey_document_requirement_id=:requirement_id
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "requirement_id": row["journey_document_requirement_id"],
-                "requirement_status": "PENDING" if resolved else "NOT_APPLICABLE",
-                "snapshot": json.dumps(snapshot),
-            },
+        updated = _apply_resolved_applicability(
+            connection,
+            tenant_id=tenant_id,
+            requirement_id=row["journey_document_requirement_id"],
+            condition_key=condition_key,
+            snapshot=snapshot,
+            resolved=resolved,
         )
         changes.append(
             {
                 "requirementKey": row["requirement_key"],
                 "previousState": previous,
-                "applicabilityState": state,
-                "reason": reason,
+                "applicabilityState": updated["condition_snapshot"]["applicabilityState"],
+                "reason": updated["condition_snapshot"]["applicabilityReason"],
             }
         )
     return changes
