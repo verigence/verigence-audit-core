@@ -8,7 +8,10 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from audit_core import uc03_pc_booking_documents as pc_documents
-from audit_core.uc03_delivery_documents import _resolve_known_applicability
+from audit_core.uc03_delivery_documents import (
+    _resolve_known_applicability,
+    resolve_requirement_applicability_if_conditional,
+)
 
 
 @pytest.fixture
@@ -182,12 +185,60 @@ def test_registration_by_dealer_resolves_from_extracted_field(delivery_journey) 
     assert snapshot["condition_snapshot"]["applicabilityState"] == "APPLICABLE"
 
 
-def test_document_link_webhook_recomputes_delivery_applicability_before_gating() -> None:
+def test_single_row_resolver_only_touches_its_own_requirement(delivery_journey) -> None:
+    """The webhook's own resolver must not need or take a lock on any other
+    conditional requirement -- given one row's own already-fetched mapping,
+    it resolves and updates only that row, leaving a second, unrelated
+    conditional requirement (still unresolvable) completely untouched."""
+    c = delivery_journey
+    accessories_id = _conditional_requirement(
+        c, requirement_key="accessory_invoice_dms", condition_key="accessoriesTaken",
+    )
+    other_id = _conditional_requirement(c, requirement_key="ew_invoice", condition_key="extendedWarrantyTaken")
+    c.execute(
+        text("""INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, actual_amount)
+                VALUES (:t, :j, 'accessories_cost', 3000)"""),
+        {"t": c.tenant_id, "j": c.journey_id},
+    )
+    requirement = c.execute(
+        text("SELECT journey_document_requirement_id, requirement_level, condition_snapshot "
+             "FROM auditcore.journey_document_requirements WHERE journey_document_requirement_id=:r"),
+        {"r": accessories_id},
+    ).mappings().one()
+
+    updated = resolve_requirement_applicability_if_conditional(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, requirement=requirement,
+    )
+
+    assert updated is not None
+    assert updated["condition_snapshot"]["applicabilityState"] == "APPLICABLE"
+    assert updated["requirement_status"] == "PENDING"
+
+    other = c.execute(
+        text("SELECT condition_snapshot FROM auditcore.journey_document_requirements WHERE journey_document_requirement_id=:r"),
+        {"r": other_id},
+    ).mappings().one()
+    assert other["condition_snapshot"].get("applicabilityState") is None
+
+    # A non-conditional or already-resolved requirement is a clean no-op.
+    assert resolve_requirement_applicability_if_conditional(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id,
+        requirement={"requirement_level": "REQUIRED", "condition_snapshot": {}},
+    ) is None
+
+
+def test_document_link_webhook_resolves_only_its_own_row_before_gating() -> None:
     # Source-inspected rather than exercised end-to-end through the full HTTP
     # webhook (service-principal auth, DI subject mapping, evidence creation
     # are a large fixture that adds nothing to this specific assertion): the
-    # webhook must call the same self-heal used by the read endpoints,
-    # scoped to Delivery, before _require_callback_applicable can 409 it.
+    # webhook must self-heal a stuck-UNRESOLVED Delivery requirement before
+    # _require_callback_applicable can 409 it, but ONLY via the single-row
+    # resolver -- NOT _resolve_known_applicability, whose journey-wide
+    # ``FOR UPDATE`` caused a live lock-contention incident when called from
+    # every callback (see resolve_requirement_applicability_if_conditional's
+    # docstring). Asserting the safe function is used, and the unsafe one
+    # is not, keeps that regression from silently coming back.
     source = inspect.getsource(pc_documents.acknowledge_booking_document_link)
-    assert '"DELIVERY"' in source
-    assert "_resolve_known_applicability(" in source
+    assert "DELIVERY" in source
+    assert "resolve_requirement_applicability_if_conditional(" in source
+    assert "_resolve_known_applicability(" not in source
