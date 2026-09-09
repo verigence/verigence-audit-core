@@ -193,7 +193,7 @@ def mahindra_journey(journey):
     return c
 
 
-def _seed_price_list(c, skus: list[dict]):
+def _seed_price_list(c, skus: list[dict], *, effective_from: str = "CURRENT_DATE - 45"):
     """One published price-list version holding every SKU in ``skus``.
 
     Each entry: {"model": str, "variant": str | None, "components": {key: amount},
@@ -201,6 +201,9 @@ def _seed_price_list(c, skus: list[dict]):
     "seater": str | None} — the last four mirror the structured attributes
     ``oem_price_masters.py`` actually populates from the OEM's own price-list
     columns, used by the attribute-decomposition fallback.
+    ``effective_from`` is a raw SQL date expression (not a bind param) so
+    callers can pass e.g. ``"CURRENT_DATE"`` to reproduce a master ingested
+    *after* a booking's own (often historical) booking_date.
     Returns the list of product_sku_id in the same order.
     """
     tenant_id, oem_id = c.tenant_id, c.oem_id
@@ -212,9 +215,9 @@ def _seed_price_list(c, skus: list[dict]):
     # A trigger forbids mutating price_list_items unless the version is DRAFT —
     # insert every item first, then publish.
     plv_id = c.execute(
-        text("INSERT INTO auditcore.price_list_versions "
-             "(tenant_id, price_list_id, version_no, lifecycle_status, effective_from) "
-             "VALUES (:t, :pl, 1, 'DRAFT', CURRENT_DATE - 45) RETURNING price_list_version_id"),
+        text(f"INSERT INTO auditcore.price_list_versions "
+             f"(tenant_id, price_list_id, version_no, lifecycle_status, effective_from) "
+             f"VALUES (:t, :pl, 1, 'DRAFT', {effective_from}) RETURNING price_list_version_id"),
         {"t": tenant_id, "pl": pl_id},
     ).scalar_one()
     sku_ids = []
@@ -502,3 +505,36 @@ def test_integration_still_raises_when_decomposition_also_ambiguous(mahindra_jou
     assert result.get("raised") is True
     assert result.get("matchStage") == "ATTRIBUTE_DECOMPOSITION"
     assert result.get("candidateCount") == 2
+
+
+def test_integration_falls_back_to_latest_master_when_booking_predates_it(journey) -> None:
+    """Regression: a real Booking Form's own extracted booking_date is often
+    well in the past (this one -- a real production case -- was 2024-08-12),
+    while a freshly-onboarded tenant's OEM master is necessarily effective
+    from the day it was ingested. Requiring a master version genuinely
+    effective as of that historical date meant sync_model_resolution always
+    hit "no_effective_price_list" and silently skipped -- forever, since
+    nothing about that mismatch ever changes on a later retry."""
+    c = journey
+    (sku_id,) = _seed_price_list(
+        c,
+        [{"model": "SCORPIO N", "variant": "Z8L",
+          "components": {"EX_SHOWROOM": "1600000", "INSURANCE": "60000",
+                         "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "220000"}}],
+        effective_from="CURRENT_DATE",  # published today; the fixture's booking_date is 10 days ago
+    )
+    _set_journey_product(c, "Scorpio N", "Z8L")
+    _set_commercial(c, "ex_showroom_price", "1600000")
+    _set_commercial(c, "total_price", "1830000")
+
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+
+    assert result.get("resolved") is True
+    pinned = c.execute(
+        text("SELECT product_sku_id FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert pinned == sku_id
