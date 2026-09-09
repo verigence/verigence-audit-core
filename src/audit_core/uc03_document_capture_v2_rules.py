@@ -143,9 +143,6 @@ def install_uc03_v2_capture_business_rules() -> None:
     from audit_core.uc03_delivery_review_confirm import (
         install_uc03_delivery_review_confirm,
     )
-    from audit_core.uc03_post_extraction_materialization import (
-        install_uc03_post_extraction_materialization,
-    )
     from audit_core.uc03_review_effective_values import (
         install_uc03_review_effective_values,
     )
@@ -198,7 +195,12 @@ def install_uc03_v2_capture_business_rules() -> None:
     # first, then wrap its DI synchronization so every confirmed fact is projected
     # into canonical Core immediately, including facts that arrive after submit.
     install_uc03_confidence_review_policy()
-    install_uc03_post_extraction_materialization()
+    # install_uc03_post_extraction_materialization() removed (Phase 0 monkeypatch
+    # removal): materialize_machine_booking_values is now called inline from
+    # uc03_confidence_review_policy._sync_booking_document, and
+    # close_booking_ready_with_lazy_v2_sync is decorated directly on
+    # booking_capture.router in that module -- registered by importing it
+    # (see main.py), not by an install function.
     # 06-Sep-2026 authority: remove customer-name/manual-details dependencies and
     # make Review the final Booking submission step. Install last so it wins the
     # intentional route overrides while retaining the confidence/materialization stack.

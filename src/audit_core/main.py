@@ -5,6 +5,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+# Import-time side effect, not unused: uc03_post_extraction_materialization.py
+# decorates close_booking_ready_with_lazy_v2_sync directly onto
+# uc03_booking_capture_router (POST /booking/close-ready) at module load,
+# instead of a startup-time install_*() route swap. Explicit here so that
+# side effect isn't only an incidental consequence of some other module's
+# transitive import order.
+import audit_core.uc03_post_extraction_materialization  # noqa: F401
 from audit_core import mahindra_masters, role_mappings
 from audit_core.attendance_context import router as attendance_context_router
 from audit_core.audit_review import router as audit_review_router

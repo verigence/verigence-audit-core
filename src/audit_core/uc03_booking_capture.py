@@ -1324,7 +1324,11 @@ def create_booking_flag(
     return body
 
 
-@router.post("/booking/close-ready", response_model=BookingCommandResponse)
+# No @router decorator: uc03_post_extraction_materialization.py's
+# close_booking_ready_with_lazy_v2_sync is decorated directly on this same
+# router for this same path (POST /booking/close-ready) -- it calls this
+# function at the end of its own body, so this stays plain library code
+# rather than a second, competing registration on the router.
 def close_booking_ready(
     tenant_id: str,
     journey_id: UUID,

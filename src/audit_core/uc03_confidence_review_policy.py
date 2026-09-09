@@ -47,6 +47,9 @@ from audit_core.uc03_booking_rule_trigger import schedule_booking_checkpoint_rul
 from audit_core.uc03_di_core_persistence import persist_reviewed_di_fields
 from audit_core.uc03_document_registry import is_reconciliation_trigger_document_type
 from audit_core.uc03_finding_classification import resolve_classification
+from audit_core.uc03_post_extraction_materialization import (
+    materialize_machine_booking_values,
+)
 from audit_core.uc03_v2_review_materialization import (
     materialize_reviewed_di_business_values,
     reviewed_field_core_owner,
@@ -985,6 +988,26 @@ def _sync_booking_document(
             journey_id=journey_id,
         )
 
+    # Booking's own canonical projection, moved here (Phase 0 monkeypatch
+    # removal) from install_uc03_post_extraction_materialization's wrapper
+    # around this whole function. Same gate the wrapper used: run whenever
+    # this call fetched at least one DI fact, matching Delivery's "materialize
+    # whenever something changed" cadence rather than gating on `changed`
+    # here too -- kept exactly as the original behaved, not revisited.
+    if stage_code == "BOOKING" and facts:
+        result = materialize_machine_booking_values(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+        )
+        logger.info(
+            "uc03_post_extraction_materialized",
+            tenant_id=tenant_id,
+            journey_id=str(journey_id),
+            fact_count=len(facts),
+            **result,
+        )
+
     return len(facts)
 
 
@@ -1611,84 +1634,13 @@ def confirm_booking_review_v2_confidence_policy(
     return booking_review.BookingReviewV2ConfirmWithDecisionsResponse.model_validate(body)
 
 
-def close_booking_ready_confidence_policy(
-    tenant_id: str,
-    journey_id: UUID,
-    request: Request,
-    response: Response,
-    idempotency_key: Annotated[
-        str,
-        Header(alias="Idempotency-Key", min_length=8, max_length=200),
-    ],
-    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-    security_client: Annotated[
-        SecurityOAuthClient,
-        Depends(get_security_oauth_client),
-    ],
-    di_client: Annotated[DiClient, Depends(get_di_client)],
-):
-    # Close the extraction-completion race: facts that are already confirmed in DI
-    # are copied to Core before the submit gate is evaluated. Pending/unavailable DI
-    # remains non-blocking and will be delivered through the durable callback later.
-    booking_review._scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    document_ids = connection.execute(
-        text(
-            """
-            SELECT e.di_document_id
-            FROM auditcore.evidence e
-            LEFT JOIN auditcore.journey_document_requirements jdr
-              ON jdr.tenant_id=e.tenant_id
-             AND jdr.journey_document_requirement_id=e.journey_document_requirement_id
-            WHERE e.tenant_id=:tenant_id AND e.journey_id=:journey_id
-              AND e.association_status='ACTIVE'
-              AND e.di_document_id IS NOT NULL
-              AND (jdr.process_area IS NULL OR upper(jdr.process_area)='BOOKING')
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).scalars().all()
-    for document_id in document_ids:
-        try:
-            _sync_booking_document(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                document_id=document_id,
-                service_id="audit-core",
-                security_client=security_client,
-                di_client=di_client,
-                bump_version=False,
-            )
-        except DependencyUnavailableError:
-            logger.warning(
-                "uc03_booking_pre_submit_di_sync_unavailable",
-                tenant_id=tenant_id,
-                journey_id=str(journey_id),
-                document_id=str(document_id),
-            )
-    return booking_capture.close_booking_ready(
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        request=request,
-        response=response,
-        idempotency_key=idempotency_key,
-        if_match=if_match,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        connection=connection,
-    )
+# close_booking_ready_confidence_policy removed (Phase 0 monkeypatch removal):
+# it was already permanently dead before this change -- install_uc03_post_
+# extraction_materialization's own later _replace_route call for the same
+# path always discarded it in favor of close_booking_ready_with_lazy_v2_sync
+# (uc03_post_extraction_materialization.py), which is now decorated directly
+# instead. Removing the _replace_route call below (which pointed at this
+# function) means this module no longer fights over that route at all.
 
 
 def _replace_route(
@@ -1758,12 +1710,5 @@ def install_uc03_confidence_review_policy() -> None:
         method="POST",
         endpoint=acknowledge_booking_document_link_with_auto_sync,
         response_model=pc_documents.BookingDocumentLinkResponse,
-    )
-    _replace_route(
-        booking_capture.router,
-        suffix="/booking/close-ready",
-        method="POST",
-        endpoint=close_booking_ready_confidence_policy,
-        response_model=booking_capture.BookingCommandResponse,
     )
     review_v2._confidence_review_policy_installed = True
