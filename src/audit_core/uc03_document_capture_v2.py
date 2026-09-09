@@ -402,6 +402,17 @@ def _requirement_refs_by_document_type_key(
     with the upload lets DI bind the accepted type to the correct requirement before
     extraction is queued, so the existing DI -> Audit Core evidence callback can run
     both before and after Booking submission.
+
+    This feeds DI's create_upload_intents call alongside candidate_document_type_keys
+    (built by _candidate_type_keys, which canonicalizes every key), and DI rejects the
+    whole request with INVALID_REQUEST if this map's keys are not a subset of the
+    candidate list. Emit ONLY the canonical key per row -- e.g. requirement rows still
+    carrying the legacy document_type_key='booking_docket' (see _DOCUMENT_TYPE_ALIASES)
+    must map under 'booking_form', the key DI actually sees as a candidate, or every
+    Booking upload attempt fails this validation (found live: 'Requirement-ref mapping
+    contains a non-candidate document type.'). _reconcile_documents binds an accepted
+    classification of either key back to the requirement separately -- that direction
+    is unaffected by this fix.
     """
 
     result: dict[str, str] = {}
@@ -409,7 +420,6 @@ def _requirement_refs_by_document_type_key(
         document_type_key = row.get("document_type_key")
         requirement_ref = row.get("requirement_ref")
         if document_type_key and requirement_ref:
-            result.setdefault(str(document_type_key), str(requirement_ref))
             result.setdefault(_canonical_document_type(str(document_type_key)), str(requirement_ref))
     return result
 
