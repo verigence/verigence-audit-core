@@ -10,6 +10,7 @@ from sqlalchemy import Connection, Engine, text
 from audit_core.db import set_tenant_context
 from audit_core.uc03_booking_commands import _append_workflow_event
 from audit_core.uc03_delivery_commands import _machine_flag
+from audit_core.uc03_manual_verification import _resolve_finding
 from audit_core.uc03_rule_engine_findings import run_rule_engine_phase
 from audit_core.workflow import claim_worker_task, get_workflow_task, start_worker_task
 from audit_core.workflow_reliability import create_workflow_task_once
@@ -342,6 +343,38 @@ def _run_booking_rules(
             blocking_completion=False,
         )
         flagged.append(spec.rule_key)
+
+    # Self-heal: a rule that was evaluated this pass but did not fire (its
+    # outstanding requirements are now met -- e.g. evidence just landed) must
+    # close any finding it previously raised. Without this, once a checkpoint
+    # rule fires it can never clear even after the PC addresses it -- only
+    # `flagged` rules were ever written here, nothing resolved the rest.
+    for rule_key in evaluated:
+        if rule_key in flagged:
+            continue
+        open_finding_id = connection.execute(
+            text(
+                """
+                SELECT audit_finding_id
+                FROM auditcore.audit_findings
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND rule_key=:rule_key AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "rule_key": rule_key},
+        ).scalar_one_or_none()
+        if open_finding_id is None:
+            continue
+        _resolve_finding(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code="BOOKING",
+            finding_id=open_finding_id,
+            actor_id=None,
+            correlation_id=correlation_id,
+            note="Outstanding Booking requirements are now satisfied.",
+        )
 
     if not flagged:
         connection.execute(

@@ -202,3 +202,98 @@ def test_async_document_sync_schedules_checkpoint_rules_for_booking() -> None:
     source = inspect.getsource(confidence_policy._run_sync_booking_document_task)
     assert 'stage_code == "BOOKING"' in source
     assert "schedule_booking_checkpoint_rules(" in source
+
+
+def test_checkpoint_rule_self_heals_once_evidence_lands() -> None:
+    """Regression: _run_booking_rules only ever called _machine_flag for
+    rules that fired this pass -- nothing resolved a rule that fired on an
+    earlier pass and no longer applies. A finding raised while a required
+    document was missing stayed OPEN forever even after the PC uploaded and
+    the document was linked, confirmed directly against a live journey where
+    the PC had reviewed everything and 3 flags still would not clear."""
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for the checkpoint-rule scheduling test")
+
+    engine = create_engine(database_url)
+    suffix = uuid4().hex
+    tenant_id = f"tenant-checkpoint-heal-{suffix}"
+    journey_id = _seed_booking_journey(engine, tenant_id=tenant_id, suffix=suffix, version_no=1)
+
+    with engine.begin() as connection:
+        requirement_id = connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.journey_document_requirements (
+                    tenant_id, journey_id, requirement_key, document_type_key,
+                    process_area, requirement_level
+                ) VALUES (
+                    :tenant_id, :journey_id, 'booking_docket', 'booking_form',
+                    'BOOKING', 'REQUIRED'
+                ) RETURNING journey_document_requirement_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one()
+
+    # Pass 1: no evidence linked yet -- BK_DOCKET_PRESENT must raise.
+    schedule_booking_checkpoint_rules(
+        engine, tenant_id=tenant_id, journey_id=journey_id,
+        correlation_id="pass-1", trigger="ASYNC_DOCUMENT_SYNC",
+    )
+    with engine.begin() as connection:
+        status = connection.execute(
+            text(
+                "SELECT finding_status FROM auditcore.audit_findings "
+                "WHERE tenant_id=:t AND journey_id=:j AND rule_key='BK_DOCKET_PRESENT'"
+            ),
+            {"t": tenant_id, "j": journey_id},
+        ).scalar_one()
+        assert status == "OPEN"
+
+        # The Booking Form is uploaded and linked; a new document sync bumps
+        # the aggregate version, same as the real async pipeline.
+        customer_id = connection.execute(
+            text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": tenant_id, "j": journey_id},
+        ).scalar_one()
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.evidence (
+                    tenant_id, journey_id, customer_id, di_subject_id, di_document_id,
+                    document_type_key, evidence_purpose, journey_document_requirement_id
+                ) VALUES (
+                    :t, :j, :cu, :subject, :doc, 'booking_form', 'BOOKING', :req_id
+                )
+                """
+            ),
+            {
+                "t": tenant_id, "j": journey_id, "cu": customer_id,
+                "subject": uuid4(), "doc": uuid4(), "req_id": requirement_id,
+            },
+        )
+        connection.execute(
+            text(
+                "UPDATE auditcore.journey_stage_states SET version_no=version_no+1 "
+                "WHERE tenant_id=:t AND journey_id=:j AND stage_code='BOOKING'"
+            ),
+            {"t": tenant_id, "j": journey_id},
+        )
+
+    # Pass 2: evidence now exists -- the same rule must self-heal.
+    schedule_booking_checkpoint_rules(
+        engine, tenant_id=tenant_id, journey_id=journey_id,
+        correlation_id="pass-2", trigger="ASYNC_DOCUMENT_SYNC",
+    )
+    with engine.begin() as connection:
+        status = connection.execute(
+            text(
+                "SELECT finding_status FROM auditcore.audit_findings "
+                "WHERE tenant_id=:t AND journey_id=:j AND rule_key='BK_DOCKET_PRESENT'"
+            ),
+            {"t": tenant_id, "j": journey_id},
+        ).scalar_one()
+        assert status == "RESOLVED"
+
+    engine.dispose()
