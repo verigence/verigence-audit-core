@@ -13,12 +13,19 @@ own documents), which the older ``uc03_sku_candidates`` resolver does not see
 
   1. exact model + exact ``total`` (offered on-road)               -> SKU
   2. if (1) is 0 or >1 : exact model + exact ``ex_showroom``       -> SKU
+  2b. if the whole-string model match found nothing at all: fall back to
+      ``uc03_model_attribute_matching`` — resolve the model via
+      ``oem_model_aliases`` and re-filter by the variant's own structured
+      fuel/transmission/drive/seater attributes, since a real Booking Form
+      folds trim + those attributes into the same free-text field as the
+      model name (e.g. ``"SCORPIO N Z8 (S)"`` / ``"DAT 2WD 7STR"``).
   3. one SKU  -> pin ``journey_products.product_sku_id``, resolve any open flag
   4. zero SKU -> MODEL_NOT_IDENTIFIED "no matching model"
   5. >1  SKU  -> MODEL_NOT_IDENTIFIED "matched multiple models" (+ candidates)
 
 No fuzzy matching, no price tolerance (``_label_similarity`` is normalised
-equality only). Idempotent, self-heals on read, never raises.
+equality only; the attribute fallback is exact-per-attribute, never a fuzzy
+score). Idempotent, self-heals on read, never raises.
 """
 from __future__ import annotations
 
@@ -33,6 +40,10 @@ from sqlalchemy import Connection, text
 
 from audit_core.uc03_delivery_commands import _machine_flag
 from audit_core.uc03_masters_alignment import registration_basis
+from audit_core.uc03_model_attribute_matching import (
+    match_by_attributes,
+    resolve_model_via_aliases,
+)
 from audit_core.uc03_sku_candidates import (
     _label_similarity,
     _price_plan_for_journey,
@@ -154,6 +165,11 @@ def _sku_rows_for_version(
     components, so a naive SUM double-counts registration. ``master_total_individual``
     excludes the corporate line, ``master_total_corporate`` excludes the individual
     line — the resolver matches against whichever the buyer's basis selects.
+
+    ``fuel_powertrain``/``transmission``/``drive``/``seater`` are the variant's own
+    already-clean structured attributes (populated verbatim from the OEM's price-list
+    columns at ingestion) — unused by ``_match``'s whole-string comparison, but read
+    here for ``uc03_model_attribute_matching``'s decomposition fallback.
     """
     rows = connection.execute(
         text(
@@ -163,6 +179,10 @@ def _sku_rows_for_version(
                    pm.model_name,
                    pv.variant_name,
                    c.colour_name,
+                   pv.fuel_powertrain,
+                   pv.transmission,
+                   pv.attributes ->> 'drive'  AS drive,
+                   pv.attributes ->> 'seater' AS seater,
                    SUM(pli.standard_amount) FILTER (WHERE pli.component_key <> 'REGISTRATION_CORPORATE')
                                                                                 AS master_total_individual,
                    SUM(pli.standard_amount) FILTER (WHERE pli.component_key <> 'REGISTRATION_INDIVIDUAL')
@@ -179,12 +199,39 @@ def _sku_rows_for_version(
               AND s.is_active = true
               AND pm.is_active = true
               AND pv.is_active = true
-            GROUP BY s.product_sku_id, s.sku_code, pm.model_name, pv.variant_name, c.colour_name
+            GROUP BY s.product_sku_id, s.sku_code, pm.model_name, pv.variant_name, c.colour_name,
+                     pv.fuel_powertrain, pv.transmission,
+                     pv.attributes ->> 'drive', pv.attributes ->> 'seater'
             """
         ),
         {"tenant_id": tenant_id, "plv": price_list_version_id, "exkey": _EX_SHOWROOM_COMPONENT},
     ).mappings().all()
     return [dict(row) for row in rows]
+
+
+def _oem_code_for_tenant(connection: Connection, *, tenant_id: str) -> str | None:
+    return connection.execute(
+        text(
+            """
+            SELECT o.oem_code
+            FROM auditcore.projects p
+            JOIN auditcore.oems o ON o.oem_id = p.oem_id
+            WHERE p.tenant_id = :tenant_id
+            """
+        ),
+        {"tenant_id": tenant_id},
+    ).scalar_one_or_none()
+
+
+def _oem_model_aliases(connection: Connection, *, oem_code: str) -> list[tuple[str, str]]:
+    rows = connection.execute(
+        text(
+            "SELECT alias_text, canonical_model_name FROM auditcore.oem_model_aliases "
+            "WHERE oem_code = :oem_code"
+        ),
+        {"oem_code": oem_code},
+    ).all()
+    return [(str(r[0]), str(r[1])) for r in rows]
 
 
 # ── matching ──────────────────────────────────────────────────────────────────
@@ -346,6 +393,42 @@ def _run_deal_reconciliation(
     )
 
 
+def _attribute_decomposition_fallback(
+    connection: Connection, *, tenant_id: str, rows: list[dict[str, Any]], inputs: dict[str, Any]
+) -> tuple[list[dict[str, Any]], str]:
+    """Second attempt when the whole-string model match found nothing.
+
+    Booking Forms fold trim/fuel/transmission/drive/seater into the same
+    free-text field as the model name (see ``uc03_model_attribute_matching``);
+    resolve the model via ``oem_model_aliases`` and re-filter by the variant's
+    own structured attributes instead of comparing one flat string. Still
+    zero fuzzy text matching — every check is exact, on a decomposed signal.
+    Returns ``([], "NONE")`` (the caller's existing empty case) when this
+    OEM has no alias/vocabulary coverage or nothing survives the filters.
+    """
+    oem_code = _oem_code_for_tenant(connection, tenant_id=tenant_id)
+    if not oem_code:
+        return [], "NONE"
+
+    aliases = _oem_model_aliases(connection, oem_code=oem_code)
+    resolved = resolve_model_via_aliases(model_name=inputs["model_name"], oem_aliases=aliases)
+    if resolved is None:
+        return [], "NONE"
+
+    canonical_model, remainder = resolved
+    model_rows = [r for r in rows if r["model_name"] == canonical_model]
+    if not model_rows:
+        return [], "NONE"
+
+    matched = match_by_attributes(
+        model_rows,
+        oem_code=oem_code,
+        model_remainder=remainder,
+        variant_text=inputs["variant_name"],
+    )
+    return matched, "ATTRIBUTE_DECOMPOSITION"
+
+
 # ── producer ──────────────────────────────────────────────────────────────────
 def sync_model_resolution(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
@@ -393,6 +476,18 @@ def sync_model_resolution(
             return {"skipped": True, "reason": "empty_price_list"}
 
         matched, stage = _match(rows, inputs)
+
+        if len(matched) != 1:
+            # Either the whole-string model compare found nothing at all, or
+            # it matched >1 rows that price alone couldn't disambiguate (e.g.
+            # the model text itself already equals the master's model_name,
+            # but the Booking Form gives no usable total/ex-showroom to pick
+            # a variant). Either way, try narrowing by decomposed attributes.
+            attr_matched, attr_stage = _attribute_decomposition_fallback(
+                connection, tenant_id=tenant_id, rows=rows, inputs=inputs
+            )
+            if len(attr_matched) == 1 or (not matched and attr_matched):
+                matched, stage = attr_matched, attr_stage
 
         if len(matched) == 1:
             _pin_sku(
