@@ -11,13 +11,15 @@ def _row(
     status: str = "SATISFIED",
     answer: str = "YES",
     has_evidence: bool = False,
-) -> dict[str, str | bool]:
+    document_type_key: str | None = None,
+) -> dict[str, str | bool | None]:
     return {
         "requirement_key": key,
         "requirement_level": level,
         "requirement_status": status,
         "answer": answer,
         "has_evidence": has_evidence,
+        "document_type_key": document_type_key,
     }
 
 
@@ -86,3 +88,37 @@ def test_active_evidence_satisfies_a_requirement_even_with_no_explicit_answer() 
         ]
     )
     assert specs == []
+
+
+def test_conditional_doc_already_covered_by_discount_evidence_is_not_double_flagged() -> None:
+    """Regression: a live journey showed BOTH BK_DISCOUNT_EVIDENCE_MISSING:
+    exchange_bonus and BK_CONDITIONAL_DOCS_ADDRESSED open at once, pointing
+    the PC at two different tabs (Deal and Documents) for what turned out to
+    be the exact same missing document -- trade_in_vehicle_rc's own
+    document_type_key is 'vehicle_rc', precisely what
+    uc03_booking_confirmation_rules already asks for when an exchange bonus
+    is claimed. The generic conditional-docs rule must not re-flag a
+    document type the more specific, business-named rule already covers.
+    """
+    specs = _booking_requirement_rule_specs(
+        [
+            _row(
+                "trade_in_vehicle_rc", level="CONDITIONAL", status="PENDING",
+                answer="NO", document_type_key="vehicle_rc",
+            ),
+        ]
+    )
+    assert specs == []
+
+    # A conditional item NOT covered by a discount-evidence rule still flags
+    # normally -- this isn't a blanket "never flag conditional docs" change.
+    specs = _booking_requirement_rule_specs(
+        [
+            _row(
+                "gst_certificate", level="CONDITIONAL", status="PENDING",
+                answer="NO", document_type_key="gst_certificate",
+            ),
+        ]
+    )
+    by_rule = {spec.rule_key: spec for spec in specs}
+    assert by_rule["BK_CONDITIONAL_DOCS_ADDRESSED"].requirement_keys == ("gst_certificate",)
