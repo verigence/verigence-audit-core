@@ -919,6 +919,30 @@ def _sync_booking_document(
 
     from audit_core.uc03_async_sync_tasks import reconcile_payments_with_escalation
 
+    # Booking's own canonical projection runs before SKU resolution below,
+    # not after: sync_model_resolution reads journey_products.model_name_
+    # snapshot, which only this call writes (_materialize_product). The
+    # booking_form document is normally the one that FIRST introduces the
+    # vehicle model -- resolving before materializing meant that document's
+    # own sync always saw an empty journey_products row and silently skipped
+    # ({"skipped": True}, no finding), leaving SKU resolution stuck until some
+    # *other* document's sync happened to run afterward and try again. Moving
+    # this first means a document's own sync call can resolve its own model
+    # in the same pass, same-transaction read-your-own-write.
+    if stage_code == "BOOKING" and facts:
+        result = materialize_machine_booking_values(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+        )
+        logger.info(
+            "uc03_post_extraction_materialized",
+            tenant_id=tenant_id,
+            journey_id=str(journey_id),
+            fact_count=len(facts),
+            **result,
+        )
+
     if stage_code == "BOOKING":
         # Resolve the booking's SKU against the OEM price masters, or raise a
         # MODEL_NOT_IDENTIFIED finding for the PC (never raises). Booking-only
@@ -980,26 +1004,6 @@ def _sync_booking_document(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
-        )
-
-    # Booking's own canonical projection, moved here (Phase 0 monkeypatch
-    # removal) from install_uc03_post_extraction_materialization's wrapper
-    # around this whole function. Same gate the wrapper used: run whenever
-    # this call fetched at least one DI fact, matching Delivery's "materialize
-    # whenever something changed" cadence rather than gating on `changed`
-    # here too -- kept exactly as the original behaved, not revisited.
-    if stage_code == "BOOKING" and facts:
-        result = materialize_machine_booking_values(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-        )
-        logger.info(
-            "uc03_post_extraction_materialized",
-            tenant_id=tenant_id,
-            journey_id=str(journey_id),
-            fact_count=len(facts),
-            **result,
         )
 
     # Booking Confirmed is data-driven off cumulative payments, independent of
