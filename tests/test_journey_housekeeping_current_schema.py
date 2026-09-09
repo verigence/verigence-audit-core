@@ -218,6 +218,104 @@ def test_hard_delete_removes_post_0026_uc03_children_before_parents() -> None:
             {"tenant_id": tenant_id, "journey_id": journey_id},
         )
 
+        # Regression coverage for migration 0071: these six tables (0048, 0065,
+        # 0066) were added after the hard-delete function was last updated
+        # (0045) and were never wired into it -- a live Super Admin purge hit
+        # this exact gap (payment_bank_matches still referencing payments).
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.booking_form_review_values (
+                    tenant_id, journey_id, source_di_document_id, reviewed_by_actor_id
+                ) VALUES (:tenant_id, :journey_id, :di_document_id, 'test-actor')
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "di_document_id": uuid4()},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.customer_identity_review_values (
+                    tenant_id, journey_id, customer_id, source_di_document_id,
+                    document_type_key, reviewed_by_actor_id
+                ) VALUES (
+                    :tenant_id, :journey_id, :customer_id, :di_document_id,
+                    'PAN', 'test-actor'
+                )
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "customer_id": customer_id,
+                "di_document_id": uuid4(),
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.dealer_receipt_review_values (
+                    tenant_id, journey_id, source_di_document_id, reviewed_by_actor_id
+                ) VALUES (:tenant_id, :journey_id, :di_document_id, 'test-actor')
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "di_document_id": uuid4()},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.invoice_review_values (
+                    tenant_id, journey_id, source_di_document_id,
+                    document_type_key, reviewed_by_actor_id
+                ) VALUES (
+                    :tenant_id, :journey_id, :di_document_id,
+                    'customer_invoice_dms', 'test-actor'
+                )
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "di_document_id": uuid4()},
+        )
+        bank_statement_line_id = connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.bank_statement_lines (
+                    tenant_id, journey_id, source_di_document_id, reviewed_by_actor_id
+                ) VALUES (:tenant_id, :journey_id, :di_document_id, 'test-actor')
+                RETURNING bank_statement_line_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "di_document_id": uuid4()},
+        ).scalar_one()
+        payment_id = connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.payments (
+                    tenant_id, journey_id, amount, payment_method_code, payment_reference,
+                    receipt_number, receipt_date, payment_stage, status_source
+                ) VALUES (
+                    :tenant_id, :journey_id, 100000, 'UPI', :ref,
+                    'RC-HK', CURRENT_DATE, 'BOOKING', 'EVIDENCE'
+                ) RETURNING payment_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "ref": f"HK-PAY-{suffix}"},
+        ).scalar_one()
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.payment_bank_matches (
+                    tenant_id, journey_id, payment_id, bank_statement_line_id, match_status
+                ) VALUES (:tenant_id, :journey_id, :payment_id, :line_id, 'MATCHED')
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "payment_id": payment_id,
+                "line_id": bank_statement_line_id,
+            },
+        )
+
         receipt = connection.execute(
             text(
                 "SELECT auditcore.hard_delete_journey_transactions(" 
@@ -233,6 +331,13 @@ def test_hard_delete_removes_post_0026_uc03_children_before_parents() -> None:
             "journey_document_extracted_fields",
             "document_capture_v2_documents",
             "document_capture_v2_declarations",
+            "payment_bank_matches",
+            "bank_statement_lines",
+            "invoice_review_values",
+            "booking_form_review_values",
+            "customer_identity_review_values",
+            "dealer_receipt_review_values",
+            "payments",
             "evidence",
             "journeys",
         ):
