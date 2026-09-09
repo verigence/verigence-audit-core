@@ -228,17 +228,69 @@ def _public(
     ).model_dump(mode="json")
 
 
+def _commercial_amount_taken(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, component_key: str
+) -> bool | None:
+    """True/False once the Booking Form (or a later source) has actually
+    reported this commercial line, None while it's genuinely unknown yet.
+
+    Mirrors trade_in_cases.details.exchangeTaken's own conservatism: a
+    positive amount means the add-on was taken, a present-but-zero amount
+    means it wasn't, and no row at all yet means "don't know" -- resolve
+    once real data exists, never guess NOT_APPLICABLE just because nothing
+    has synced yet.
+    """
+    amount = connection.execute(
+        text(
+            """
+            SELECT actual_amount FROM auditcore.commercial_lines
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND component_key=:component_key
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "component_key": component_key},
+    ).scalar_one_or_none()
+    if amount is None:
+        return None
+    return amount > 0
+
+
+def _registration_by_dealer(
+    connection: Connection, *, tenant_id: str, journey_id: UUID
+) -> bool | None:
+    """True/False once a registration_by fact exists (Booking or Delivery
+    evidence), None while nothing has extracted it yet."""
+    value = connection.execute(
+        text(
+            """
+            SELECT effective_value FROM auditcore.journey_document_extracted_fields
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND field_key='registration_by'
+              AND effective_value IS NOT NULL
+            ORDER BY reviewed_at_utc DESC NULLS LAST, updated_at_utc DESC
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalar_one_or_none()
+    if value is None:
+        return None
+    return str(value).strip().casefold() == "dealer"
+
+
 def _resolve_known_applicability(
     connection: Connection,
     *,
     tenant_id: str,
     journey_id: UUID,
 ) -> list[dict[str, str]]:
-    """Resolve only frozen C2 conditions whose authoritative fact already exists.
-
-    Exchange is frozen and typed in the Trade-In domain. Other conditional
-    families remain profile-driven unless their condition snapshot already has a
-    resolved applicability state; C2 must not infer unresolved business logic.
+    """Resolve conditional Delivery document requirements whose authoritative
+    fact already exists, self-healing on every read rather than depending on
+    a human happening to have loaded this list first -- the DI document-link
+    webhook rejects a callback for a requirement stuck UNRESOLVED (see
+    uc03_pc_booking_documents._require_callback_applicable), and nothing
+    besides this function and its callers ever moves a Delivery conditional
+    requirement out of UNRESOLVED. Every additional conditionKey covered here
+    is one more class of Delivery document DI can actually confirm instead
+    of retrying a 409 forever.
     """
     details = connection.execute(
         text(
@@ -250,6 +302,26 @@ def _resolve_known_applicability(
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).scalar_one_or_none()
     exchange_taken = details.get("exchangeTaken") if isinstance(details, dict) else None
+
+    # Each resolver is looked up lazily (only when a requirement actually
+    # needs it) since most journeys won't have every condition family.
+    resolvers: dict[str, Any] = {
+        "exchangetaken": lambda: exchange_taken,
+        "exchange_taken": lambda: exchange_taken,
+        "accessoriestaken": lambda: _commercial_amount_taken(
+            connection, tenant_id=tenant_id, journey_id=journey_id, component_key="accessories_cost"
+        ),
+        "extendedwarrantytaken": lambda: _commercial_amount_taken(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            component_key="additional_warranty_amount",
+        ),
+        "rsataken": lambda: _commercial_amount_taken(
+            connection, tenant_id=tenant_id, journey_id=journey_id, component_key="rsa_amount"
+        ),
+        "registrationbydealer": lambda: _registration_by_dealer(
+            connection, tenant_id=tenant_id, journey_id=journey_id
+        ),
+    }
 
     rows = connection.execute(
         text(
@@ -269,13 +341,15 @@ def _resolve_known_applicability(
     for row in rows:
         snapshot = dict(row["condition_snapshot"] or {})
         condition_key = str(snapshot.get("conditionKey") or "").strip().lower()
-        if condition_key not in {"exchangetaken", "exchange_taken"}:
+        resolver = resolvers.get(condition_key)
+        if resolver is None:
             continue
-        if not isinstance(exchange_taken, bool):
+        resolved = resolver()
+        if not isinstance(resolved, bool):
             continue
-        state = "APPLICABLE" if exchange_taken else "NOT_APPLICABLE"
+        state = "APPLICABLE" if resolved else "NOT_APPLICABLE"
         previous = str(snapshot.get("applicabilityState") or "UNRESOLVED")
-        reason = f"exchangeTaken={'Yes' if exchange_taken else 'No'}"
+        reason = f"{condition_key}={'Yes' if resolved else 'No'}"
         if previous == state and snapshot.get("applicabilityReason") == reason:
             continue
         snapshot["applicabilityState"] = state
@@ -294,7 +368,7 @@ def _resolve_known_applicability(
             {
                 "tenant_id": tenant_id,
                 "requirement_id": row["journey_document_requirement_id"],
-                "requirement_status": "PENDING" if exchange_taken else "NOT_APPLICABLE",
+                "requirement_status": "PENDING" if resolved else "NOT_APPLICABLE",
                 "snapshot": json.dumps(snapshot),
             },
         )
