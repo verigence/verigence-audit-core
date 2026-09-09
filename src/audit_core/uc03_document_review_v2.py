@@ -35,13 +35,19 @@ from audit_core.uc03_document_capture_v2 import (
     get_di_capture_v2_client,
 )
 from audit_core.uc03_document_registry import is_receipt_document_type
+from audit_core.uc03_review_confidence import (
+    field_review_state as _field_review_state,
+)
+from audit_core.uc03_review_confidence import (
+    has_value,
+    requires_pc_review,
+)
 
 router = APIRouter(
     prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}",
     tags=["uc03-document-review-v2"],
 )
 
-_REVIEW_THRESHOLD = 92.0
 _FAILED_PROCESSING = {"FAILED", "ERROR", "REJECTED"}
 
 
@@ -144,12 +150,6 @@ class AuditSourceComparisonV2Response(BaseModel):
     attributes: list[ReviewV2Attribute]
     unmappedFields: list[ReviewV2UnmappedField]
     documents: list[ReviewV2Document]
-
-
-def _field_review_state(*, value: Any, confidence_score: float | None) -> Literal["READY", "NEEDS_REVIEW"]:
-    if value is None or confidence_score is None or confidence_score < _REVIEW_THRESHOLD:
-        return "NEEDS_REVIEW"
-    return "READY"
 
 
 def _stage_submission_state(
@@ -430,6 +430,19 @@ def _build_attributes(
             review_state: Literal["READY", "NEEDS_REVIEW"] = "NEEDS_REVIEW"
             if resolved_source is not None:
                 review_state = resolved_source.reviewState
+            populated_sources = [source for source in sources if has_value(source.value)]
+            if populated_sources:
+                # Uniform policy across every document extraction, Booking or
+                # Delivery: if ANY candidate source for this attribute -- not
+                # just the auto-resolved winner -- is a populated value below
+                # the confidence threshold, the attribute as a whole still
+                # needs a PC's eyes. Conflicting sources that are all
+                # individually confident do not, on their own, need review.
+                review_state = (
+                    "NEEDS_REVIEW"
+                    if any(requires_pc_review(source.confidenceScore) for source in populated_sources)
+                    else "READY"
+                )
             result.append(
                 ReviewV2Attribute(
                     attributeKey=spec.attribute_key,

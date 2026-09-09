@@ -49,6 +49,14 @@ from audit_core.uc03_finding_classification import resolve_classification
 from audit_core.uc03_post_extraction_materialization import (
     materialize_machine_booking_values,
 )
+from audit_core.uc03_review_confidence import (
+    REVIEW_THRESHOLD_PERCENT,
+    has_value,
+    requires_pc_review,
+)
+from audit_core.uc03_review_confidence import (
+    field_review_state as _field_review_state,  # noqa: F401 -- re-exported, tests import it here
+)
 from audit_core.uc03_v2_review_materialization import (
     materialize_reviewed_di_business_values,
     reviewed_field_core_owner,
@@ -56,53 +64,16 @@ from audit_core.uc03_v2_review_materialization import (
 
 logger = structlog.get_logger(__name__)
 
-REVIEW_THRESHOLD_PERCENT = 90.0
 _DI_AUDIENCE = "di"
 _REVIEW_FLAG_RULE = "UC03_DI_LOW_CONFIDENCE_POST_SUBMIT"
 _TL_CORRECTION_RULE = "UC03_POST_SUBMIT_DI_CORRECTION"
-
-
-def _has_value(value: Any) -> bool:
-    return value is not None and value != ""
-
-
-def requires_pc_review(confidence_score: float | None) -> bool:
-    """Return True only when a DI fact cannot satisfy the 90% trust threshold."""
-
-    return confidence_score is None or float(confidence_score) < REVIEW_THRESHOLD_PERCENT
-
-
-def _field_review_state(
-    *,
-    value: Any,
-    confidence_score: float | None,
-) -> str:
-    del value
-    return "NEEDS_REVIEW" if requires_pc_review(confidence_score) else "READY"
-
-
-def _strict_confidence_attributes(original: Any):
-    def wrapped(*args: Any, **kwargs: Any):
-        attributes, unmapped = original(*args, **kwargs)
-        for attribute in attributes:
-            populated = [source for source in attribute.sources if _has_value(source.value)]
-            if not populated:
-                continue
-            attribute.reviewState = (
-                "NEEDS_REVIEW"
-                if any(requires_pc_review(source.confidenceScore) for source in populated)
-                else "READY"
-            )
-        return attributes, unmapped
-
-    return wrapped
 
 
 def _build_raw_review_item(
     review_key: str,
     sources: list[review_v2.ReviewV2UnmappedField],
 ):
-    populated = [source for source in sources if _has_value(source.value)]
+    populated = [source for source in sources if has_value(source.value)]
     if not populated:
         return None
     selected = min(
@@ -1666,11 +1637,6 @@ def install_uc03_confidence_review_policy() -> None:
     if getattr(review_v2, "_confidence_review_policy_installed", False):
         return
 
-    review_v2._REVIEW_THRESHOLD = REVIEW_THRESHOLD_PERCENT
-    review_v2._field_review_state = _field_review_state  # type: ignore[assignment]
-    review_v2._build_attributes = _strict_confidence_attributes(  # type: ignore[assignment]
-        review_v2._build_attributes
-    )
     booking_review._build_raw_review_item = _build_raw_review_item  # type: ignore[assignment]
     booking_capture._completion_summary = _completion_summary  # type: ignore[assignment]
 
@@ -1681,12 +1647,19 @@ def install_uc03_confidence_review_policy() -> None:
     # set_booking_review_decision_confidence_policy,
     # confirm_booking_review_v2_confidence_policy, and
     # acknowledge_booking_document_link_with_auto_sync are now decorated
-    # directly at their definitions above instead. The five attribute
-    # patches above this comment stay -- unlike the routes, they exist
-    # because of a genuine circular import (uc03_booking_capture.py and
-    # uc03_document_review_v2.py can't import this module back), not just
-    # unwired composition; untangling them needs the module split already
-    # planned for Phase 1 (uc03_confidence_review_policy.py splitting into
-    # the generic sync pipeline vs. booking-review-decision-specific logic),
-    # not a quick fix here.
+    # directly at their definitions above instead. The three threshold/
+    # attribute-resolution patches that used to live here too
+    # (review_v2._REVIEW_THRESHOLD, review_v2._field_review_state,
+    # review_v2._build_attributes) are gone as well: both modules now import
+    # the single confidence policy directly from uc03_review_confidence.py
+    # (a dependency-free leaf module, so no cycle) instead of one patching
+    # the other's namespace at startup. The two patches remaining below --
+    # booking_review._build_raw_review_item, booking_capture._completion_
+    # summary -- stay: unlike the threshold logic, they exist because of a
+    # genuine circular import (uc03_booking_capture.py and uc03_booking_
+    # review_decisions.py can't import this module back), not just unwired
+    # composition; untangling them needs the module split already planned
+    # for Phase 1 (uc03_confidence_review_policy.py splitting into the
+    # generic sync pipeline vs. booking-review-decision-specific logic), not
+    # a quick fix here.
     review_v2._confidence_review_policy_installed = True

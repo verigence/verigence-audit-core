@@ -4,8 +4,10 @@ import inspect
 from uuid import uuid4
 
 from audit_core import uc03_delivery_review_materialization as materialization
-from audit_core.uc03_delivery_review_confirm import confirm_delivery_review_v2
 from audit_core.uc03_document_review_v2 import ReviewV2Document, ReviewV2Field
+from audit_core.uc03_review_effective_values import (
+    confirm_delivery_review_v2_effective_values,
+)
 
 
 def _field(field_key: str, value, *, confidence: float = 99.0) -> ReviewV2Field:
@@ -139,7 +141,14 @@ def test_delivery_business_materializer_calls_all_canonical_projections(monkeypa
 
 
 def test_delivery_review_materializes_before_marking_stage_verified() -> None:
-    source = inspect.getsource(confirm_delivery_review_v2)
+    # confirm_delivery_review_v2_effective_values is the live handler for
+    # POST /delivery/review/confirm (confirm_delivery_review_v2, previously
+    # tested here, was shadowed dead code -- see
+    # test_uc03_delivery_review_confirm.py). Canonical materialization also
+    # runs async per document as DI confirms it (durable-state-driven, safe
+    # to call redundantly); this synchronous call is confirm's own safety
+    # net for a correction applied at confirm time, matching Booking's.
+    source = inspect.getsource(confirm_delivery_review_v2_effective_values)
     materialize_at = source.index("materialize_reviewed_delivery_business_values(")
     verified_at = source.index("pc_verification_status='VERIFIED'")
 
