@@ -41,6 +41,10 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.security_integration import SecurityOAuthClient, SecurityTokenError
+from audit_core.uc03_attribute_resolution import (
+    apply_supported_operational_attribute,
+    record_attribute_resolution,
+)
 from audit_core.uc03_booking_commands import _aggregate_lock, _parse_if_match
 from audit_core.uc03_booking_rule_trigger import schedule_booking_checkpoint_rules
 from audit_core.uc03_di_core_persistence import persist_reviewed_di_fields
@@ -1455,7 +1459,7 @@ def confirm_booking_review_v2_confidence_policy(
                     attribute_key=attribute.attributeKey,
                 )
             resolved_count += 1
-            application = review_v2.apply_supported_operational_attribute(
+            application = apply_supported_operational_attribute(
                 connection,
                 tenant_id=tenant_id,
                 journey_id=journey_id,
@@ -1482,7 +1486,7 @@ def confirm_booking_review_v2_confidence_policy(
                     conflicts.append(attribute.attributeKey)
             applied.append(attribute.attributeKey)
             if spec.mapping_status == "SUPPORTED":
-                review_v2.record_attribute_resolution(
+                record_attribute_resolution(
                     connection,
                     tenant_id=tenant_id,
                     journey_id=journey_id,

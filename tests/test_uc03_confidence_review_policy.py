@@ -110,3 +110,26 @@ def test_sync_booking_document_serializes_per_journey_with_an_advisory_lock() ->
         function_source.index("pg_advisory_xact_lock")
         < function_source.index("FROM auditcore.evidence")
     )
+
+
+def test_confirm_calls_attribute_resolution_directly_not_via_review_v2() -> None:
+    # Regression test for a live production AttributeError: confirm_booking_
+    # review_v2_confidence_policy used to call review_v2.apply_supported_
+    # operational_attribute(...) / review_v2.record_attribute_resolution(...),
+    # relying on uc03_document_review_v2.py having imported those two names
+    # into its own module namespace. That import was removed on 2026-08-31
+    # when confirm_booking_review_v2 (the handler that originally called them
+    # directly) moved out of uc03_document_review_v2.py entirely -- leaving
+    # this confirm handler's own later call sites pointing at a module
+    # attribute that no longer exists. Nothing caught it because no test
+    # exercises this handler's actual execute() body (it needs a full
+    # attributes/documents/decisions fixture); it surfaced only once a real
+    # Booking confirm reached a populated, SUPPORTED-mapping attribute.
+    assert hasattr(confidence_policy, "apply_supported_operational_attribute")
+    assert hasattr(confidence_policy, "record_attribute_resolution")
+
+    source = inspect.getsource(confidence_policy.confirm_booking_review_v2_confidence_policy)
+    assert "review_v2.apply_supported_operational_attribute" not in source
+    assert "review_v2.record_attribute_resolution" not in source
+    assert "apply_supported_operational_attribute(" in source
+    assert "record_attribute_resolution(" in source
