@@ -425,6 +425,20 @@ def acknowledge_booking_document_link(
     journey_id: UUID = discovered["journey_id"]
     set_tenant_context(connection, tenant_id)
 
+    if str(discovered["process_area"]).upper() == "DELIVERY":
+        # A conditional Delivery requirement's applicability only ever gets
+        # recomputed today when a human happens to load the Delivery
+        # documents list first (uc03_delivery_documents.list_delivery_
+        # documents) -- if DI's callback for that exact document arrives
+        # before anyone has, _require_callback_applicable below sees it
+        # stuck UNRESOLVED and rejects with 409 forever, even once the
+        # authoritative fact (e.g. an accessories amount on the Booking
+        # Form) has been there the whole time. Recompute it here too so the
+        # callback self-heals instead of depending on that page load.
+        from audit_core.uc03_delivery_documents import _resolve_known_applicability
+
+        _resolve_known_applicability(connection, tenant_id=tenant_id, journey_id=journey_id)
+
     # Stage is data, not routing: this callback is DI telling Audit Core "this
     # document is linked to this requirement" -- DI has no notion of Booking vs
     # Delivery, and neither should this handler. The requirement row itself
