@@ -4,7 +4,6 @@ from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import Depends, Header, Request, Response
-from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, Engine, text
 
@@ -24,11 +23,15 @@ from audit_core.security_authorization import (
 from audit_core.security_integration import SecurityOAuthClient
 from audit_core.uc03_booking_commands import _aggregate_lock, _parse_if_match
 from audit_core.uc03_delivery_commands import _append_delivery_event
+from audit_core.uc03_delivery_review_materialization import (
+    materialize_reviewed_delivery_business_values,
+)
 from audit_core.uc03_di_core_persistence import (
     ReviewedDiField,
     persist_reviewed_di_fields,
 )
 from audit_core.uc03_document_registry import is_receipt_document_type
+from audit_core.uc03_review_confidence import has_value, requires_pc_review
 from audit_core.uc03_v2_review_materialization import (
     receipt_document_ordinals,
     receipt_review_key,
@@ -314,6 +317,26 @@ def _reviewed_fields(
     return reviewed
 
 
+def _unresolved_low_confidence_fields(
+    documents: list[review_v2.ReviewV2Document],
+    corrections: dict[tuple[UUID, str, str, int], ReviewFieldCorrection],
+) -> list[str]:
+    """Populated DI values below the 90% threshold that this confirm request
+    doesn't account for -- Delivery's stand-in for Booking's decision_required/
+    missing_keys gate. Delivery has no separate Accept/Reject decision table,
+    so a correction submitted for the field (any effective value, including
+    the extracted one resubmitted as-is) stands in for that decision here."""
+
+    return sorted(
+        f"{field.fieldKey}@{document.documentId}"
+        for document in documents
+        for field in document.fields
+        if has_value(field.value)
+        and requires_pc_review(field.confidenceScore)
+        and _field_target(document, field) not in corrections
+    )
+
+
 def _corrected_documents(
     documents: list[review_v2.ReviewV2Document],
     corrections: dict[tuple[UUID, str, str, int], ReviewFieldCorrection],
@@ -350,10 +373,19 @@ def _corrected_attributes(
 # install_uc03_confidence_review_policy ran after install_uc03_review_
 # effective_values in the original chain, so its own confirm_booking_
 # review_v2_confidence_policy always won this route in the end anyway.
-# confirm_delivery_review_v2_effective_values below is untouched --
-# Delivery's /delivery/review/confirm has no equivalent later swap.
+# confirm_delivery_review_v2_effective_values below IS the live handler for
+# POST /delivery/review/confirm -- confirmed by tracing install order
+# (install_uc03_delivery_review_confirm ran first in the cascade, so this
+# module's own _replace_confirm_route call always discarded its route in
+# favor of this one). uc03_delivery_review_confirm.py's own confirm handler
+# was dead code despite having its own passing test; it and its installer
+# were removed once this was confirmed.
 
 
+@review_v2.router.post(
+    "/delivery/review/confirm",
+    response_model=delivery_review.DeliveryReviewV2ConfirmResponse,
+)
 def confirm_delivery_review_v2_effective_values(
     tenant_id: str,
     journey_id: UUID,
@@ -433,6 +465,22 @@ def confirm_delivery_review_v2_effective_values(
 
     command = payload or ReviewConfirmCommand()
     corrections = _correction_map(documents, command.corrections)
+
+    # Uniform confidence policy: a populated DI value below the 90% threshold
+    # needs a PC's eyes before Delivery Review can complete, exactly like
+    # Booking's confirm gate (missing_keys derived from decision_required).
+    unresolved = _unresolved_low_confidence_fields(documents, corrections)
+    if unresolved:
+        raise ConflictError(
+            error_code="VAC-CONFLICT-012",
+            title="Review decisions are pending",
+            detail=(
+                f"{len(unresolved)} low-confidence extracted value"
+                f"{'s' if len(unresolved) != 1 else ''} still require a reviewed "
+                "correction before Delivery Review can be confirmed."
+            ),
+        )
+
     correlation_id = get_correlation_id(request)
 
     def execute() -> dict[str, Any]:
@@ -476,6 +524,21 @@ def confirm_delivery_review_v2_effective_values(
             actor_id=human_principal.subject,
             fields=_reviewed_fields(documents, corrections),
         )
+        # Canonical materialization already runs async, per document, as each
+        # Delivery document is confirmed by DI (uc03_delivery_post_extraction_
+        # materialization.materialize_delivery_documents_from_durable_store,
+        # itself durable-state-driven so it's safe to call redundantly). This
+        # is the same synchronous safety net Booking's confirm/submit already
+        # get: a PC correction applied at confirm time must be reflected in
+        # Journey 360's business tables before Review can become VERIFIED,
+        # not just left for the next async trigger.
+        materialization = materialize_reviewed_delivery_business_values(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            documents=_corrected_documents(documents, corrections),
+            actor_id=human_principal.subject,
+        )
         next_version = expected_version + 1
         connection.execute(
             text(
@@ -509,6 +572,7 @@ def confirm_delivery_review_v2_effective_values(
                 "storedFieldCount": stored_field_count,
                 "modifiedFieldCount": len(corrections),
                 "rawDiValuesCopied": True,
+                "canonicalMaterialization": materialization,
             },
             aggregate_version=next_version,
         )
@@ -534,29 +598,6 @@ def confirm_delivery_review_v2_effective_values(
     return delivery_review.DeliveryReviewV2ConfirmResponse.model_validate(body)
 
 
-def _replace_confirm_route(
-    suffix: str,
-    endpoint: Any,
-    response_model: type[BaseModel],
-) -> None:
-    retained = []
-    for route in review_v2.router.routes:
-        if (
-            isinstance(route, APIRoute)
-            and route.path.endswith(suffix)
-            and "POST" in route.methods
-        ):
-            continue
-        retained.append(route)
-    review_v2.router.routes[:] = retained
-    review_v2.router.add_api_route(
-        suffix,
-        endpoint,
-        methods=["POST"],
-        response_model=response_model,
-    )
-
-
 def install_uc03_review_effective_values() -> None:
     """Install V2 effective-value corrections and document-scoped raw review identity."""
 
@@ -568,9 +609,7 @@ def install_uc03_review_effective_values() -> None:
     # confirm_delivery_review_v2_effective_values -- confirm_booking_
     # review_v2_confidence_policy is decorated directly on this route in
     # uc03_confidence_review_policy.py instead.
-    _replace_confirm_route(
-        "/delivery/review/confirm",
-        confirm_delivery_review_v2_effective_values,
-        delivery_review.DeliveryReviewV2ConfirmResponse,
-    )
+    # POST /delivery/review/confirm's _replace_confirm_route call removed
+    # (uniform-confidence-policy pass): confirm_delivery_review_v2_effective_
+    # values is now decorated directly at its definition above instead.
     review_v2._review_effective_values_installed = True

@@ -38,6 +38,7 @@ from audit_core.uc03_di_core_persistence import (
     scope_with_actor_context as _scope,
 )
 from audit_core.uc03_document_registry import is_receipt_document_type
+from audit_core.uc03_review_confidence import requires_pc_review
 from audit_core.uc03_v2_review_materialization import (
     materialize_reviewed_di_business_values,
     receipt_document_ordinals,
@@ -159,10 +160,7 @@ def _build_raw_review_item(
         ),
     )
     distinct_values = {_normalized_value(source.value) for source in populated}
-    low_confidence = (
-        selected.confidenceScore is None
-        or selected.confidenceScore < review_v2._REVIEW_THRESHOLD
-    )
+    low_confidence = requires_pc_review(selected.confidenceScore)
     return _ReviewItem(
         review_key=review_key,
         review_kind="RAW_FIELD",

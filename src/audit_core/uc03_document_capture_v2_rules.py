@@ -140,9 +140,6 @@ def install_uc03_v2_capture_business_rules() -> None:
     from audit_core.uc03_confidence_review_policy import (
         install_uc03_confidence_review_policy,
     )
-    from audit_core.uc03_delivery_review_confirm import (
-        install_uc03_delivery_review_confirm,
-    )
     from audit_core.uc03_review_effective_values import (
         install_uc03_review_effective_values,
     )
@@ -171,7 +168,12 @@ def install_uc03_v2_capture_business_rules() -> None:
     # Aadhaar v1.2 added explicit pincode/state/district extraction after the first
     # typed identity owner was created. Extend that same owner before Review traffic.
     install_uc03_aadhaar_address_core_ownership()
-    install_uc03_delivery_review_confirm()
+    # install_uc03_delivery_review_confirm() removed (uniform-confidence-
+    # policy pass): its route registration was always discarded by
+    # install_uc03_review_effective_values()'s later _replace_confirm_route
+    # call anyway -- confirm_delivery_review_v2_effective_values is now
+    # decorated directly on that path instead, in uc03_review_effective_
+    # values.py.
     # install_uc03_delivery_review_read() removed (Phase 0 dead-code cleanup):
     # its two added routes (/booking/capture-local, /delivery/capture-local on
     # review_v2.router) were always shadowed by uc03_capture_local_reads.py's

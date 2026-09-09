@@ -1,20 +1,15 @@
 from __future__ import annotations
 
-import inspect
 from uuid import uuid4
 
 from fastapi.routing import APIRoute
 
 from audit_core import uc03_document_review_v2 as review_v2
-from audit_core.uc03_delivery_review_confirm import (
-    DeliveryReviewV2ConfirmResponse,
-    _lossless_delivery_fields,
-    confirm_delivery_review_v2,
-    install_uc03_delivery_review_confirm,
-)
+from audit_core import uc03_review_effective_values as effective_values
+from audit_core.uc03_delivery_review_confirm import DeliveryReviewV2ConfirmResponse
 
 
-def _delivery_document(*, value="delivery-value") -> review_v2.ReviewV2Document:
+def _delivery_document(*, value="delivery-value", confidence=97.0) -> review_v2.ReviewV2Document:
     return review_v2.ReviewV2Document(
         documentId=uuid4(),
         evidenceId=None,
@@ -29,7 +24,7 @@ def _delivery_document(*, value="delivery-value") -> review_v2.ReviewV2Document:
                 canonicalFieldId=str(uuid4()),
                 fieldKey="future_delivery_field",
                 value=value,
-                confidenceScore=97.0,
+                confidenceScore=confidence,
                 sourceFactVersion=3,
                 reviewState="READY",
             )
@@ -37,65 +32,62 @@ def _delivery_document(*, value="delivery-value") -> review_v2.ReviewV2Document:
     )
 
 
-def test_delivery_review_confirm_route_is_explicit_post_not_get_side_effect() -> None:
-    install_uc03_delivery_review_confirm()
+def test_delivery_review_confirm_route_is_a_single_registration() -> None:
+    # uc03_delivery_review_confirm.py's own confirm_delivery_review_v2 and
+    # install_uc03_delivery_review_confirm were removed: install order in the
+    # app-startup cascade meant install_uc03_review_effective_values() always
+    # ran after it and discarded its route in favor of
+    # confirm_delivery_review_v2_effective_values -- the dead handler had its
+    # own passing "route exists" test despite never winning a single real
+    # request. That function is now the only registration for this path,
+    # decorated directly at its definition instead of installed at runtime.
     routes = [
         route
         for route in review_v2.router.routes
-        if isinstance(route, APIRoute)
-        and route.path.endswith("/delivery/review/confirm")
+        if isinstance(route, APIRoute) and route.path.endswith("/delivery/review/confirm")
     ]
-
     assert len(routes) == 1
     assert routes[0].methods == {"POST"}
     assert routes[0].response_model is DeliveryReviewV2ConfirmResponse
-
-    comparison_routes = [
-        route
-        for route in review_v2.router.routes
-        if isinstance(route, APIRoute)
-        and route.path.endswith("/audit/source-comparison")
-    ]
-    assert len(comparison_routes) == 1
-    assert comparison_routes[0].methods == {"GET"}
+    assert routes[0].endpoint is effective_values.confirm_delivery_review_v2_effective_values
 
 
-def test_delivery_review_fields_keep_di_identity_and_effective_value() -> None:
-    document = _delivery_document(value=False)
-    fields = _lossless_delivery_fields([document])
-
-    assert len(fields) == 1
-    field = fields[0]
-    assert field.document_id == document.documentId
-    assert field.evidence_id is None
-    assert field.source_canonical_field_id == document.fields[0].canonicalFieldId
-    assert field.source_fact_version == 3
-    assert field.field_key == "future_delivery_field"
-    assert field.extracted_value is False
-    assert field.effective_value is False
-    assert field.confidence_score == 97.0
-    assert field.confidence_scale == "PERCENT"
-    assert field.is_modified is False
-
-
-def test_delivery_confirm_persists_before_verified_state_transition() -> None:
-    source = inspect.getsource(confirm_delivery_review_v2)
-
-    assert source.index("persist_reviewed_di_fields(") < source.index(
-        "SET pc_verification_status='VERIFIED'"
+def test_low_confidence_field_without_a_correction_is_unresolved() -> None:
+    document = _delivery_document(confidence=85.0)
+    unresolved = effective_values._unresolved_low_confidence_fields(
+        [document], corrections={}
     )
-    assert 'stage_code="DELIVERY"' in source
-    assert 'event_type="PC_DELIVERY_REVIEW_CONFIRMED"' in source
-    assert '"rawDiValuesCopied": True' in source
-    assert "FOR UPDATE" in source
-    assert "execute_idempotent_json_command(" in source
-    assert "expected_version = _parse_if_match(if_match)" in source
+    assert unresolved == [f"future_delivery_field@{document.documentId}"]
 
 
-def test_delivery_confirm_refuses_pending_or_failed_extraction() -> None:
-    source = inspect.getsource(confirm_delivery_review_v2)
+def test_low_confidence_field_with_any_correction_is_resolved() -> None:
+    # Delivery has no separate Accept/Reject decision table -- resubmitting
+    # the same extracted value as a "correction" is how a PC accepts a
+    # low-confidence value as-is.
+    document = _delivery_document(confidence=85.0)
+    field = document.fields[0]
+    corrections = effective_values._correction_map(
+        [document],
+        [
+            effective_values.ReviewFieldCorrection(
+                documentId=document.documentId,
+                canonicalFieldId=field.canonicalFieldId,
+                fieldKey=field.fieldKey,
+                sourceFactVersion=field.sourceFactVersion,
+                effectiveValue=field.value,
+            )
+        ],
+    )
+    assert effective_values._unresolved_low_confidence_fields([document], corrections) == []
 
-    assert 'document.extractionState == "PENDING"' in source
-    assert 'document.extractionState == "FAILED"' in source
-    assert 'title="Documents are not ready for review"' in source
-    assert 'title="Document processing requires follow-up"' in source
+
+def test_high_confidence_field_needs_no_correction() -> None:
+    document = _delivery_document(confidence=97.0)
+    assert effective_values._unresolved_low_confidence_fields([document], corrections={}) == []
+
+
+def test_unpopulated_low_confidence_field_needs_no_correction() -> None:
+    # Nothing was extracted for this field on this document -- there is
+    # nothing for a PC to review.
+    document = _delivery_document(value=None, confidence=None)
+    assert effective_values._unresolved_low_confidence_fields([document], corrections={}) == []
