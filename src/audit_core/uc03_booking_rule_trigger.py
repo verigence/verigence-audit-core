@@ -9,6 +9,7 @@ from sqlalchemy import Connection, Engine, text
 
 from audit_core.db import set_tenant_context
 from audit_core.uc03_booking_commands import _append_workflow_event
+from audit_core.uc03_booking_confirmation_rules import _DISCOUNT_EVIDENCE
 from audit_core.uc03_delivery_commands import _machine_flag
 from audit_core.uc03_manual_verification import _resolve_finding
 from audit_core.uc03_rule_engine_findings import run_rule_engine_phase
@@ -20,6 +21,16 @@ logger = structlog.get_logger(__name__)
 _WORKFLOW_TYPE = "UC03_BOOKING_AUDIT"
 _TASK_TYPE = "BOOKING_RULE_EVALUATION"
 _WORKER_ID = "uc03-booking-rule-engine"
+
+# document_type_keys already covered by uc03_booking_confirmation_rules' own
+# BK_DISCOUNT_EVIDENCE_MISSING:<label> findings (e.g. a claimed exchange bonus
+# requires vehicle_rc). A CONDITIONAL requirement backing one of these is a
+# duplicate of that more specific, business-named finding, not a distinct gap
+# -- e.g. trade_in_vehicle_rc (document_type_key=vehicle_rc) is exactly what
+# BK_DISCOUNT_EVIDENCE_MISSING:exchange_bonus already asks the PC to address.
+_DOCUMENT_TYPES_COVERED_BY_DISCOUNT_EVIDENCE = frozenset(
+    document_type_key for _label, document_type_key in _DISCOUNT_EVIDENCE.values()
+)
 
 
 @dataclass(frozen=True)
@@ -42,7 +53,7 @@ def _requirement_snapshot(
         text(
             """
             SELECT jdr.requirement_key, jdr.requirement_level,
-                   jdr.requirement_status,
+                   jdr.requirement_status, jdr.document_type_key,
                    COALESCE(jda.answer, 'UNANSWERED') AS answer,
                    EXISTS (
                        SELECT 1 FROM auditcore.evidence e
@@ -159,6 +170,8 @@ def _booking_requirement_rule_specs(rows: list[dict[str, Any]]) -> list[_RuleSpe
             str(row["requirement_key"])
             for row in outstanding
             if str(row.get("requirement_level") or "").upper() == "CONDITIONAL"
+            and str(row.get("document_type_key") or "")
+            not in _DOCUMENT_TYPES_COVERED_BY_DISCOUNT_EVIDENCE
         )
     )
     if conditional_keys:
