@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Annotated, Any
 from uuid import UUID
@@ -109,6 +110,45 @@ def _can_read_full_contact(
         ).allowed
     except SecurityAuthorizationError:
         return False
+
+
+def _authorize_read_and_check_full_contact(
+    client: SecurityAuthorizationClient,
+    *,
+    human_principal: HumanPrincipal,
+    tenant_id: str,
+) -> bool:
+    """Both permission checks for a Journey Overview read, run concurrently.
+
+    Each is an independent call to the Security service
+    (SecurityAuthorizationClient.check_user_permission), and on a cache miss
+    each pays its own full network round trip up to a 5s timeout. Run
+    sequentially, a cold-cache overview read pays up to ~10s just on
+    authorization before a single Journey row is queried -- observed live as
+    the Journey Overview page hitting the web client's own 10s timeout
+    (WEB-AC-TIMEOUT). Running them in parallel halves that worst case; it
+    does not touch the timeout or caching behavior of either check itself.
+    _authorize_read raises (DependencyUnavailableError / AuthorizationError)
+    on its own -- run it on the calling thread so that exception still
+    propagates immediately (not delayed waiting for the background check to
+    finish), while the full-contact check runs alongside it in the common,
+    both-succeed case.
+    """
+    executor = ThreadPoolExecutor(max_workers=1)
+    full_contact_future = executor.submit(
+        _can_read_full_contact,
+        client,
+        human_principal=human_principal,
+        tenant_id=tenant_id,
+    )
+    try:
+        _authorize_read(client, human_principal=human_principal, tenant_id=tenant_id)
+    except Exception:
+        executor.shutdown(wait=False)
+        raise
+    result = full_contact_future.result()
+    executor.shutdown(wait=False)
+    return result
 
 
 def _visible_mobile(
@@ -555,7 +595,12 @@ def get_journey_overview(
 ) -> JourneyOverviewResponse:
     """Return a read-only Journey 360 projection using only Audit Core-owned data."""
 
-    _authorize_read(
+    # Both permission checks run concurrently -- see
+    # _authorize_read_and_check_full_contact's own docstring. This does mean
+    # a 404 (Journey outside scope) now also pays for the full-contact check
+    # instead of skipping it, trading a small cost in the rare not-found case
+    # for cutting the common case's worst-case authorization latency in half.
+    full_contact = _authorize_read_and_check_full_contact(
         authorization_client,
         human_principal=human_principal,
         tenant_id=tenant_id,
@@ -575,11 +620,6 @@ def get_journey_overview(
             detail="Journey not found in your current Project scope.",
         )
 
-    full_contact = _can_read_full_contact(
-        authorization_client,
-        human_principal=human_principal,
-        tenant_id=tenant_id,
-    )
     customer = connection.execute(
         text(
             """
