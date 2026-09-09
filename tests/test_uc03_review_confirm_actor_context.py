@@ -18,10 +18,10 @@ def test_review_scope_sets_authenticated_actor_context(monkeypatch) -> None:
         calls["actor_connection"] = conn
         calls["actor_id"] = actor_id
 
-    monkeypatch.setattr(persistence, "_original_review_scope", fake_scope)
+    monkeypatch.setattr(persistence.booking_capture, "_scope", fake_scope)
     monkeypatch.setattr(persistence, "set_security_actor_context", fake_set_actor_context)
 
-    result = persistence._scope_with_actor_context(
+    result = persistence.scope_with_actor_context(
         connection,
         tenant_id="tenant-1",
         journey_id=uuid4(),

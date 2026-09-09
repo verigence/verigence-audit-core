@@ -26,7 +26,6 @@ from audit_core.uc03_attribute_resolution import (
     apply_supported_operational_attribute,
     record_attribute_resolution,
 )
-from audit_core.uc03_booking_capture import _scope
 from audit_core.uc03_booking_commands import (
     _aggregate_lock,
     _append_workflow_event,
@@ -35,6 +34,9 @@ from audit_core.uc03_booking_commands import (
 from audit_core.uc03_di_core_persistence import (
     ReviewedDiField,
     persist_reviewed_di_fields,
+)
+from audit_core.uc03_di_core_persistence import (
+    scope_with_actor_context as _scope,
 )
 from audit_core.uc03_document_registry import is_receipt_document_type
 from audit_core.uc03_v2_review_materialization import (

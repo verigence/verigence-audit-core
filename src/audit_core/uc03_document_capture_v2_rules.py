@@ -146,7 +146,6 @@ def install_uc03_v2_capture_business_rules() -> None:
     from audit_core.uc03_delivery_review_confirm import (
         install_uc03_delivery_review_confirm,
     )
-    from audit_core.uc03_di_core_persistence import install_uc03_di_core_persistence
     from audit_core.uc03_post_extraction_materialization import (
         install_uc03_post_extraction_materialization,
     )
@@ -167,7 +166,10 @@ def install_uc03_v2_capture_business_rules() -> None:
     # handle any request. This extends existing Core owners; it creates no new table.
     install_uc03_booking_commercial_components()
     install_uc03_booking_review_decisions()
-    install_uc03_di_core_persistence()
+    # install_uc03_di_core_persistence() removed (Phase 0 monkeypatch removal):
+    # uc03_booking_review_decisions.py now imports uc03_di_core_persistence.
+    # scope_with_actor_context directly as its own _scope, instead of that
+    # name being reassigned at startup.
     # Review Confirm is fail-closed: generic DI provenance is not a substitute for
     # an explicit typed Audit Core business owner. Booking Docket shares the same
     # typed Booking business owner as Booking Form.
