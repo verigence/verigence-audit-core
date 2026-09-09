@@ -569,7 +569,6 @@ def _sku_pricing_panel(
             SELECT
                 pli.component_key,
                 pli.standard_amount,
-                pli.currency_code,
                 plv.price_list_version_id,
                 plv.version_no,
                 plv.currency_code AS plan_currency
@@ -581,8 +580,8 @@ def _sku_pricing_panel(
               AND pli.product_sku_id=:product_sku_id
               AND plv.lifecycle_status='PUBLISHED'
               AND (
-                  :price_list_id::uuid IS NULL
-                  OR plv.price_list_id = :price_list_id::uuid
+                  CAST(:price_list_id AS uuid) IS NULL
+                  OR plv.price_list_id = CAST(:price_list_id AS uuid)
               )
             ORDER BY plv.effective_from DESC, plv.version_no DESC, pli.component_key
             LIMIT 100
