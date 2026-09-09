@@ -65,7 +65,6 @@ from audit_core.uc03_booking_integrations import (
     router as uc03_booking_integrations_router,
 )
 from audit_core.uc03_booking_part1 import router as uc03_booking_part1_router
-from audit_core.uc03_booking_review import router as uc03_booking_review_router
 from audit_core.uc03_booking_v2 import router as uc03_booking_v2_router
 from audit_core.uc03_capture_local_reads import (
     router as uc03_capture_local_reads_router,
@@ -206,7 +205,9 @@ def create_app() -> FastAPI:
     application.include_router(uc03_booking_evidence_router)
     application.include_router(uc03_booking_evidence_details_router)
     application.include_router(uc03_booking_details_router)
-    application.include_router(uc03_booking_review_router)
+    # uc03_booking_review_router removed (Phase 0 dead-code cleanup): its one
+    # route, POST .../booking/details/review/{evidence_id}/approve-editable,
+    # gated the retired V1 proposal flow and had zero callers and zero tests.
     application.include_router(uc03_delivery_router)
     application.include_router(uc03_delivery_capture_v2_router)
     application.include_router(uc03_delivery_documents_router)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Annotated, Any
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Request
@@ -9,16 +9,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import Connection, text
 
 from audit_core.dependencies import get_connection, get_human_principal
-from audit_core.di_client import DiClient, DiClientError
-from audit_core.errors import AuditCoreError, ConflictError, DependencyUnavailableError
-from audit_core.evidence import get_di_client, get_security_oauth_client
+from audit_core.errors import AuditCoreError, ConflictError
 from audit_core.observability import get_correlation_id
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
-from audit_core.security_integration import SecurityOAuthClient, SecurityTokenError
 from audit_core.uc03_booking_capture import _scope
 from audit_core.uc03_booking_commands import (
     _aggregate_lock,
@@ -27,7 +24,6 @@ from audit_core.uc03_booking_commands import (
     _require_expected_version,
     _stage_state,
 )
-from audit_core.uc03_finding_classification import resolve_classification
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/journeys/{journey_id}/booking/details",
@@ -138,25 +134,9 @@ class BookingDetailsSaveResponse(BaseModel):
     optionalEvidence: list[OptionalEvidenceView]
 
 
-class ReviewEvidenceItem(BaseModel):
-    evidenceId: UUID
-    requirementKey: str | None = None
-    documentTypeKey: str | None = None
-    processingStatus: str | None = None
-    verificationStatus: str | None = None
-
-
-class BookingReviewStartResponse(BaseModel):
-    journeyId: UUID
-    aggregateVersion: int
-    raisedObservationIds: list[UUID]
-    documents: list[ReviewEvidenceItem]
-
-
-class DocumentApprovalResponse(BaseModel):
-    evidenceId: UUID
-    aggregateVersion: int
-    verificationStatus: str
+# ReviewEvidenceItem, BookingReviewStartResponse, DocumentApprovalResponse
+# removed (Phase 0 dead-code cleanup) along with start_booking_review and
+# approve_review_document below -- see that removal note.
 
 
 def _require_active(state) -> None:
@@ -534,136 +514,9 @@ def _details_view(
     )
 
 
-def _review_documents(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-) -> list[ReviewEvidenceItem]:
-    rows = connection.execute(
-        text(
-            """
-            SELECT e.evidence_id, jdr.requirement_key, e.document_type_key,
-                   e.processing_status_cache, e.verification_status_cache,
-                   e.linked_at_utc
-            FROM auditcore.evidence e
-            LEFT JOIN auditcore.journey_document_requirements jdr
-              ON jdr.tenant_id=e.tenant_id
-             AND jdr.journey_document_requirement_id=e.journey_document_requirement_id
-            WHERE e.tenant_id=:tenant_id AND e.journey_id=:journey_id
-              AND e.association_status='ACTIVE'
-              AND upper(COALESCE(e.process_area, 'BOOKING'))='BOOKING'
-            ORDER BY
-              CASE COALESCE(jdr.requirement_key, '')
-                WHEN 'booking_docket' THEN 10
-                WHEN 'pan_card' THEN 20
-                WHEN 'aadhaar' THEN 30
-                WHEN 'booking_payment_receipt' THEN 40
-                WHEN 'corporate_id' THEN 50
-                WHEN 'gst_certificate' THEN 60
-                WHEN 'trade_in_vehicle_rc' THEN 70
-                ELSE 90
-              END,
-              e.linked_at_utc, e.evidence_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().all()
-    return [
-        ReviewEvidenceItem(
-            evidenceId=row["evidence_id"],
-            requirementKey=row["requirement_key"],
-            documentTypeKey=row["document_type_key"],
-            processingStatus=row["processing_status_cache"],
-            verificationStatus=row["verification_status_cache"],
-        )
-        for row in rows
-    ]
-
-
-def _record_machine_observation(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-    rule_key: str,
-    title: str,
-    description: str,
-    correlation_id: str,
-) -> UUID:
-    existing = connection.execute(
-        text(
-            """
-            SELECT audit_finding_id
-            FROM auditcore.audit_findings
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code='BOOKING' AND rule_key=:rule_key
-              AND finding_status <> 'VOIDED'
-            ORDER BY created_at_utc DESC, audit_finding_id DESC LIMIT 1
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id, "rule_key": rule_key},
-    ).scalar_one_or_none()
-    if existing is not None:
-        return existing
-    routing = resolve_classification(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        rule_key=rule_key,
-        finding_type_code="DOCUMENT_EXCEPTION",
-        severity="INFO",
-    )
-    finding_id = connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.audit_findings (
-                tenant_id, journey_id, finding_type_code, severity,
-                finding_status, title, description, created_by_actor_id,
-                correlation_id, stage_code, origin_kind, origin_actor_id,
-                origin_role_snapshot, rule_key, blocking_completion,
-                finding_class, owner_role_code, sla_due_at_utc
-            ) VALUES (
-                :tenant_id, :journey_id, 'DOCUMENT_EXCEPTION', 'INFO',
-                'OPEN', :title, :description, NULL,
-                :correlation_id, 'BOOKING', 'MACHINE', NULL,
-                'SYSTEM', :rule_key, false,
-                :finding_class, :owner_role_code, :sla_due_at_utc
-            ) RETURNING audit_finding_id
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "title": title,
-            "description": description,
-            "correlation_id": correlation_id,
-            "rule_key": rule_key,
-            **routing,
-        },
-    ).scalar_one()
-    connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.audit_finding_events (
-                tenant_id, audit_finding_id, journey_id, stage_code,
-                event_type, actor_id, actor_role_snapshot,
-                safe_payload, correlation_id
-            ) VALUES (
-                :tenant_id, :finding_id, :journey_id, 'BOOKING',
-                'RAISED', NULL, 'SYSTEM', CAST(:payload AS jsonb), :correlation_id
-            )
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "finding_id": finding_id,
-            "journey_id": journey_id,
-            "payload": json.dumps({"originKind": "MACHINE", "ruleKey": rule_key}),
-            "correlation_id": correlation_id,
-        },
-    )
-    return finding_id
+# _review_documents and _record_machine_observation removed (Phase 0
+# dead-code cleanup) -- both were only used by start_booking_review /
+# approve_review_document below, which are removed too.
 
 
 @router.get("", response_model=BookingDetailsView)
@@ -940,265 +793,9 @@ def save_booking_details(
     )
 
 
-@router.post("/review", response_model=BookingReviewStartResponse)
-def start_booking_review(
-    request: Request,
-    tenant_id: str,
-    journey_id: UUID,
-    if_match: Annotated[str, Header(alias="If-Match")],
-    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient, Depends(get_security_authorization_client)
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> BookingReviewStartResponse:
-    context = _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
-    state = _stage_state(connection, tenant_id=tenant_id, journey_id=journey_id)
-    _require_active(state)
-    _require_expected_version(state, _parse_if_match(if_match))
-    details = _details_view(connection, tenant_id=tenant_id, journey_id=journey_id)
-    required: dict[str, Any] = {
-        "Type of Customer": details.customerType,
-        "Type of Deal": details.dealType,
-        "Deal Source": details.dealSource,
-        "Lead Generated Through": details.leadSource,
-        "Registration State": details.registrationState,
-        "Territory Categorization": details.territoryCategorization,
-        "District Name": details.districtName,
-        "Registration Type": details.registrationType,
-        "Registration Category": details.registrationCategory,
-        "Outright Purchase": details.outrightPurchase,
-        "Trade In": details.tradeIn,
-        "GST Benefit": details.gstBenefit,
-    }
-    missing = [label for label, value in required.items() if value is None or value == ""]
-    if details.customerType == "CORPORATE" and details.corporateIdAvailable is None:
-        missing.append("Corporate ID availability")
-    if missing:
-        raise AuditCoreError(
-            error_code="VAC-VAL-002",
-            status_code=422,
-            title="Booking Details incomplete",
-            detail="Complete the required Booking Details before review: " + ", ".join(missing),
-        )
-
-    by_key = {item.requirementKey: item for item in details.optionalEvidence}
-    correlation_id = get_correlation_id(request)
-    observations: list[UUID] = []
-    if details.priceListId is None:
-        observations.append(
-            _record_machine_observation(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                rule_key=_PRICE_LIST_RULE,
-                title="Price List not configured",
-                description=(
-                    "No effective published Price List was available for this Booking date. "
-                    "Booking capture may continue; the missing Project configuration is recorded at INFO level."
-                ),
-                correlation_id=correlation_id,
-            )
-        )
-    corporate = by_key.get("corporate_id")
-    if details.customerType == "CORPORATE" and (
-        details.corporateIdAvailable is False or corporate is None or corporate.evidenceId is None
-    ):
-        observations.append(
-            _record_machine_observation(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                rule_key=_CORPORATE_ID_RULE,
-                title="Corporate ID not available",
-                description=(
-                    "The Booking is Corporate and no Corporate ID document was supplied before review. "
-                    "The document is optional and Booking may continue."
-                ),
-                correlation_id=correlation_id,
-            )
-        )
-    gst = by_key.get("gst_certificate")
-    if details.gstBenefit and (gst is None or gst.evidenceId is None):
-        observations.append(
-            _record_machine_observation(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                rule_key=_GST_DOCUMENT_RULE,
-                title="GST Certificate not available",
-                description=(
-                    "GST Benefit is Yes and no GST Certificate was supplied before review. "
-                    "The document is optional and Booking may continue."
-                ),
-                correlation_id=correlation_id,
-            )
-        )
-
-    next_version = int(state["version_no"]) + 1
-    connection.execute(
-        text(
-            """
-            UPDATE auditcore.journey_stage_states
-            SET business_status='BOOKING_IN_PROGRESS',
-                audit_state=CASE WHEN audit_state='NOT_STARTED' THEN 'IN_PROGRESS' ELSE audit_state END,
-                latest_activity_at_utc=now(), updated_at_utc=now(), version_no=:version
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND stage_code='BOOKING'
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id, "version": next_version},
-    )
-    _append_workflow_event(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        event_type="BOOKING_DOCUMENT_REVIEW_STARTED",
-        source_kind="HUMAN",
-        actor_id=human_principal.subject,
-        actor_role_snapshot=context["operating_role"],
-        idempotency_key=idempotency_key,
-        correlation_id=correlation_id,
-        safe_payload={"observationCount": len(observations)},
-        aggregate_version=next_version,
-    )
-    return BookingReviewStartResponse(
-        journeyId=journey_id,
-        aggregateVersion=next_version,
-        raisedObservationIds=observations,
-        documents=_review_documents(connection, tenant_id=tenant_id, journey_id=journey_id),
-    )
-
-
-@router.post("/review/{evidence_id}/approve", response_model=DocumentApprovalResponse)
-def approve_review_document(
-    request: Request,
-    tenant_id: str,
-    journey_id: UUID,
-    evidence_id: UUID,
-    if_match: Annotated[str, Header(alias="If-Match")],
-    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient, Depends(get_security_authorization_client)
-    ],
-    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
-    di_client: Annotated[DiClient, Depends(get_di_client)],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> DocumentApprovalResponse:
-    context = _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
-    state = _stage_state(connection, tenant_id=tenant_id, journey_id=journey_id)
-    _require_active(state)
-    _require_expected_version(state, _parse_if_match(if_match))
-    evidence = connection.execute(
-        text(
-            """
-            SELECT di_subject_id, di_document_id
-            FROM auditcore.evidence
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND evidence_id=:evidence_id AND association_status='ACTIVE'
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "evidence_id": evidence_id,
-        },
-    ).mappings().one_or_none()
-    if evidence is None:
-        raise AuditCoreError(
-            error_code="VAC-NF-006",
-            status_code=404,
-            title="Evidence not found",
-            detail="The Booking evidence was not found for this Journey.",
-        )
-    pending = connection.execute(
-        text(
-            """
-            SELECT count(*)
-            FROM auditcore.journey_capture_proposals
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND source_evidence_id=:evidence_id AND proposal_status='PENDING'
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "evidence_id": evidence_id,
-        },
-    ).scalar_one()
-    if int(pending) > 0:
-        raise AuditCoreError(
-            error_code="VAC-VAL-002",
-            status_code=422,
-            title="Document review incomplete",
-            detail="Review all editable extracted fields before approving this document.",
-        )
-    try:
-        service_token = security_client.get_service_token(audience=_DI_AUDIENCE)
-        di_client.verify_document(
-            token=service_token,
-            tenant_id=tenant_id,
-            subject_id=str(evidence["di_subject_id"]),
-            document_id=str(evidence["di_document_id"]),
-            remarks="UC03 Process Consultant document review approved",
-            field_corrections=[],
-        )
-    except (DiClientError, SecurityTokenError) as exc:
-        raise DependencyUnavailableError(
-            detail="Document verification is temporarily unavailable. Please try again."
-        ) from exc
-
-    connection.execute(
-        text(
-            """
-            UPDATE auditcore.evidence
-            SET verification_status_cache='VERIFIED', cache_updated_at_utc=now()
-            WHERE tenant_id=:tenant_id AND evidence_id=:evidence_id
-            """
-        ),
-        {"tenant_id": tenant_id, "evidence_id": evidence_id},
-    )
-    next_version = int(state["version_no"]) + 1
-    connection.execute(
-        text(
-            """
-            UPDATE auditcore.journey_stage_states
-            SET latest_activity_at_utc=now(), updated_at_utc=now(), version_no=:version
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND stage_code='BOOKING'
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id, "version": next_version},
-    )
-    _append_workflow_event(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        event_type="BOOKING_DOCUMENT_REVIEW_APPROVED",
-        source_kind="HUMAN",
-        actor_id=human_principal.subject,
-        actor_role_snapshot=context["operating_role"],
-        idempotency_key=idempotency_key,
-        correlation_id=get_correlation_id(request),
-        safe_payload={"evidenceId": str(evidence_id)},
-        aggregate_version=next_version,
-    )
-    return DocumentApprovalResponse(
-        evidenceId=evidence_id,
-        aggregateVersion=next_version,
-        verificationStatus="VERIFIED",
-    )
+# start_booking_review (POST .../review) and approve_review_document
+# (POST .../review/{evidence_id}/approve) removed (Phase 0 dead-code
+# cleanup): confirmed zero web callers (uc03BookingJourney.ts's
+# startBookingDetailsReview/approveBookingReviewDocument wrappers exist
+# but nothing in verigence-web calls either), zero test coverage, and no
+# api/openapi-v1.yaml entry.
