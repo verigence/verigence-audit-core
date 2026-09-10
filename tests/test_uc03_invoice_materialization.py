@@ -89,6 +89,40 @@ def test_derive_discounts_empty() -> None:
     assert im.derive_discounts({"grand_total_amount": "100"}) == {}
 
 
+def test_derive_commercials_skips_a_credit_note_entirely() -> None:
+    # A credit note reduces an earlier invoice -- it must never also land as
+    # a fresh ex_showroom_price/commercial line (that would double-count the
+    # original sale). derive_discounts below is where its value belongs.
+    out = im.derive_commercials(
+        {
+            "invoice_nature": "CREDIT_NOTE",
+            "invoice_purpose": "VEHICLE_SALE",
+            "taxable_amount": "25000",
+            "grand_total_amount": "25000",
+            "line_items": [{"line_category": "VEHICLE", "net_amount": "25000"}],
+        }
+    )
+    assert out == {}
+
+
+def test_derive_discounts_routes_a_credit_note_to_additional_discount() -> None:
+    out = im.derive_discounts(
+        {"invoice_nature": "CREDIT_NOTE", "grand_total_amount": "25000"}
+    )
+    assert out == {"ADDITIONAL_DISCOUNT": Decimal(25000)}
+
+
+def test_derive_discounts_credit_note_falls_back_to_taxable_amount() -> None:
+    out = im.derive_discounts(
+        {"invoice_nature": "credit_note", "taxable_amount": "17857.14"}
+    )
+    assert out == {"ADDITIONAL_DISCOUNT": Decimal("17857.14")}
+
+
+def test_derive_discounts_credit_note_with_no_amount_is_empty() -> None:
+    assert im.derive_discounts({"invoice_nature": "CREDIT_NOTE"}) == {}
+
+
 def test_line_item_rows_parses_json_string() -> None:
     rows = im._line_item_rows('[{"line_category": "RSA", "net_amount": 2000}]')
     assert rows == [{"line_category": "RSA", "net_amount": 2000}]
