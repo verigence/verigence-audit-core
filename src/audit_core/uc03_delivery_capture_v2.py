@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, Request
 from pydantic import BaseModel
 from sqlalchemy import Connection, Engine, text
 
@@ -971,3 +971,63 @@ def submit_delivery_capture_v2(
         execute=execute,
     )
     return DeliveryCaptureV2SubmissionResponse.model_validate(body)
+
+
+def _resyncable_document_ids(documents: list[dict[str, Any]]) -> list[UUID]:
+    """Only a document DI has actually classified is worth re-syncing --
+    one still mid-classification has nothing durable to copy yet, and
+    _sync_booking_document's own DOCUMENT_MISSING/manual-verification logic
+    already covers a document that never got this far."""
+    return [
+        row["di_document_id"] for row in documents
+        if str(row.get("capture_status") or "").upper() == "CLASSIFIED"
+    ]
+
+
+@router.post("/resync")
+def resync_delivery_capture_v2(
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    engine: Annotated[Engine, Depends(get_engine)],
+    background_tasks: BackgroundTasks,
+) -> dict[str, Any]:
+    """Force every already-classified Delivery document through the full
+    per-document sync pipeline again (durable fact copy, MANUAL_VERIFICATION,
+    payment reconciliation, canonical materialization, document-gap
+    checkpoint) -- confirmed live need: a document whose sync attempt fails
+    (e.g. the statement-timeout regression on a 15-document upload burst,
+    now fixed) never gets a second try. DI's webhook already received a fast
+    200 OK for the link callback before that failure happened (the whole
+    point of the fast-ack/background-task split), so from DI's side the
+    callback was delivered successfully -- it will not retry on its own, no
+    matter how long the document sits with durable state never written.
+    Idempotent and cheap to call repeatedly: _sync_booking_document's own
+    per-journey advisory lock still serializes these against any concurrent
+    webhook-triggered sync for the same journey.
+    """
+    _authorize_delivery(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    documents = _linked_delivery_documents(connection, tenant_id, journey_id)
+    document_ids = _resyncable_document_ids(documents)
+
+    from audit_core.uc03_confidence_review_policy import _run_sync_booking_document_task
+
+    for document_id in document_ids:
+        background_tasks.add_task(
+            _run_sync_booking_document_task,
+            engine,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            document_id=document_id,
+            service_id=f"manual-resync:{human_principal.subject}",
+            stage_code="DELIVERY",
+        )
+    return {"queuedDocumentCount": len(document_ids)}
