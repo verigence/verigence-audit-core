@@ -10,10 +10,21 @@ gap that has passed its SLA and escalated up to their level.
 Everything is scoped to the caller's active business assignments and evaluated
 against the caller's held roles. SLA / escalation is computed on read from
 ``sla_due_at_utc`` — there is no background job.
+
+Two subjects, one queue: a flag either belongs to a journey (Booking/
+Delivery) or a Daily Operations run (see migration 0080 and
+``uc03_daily_ops_flags.py``). ``subjectKind`` on each ``QueueItem`` and the
+``subjectKind`` query param tell them apart -- the frontend renders this as
+a "Journey Audits" / "Daily Operations" tab toggle, not two separate pages,
+so this endpoint stays the one place both are read from. The two subjects
+have genuinely different case-context columns (a journey has a customer/
+booking reference; a Daily Ops run has an outlet/business date instead),
+so they're loaded via two separate queries rather than one SQL UNION
+across differently-shaped joins, and merged in Python.
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -48,13 +59,20 @@ _ROLE_LADDER = ("PC", "TL", "PM", "EXECUTIVE")
 _SEVERITY_RANK = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
 
 QueueScope = Literal["ALL", "MINE", "ESCALATED"]
+QueueSubjectKind = Literal["JOURNEY", "DAILY_OPS"]
 
 
 class QueueItem(BaseModel):
     flagId: UUID
-    journeyId: UUID
-    journeyReference: str | None
-    stage: str
+    subjectKind: QueueSubjectKind = "JOURNEY"
+    # JOURNEY subject only.
+    journeyId: UUID | None = None
+    journeyReference: str | None = None
+    stage: str | None = None
+    # DAILY_OPS subject only.
+    dailyOpsRunId: UUID | None = None
+    outletId: UUID | None = None
+    businessDate: date | None = None
     findingClass: str
     resolutionMode: str
     category: str | None
@@ -73,12 +91,13 @@ class QueueItem(BaseModel):
     overdue: bool
     isMine: bool
     permittedActions: list[str] = Field(default_factory=list)
-    # case context
-    customerName: str | None
+    # case context -- customer/product/booking are JOURNEY-only; dealerName/
+    # outletName are populated for both subjects.
+    customerName: str | None = None
     dealerName: str | None
     outletName: str | None
-    productLabel: str | None
-    bookingReference: str | None
+    productLabel: str | None = None
+    bookingReference: str | None = None
 
 
 class ReviewQueueResponse(BaseModel):
@@ -169,6 +188,7 @@ _QUEUE_SQL = """
     LEFT JOIN auditcore.bookings b
       ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
     WHERE f.tenant_id = :tenant_id
+      AND f.subject_kind = 'JOURNEY'
       AND f.finding_status IN ('OPEN','ACKNOWLEDGED')
       AND f.stage_code IN ('BOOKING','DELIVERY')
       AND EXISTS (
@@ -185,6 +205,110 @@ _QUEUE_SQL = """
               )
       )
 """
+
+_DAILY_OPS_QUEUE_SQL = """
+    SELECT
+        f.audit_finding_id, f.daily_ops_run_id, f.finding_type_code,
+        f.severity, f.finding_status, f.version_no, f.title, f.description,
+        f.rule_key, f.origin_kind, f.created_at_utc, f.finding_class,
+        f.owner_role_code, f.sla_due_at_utc, f.disposition,
+        dor.outlet_id, dor.business_date,
+        d.dealer_name,
+        o.outlet_name
+    FROM auditcore.audit_findings f
+    JOIN auditcore.daily_ops_runs dor
+      ON dor.tenant_id = f.tenant_id AND dor.daily_ops_run_id = f.daily_ops_run_id
+    JOIN auditcore.dealer_outlets o
+      ON o.tenant_id = dor.tenant_id AND o.outlet_id = dor.outlet_id
+    JOIN auditcore.dealers d
+      ON d.tenant_id = o.tenant_id AND d.dealer_id = o.dealer_id
+    WHERE f.tenant_id = :tenant_id
+      AND f.subject_kind = 'DAILY_OPS'
+      AND f.finding_status IN ('OPEN','ACKNOWLEDGED')
+      AND EXISTS (
+            SELECT 1 FROM auditcore.business_assignments ba
+            WHERE ba.tenant_id = o.tenant_id
+              AND ba.security_actor_id = :actor_id
+              AND ba.assignment_status = 'ACTIVE'
+              AND ba.effective_from <= now()
+              AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+              AND (
+                    ba.dealer_id IS NULL
+                    OR (ba.dealer_id = o.dealer_id
+                        AND (ba.outlet_id IS NULL OR ba.outlet_id = o.outlet_id))
+              )
+      )
+"""
+
+
+def _load_daily_ops_queue(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    actor_id: str,
+    roles: list[str],
+    policy,
+    now: datetime,
+    finding_class: str | None,
+) -> list[tuple[QueueItem, bool]]:
+    """Same shape as _load_queue, for Daily Ops run flags instead of journeys."""
+    rows = connection.execute(
+        text(_DAILY_OPS_QUEUE_SQL), {"tenant_id": tenant_id, "actor_id": actor_id}
+    ).mappings().all()
+    top_role = roles[-1] if roles else ""
+    out: list[tuple[QueueItem, bool]] = []
+
+    for row in rows:
+        cls = row["finding_class"] or classify_finding(row["rule_key"], row["finding_type_code"])
+        if finding_class and cls != finding_class:
+            continue
+
+        profile = class_profile(cls)
+        owner_role = row["owner_role_code"] or profile.owner_role
+        due_at = row["sla_due_at_utc"] or sla_due_at(
+            row["created_at_utc"], finding_class=cls, severity=row["severity"], policy=policy
+        )
+        level = escalation_level(due_at, now, policy)
+
+        seeing_roles = [r for r in roles if visible_to_role(owner_role, level, r)]
+        if not seeing_roles:
+            continue
+        is_mine = owner_role in roles
+        escalated_to_me = (not is_mine) and bool(seeing_roles)
+
+        item = QueueItem(
+            flagId=row["audit_finding_id"],
+            subjectKind="DAILY_OPS",
+            dailyOpsRunId=row["daily_ops_run_id"],
+            outletId=row["outlet_id"],
+            businessDate=row["business_date"],
+            findingClass=cls,
+            resolutionMode=profile.resolution_mode,
+            category=row["finding_type_code"],
+            severity=row["severity"],
+            status=row["finding_status"],
+            version=int(row["version_no"]),
+            title=row["title"],
+            description=row["description"],
+            ownerRoleCode=owner_role,
+            disposition=row["disposition"],
+            originKind=row["origin_kind"],
+            ruleKey=row["rule_key"],
+            createdAtUtc=row["created_at_utc"],
+            slaDueAtUtc=due_at,
+            escalationLevel=level,
+            overdue=now > due_at if due_at is not None else False,
+            isMine=is_mine,
+            permittedActions=permitted_actions(
+                finding_class=cls,
+                role=seeing_roles[-1] if seeing_roles else top_role,
+                finding_status=row["finding_status"],
+            ),
+            dealerName=row["dealer_name"],
+            outletName=row["outlet_name"],
+        )
+        out.append((item, escalated_to_me))
+    return out
 
 
 def _load_queue(
@@ -273,6 +397,7 @@ def _sort_key(item: QueueItem) -> tuple[Any, ...]:
 def get_review_queue(
     tenant_id: str,
     scope: Annotated[QueueScope, Query()] = "ALL",
+    subjectKind: Annotated[QueueSubjectKind, Query()] = "JOURNEY",
     findingClass: Annotated[str | None, Query()] = None,
     stage: Annotated[str | None, Query()] = None,
     human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)] = None,
@@ -287,16 +412,27 @@ def get_review_queue(
     roles = _actor_roles(connection, tenant_id=tenant_id, actor_id=human_principal.subject)
     policy = resolve_sla_policy(_first_policy_settings(connection, tenant_id))
 
-    loaded = _load_queue(
-        connection,
-        tenant_id=tenant_id,
-        actor_id=human_principal.subject,
-        roles=roles,
-        policy=policy,
-        now=now,
-        finding_class=(findingClass or "").upper() or None,
-        stage=(stage or "").upper() or None,
-    )
+    if subjectKind == "DAILY_OPS":
+        loaded = _load_daily_ops_queue(
+            connection,
+            tenant_id=tenant_id,
+            actor_id=human_principal.subject,
+            roles=roles,
+            policy=policy,
+            now=now,
+            finding_class=(findingClass or "").upper() or None,
+        )
+    else:
+        loaded = _load_queue(
+            connection,
+            tenant_id=tenant_id,
+            actor_id=human_principal.subject,
+            roles=roles,
+            policy=policy,
+            now=now,
+            finding_class=(findingClass or "").upper() or None,
+            stage=(stage or "").upper() or None,
+        )
     if scope == "MINE":
         loaded = [pair for pair in loaded if pair[0].isMine]
     elif scope == "ESCALATED":
@@ -309,6 +445,7 @@ def get_review_queue(
 @router.get("/review-queue/summary", response_model=ReviewQueueSummary)
 def get_review_queue_summary(
     tenant_id: str,
+    subjectKind: Annotated[QueueSubjectKind, Query()] = "JOURNEY",
     human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)] = None,
     authorization_client: Annotated[
         SecurityAuthorizationClient, Depends(get_security_authorization_client)
@@ -321,21 +458,28 @@ def get_review_queue_summary(
     roles = _actor_roles(connection, tenant_id=tenant_id, actor_id=human_principal.subject)
     policy = resolve_sla_policy(_first_policy_settings(connection, tenant_id))
 
-    loaded = _load_queue(
-        connection,
-        tenant_id=tenant_id,
-        actor_id=human_principal.subject,
-        roles=roles,
-        policy=policy,
-        now=now,
-        finding_class=None,
-        stage=None,
-    )
+    if subjectKind == "DAILY_OPS":
+        loaded = _load_daily_ops_queue(
+            connection, tenant_id=tenant_id, actor_id=human_principal.subject,
+            roles=roles, policy=policy, now=now, finding_class=None,
+        )
+    else:
+        loaded = _load_queue(
+            connection,
+            tenant_id=tenant_id,
+            actor_id=human_principal.subject,
+            roles=roles,
+            policy=policy,
+            now=now,
+            finding_class=None,
+            stage=None,
+        )
     by_class: dict[str, int] = {}
     by_stage: dict[str, int] = {}
     for item, _ in loaded:
         by_class[item.findingClass] = by_class.get(item.findingClass, 0) + 1
-        by_stage[item.stage] = by_stage.get(item.stage, 0) + 1
+        if item.stage:
+            by_stage[item.stage] = by_stage.get(item.stage, 0) + 1
     return ReviewQueueSummary(
         roles=roles,
         total=len(loaded),
