@@ -1063,6 +1063,22 @@ def _run_sync_booking_document_task(
         di_client = next(di_provider)
         with engine.begin() as connection:
             set_tenant_context(connection, tenant_id)
+            # _sync_booking_document's own per-journey advisory lock (see its
+            # docstring) makes concurrent documents for one journey queue
+            # instead of racing on the same evidence/journey_stage_states
+            # rows -- correct, but each document's turn now includes a DI
+            # network round trip, so a real upload batch (confirmed live at
+            # 15 Delivery documents) can genuinely take longer, queued, than
+            # the connection pool's 10s statement_timeout (dependencies.py,
+            # tuned for interactive HTTP requests). The result was the exact
+            # failure this lock was built to prevent in the first place:
+            # QueryCanceled: canceling statement due to statement timeout,
+            # this time on a document late in the queue's own evidence
+            # UPDATE. This background task has no HTTP client waiting on
+            # it, so give this one transaction (not the request-serving
+            # pool generally) real headroom instead of tightening the lock
+            # further.
+            connection.execute(text("SET LOCAL statement_timeout = '45s'"))
             _sync_booking_document(
                 connection,
                 tenant_id=tenant_id,
