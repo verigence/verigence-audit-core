@@ -81,6 +81,7 @@ from audit_core.uc03_capture_local_reads import (
 )
 from audit_core.uc03_create_booking import router as uc03_create_booking_router
 from audit_core.uc03_customer_mobile_pii import install_uc03_customer_mobile_pii
+from audit_core.uc03_daily_ops_flags import router as uc03_daily_ops_flags_router
 from audit_core.uc03_delivery_capture_v2 import (
     router as uc03_delivery_capture_v2_router,
 )
@@ -243,6 +244,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_delivery_documents_router)
     application.include_router(uc03_document_assessments_router)
     application.include_router(uc03_audit_router)
+    application.include_router(uc03_daily_ops_flags_router)
     application.include_router(uc03_review_queue_router)
     application.include_router(uc03_manual_verification_router)
     application.include_router(readiness_router)
