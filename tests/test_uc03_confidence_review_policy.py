@@ -112,6 +112,31 @@ def test_sync_booking_document_serializes_per_journey_with_an_advisory_lock() ->
     )
 
 
+def test_background_sync_task_gives_itself_headroom_past_the_pool_default_timeout() -> None:
+    # Regression: the per-journey advisory lock above (added specifically to
+    # stop QueryCanceled: canceling statement due to statement timeout) can
+    # still hit that exact same error once a real upload batch is large
+    # enough -- confirmed live at 15 Delivery documents -- because each
+    # document's turn under the lock now includes a DI network round trip,
+    # and the connection pool's statement_timeout (dependencies.py, 10s) is
+    # tuned for interactive HTTP requests, not a serialized background
+    # queue. This background task has no HTTP client waiting on it, so it
+    # must give its own transaction real headroom instead of inheriting the
+    # tight default.
+    source_file = inspect.getsourcefile(confidence_policy)
+    assert source_file is not None
+    with open(source_file) as f:
+        module_source = f.read()
+    start = module_source.index("\ndef _run_sync_booking_document_task(")
+    end = module_source.index("\ndef ", start + 1)
+    function_source = module_source[start:end]
+    assert "SET LOCAL statement_timeout" in function_source
+    assert (
+        function_source.index("SET LOCAL statement_timeout")
+        < function_source.index("_sync_booking_document(")
+    )
+
+
 def test_confirm_calls_attribute_resolution_directly_not_via_review_v2() -> None:
     # Regression test for a live production AttributeError: confirm_booking_
     # review_v2_confidence_policy used to call review_v2.apply_supported_
