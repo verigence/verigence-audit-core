@@ -22,6 +22,7 @@ from sqlalchemy import Connection, text
 from audit_core import uc03_booking_capture
 from audit_core import uc03_v2_review_materialization as booking_materialization
 from audit_core.uc03_attribute_mapping import spec_for_field
+from audit_core.uc03_delivery_commands import _machine_flag, _set_stage_flag_status
 from audit_core.uc03_document_registry import is_receipt_document_type
 from audit_core.uc03_invoice_materialization import materialize_reviewed_invoices
 from audit_core.uc03_payment_reconciliation import (
@@ -52,6 +53,13 @@ _RTO_CHALLAN_FIELDS = {
     "registration_district": "registration_district",
     "registration_type": "registration_type_code",
 }
+
+# financed_by (bank/institution name) is a common invoice-schema field, not
+# scoped to one document type -- any invoice can carry it. hp_charges_amount
+# (hypothecation charges) is RTO-Challan-specific, same reasoning as the
+# registration_state/district/territory/type fields above.
+_FINANCED_BY_FIELD_KEYS = ("financed_by",)
+_HP_CHARGES_FIELD_KEYS = ("hp_charges_amount",)
 
 _INSURANCE_FIELDS = {
     "insurer_name": "insurer_name",
@@ -370,6 +378,213 @@ def materialize_delivery_registration(
         1 for column in columns
         if values.get(column) is not None and (existing is None or existing[column] is None)
     )
+
+
+def materialize_delivery_finance(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    documents: list[Any],
+) -> int:
+    """Fill Finance tab facts from the explicit invoice financier field and
+    the RTO Challan's hypothecation charges.
+
+    A finance_records row is only created when a financier is actually
+    stated -- no invoice ever declares "this is a cash purchase", so absence
+    of financed_by is the correct signal for "presumed cash/outright
+    purchase" (see the Finance tab's own empty-state copy), not something to
+    default a row for.
+    """
+
+    provider_pair = _best_field(documents, _FINANCED_BY_FIELD_KEYS)
+    provider_name = _text(getattr(provider_pair[1], "value", None)) if provider_pair is not None else None
+    if provider_name is None:
+        return 0
+
+    hp_pair = _best_field(documents, _HP_CHARGES_FIELD_KEYS, document_types={_RTO_CHALLAN_DOCUMENT_TYPE})
+    financed_amount = None
+    if hp_pair is not None:
+        raw_amount = getattr(hp_pair[1], "value", None)
+        if _has_value(raw_amount):
+            financed_amount = uc03_booking_capture._as_decimal(raw_amount, "HP_CHARGES_AMOUNT")
+
+    values = {
+        "finance_type_code": "LOAN",
+        "provider_name": provider_name,
+        "financed_amount": financed_amount,
+    }
+    columns = ("finance_type_code", "provider_name", "financed_amount")
+
+    # finance_records has no (tenant_id, journey_id) uniqueness -- its own PC
+    # write path (payments_finance.put_finance) treats the latest row as "the"
+    # finance record for a journey rather than upserting on a key. Match that
+    # exact select-then-branch pattern instead of ON CONFLICT.
+    existing = connection.execute(
+        text(
+            """
+            SELECT finance_record_id, finance_type_code, provider_name, financed_amount,
+                   source_kind, source_evidence_id
+            FROM auditcore.finance_records
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            ORDER BY created_at_utc DESC, finance_record_id DESC
+            LIMIT 1
+            FOR UPDATE
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
+
+    merged = dict(values)
+    source_evidence_id: UUID | None = None
+    if existing is not None:
+        for column in columns:
+            merged[column] = existing[column] if existing[column] is not None else values[column]
+        source_evidence_id = existing["source_evidence_id"]
+    if source_evidence_id is None:
+        for pair in (provider_pair, hp_pair):
+            if pair is not None:
+                source_evidence_id = _source_evidence(pair[0])
+                if source_evidence_id is not None:
+                    break
+
+    if existing is not None and all(existing[column] == merged[column] for column in columns):
+        return 0
+
+    if existing is None:
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.finance_records (
+                    tenant_id, journey_id, finance_type_code, provider_name,
+                    financed_amount, source_kind, source_evidence_id
+                ) VALUES (
+                    :tenant_id, :journey_id, :finance_type_code, :provider_name,
+                    :financed_amount, 'EVIDENCE', :source_evidence_id
+                )
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                **merged,
+                "source_evidence_id": source_evidence_id,
+            },
+        )
+    else:
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.finance_records
+                SET finance_type_code=:finance_type_code,
+                    provider_name=:provider_name,
+                    financed_amount=:financed_amount,
+                    source_kind=COALESCE(source_kind, 'EVIDENCE'),
+                    source_evidence_id=COALESCE(source_evidence_id, :source_evidence_id),
+                    updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND finance_record_id=:finance_record_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "finance_record_id": existing["finance_record_id"],
+                **merged,
+                "source_evidence_id": source_evidence_id,
+            },
+        )
+    return sum(
+        1 for column in columns
+        if values.get(column) is not None and (existing is None or existing[column] is None)
+    )
+
+
+_FINANCE_HYPOTHECATION_FINDING_TYPE = "FINANCE_HYPOTHECATION_MISSING"
+_FINANCE_HYPOTHECATION_RULE_KEY = "FINANCE_HYPOTHECATION_MISSING"
+
+
+def sync_finance_hypothecation_findings(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    stage_code: str = "DELIVERY",
+    correlation_id: str = "",
+) -> dict[str, int]:
+    """Raise a finding when a financed deal has no hypothecation (HP) charges
+    on record; resolve it once one is captured or the deal turns out to be
+    cash after all.
+
+    Reads the same finance_records row materialize_delivery_finance keeps
+    current -- best-effort and idempotent, safe to call after every Delivery
+    review sync. Never raises.
+    """
+    try:
+        finance = connection.execute(
+            text(
+                """
+                SELECT finance_type_code, financed_amount
+                FROM auditcore.finance_records
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                ORDER BY created_at_utc DESC, finance_record_id DESC
+                LIMIT 1
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).mappings().one_or_none()
+    except Exception:  # noqa: BLE001 - producer must never break the caller
+        return {"raised": 0, "resolved": 0, "error": 1}
+
+    is_financed = finance is not None and bool(str(finance["finance_type_code"] or "").strip())
+    has_hp_charges = finance is not None and finance["financed_amount"] is not None and finance["financed_amount"] != 0
+    is_gap = is_financed and not has_hp_charges
+
+    if is_gap:
+        _machine_flag(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code=stage_code,
+            rule_key=_FINANCE_HYPOTHECATION_RULE_KEY,
+            finding_type=_FINANCE_HYPOTHECATION_FINDING_TYPE,
+            severity="MEDIUM",
+            title="Financed deal has no hypothecation charges on record",
+            description=(
+                "This deal is financed but no hypothecation (HP) charges amount "
+                "has been captured. HP charges are stated on the RTO Challan -- "
+                "upload it or confirm the amount if it is genuinely zero."
+            ),
+            correlation_id=correlation_id,
+            safe_payload={"financeTypeCode": finance["finance_type_code"]},
+        )
+        _set_stage_flag_status(connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage_code)
+        return {"raised": 1, "resolved": 0}
+
+    updated = connection.execute(
+        text(
+            """
+            UPDATE auditcore.audit_findings
+            SET finding_status = 'RESOLVED',
+                disposition = 'FIXED',
+                resolved_at_utc = now(),
+                updated_at_utc = now()
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+              AND stage_code = :stage_code
+              AND finding_type_code = :finding_type
+              AND rule_key = :rule_key
+              AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "stage_code": stage_code,
+            "finding_type": _FINANCE_HYPOTHECATION_FINDING_TYPE,
+            "rule_key": _FINANCE_HYPOTHECATION_RULE_KEY,
+        },
+    )
+    if updated.rowcount:
+        _set_stage_flag_status(connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage_code)
+    return {"raised": 0, "resolved": updated.rowcount}
 
 
 def materialize_delivery_insurance(
@@ -794,6 +1009,17 @@ def materialize_reviewed_delivery_business_values(
         journey_id=journey_id,
         documents=documents,
     )
+    finance_fields = materialize_delivery_finance(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        documents=documents,
+    )
+    finance_hypothecation = sync_finance_hypothecation_findings(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+    )
     insurance_fields = materialize_delivery_insurance(
         connection,
         tenant_id=tenant_id,
@@ -833,6 +1059,9 @@ def materialize_reviewed_delivery_business_values(
     result = {
         "vehicleFields": vehicle_fields,
         "registrationFields": registration_fields,
+        "financeFields": finance_fields,
+        "financeHypothecationRaised": finance_hypothecation["raised"],
+        "financeHypothecationResolved": finance_hypothecation["resolved"],
         "insuranceFields": insurance_fields,
         "invoicesMaterialized": invoices["invoices"],
         "invoiceCommercialLines": invoices["commercialLines"],
