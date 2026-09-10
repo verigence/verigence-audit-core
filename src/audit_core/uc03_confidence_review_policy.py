@@ -1088,13 +1088,11 @@ def _run_sync_booking_document_task(
         security_provider.close()
 
     # Async by construction, matching this pipeline's own philosophy: a
-    # document confirming is what should evaluate Booking checkpoint rules
-    # and the external rule-engine phase, not the PC remembering to click
-    # Confirm. schedule_booking_checkpoint_rules opens its own connection and
-    # runs only after the sync above has already committed, so it always
-    # evaluates the just-synced data, never a stale pre-commit snapshot.
-    # Booking-only for now (see uc03_booking_rule_trigger.py); Delivery has
-    # no equivalent checkpoint-rule set yet.
+    # document confirming is what should evaluate checkpoint rules, not the
+    # PC remembering to click Confirm/Submit. Each branch opens its own
+    # connection and runs only after the sync above has already committed,
+    # so it always evaluates the just-synced data, never a stale pre-commit
+    # snapshot.
     if stage_code == "BOOKING":
         try:
             schedule_booking_checkpoint_rules(
@@ -1107,6 +1105,35 @@ def _run_sync_booking_document_task(
         except Exception:
             logger.warning(
                 "uc03_booking_checkpoint_rule_schedule_failed",
+                tenant_id=tenant_id,
+                journey_id=str(journey_id),
+                document_id=str(document_id),
+                exc_info=True,
+            )
+    else:
+        # Previously Delivery's document-gap findings (DL_V2_REQUIRED_
+        # DOCUMENT_MISSING / DL_V2_DOCUMENT_PROCESSING_FAILED) were only ever
+        # evaluated once, at Submit -- uploading the missing document
+        # afterward never cleared the flag it was meant to resolve, since
+        # nothing re-ran the check. This is the Delivery-side equivalent of
+        # schedule_booking_checkpoint_rules above: cheap and idempotent (no
+        # external I/O), safe to call after every confirmed document.
+        try:
+            from audit_core.uc03_delivery_capture_v2 import (
+                schedule_delivery_document_checkpoint,
+            )
+
+            with engine.begin() as checkpoint_connection:
+                set_tenant_context(checkpoint_connection, tenant_id)
+                schedule_delivery_document_checkpoint(
+                    checkpoint_connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    correlation_id="",
+                )
+        except Exception:
+            logger.warning(
+                "uc03_delivery_checkpoint_schedule_failed",
                 tenant_id=tenant_id,
                 journey_id=str(journey_id),
                 document_id=str(document_id),

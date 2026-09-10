@@ -735,6 +735,145 @@ def _raise_delivery_capture_exceptions(
     return list(dict.fromkeys(flags))
 
 
+def _resolve_delivery_capture_exceptions(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    requirements: list[dict[str, Any]],
+    documents: list[dict[str, Any]],
+    correlation_id: str,
+) -> list[UUID]:
+    """Self-heal the two document-gap finding families _raise_delivery_capture_
+    exceptions raises: a DL_V2_REQUIRED_DOCUMENT_MISSING finding closes once its
+    requirement has an active classified document; a DL_V2_DOCUMENT_PROCESSING_
+    FAILED finding closes once that document is no longer in a terminal failure
+    state (retried successfully, replaced, or removed).
+
+    _raise_delivery_capture_exceptions was, until now, only ever called once --
+    at Submit. Nothing ever re-evaluated it afterward, so a document uploaded
+    later (via "Add more documents", or in direct response to the Audit Flag's
+    own "Upload document" action) never cleared the finding it was meant to
+    resolve, even though the real gap was gone. Mirrors _run_booking_rules'
+    resolve-if-not-flagged pattern (uc03_booking_rule_trigger.py).
+    """
+    from audit_core.uc03_manual_verification import _resolve_finding
+
+    resolved: list[UUID] = []
+    active_by_requirement = {
+        str(row["requirement_key"])
+        for row in documents
+        if row.get("requirement_key") and str(row.get("capture_status") or "").upper() == "CLASSIFIED"
+    }
+    for requirement in requirements:
+        if str(requirement.get("requirement_level") or "").upper() != "REQUIRED":
+            continue
+        if str(requirement.get("requirement_status") or "").upper() == "NOT_APPLICABLE":
+            continue
+        key = str(requirement["requirement_key"])
+        if key not in active_by_requirement:
+            continue
+        open_finding_id = connection.execute(
+            text(
+                """
+                SELECT audit_finding_id
+                FROM auditcore.audit_findings
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND rule_key=:rule_key AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "rule_key": f"DL_V2_REQUIRED_DOCUMENT_MISSING:{key}",
+            },
+        ).scalar_one_or_none()
+        if open_finding_id is None:
+            continue
+        _resolve_finding(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code="DELIVERY",
+            finding_id=open_finding_id,
+            actor_id=None,
+            correlation_id=correlation_id,
+            note="The configured mandatory document has since been uploaded and classified.",
+        )
+        resolved.append(open_finding_id)
+
+    failing_document_ids = {
+        str(row["di_document_id"])
+        for row in documents
+        if str(row.get("capture_status") or "").upper() in _TERMINAL_FAILURE_STATES
+    }
+    open_processing_findings = connection.execute(
+        text(
+            """
+            SELECT audit_finding_id, rule_key
+            FROM auditcore.audit_findings
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND rule_key LIKE 'DL_V2_DOCUMENT_PROCESSING_FAILED:%'
+              AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    for row in open_processing_findings:
+        document_id = str(row["rule_key"]).split(":", 1)[1]
+        if document_id in failing_document_ids:
+            continue
+        _resolve_finding(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code="DELIVERY",
+            finding_id=row["audit_finding_id"],
+            actor_id=None,
+            correlation_id=correlation_id,
+            note="The document no longer requires follow-up.",
+        )
+        resolved.append(row["audit_finding_id"])
+    return resolved
+
+
+def schedule_delivery_document_checkpoint(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    correlation_id: str,
+) -> tuple[list[UUID], list[UUID]]:
+    """Re-evaluate Delivery's document-gap findings against current durable
+    state: raise DL_V2_REQUIRED_DOCUMENT_MISSING / DL_V2_DOCUMENT_PROCESSING_
+    FAILED for whatever is still missing/failing, and resolve any that have
+    since cleared. Cheap and idempotent (no external I/O; every write goes
+    through _machine_flag / _resolve_finding's own status-guarded UPDATEs),
+    so calling it once per confirmed document -- the same trigger Booking's
+    schedule_booking_checkpoint_rules uses -- costs nothing extra when
+    nothing changed. Returns (raised_finding_ids, resolved_finding_ids).
+    """
+    requirements = _delivery_requirements(connection, tenant_id, journey_id)
+    documents = _linked_delivery_documents(connection, tenant_id, journey_id)
+    raised = _raise_delivery_capture_exceptions(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        requirements=requirements,
+        documents=documents,
+        correlation_id=correlation_id,
+    )
+    resolved = _resolve_delivery_capture_exceptions(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        requirements=requirements,
+        documents=documents,
+        correlation_id=correlation_id,
+    )
+    return raised, resolved
+
+
 @router.post("/submit", response_model=DeliveryCaptureV2SubmissionResponse)
 def submit_delivery_capture_v2(
     tenant_id: str,
@@ -757,16 +896,18 @@ def submit_delivery_capture_v2(
     def execute() -> dict[str, Any]:
         refreshed = _delivery_state(connection, tenant_id=tenant_id, journey_id=journey_id)
         aggregate_version = int(refreshed["version_no"])
-        requirements = _delivery_requirements(connection, tenant_id, journey_id)
-        documents = _linked_delivery_documents(connection, tenant_id, journey_id)
-        flags = _raise_delivery_capture_exceptions(
+        # Safety net, same role Submit plays for document sync itself: the
+        # async per-document trigger (schedule_delivery_document_checkpoint,
+        # called from the DI webhook) already keeps these findings current,
+        # but Submit re-evaluates once more here in case anything hasn't
+        # landed yet.
+        flags, _resolved = schedule_delivery_document_checkpoint(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
-            requirements=requirements,
-            documents=documents,
             correlation_id=correlation_id,
         )
+        documents = _linked_delivery_documents(connection, tenant_id, journey_id)
         connection.execute(
             text(
                 """
