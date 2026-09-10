@@ -75,12 +75,17 @@ _AUDIT_SERVICE_AUDIENCE = "audit"
 # rather than the newest superseding the last. Delivery's payment-receipt
 # requirement (0017/0022) needs the same treatment as Booking's now that this
 # callback handles both process areas; the bank-statement requirement
-# (0070) is repeatable for the same reason on both stages.
+# (0070) is repeatable for the same reason on both stages. The scrappage
+# certificate requirement (0078) is repeatable too -- a journey can hold both
+# the original Certificate of Deposit and a Transfer Certificate of Deposit
+# recording its resale as two separate documents.
 _REPEATABLE_REQUIREMENT_KEYS = {
     "booking_payment_receipt",
     "payment_receipt",
     "booking_bank_statement",
     "delivery_bank_statement",
+    "booking_scrappage_certificate",
+    "delivery_scrappage_certificate",
 }
 
 

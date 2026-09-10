@@ -1178,8 +1178,18 @@ def materialize_reviewed_di_business_values(
         materialize_reviewed_bank_statements,
         reconcile_payments,
     )
+    from audit_core.uc03_scrappage_certificate_materialization import (
+        materialize_reviewed_scrappage_certificates,
+    )
 
     invoices = materialize_reviewed_invoices(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        documents=documents,
+        actor_id=actor_id,
+    )
+    scrappage_certificates = materialize_reviewed_scrappage_certificates(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
@@ -1202,6 +1212,7 @@ def materialize_reviewed_di_business_values(
         "invoicesMaterialized": invoices["invoices"],
         "invoiceCommercialLines": invoices["commercialLines"],
         "invoiceDiscountApplications": invoices["discountApplications"],
+        "scrappageCertificatesMaterialized": scrappage_certificates,
         "bankStatementLines": bank_lines,
         "paymentReconciliation": reconciliation,
         "identityDocuments": identities,

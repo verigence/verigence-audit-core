@@ -10,6 +10,7 @@ from audit_core.uc03_journey_overview_projection import (
     _receipts,
     _reviewed_booking_projection,
     _reviewed_legal_name,
+    _scrappage_certificates,
 )
 from audit_core.uc03_journey_overview_projection import (
     router as projection_router,
@@ -218,6 +219,97 @@ def test_invoices_handles_a_document_with_no_source_document_id() -> None:
     result = _invoices(connection, tenant_id="tenant-a", journey_id=uuid4())
     assert result[0]["documentId"] is None
     assert result[0]["invoiceNature"] == "CREDIT_NOTE"
+
+
+def test_scrappage_certificates_projects_old_vehicle_details_with_stringified_ids() -> None:
+    document_id = uuid4()
+    row_id = uuid4()
+    connection = _ScriptedConnection(
+        [
+            {
+                "scrappageCertificateReviewValueId": row_id,
+                "documentId": document_id,
+                "certificateVariant": "ORIGINAL",
+                "certificateNumber": "COD202608000DL7C5573",
+                "oldVehicleRegistrationNumber": "DL7C5573",
+                "oldVehicleMake": "MARUTI SUZUKI INDIA LTD",
+                "oldVehicleModel": "M800",
+                "oldVehicleCategory": "LMV",
+                "oldVehicleType": "Non - Transport",
+                "oldVehicleFuelType": "PETROL",
+                "oldVehicleCubicCapacity": 800,
+                "oldVehicleSeatingCapacity": 4,
+                "oldVehicleYearOfManufacturing": "1996",
+                "oldVehicleUnladenWeightKg": 620,
+                "oldVehicleNumberOfCylinders": 3,
+                "oldVehicleGrossVehicleWeightKg": 0,
+                "oldVehicleWheelbaseMm": None,
+                "originalOwnerName": None,
+                "currentHolderName": "IMRAN KHAN",
+                "currentHolderMobile": None,
+                "currentHolderPan": None,
+                "tradeDate": None,
+                "tradeNumber": None,
+                "certificateIssueDate": "2026-08-11",
+                "certificateValidUntilDate": "2029-08-10",
+                "scrappingFacilityName": "YGA STAR AUTO SCRAPPING CENTRE PRIVATE LIMITED",
+                "rvsfRegistrationNumber": None,
+                "stateOfScrapping": "UTTAR PRADESH",
+                "reviewedAtUtc": None,
+            },
+        ],
+    )
+    result = _scrappage_certificates(connection, tenant_id="tenant-a", journey_id=uuid4())
+    assert len(result) == 1
+    assert result[0]["scrappageCertificateReviewValueId"] == str(row_id)
+    assert result[0]["documentId"] == str(document_id)
+    assert result[0]["certificateVariant"] == "ORIGINAL"
+    assert result[0]["oldVehicleRegistrationNumber"] == "DL7C5573"
+    assert result[0]["oldVehicleMake"] == "MARUTI SUZUKI INDIA LTD"
+    assert result[0]["currentHolderName"] == "IMRAN KHAN"
+
+
+def test_scrappage_certificates_handles_a_document_with_no_source_document_id() -> None:
+    connection = _ScriptedConnection(
+        [
+            {
+                "scrappageCertificateReviewValueId": uuid4(),
+                "documentId": None,
+                "certificateVariant": "TRANSFERRED",
+                "certificateNumber": "COD202608000DL7C5573",
+                "oldVehicleRegistrationNumber": "DL7C5573",
+                "oldVehicleMake": None,
+                "oldVehicleModel": None,
+                "oldVehicleCategory": None,
+                "oldVehicleType": None,
+                "oldVehicleFuelType": None,
+                "oldVehicleCubicCapacity": None,
+                "oldVehicleSeatingCapacity": None,
+                "oldVehicleYearOfManufacturing": None,
+                "oldVehicleUnladenWeightKg": None,
+                "oldVehicleNumberOfCylinders": None,
+                "oldVehicleGrossVehicleWeightKg": None,
+                "oldVehicleWheelbaseMm": None,
+                "originalOwnerName": "IMRAN KHAN",
+                "currentHolderName": "SANJAYA KUMAR MOHANTY",
+                "currentHolderMobile": "******9204",
+                "currentHolderPan": "******582C",
+                "tradeDate": "2026-08-13",
+                "tradeNumber": "33130826332229771262",
+                "certificateIssueDate": None,
+                "certificateValidUntilDate": None,
+                "scrappingFacilityName": None,
+                "rvsfRegistrationNumber": None,
+                "stateOfScrapping": None,
+                "reviewedAtUtc": None,
+            },
+        ],
+    )
+    result = _scrappage_certificates(connection, tenant_id="tenant-a", journey_id=uuid4())
+    assert result[0]["documentId"] is None
+    assert result[0]["certificateVariant"] == "TRANSFERRED"
+    assert result[0]["originalOwnerName"] == "IMRAN KHAN"
+    assert result[0]["currentHolderName"] == "SANJAYA KUMAR MOHANTY"
 
 
 def test_receipts_keep_every_reviewed_receipt_and_pending_capture_distinct() -> None:

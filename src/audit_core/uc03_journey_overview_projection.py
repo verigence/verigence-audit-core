@@ -39,6 +39,7 @@ class JourneyOverviewProjectionResponse(legacy.JourneyOverviewResponse):
     skuPricing: dict[str, Any] | None = Field(default=None)
     bankStatementLines: list[dict[str, Any]] = Field(default_factory=list)
     invoices: list[dict[str, Any]] = Field(default_factory=list)
+    scrappageCertificates: list[dict[str, Any]] = Field(default_factory=list)
 
 
 _BOOKING_REVIEW_FIELDS = (
@@ -485,6 +486,65 @@ def _invoices(
     for row in rows:
         item = dict(row)
         item["invoiceReviewValueId"] = str(item["invoiceReviewValueId"])
+        if item.get("documentId") is not None:
+            item["documentId"] = str(item["documentId"])
+        out.append(item)
+    return out
+
+
+def _scrappage_certificates(
+    connection: Connection, *, tenant_id: str, journey_id: UUID
+) -> list[dict[str, Any]]:
+    """Every reviewed Vehicle Scrappage Certificate of Deposit on this
+    journey -- one row per document, since a journey can hold both the
+    original Certificate of Deposit and a Transfer Certificate of Deposit
+    recording its resale. Feeds the old-vehicle/scrappage evidence a
+    PC/TL needs to verify the Booking Form's own scrappage_discount_amount.
+    """
+    rows = connection.execute(
+        text(
+            """
+            SELECT
+                scrappage_certificate_review_value_id AS "scrappageCertificateReviewValueId",
+                source_di_document_id                 AS "documentId",
+                certificate_variant                   AS "certificateVariant",
+                certificate_number                    AS "certificateNumber",
+                old_vehicle_registration_number       AS "oldVehicleRegistrationNumber",
+                old_vehicle_make                      AS "oldVehicleMake",
+                old_vehicle_model                      AS "oldVehicleModel",
+                old_vehicle_category                  AS "oldVehicleCategory",
+                old_vehicle_type                       AS "oldVehicleType",
+                old_vehicle_fuel_type                  AS "oldVehicleFuelType",
+                old_vehicle_cubic_capacity             AS "oldVehicleCubicCapacity",
+                old_vehicle_seating_capacity           AS "oldVehicleSeatingCapacity",
+                old_vehicle_year_of_manufacturing      AS "oldVehicleYearOfManufacturing",
+                old_vehicle_unladen_weight_kg          AS "oldVehicleUnladenWeightKg",
+                old_vehicle_number_of_cylinders        AS "oldVehicleNumberOfCylinders",
+                old_vehicle_gross_vehicle_weight_kg    AS "oldVehicleGrossVehicleWeightKg",
+                old_vehicle_wheelbase_mm               AS "oldVehicleWheelbaseMm",
+                original_owner_name                    AS "originalOwnerName",
+                current_holder_name                    AS "currentHolderName",
+                current_holder_mobile                  AS "currentHolderMobile",
+                current_holder_pan                     AS "currentHolderPan",
+                trade_date                             AS "tradeDate",
+                trade_number                           AS "tradeNumber",
+                certificate_issue_date                 AS "certificateIssueDate",
+                certificate_valid_until_date           AS "certificateValidUntilDate",
+                scrapping_facility_name                AS "scrappingFacilityName",
+                rvsf_registration_number               AS "rvsfRegistrationNumber",
+                state_of_scrapping                     AS "stateOfScrapping",
+                reviewed_at_utc                        AS "reviewedAtUtc"
+            FROM auditcore.scrappage_certificate_review_values
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            ORDER BY reviewed_at_utc, scrappage_certificate_review_value_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["scrappageCertificateReviewValueId"] = str(item["scrappageCertificateReviewValueId"])
         if item.get("documentId") is not None:
             item["documentId"] = str(item["documentId"])
         out.append(item)
@@ -945,6 +1005,11 @@ def get_journey_overview_projection(
         journey_id=journey_id,
     )
     data["invoices"] = _invoices(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+    )
+    data["scrappageCertificates"] = _scrappage_certificates(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,

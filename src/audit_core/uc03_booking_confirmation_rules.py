@@ -55,14 +55,22 @@ _FINDING_TYPE_DOCUMENT_EXCEPTION = "DOCUMENT_EXCEPTION"
 _FINDING_TYPE_COMMERCIAL_EXCEPTION = "COMMERCIAL_EXCEPTION"
 
 # discount field on the Booking Form -> the document type that must be on file.
-# Scrappage has no registered, classifiable document type in DI yet -- see the
-# module docstring for _scrappage_documents_present's own commentary -- so it
-# always raises rather than checking presence.
+# scrappage_discount_amount used to be a special case here (DI had no
+# registered, classifiable document type for scrappage evidence, so it always
+# raised BK_SCRAPPAGE_DOCUMENT_UNCLASSIFIED unconditionally instead of
+# checking presence) -- verigence-di now has scrappage_certificate_of_deposit
+# (Certificate of Deposit / Transfer Certificate of Deposit), so it folds
+# into the same self-healing presence check as the other two.
 _DISCOUNT_EVIDENCE: dict[str, tuple[str, str]] = {
     "corporate_discount_amount": ("corporate_discount", "corporate_id"),
     "exchange_discount_amount": ("exchange_bonus", "vehicle_rc"),
+    "scrappage_discount_amount": ("scrappage_discount", "scrappage_certificate_of_deposit"),
 }
-_SCRAPPAGE_FIELD_KEY = "scrappage_discount_amount"
+# Retired rule_key from when scrappage always raised unconditionally (see
+# above) -- resolved unconditionally below so a journey flagged before this
+# document type existed doesn't carry a permanently-open, now-meaningless
+# finding once its Booking Form is re-confirmed for any reason.
+_RETIRED_SCRAPPAGE_UNCLASSIFIED_RULE_KEY = "BK_SCRAPPAGE_DOCUMENT_UNCLASSIFIED"
 
 
 def _confidence_percent(row: dict[str, Any]) -> float | None:
@@ -110,7 +118,7 @@ def _extracted_date(row: dict[str, Any] | None) -> date | None:
 def _booking_form_fields(
     connection: Connection, *, tenant_id: str, journey_id: UUID, document_id: UUID
 ) -> dict[str, dict[str, Any]]:
-    field_keys = (*_DISCOUNT_EVIDENCE.keys(), _SCRAPPAGE_FIELD_KEY, "booking_date")
+    field_keys = (*_DISCOUNT_EVIDENCE.keys(), "booking_date")
     rows = connection.execute(
         text(
             """
@@ -238,36 +246,17 @@ def record_booking_form_intimation_and_discount_evidence(
             blocking_completion=False,
         )
 
-    # Scrappage has no registered, classifiable document type in DI yet, so
-    # presence can never be verified -- this always raises when the amount is
-    # present and stays open until a PC/TL clears it by hand. Deliberately
-    # not self-healing like the two checks above.
-    scrappage_amount = _extracted_amount(fields.get(_SCRAPPAGE_FIELD_KEY))
-    if scrappage_amount is not None:
-        _machine_flag(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            stage_code="BOOKING",
-            rule_key="BK_SCRAPPAGE_DOCUMENT_UNCLASSIFIED",
-            finding_type=_FINDING_TYPE_DOCUMENT_EXCEPTION,
-            severity="HIGH",
-            title="Scrappage Documents evidence is missing",
-            description=(
-                f"The Booking Form shows a scrappage discount/bonus of "
-                f"₹{scrappage_amount:,.2f}. Scrappage evidence has no dedicated "
-                "document type in Verigence yet, so it cannot be verified "
-                "automatically -- confirm the scrappage certificate is on file."
-            ),
-            correlation_id=correlation_id,
-            safe_payload={
-                "trigger": "BOOKING_FORM_CONFIRMED",
-                "discountField": _SCRAPPAGE_FIELD_KEY,
-                "amount": str(scrappage_amount),
-                "requiredDocumentType": None,
-            },
-            blocking_completion=False,
-        )
+    # scrappage_discount_amount is now handled by the loop above like any
+    # other discount evidence. Resolve the retired unconditional-raise finding
+    # so a journey flagged before scrappage_certificate_of_deposit existed
+    # doesn't carry a permanently-open, now-meaningless finding forever.
+    _resolve_if_open(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        rule_key=_RETIRED_SCRAPPAGE_UNCLASSIFIED_RULE_KEY,
+        correlation_id=correlation_id,
+    )
 
 
 def _resolve_if_open(
