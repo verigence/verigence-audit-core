@@ -449,19 +449,19 @@ def create_delivery_upload_intents_v2(
     di_client: Annotated[DiClient, Depends(get_di_client)],
     v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
 ) -> UploadIntentResponse:
-    state = _authorize_delivery(
+    # Documents legitimately keep arriving after the PC has moved on to
+    # Delivery Details -- a late invoice, a corrected receipt -- and nothing
+    # about accepting one more upload conflicts with a submission that
+    # already happened (each document syncs/materializes independently).
+    # Only deleting already-submitted evidence stays locked (see
+    # delete_delivery_document_v2), not adding to it.
+    _authorize_delivery(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
     )
-    if state.get("capture_completed_at_utc") is not None:
-        raise ConflictError(
-            error_code="VAC-CONFLICT-004",
-            title="Delivery document submission is complete",
-            detail="Delivery documents have already been submitted for review.",
-        )
     requirements = _delivery_requirements(connection, tenant_id, journey_id)
     context_ref, token = _ensure_di_context(
         connection=connection,
@@ -550,19 +550,15 @@ def finalize_delivery_document_v2(
     di_client: Annotated[DiClient, Depends(get_di_client)],
     v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
 ) -> FinalizeResponse:
-    state = _authorize_delivery(
+    # See create_delivery_upload_intents_v2 -- adding a document after
+    # submission is allowed; only deleting one is locked.
+    _authorize_delivery(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
     )
-    if state.get("capture_completed_at_utc") is not None:
-        raise ConflictError(
-            error_code="VAC-CONFLICT-004",
-            title="Delivery document submission is complete",
-            detail="Delivery documents have already been submitted for review.",
-        )
     exists = connection.execute(
         text(
             """

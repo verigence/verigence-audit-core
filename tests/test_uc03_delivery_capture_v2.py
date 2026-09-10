@@ -4,6 +4,9 @@ from uuid import uuid4
 from audit_core.uc03_delivery_capture_v2 import (
     _build_delivery_capture_response,
     _resyncable_document_ids,
+    create_delivery_upload_intents_v2,
+    delete_delivery_document_v2,
+    finalize_delivery_document_v2,
     resync_delivery_capture_v2,
 )
 
@@ -122,3 +125,21 @@ def test_resync_endpoint_queues_one_background_task_per_resyncable_document() ->
     assert "_resyncable_document_ids(" in source
     assert "background_tasks.add_task(" in source
     assert "_run_sync_booking_document_task" in source
+
+
+def test_uploading_and_finalizing_after_submission_is_allowed_but_delete_stays_locked() -> None:
+    # Documents legitimately keep arriving after the PC has moved on to
+    # Delivery Details (a late invoice, a corrected receipt) -- confirmed
+    # live need. Only deleting already-submitted evidence should stay
+    # locked. Source-inspected for the same reason as the resync endpoint
+    # above: exercising the full routes needs infrastructure this file's
+    # other tests don't set up; what matters is that the submission-complete
+    # conflict check is gone from the two write paths that add evidence, and
+    # still present on the one that removes it.
+    upload_source = inspect.getsource(create_delivery_upload_intents_v2)
+    finalize_source = inspect.getsource(finalize_delivery_document_v2)
+    delete_source = inspect.getsource(delete_delivery_document_v2)
+
+    assert "capture_completed_at_utc" not in upload_source
+    assert "capture_completed_at_utc" not in finalize_source
+    assert "capture_completed_at_utc" in delete_source
