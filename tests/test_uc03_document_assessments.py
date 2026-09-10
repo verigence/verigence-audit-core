@@ -393,13 +393,14 @@ def test_booking_start_snapshots_profile_requirements(booking_document_setup) ->
     assert listed.status_code == 200, listed.text
     by_key = {item["requirementKey"]: item for item in listed.json()}
     # booking_bank_statement (0070), booking_credit_note and
-    # booking_gst_declaration (0073) are unconditionally added by the Booking
-    # snapshot trigger to every Booking regardless of profile -- none are
-    # checklist items (no document_requirement_item_id), so they don't affect
-    # the applicability/answer assertions below or audit completion.
+    # booking_gst_declaration (0073), and booking_scrappage_certificate
+    # (0078) are unconditionally added by the Booking snapshot trigger to
+    # every Booking regardless of profile -- none are checklist items (no
+    # document_requirement_item_id), so they don't affect the applicability/
+    # answer assertions below or audit completion.
     assert set(by_key) == {
         "BOOKING_DOCKET", "TRADE_IN_RC", "booking_bank_statement",
-        "booking_credit_note", "booking_gst_declaration",
+        "booking_credit_note", "booking_gst_declaration", "booking_scrappage_certificate",
     }
     assert by_key["BOOKING_DOCKET"]["applicabilityState"] == "APPLICABLE"
     assert by_key["BOOKING_DOCKET"]["answer"] == "UNANSWERED"

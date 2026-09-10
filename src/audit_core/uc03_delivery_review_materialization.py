@@ -29,6 +29,9 @@ from audit_core.uc03_payment_reconciliation import (
     materialize_reviewed_bank_statements,
     reconcile_payments,
 )
+from audit_core.uc03_scrappage_certificate_materialization import (
+    materialize_reviewed_scrappage_certificates,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1033,6 +1036,13 @@ def materialize_reviewed_delivery_business_values(
         documents=documents,
         actor_id=actor_id,
     )
+    scrappage_certificates = materialize_reviewed_scrappage_certificates(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        documents=documents,
+        actor_id=actor_id,
+    )
     commercial_lines = materialize_delivery_commercial_lines(
         connection,
         tenant_id=tenant_id,
@@ -1066,6 +1076,7 @@ def materialize_reviewed_delivery_business_values(
         "invoicesMaterialized": invoices["invoices"],
         "invoiceCommercialLines": invoices["commercialLines"],
         "invoiceDiscountApplications": invoices["discountApplications"],
+        "scrappageCertificatesMaterialized": scrappage_certificates,
         "commercialLines": commercial_lines,
         "bankStatementLines": bank_lines,
         "paymentReconciliation": reconciliation,

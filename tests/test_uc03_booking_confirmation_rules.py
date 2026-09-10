@@ -213,18 +213,23 @@ def test_booking_form_discount_evidence_and_intimation_date() -> None:
     rule_keys = {row["rule_key"] for row in findings}
     assert "BK_DISCOUNT_EVIDENCE_MISSING:corporate_discount" in rule_keys
     assert "BK_DISCOUNT_EVIDENCE_MISSING:exchange_bonus" in rule_keys
-    assert "BK_SCRAPPAGE_DOCUMENT_UNCLASSIFIED" in rule_keys
+    assert "BK_DISCOUNT_EVIDENCE_MISSING:scrappage_discount" in rule_keys
     for row in findings:
         assert row["severity"] == "HIGH"
         assert row["finding_status"] == "OPEN"
 
-    # Corporate ID now arrives: the corporate-discount finding self-heals;
-    # the other two (no vehicle_rc, and scrappage's permanent gap) stay open.
+    # Corporate ID and a Scrappage Certificate of Deposit now arrive: both
+    # self-heal; exchange (no vehicle_rc ever linked) stays open.
     corporate_id_doc = _link_evidence(
         engine, tenant_id=tenant_id, journey_id=journey_id, customer_id=customer_id,
         document_type_key="corporate_id",
     )
     di_client.add(_confirmed_document(corporate_id_doc, "corporate_id"), [])
+    scrappage_certificate_doc = _link_evidence(
+        engine, tenant_id=tenant_id, journey_id=journey_id, customer_id=customer_id,
+        document_type_key="scrappage_certificate_of_deposit",
+    )
+    di_client.add(_confirmed_document(scrappage_certificate_doc, "scrappage_certificate_of_deposit"), [])
     with engine.begin() as connection:
         confidence_policy._sync_booking_document(
             connection,
@@ -259,7 +264,7 @@ def test_booking_form_discount_evidence_and_intimation_date() -> None:
     status_by_key = {row["rule_key"]: row["finding_status"] for row in findings}
     assert status_by_key["BK_DISCOUNT_EVIDENCE_MISSING:corporate_discount"] == "RESOLVED"
     assert status_by_key["BK_DISCOUNT_EVIDENCE_MISSING:exchange_bonus"] == "OPEN"
-    assert status_by_key["BK_SCRAPPAGE_DOCUMENT_UNCLASSIFIED"] == "OPEN"
+    assert status_by_key["BK_DISCOUNT_EVIDENCE_MISSING:scrappage_discount"] == "RESOLVED"
 
     engine.dispose()
 

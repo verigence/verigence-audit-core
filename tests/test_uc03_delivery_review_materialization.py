@@ -305,6 +305,9 @@ def test_delivery_business_materializer_calls_all_canonical_projections(monkeypa
     assert result["insuranceFields"] == 3
     assert result["commercialLines"] == 4
     assert result["receiptPaymentsCreated"] == 1
+    # Not monkeypatched -- runs for real against documents=[] and returns 0
+    # without touching the (dummy) connection, same as invoices/bank lines.
+    assert result["scrappageCertificatesMaterialized"] == 0
 
 
 def test_delivery_review_materializes_before_marking_stage_verified() -> None:
