@@ -12,6 +12,7 @@ Delivery status/timestamps. Unsupported DI fields remain available losslessly un
 an explicit typed owner is added.
 """
 
+import json
 import logging
 from typing import Any
 from uuid import UUID
@@ -41,12 +42,29 @@ _CHASSIS_FIELD_KEYS = ("chassis_number", "chassis_no")
 _INVOICE_REFERENCE_FIELD_KEYS = ("invoice_reference", "invoice_number", "dms_invoice_number")
 _DMS_REFERENCE_FIELD_KEYS = ("dms_reference",)
 _REGISTRATION_FIELD_KEYS = ("registration_number", "insured_vehicle_reg")
+_RTO_CHALLAN_DOCUMENT_TYPE = "rto_challan"
+# registration_state/territory/district/type are only meaningful coming from
+# an actual RTO Challan -- unlike registration_number, no other document type
+# carries a truthful value for these.
+_RTO_CHALLAN_FIELDS = {
+    "registration_state": "registration_state",
+    "registration_territory": "registration_territory",
+    "registration_district": "registration_district",
+    "registration_type": "registration_type_code",
+}
 
 _INSURANCE_FIELDS = {
     "insurer_name": "insurer_name",
     "policy_number": "policy_reference",
     "premium_amount": "actual_premium_amount",
+    "agent_intermediary_name": "agent_intermediary_name",
+    "agent_intermediary_code": "agent_intermediary_code",
+    "misp_code": "misp_code",
 }
+_INSURANCE_MERGE_COLUMNS = (
+    "insurer_name", "policy_reference", "actual_premium_amount",
+    "agent_intermediary_name", "agent_intermediary_code", "misp_code",
+)
 
 _VEHICLE_SOURCE_PRIORITY = (
     "customer_invoice_dms",
@@ -241,20 +259,47 @@ def materialize_delivery_registration(
     journey_id: UUID,
     documents: list[Any],
 ) -> int:
-    """Fill a missing registration number from explicit reviewed Delivery fields."""
+    """Fill missing registration facts from explicit reviewed Delivery fields.
 
-    selected = _best_field(documents, _REGISTRATION_FIELD_KEYS)
-    if selected is None:
-        return 0
-    document, field = selected
-    registration_number = _text(getattr(field, "value", None))
-    if registration_number is None:
+    registration_number can come from any document that carries a truthful
+    vehicle registration (RTO Challan, Delivery Order Cover). State/
+    Territory/District/Type are only ever truthful on an actual RTO Challan
+    -- confirmed live: DI extracts all four from the Challan (rto_challan.py),
+    but only registration_number was ever wired into this table, leaving the
+    PC to type State/District in by hand even when the document already
+    states them.
+    """
+
+    values: dict[str, Any] = {}
+    document_for_field: dict[str, Any] = {}
+
+    number_selected = _best_field(documents, _REGISTRATION_FIELD_KEYS)
+    if number_selected is not None:
+        document, field = number_selected
+        registration_number = _text(getattr(field, "value", None))
+        if registration_number is not None:
+            values["registration_number"] = registration_number
+            document_for_field["registration_number"] = document
+
+    for source, destination in _RTO_CHALLAN_FIELDS.items():
+        selected = _best_field(documents, (source,), document_types={_RTO_CHALLAN_DOCUMENT_TYPE})
+        if selected is None:
+            continue
+        document, field = selected
+        text_value = _text(getattr(field, "value", None))
+        if text_value is not None:
+            values[destination] = text_value
+            document_for_field[destination] = document
+
+    if not values:
         return 0
 
     existing = connection.execute(
         text(
             """
-            SELECT registration_number
+            SELECT registration_number, registration_state, registration_territory,
+                   registration_district, registration_type_code,
+                   source_kind, source_evidence_id
             FROM auditcore.registration_records
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
             FOR UPDATE
@@ -262,24 +307,46 @@ def materialize_delivery_registration(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().one_or_none()
-    if existing is not None and existing["registration_number"]:
+
+    columns = (
+        "registration_number", "registration_state", "registration_territory",
+        "registration_district", "registration_type_code",
+    )
+    merged: dict[str, Any] = {column: values.get(column) for column in columns}
+    source_evidence_id: UUID | None = None
+    if existing is not None:
+        for column in columns:
+            merged[column] = existing[column] if existing[column] is not None else merged[column]
+        source_evidence_id = existing["source_evidence_id"]
+    if source_evidence_id is None:
+        for column in columns:
+            document = document_for_field.get(column)
+            if document is not None:
+                source_evidence_id = _source_evidence(document)
+                if source_evidence_id is not None:
+                    break
+
+    if existing is not None and all(existing[column] == merged[column] for column in columns):
         return 0
 
     connection.execute(
         text(
             """
             INSERT INTO auditcore.registration_records (
-                tenant_id, journey_id, registration_number,
+                tenant_id, journey_id, registration_number, registration_state,
+                registration_territory, registration_district, registration_type_code,
                 source_kind, source_evidence_id
             ) VALUES (
-                :tenant_id, :journey_id, :registration_number,
+                :tenant_id, :journey_id, :registration_number, :registration_state,
+                :registration_territory, :registration_district, :registration_type_code,
                 'EVIDENCE', :source_evidence_id
             )
             ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
-                registration_number=COALESCE(
-                    auditcore.registration_records.registration_number,
-                    EXCLUDED.registration_number
-                ),
+                registration_number=EXCLUDED.registration_number,
+                registration_state=EXCLUDED.registration_state,
+                registration_territory=EXCLUDED.registration_territory,
+                registration_district=EXCLUDED.registration_district,
+                registration_type_code=EXCLUDED.registration_type_code,
                 source_kind=COALESCE(
                     auditcore.registration_records.source_kind,
                     'EVIDENCE'
@@ -295,11 +362,14 @@ def materialize_delivery_registration(
         {
             "tenant_id": tenant_id,
             "journey_id": journey_id,
-            "registration_number": registration_number,
-            "source_evidence_id": _source_evidence(document),
+            **merged,
+            "source_evidence_id": source_evidence_id,
         },
     )
-    return 1
+    return sum(
+        1 for column in columns
+        if values.get(column) is not None and (existing is None or existing[column] is None)
+    )
 
 
 def materialize_delivery_insurance(
@@ -335,13 +405,20 @@ def materialize_delivery_insurance(
             values[destination] = uc03_booking_capture._as_decimal(raw, "PREMIUM_AMOUNT")
         else:
             values[destination] = _text(raw)
-    if not any(value is not None for value in values.values()):
+
+    # add_ons is a DI array field (zero dep, engine protect, etc.), not a
+    # single text value like the others -- kept out of _INSURANCE_FIELDS'
+    # per-column text merge and handled as its own JSON column.
+    add_ons_pair = _best_field(documents, ("add_ons",), document_types=insurance_documents)
+    add_ons_json = json.dumps(add_ons_pair[1].value) if add_ons_pair is not None and _has_value(add_ons_pair[1].value) else None
+
+    if not any(value is not None for value in values.values()) and add_ons_json is None:
         return 0
 
     existing = connection.execute(
         text(
-            """
-            SELECT insurer_name, policy_reference, actual_premium_amount,
+            f"""
+            SELECT {', '.join(_INSURANCE_MERGE_COLUMNS)}, add_ons,
                    source_kind, source_evidence_id
             FROM auditcore.insurance_records
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
@@ -352,38 +429,39 @@ def materialize_delivery_insurance(
     ).mappings().one_or_none()
 
     merged = dict(values)
+    merged["add_ons"] = add_ons_json
     source_evidence_id: UUID | None = None
     if existing is not None:
-        for key in ("insurer_name", "policy_reference", "actual_premium_amount"):
-            merged[key] = existing[key] if existing[key] is not None else values[key]
+        for key in _INSURANCE_MERGE_COLUMNS:
+            merged[key] = existing[key] if existing[key] is not None else values.get(key)
+        merged["add_ons"] = existing["add_ons"] if existing["add_ons"] is not None else add_ons_json
         source_evidence_id = existing["source_evidence_id"]
     if source_evidence_id is None:
-        for pair in selected.values():
+        candidates = list(selected.values()) + [add_ons_pair]
+        for pair in candidates:
             if pair is not None:
                 source_evidence_id = _source_evidence(pair[0])
                 if source_evidence_id is not None:
                     break
 
     if existing is not None and all(
-        existing[key] == merged[key]
-        for key in ("insurer_name", "policy_reference", "actual_premium_amount")
+        existing[key] == merged[key] for key in (*_INSURANCE_MERGE_COLUMNS, "add_ons")
     ):
         return 0
 
     connection.execute(
         text(
-            """
+            f"""
             INSERT INTO auditcore.insurance_records (
-                tenant_id, journey_id, insurer_name, policy_reference,
-                actual_premium_amount, source_kind, source_evidence_id
+                tenant_id, journey_id, {', '.join(_INSURANCE_MERGE_COLUMNS)},
+                add_ons, source_kind, source_evidence_id
             ) VALUES (
-                :tenant_id, :journey_id, :insurer_name, :policy_reference,
-                :actual_premium_amount, 'EVIDENCE', :source_evidence_id
+                :tenant_id, :journey_id, {', '.join(f':{c}' for c in _INSURANCE_MERGE_COLUMNS)},
+                CAST(:add_ons AS jsonb), 'EVIDENCE', :source_evidence_id
             )
             ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
-                insurer_name=EXCLUDED.insurer_name,
-                policy_reference=EXCLUDED.policy_reference,
-                actual_premium_amount=EXCLUDED.actual_premium_amount,
+                {', '.join(f'{c}=EXCLUDED.{c}' for c in _INSURANCE_MERGE_COLUMNS)},
+                add_ons=EXCLUDED.add_ons,
                 source_kind=COALESCE(auditcore.insurance_records.source_kind, 'EVIDENCE'),
                 source_evidence_id=COALESCE(
                     auditcore.insurance_records.source_evidence_id,
@@ -400,11 +478,14 @@ def materialize_delivery_insurance(
             "source_evidence_id": source_evidence_id,
         },
     )
-    return sum(
+    written = sum(
         1
         for key, value in values.items()
         if value is not None and (existing is None or existing[key] is None)
     )
+    if add_ons_json is not None and (existing is None or existing["add_ons"] is None):
+        written += 1
+    return written
 
 
 def _source_rank(source_priority: tuple[str, ...], source_type: str | None) -> int:

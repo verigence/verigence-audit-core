@@ -75,17 +75,75 @@ def test_invoice_source_precedes_delivery_order_for_vehicle_identifier() -> None
     assert selected[1].value == "INV-CHASSIS"
 
 
+def test_rto_challan_registration_fields_mapping() -> None:
+    # Confirmed live gap: DI extracts registration_state/territory/district/
+    # type from an RTO Challan fine (rto_challan.py), but only
+    # registration_number was ever wired into registration_records, leaving
+    # a PC to type State/District in by hand.
+    assert materialization._RTO_CHALLAN_DOCUMENT_TYPE == "rto_challan"
+    assert materialization._RTO_CHALLAN_FIELDS == {
+        "registration_state": "registration_state",
+        "registration_territory": "registration_territory",
+        "registration_district": "registration_district",
+        "registration_type": "registration_type_code",
+    }
+
+
+def test_rto_challan_fields_only_selected_from_an_actual_rto_challan() -> None:
+    challan = _document(
+        "rto_challan",
+        [
+            _field("registration_state", "Odisha"),
+            _field("registration_district", "Cuttack"),
+        ],
+    )
+    other = _document(
+        "customer_invoice_dms",
+        [_field("registration_state", "SHOULD-NOT-MATCH")],
+    )
+
+    state = materialization._best_field(
+        [other, challan], ("registration_state",), document_types={"rto_challan"},
+    )
+    assert state is not None
+    assert state[0].documentTypeKey == "rto_challan"
+    assert state[1].value == "Odisha"
+
+    district = materialization._best_field(
+        [challan], ("registration_district",), document_types={"rto_challan"},
+    )
+    assert district is not None
+    assert district[1].value == "Cuttack"
+
+
 def test_delivery_insurance_mapping_matches_di_insurance_cover_contract() -> None:
     assert materialization._INSURANCE_DOCUMENT_TYPE == "insurance_cover"
     assert materialization._INSURANCE_FIELDS == {
         "insurer_name": "insurer_name",
         "policy_number": "policy_reference",
         "premium_amount": "actual_premium_amount",
+        "agent_intermediary_name": "agent_intermediary_name",
+        "agent_intermediary_code": "agent_intermediary_code",
+        "misp_code": "misp_code",
     }
     assert materialization._REGISTRATION_FIELD_KEYS == (
         "registration_number",
         "insured_vehicle_reg",
     )
+
+
+def test_insurance_addons_are_selected_from_the_di_add_ons_array_field() -> None:
+    # add_ons is a DI array field (zero dep, engine protect, etc.) kept out
+    # of the per-column text merge and handled as its own JSON column.
+    document = _document(
+        "insurance_cover",
+        [_field("add_ons", ["zero_depreciation", "engine_protection"])],
+    )
+    selected = materialization._best_field(
+        [document], ("add_ons",), document_types={"insurance_cover"},
+    )
+    assert selected is not None
+    assert selected[1].value == ["zero_depreciation", "engine_protection"]
 
 
 def test_delivery_business_materializer_calls_all_canonical_projections(monkeypatch) -> None:

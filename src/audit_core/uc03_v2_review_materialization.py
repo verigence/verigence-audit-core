@@ -165,6 +165,12 @@ _INVOICE_DOCUMENT_TYPES = frozenset(
         "tax_invoice",
         "tax_invoice_dms",
         "customer_invoice_dms_v2",
+        # Shares invoice.py's field superset (DI schema, extension="vehicle",
+        # same as customer_invoice_dms) but derive_commercials/derive_discounts
+        # in uc03_invoice_materialization.py route it to discounts, not a
+        # fresh commercial line -- a credit note reduces an earlier invoice,
+        # it isn't a new sale.
+        "credit_note",
     }
 )
 _INVOICE_REVIEW_FIELDS = frozenset(

@@ -211,6 +211,11 @@ def _header_values(raw: dict[str, Any]) -> dict[str, Any]:
 # ── derivation ──────────────────────────────────────────────────────────────
 def derive_commercials(raw: dict[str, Any]) -> dict[str, Decimal]:
     """OEM-neutral invoice fields -> Audit Core commercial component amounts."""
+    # A credit note reduces an earlier invoice; it is never a fresh sale, so
+    # it contributes nothing here -- derive_discounts below is where its
+    # value lands instead.
+    if _upper(raw.get("invoice_nature")) == "CREDIT_NOTE":
+        return {}
     purpose = _upper(raw.get("invoice_purpose"))
     lines = _line_item_rows(raw.get("line_items"))
     out: dict[str, Decimal] = {}
@@ -261,6 +266,15 @@ def derive_commercials(raw: dict[str, Any]) -> dict[str, Decimal]:
 
 def derive_discounts(raw: dict[str, Any]) -> dict[str, Decimal]:
     """Invoice-level + DISCOUNT_LINE amounts -> canonical discount keys."""
+    # A credit note's whole value is a reduction against an earlier invoice --
+    # not tied to a specific OEM scheme entitlement, so it lands under the
+    # same discretionary bucket a dealer's own over-grant discount does.
+    if _upper(raw.get("invoice_nature")) == "CREDIT_NOTE":
+        amount = _to_decimal(raw.get("grand_total_amount")) or _to_decimal(raw.get("taxable_amount"))
+        if amount is None or amount == 0:
+            return {}
+        return {canonical_discount_key("ADDITIONAL_DISCOUNT"): abs(amount)}
+
     total = Decimal(0)
     invoice_level = _to_decimal(raw.get("invoice_discount_amount"))
     if invoice_level is not None:
