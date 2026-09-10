@@ -847,12 +847,29 @@ def schedule_delivery_document_checkpoint(
     """Re-evaluate Delivery's document-gap findings against current durable
     state: raise DL_V2_REQUIRED_DOCUMENT_MISSING / DL_V2_DOCUMENT_PROCESSING_
     FAILED for whatever is still missing/failing, and resolve any that have
-    since cleared. Cheap and idempotent (no external I/O; every write goes
-    through _machine_flag / _resolve_finding's own status-guarded UPDATEs),
-    so calling it once per confirmed document -- the same trigger Booking's
-    schedule_booking_checkpoint_rules uses -- costs nothing extra when
-    nothing changed. Returns (raised_finding_ids, resolved_finding_ids).
+    since cleared. Called once per confirmed document, the same trigger
+    Booking's schedule_booking_checkpoint_rules uses -- Delivery routinely
+    confirms 10-15 documents in a tight burst (real dealership upload
+    behaviour, already the cause of one live lock-contention incident this
+    session), so this uses pg_try_advisory_xact_lock (non-blocking) rather
+    than the blocking pg_advisory_xact_lock _sync_booking_document itself
+    uses: several documents from the same burst each open their own
+    connection to call this (see _run_sync_booking_document_task), and this
+    service's connection pool is small (SQLAlchemy defaults, pool_timeout=5s).
+    A BLOCKING lock would have each of those connections sit idle-in-wait for
+    the whole burst instead of being returned to the pool, which is exactly
+    what starves an unrelated request (e.g. opening a Booking) waiting for a
+    free connection. Skipping when contended costs nothing -- the document
+    that's already running this reads the same current state, and the very
+    next confirmed document re-triggers it anyway.
     """
+    acquired = connection.execute(
+        text("SELECT pg_try_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+        {"lock_key": f"uc03-delivery-document-checkpoint:{tenant_id}:{journey_id}"},
+    ).scalar_one()
+    if not acquired:
+        return [], []
+
     requirements = _delivery_requirements(connection, tenant_id, journey_id)
     documents = _linked_delivery_documents(connection, tenant_id, journey_id)
     raised = _raise_delivery_capture_exceptions(
