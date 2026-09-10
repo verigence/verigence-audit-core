@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import os
 from dataclasses import dataclass
 from uuid import uuid4
@@ -15,6 +16,7 @@ from audit_core.security_authorization import (
     SecurityAuthorizationDecision,
     get_security_authorization_client,
 )
+from audit_core.uc03_journey_search import get_journey_overview
 
 
 @dataclass
@@ -531,3 +533,16 @@ def test_out_of_scope_overview_does_not_disclose_journey(journey_search_setup) -
         f"/v1/tenants/{setup['tenant_id']}/uc03/journeys/{setup['hidden']}/overview"
     )
     assert response.status_code == 404
+
+
+def test_commercial_lines_sort_ex_showroom_price_first() -> None:
+    # Business ask: the Deal panel's line items must show Ex-showroom price
+    # first, then other charges, then Discounts (the latter already renders
+    # as its own panel after this table). Previously plain
+    # "ORDER BY component_key" put it wherever it fell alphabetically
+    # (after accessories_cost, for example).
+    source = inspect.getsource(get_journey_overview)
+    query_start = source.index("FROM auditcore.commercial_lines")
+    query_end = source.index('"""', query_start)
+    query = source[query_start:query_end]
+    assert "CASE WHEN component_key = 'ex_showroom_price' THEN 0 ELSE 1 END" in query
