@@ -8,6 +8,7 @@ import structlog
 from sqlalchemy import Connection, Engine, text
 
 from audit_core.db import set_tenant_context
+from audit_core.errors import AuditCoreError
 from audit_core.uc03_booking_commands import _append_workflow_event
 from audit_core.uc03_booking_confirmation_rules import _DISCOUNT_EVIDENCE
 from audit_core.uc03_delivery_commands import _machine_flag
@@ -459,13 +460,32 @@ def run_booking_review_rule_task(
                 )
                 return
 
-            claim_worker_task(
-                connection,
-                tenant_id=tenant_id,
-                workflow_task_id=workflow_task_id,
-                worker_id=_WORKER_ID,
-                lease_seconds=120,
-            )
+            try:
+                claim_worker_task(
+                    connection,
+                    tenant_id=tenant_id,
+                    workflow_task_id=workflow_task_id,
+                    worker_id=_WORKER_ID,
+                    lease_seconds=120,
+                )
+            except AuditCoreError:
+                # Two independent triggers call schedule_booking_checkpoint_rules
+                # for the same task by design (the async document-sync path and
+                # PC Review Confirm's safety net) -- claim_worker_task's UPDATE is
+                # atomic, so losing this race just means the other trigger claimed
+                # it between our READY check above and this call. Expected, not a
+                # failure: whoever won proceeds to evaluate, we have nothing left
+                # to do. (Previously fell through to the broad `except Exception`
+                # below, logging a full traceback as uc03_booking_rule_evaluation_
+                # failed for a routine race -- noisy, and easy to mistake for a
+                # real defect.)
+                logger.info(
+                    "uc03_booking_rule_task_already_claimed",
+                    tenant_id=tenant_id,
+                    journey_id=str(journey_id),
+                    task_id=str(workflow_task_id),
+                )
+                return
             start_worker_task(
                 connection,
                 tenant_id=tenant_id,
