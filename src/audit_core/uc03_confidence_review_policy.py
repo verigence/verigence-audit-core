@@ -995,7 +995,21 @@ def _sync_booking_document(
             correlation_id="",
         )
 
-    if stage_code == "DELIVERY" and changed:
+    # Deliberately NOT gated on `changed`. `changed` answers "did this
+    # document's raw extracted VALUES differ from what was already durably
+    # stored" -- a question about the source data, not about whether
+    # materialization has ever actually run with the CURRENT materializer
+    # code. A document confirmed once, whose facts have not moved since,
+    # will show changed=False on every later sync (a duplicate DI webhook
+    # redelivery, or the PC's own /resync) even after a materializer fix or
+    # a whole new canonical table ships -- gating on `changed` silently
+    # stranded already-confirmed Delivery documents' data out of
+    # registration/finance/invoice/insurance/scrappage/receipts forever,
+    # with no way for the PC's own "Recheck documents" resync to reach it
+    # either, since resync hits this exact same gate. Materialization is
+    # documented as cheap and safe to call redundantly (every typed writer
+    # underneath upserts; never raises) -- always re-run it for Delivery.
+    if stage_code == "DELIVERY":
         from audit_core.uc03_delivery_post_extraction_materialization import (
             materialize_delivery_documents_from_durable_store,
         )
