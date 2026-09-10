@@ -38,6 +38,7 @@ class JourneyOverviewProjectionResponse(legacy.JourneyOverviewResponse):
     resolvedReviewedValues: dict[str, dict[str, Any]] = Field(default_factory=dict)
     skuPricing: dict[str, Any] | None = Field(default=None)
     bankStatementLines: list[dict[str, Any]] = Field(default_factory=list)
+    invoices: list[dict[str, Any]] = Field(default_factory=list)
 
 
 _BOOKING_REVIEW_FIELDS = (
@@ -431,6 +432,59 @@ def _bank_statement_lines(
         matched_payment = item.pop("matchedPaymentId", None)
         item["matchedPaymentId"] = str(matched_payment) if matched_payment is not None else None
         item["bankStatementLineId"] = str(item["bankStatementLineId"])
+        if item.get("documentId") is not None:
+            item["documentId"] = str(item["documentId"])
+        out.append(item)
+    return out
+
+
+def _invoices(
+    connection: Connection, *, tenant_id: str, journey_id: UUID
+) -> list[dict[str, Any]]:
+    """Every reviewed invoice-family document on this journey (tax/retail/
+    accessory/EW/RSA invoices, wholesale invoices, and credit notes -- one
+    row per document, invoice_review_values already stores them separately
+    rather than collapsing multiple invoices into one). Feeds the Invoice
+    tab so a PC/TL can see every invoice uploaded without opening each
+    document individually.
+    """
+    rows = connection.execute(
+        text(
+            """
+            SELECT
+                invoice_review_value_id AS "invoiceReviewValueId",
+                source_di_document_id   AS "documentId",
+                document_type_key       AS "documentTypeKey",
+                invoice_purpose         AS "invoicePurpose",
+                invoice_nature          AS "invoiceNature",
+                invoice_number          AS "invoiceNumber",
+                invoice_date            AS "invoiceDate",
+                seller_name             AS "sellerName",
+                seller_gstin            AS "sellerGstin",
+                buyer_name              AS "buyerName",
+                buyer_gstin             AS "buyerGstin",
+                financed_by             AS "financedBy",
+                taxable_amount          AS "taxableAmount",
+                cgst_amount             AS "cgstAmount",
+                sgst_amount             AS "sgstAmount",
+                igst_amount             AS "igstAmount",
+                tcs_amount              AS "tcsAmount",
+                invoice_discount_amount AS "invoiceDiscountAmount",
+                grand_total_amount      AS "grandTotalAmount",
+                amount_in_words         AS "amountInWords",
+                line_items              AS "lineItems",
+                reviewed_at_utc         AS "reviewedAtUtc"
+            FROM auditcore.invoice_review_values
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            ORDER BY invoice_date NULLS LAST, invoice_review_value_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["invoiceReviewValueId"] = str(item["invoiceReviewValueId"])
         if item.get("documentId") is not None:
             item["documentId"] = str(item["documentId"])
         out.append(item)
@@ -886,6 +940,11 @@ def get_journey_overview_projection(
         reviewed_booking=reviewed_booking,
     )
     data["bankStatementLines"] = _bank_statement_lines(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+    )
+    data["invoices"] = _invoices(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,

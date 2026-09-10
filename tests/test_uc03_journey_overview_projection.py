@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from audit_core.uc03_journey_overview_projection import (
     _documents,
+    _invoices,
     _masked_phone,
     _receipts,
     _reviewed_booking_projection,
@@ -140,6 +141,83 @@ def test_documents_include_v2_capture_and_dedupe_legacy_evidence() -> None:
     assert documents[0]["originalFilename"] == "receipt-1.pdf"
     assert documents[0]["reviewStatus"] == "PENDING"
     assert str(documents[1]["documentId"]) == str(legacy_only_document_id)
+
+
+def test_invoices_projects_every_reviewed_invoice_with_stringified_ids() -> None:
+    # Feeds the Invoice tab: one row per reviewed invoice-family document
+    # (invoice_review_values stores multiple invoices on one journey
+    # separately, never collapsed), including a credit note.
+    document_id = uuid4()
+    row_id = uuid4()
+    connection = _ScriptedConnection(
+        [
+            {
+                "invoiceReviewValueId": row_id,
+                "documentId": document_id,
+                "documentTypeKey": "customer_invoice_dms",
+                "invoicePurpose": "VEHICLE_SALE",
+                "invoiceNature": "TAX_INVOICE",
+                "invoiceNumber": "INV-001",
+                "invoiceDate": "2026-08-13",
+                "sellerName": "Aditya Motors",
+                "sellerGstin": "21AAECA5786A3Z1",
+                "buyerName": "Sanjaya Kumar Mohanty",
+                "buyerGstin": None,
+                "financedBy": "HDFC Bank",
+                "taxableAmount": 1600000,
+                "cgstAmount": 16000,
+                "sgstAmount": 16000,
+                "igstAmount": None,
+                "tcsAmount": 16000,
+                "invoiceDiscountAmount": None,
+                "grandTotalAmount": 1596000,
+                "amountInWords": None,
+                "lineItems": [],
+                "reviewedAtUtc": None,
+            },
+        ],
+    )
+    result = _invoices(connection, tenant_id="tenant-a", journey_id=uuid4())
+    assert len(result) == 1
+    assert result[0]["invoiceReviewValueId"] == str(row_id)
+    assert result[0]["documentId"] == str(document_id)
+    assert result[0]["invoiceNumber"] == "INV-001"
+    assert result[0]["financedBy"] == "HDFC Bank"
+    assert result[0]["grandTotalAmount"] == 1596000
+
+
+def test_invoices_handles_a_document_with_no_source_document_id() -> None:
+    connection = _ScriptedConnection(
+        [
+            {
+                "invoiceReviewValueId": uuid4(),
+                "documentId": None,
+                "documentTypeKey": "credit_note",
+                "invoicePurpose": "VEHICLE_SALE",
+                "invoiceNature": "CREDIT_NOTE",
+                "invoiceNumber": "CN-001",
+                "invoiceDate": None,
+                "sellerName": None,
+                "sellerGstin": None,
+                "buyerName": None,
+                "buyerGstin": None,
+                "financedBy": None,
+                "taxableAmount": None,
+                "cgstAmount": None,
+                "sgstAmount": None,
+                "igstAmount": None,
+                "tcsAmount": None,
+                "invoiceDiscountAmount": None,
+                "grandTotalAmount": 25000,
+                "amountInWords": None,
+                "lineItems": [],
+                "reviewedAtUtc": None,
+            },
+        ],
+    )
+    result = _invoices(connection, tenant_id="tenant-a", journey_id=uuid4())
+    assert result[0]["documentId"] is None
+    assert result[0]["invoiceNature"] == "CREDIT_NOTE"
 
 
 def test_receipts_keep_every_reviewed_receipt_and_pending_capture_distinct() -> None:

@@ -701,7 +701,9 @@ def get_journey_overview(
                 source_reference AS "sourceReference"
             FROM auditcore.commercial_lines
             WHERE tenant_id = :tenant_id AND journey_id = :journey_id
-            ORDER BY component_key
+            ORDER BY
+                CASE WHEN component_key = 'ex_showroom_price' THEN 0 ELSE 1 END,
+                component_key
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
