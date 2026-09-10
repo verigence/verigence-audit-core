@@ -384,6 +384,18 @@ def _read_delivery_capture(
         requirements=requirements,
         di_documents=di_documents,
     )
+    from audit_core.uc03_document_unrecognized import (
+        sync_document_unrecognized_findings,
+    )
+
+    sync_document_unrecognized_findings(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code="DELIVERY",
+        di_documents=di_documents,
+        correlation_id="",
+    )
     return _build_delivery_capture_response(
         journey_id=journey_id,
         context_ref=context_ref,
