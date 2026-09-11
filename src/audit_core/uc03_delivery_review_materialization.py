@@ -7,13 +7,18 @@ Delivery Review already preserves every DI field losslessly in
 owner used by Journey 360, so reviewed Delivery facts that have an explicit,
 truthful mapping are also projected into the existing canonical Core tables.
 
-This module deliberately does not infer fuzzy aliases or overwrite workflow-owned
-Delivery status/timestamps. Unsupported DI fields remain available losslessly until
-an explicit typed owner is added.
+This module deliberately does not infer fuzzy aliases. Unsupported DI fields
+remain available losslessly until an explicit typed owner is added. The one
+deliberate exception to "never overwrite workflow-owned Delivery timestamps"
+is ``actual_delivered_at`` itself: the Gate Pass is the authoritative source
+for the real delivery date, so it is allowed to replace whatever operational
+default (e.g. the moment a PC clicked "Delivery Completed") is on record --
+see ``materialize_delivery_date``.
 """
 
 import json
 import logging
+from datetime import UTC, date, datetime, time
 from typing import Any
 from uuid import UUID
 
@@ -37,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 _DELIVERY_ORDER_DOCUMENT_TYPE = "delivery_order_cover"
 _INSURANCE_DOCUMENT_TYPE = "insurance_cover"
+_GATE_PASS_DOCUMENT_TYPE = "gate_pass"
 
 # These are exact DI field keys, not fuzzy text matches.  ``chassis_no`` is the
 # field emitted by verigence-di's delivery_order_cover schema.  The other keys are
@@ -161,6 +167,94 @@ def _text(value: Any) -> str | None:
 
 def _source_evidence(document: Any) -> UUID | None:
     return getattr(document, "evidenceId", None)
+
+
+def _to_delivery_date(value: Any) -> date | None:
+    if isinstance(value, date):
+        return value
+    if not _has_value(value):
+        return None
+    try:
+        return date.fromisoformat(str(value).strip()[:10])
+    except ValueError:
+        return None
+
+
+def materialize_delivery_date(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    documents: list[Any],
+) -> int:
+    """Set the canonical delivery date from the Gate Pass.
+
+    The Gate Pass date is the ground truth for when the vehicle actually left
+    the dealership -- not the timestamp of whichever operational action
+    happened to run first (a PC clicking "Delivery Completed" defaults
+    ``actual_delivered_at`` to ``now()``, per ``_upsert_delivery_business_record``
+    in uc03_delivery_commands.py). Once the Gate Pass is confirmed, its date
+    is authoritative and replaces that default -- re-running this on every
+    sync keeps it live if the field is later corrected in review, matching
+    this pipeline's own "always-live, never-frozen" philosophy elsewhere.
+    """
+
+    pair = _best_field(
+        documents, ("delivery_date",), document_types={_GATE_PASS_DOCUMENT_TYPE}
+    )
+    if pair is None:
+        return 0
+    parsed = _to_delivery_date(getattr(pair[1], "value", None))
+    if parsed is None:
+        return 0
+    actual_delivered_at = datetime.combine(parsed, time.min, tzinfo=UTC)
+    source_evidence_id = _source_evidence(pair[0])
+
+    existing = connection.execute(
+        text(
+            """
+            SELECT actual_delivered_at, status_source
+            FROM auditcore.deliveries
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            FOR UPDATE
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
+
+    if (
+        existing is not None
+        and existing["status_source"] == "EVIDENCE"
+        and existing["actual_delivered_at"] == actual_delivered_at
+    ):
+        return 0
+
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.deliveries (
+                tenant_id, journey_id, actual_delivered_at,
+                status_source, source_evidence_id
+            ) VALUES (
+                :tenant_id, :journey_id, :actual_delivered_at,
+                'EVIDENCE', :source_evidence_id
+            )
+            ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
+                actual_delivered_at=EXCLUDED.actual_delivered_at,
+                status_source='EVIDENCE',
+                source_evidence_id=EXCLUDED.source_evidence_id,
+                updated_at_utc=now(),
+                version_no=auditcore.deliveries.version_no+1
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "actual_delivered_at": actual_delivered_at,
+            "source_evidence_id": source_evidence_id,
+        },
+    )
+    return 1
 
 
 def materialize_delivery_vehicle(
@@ -1029,6 +1123,12 @@ def materialize_reviewed_delivery_business_values(
         journey_id=journey_id,
         documents=documents,
     )
+    delivery_date_set = materialize_delivery_date(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        documents=documents,
+    )
     invoices = materialize_reviewed_invoices(
         connection,
         tenant_id=tenant_id,
@@ -1073,6 +1173,7 @@ def materialize_reviewed_delivery_business_values(
         "financeHypothecationRaised": finance_hypothecation["raised"],
         "financeHypothecationResolved": finance_hypothecation["resolved"],
         "insuranceFields": insurance_fields,
+        "deliveryDateSet": delivery_date_set,
         "invoicesMaterialized": invoices["invoices"],
         "invoiceCommercialLines": invoices["commercialLines"],
         "invoiceDiscountApplications": invoices["discountApplications"],

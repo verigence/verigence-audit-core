@@ -269,6 +269,11 @@ def test_delivery_business_materializer_calls_all_canonical_projections(monkeypa
     )
     monkeypatch.setattr(
         materialization,
+        "materialize_delivery_date",
+        lambda *args, **kwargs: calls.append("delivery_date") or 1,
+    )
+    monkeypatch.setattr(
+        materialization,
         "materialize_delivery_commercial_lines",
         lambda *args, **kwargs: calls.append("commercials") or 4,
     )
@@ -295,7 +300,7 @@ def test_delivery_business_materializer_calls_all_canonical_projections(monkeypa
 
     assert calls == [
         "vehicle", "registration", "finance", "finance_hypothecation",
-        "insurance", "commercials", "receipts",
+        "insurance", "delivery_date", "commercials", "receipts",
     ]
     assert result["vehicleFields"] == 2
     assert result["registrationFields"] == 1
@@ -303,6 +308,7 @@ def test_delivery_business_materializer_calls_all_canonical_projections(monkeypa
     assert result["financeHypothecationRaised"] == 1
     assert result["financeHypothecationResolved"] == 0
     assert result["insuranceFields"] == 3
+    assert result["deliveryDateSet"] == 1
     assert result["commercialLines"] == 4
     assert result["receiptPaymentsCreated"] == 1
     # Not monkeypatched -- runs for real against documents=[] and returns 0
@@ -442,3 +448,101 @@ def test_finance_hypothecation_no_finding_when_not_financed(journey) -> None:
         {"t": tenant_id, "j": journey_id},
     ).scalar_one()
     assert count == 0
+
+
+def test_materialize_delivery_date_sets_from_gate_pass_when_no_row_exists(journey) -> None:
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    gate_pass = _document("gate_pass", [_field("delivery_date", "2026-09-05")])
+
+    written = materialization.materialize_delivery_date(
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[gate_pass],
+    )
+    assert written == 1
+
+    row = journey.execute(
+        text("SELECT actual_delivered_at, status_source FROM auditcore.deliveries "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one()
+    assert row["status_source"] == "EVIDENCE"
+    assert row["actual_delivered_at"].date().isoformat() == "2026-09-05"
+
+
+def test_materialize_delivery_date_overrides_operational_default(journey) -> None:
+    # A PC clicking "Delivery Completed" stamps actual_delivered_at=now() with
+    # status_source='OPERATIONAL_INPUT' (uc03_delivery_commands.py). Once the
+    # Gate Pass is confirmed, its printed date is the ground truth and must
+    # replace that click-time default, not defer to it.
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    journey.execute(
+        text("""
+            INSERT INTO auditcore.deliveries (
+                tenant_id, journey_id, actual_delivery_status_code,
+                actual_delivered_at, status_source
+            ) VALUES (
+                :t, :j, 'DELIVERY_COMPLETED', now(), 'OPERATIONAL_INPUT'
+            )
+        """),
+        {"t": tenant_id, "j": journey_id},
+    )
+
+    gate_pass = _document("gate_pass", [_field("delivery_date", "2026-08-20")])
+    written = materialization.materialize_delivery_date(
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[gate_pass],
+    )
+    assert written == 1
+
+    row = journey.execute(
+        text("SELECT actual_delivery_status_code, actual_delivered_at, status_source "
+             "FROM auditcore.deliveries WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one()
+    # The operational status code is untouched -- only the date/source change.
+    assert row["actual_delivery_status_code"] == "DELIVERY_COMPLETED"
+    assert row["status_source"] == "EVIDENCE"
+    assert row["actual_delivered_at"].date().isoformat() == "2026-08-20"
+
+
+def test_materialize_delivery_date_is_idempotent_on_rerun(journey) -> None:
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    gate_pass = _document("gate_pass", [_field("delivery_date", "2026-09-05")])
+
+    materialization.materialize_delivery_date(
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[gate_pass],
+    )
+    version_after_first = journey.execute(
+        text("SELECT version_no FROM auditcore.deliveries WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one()
+
+    written = materialization.materialize_delivery_date(
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[gate_pass],
+    )
+    assert written == 0
+    version_after_second = journey.execute(
+        text("SELECT version_no FROM auditcore.deliveries WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one()
+    assert version_after_second == version_after_first
+
+
+def test_materialize_delivery_date_ignores_unparseable_or_missing_value(journey) -> None:
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    gate_pass = _document("gate_pass", [_field("delivery_date", "not a date")])
+
+    written = materialization.materialize_delivery_date(
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[gate_pass],
+    )
+    assert written == 0
+    count = journey.execute(
+        text("SELECT count(*) FROM auditcore.deliveries WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one()
+    assert count == 0
+
+    # A different document type carrying the same field key must not match.
+    other = _document("customer_invoice_dms", [_field("delivery_date", "2026-09-05")])
+    written = materialization.materialize_delivery_date(
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[other],
+    )
+    assert written == 0

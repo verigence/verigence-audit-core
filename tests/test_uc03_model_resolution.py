@@ -538,3 +538,120 @@ def test_integration_falls_back_to_latest_master_when_booking_predates_it(journe
         {"t": c.tenant_id, "j": c.journey_id},
     ).scalar_one()
     assert pinned == sku_id
+
+
+# ── Delivery-invoice fallback ────────────────────────────────────────────────
+def _set_invoice_field(c, field_key, value, *, document_type_key="customer_invoice_dms"):
+    c.execute(
+        text(
+            """
+            INSERT INTO auditcore.journey_document_extracted_fields (
+                tenant_id, journey_id, evidence_id, di_document_id,
+                source_fact_ref, source_fact_version, stage_code,
+                source_document_type_key, source_canonical_field_id, field_key,
+                extracted_value, effective_value, is_modified
+            ) VALUES (
+                :t, :j, NULL, :doc,
+                NULL, 1, 'DELIVERY',
+                :dtk, NULL, :fk,
+                CAST(:v AS jsonb), CAST(:v AS jsonb), false
+            )
+            """
+        ),
+        {"t": c.tenant_id, "j": c.journey_id, "doc": uuid4(), "dtk": document_type_key,
+         "fk": field_key, "v": json.dumps(value)},
+    )
+
+
+def test_invoice_sku_code_resolves_when_booking_never_matched(journey) -> None:
+    # Booking's own model text never matched anything at all -- the fixture
+    # never even calls sync_model_resolution here, standing in for a Booking
+    # that already raised MODEL_NOT_IDENTIFIED and stayed unresolved.
+    c = journey
+    (sku_id,) = _seed_price_list(c, [{
+        "model": "SCORPIO N", "variant": "Z8L",
+        "components": {"EX_SHOWROOM": "1600000", "INSURANCE": "60000",
+                       "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "220000"},
+    }])
+    sku_code = c.execute(
+        text("SELECT sku_code FROM auditcore.product_skus WHERE product_sku_id=:s"),
+        {"s": sku_id},
+    ).scalar_one()
+    _set_journey_product(c, "ILLEGIBLE SCAN TEXT", None)
+    _set_invoice_field(c, "sku_code", sku_code)
+
+    result = mr.sync_model_resolution_from_invoice(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+
+    assert result.get("resolved") is True
+    assert result.get("matchStage") == "INVOICE_SKU_CODE"
+    pinned = c.execute(
+        text("SELECT product_sku_id FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert pinned == sku_id
+
+
+def test_invoice_model_text_resolves_when_no_sku_code_printed(journey) -> None:
+    c = journey
+    (sku_id,) = _seed_price_list(c, [{
+        "model": "THAR", "variant": "LX",
+        "components": {"EX_SHOWROOM": "1400000", "INSURANCE": "50000",
+                       "REGISTRATION_INDIVIDUAL": "150000", "REGISTRATION_CORPORATE": "190000"},
+    }])
+    _set_journey_product(c, "ILLEGIBLE SCAN TEXT", None)
+    _set_invoice_field(c, "model_name_raw", "Thar")
+    _set_invoice_field(c, "variant_raw", "LX")
+
+    result = mr.sync_model_resolution_from_invoice(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+
+    assert result.get("resolved") is True
+    pinned = c.execute(
+        text("SELECT product_sku_id FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert pinned == sku_id
+
+
+def test_invoice_fallback_is_noop_once_already_resolved(journey) -> None:
+    c = journey
+    (sku_id,) = _seed_price_list(c, [{
+        "model": "XUV700", "variant": "AX7L",
+        "components": {"EX_SHOWROOM": "2000000"},
+    }])
+    _set_journey_product(c, "XUV700", "AX7L")
+    c.execute(
+        text("UPDATE auditcore.journey_products SET product_sku_id=:s "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"s": sku_id, "t": c.tenant_id, "j": c.journey_id},
+    )
+    # A different SKU code on the invoice must NOT override an already-pinned SKU.
+    _set_invoice_field(c, "sku_code", "SOME-OTHER-CODE")
+
+    result = mr.sync_model_resolution_from_invoice(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+
+    assert result == {"skipped": True, "reason": "already_resolved"}
+    pinned = c.execute(
+        text("SELECT product_sku_id FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert pinned == sku_id
+
+
+def test_invoice_fallback_skips_without_any_invoice_data(journey) -> None:
+    c = journey
+    _set_journey_product(c, "ILLEGIBLE SCAN TEXT", None)
+
+    result = mr.sync_model_resolution_from_invoice(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+
+    assert result == {"skipped": True, "reason": "no_invoice_model_data"}

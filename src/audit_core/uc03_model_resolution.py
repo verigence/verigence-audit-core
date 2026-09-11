@@ -48,6 +48,9 @@ from audit_core.uc03_sku_candidates import (
     _label_similarity,
     _price_plan_for_journey,
 )
+from audit_core.uc03_v2_review_materialization import (
+    _INVOICE_DOCUMENT_TYPES as _DELIVERY_INVOICE_DOCUMENT_TYPES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,16 @@ _RULE_KEY = "MODEL_NOT_IDENTIFIED:BOOKING"
 _STAGE = "BOOKING"
 _SELECTION_METHOD = "MODEL_RESOLUTION_SYNC_V1"
 _EX_SHOWROOM_COMPONENT = "EX_SHOWROOM"
+
+# Delivery-side fallback (see sync_model_resolution_from_invoice below): DI's
+# generalized invoice schema (verigence-di schemas/invoice.py) never maps
+# these to a master -- "exactly as printed", "do not map to a master" -- so
+# this module still does that resolution, deterministically, the same way it
+# already does for the Booking Form.
+_INVOICE_SKU_CODE_FIELD_KEYS = ("sku_code",)
+_INVOICE_MODEL_FIELD_KEYS = ("model_name_raw",)
+_INVOICE_VARIANT_FIELD_KEYS = ("variant_raw",)
+_INVOICE_SELECTION_METHOD = "MODEL_RESOLUTION_INVOICE_FALLBACK_V1"
 
 
 def _to_decimal(value: Any) -> Decimal | None:
@@ -429,7 +442,151 @@ def _attribute_decomposition_fallback(
     return matched, "ATTRIBUTE_DECOMPOSITION"
 
 
+def _latest_invoice_field(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, field_keys: tuple[str, ...]
+) -> str | None:
+    """Highest-confidence, most-recent value for ``field_keys`` off any Delivery
+    invoice document, read from durable storage (never DI directly)."""
+    value = connection.execute(
+        text(
+            """
+            SELECT effective_value
+            FROM auditcore.journey_document_extracted_fields
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+              AND stage_code = 'DELIVERY'
+              AND source_document_type_key = ANY(:document_types)
+              AND field_key = ANY(:field_keys)
+              AND effective_value IS NOT NULL
+            ORDER BY confidence_score DESC NULLS LAST, updated_at_utc DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "document_types": list(_DELIVERY_INVOICE_DOCUMENT_TYPES),
+            "field_keys": list(field_keys),
+        },
+    ).scalar_one_or_none()
+    if value is None:
+        return None
+    text_value = str(value).strip()
+    return text_value or None
+
+
 # ── producer ──────────────────────────────────────────────────────────────────
+def sync_model_resolution_from_invoice(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
+) -> dict[str, Any]:
+    """Delivery-side fallback for a Booking that never pinned a SKU.
+
+    ``sync_model_resolution`` already covers the Booking Form, including using
+    its ex-showroom price to break a tie when the model text alone matches
+    more than one price-master SKU. When that still leaves no SKU pinned by
+    the time a Delivery invoice is confirmed, this reads the invoice's own
+    ``sku_code`` (an explicit master code, when the invoice prints one -- the
+    strongest possible signal) or, failing that, its ``model_name_raw`` /
+    ``variant_raw`` free text, and resolves against the same price masters
+    the Booking resolver uses. Idempotent, self-heals on read, never raises;
+    a no-op once a SKU is already pinned, by either path.
+    """
+    try:
+        already_resolved = connection.execute(
+            text(
+                """
+                SELECT product_sku_id FROM auditcore.journey_products
+                WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one_or_none()
+        if already_resolved is not None:
+            return {"skipped": True, "reason": "already_resolved"}
+
+        sku_code = _latest_invoice_field(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            field_keys=_INVOICE_SKU_CODE_FIELD_KEYS,
+        )
+        invoice_model = _latest_invoice_field(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            field_keys=_INVOICE_MODEL_FIELD_KEYS,
+        )
+        if sku_code is None and invoice_model is None:
+            return {"skipped": True, "reason": "no_invoice_model_data"}
+
+        inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id)
+        if inputs is None:
+            return {"skipped": True, "reason": "no_booking_snapshot"}
+
+        effective_on = date.fromisoformat(
+            connection.execute(
+                text(
+                    """
+                    SELECT COALESCE(b.booking_date, CURRENT_DATE)
+                    FROM auditcore.journeys j
+                    LEFT JOIN auditcore.bookings b
+                      ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
+                    WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
+                    """
+                ),
+                {"tenant_id": tenant_id, "journey_id": journey_id},
+            ).scalar_one().isoformat()
+        )
+        try:
+            plan = _price_plan_for_journey(
+                connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on
+            )
+        except Exception:  # noqa: BLE001 - no effective price list yet
+            return {"skipped": True, "reason": "no_effective_price_list"}
+
+        rows = _sku_rows_for_version(
+            connection, tenant_id=tenant_id, price_list_version_id=plan["price_list_version_id"]
+        )
+        if not rows:
+            return {"skipped": True, "reason": "empty_price_list"}
+
+        matched: list[dict[str, Any]] = []
+        stage = "NONE"
+        if sku_code is not None:
+            matched = [
+                r for r in rows if str(r["sku_code"]).strip().casefold() == sku_code.casefold()
+            ]
+            stage = "INVOICE_SKU_CODE"
+
+        if len(matched) != 1 and invoice_model is not None:
+            invoice_variant = _latest_invoice_field(
+                connection, tenant_id=tenant_id, journey_id=journey_id,
+                field_keys=_INVOICE_VARIANT_FIELD_KEYS,
+            )
+            invoice_inputs = dict(inputs)
+            invoice_inputs["model_name"] = invoice_model
+            invoice_inputs["variant_name"] = invoice_variant or inputs["variant_name"]
+            matched, stage = _match(rows, invoice_inputs)
+
+        if len(matched) == 1:
+            _pin_sku(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                product_sku_id=matched[0]["product_sku_id"],
+            )
+            _resolve_open_flag(
+                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
+            )
+            _run_deal_reconciliation(
+                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
+            )
+            return {"resolved": True, "skuCode": matched[0]["sku_code"], "matchStage": stage}
+
+        # Deliberately does not raise MODEL_NOT_IDENTIFIED here -- this is an
+        # extra chance to resolve, not a new alerting path. If Booking already
+        # raised the finding, it stays open until a human resolves it.
+        return {"skipped": True, "reason": "unresolved_from_invoice", "matchStage": stage, "candidateCount": len(matched)}
+    except Exception:
+        logger.warning("sync_model_resolution_from_invoice failed", exc_info=True)
+        return {"error": True}
+
+
 def sync_model_resolution(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
 ) -> dict[str, Any]:
@@ -562,4 +719,4 @@ def sync_model_resolution(
         return {"error": True}
 
 
-__all__ = ["sync_model_resolution"]
+__all__ = ["sync_model_resolution", "sync_model_resolution_from_invoice"]
