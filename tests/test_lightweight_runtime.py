@@ -89,7 +89,11 @@ def test_postgresql_engine_uses_resilient_pool_configuration(monkeypatch) -> Non
         "keepalives_idle": 30,
         "keepalives_interval": 10,
         "keepalives_count": 3,
-        "options": "-c statement_timeout=10000 -c role=audit_core_runtime",
+        "options": (
+            "-c statement_timeout=10000 "
+            "-c idle_in_transaction_session_timeout=60000 "
+            "-c role=audit_core_runtime"
+        ),
     }
 
 
