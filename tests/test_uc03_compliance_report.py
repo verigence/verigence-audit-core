@@ -1,16 +1,37 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, text
 
-from audit_core.security import Principal
+from audit_core.authorization import AuthorizationError
+from audit_core.security import HumanPrincipal
+from audit_core.security_authorization import SecurityAuthorizationDecision
 from audit_core.uc03_compliance_report import get_compliance_report
 
 _PERMISSION = "audit.finding.read"
+
+
+@dataclass
+class _AllowAuthorization:
+    """Same fake used by test_uc03_work_items.py -- a live-check double,
+    matching what get_compliance_report actually calls now (previously this
+    file passed a Principal with a static permissions tuple, which is NOT
+    what the endpoint checks; that mismatch is exactly how the real 403 in
+    production went unnoticed by this test)."""
+
+    calls: list[tuple[str, str, str]] = field(default_factory=list)
+
+    def check_user_permission(self, *, user_id: str, tenant_id: str, permission_key: str) -> SecurityAuthorizationDecision:
+        self.calls.append((user_id, tenant_id, permission_key))
+        return SecurityAuthorizationDecision(
+            allowed=True, reason_code="AUTHORIZED", user_id=user_id,
+            tenant_id=tenant_id, permission_key=permission_key, role_key="TL",
+        )
 
 
 @pytest.fixture
@@ -128,15 +149,12 @@ def compliance_report_setup():
     engine.dispose()
 
 
-def _principal(actor_id: str, tenant_id: str) -> Principal:
-    return Principal(subject=actor_id, tenant_id=tenant_id, permissions=(_PERMISSION,))
-
-
 def test_compliance_report_header_and_summary(compliance_report_setup) -> None:
     setup = compliance_report_setup
     report = get_compliance_report(
         setup["tenant_id"], setup["journey_id"],
-        principal=_principal(setup["actor_id"], setup["tenant_id"]),
+        human_principal=HumanPrincipal(subject=setup["actor_id"]),
+        authorization_client=_AllowAuthorization(),
         connection=setup["connection"],
     )
 
@@ -153,7 +171,8 @@ def test_compliance_report_sections_carry_line_items_and_flags(compliance_report
     setup = compliance_report_setup
     report = get_compliance_report(
         setup["tenant_id"], setup["journey_id"],
-        principal=_principal(setup["actor_id"], setup["tenant_id"]),
+        human_principal=HumanPrincipal(subject=setup["actor_id"]),
+        authorization_client=_AllowAuthorization(),
         connection=setup["connection"],
     )
     by_key = {section.key: section for section in report.sections}
@@ -181,7 +200,8 @@ def test_compliance_report_resolved_history(compliance_report_setup) -> None:
     setup = compliance_report_setup
     report = get_compliance_report(
         setup["tenant_id"], setup["journey_id"],
-        principal=_principal(setup["actor_id"], setup["tenant_id"]),
+        human_principal=HumanPrincipal(subject=setup["actor_id"]),
+        authorization_client=_AllowAuthorization(),
         connection=setup["connection"],
     )
 
@@ -195,3 +215,27 @@ def test_compliance_report_resolved_history(compliance_report_setup) -> None:
     # And it should NOT also appear as an open flag anywhere.
     for section in report.sections:
         assert resolved.findingId not in {flag.findingId for flag in section.flags}
+
+
+def test_compliance_report_denies_when_the_live_check_says_no(compliance_report_setup) -> None:
+    """Regression: this endpoint originally authorized via the static
+    authorize()/Principal.permissions JWT-claim check, which had no proven
+    real caller anywhere in the app and, in production, denied every real
+    request -- the page never appeared. Proves the live-check wiring is real
+    in both directions, not just the allow path the other tests exercise."""
+    setup = compliance_report_setup
+
+    class _DenyAuthorization:
+        def check_user_permission(self, *, user_id: str, tenant_id: str, permission_key: str) -> SecurityAuthorizationDecision:
+            return SecurityAuthorizationDecision(
+                allowed=False, reason_code="PERMISSION_DENIED", user_id=user_id,
+                tenant_id=tenant_id, permission_key=permission_key, role_key=None,
+            )
+
+    with pytest.raises(AuthorizationError):
+        get_compliance_report(
+            setup["tenant_id"], setup["journey_id"],
+            human_principal=HumanPrincipal(subject=setup["actor_id"]),
+            authorization_client=_DenyAuthorization(),
+            connection=setup["connection"],
+        )

@@ -25,14 +25,94 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import Connection, text
 
-from audit_core.authorization import authorize
-from audit_core.business_assignments import require_business_scope
+from audit_core.authorization import AuthorizationError
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import get_connection, get_principal
-from audit_core.errors import NotFoundError
-from audit_core.security import Principal
+from audit_core.dependencies import get_connection, get_human_principal
+from audit_core.errors import DependencyUnavailableError, NotFoundError
+from audit_core.security import HumanPrincipal
+from audit_core.security_authorization import (
+    SecurityAuthorizationClient,
+    SecurityAuthorizationError,
+    get_security_authorization_client,
+)
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["compliance-report"])
+
+# Same permission key uc03_review_queue.py uses, checked the same way: a live
+# call to the Security service (SecurityAuthorizationClient.check_user_
+# permission), not the static authorize()/Principal.permissions JWT-claim
+# check findings.py happens to use for this same key. That static check has
+# no proven, reachable frontend caller anywhere in this codebase (findings.py's
+# own listFindings/createFinding are dead code, never called) -- there was no
+# actual evidence a real user's JWT carries this permission in its static
+# claims, and in practice it didn't: every real request 403'd. The live
+# role-based check below is what Review Queue actually exercises daily.
+_PERMISSION_KEY = "audit.finding.read"
+
+
+def _authorize(
+    client: SecurityAuthorizationClient,
+    *,
+    human_principal: HumanPrincipal,
+    tenant_id: str,
+) -> None:
+    try:
+        decision = client.check_user_permission(
+            user_id=human_principal.subject,
+            tenant_id=tenant_id,
+            permission_key=_PERMISSION_KEY,
+        )
+    except SecurityAuthorizationError as exc:
+        raise DependencyUnavailableError(
+            detail="The compliance report is temporarily unavailable. Please try again."
+        ) from exc
+    if not decision.allowed:
+        raise AuthorizationError(
+            error_code="VAC-AUTH-002",
+            status_code=403,
+            title="Permission denied",
+        )
+
+
+def _require_business_scope(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    actor_id: str,
+    dealer_id: UUID,
+    outlet_id: UUID | None,
+) -> None:
+    # require_business_scope (business_assignments.py) takes a Principal
+    # (subject + tenant_id + permissions) -- HumanPrincipal only carries
+    # subject, so it isn't a fit. Same query uc03_review_queue.py's own
+    # _QUEUE_SQL embeds inline, extracted here for one journey instead of
+    # filtering a whole result set.
+    assigned = connection.execute(
+        text(
+            """
+            SELECT 1
+            FROM auditcore.business_assignments
+            WHERE tenant_id = :tenant_id
+              AND security_actor_id = :actor_id
+              AND assignment_status = 'ACTIVE'
+              AND effective_from <= now()
+              AND (effective_to IS NULL OR effective_to >= now())
+              AND (
+                    dealer_id IS NULL
+                    OR (dealer_id = :dealer_id AND (outlet_id IS NULL OR outlet_id = :outlet_id))
+              )
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "actor_id": actor_id, "dealer_id": dealer_id, "outlet_id": outlet_id},
+    ).scalar_one_or_none()
+    if assigned is None:
+        raise AuthorizationError(
+            error_code="VAC-AUTH-004",
+            status_code=403,
+            title="Business scope denied",
+        )
+
 
 # A finding raised more recently than this is flagged isNew=True so a TL/PM
 # revisiting a report can tell what showed up since a previous look, without
@@ -434,21 +514,21 @@ def _findings(connection: Connection, tenant_id: str, journey_id: UUID):
 def get_compliance_report(
     tenant_id: str,
     journey_id: UUID,
-    principal: Annotated[Principal, Depends(get_principal)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> ComplianceReportResponse:
-    # A PC can already reach this same finding data through the Review Queue
-    # (audit.finding.read is not TL/PM-exclusive at the permission-key level);
+    # Same finding data a PC can already reach through the Review Queue;
     # restricting the *action* of generating a Compliance Report to TL/PM is
-    # enforced at the frontend menu today. Revisit if that needs to become a
-    # hard backend rule.
-    authorize(principal, tenant_id=tenant_id, permission="audit.finding.read")
+    # enforced at the frontend menu today, not here. Revisit if that needs to
+    # become a hard backend rule.
+    _authorize(authorization_client, human_principal=human_principal, tenant_id=tenant_id)
     set_tenant_context(connection, tenant_id)
     journey = _journey_scope(connection, tenant_id, journey_id)
-    require_business_scope(
+    _require_business_scope(
         connection,
-        principal,
         tenant_id=tenant_id,
+        actor_id=human_principal.subject,
         dealer_id=journey["dealer_id"],
         outlet_id=journey["outlet_id"],
     )
