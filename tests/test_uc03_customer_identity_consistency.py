@@ -136,7 +136,10 @@ def _open_wrong_document_findings(c) -> list[dict]:
     ]
 
 
-def test_skips_when_no_kyc_document_yet(journey) -> None:
+def test_customer_name_check_is_a_noop_without_kyc_but_dealer_check_still_runs(journey) -> None:
+    # No KYC document exists yet -- nothing to check customer names
+    # against -- but the dealer-name check is independent of that and
+    # still runs (checked against the dealer master record, not a KYC doc).
     c = journey
     _set_named_field(
         c, stage_code="BOOKING", document_type_key="booking_form",
@@ -147,7 +150,7 @@ def test_skips_when_no_kyc_document_yet(journey) -> None:
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
 
-    assert result == {"skipped": True, "reason": "no_kyc_name_yet"}
+    assert result == {"raised": 0, "resolved": 0, "referenceName": None}
     assert _open_wrong_document_findings(c) == []
 
 
@@ -270,3 +273,104 @@ def test_kyc_document_itself_is_not_checked_against_its_own_name(journey) -> Non
 
     assert result["raised"] == 0
     assert result["resolved"] == 0
+
+
+# ── Receipt dealer-name consistency ─────────────────────────────────────────
+# The fixture's dealer is named 'D' (auditcore.dealers.dealer_name).
+
+def test_receipt_dealer_name_check_runs_even_without_kyc(journey) -> None:
+    # Independent of the customer-name check: no KYC document exists yet,
+    # but a receipt from a different dealership must still be caught.
+    c = journey
+    _set_named_field(
+        c, stage_code="BOOKING", document_type_key="dealer_receipt",
+        field_key="dealer_name", value="Some Other Motors Pvt Ltd",
+    )
+
+    result = cic.sync_customer_identity_consistency(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+
+    assert result["raised"] == 1
+    findings = _open_wrong_document_findings(c)
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "HIGH"
+    assert findings[0]["rule_key"].startswith("WRONG_DOCUMENT:DEALER:")
+
+
+def test_matching_dealer_name_raises_nothing(journey) -> None:
+    c = journey
+    _set_named_field(
+        c, stage_code="DELIVERY", document_type_key="payment_receipt",
+        field_key="dealer_name", value="D",
+    )
+
+    result = cic.sync_customer_identity_consistency(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+
+    assert result["raised"] == 0
+    assert _open_wrong_document_findings(c) == []
+
+
+def test_dealer_check_and_customer_check_track_independently_on_one_document(journey) -> None:
+    # A single receipt document can fail both checks (wrong customer AND
+    # wrong dealer) -- each must raise and resolve on its own rule_key,
+    # never clobbering the other.
+    c = journey
+    _set_named_field(
+        c, stage_code="BOOKING", document_type_key="aadhaar",
+        field_key="aadhaar_name", value="Sanjaya Kumar Mohanty",
+    )
+    receipt_doc = _set_named_field(
+        c, stage_code="BOOKING", document_type_key="dealer_receipt",
+        field_key="customer_name", value="Priya Nair",
+    )
+    _set_named_field(
+        c, stage_code="BOOKING", document_type_key="dealer_receipt",
+        field_key="dealer_name", value="Some Other Motors Pvt Ltd",
+        document_id=receipt_doc,
+    )
+
+    result = cic.sync_customer_identity_consistency(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+
+    assert result["raised"] == 2
+    findings = {f["rule_key"] for f in _open_wrong_document_findings(c)}
+    assert findings == {
+        f"WRONG_DOCUMENT:{receipt_doc}",
+        f"WRONG_DOCUMENT:DEALER:{receipt_doc}",
+    }
+
+    # Correcting only the dealer name resolves that one finding and leaves
+    # the customer-name mismatch open.
+    c.execute(
+        text("UPDATE auditcore.journey_document_extracted_fields "
+             "SET effective_value = CAST(:v AS jsonb) "
+             "WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:doc AND field_key='dealer_name'"),
+        {"v": json.dumps("D"), "t": c.tenant_id, "j": c.journey_id, "doc": receipt_doc},
+    )
+    result2 = cic.sync_customer_identity_consistency(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result2["resolved"] == 1
+    remaining = {f["rule_key"] for f in _open_wrong_document_findings(c)}
+    assert remaining == {f"WRONG_DOCUMENT:{receipt_doc}"}
+
+
+def test_non_receipt_document_types_are_not_dealer_checked(journey) -> None:
+    # A dealer_name-like field on some other document type must not be
+    # picked up -- only dealer_receipt/payment_receipt are in scope.
+    c = journey
+    _set_named_field(
+        c, stage_code="BOOKING", document_type_key="booking_form",
+        field_key="dealer_name", value="Some Other Motors Pvt Ltd",
+    )
+
+    result = cic.sync_customer_identity_consistency(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+
+    assert result["raised"] == 0
+    assert _open_wrong_document_findings(c) == []
