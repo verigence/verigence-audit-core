@@ -932,6 +932,20 @@ def _sync_booking_document(
         correlation_id="",
     )
 
+    # The same physical receipt uploaded more than once must not be counted
+    # as more money paid. Scoped to same-type receipts only (dealer_receipt
+    # vs dealer_receipt, payment_receipt vs payment_receipt) -- never raises.
+    from audit_core.uc03_duplicate_receipt_detection import (
+        sync_duplicate_receipt_detection,
+    )
+
+    sync_duplicate_receipt_detection(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        correlation_id="",
+    )
+
     from audit_core.uc03_async_sync_tasks import reconcile_payments_with_escalation
 
     # Booking's own canonical projection runs before SKU resolution below,
