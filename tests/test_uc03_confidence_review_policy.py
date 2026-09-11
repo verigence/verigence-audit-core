@@ -135,6 +135,19 @@ def test_background_sync_task_gives_itself_headroom_past_the_pool_default_timeou
         function_source.index("SET LOCAL statement_timeout")
         < function_source.index("_sync_booking_document(")
     )
+    # statement_timeout alone only bounds a single SQL statement -- it does
+    # nothing while the connection sits idle waiting on a DI/Security HTTP
+    # call between statements. Confirmed live: the server's own default
+    # idle_in_transaction_session_timeout killed a background sync mid-flight
+    # (psycopg.errors.IdleInTransactionSessionTimeout at commit time),
+    # discarding whatever that document's sync had already done, with no
+    # caller watching to retry it. This transaction needs the same
+    # deliberate headroom on that axis too.
+    assert "SET LOCAL idle_in_transaction_session_timeout" in function_source
+    assert (
+        function_source.index("SET LOCAL idle_in_transaction_session_timeout")
+        < function_source.index("_sync_booking_document(")
+    )
 
 
 def test_confirm_calls_attribute_resolution_directly_not_via_review_v2() -> None:

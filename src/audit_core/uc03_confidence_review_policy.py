@@ -1138,6 +1138,17 @@ def _run_sync_booking_document_task(
             # pool generally) real headroom instead of tightening the lock
             # further.
             connection.execute(text("SET LOCAL statement_timeout = '45s'"))
+            # statement_timeout alone only bounds a single SQL statement --
+            # it does nothing while the connection sits idle waiting on a DI/
+            # Security HTTP call between statements (a Security token fetch,
+            # then two DI calls, each up to 15s, all made while this same
+            # transaction is open). Confirmed live: the server's own default
+            # idle_in_transaction_session_timeout killed one of these mid-
+            # sync (psycopg.errors.IdleInTransactionSessionTimeout at commit
+            # time), discarding whatever this document's sync had already
+            # done. Give this one background transaction the same deliberate
+            # headroom as statement_timeout above, for the same reason.
+            connection.execute(text("SET LOCAL idle_in_transaction_session_timeout = '90s'"))
             _sync_booking_document(
                 connection,
                 tenant_id=tenant_id,
