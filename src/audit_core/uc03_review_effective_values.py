@@ -539,6 +539,21 @@ def confirm_delivery_review_v2_effective_values(
             documents=_corrected_documents(documents, corrections),
             actor_id=human_principal.subject,
         )
+        # Same safety-net treatment for the Delivery-invoice SKU fallback
+        # (uc03_model_resolution.sync_model_resolution_from_invoice): a PC
+        # correction to the invoice's model/SKU text at confirm time must
+        # get its own chance to resolve here too, not wait for the next
+        # async trigger. A no-op once a SKU is already pinned.
+        from audit_core.uc03_async_sync_tasks import (
+            sync_model_resolution_from_invoice_with_escalation,
+        )
+
+        sync_model_resolution_from_invoice_with_escalation(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            correlation_id="",
+        )
         next_version = expected_version + 1
         connection.execute(
             text(

@@ -31,17 +31,21 @@ from sqlalchemy import Connection, text
 
 from audit_core.uc03_delivery_commands import _machine_flag
 from audit_core.uc03_manual_verification import _resolve_finding
-from audit_core.uc03_model_resolution import sync_model_resolution
+from audit_core.uc03_model_resolution import (
+    sync_model_resolution,
+    sync_model_resolution_from_invoice,
+)
 from audit_core.uc03_payment_reconciliation import reconcile_payments
 
 logger = structlog.get_logger(__name__)
 
 _FINDING_TYPE = "AUTOMATED_SYNC_FAILURE"
 StageCode = Literal["BOOKING", "DELIVERY"]
-TaskType = Literal["SKU_RESOLUTION", "PAYMENT_RECONCILIATION"]
+TaskType = Literal["SKU_RESOLUTION", "SKU_RESOLUTION_INVOICE", "PAYMENT_RECONCILIATION"]
 
 _TASK_LABELS: dict[TaskType, str] = {
     "SKU_RESOLUTION": "match the vehicle model against the price masters",
+    "SKU_RESOLUTION_INVOICE": "match the vehicle model against the price masters using the Delivery invoice",
     "PAYMENT_RECONCILIATION": "reconcile payments against the bank statement",
 }
 
@@ -60,6 +64,10 @@ def _flag_failure(
     correlation_id: str,
 ) -> None:
     label = _TASK_LABELS[task_type]
+    title_subject = (
+        "model matching" if task_type in ("SKU_RESOLUTION", "SKU_RESOLUTION_INVOICE")
+        else "payment reconciliation"
+    )
     _machine_flag(
         connection,
         tenant_id=tenant_id,
@@ -68,7 +76,7 @@ def _flag_failure(
         rule_key=_rule_key(task_type, journey_id),
         finding_type=_FINDING_TYPE,
         severity="MEDIUM",
-        title=f"Automatic {'model matching' if task_type == 'SKU_RESOLUTION' else 'payment reconciliation'} could not complete",
+        title=f"Automatic {title_subject} could not complete",
         description=(
             f"The system tried to automatically {label} and hit an unexpected "
             "error. This does not block the journey, but the result needs a "
@@ -225,6 +233,42 @@ def sync_model_resolution_with_escalation(
     return result
 
 
+def sync_model_resolution_from_invoice_with_escalation(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    correlation_id: str,
+) -> dict[str, Any]:
+    """Delivery-invoice SKU fallback, escalating a repeated internal failure
+    to the PC. A no-op (not an error) once a SKU is already pinned, or when
+    the confirmed invoice carries no sku_code/model_name_raw at all -- only a
+    genuine internal exception escalates."""
+
+    result = sync_model_resolution_from_invoice(
+        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
+    )
+    if result.get("error"):
+        _flag_failure(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code="DELIVERY",
+            task_type="SKU_RESOLUTION_INVOICE",
+            correlation_id=correlation_id,
+        )
+    else:
+        _resolve_failure(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code="DELIVERY",
+            task_type="SKU_RESOLUTION_INVOICE",
+            correlation_id=correlation_id,
+        )
+    return result
+
+
 def reconcile_payments_with_escalation(
     connection: Connection,
     *,
@@ -262,5 +306,6 @@ def reconcile_payments_with_escalation(
 __all__ = [
     "reconcile_payments_with_escalation",
     "sync_document_confirmation_status",
+    "sync_model_resolution_from_invoice_with_escalation",
     "sync_model_resolution_with_escalation",
 ]

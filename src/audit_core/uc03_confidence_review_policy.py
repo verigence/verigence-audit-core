@@ -917,6 +917,21 @@ def _sync_booking_document(
         correlation_id="",
     )
 
+    # Every document on this Journey must belong to the same customer.
+    # Reacts to any document of either stage (a KYC document confirming
+    # after the fact re-checks documents already on file; a non-KYC document
+    # confirming after KYC is checked against it immediately) -- never raises.
+    from audit_core.uc03_customer_identity_consistency import (
+        sync_customer_identity_consistency,
+    )
+
+    sync_customer_identity_consistency(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        correlation_id="",
+    )
+
     from audit_core.uc03_async_sync_tasks import reconcile_payments_with_escalation
 
     # Booking's own canonical projection runs before SKU resolution below,
@@ -1018,6 +1033,22 @@ def _sync_booking_document(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
+        )
+
+        # A Booking that never pinned a SKU (0 or >1 price-master matches,
+        # even after the Booking Form's own ex-showroom tiebreak) gets one
+        # more chance here: the Delivery invoice's own sku_code or model/
+        # variant text, once that invoice confirms. Never raises; a no-op
+        # once a SKU is already pinned by either path.
+        from audit_core.uc03_async_sync_tasks import (
+            sync_model_resolution_from_invoice_with_escalation,
+        )
+
+        sync_model_resolution_from_invoice_with_escalation(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            correlation_id="",
         )
 
     # Booking Confirmed is data-driven off cumulative payments, independent of
