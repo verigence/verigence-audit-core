@@ -82,11 +82,25 @@ def _to_decimal(value: Any) -> Decimal | None:
 
 # ── inputs ────────────────────────────────────────────────────────────────────
 def _resolution_inputs(
-    connection: Connection, *, tenant_id: str, journey_id: UUID
+    connection: Connection, *, tenant_id: str, journey_id: UUID, require_model: bool = True
 ) -> dict[str, Any] | None:
     """Reviewed model / offered total / offered ex-showroom for this journey.
 
-    Returns None when there is nothing to resolve yet (no model snapshot).
+    Returns None when there is nothing to resolve yet (no model snapshot) --
+    unless ``require_model=False``. That's sync_model_resolution_from_
+    invoice's own case: it exists SPECIFICALLY for when the Booking side
+    never captured a usable model at all (no journey_products row yet, or
+    one with no model_name_snapshot), substituting the Delivery invoice's
+    own model/sku_code text instead. Bailing out here just because that
+    exact condition is true was a real, confirmed bug: the one caller this
+    was built for could never actually reach its own fallback logic, since
+    it always hit this same early return first -- "resolve from the invoice
+    when the Booking model isn't found" silently never ran for the one case
+    it names. Only the registration/commercial inputs below are genuinely
+    needed by that caller; model_name/variant_name/colour_name/
+    product_sku_id/selection_status all come back None when there's no row,
+    which is exactly what it wants (it overwrites model_name/variant_name
+    from the invoice regardless).
     """
     jp = connection.execute(
         text(
@@ -102,7 +116,17 @@ def _resolution_inputs(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().one_or_none()
-    if jp is None or jp["model_name"] is None:
+    if jp is None:
+        if require_model:
+            return None
+        jp = {
+            "product_sku_id": None,
+            "model_name": None,
+            "variant_name": None,
+            "colour_name": None,
+            "selection_status": None,
+        }
+    elif require_model and jp["model_name"] is None:
         return None
 
     reg = connection.execute(
@@ -514,7 +538,13 @@ def sync_model_resolution_from_invoice(
         if sku_code is None and invoice_model is None:
             return {"skipped": True, "reason": "no_invoice_model_data"}
 
-        inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id)
+        # require_model=False: this function's whole purpose is resolving a
+        # SKU when the Booking side never captured a usable model at all --
+        # requiring one here first would defeat it. See _resolution_inputs'
+        # own docstring for the bug this fixes.
+        inputs = _resolution_inputs(
+            connection, tenant_id=tenant_id, journey_id=journey_id, require_model=False
+        )
         if inputs is None:
             return {"skipped": True, "reason": "no_booking_snapshot"}
 

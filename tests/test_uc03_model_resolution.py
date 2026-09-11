@@ -655,3 +655,68 @@ def test_invoice_fallback_skips_without_any_invoice_data(journey) -> None:
     )
 
     assert result == {"skipped": True, "reason": "no_invoice_model_data"}
+
+
+def test_invoice_fallback_resolves_with_no_model_snapshot_at_all(journey) -> None:
+    # Regression test for a real bug: _resolution_inputs unconditionally
+    # returned None whenever journey_products.model_name_snapshot was
+    # missing -- exactly the condition this fallback exists to handle (the
+    # Booking side never captured a usable model at all, not merely an
+    # unmatched one). It could never reach its own resolution logic. Every
+    # other test above seeds a non-null (if garbage) model_name_snapshot
+    # via _set_journey_product, which never exercised this path -- here the
+    # row is left out entirely, standing in for a Booking whose own model
+    # materialization never ran.
+    c = journey
+    (sku_id,) = _seed_price_list(c, [{
+        "model": "BOLERO NEO", "variant": "N10",
+        "components": {"EX_SHOWROOM": "900000"},
+    }])
+    sku_code = c.execute(
+        text("SELECT sku_code FROM auditcore.product_skus WHERE product_sku_id=:s"),
+        {"s": sku_id},
+    ).scalar_one()
+    _set_invoice_field(c, "sku_code", sku_code)
+
+    result = mr.sync_model_resolution_from_invoice(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+
+    assert result.get("resolved") is True
+    pinned = c.execute(
+        text("SELECT product_sku_id FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert pinned == sku_id
+
+
+def test_invoice_fallback_resolves_with_null_model_snapshot(journey) -> None:
+    # Same regression, the other shape of the bug: a journey_products row
+    # DOES exist (e.g. a partial materialization ran) but its
+    # model_name_snapshot column is genuinely NULL, not merely blank text.
+    c = journey
+    (sku_id,) = _seed_price_list(c, [{
+        "model": "MARAZZO", "variant": "M6",
+        "components": {"EX_SHOWROOM": "1100000"},
+    }])
+    c.execute(
+        text("INSERT INTO auditcore.journey_products "
+             "(tenant_id, journey_id, model_name_snapshot, selection_source) "
+             "VALUES (:t, :j, NULL, 'EVIDENCE')"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    )
+    _set_invoice_field(c, "model_name_raw", "Marazzo")
+    _set_invoice_field(c, "variant_raw", "M6")
+
+    result = mr.sync_model_resolution_from_invoice(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+
+    assert result.get("resolved") is True
+    pinned = c.execute(
+        text("SELECT product_sku_id FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert pinned == sku_id
