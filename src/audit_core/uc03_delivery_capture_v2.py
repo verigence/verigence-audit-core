@@ -992,7 +992,14 @@ def _resyncable_document_ids(documents: list[dict[str, Any]]) -> list[UUID]:
     ]
 
 
-@router.post("/resync")
+class DeliveryCaptureV2ResyncResponse(BaseModel):
+    documentsFound: int
+    documentsResynced: int
+    documentsNotYetExtracted: int
+    queuedDocumentCount: int
+
+
+@router.post("/resync", response_model=DeliveryCaptureV2ResyncResponse)
 def resync_delivery_capture_v2(
     tenant_id: str,
     journey_id: UUID,
@@ -1001,7 +1008,7 @@ def resync_delivery_capture_v2(
     connection: Annotated[Connection, Depends(get_connection)],
     engine: Annotated[Engine, Depends(get_engine)],
     background_tasks: BackgroundTasks,
-) -> dict[str, Any]:
+) -> DeliveryCaptureV2ResyncResponse:
     """Force every already-classified Delivery document through the full
     per-document sync pipeline again (durable fact copy, MANUAL_VERIFICATION,
     payment reconciliation, canonical materialization, document-gap
@@ -1038,4 +1045,9 @@ def resync_delivery_capture_v2(
             service_id=f"manual-resync:{human_principal.subject}",
             stage_code="DELIVERY",
         )
-    return {"queuedDocumentCount": len(document_ids)}
+    return DeliveryCaptureV2ResyncResponse(
+        documentsFound=len(documents),
+        documentsResynced=len(document_ids),
+        documentsNotYetExtracted=len(documents) - len(document_ids),
+        queuedDocumentCount=len(document_ids),
+    )

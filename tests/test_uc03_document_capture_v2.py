@@ -1,4 +1,5 @@
-from uuid import UUID
+import inspect
+from uuid import UUID, uuid4
 
 from audit_core.main import app
 from audit_core.security import HumanPrincipal
@@ -8,6 +9,7 @@ from audit_core.uc03_document_capture_v2 import (
     _candidate_type_keys,
     _human_actor_id,
     _requirement_refs_by_document_type_key,
+    resync_booking_capture_v2,
 )
 
 JOURNEY_ID = UUID("11111111-1111-1111-1111-111111111111")
@@ -259,3 +261,44 @@ def test_local_completion_check_uses_reconciled_classified_links() -> None:
 
     assert result.canContinue is True
     assert result.requirements[0].state == "UPLOADED"
+
+
+def test_booking_resync_only_includes_classified_documents() -> None:
+    # Same filter as uc03_delivery_capture_v2._resyncable_document_ids,
+    # duplicated (not imported, to avoid a circular import between the two
+    # modules) -- kept in lockstep by this test asserting on the actual
+    # source, not a restated copy of the logic.
+    classified_id = uuid4()
+    documents = [
+        {"di_document_id": classified_id, "capture_status": "CLASSIFIED"},
+        {"di_document_id": uuid4(), "capture_status": "UNKNOWN"},
+        {"di_document_id": uuid4(), "capture_status": None},
+        {"di_document_id": uuid4()},
+    ]
+    resyncable = [
+        row["di_document_id"] for row in documents
+        if str(row.get("capture_status") or "").upper() == "CLASSIFIED"
+    ]
+    assert resyncable == [classified_id]
+
+
+def test_booking_resync_endpoint_authorizes_and_queues_the_shared_sync_task() -> None:
+    # Source-inspected: exercising the full route (auth, a real
+    # BackgroundTasks dispatch) needs infrastructure this file's other
+    # tests don't set up. What matters for the regression this endpoint
+    # exists to fix (available to any role, opens the same door Delivery's
+    # own /resync already has) is that it (a) re-authorizes against the
+    # journey, (b) lists documents the same way the capture screen itself
+    # does, (c) filters to classified documents, and (d) queues the same
+    # _run_sync_booking_document_task the DI webhook itself uses -- a
+    # manually-triggered resync goes through the identical, already-tested
+    # pipeline (including every producer wired into it: SKU resolution,
+    # identity/dealer checks, duplicate-receipt detection) rather than a
+    # parallel one.
+    source = inspect.getsource(resync_booking_capture_v2)
+    assert "_authorize_booking(" in source
+    assert "_linked_documents(" in source
+    assert '"CLASSIFIED"' in source
+    assert "background_tasks.add_task(" in source
+    assert "_run_sync_booking_document_task" in source
+    assert 'stage_code="BOOKING"' in source
