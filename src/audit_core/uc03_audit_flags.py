@@ -101,8 +101,21 @@ class FlagCreateCommand(BaseModel):
     category: str = Field(min_length=1, max_length=100)
     severity: str = Field(min_length=1, max_length=20)
     summary: str = Field(min_length=1, max_length=500)
-    remarks: str | None = Field(default=None, max_length=4000)
+    # Required, not optional: this is the ONLY thing that becomes the
+    # finding's description (create_flag's execute() sets description=
+    # (payload.remarks or "").strip() or None). Confirmed live: every
+    # machine-raised finding in this codebase carries a real, specific
+    # description; a human-raised flag with remarks left blank -- the
+    # common case when it was merely optional -- was the actual gap,
+    # landing with nothing beyond its one-line title to explain it.
+    remarks: str = Field(min_length=1, max_length=4000)
     evidenceIds: list[UUID] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def require_non_blank_remarks(self):
+        if not self.remarks.strip():
+            raise ValueError("Remarks are required and cannot be blank.")
+        return self
 
 
 class FlagLifecycleCommand(BaseModel):
