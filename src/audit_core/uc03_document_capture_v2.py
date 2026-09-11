@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from functools import lru_cache
+from types import SimpleNamespace
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -531,6 +532,124 @@ def _reconcile_documents(
                 "classified_type": classified_type,
                 "requirement_key": requirement_key,
             },
+        )
+
+
+def _ensure_evidence_link_for_resync(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    requirement_ref: Any,
+    document_id: UUID,
+    service_id: str,
+) -> bool:
+    """Resync's own filter only re-runs _sync_booking_document for a document
+    that ALREADY has an ACTIVE ``evidence`` row -- that row is normally
+    created by DI's async "link" callback (acknowledge_booking_document_link),
+    a separate mechanism from document_capture_v2_documents.capture_status,
+    which _reconcile_documents/_reconcile_delivery_documents refresh above.
+
+    Confirmed live gap: DI's list_documents can report a document CLASSIFIED
+    (updating capture_status correctly) while the one-time "link" callback
+    for that same document never landed at Audit Core -- dropped during an
+    earlier incident, or simply never retried, since DI considers its own
+    delivery successful once it gets any 2xx and has no other reason to
+    re-send it. In that case _sync_booking_document's very first check
+    (``link is None ... return 0``) silently no-ops forever: resync reports
+    a document as "resynced" (the background task ran without error) while
+    genuinely doing nothing, no matter how many times it's called, because
+    nothing else ever creates the missing evidence row. This is the leading,
+    well-evidenced explanation for "resync says done, but no payments/
+    insurance/etc ever land in the canonical tables."
+
+    Closes that gap by running the exact same idempotent link logic the
+    webhook itself uses (uc03_pc_booking_documents.acknowledge_booking_
+    document_link) whenever an ACTIVE evidence row is not already present
+    for this document -- safe to call redundantly (that function's own
+    upsert logic is what the live webhook already relies on for replay
+    safety). A ConflictError/NotFoundError here (the requirement is not
+    currently applicable, or belongs to a different journey than expected)
+    means this specific document genuinely cannot be linked yet -- skip it
+    rather than fail the whole resync.
+    """
+    existing = connection.execute(
+        text(
+            """
+            SELECT association_status
+            FROM auditcore.evidence
+            WHERE tenant_id=:tenant_id AND di_document_id=:document_id
+            """
+        ),
+        {"tenant_id": tenant_id, "document_id": document_id},
+    ).mappings().one_or_none()
+    if existing is not None and str(existing["association_status"]) == "ACTIVE":
+        return True
+
+    from audit_core.uc03_pc_booking_documents import (
+        BookingDocumentLinkCommand,
+        acknowledge_booking_document_link,
+    )
+
+    try:
+        acknowledge_booking_document_link(
+            payload=BookingDocumentLinkCommand(
+                requirementRef=requirement_ref,
+                documentId=document_id,
+            ),
+            service_principal=SimpleNamespace(subject=service_id),
+            connection=connection,
+        )
+        return True
+    except (ConflictError, NotFoundError) as exc:
+        logger.warning(
+            "uc03_resync_evidence_link_backfill_skipped",
+            tenant_id=tenant_id,
+            journey_id=str(journey_id),
+            document_id=str(document_id),
+            requirement_ref=str(requirement_ref),
+            error=str(exc),
+        )
+        return False
+
+
+def _backfill_evidence_links_for_resync(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    documents: list[dict[str, Any]],
+    document_ids: list[UUID],
+    requirements: list[dict[str, Any]],
+    service_id: str,
+) -> None:
+    """Run _ensure_evidence_link_for_resync for every document about to be
+    resynced. Kept as one small helper (shared verbatim by both Booking's
+    and Delivery's resync endpoints) so the two stages can't drift the way
+    the receipt-document-type constant once did.
+    """
+    requirement_ref_by_key = {
+        str(row["requirement_key"]): row["requirement_ref"]
+        for row in requirements
+        if row.get("requirement_ref") is not None
+    }
+    by_document_id = {row["di_document_id"]: row for row in documents}
+    for document_id in document_ids:
+        row = by_document_id.get(document_id)
+        requirement_ref = (
+            requirement_ref_by_key.get(str(row.get("requirement_key")))
+            if row is not None
+            else None
+        )
+        if requirement_ref is None:
+            continue
+        _ensure_evidence_link_for_resync(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            requirement_ref=requirement_ref,
+            document_id=document_id,
+            service_id=service_id,
         )
 
 
@@ -1302,6 +1421,20 @@ def resync_booking_capture_v2(
         row["di_document_id"] for row in documents
         if str(row.get("capture_status") or "").upper() == "CLASSIFIED"
     ]
+
+    # Backfill any missing/inactive evidence link BEFORE queuing the sync
+    # task -- see _ensure_evidence_link_for_resync's own docstring. Without
+    # this, a document whose one-time DI "link" callback never landed would
+    # report as resynced while _sync_booking_document silently does nothing.
+    _backfill_evidence_links_for_resync(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        documents=documents,
+        document_ids=document_ids,
+        requirements=requirements,
+        service_id=f"manual-resync:{human_principal.subject}",
+    )
 
     from audit_core.uc03_confidence_review_policy import _run_sync_booking_document_task
 
