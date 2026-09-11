@@ -8,7 +8,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, Depends, Header, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Connection, Engine, text
 
@@ -1161,4 +1161,80 @@ def set_booking_declaration_v2(
         requirements=requirements,
         declaration_rows=_declarations(connection, tenant_id, journey_id),
         audit_documents=_linked_documents(connection, tenant_id, journey_id),
+    )
+
+
+class BookingCaptureV2ResyncResponse(BaseModel):
+    documentsFound: int
+    documentsResynced: int
+    documentsNotYetExtracted: int
+    queuedDocumentCount: int
+
+
+@router.post("/booking/resync", response_model=BookingCaptureV2ResyncResponse)
+def resync_booking_capture_v2(
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    engine: Annotated[Engine, Depends(get_engine)],
+    background_tasks: BackgroundTasks,
+) -> BookingCaptureV2ResyncResponse:
+    """The Booking counterpart of uc03_delivery_capture_v2.resync_delivery_
+    capture_v2 -- open to any role with legitimate access to this Journey
+    (per _authorize_booking's own scoping, not restricted further here).
+
+    1. Lists every document uploaded for this Journey (via _linked_documents,
+       the same durable listing the capture screen itself reads).
+    2. Only a document DI has actually classified is worth re-syncing -- one
+       still mid-classification has nothing durable to copy yet, and
+       _sync_booking_document's own DOCUMENT_MISSING/manual-verification
+       logic already covers a document that never got this far. The
+       response reports both counts so a stuck upload is visible, not silent.
+    3. Forces every classified document through the full per-document sync
+       pipeline again (durable fact copy, MANUAL_VERIFICATION, SKU
+       resolution, payment reconciliation, canonical materialization, the
+       newer identity/duplicate-receipt checks -- everything wired into
+       _run_sync_booking_document_task). Every writer underneath is an
+       idempotent upsert (INSERT ... ON CONFLICT DO UPDATE, or an explicit
+       existing-row check before insert) specifically so calling this
+       redundantly, including concurrently with the async webhook trigger
+       for the same document, only ever creates-or-updates -- it cannot
+       double-insert.
+    """
+    _authorize_booking(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    documents = _linked_documents(connection, tenant_id, journey_id)
+    # Only a document DI has actually classified is worth re-syncing -- see
+    # uc03_delivery_capture_v2._resyncable_document_ids, the same filter,
+    # duplicated rather than imported to avoid a circular import (that
+    # module already imports from this one).
+    document_ids = [
+        row["di_document_id"] for row in documents
+        if str(row.get("capture_status") or "").upper() == "CLASSIFIED"
+    ]
+
+    from audit_core.uc03_confidence_review_policy import _run_sync_booking_document_task
+
+    for document_id in document_ids:
+        background_tasks.add_task(
+            _run_sync_booking_document_task,
+            engine,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            document_id=document_id,
+            service_id=f"manual-resync:{human_principal.subject}",
+            stage_code="BOOKING",
+        )
+    return BookingCaptureV2ResyncResponse(
+        documentsFound=len(documents),
+        documentsResynced=len(document_ids),
+        documentsNotYetExtracted=len(documents) - len(document_ids),
+        queuedDocumentCount=len(document_ids),
     )
