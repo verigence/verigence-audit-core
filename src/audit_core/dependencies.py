@@ -76,6 +76,23 @@ def _engine() -> Engine:
     # SET LOCAL ROLE on every HTTP request. Railway/PostgreSQL can terminate pooled
     # connections during a restart/failover, so pre-ping each checkout and let
     # SQLAlchemy discard a dead connection before a user request receives it.
+    #
+    # idle_in_transaction_session_timeout: confirmed live, recurring --
+    # psycopg.errors.IdleInTransactionSessionTimeout killing a connection at
+    # commit time. Many request handlers in this codebase open a transaction
+    # (get_connection, or engine.begin() -- the SAME pool, same engine
+    # singleton, so this option covers every caller) and then make one or
+    # more Security/DI network calls -- a token fetch, a document-facts
+    # fetch, a live DI list_documents -- WHILE that transaction stays open,
+    # before finally committing. Postgres's own default for this setting is
+    # apparently short enough that an ordinary, not even unusually slow, DI
+    # round trip can exceed it. statement_timeout alone does nothing here --
+    # it only bounds a single SQL statement, not the gap between statements
+    # while Python is waiting on an HTTP response. This is a pool-wide
+    # default protecting every current and future call site with this same
+    # shape; a caller doing unusually long work (the background document-
+    # sync task, several sequential DI calls per document) still overrides
+    # it higher with its own SET LOCAL for that one transaction.
     engine_options: dict[str, object] = {"pool_pre_ping": True}
     if _postgresql_url(database_url):
         engine_options.update(
@@ -88,7 +105,11 @@ def _engine() -> Engine:
                 "keepalives_idle": 30,
                 "keepalives_interval": 10,
                 "keepalives_count": 3,
-                "options": "-c statement_timeout=10000 -c role=audit_core_runtime",
+                "options": (
+                    "-c statement_timeout=10000 "
+                    "-c idle_in_transaction_session_timeout=60000 "
+                    "-c role=audit_core_runtime"
+                ),
             },
         )
     return create_engine(database_url, **engine_options)
