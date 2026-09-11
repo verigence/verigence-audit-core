@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 from audit_core.main import app
 from audit_core.security import HumanPrincipal
 from audit_core.uc03_document_capture_v2 import (
+    _authorize_booking_for_resync,
     _build_capture_response,
     _build_local_capture_response,
     _candidate_type_keys,
@@ -288,17 +289,37 @@ def test_booking_resync_endpoint_authorizes_and_queues_the_shared_sync_task() ->
     # tests don't set up. What matters for the regression this endpoint
     # exists to fix (available to any role, opens the same door Delivery's
     # own /resync already has) is that it (a) re-authorizes against the
-    # journey, (b) lists documents the same way the capture screen itself
-    # does, (c) filters to classified documents, and (d) queues the same
+    # journey WITHOUT requiring an active Booking (a resync on a Journey
+    # that has moved on to Delivery, where Booking is CLOSED, must still
+    # work -- this is the exact bug a closed Booking triggered live), (b)
+    # refreshes classification status from DI's own live state before
+    # filtering, so a stale local cache can't silently resync 0 documents,
+    # (c) lists documents the same way the capture screen itself does, (d)
+    # filters to classified documents, and (e) queues the same
     # _run_sync_booking_document_task the DI webhook itself uses -- a
     # manually-triggered resync goes through the identical, already-tested
     # pipeline (including every producer wired into it: SKU resolution,
     # identity/dealer checks, duplicate-receipt detection) rather than a
     # parallel one.
     source = inspect.getsource(resync_booking_capture_v2)
-    assert "_authorize_booking(" in source
+    assert "_authorize_booking_for_resync(" in source
+    assert "_authorize_booking(" not in source
+    assert "_ensure_di_context(" in source
+    assert "_reconcile_documents(" in source
     assert "_linked_documents(" in source
     assert '"CLASSIFIED"' in source
     assert "background_tasks.add_task(" in source
     assert "_run_sync_booking_document_task" in source
     assert 'stage_code="BOOKING"' in source
+
+
+def test_authorize_booking_for_resync_does_not_require_active_booking() -> None:
+    # The regression itself: _authorize_booking (used by ordinary capture
+    # writes) calls _require_active_booking and rejects a CLOSED Booking --
+    # correct for a capture edit, wrong for a resync/repair action on a
+    # Journey that has since progressed to Delivery. The resync-specific
+    # authorizer must scope-check and load state without that gate.
+    source = inspect.getsource(_authorize_booking_for_resync)
+    assert "_scope(" in source
+    assert "_capture_phase_state(" in source
+    assert "_require_active_booking(" not in source

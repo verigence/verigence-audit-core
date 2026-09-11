@@ -115,13 +115,18 @@ def test_resync_endpoint_queues_one_background_task_per_resyncable_document() ->
     # dispatch, DI/Security client construction) needs infrastructure this
     # file's other tests don't set up. What matters for the regression this
     # endpoint exists to fix is that it (a) re-authorizes against the
-    # journey, (b) filters to resyncable documents through the function
-    # above (not some inline duplicate of the filter), and (c) queues the
-    # same _run_sync_booking_document_task the DI webhook itself uses, so a
-    # manually-triggered resync goes through the identical, already-tested
-    # pipeline rather than a parallel one.
+    # journey, (b) refreshes classification status from DI's own live state
+    # before filtering -- otherwise a Journey whose Delivery capture screen
+    # has not been reopened since classification finished silently resyncs 0
+    # documents against a stale local cache, (c) filters to resyncable
+    # documents through the function above (not some inline duplicate of the
+    # filter), and (d) queues the same _run_sync_booking_document_task the DI
+    # webhook itself uses, so a manually-triggered resync goes through the
+    # identical, already-tested pipeline rather than a parallel one.
     source = inspect.getsource(resync_delivery_capture_v2)
     assert "_authorize_delivery(" in source
+    assert "_ensure_di_context(" in source
+    assert "_reconcile_delivery_documents(" in source
     assert "_resyncable_document_ids(" in source
     assert "background_tasks.add_task(" in source
     assert "_run_sync_booking_document_task" in source
