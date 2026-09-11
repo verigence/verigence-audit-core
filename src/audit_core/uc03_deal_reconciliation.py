@@ -318,8 +318,9 @@ def _materialize_discount_standards(
                     discount_scheme_version_id, eligibility_result,
                     actual_source_kind, details
                 )
-                SELECT :tenant_id, :journey_id, :discount_key,
-                       :standard, :actual, :dsv, :result, :calc, CAST(:details AS jsonb)
+                SELECT CAST(:tenant_id AS varchar), CAST(:journey_id AS uuid), CAST(:discount_key AS varchar),
+                       :standard, :actual, CAST(:dsv AS uuid), CAST(:result AS varchar),
+                       CAST(:calc AS varchar), CAST(:details AS jsonb)
                 WHERE NOT EXISTS (SELECT 1 FROM upd)
                 """
             ),

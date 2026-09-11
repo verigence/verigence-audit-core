@@ -401,8 +401,8 @@ def _upsert_addon(
                 tenant_id, journey_id, addon_type_code, actual_amount,
                 source_kind, source_evidence_id, details
             )
-            SELECT :tenant_id, :journey_id, :addon_type_code, :amount,
-                   'EVIDENCE', :evidence_id, CAST(:details AS jsonb)
+            SELECT CAST(:tenant_id AS varchar), CAST(:journey_id AS uuid), CAST(:addon_type_code AS varchar), :amount,
+                   'EVIDENCE', CAST(:evidence_id AS uuid), CAST(:details AS jsonb)
             WHERE NOT EXISTS (SELECT 1 FROM upd)
             """
         ),

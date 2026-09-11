@@ -450,7 +450,8 @@ def _link_evidence(
                 INSERT INTO auditcore.finding_evidence (
                     tenant_id, audit_finding_id, evidence_id, linkage_purpose
                 )
-                SELECT :tenant_id, :flag_id, :evidence_id, :purpose
+                SELECT CAST(:tenant_id AS varchar), CAST(:flag_id AS uuid),
+                       CAST(:evidence_id AS uuid), CAST(:purpose AS varchar)
                 WHERE NOT EXISTS (
                     SELECT 1 FROM auditcore.finding_evidence
                     WHERE tenant_id=:tenant_id
