@@ -1076,6 +1076,23 @@ def resync_delivery_capture_v2(
     documents = _linked_delivery_documents(connection, tenant_id, journey_id)
     document_ids = _resyncable_document_ids(documents)
 
+    # Backfill any missing/inactive evidence link BEFORE queuing the sync
+    # task -- see uc03_document_capture_v2._ensure_evidence_link_for_resync's
+    # own docstring. Without this, a document whose one-time DI "link"
+    # callback never landed would report as resynced while
+    # _sync_booking_document silently does nothing.
+    from audit_core.uc03_document_capture_v2 import _backfill_evidence_links_for_resync
+
+    _backfill_evidence_links_for_resync(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        documents=documents,
+        document_ids=document_ids,
+        requirements=requirements,
+        service_id=f"manual-resync:{human_principal.subject}",
+    )
+
     from audit_core.uc03_confidence_review_policy import _run_sync_booking_document_task
 
     for document_id in document_ids:
