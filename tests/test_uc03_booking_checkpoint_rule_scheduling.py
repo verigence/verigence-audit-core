@@ -8,7 +8,10 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from audit_core import uc03_confidence_review_policy as confidence_policy
-from audit_core.uc03_booking_rule_trigger import schedule_booking_checkpoint_rules
+from audit_core.uc03_booking_rule_trigger import (
+    run_booking_review_rule_task,
+    schedule_booking_checkpoint_rules,
+)
 
 
 def _seed_booking_journey(engine, *, tenant_id: str, suffix: str, version_no: int = 1):
@@ -297,3 +300,34 @@ def test_checkpoint_rule_self_heals_once_evidence_lands() -> None:
         assert status == "RESOLVED"
 
     engine.dispose()
+
+
+def test_losing_the_claim_race_is_handled_as_an_expected_outcome_not_a_failure() -> None:
+    """Regression: schedule_booking_checkpoint_rules is called from two
+    independent triggers by design (the async document-sync path and PC
+    Review Confirm's safety net) for the same task. claim_worker_task's
+    UPDATE is atomic -- READY, WHERE-guarded -- so exactly one of two
+    genuinely concurrent callers wins the claim; the loser's UPDATE matches
+    zero rows and claim_worker_task raises AuditCoreError. Before this fix
+    that fell through to the function's broad `except Exception`, logged at
+    error level with a full traceback as uc03_booking_rule_evaluation_failed
+    -- for what is actually an expected, routine outcome of this module's
+    own two-trigger design, not a defect.
+
+    The true TOCTOU window (both callers reading READY before either commits
+    its claim) needs real concurrent transactions to force deterministically
+    -- this file's own precedent for exactly this class of trigger behavior
+    (test_confirm_handler_schedules_checkpoint_rules_as_a_safety_net,
+    test_async_document_sync_schedules_checkpoint_rules_for_booking) is
+    source inspection rather than an end-to-end race, so this follows suit:
+    assert the specific claim_worker_task call is guarded by its own
+    AuditCoreError handler, ahead of (not inside) the broad except Exception.
+    """
+    source = inspect.getsource(run_booking_review_rule_task)
+    claim_call_index = source.index("claim_worker_task(")
+    guard_index = source.index("except AuditCoreError:")
+    broad_except_index = source.index("except Exception:")
+
+    assert claim_call_index < guard_index < broad_except_index
+    assert '"uc03_booking_rule_task_already_claimed"' in source
+    assert "return" in source[guard_index:broad_except_index]
