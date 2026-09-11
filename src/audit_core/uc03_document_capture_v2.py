@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 from functools import lru_cache
 from typing import Annotated, Any, Literal
 from uuid import UUID
@@ -326,6 +328,26 @@ def _linked_documents(connection: Connection, tenant_id: str, journey_id: UUID) 
     return [dict(row) for row in rows]
 
 
+# _ensure_di_context is called on every Booking/Delivery capture read (once
+# documents exist), every upload-intents call, every Review-page DI fetch and
+# work-item enrichment pass -- shared by uc03_document_capture_v2.py,
+# uc03_delivery_capture_v2.py, uc03_document_review_v2.py, uc03_work_item_
+# enrichment.py and (via review_v2._ensure_di_context) uc03_delivery_review_
+# confirm.py. Its ensure_audit_storage_context() PUT is idempotent at DI (an
+# Idempotency-Key is already passed) but was previously re-issued on every
+# single call regardless -- a second full DI round trip (up to a 15s budget)
+# stacked in front of whatever the caller actually wanted, repeated roughly
+# every 5s for up to 2 minutes after every upload while extraction is
+# pending. Reusing the underlying (dealer/outlet/customer) context info for a
+# journey doesn't change between calls in that window, so a short in-process
+# cache skips the redundant PUT without weakening the guarantee -- worst
+# case on a cache miss (process restart, cache eviction) is exactly today's
+# behavior, never a correctness issue.
+_DI_CONTEXT_ENSURE_REUSE_SECONDS = 300.0
+_di_context_ensured_until: dict[tuple[str, str], float] = {}
+_di_context_ensured_lock = threading.Lock()
+
+
 def _ensure_di_context(
     *,
     connection: Connection,
@@ -354,20 +376,28 @@ def _ensure_di_context(
             customer_id=customer_id,
             subject_id=subject_id,
         )
-    di_client.ensure_audit_storage_context(
-        token=token,
-        tenant_id=tenant_id,
-        external_context_ref=context_ref,
-        subject_id=str(subject_id),
-        dealer_id=str(journey["dealer_id"]),
-        outlet_id=str(journey["outlet_id"]),
-        customer_id=str(customer_id),
-        project_name=journey["project_name"],
-        dealer_name=journey["dealer_name"],
-        outlet_name=journey["outlet_name"],
-        customer_name=journey["customer_name"],
-        idempotency_key=f"uc03-document-capture-v2-context:{journey_id}",
-    )
+
+    cache_key = (tenant_id, context_ref)
+    now = time.monotonic()
+    with _di_context_ensured_lock:
+        already_ensured = _di_context_ensured_until.get(cache_key, 0.0) > now
+    if not already_ensured:
+        di_client.ensure_audit_storage_context(
+            token=token,
+            tenant_id=tenant_id,
+            external_context_ref=context_ref,
+            subject_id=str(subject_id),
+            dealer_id=str(journey["dealer_id"]),
+            outlet_id=str(journey["outlet_id"]),
+            customer_id=str(customer_id),
+            project_name=journey["project_name"],
+            dealer_name=journey["dealer_name"],
+            outlet_name=journey["outlet_name"],
+            customer_name=journey["customer_name"],
+            idempotency_key=f"uc03-document-capture-v2-context:{journey_id}",
+        )
+        with _di_context_ensured_lock:
+            _di_context_ensured_until[cache_key] = now + _DI_CONTEXT_ENSURE_REUSE_SECONDS
     return context_ref, token
 
 
