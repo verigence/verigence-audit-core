@@ -247,6 +247,43 @@ def _authorize_booking(
     return dict(state)
 
 
+def _authorize_booking_for_resync(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: HumanPrincipal,
+    authorization_client: SecurityAuthorizationClient,
+) -> dict[str, Any]:
+    """Same permission scoping as _authorize_booking, but deliberately does
+    NOT call _require_active_booking. That gate exists to stop ordinary
+    capture/declaration writes from mutating a Booking that has already
+    closed -- exactly right for those endpoints. Resync is a repair action,
+    not a capture edit: on any journey that has progressed to Delivery (the
+    overwhelmingly common case for a journey old enough to need a resync),
+    Booking is CLOSED by design, and that must not block re-running the sync
+    pipeline against documents that were already accepted while it was
+    open. Still requires the Booking stage to exist at all (via
+    _capture_phase_state's own NotFoundError) -- only the active-status
+    requirement is dropped.
+    """
+    _scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    return dict(
+        _capture_phase_state(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            for_update=False,
+        )
+    )
+
+
 def _base_requirements(connection: Connection, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
     rows = connection.execute(
         text(
@@ -1179,20 +1216,33 @@ def resync_booking_capture_v2(
     authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
     engine: Annotated[Engine, Depends(get_engine)],
+    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
+    di_client: Annotated[DiClient, Depends(get_di_client)],
+    v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
     background_tasks: BackgroundTasks,
 ) -> BookingCaptureV2ResyncResponse:
     """The Booking counterpart of uc03_delivery_capture_v2.resync_delivery_
     capture_v2 -- open to any role with legitimate access to this Journey
-    (per _authorize_booking's own scoping, not restricted further here).
+    (per _authorize_booking_for_resync's own scoping, not restricted further
+    here). Deliberately does NOT require the Booking to still be active --
+    see _authorize_booking_for_resync's own docstring for why: this is the
+    repair path for a Booking that has long since closed and moved on to
+    Delivery, which is the normal case for anything old enough to need one.
 
-    1. Lists every document uploaded for this Journey (via _linked_documents,
+    1. Refreshes document classification status from DI's own live state
+       first (_reconcile_documents), the same call the capture screen's own
+       read makes -- without this, a Journey whose capture screen has not
+       been reopened since classification actually finished would still be
+       filtered against a stale local cache and resync 0 documents with no
+       error, which is exactly what this endpoint must not do silently.
+    2. Lists every document uploaded for this Journey (via _linked_documents,
        the same durable listing the capture screen itself reads).
-    2. Only a document DI has actually classified is worth re-syncing -- one
+    3. Only a document DI has actually classified is worth re-syncing -- one
        still mid-classification has nothing durable to copy yet, and
        _sync_booking_document's own DOCUMENT_MISSING/manual-verification
        logic already covers a document that never got this far. The
        response reports both counts so a stuck upload is visible, not silent.
-    3. Forces every classified document through the full per-document sync
+    4. Forces every classified document through the full per-document sync
        pipeline again (durable fact copy, MANUAL_VERIFICATION, SKU
        resolution, payment reconciliation, canonical materialization, the
        newer identity/duplicate-receipt checks -- everything wired into
@@ -1203,13 +1253,46 @@ def resync_booking_capture_v2(
        for the same document, only ever creates-or-updates -- it cannot
        double-insert.
     """
-    _authorize_booking(
+    _authorize_booking_for_resync(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
     )
+    requirements = _base_requirements(connection, tenant_id, journey_id)
+    if _linked_documents(connection, tenant_id, journey_id):
+        context_ref, token = _ensure_di_context(
+            connection=connection,
+            engine=engine,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            security_client=security_client,
+            di_client=di_client,
+        )
+        try:
+            payload = v2_client.list_documents(
+                token=token,
+                tenant_id=tenant_id,
+                external_context_ref=context_ref,
+                phase="BOOKING",
+            )
+        except DiCaptureV2Error as exc:
+            _log_di_capture_v2_failure(
+                operation="list_documents", exc=exc, tenant_id=tenant_id,
+                journey_id=journey_id, context_ref=context_ref,
+            )
+            raise DependencyUnavailableError(
+                detail="Document status is temporarily unavailable -- try resync again shortly."
+            ) from exc
+        _reconcile_documents(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            requirements=requirements,
+            di_documents=list(payload.get("documents") or []),
+        )
+
     documents = _linked_documents(connection, tenant_id, journey_id)
     # Only a document DI has actually classified is worth re-syncing -- see
     # uc03_delivery_capture_v2._resyncable_document_ids, the same filter,

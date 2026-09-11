@@ -1007,6 +1007,9 @@ def resync_delivery_capture_v2(
     authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
     engine: Annotated[Engine, Depends(get_engine)],
+    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
+    di_client: Annotated[DiClient, Depends(get_di_client)],
+    v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
     background_tasks: BackgroundTasks,
 ) -> DeliveryCaptureV2ResyncResponse:
     """Force every already-classified Delivery document through the full
@@ -1022,6 +1025,13 @@ def resync_delivery_capture_v2(
     Idempotent and cheap to call repeatedly: _sync_booking_document's own
     per-journey advisory lock still serializes these against any concurrent
     webhook-triggered sync for the same journey.
+
+    Refreshes classification status from DI's own live state first (via
+    _reconcile_delivery_documents, the same call the capture screen's own
+    read makes) before deciding which documents are resyncable -- without
+    this, a Journey whose Delivery capture screen has not been reopened
+    since classification actually finished would be filtered against a
+    stale local cache and silently resync 0 documents.
     """
     _authorize_delivery(
         connection,
@@ -1030,6 +1040,39 @@ def resync_delivery_capture_v2(
         human_principal=human_principal,
         authorization_client=authorization_client,
     )
+    requirements = _delivery_requirements(connection, tenant_id, journey_id)
+    if _linked_delivery_documents(connection, tenant_id, journey_id):
+        context_ref, token = _ensure_di_context(
+            connection=connection,
+            engine=engine,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            security_client=security_client,
+            di_client=di_client,
+        )
+        try:
+            payload = v2_client.list_documents(
+                token=token,
+                tenant_id=tenant_id,
+                external_context_ref=context_ref,
+                phase="DELIVERY",
+            )
+        except DiCaptureV2Error as exc:
+            _log_di_capture_v2_failure(
+                operation="list_documents", exc=exc, tenant_id=tenant_id,
+                journey_id=journey_id, context_ref=context_ref,
+            )
+            raise DependencyUnavailableError(
+                detail="Document status is temporarily unavailable -- try resync again shortly."
+            ) from exc
+        _reconcile_delivery_documents(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            requirements=requirements,
+            di_documents=list(payload.get("documents") or []),
+        )
+
     documents = _linked_delivery_documents(connection, tenant_id, journey_id)
     document_ids = _resyncable_document_ids(documents)
 
