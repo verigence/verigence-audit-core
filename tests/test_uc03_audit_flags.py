@@ -238,6 +238,7 @@ def _create_flag_category(
             "category": category,
             "severity": severity,
             "summary": f"{category} raised",
+            "remarks": f"{category} observed during audit review",
         },
     )
     assert response.status_code == 200, response.text
@@ -428,6 +429,53 @@ def test_human_flag_cannot_self_declare_completion_guard(audit_setup):
         },
     )
     assert response.status_code == 400, response.text
+    with audit_setup["engine"].begin() as connection:
+        finding_count = connection.execute(
+            text(
+                """
+                SELECT count(*) FROM auditcore.audit_findings
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                """
+            ),
+            {
+                "tenant_id": audit_setup["tenant_id"],
+                "journey_id": audit_setup["journey_id"],
+            },
+        ).scalar_one()
+    assert finding_count == 0
+
+
+def test_human_flag_requires_non_blank_remarks(audit_setup):
+    # Regression test: remarks used to be optional, and create_flag's own
+    # execute() sets the finding's description straight from it -- a human
+    # flag whose Remarks was left blank landed with nothing beyond its
+    # one-line title to explain it. Required now, both a missing key and a
+    # whitespace-only one.
+    missing = _client().post(
+        f"{_base(audit_setup)}/flags",
+        headers={"Idempotency-Key": "flag-no-remarks", "If-Match": '"1"'},
+        json={
+            "stage": "BOOKING",
+            "category": "PROCESS_NON_COMPLIANCE",
+            "severity": "HIGH",
+            "summary": "Attempted flag with no remarks",
+        },
+    )
+    assert missing.status_code in (400, 422), missing.text
+
+    blank = _client().post(
+        f"{_base(audit_setup)}/flags",
+        headers={"Idempotency-Key": "flag-blank-remarks", "If-Match": '"1"'},
+        json={
+            "stage": "BOOKING",
+            "category": "PROCESS_NON_COMPLIANCE",
+            "severity": "HIGH",
+            "summary": "Attempted flag with whitespace-only remarks",
+            "remarks": "   ",
+        },
+    )
+    assert blank.status_code in (400, 422), blank.text
+
     with audit_setup["engine"].begin() as connection:
         finding_count = connection.execute(
             text(
