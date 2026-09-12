@@ -125,6 +125,7 @@ from audit_core.uc03_review_queue import router as uc03_review_queue_router
 from audit_core.uc03_review_value_normalization import (
     install_uc03_review_value_normalization,
 )
+from audit_core.uc03_rule_registry import router as uc03_rule_registry_router
 from audit_core.uc03_sku_candidates import router as uc03_sku_candidates_router
 from audit_core.uc03_tl_scope_alignment import install_tl_scope_alignment
 from audit_core.uc03_tl_supervisory import router as uc03_tl_supervisory_router
@@ -251,6 +252,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_audit_router)
     application.include_router(uc03_daily_ops_flags_router)
     application.include_router(uc03_review_queue_router)
+    application.include_router(uc03_rule_registry_router)
     application.include_router(uc03_manual_verification_router)
     application.include_router(readiness_router)
     application.include_router(project_activation_router)
