@@ -1,0 +1,214 @@
+"""Phase 4 of the rule-engine platform: DOCUMENT_SYNCED producers start
+writing PASS/FAIL/SKIPPED rows to auditcore.rule_executions, not just a
+finding on FAIL. WRONG_DOCUMENT is the first rule instrumented (see
+_sync_booking_document's customer-identity-consistency call site) -- this
+is its end-to-end coverage, calling the real per-document sync pipeline
+with a fake DI/Security client, matching test_uc03_sku_resolution_ordering.py's
+established pattern for exercising _sync_booking_document directly.
+"""
+from __future__ import annotations
+
+import os
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import create_engine, text
+
+from audit_core import uc03_confidence_review_policy as confidence_policy
+from audit_core.di_client import DiDocument, DiFact
+
+
+class _FakeSecurityClient:
+    def get_service_token(self, *, audience: str) -> str:
+        return "fake-token"
+
+
+class _FakeDiClient:
+    def __init__(self) -> None:
+        self._documents: dict[str, DiDocument] = {}
+        self._facts: dict[str, list[DiFact]] = {}
+
+    def add(self, document: DiDocument, facts: list[DiFact]) -> None:
+        self._documents[document.document_id] = document
+        self._facts[document.document_id] = facts
+
+    def get_audit_document(self, *, document_id: str, **kwargs) -> DiDocument:
+        return self._documents[document_id]
+
+    def get_audit_document_facts(self, *, document_id: str, **kwargs) -> list[DiFact]:
+        return self._facts[document_id]
+
+
+def _fact(field_key: str, value: str, confidence: float = 92.0) -> DiFact:
+    return DiFact(
+        canonical_field_id=field_key, field_key=field_key, value=value,
+        value_source="EXTRACTION", confidence_score=confidence, version_no=1,
+    )
+
+
+def _confirmed(document_id, document_type_key: str) -> DiDocument:
+    return DiDocument(
+        document_id=str(document_id), upload_status="COMPLETE",
+        processing_status="COMPLETED", confirmation_status="CONFIRMED",
+        document_type_key=document_type_key, verification_state="NOT_VERIFIED",
+    )
+
+
+@pytest.fixture
+def synced_document_setup():
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for this integration test")
+    engine = create_engine(database_url)
+    suffix = uuid4().hex[:10]
+    tenant_id = f"tenant-desl-{suffix}"
+    with engine.begin() as c:
+        category_id = c.execute(
+            text("INSERT INTO auditcore.product_categories (category_code, category_name) "
+                 "VALUES (:c, 'V') RETURNING product_category_id"),
+            {"c": f"DESL-CAT-{suffix}"},
+        ).scalar_one()
+        oem_id = c.execute(
+            text("INSERT INTO auditcore.oems (oem_code, oem_name) VALUES (:c, 'O') RETURNING oem_id"),
+            {"c": f"DESL-OEM-{suffix}"},
+        ).scalar_one()
+        c.execute(
+            text("""INSERT INTO auditcore.projects
+                (tenant_id, project_code, project_name, oem_id, product_category_id,
+                 effective_start_date)
+                VALUES (:t, :pc, 'DESL', :o, :cat, CURRENT_DATE - 60)"""),
+            {"t": tenant_id, "pc": f"DESL-{suffix}", "o": oem_id, "cat": category_id},
+        )
+        dealer_id = c.execute(
+            text("INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
+                 "VALUES (:t, :c, 'D') RETURNING dealer_id"),
+            {"t": tenant_id, "c": f"DESL-D-{suffix}"},
+        ).scalar_one()
+        outlet_id = c.execute(
+            text("INSERT INTO auditcore.dealer_outlets (tenant_id, dealer_id, outlet_code, outlet_name) "
+                 "VALUES (:t, :d, :c, 'O') RETURNING outlet_id"),
+            {"t": tenant_id, "d": dealer_id, "c": f"DESL-O-{suffix}"},
+        ).scalar_one()
+        customer_id = c.execute(
+            text("""INSERT INTO auditcore.customers
+                (tenant_id, dealer_id, outlet_id, customer_type_code, display_name)
+                VALUES (:t, :d, :o, 'INDIVIDUAL', 'C') RETURNING customer_id"""),
+            {"t": tenant_id, "d": dealer_id, "o": outlet_id},
+        ).scalar_one()
+        journey_id = c.execute(
+            text("""INSERT INTO auditcore.journeys
+                (tenant_id, dealer_id, outlet_id, customer_id, journey_reference)
+                VALUES (:t, :d, :o, :cu, :r) RETURNING journey_id"""),
+            {"t": tenant_id, "d": dealer_id, "o": outlet_id, "cu": customer_id, "r": f"DESL-J-{suffix}"},
+        ).scalar_one()
+        c.execute(
+            text("""INSERT INTO auditcore.journey_stage_states
+                (tenant_id, journey_id, stage_code, business_status, audit_state, audit_status,
+                 first_started_at_utc, latest_activity_at_utc, version_no)
+                VALUES (:t, :j, 'BOOKING', 'BOOKING_IN_PROGRESS', 'IN_PROGRESS', 'NOT_EVALUATED',
+                        now(), now(), 1)"""),
+            {"t": tenant_id, "j": journey_id},
+        )
+    yield engine, tenant_id, journey_id
+    engine.dispose()
+
+
+def _sync(engine, tenant_id, journey_id, document_id, di_client) -> None:
+    with engine.begin() as c:
+        confidence_policy._sync_booking_document(
+            c, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+            service_id="di-service", security_client=_FakeSecurityClient(),
+            di_client=di_client, bump_version=True,
+        )
+
+
+def _wrong_document_executions(engine, tenant_id):
+    with engine.begin() as c:
+        return c.execute(
+            text(
+                "SELECT outcome, reason, triggering_event FROM auditcore.rule_executions "
+                "WHERE tenant_id=:t AND rule_code='WRONG_DOCUMENT' ORDER BY evaluated_at_utc"
+            ),
+            {"t": tenant_id},
+        ).mappings().all()
+
+
+def _add_evidence(engine, tenant_id, journey_id, customer_id, document_id, document_type_key) -> None:
+    with engine.begin() as c:
+        c.execute(
+            text("""INSERT INTO auditcore.evidence
+                (tenant_id, journey_id, customer_id, di_subject_id, di_document_id,
+                 document_type_key, evidence_purpose)
+                VALUES (:t, :j, :cu, :s, :d, :dtk, 'BOOKING')"""),
+            {"t": tenant_id, "j": journey_id, "cu": customer_id, "s": uuid4(),
+             "d": document_id, "dtk": document_type_key},
+        )
+
+
+def _customer_id(engine, tenant_id, journey_id):
+    with engine.begin() as c:
+        return c.execute(
+            text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": tenant_id, "j": journey_id},
+        ).scalar_one()
+
+
+def test_no_reference_document_yet_records_skipped(synced_document_setup) -> None:
+    engine, tenant_id, journey_id = synced_document_setup
+    customer_id = _customer_id(engine, tenant_id, journey_id)
+    booking_form_id = uuid4()
+    _add_evidence(engine, tenant_id, journey_id, customer_id, booking_form_id, "booking_form")
+
+    di_client = _FakeDiClient()
+    di_client.add(
+        _confirmed(booking_form_id, "booking_form"),
+        [_fact("customer_name", "Sanjaya Kumar Mohanty")],
+    )
+    _sync(engine, tenant_id, journey_id, booking_form_id, di_client)
+
+    rows = _wrong_document_executions(engine, tenant_id)
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "SKIPPED"
+    assert rows[0]["triggering_event"] == "DOCUMENT_SYNCED"
+    assert rows[0]["reason"] is not None
+
+
+def test_matching_names_record_pass(synced_document_setup) -> None:
+    engine, tenant_id, journey_id = synced_document_setup
+    customer_id = _customer_id(engine, tenant_id, journey_id)
+
+    aadhaar_id = uuid4()
+    _add_evidence(engine, tenant_id, journey_id, customer_id, aadhaar_id, "aadhaar")
+    di_client = _FakeDiClient()
+    di_client.add(_confirmed(aadhaar_id, "aadhaar"), [_fact("aadhaar_name", "Sanjaya Kumar Mohanty")])
+    _sync(engine, tenant_id, journey_id, aadhaar_id, di_client)
+
+    booking_form_id = uuid4()
+    _add_evidence(engine, tenant_id, journey_id, customer_id, booking_form_id, "booking_form")
+    di_client.add(_confirmed(booking_form_id, "booking_form"), [_fact("customer_name", "Sanjaya Kumar Mohanty")])
+    _sync(engine, tenant_id, journey_id, booking_form_id, di_client)
+
+    rows = _wrong_document_executions(engine, tenant_id)
+    # aadhaar's own sync: it IS the reference, nothing else to compare it to
+    # yet -- SKIPPED. booking_form's sync: compared against the aadhaar
+    # reference, matches -- PASS.
+    assert [r["outcome"] for r in rows] == ["SKIPPED", "PASS"]
+
+
+def test_mismatched_name_records_fail(synced_document_setup) -> None:
+    engine, tenant_id, journey_id = synced_document_setup
+    customer_id = _customer_id(engine, tenant_id, journey_id)
+
+    aadhaar_id = uuid4()
+    _add_evidence(engine, tenant_id, journey_id, customer_id, aadhaar_id, "aadhaar")
+    di_client = _FakeDiClient()
+    di_client.add(_confirmed(aadhaar_id, "aadhaar"), [_fact("aadhaar_name", "Sanjaya Kumar Mohanty")])
+    _sync(engine, tenant_id, journey_id, aadhaar_id, di_client)
+
+    invoice_id = uuid4()
+    _add_evidence(engine, tenant_id, journey_id, customer_id, invoice_id, "customer_invoice_dms")
+    di_client.add(_confirmed(invoice_id, "customer_invoice_dms"), [_fact("buyer_name", "Priya Nair")])
+    _sync(engine, tenant_id, journey_id, invoice_id, di_client)
+
+    rows = _wrong_document_executions(engine, tenant_id)
+    assert [r["outcome"] for r in rows] == ["SKIPPED", "FAIL"]

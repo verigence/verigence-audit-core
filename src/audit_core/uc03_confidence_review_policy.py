@@ -924,13 +924,38 @@ def _sync_booking_document(
     from audit_core.uc03_customer_identity_consistency import (
         sync_customer_identity_consistency,
     )
+    from audit_core.uc03_rule_execution_log import record_execution
 
-    sync_customer_identity_consistency(
+    identity_result = sync_customer_identity_consistency(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
         correlation_id="",
     )
+    if "error" in identity_result:
+        record_execution(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            rule_code="WRONG_DOCUMENT", triggering_event="DOCUMENT_SYNCED",
+            outcome="ERROR", reason="sync_customer_identity_consistency raised",
+        )
+    elif identity_result.get("examined", 0) == 0:
+        record_execution(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            rule_code="WRONG_DOCUMENT", triggering_event="DOCUMENT_SYNCED",
+            outcome="SKIPPED", reason="no other named document to compare against a KYC reference yet",
+        )
+    else:
+        # WRONG_DOCUMENT is evaluated per-document (its own rule_key per
+        # mismatching document, see the producer) -- a summary row here
+        # (audit_finding_id left unset even on FAIL) rather than one row per
+        # document; the specific finding(s) are already reachable from
+        # audit_findings by rule_key prefix. This Execution Log row's job is
+        # the PASS/FAIL/SKIPPED signal that didn't exist at all before now.
+        record_execution(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            rule_code="WRONG_DOCUMENT", triggering_event="DOCUMENT_SYNCED",
+            outcome="FAIL" if identity_result["raised"] > 0 else "PASS",
+        )
 
     # The same physical receipt uploaded more than once must not be counted
     # as more money paid. Scoped to same-type receipts only (dealer_receipt

@@ -267,6 +267,7 @@ def sync_customer_identity_consistency(
     try:
         raised = 0
         resolved = 0
+        examined = 0
         reference_name: str | None = None
 
         documents = _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
@@ -282,6 +283,7 @@ def sync_customer_identity_consistency(
                 if document_id == reference_document_id:
                     continue
                 document_name = str(document["effective_value"] or "").strip()
+                examined += 1
                 rule_key = f"{_RULE_PREFIX}:{document_id}"
                 if not document_name or _names_match(reference_name, document_name):
                     if _resolve_if_open(
@@ -327,6 +329,7 @@ def sync_customer_identity_consistency(
             for receipt in _receipt_dealer_names(connection, tenant_id=tenant_id, journey_id=journey_id):
                 document_id = receipt["di_document_id"]
                 receipt_dealer_name = str(receipt["effective_value"] or "").strip()
+                examined += 1
                 rule_key = f"{_DEALER_RULE_PREFIX}:{document_id}"
                 if not receipt_dealer_name or _names_match(dealer_name, receipt_dealer_name):
                     if _resolve_if_open(
@@ -366,7 +369,12 @@ def sync_customer_identity_consistency(
                 )
                 raised += 1
 
-        return {"raised": raised, "resolved": resolved, "referenceName": reference_name}
+        return {
+            "raised": raised,
+            "resolved": resolved,
+            "examined": examined,
+            "referenceName": reference_name,
+        }
     except Exception:
         logger.warning("sync_customer_identity_consistency failed", exc_info=True)
         return {"error": True}
