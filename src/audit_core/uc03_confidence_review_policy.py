@@ -972,6 +972,27 @@ def _sync_booking_document(
         skipped_reason="no receipt documents on this Journey yet",
     )
 
+    # The same real customer must not appear as two separate, unrelated
+    # bookings within this tenant -- native replacement for the
+    # rule-engine's own (parked) CROSS_CASE duplicate-detection mechanism.
+    # Reacts to any document carrying PAN/Aadhaar/name/address; never raises.
+    from audit_core.uc03_duplicate_booking_detection import (
+        sync_duplicate_booking_detection,
+    )
+
+    duplicate_booking_result = sync_duplicate_booking_detection(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        correlation_id="",
+    )
+    record_from_summary(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+        rule_code="DUPLICATE_BOOKING", triggering_event="DOCUMENT_SYNCED",
+        result=duplicate_booking_result,
+        skipped_reason="no PAN/Aadhaar/name identified for this customer yet, or no other journey to compare against",
+    )
+
     from audit_core.uc03_async_sync_tasks import reconcile_payments_with_escalation
 
     # Booking's own canonical projection runs before SKU resolution below,
