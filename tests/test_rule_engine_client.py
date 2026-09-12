@@ -111,3 +111,47 @@ def test_dependency_and_factory_are_dormant_without_base_url(monkeypatch) -> Non
     monkeypatch.delenv("RULE_ENGINE_BASE_URL", raising=False)
     assert build_rule_engine_client() is None
     assert next(get_rule_engine_client()) is None
+
+
+def test_list_rules_parses_catalog() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == f"Bearer {TOKEN}"
+        assert request.url.path == f"/v1/tenants/{TENANT}/audit/rules"
+        assert request.method == "GET"
+        return httpx.Response(
+            200,
+            json=_envelope(
+                {
+                    "rules": [
+                        {
+                            "rule_code": "PRICE_BOOKING_VS_INVOICE",
+                            "category": "PRICE",
+                            "audit_scope": "WITHIN_CASE",
+                            "phases": ["BOOKING", "DELIVERY"],
+                            "comparator": "ABS_DIFF_GT",
+                            "threshold": 500.0,
+                            "severity": "CRITICAL",
+                            "finding_message": "Booking price differs from invoice",
+                            "enabled": True,
+                        },
+                        {"rule_code": ""},  # dropped -- no usable rule_code
+                    ],
+                }
+            ),
+        )
+
+    with _client(handle) as client:
+        rules = client.list_rules(token=TOKEN, tenant_id=TENANT)
+
+    assert len(rules) == 1
+    rule = rules[0]
+    assert rule.rule_code == "PRICE_BOOKING_VS_INVOICE"
+    assert rule.category == "PRICE"
+    assert rule.phases == ("BOOKING", "DELIVERY")
+    assert rule.threshold == 500.0
+    assert rule.enabled is True
+
+
+def test_list_rules_requires_token() -> None:
+    with _client(lambda r: httpx.Response(200)) as client, pytest.raises(ValueError):
+        client.list_rules(token="", tenant_id=TENANT)

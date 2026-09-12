@@ -57,6 +57,24 @@ class RuleEnginePhaseResult:
     anomalies: tuple[RuleEngineAnomaly, ...]
 
 
+@dataclass(frozen=True)
+class RuleEngineRule:
+    """One row of the rule-engine's own ``audit.audit_rules`` catalog, as
+    returned by ``GET /v1/tenants/{t}/audit/rules`` -- the source-of-truth
+    definition for a RULE_ENGINE-executor row in audit-core's own
+    ``rule_definitions`` registry (see uc03_rule_registry.py)."""
+
+    rule_code: str
+    category: str | None
+    audit_scope: str | None
+    phases: tuple[str, ...]
+    comparator: str | None
+    threshold: float | None
+    severity: str | None
+    finding_message: str | None
+    enabled: bool
+
+
 class RuleEngineClient:
     """Thin adapter for ``POST /v1/tenants/{t}/subjects/{s}/audit/{phase}``."""
 
@@ -110,6 +128,45 @@ class RuleEngineClient:
             json={"includeSkipped": False, "failFast": False},
         )
         return _phase_result(normalised_phase, payload)
+
+    def list_rules(self, *, token: str, tenant_id: str) -> tuple[RuleEngineRule, ...]:
+        """``GET /v1/tenants/{t}/audit/rules`` -- the rule-engine's own full
+        catalog. Used to keep audit-core's unified ``rule_definitions``
+        registry in sync with the rule-engine's rows; never used to
+        evaluate anything (evaluation stays ``evaluate_phase``'s job)."""
+        if not token:
+            raise ValueError("rule-engine bearer token is required")
+        payload = self._request_data(
+            "GET",
+            f"/v1/tenants/{tenant_id}/audit/rules",
+            operation="list_rules",
+            token=token,
+        )
+        raw_rules = payload.get("rules")
+        rules: list[RuleEngineRule] = []
+        if isinstance(raw_rules, list):
+            for raw in raw_rules:
+                if not isinstance(raw, dict):
+                    continue
+                rule_code = str(raw.get("rule_code") or "").strip()
+                if not rule_code:
+                    continue
+                raw_phases = raw.get("phases")
+                threshold = raw.get("threshold")
+                rules.append(
+                    RuleEngineRule(
+                        rule_code=rule_code,
+                        category=_opt_str(raw.get("category")),
+                        audit_scope=_opt_str(raw.get("audit_scope")),
+                        phases=tuple(raw_phases) if isinstance(raw_phases, list) else (),
+                        comparator=_opt_str(raw.get("comparator")),
+                        threshold=float(threshold) if isinstance(threshold, (int, float)) else None,
+                        severity=_opt_str(raw.get("severity")),
+                        finding_message=_opt_str(raw.get("finding_message")),
+                        enabled=bool(raw.get("enabled", True)),
+                    )
+                )
+        return tuple(rules)
 
     # ── internals ────────────────────────────────────────────────────────────
 
