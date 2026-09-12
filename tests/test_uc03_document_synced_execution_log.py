@@ -294,11 +294,13 @@ def test_low_confidence_field_records_fail_for_manual_verification(synced_docume
     _add_evidence(engine, tenant_id, journey_id, customer_id, booking_form_id, "booking_form")
     di_client = _FakeDiClient()
     di_client.add(
-        # _LOW_CONFIDENCE_SQL compares confidence_score directly against 0.90
-        # (a unit-interval threshold) regardless of confidence_scale -- a
-        # value has to be numerically below 0.90 to trip it, not "below 90%".
+        # A realistic DI confidence value (65%, PERCENT scale, the scale
+        # _machine_upsert_fact actually stores) -- proves the fix: the
+        # pre-fix _LOW_CONFIDENCE_SQL compared this raw against 0.90 and
+        # never flagged it (65.0 is not < 0.90), even though 65% is well
+        # below the intended 90% review threshold.
         _confirmed(booking_form_id, "booking_form"),
-        [_fact("customer_name", "Sanjaya Kumar Mohanty", confidence=0.5)],
+        [_fact("customer_name", "Sanjaya Kumar Mohanty", confidence=65.0)],
     )
     _sync(engine, tenant_id, journey_id, booking_form_id, di_client)
 

@@ -40,12 +40,12 @@ from audit_core.security_authorization import (
 )
 from audit_core.uc03_authorized_work_items import _authorize_workspace
 from audit_core.uc03_delivery_commands import _machine_flag
+from audit_core.uc03_review_confidence import REVIEW_THRESHOLD_PERCENT
 
 router = APIRouter(tags=["uc03-manual-verification"])
 
 _RULE_PREFIX = "MANUAL_VERIFICATION"
 _FINDING_TYPE = "MANUAL_VERIFICATION"
-_CONFIDENCE_THRESHOLD = 0.90  # journey_document_extracted_fields.confidence_score is 0..1
 
 StageCode = Literal["BOOKING", "DELIVERY"]
 
@@ -55,7 +55,16 @@ def _rule_key(stage_code: str, document_id: UUID) -> str:
 
 
 # ── low-confidence field query ─────────────────────────────────────────────────
-_LOW_CONFIDENCE_SQL = """
+# Bug fix: this used to compare confidence_score < 0.90 unconditionally, but
+# verigence-di computes and stores confidence on a 0.00-100.00 scale
+# (confidence_scale='PERCENT' on every row _machine_upsert_fact writes) --
+# so a real, non-degenerate low-confidence extraction (45, 60, 85) was never
+# < 0.90 and this worklist essentially never populated in production. Fixed
+# to reuse the SAME normalize-then-compare-to-REVIEW_THRESHOLD_PERCENT logic
+# uc03_confidence_review_policy.py::_unreviewed_low_confidence_count already
+# gets right for the pre-submit blocking gate, rather than a third,
+# independent (and wrong) copy of the same 90% threshold.
+_LOW_CONFIDENCE_SQL = f"""
     SELECT f.extracted_field_id,
            f.di_document_id,
            f.field_key,
@@ -76,7 +85,13 @@ _LOW_CONFIDENCE_SQL = """
       AND f.reviewed_at_utc IS NULL
       AND f.extracted_value IS NOT NULL
       AND f.extracted_value <> 'null'::jsonb
-      AND (f.confidence_score IS NULL OR f.confidence_score < :threshold)
+      AND (
+          f.confidence_score IS NULL
+          OR CASE
+              WHEN f.confidence_scale='UNIT_INTERVAL' THEN f.confidence_score * 100
+              ELSE f.confidence_score
+          END < {REVIEW_THRESHOLD_PERCENT}
+      )
     ORDER BY f.di_document_id, f.field_key
 """
 
@@ -90,7 +105,6 @@ def _unreviewed_low_confidence(
             "tenant_id": tenant_id,
             "journey_id": journey_id,
             "stage_code": stage_code,
-            "threshold": _CONFIDENCE_THRESHOLD,
         },
     ).mappings().all()
     return [dict(row) for row in rows]
