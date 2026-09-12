@@ -40,8 +40,14 @@ _DELIVERY_AUDIT_INCOMPLETE_RULE = "WF_DELIVERY_COMPLETED_WITH_AUDIT_INCOMPLETE"
 _NOT_INTIMATED_RULE = "DL_NOT_INTIMATED"
 _VIN_RULE = "DL_VIN_RECONCILIATION"
 _DOCUMENT_NO_RULE = "DOC_REQUIRED_ANSWER_NO"
-_PAYMENT_UNVERIFIED_RULE = "PAY_UNVERIFIED_RECEIPT"
 _VIN_EVALUATOR = "EXACT_COMPARABLE_IDENTIFIER_V1"
+# PAY_UNVERIFIED_RECEIPT was retired as a standalone rule_code -- the
+# unverified-payment check below now raises under PAYMENT_BANK_UNMATCHED's
+# own per-payment rule_key instead (see the call site), since both checked
+# the exact same underlying fact (no VERIFIED payment_verification_events
+# row). uc03_finding_routing.py's classification tables still recognize the
+# retired rule_key so historical findings raised under it keep classifying
+# correctly.
 
 
 class DeliveryCommandResponse(BaseModel):
@@ -648,22 +654,35 @@ def _delivery_audit_gaps(
     ).scalars().all()
     if unverified_payments:
         gaps.append("PAYMENT_VERIFICATION_INCOMPLETE")
-        flags.append(
-            _machine_flag(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                stage_code="DELIVERY",
-                rule_key=_PAYMENT_UNVERIFIED_RULE,
-                finding_type="PAYMENT_UNVERIFIED",
-                severity="HIGH",
-                title="Delivery payment verification incomplete",
-                description="One or more captured payments do not have a VERIFIED realization event.",
-                correlation_id=correlation_id,
-                safe_payload={"paymentIds": [str(value) for value in unverified_payments]},
-                blocking_completion=True,
+        # Consolidated onto PAYMENT_BANK_UNMATCHED's own per-payment rule_key
+        # (uc03_payment_reconciliation.py::_raise_flag) rather than a
+        # separate PAY_UNVERIFIED_RECEIPT finding for the same underlying
+        # fact -- _record_verification is the only path that ever clears
+        # "unverified", so a payment failing this check either already has
+        # an open PAYMENT_BANK_UNMATCHED:{payment_id} finding (reconciliation
+        # already ran) or gets one raised here for the first time (it never
+        # ran yet, e.g. no reconciliation-trigger document has synced). Both
+        # cases now land under one rule instead of two.
+        for payment_id in unverified_payments:
+            flags.append(
+                _machine_flag(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    stage_code="DELIVERY",
+                    rule_key=f"PAYMENT_BANK_UNMATCHED:{payment_id}",
+                    finding_type="PAYMENT_UNVERIFIED",
+                    severity="HIGH",
+                    title="Delivery payment not verified",
+                    description=(
+                        "This payment does not have a VERIFIED realization event -- "
+                        "confirm it against a bank statement before completing Delivery."
+                    ),
+                    correlation_id=correlation_id,
+                    safe_payload={"paymentId": str(payment_id)},
+                    blocking_completion=True,
+                )
             )
-        )
 
     return gaps, list(dict.fromkeys(flags))
 

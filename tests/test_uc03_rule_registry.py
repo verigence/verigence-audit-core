@@ -103,16 +103,21 @@ def test_rule_catalog_returns_seeded_audit_core_rules_grouped_by_category(
     )
     assert once_rule.rerunPolicy == "ONCE"
 
-    # The one rule that actually blocks stage completion today (0084 backfill,
-    # verified against its real _machine_flag(blocking_completion=True) call).
-    delivery_group = next(
-        g for g in response.groups if g.category == "Delivery Process"
+    # PAY_UNVERIFIED_RECEIPT was retired (0086) -- it checked the exact same
+    # fact as PAYMENT_BANK_UNMATCHED (no VERIFIED payment_verification_events
+    # row), so the unverified-payment gap at Delivery completion now raises
+    # under PAYMENT_BANK_UNMATCHED's own rule_key instead of a separate rule.
+    assert "PAY_UNVERIFIED_RECEIPT" not in all_rule_codes
+    payment_group = next(
+        g for g in response.groups if g.category == "Payments & Reconciliation"
     )
-    pay_unverified = next(
-        r for r in delivery_group.rules if r.ruleCode == "PAY_UNVERIFIED_RECEIPT"
+    payment_bank_unmatched = next(
+        r for r in payment_group.rules if r.ruleCode == "PAYMENT_BANK_UNMATCHED"
     )
-    assert pay_unverified.blockingCompletion is True
-    assert set(pay_unverified.boundActions) == {"REMARK", "RESOLVE"}  # DATA_GAP -> self-serve
+    # The retired rule's one distinguishing property (this check can hold up
+    # Delivery completion) transfers to the surviving rule.
+    assert payment_bank_unmatched.blockingCompletion is True
+    assert set(payment_bank_unmatched.boundActions) == {"REMARK", "RESOLVE"}  # DATA_GAP -> self-serve
 
 
 def test_rule_catalog_denies_without_permission(rule_registry_setup) -> None:
