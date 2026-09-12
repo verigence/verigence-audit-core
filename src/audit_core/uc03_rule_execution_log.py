@@ -65,6 +65,57 @@ def record_execution(
     )
 
 
+def record_from_summary(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    rule_code: str,
+    triggering_event: str,
+    result: dict,
+    skipped_reason: str,
+    correlation_id: str | None = None,
+) -> None:
+    """Convenience for the common DOCUMENT_SYNCED producer return shape --
+    ``{"raised": int, "examined": int, ...}`` on success, ``{"error": True}``
+    on the producer's own caught exception -- shared by every rule
+    instrumented this way (Phase 4) so the per-call-site logic is identical
+    instead of hand-rolled per rule:
+
+      - ``error`` present                -> ERROR
+      - ``examined`` is 0                -> SKIPPED (``skipped_reason``)
+      - ``raised`` > 0                   -> FAIL
+      - otherwise                        -> PASS
+
+    A rule evaluated per-document (its own rule_key per instance, e.g.
+    WRONG_DOCUMENT, DUPLICATE_RECEIPT) writes one summary row per
+    invocation this way, not one per document -- the specific finding(s)
+    stay reachable from ``audit_findings`` by rule_key prefix.
+    """
+    if result.get("error"):
+        outcome: Outcome = "ERROR"
+        reason: str | None = f"{rule_code} producer raised an exception"
+    elif result.get("examined", 0) == 0:
+        outcome = "SKIPPED"
+        reason = skipped_reason
+    elif result.get("raised", 0) > 0:
+        outcome = "FAIL"
+        reason = None
+    else:
+        outcome = "PASS"
+        reason = None
+    record_execution(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        rule_code=rule_code,
+        triggering_event=triggering_event,
+        outcome=outcome,
+        reason=reason,
+        correlation_id=correlation_id,
+    )
+
+
 def record_executions_bulk(
     connection: Connection,
     *,
