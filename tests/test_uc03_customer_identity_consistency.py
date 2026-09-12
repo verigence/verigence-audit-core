@@ -150,7 +150,7 @@ def test_customer_name_check_is_a_noop_without_kyc_but_dealer_check_still_runs(j
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
 
-    assert result == {"raised": 0, "resolved": 0, "referenceName": None}
+    assert result == {"raised": 0, "resolved": 0, "examined": 0, "referenceName": None}
     assert _open_wrong_document_findings(c) == []
 
 
@@ -174,6 +174,7 @@ def test_matching_names_raise_nothing(journey) -> None:
     )
 
     assert result["raised"] == 0
+    assert result["examined"] == 2  # booking_form + insurance_cover vs the aadhaar reference
     assert _open_wrong_document_findings(c) == []
 
 
