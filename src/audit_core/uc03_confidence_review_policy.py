@@ -1007,12 +1007,27 @@ def _sync_booking_document(
         from audit_core.uc03_async_sync_tasks import (
             sync_model_resolution_with_escalation,
         )
+        from audit_core.uc03_rule_execution_log import (
+            record_execution,
+            record_from_resolution,
+        )
 
-        sync_model_resolution_with_escalation(
+        model_resolution_result = sync_model_resolution_with_escalation(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
             correlation_id="",
+        )
+        record_from_resolution(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            rule_code="MODEL_NOT_IDENTIFIED", triggering_event="DOCUMENT_SYNCED",
+            result=model_resolution_result,
+        )
+        record_execution(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            rule_code="AUTOMATED_SYNC_FAILURE", triggering_event="DOCUMENT_SYNCED",
+            outcome="FAIL" if model_resolution_result.get("error") else "PASS",
+            reason="SKU resolution raised an unexpected internal error" if model_resolution_result.get("error") else None,
         )
 
         # Intimation Date + corporate/exchange/scrappage discount evidence,
@@ -1120,11 +1135,30 @@ def _sync_booking_document(
             sync_model_resolution_from_invoice_with_escalation,
         )
 
-        sync_model_resolution_from_invoice_with_escalation(
+        invoice_model_resolution_result = sync_model_resolution_from_invoice_with_escalation(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
             correlation_id="",
+        )
+        from audit_core.uc03_rule_execution_log import (
+            record_execution,
+            record_from_resolution,
+        )
+
+        record_from_resolution(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            rule_code="MODEL_NOT_IDENTIFIED", triggering_event="DOCUMENT_SYNCED",
+            result=invoice_model_resolution_result,
+        )
+        record_execution(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            rule_code="AUTOMATED_SYNC_FAILURE", triggering_event="DOCUMENT_SYNCED",
+            outcome="FAIL" if invoice_model_resolution_result.get("error") else "PASS",
+            reason=(
+                "Delivery-invoice SKU fallback raised an unexpected internal error"
+                if invoice_model_resolution_result.get("error") else None
+            ),
         )
 
     # Booking Confirmed is data-driven off cumulative payments, independent of

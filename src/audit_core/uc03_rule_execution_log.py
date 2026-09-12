@@ -116,6 +116,51 @@ def record_from_summary(
     )
 
 
+def record_from_resolution(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    rule_code: str,
+    triggering_event: str,
+    result: dict,
+    correlation_id: str | None = None,
+) -> None:
+    """Convenience for the sync_model_resolution*-style producer return
+    shape -- ``{"resolved": True, ...}`` | ``{"raised": True, ...}`` |
+    ``{"skipped": True, "reason": ...}`` | ``{"error": True}`` -- distinct
+    from ``record_from_summary``'s raised/examined-COUNT convention
+    (this one uses boolean flags, not counts):
+
+      - ``error`` present   -> ERROR
+      - ``raised`` truthy    -> FAIL
+      - ``skipped`` truthy   -> SKIPPED (``reason`` if given, else generic)
+      - otherwise (``resolved``) -> PASS
+    """
+    if result.get("error"):
+        outcome: Outcome = "ERROR"
+        reason: str | None = f"{rule_code} producer raised an exception"
+    elif result.get("raised"):
+        outcome = "FAIL"
+        reason = None
+    elif result.get("skipped"):
+        outcome = "SKIPPED"
+        reason = str(result.get("reason") or "not resolvable yet")
+    else:
+        outcome = "PASS"
+        reason = None
+    record_execution(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        rule_code=rule_code,
+        triggering_event=triggering_event,
+        outcome=outcome,
+        reason=reason,
+        correlation_id=correlation_id,
+    )
+
+
 def record_executions_bulk(
     connection: Connection,
     *,
