@@ -191,7 +191,7 @@ def _payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> li
         text(
             """
             SELECT payment_id, amount, payment_method_code, payment_reference,
-                   receipt_date, receipt_number
+                   receipt_date, receipt_number, payment_stage
             FROM auditcore.payments
             WHERE tenant_id = :tenant_id AND journey_id = :journey_id
             ORDER BY created_at_utc, payment_id
@@ -200,6 +200,15 @@ def _payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> li
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
     return [dict(row) for row in rows]
+
+
+def _stage_for_payment(payment: dict[str, Any]) -> str:
+    """auditcore.payments.payment_stage is 'UNSPECIFIED'|'BOOKING'|'DELIVERY'
+    -- only the latter two are valid audit_findings.stage_code values, so an
+    UNSPECIFIED (or missing) payment falls back to _STAGE, same as before
+    this was tracked at all."""
+    stage = payment.get("payment_stage")
+    return stage if stage in ("BOOKING", "DELIVERY") else _STAGE
 
 
 def _bank_lines(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
@@ -416,7 +425,7 @@ def _raise_flag(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
-        stage_code=_STAGE,
+        stage_code=_stage_for_payment(payment),
         rule_key=f"{_RULE_PREFIX}:{payment['payment_id']}",
         finding_type=_FINDING_TYPE,
         severity="HIGH",

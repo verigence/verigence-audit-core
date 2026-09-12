@@ -161,14 +161,14 @@ def journey():
     engine.dispose()
 
 
-def _add_payment(c, *, amount, ref, method="UPI", day=1):
+def _add_payment(c, *, amount, ref, method="UPI", day=1, stage="BOOKING"):
     return c.execute(
         text("""INSERT INTO auditcore.payments
             (tenant_id, journey_id, amount, payment_method_code, payment_reference,
              receipt_number, receipt_date, payment_stage, status_source)
-            VALUES (:t, :j, :a, :m, :r, 'RC-1', DATE '2026-09-01' + :day, 'BOOKING', 'EVIDENCE')
+            VALUES (:t, :j, :a, :m, :r, 'RC-1', DATE '2026-09-01' + :day, :stage, 'EVIDENCE')
             RETURNING payment_id"""),
-        {"t": c.tenant_id, "j": c.journey_id, "a": amount, "m": method, "r": ref, "day": day},
+        {"t": c.tenant_id, "j": c.journey_id, "a": amount, "m": method, "r": ref, "day": day, "stage": stage},
     ).scalar_one()
 
 
@@ -309,3 +309,26 @@ def test_idempotent(journey) -> None:
         {"t": c.tenant_id, "p": pid},
     ).scalar_one() == 1
     assert _verified(c, pid) == 1
+
+
+def test_unmatched_delivery_payment_flag_stamped_with_delivery_stage(journey) -> None:
+    """Regression: _raise_flag used to hardcode stage_code=_STAGE ('BOOKING')
+    for every payment regardless of its own payment_stage -- a Delivery
+    payment's PAYMENT_BANK_UNMATCHED finding was silently mislabeled under
+    the Booking stage. Fixed so a Delivery-stage payment's finding actually
+    carries stage_code='DELIVERY', which is also what lets
+    _delivery_audit_gaps's own unverified-payment check dedupe against this
+    rule instead of raising a second, separate finding for the same fact."""
+    c = journey
+    c.execute(
+        text("INSERT INTO auditcore.deliveries (tenant_id, journey_id) VALUES (:t, :j)"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    )
+    pid = _add_payment(c, amount=60000, ref="UTR-DELIVERY-1", stage="DELIVERY")
+    pr.reconcile_payments(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    stage = c.execute(
+        text("SELECT stage_code FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND rule_key=:rk"),
+        {"t": c.tenant_id, "j": c.journey_id, "rk": f"PAYMENT_BANK_UNMATCHED:{pid}"},
+    ).scalar_one()
+    assert stage == "DELIVERY"
