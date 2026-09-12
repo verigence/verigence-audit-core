@@ -279,7 +279,7 @@ def test_tl_accepts_violation_and_records_confirmed_breach(audit_setup):
     accepted = _client().post(
         f"{_base(audit_setup)}/flags/{flag['flagId']}/actions",
         headers={"Idempotency-Key": "adj-accept-act-01", "If-Match": '"1"'},
-        json={"action": "ACCEPT", "resolutionReason": "Discount exceeds policy — breach"},
+        json={"action": "CONFIRM_BREACH", "resolutionReason": "Discount exceeds policy — breach"},
     )
     assert accepted.status_code == 200, accepted.text
     body = accepted.json()["flag"]
@@ -295,10 +295,10 @@ def test_tl_rejects_violation_and_records_not_a_breach(audit_setup):
     rejected = _client().post(
         f"{_base(audit_setup)}/flags/{flag['flagId']}/actions",
         headers={"Idempotency-Key": "adj-reject-act-01", "If-Match": '"1"'},
-        json={"action": "REJECT", "resolutionReason": "Within approved deviation"},
+        json={"action": "MARK_FALSE_POSITIVE", "resolutionReason": "Within approved deviation"},
     )
     assert rejected.status_code == 200, rejected.text
-    assert rejected.json()["flag"]["disposition"] == "NOT_A_BREACH"
+    assert rejected.json()["flag"]["disposition"] == "FALSE_POSITIVE"
 
 
 def test_accept_is_rejected_for_a_document_gap(audit_setup):
@@ -309,7 +309,7 @@ def test_accept_is_rejected_for_a_document_gap(audit_setup):
     denied = _client().post(
         f"{_base(audit_setup)}/flags/{flag['flagId']}/actions",
         headers={"Idempotency-Key": "adj-wrongclass-act-01", "If-Match": '"1"'},
-        json={"action": "ACCEPT", "resolutionReason": "n/a"},
+        json={"action": "CONFIRM_BREACH", "resolutionReason": "n/a"},
     )
     assert denied.status_code == 403
 
@@ -353,7 +353,7 @@ def test_review_queue_routes_by_role_and_supports_scope(audit_setup):
     tl_item = next(item for item in tl_mine if item["flagId"] == violation["flagId"])
     assert tl_item["isMine"] is True
     assert tl_item["version"] == 1
-    assert "ACCEPT" in tl_item["permittedActions"]
+    assert "CONFIRM_BREACH" in tl_item["permittedActions"]
     assert doc_gap["flagId"] not in {item["flagId"] for item in tl_mine}
 
     summary = _client().get(f"{_queue(audit_setup)}/summary").json()
@@ -805,15 +805,15 @@ def test_summary_exposes_role_capabilities_without_client_side_authority(audit_s
     assert "RAISE" in pc.json()["permittedActions"]
     # A PC may close their own data / document gap, but never adjudicate:
     assert "RESOLVE" in pc.json()["permittedActions"]
-    assert "ACCEPT" not in pc.json()["permittedActions"]
-    assert "REJECT" not in pc.json()["permittedActions"]
+    assert "CONFIRM_BREACH" not in pc.json()["permittedActions"]
+    assert "MARK_FALSE_POSITIVE" not in pc.json()["permittedActions"]
     assert "ACKNOWLEDGE" not in pc.json()["permittedActions"]
 
     _set_role(audit_setup, "TL")
     tl = _client().get(f"{_base(audit_setup)}/audit-summary")
     assert tl.status_code == 200
     assert "RESOLVE" in tl.json()["permittedActions"]
-    assert "ACCEPT" in tl.json()["permittedActions"]
+    assert "CONFIRM_BREACH" in tl.json()["permittedActions"]
     assert "VOID" not in tl.json()["permittedActions"]
 
     _set_role(audit_setup, "EXECUTIVE")

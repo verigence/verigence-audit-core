@@ -55,6 +55,7 @@ from audit_core.observability import get_correlation_id
 from audit_core.security import Principal
 from audit_core.uc03_audit_flags import (
     _ACTION_DISPOSITION,
+    _ACTION_LABEL,
     _HUMAN_FLAG_CATEGORIES,
     FlagLifecycleCommand,
     FlagRemarkCommand,
@@ -444,15 +445,15 @@ def act_on_daily_ops_flag(
             )
         finding_class = row["finding_class"] or classify_finding(None, row["finding_type_code"])
         resolution_mode = class_profile(finding_class).resolution_mode
-        if payload.action in {"ACCEPT", "REJECT"} and resolution_mode != "ADJUDICATED":
+        if payload.action in {"CONFIRM_BREACH", "MARK_FALSE_POSITIVE"} and resolution_mode != "ADJUDICATED":
             raise AuthorizationError(
                 error_code="VAC-AUTH-005", status_code=403,
-                title=f"{payload.action.title()} is not available for a {finding_class.replace('_', ' ').lower()}",
+                title=f"{_ACTION_LABEL.get(payload.action, payload.action)} is not available for a {finding_class.replace('_', ' ').lower()}",
             )
         if payload.action == "RESOLVE" and context["operating_role"] == "PC" and resolution_mode == "ADJUDICATED":
             raise AuthorizationError(
                 error_code="VAC-AUTH-005", status_code=403,
-                title="A violation must be accepted or rejected by a Team Lead or PM",
+                title="A violation must be Confirmed Breach or Marked False Positive by a Team Lead or PM",
             )
         next_status = _transition(payload.action, row["finding_status"])
         reason = (payload.resolutionReason or payload.remarks or "").strip() or None
@@ -463,7 +464,7 @@ def act_on_daily_ops_flag(
                 UPDATE auditcore.audit_findings
                 SET finding_status=:status,
                     resolution_reason=CASE
-                        WHEN :action IN ('RESOLVE','VOID','ACCEPT','REJECT') THEN CAST(:reason AS text)
+                        WHEN :action IN ('RESOLVE','VOID','CONFIRM_BREACH','MARK_FALSE_POSITIVE') THEN CAST(:reason AS text)
                         WHEN :action='REOPEN' THEN NULL
                         ELSE resolution_reason
                     END,

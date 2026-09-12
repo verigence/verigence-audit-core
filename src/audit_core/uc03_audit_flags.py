@@ -44,8 +44,21 @@ router = APIRouter(
 
 StageCode = Literal["BOOKING", "DELIVERY"]
 FlagAction = Literal[
-    "ACKNOWLEDGE", "REVIEW", "RESOLVE", "REOPEN", "VOID", "ACCEPT", "REJECT"
+    "ACKNOWLEDGE", "REVIEW", "RESOLVE", "REOPEN", "VOID",
+    "CONFIRM_BREACH", "MARK_FALSE_POSITIVE",
 ]
+
+# Human-readable label for an action code -- used in error titles instead of
+# a blind .title() call, which would render "Confirm_Breach".
+_ACTION_LABEL: dict[str, str] = {
+    "ACKNOWLEDGE": "Acknowledge",
+    "REVIEW": "Review",
+    "RESOLVE": "Resolve",
+    "REOPEN": "Reopen",
+    "VOID": "Void",
+    "CONFIRM_BREACH": "Confirm Breach",
+    "MARK_FALSE_POSITIVE": "Mark False Positive",
+}
 
 _HUMAN_FLAG_CATEGORIES = {
     "PHYSICAL_OBSERVATION",
@@ -66,8 +79,8 @@ _PERMISSION_BY_OPERATION = {
     "REMARK": "audit.finding.update",
     "ACKNOWLEDGE": "audit.review.decide",
     "REVIEW": "audit.review.decide",
-    "ACCEPT": "audit.review.decide",
-    "REJECT": "audit.review.decide",
+    "CONFIRM_BREACH": "audit.review.decide",
+    "MARK_FALSE_POSITIVE": "audit.review.decide",
     "RESOLVE": "audit.finding.resolve",
     "REOPEN": "audit.finding.resolve",
     "VOID": "audit.finding.resolve",
@@ -80,9 +93,9 @@ _DEFAULT_ROLE_POLICY: dict[str, set[str]] = {
     "REMARK": {"PC", "TL", "PM", "EXECUTIVE"},
     "ACKNOWLEDGE": {"TL", "PM", "EXECUTIVE"},
     "REVIEW": {"TL", "PM", "EXECUTIVE"},
-    # Accept / Reject a VIOLATION: TL first, PM on escalation.
-    "ACCEPT": {"TL", "PM", "EXECUTIVE"},
-    "REJECT": {"TL", "PM", "EXECUTIVE"},
+    # Confirm Breach / Mark False Positive a VIOLATION: TL first, PM on escalation.
+    "CONFIRM_BREACH": {"TL", "PM", "EXECUTIVE"},
+    "MARK_FALSE_POSITIVE": {"TL", "PM", "EXECUTIVE"},
     # A self-serve DATA_GAP / DOCUMENT_GAP is resolved by its PC owner; TL/PM may
     # also close it. Adjudicated findings never take the plain RESOLVE path.
     "RESOLVE": {"PC", "TL", "PM", "EXECUTIVE"},
@@ -128,7 +141,7 @@ class FlagLifecycleCommand(BaseModel):
 
     @model_validator(mode="after")
     def require_reason_for_terminal_or_reopen(self):
-        if self.action in {"RESOLVE", "REOPEN", "VOID", "ACCEPT", "REJECT"}:
+        if self.action in {"RESOLVE", "REOPEN", "VOID", "CONFIRM_BREACH", "MARK_FALSE_POSITIVE"}:
             reason = (self.resolutionReason or self.remarks or "").strip()
             if not reason:
                 raise ValueError("A reason is required for resolve, reopen, or void actions")
@@ -751,8 +764,8 @@ def _role_permitted_actions(context: dict[str, Any]) -> list[str]:
         "REMARK",
         "ACKNOWLEDGE",
         "REVIEW",
-        "ACCEPT",
-        "REJECT",
+        "CONFIRM_BREACH",
+        "MARK_FALSE_POSITIVE",
         "RESOLVE",
         "REOPEN",
         "VOID",
@@ -779,8 +792,8 @@ def _highest_open_severity(flags: list[FlagView]) -> str | None:
 # action → disposition written on the finding when it terminates.
 _ACTION_DISPOSITION: dict[str, str] = {
     "RESOLVE": "FIXED",
-    "ACCEPT": "CONFIRMED_BREACH",
-    "REJECT": "NOT_A_BREACH",
+    "CONFIRM_BREACH": "CONFIRMED_BREACH",
+    "MARK_FALSE_POSITIVE": "FALSE_POSITIVE",
 }
 
 
@@ -789,8 +802,8 @@ def _transition(action: FlagAction, current_status: str) -> str:
         "ACKNOWLEDGE": ({"OPEN"}, "ACKNOWLEDGED"),
         "REVIEW": ({"OPEN", "ACKNOWLEDGED"}, "ACKNOWLEDGED"),
         "RESOLVE": ({"OPEN", "ACKNOWLEDGED"}, "RESOLVED"),
-        "ACCEPT": ({"OPEN", "ACKNOWLEDGED"}, "RESOLVED"),
-        "REJECT": ({"OPEN", "ACKNOWLEDGED"}, "RESOLVED"),
+        "CONFIRM_BREACH": ({"OPEN", "ACKNOWLEDGED"}, "RESOLVED"),
+        "MARK_FALSE_POSITIVE": ({"OPEN", "ACKNOWLEDGED"}, "RESOLVED"),
         "REOPEN": ({"RESOLVED"}, "OPEN"),
         "VOID": ({"OPEN", "ACKNOWLEDGED", "RESOLVED"}, "VOIDED"),
     }
@@ -1169,15 +1182,16 @@ def act_on_flag(
             row["rule_key"], row["finding_type_code"]
         )
         resolution_mode = class_profile(finding_class).resolution_mode
-        # Accept / Reject are verdicts on a rule breach — only for adjudicated
-        # findings (VIOLATION). A data / document gap is fixed, not adjudicated.
-        if payload.action in {"ACCEPT", "REJECT"} and resolution_mode != "ADJUDICATED":
+        # Confirm Breach / Mark False Positive are verdicts on a rule breach —
+        # only for adjudicated findings (VIOLATION). A data / document gap is
+        # fixed, not adjudicated.
+        if payload.action in {"CONFIRM_BREACH", "MARK_FALSE_POSITIVE"} and resolution_mode != "ADJUDICATED":
             raise AuthorizationError(
                 error_code="VAC-AUTH-005",
                 status_code=403,
                 title=(
-                    f"{payload.action.title()} is not available for a "
-                    f"{finding_class.replace('_', ' ').lower()}"
+                    f"{_ACTION_LABEL.get(payload.action, payload.action)} is not "
+                    f"available for a {finding_class.replace('_', ' ').lower()}"
                 ),
             )
         # A PC may close their own data / document gap, but never a VIOLATION —
@@ -1190,7 +1204,7 @@ def act_on_flag(
             raise AuthorizationError(
                 error_code="VAC-AUTH-005",
                 status_code=403,
-                title="A violation must be accepted or rejected by a Team Lead or PM",
+                title="A violation must be Confirmed Breach or Marked False Positive by a Team Lead or PM",
             )
         next_status = _transition(payload.action, row["finding_status"])
         _validate_evidence(
@@ -1214,7 +1228,7 @@ def act_on_flag(
                 UPDATE auditcore.audit_findings
                 SET finding_status=:status,
                     resolution_reason=CASE
-                        WHEN :action IN ('RESOLVE','VOID','ACCEPT','REJECT')
+                        WHEN :action IN ('RESOLVE','VOID','CONFIRM_BREACH','MARK_FALSE_POSITIVE')
                             THEN CAST(:reason AS text)
                         WHEN :action='REOPEN' THEN NULL
                         ELSE resolution_reason
