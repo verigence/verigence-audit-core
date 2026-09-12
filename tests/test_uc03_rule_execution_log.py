@@ -7,7 +7,11 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
-from audit_core.uc03_rule_execution_log import record_execution, record_executions_bulk
+from audit_core.uc03_rule_execution_log import (
+    record_execution,
+    record_executions_bulk,
+    record_from_summary,
+)
 
 
 @pytest.fixture
@@ -152,3 +156,54 @@ def test_record_executions_bulk_writes_pass_fail_skipped(execution_log_setup) ->
     assert rows["RULE_SKIPPED"]["outcome"] == "SKIPPED"
     assert rows["RULE_SKIPPED"]["reason"] == "no evidence document on file"
     assert all(row["triggering_event"] == "DELIVERY_COMPLETED" for row in rows.values())
+
+
+def test_record_from_summary_skipped_when_nothing_examined(execution_log_setup) -> None:
+    engine, tenant_id, journey_id = execution_log_setup
+    with engine.begin() as connection:
+        record_from_summary(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            rule_code="SOME_RULE", triggering_event="DOCUMENT_SYNCED",
+            result={"raised": 0, "examined": 0}, skipped_reason="nothing to check yet",
+        )
+    rows = _rows(engine, tenant_id)
+    assert rows[0]["outcome"] == "SKIPPED"
+    assert rows[0]["reason"] == "nothing to check yet"
+
+
+def test_record_from_summary_pass_when_examined_and_clean(execution_log_setup) -> None:
+    engine, tenant_id, journey_id = execution_log_setup
+    with engine.begin() as connection:
+        record_from_summary(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            rule_code="SOME_RULE", triggering_event="DOCUMENT_SYNCED",
+            result={"raised": 0, "examined": 3}, skipped_reason="unused",
+        )
+    rows = _rows(engine, tenant_id)
+    assert rows[0]["outcome"] == "PASS"
+    assert rows[0]["reason"] is None
+
+
+def test_record_from_summary_fail_when_raised(execution_log_setup) -> None:
+    engine, tenant_id, journey_id = execution_log_setup
+    with engine.begin() as connection:
+        record_from_summary(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            rule_code="SOME_RULE", triggering_event="DOCUMENT_SYNCED",
+            result={"raised": 2, "examined": 3}, skipped_reason="unused",
+        )
+    rows = _rows(engine, tenant_id)
+    assert rows[0]["outcome"] == "FAIL"
+
+
+def test_record_from_summary_error_when_producer_failed(execution_log_setup) -> None:
+    engine, tenant_id, journey_id = execution_log_setup
+    with engine.begin() as connection:
+        record_from_summary(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            rule_code="SOME_RULE", triggering_event="DOCUMENT_SYNCED",
+            result={"error": True}, skipped_reason="unused",
+        )
+    rows = _rows(engine, tenant_id)
+    assert rows[0]["outcome"] == "ERROR"
+    assert "SOME_RULE" in rows[0]["reason"]

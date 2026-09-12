@@ -284,7 +284,12 @@ def sync_duplicate_receipt_detection(
             current_rule_keys={g.rule_key for g in groups},
             correlation_id=correlation_id,
         )
-        return {"raised": raised, "resolved": resolved, "groupCount": len(groups)}
+        return {
+            "raised": raised,
+            "resolved": resolved,
+            "groupCount": len(groups),
+            "examined": len(documents),
+        }
     except Exception:
         logger.warning("sync_duplicate_receipt_detection failed", exc_info=True)
         return {"error": True}

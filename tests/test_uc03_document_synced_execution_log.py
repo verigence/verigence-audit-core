@@ -1,10 +1,11 @@
 """Phase 4 of the rule-engine platform: DOCUMENT_SYNCED producers start
 writing PASS/FAIL/SKIPPED rows to auditcore.rule_executions, not just a
-finding on FAIL. WRONG_DOCUMENT is the first rule instrumented (see
-_sync_booking_document's customer-identity-consistency call site) -- this
-is its end-to-end coverage, calling the real per-document sync pipeline
-with a fake DI/Security client, matching test_uc03_sku_resolution_ordering.py's
-established pattern for exercising _sync_booking_document directly.
+finding on FAIL. WRONG_DOCUMENT and DUPLICATE_RECEIPT are instrumented so
+far (see _sync_booking_document's identity-consistency and duplicate-
+receipt call sites) -- this is their end-to-end coverage, calling the real
+per-document sync pipeline with a fake DI/Security client, matching
+test_uc03_sku_resolution_ordering.py's established pattern for exercising
+_sync_booking_document directly.
 """
 from __future__ import annotations
 
@@ -122,15 +123,19 @@ def _sync(engine, tenant_id, journey_id, document_id, di_client) -> None:
         )
 
 
-def _wrong_document_executions(engine, tenant_id):
+def _executions_for_rule(engine, tenant_id, rule_code):
     with engine.begin() as c:
         return c.execute(
             text(
                 "SELECT outcome, reason, triggering_event FROM auditcore.rule_executions "
-                "WHERE tenant_id=:t AND rule_code='WRONG_DOCUMENT' ORDER BY evaluated_at_utc"
+                "WHERE tenant_id=:t AND rule_code=:rc ORDER BY evaluated_at_utc"
             ),
-            {"t": tenant_id},
+            {"t": tenant_id, "rc": rule_code},
         ).mappings().all()
+
+
+def _wrong_document_executions(engine, tenant_id):
+    return _executions_for_rule(engine, tenant_id, "WRONG_DOCUMENT")
 
 
 def _add_evidence(engine, tenant_id, journey_id, customer_id, document_id, document_type_key) -> None:
@@ -212,3 +217,52 @@ def test_mismatched_name_records_fail(synced_document_setup) -> None:
 
     rows = _wrong_document_executions(engine, tenant_id)
     assert [r["outcome"] for r in rows] == ["SKIPPED", "FAIL"]
+
+
+def test_single_receipt_records_pass_for_duplicate_receipt(synced_document_setup) -> None:
+    engine, tenant_id, journey_id = synced_document_setup
+    customer_id = _customer_id(engine, tenant_id, journey_id)
+
+    receipt_id = uuid4()
+    _add_evidence(engine, tenant_id, journey_id, customer_id, receipt_id, "dealer_receipt")
+    di_client = _FakeDiClient()
+    di_client.add(
+        _confirmed(receipt_id, "dealer_receipt"),
+        [
+            _fact("receipt_number", "RCPT-001"),
+            _fact("amount_paid", "50000"),
+            _fact("receipt_date", "2026-09-01"),
+        ],
+    )
+    _sync(engine, tenant_id, journey_id, receipt_id, di_client)
+
+    rows = _executions_for_rule(engine, tenant_id, "DUPLICATE_RECEIPT")
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "PASS"
+
+
+def test_two_matching_receipts_record_fail_for_duplicate_receipt(synced_document_setup) -> None:
+    engine, tenant_id, journey_id = synced_document_setup
+    customer_id = _customer_id(engine, tenant_id, journey_id)
+    di_client = _FakeDiClient()
+
+    first_id = uuid4()
+    _add_evidence(engine, tenant_id, journey_id, customer_id, first_id, "dealer_receipt")
+    di_client.add(
+        _confirmed(first_id, "dealer_receipt"),
+        [_fact("receipt_number", "RCPT-002"), _fact("amount_paid", "75000"), _fact("receipt_date", "2026-09-01")],
+    )
+    _sync(engine, tenant_id, journey_id, first_id, di_client)
+
+    second_id = uuid4()
+    _add_evidence(engine, tenant_id, journey_id, customer_id, second_id, "dealer_receipt")
+    di_client.add(
+        _confirmed(second_id, "dealer_receipt"),
+        [_fact("receipt_number", "RCPT-002"), _fact("amount_paid", "75000"), _fact("receipt_date", "2026-09-01")],
+    )
+    _sync(engine, tenant_id, journey_id, second_id, di_client)
+
+    rows = _executions_for_rule(engine, tenant_id, "DUPLICATE_RECEIPT")
+    # first sync: only one receipt on file yet -- PASS. second sync: now a
+    # matching pair exists -- FAIL.
+    assert [r["outcome"] for r in rows] == ["PASS", "FAIL"]
