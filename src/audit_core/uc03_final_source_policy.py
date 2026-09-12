@@ -219,6 +219,11 @@ PROVEN_REVIEWED_SOURCE_POLICIES: tuple[ReviewedSourcePolicy, ...] = (
 # converting presentation labels into guessed keys.
 UNRESOLVED_TECHNICAL_POLICIES: tuple[UnresolvedTechnicalPolicy, ...] = (
     UnresolvedTechnicalPolicy(
+        "First receipt date",
+        "Money Receipt",
+        "canonical Money Receipt document identity and receipt-date field mapping are not proven",
+    ),
+    UnresolvedTechnicalPolicy(
         "Finance Type",
         "Bank DO",
         "Bank DO canonical document/field mapping is not proven",
