@@ -339,8 +339,11 @@ def test_no_payments_yet_records_skipped_for_payment_reconciliation(synced_docum
     assert payment_rows[0]["outcome"] == "SKIPPED"
 
     sync_failure_rows = _executions_for_rule(engine, tenant_id, "AUTOMATED_SYNC_FAILURE")
-    assert len(sync_failure_rows) == 1
-    assert sync_failure_rows[0]["outcome"] == "PASS"
+    # Two rows: payment reconciliation's own half (this document type
+    # triggers it), plus SKU resolution's own half (runs unconditionally
+    # for stage=="BOOKING", regardless of document type).
+    assert len(sync_failure_rows) == 2
+    assert all(row["outcome"] == "PASS" for row in sync_failure_rows)
 
 
 def test_unmatched_payment_records_fail_for_payment_reconciliation(synced_document_setup) -> None:
@@ -375,3 +378,93 @@ def test_cash_payment_records_pass_for_payment_reconciliation(synced_document_se
     rows = _executions_for_rule(engine, tenant_id, "PAYMENT_BANK_UNMATCHED")
     assert len(rows) == 1
     assert rows[0]["outcome"] == "PASS"
+
+
+def test_no_model_snapshot_yet_records_skipped_for_model_resolution(synced_document_setup) -> None:
+    engine, tenant_id, journey_id = synced_document_setup
+    customer_id = _customer_id(engine, tenant_id, journey_id)
+
+    # No vehicle_model fact at all -- journey_products.model_name_snapshot
+    # never gets written, sync_model_resolution's own "nothing to resolve
+    # yet" case.
+    booking_form_id = uuid4()
+    _add_evidence(engine, tenant_id, journey_id, customer_id, booking_form_id, "booking_form")
+    di_client = _FakeDiClient()
+    di_client.add(_confirmed(booking_form_id, "booking_form"), [_fact("customer_name", "Sanjaya Kumar Mohanty")])
+    _sync(engine, tenant_id, journey_id, booking_form_id, di_client)
+
+    model_rows = _executions_for_rule(engine, tenant_id, "MODEL_NOT_IDENTIFIED")
+    assert len(model_rows) == 1
+    assert model_rows[0]["outcome"] == "SKIPPED"
+
+    sync_failure_rows = _executions_for_rule(engine, tenant_id, "AUTOMATED_SYNC_FAILURE")
+    # booking_form isn't a reconciliation-trigger document type, so payment
+    # reconciliation's own AUTOMATED_SYNC_FAILURE half never runs here --
+    # only SKU resolution's does.
+    assert len(sync_failure_rows) == 1
+    assert sync_failure_rows[0]["outcome"] == "PASS"
+
+
+def test_resolvable_model_records_pass_for_model_resolution(synced_document_setup) -> None:
+    engine, tenant_id, journey_id = synced_document_setup
+    customer_id = _customer_id(engine, tenant_id, journey_id)
+
+    with engine.begin() as c:
+        oem_id = c.execute(
+            text("SELECT oem_id FROM auditcore.projects WHERE tenant_id=:t LIMIT 1"),
+            {"t": tenant_id},
+        ).scalar_one()
+        model_id = c.execute(
+            text("INSERT INTO auditcore.product_models (oem_id, model_code, model_name) "
+                 "VALUES (:o, :mc, 'SCORPIO N') RETURNING model_id"),
+            {"o": oem_id, "mc": f"MR-M-{uuid4().hex[:8]}"},
+        ).scalar_one()
+        variant_id = c.execute(
+            text("INSERT INTO auditcore.product_variants (model_id, variant_code, variant_name) "
+                 "VALUES (:m, :vc, 'Z8L') RETURNING variant_id"),
+            {"m": model_id, "vc": f"MR-V-{uuid4().hex[:8]}"},
+        ).scalar_one()
+        sku_id = c.execute(
+            text("INSERT INTO auditcore.product_skus (oem_id, model_id, variant_id, sku_code) "
+                 "VALUES (:o, :m, :v, :sc) RETURNING product_sku_id"),
+            {"o": oem_id, "m": model_id, "v": variant_id, "sc": f"MR-SKU-{uuid4().hex[:10]}"},
+        ).scalar_one()
+        price_list_id = c.execute(
+            text("INSERT INTO auditcore.price_lists (tenant_id, price_list_code, price_list_name) "
+                 "VALUES (:t, :c, 'OEM') RETURNING price_list_id"),
+            {"t": tenant_id, "c": f"MR-PL-{uuid4().hex[:8]}"},
+        ).scalar_one()
+        price_list_version_id = c.execute(
+            text("INSERT INTO auditcore.price_list_versions "
+                 "(tenant_id, price_list_id, version_no, lifecycle_status, effective_from) "
+                 "VALUES (:t, :pl, 1, 'DRAFT', CURRENT_DATE - 45) RETURNING price_list_version_id"),
+            {"t": tenant_id, "pl": price_list_id},
+        ).scalar_one()
+        c.execute(
+            text("INSERT INTO auditcore.price_list_items "
+                 "(tenant_id, price_list_version_id, product_sku_id, component_key, standard_amount) "
+                 "VALUES (:t, :plv, :sku, 'EX_SHOWROOM', 1988996)"),
+            {"t": tenant_id, "plv": price_list_version_id, "sku": sku_id},
+        )
+        c.execute(
+            text("UPDATE auditcore.price_list_versions SET lifecycle_status='PUBLISHED' "
+                 "WHERE price_list_version_id=:plv"),
+            {"plv": price_list_version_id},
+        )
+
+    booking_form_id = uuid4()
+    _add_evidence(engine, tenant_id, journey_id, customer_id, booking_form_id, "booking_form")
+    di_client = _FakeDiClient()
+    di_client.add(
+        _confirmed(booking_form_id, "booking_form"),
+        [
+            _fact("vehicle_model", "SCORPIO N"),
+            _fact("vehicle_variant", "Z8L"),
+            _fact("ex_showroom_price", "1988996"),
+        ],
+    )
+    _sync(engine, tenant_id, journey_id, booking_form_id, di_client)
+
+    model_rows = _executions_for_rule(engine, tenant_id, "MODEL_NOT_IDENTIFIED")
+    assert len(model_rows) == 1
+    assert model_rows[0]["outcome"] == "PASS"
