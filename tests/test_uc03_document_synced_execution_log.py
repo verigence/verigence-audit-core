@@ -307,3 +307,71 @@ def test_low_confidence_field_records_fail_for_manual_verification(synced_docume
     rows = _executions_for_rule(engine, tenant_id, "MANUAL_VERIFICATION")
     assert len(rows) == 1
     assert rows[0]["outcome"] == "FAIL"
+
+
+def _add_payment(engine, tenant_id, journey_id, *, amount, ref, method="UPI") -> None:
+    with engine.begin() as c:
+        c.execute(
+            text("""INSERT INTO auditcore.payments
+                (tenant_id, journey_id, amount, payment_method_code, payment_reference,
+                 receipt_number, receipt_date, payment_stage, status_source)
+                VALUES (:t, :j, :a, :m, :r, 'RC-1', DATE '2026-09-01', 'BOOKING', 'EVIDENCE')"""),
+            {"t": tenant_id, "j": journey_id, "a": amount, "m": method, "r": ref},
+        )
+
+
+def test_no_payments_yet_records_skipped_for_payment_reconciliation(synced_document_setup) -> None:
+    engine, tenant_id, journey_id = synced_document_setup
+    customer_id = _customer_id(engine, tenant_id, journey_id)
+
+    # A receipt-type document with zero payments in auditcore.payments yet
+    # (reconcile_payments reads from that table, not from the document's own
+    # extracted fields) -- confirming this document type is what actually
+    # gates the call site, not the document's own content.
+    receipt_id = uuid4()
+    _add_evidence(engine, tenant_id, journey_id, customer_id, receipt_id, "dealer_receipt")
+    di_client = _FakeDiClient()
+    di_client.add(_confirmed(receipt_id, "dealer_receipt"), [])
+    _sync(engine, tenant_id, journey_id, receipt_id, di_client)
+
+    payment_rows = _executions_for_rule(engine, tenant_id, "PAYMENT_BANK_UNMATCHED")
+    assert len(payment_rows) == 1
+    assert payment_rows[0]["outcome"] == "SKIPPED"
+
+    sync_failure_rows = _executions_for_rule(engine, tenant_id, "AUTOMATED_SYNC_FAILURE")
+    assert len(sync_failure_rows) == 1
+    assert sync_failure_rows[0]["outcome"] == "PASS"
+
+
+def test_unmatched_payment_records_fail_for_payment_reconciliation(synced_document_setup) -> None:
+    engine, tenant_id, journey_id = synced_document_setup
+    customer_id = _customer_id(engine, tenant_id, journey_id)
+    _add_payment(engine, tenant_id, journey_id, amount=50000, ref="UTR-NO-MATCH")
+
+    receipt_id = uuid4()
+    _add_evidence(engine, tenant_id, journey_id, customer_id, receipt_id, "dealer_receipt")
+    di_client = _FakeDiClient()
+    di_client.add(_confirmed(receipt_id, "dealer_receipt"), [])
+    _sync(engine, tenant_id, journey_id, receipt_id, di_client)
+
+    rows = _executions_for_rule(engine, tenant_id, "PAYMENT_BANK_UNMATCHED")
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "FAIL"
+
+
+def test_cash_payment_records_pass_for_payment_reconciliation(synced_document_setup) -> None:
+    engine, tenant_id, journey_id = synced_document_setup
+    customer_id = _customer_id(engine, tenant_id, journey_id)
+    # Cash is NOT_APPLICABLE, not unmatched -- reconcile_payments never
+    # raises a flag for it, so the Execution Log should read PASS.
+    _add_payment(engine, tenant_id, journey_id, amount=25000, ref="", method="Cash")
+
+    receipt_id = uuid4()
+    _add_evidence(engine, tenant_id, journey_id, customer_id, receipt_id, "dealer_receipt")
+    di_client = _FakeDiClient()
+    di_client.add(_confirmed(receipt_id, "dealer_receipt"), [])
+    _sync(engine, tenant_id, journey_id, receipt_id, di_client)
+
+    rows = _executions_for_rule(engine, tenant_id, "PAYMENT_BANK_UNMATCHED")
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "PASS"

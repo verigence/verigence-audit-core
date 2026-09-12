@@ -1042,13 +1042,49 @@ def _sync_booking_document(
     # don't pay for a no-op reconciliation pass. Booking's receipt document
     # type is dealer_receipt; Delivery's is payment_receipt (0017/0022).
     if is_reconciliation_trigger_document_type(document_type_key):
-        reconcile_payments_with_escalation(
+        reconciliation_result = reconcile_payments_with_escalation(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
             stage_code=stage_code,
             correlation_id="",
         )
+        # reconcile_payments' own return shape (matched/unmatched/notApplicable/
+        # ambiguous, or {"skipped": True, "reason": ...} with nothing to match,
+        # or {"error": True}) doesn't fit record_from_summary's raised/examined
+        # convention -- it already has cleaner, purpose-built signals, so read
+        # them directly rather than force a translation.
+        from audit_core.uc03_rule_execution_log import record_execution
+
+        if reconciliation_result.get("error"):
+            record_execution(
+                connection, tenant_id=tenant_id, journey_id=journey_id,
+                rule_code="PAYMENT_BANK_UNMATCHED", triggering_event="DOCUMENT_SYNCED",
+                outcome="ERROR", reason="reconcile_payments raised",
+            )
+            record_execution(
+                connection, tenant_id=tenant_id, journey_id=journey_id,
+                rule_code="AUTOMATED_SYNC_FAILURE", triggering_event="DOCUMENT_SYNCED",
+                outcome="FAIL", reason="payment reconciliation raised an unexpected internal error",
+            )
+        else:
+            record_execution(
+                connection, tenant_id=tenant_id, journey_id=journey_id,
+                rule_code="AUTOMATED_SYNC_FAILURE", triggering_event="DOCUMENT_SYNCED",
+                outcome="PASS",
+            )
+            if reconciliation_result.get("skipped"):
+                record_execution(
+                    connection, tenant_id=tenant_id, journey_id=journey_id,
+                    rule_code="PAYMENT_BANK_UNMATCHED", triggering_event="DOCUMENT_SYNCED",
+                    outcome="SKIPPED", reason=str(reconciliation_result.get("reason") or "no payments to reconcile yet"),
+                )
+            else:
+                record_execution(
+                    connection, tenant_id=tenant_id, journey_id=journey_id,
+                    rule_code="PAYMENT_BANK_UNMATCHED", triggering_event="DOCUMENT_SYNCED",
+                    outcome="FAIL" if reconciliation_result.get("unmatched", 0) > 0 else "PASS",
+                )
 
     # Deliberately NOT gated on `changed`. `changed` answers "did this
     # document's raw extracted VALUES differ from what was already durably
