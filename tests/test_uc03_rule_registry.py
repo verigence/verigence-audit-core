@@ -87,6 +87,11 @@ def test_rule_catalog_returns_seeded_audit_core_rules_grouped_by_category(
     assert wrong_document.rerunPolicy == "RERUNNABLE"
     assert wrong_document.findingClass == "VIOLATION"
     assert "DOCUMENT_SYNCED" in wrong_document.triggerEvents
+    # VIOLATION -> ADJUDICATED -> the adjudicated bound-action set (0084).
+    assert set(wrong_document.boundActions) == {
+        "REMARK", "ACKNOWLEDGE", "CONFIRM_BREACH", "MARK_FALSE_POSITIVE", "RESOLVE",
+    }
+    assert wrong_document.blockingCompletion is False
 
     all_rule_codes = {rule.ruleCode for group in response.groups for rule in group.rules}
     assert "DL_VIN_RECONCILIATION" in all_rule_codes
@@ -97,6 +102,17 @@ def test_rule_catalog_returns_seeded_audit_core_rules_grouped_by_category(
         if r.ruleCode == "DL_VIN_RECONCILIATION"
     )
     assert once_rule.rerunPolicy == "ONCE"
+
+    # The one rule that actually blocks stage completion today (0084 backfill,
+    # verified against its real _machine_flag(blocking_completion=True) call).
+    delivery_group = next(
+        g for g in response.groups if g.category == "Delivery Process"
+    )
+    pay_unverified = next(
+        r for r in delivery_group.rules if r.ruleCode == "PAY_UNVERIFIED_RECEIPT"
+    )
+    assert pay_unverified.blockingCompletion is True
+    assert set(pay_unverified.boundActions) == {"REMARK", "RESOLVE"}  # DATA_GAP -> self-serve
 
 
 def test_rule_catalog_denies_without_permission(rule_registry_setup) -> None:

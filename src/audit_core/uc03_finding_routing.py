@@ -25,7 +25,7 @@ from typing import Any, Literal
 
 FindingClass = Literal["DATA_GAP", "DOCUMENT_GAP", "VIOLATION"]
 ResolutionMode = Literal["SELF_SERVICE", "ADJUDICATED"]
-Disposition = Literal["FIXED", "CONFIRMED_BREACH", "NOT_A_BREACH"]
+Disposition = Literal["FIXED", "CONFIRMED_BREACH", "FALSE_POSITIVE"]
 
 _ROLE_LADDER: tuple[str, ...] = ("PC", "TL", "PM", "EXECUTIVE")
 
@@ -266,11 +266,11 @@ def permitted_actions(
         if status in _OPEN_STATUSES and rank >= 0:
             actions.append("RESOLVE")
     elif status in _OPEN_STATUSES and rank >= _role_rank("TL"):  # ADJUDICATED
-        # Accept / Reject are the meaningful verdicts on a violation; RESOLVE
-        # stays available as a plain close for TL and above.
+        # Confirm Breach / Mark False Positive are the meaningful verdicts on
+        # a violation; RESOLVE stays available as a plain close for TL+.
         actions.append("ACKNOWLEDGE")
-        actions.append("ACCEPT")
-        actions.append("REJECT")
+        actions.append("CONFIRM_BREACH")
+        actions.append("MARK_FALSE_POSITIVE")
         actions.append("RESOLVE")
 
     if status == "RESOLVED" and rank >= _role_rank("TL"):

@@ -161,7 +161,7 @@ def test_tl_can_accept_a_violation(daily_ops_setup) -> None:
     raised = _raise_flag(daily_ops_setup, actor_id=daily_ops_setup.pc_actor_id, category="PROCESS_NON_COMPLIANCE")
     result = act_on_daily_ops_flag(
         daily_ops_setup.tenant_id, daily_ops_setup.outlet_id, daily_ops_setup.run_id, raised.flag.flagId,
-        FlagLifecycleCommand(action="ACCEPT", resolutionReason="Confirmed breach"),
+        FlagLifecycleCommand(action="CONFIRM_BREACH", resolutionReason="Confirmed breach"),
         _request(), Response(), idempotency_key=f"idem-{uuid4()}", if_match=f'"{raised.flag.version}"',
         principal=_principal(daily_ops_setup.tl_actor_id, daily_ops_setup.tenant_id),
         connection=daily_ops_setup.connection,

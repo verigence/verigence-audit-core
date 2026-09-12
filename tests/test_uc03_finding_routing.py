@@ -117,14 +117,14 @@ def test_self_serve_actions() -> None:
         "REMARK",
         "RESOLVE",
     }
-    assert "ACCEPT" not in permitted_actions(finding_class="DATA_GAP", role="TL", finding_status="OPEN")
+    assert "CONFIRM_BREACH" not in permitted_actions(finding_class="DATA_GAP", role="TL", finding_status="OPEN")
 
 
 def test_adjudicated_actions() -> None:
     pc = permitted_actions(finding_class="VIOLATION", role="PC", finding_status="OPEN")
     assert pc == ["REMARK"]  # PC can only comment on a violation
     tl = permitted_actions(finding_class="VIOLATION", role="TL", finding_status="ACKNOWLEDGED")
-    assert "ACCEPT" in tl and "REJECT" in tl
+    assert "CONFIRM_BREACH" in tl and "MARK_FALSE_POSITIVE" in tl
     # RESOLVE stays available as a plain close for TL and above
     assert "RESOLVE" in tl
 

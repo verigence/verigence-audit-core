@@ -75,6 +75,14 @@ _DEFAULT_DISPLAY_CATEGORY = "Cross-Case / Fraud Detection"
 _RULE_ENGINE_CACHE_TTL_SECONDS = 300.0
 _rule_engine_cache: tuple[float, list[dict[str, Any]]] | None = None
 
+# Every rule-engine row is VIOLATION/ADJUDICATED (see the class comment
+# above) -- same bound-action set migration 0084 backfilled for audit-core's
+# own ADJUDICATED rows. Kept in sync with that migration and with
+# uc03_finding_routing.py::permitted_actions's ADJUDICATED branch.
+_ADJUDICATED_ACTIONS: list[str] = [
+    "REMARK", "ACKNOWLEDGE", "CONFIRM_BREACH", "MARK_FALSE_POSITIVE", "RESOLVE",
+]
+
 
 def _authorize(
     client: SecurityAuthorizationClient,
@@ -115,6 +123,8 @@ class RuleCatalogEntry(BaseModel):
     defaultSeverity: str | None
     defaultOwnerRole: str | None
     resolutionMode: str | None
+    boundActions: list[str]
+    blockingCompletion: bool
     enabled: bool
 
 
@@ -135,7 +145,7 @@ def _audit_core_rows(connection: Connection) -> list[RuleCatalogEntry]:
             SELECT rule_code, category, title, description, executor,
                    execution_kind, trigger_events, rerun_policy,
                    finding_class, default_severity, default_owner_role,
-                   resolution_mode, enabled
+                   resolution_mode, bound_actions, blocking_completion, enabled
             FROM auditcore.rule_definitions
             WHERE executor = 'AUDIT_CORE'
             ORDER BY category, rule_code
@@ -156,6 +166,8 @@ def _audit_core_rows(connection: Connection) -> list[RuleCatalogEntry]:
             defaultSeverity=row["default_severity"],
             defaultOwnerRole=row["default_owner_role"],
             resolutionMode=row["resolution_mode"],
+            boundActions=list(row["bound_actions"] or []),
+            blockingCompletion=row["blocking_completion"],
             enabled=row["enabled"],
         )
         for row in rows
@@ -221,6 +233,8 @@ def _rule_engine_rows(tenant_id: str) -> tuple[list[RuleCatalogEntry], bool]:
                 defaultSeverity=_SEVERITY_MAP.get((rule.severity or "").upper(), _DEFAULT_SEVERITY),
                 defaultOwnerRole="TL",
                 resolutionMode="ADJUDICATED",
+                boundActions=_ADJUDICATED_ACTIONS,
+                blockingCompletion=False,
                 enabled=rule.enabled,
             )
         )
