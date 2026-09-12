@@ -155,3 +155,82 @@ def test_list_rules_parses_catalog() -> None:
 def test_list_rules_requires_token() -> None:
     with _client(lambda r: httpx.Response(200)) as client, pytest.raises(ValueError):
         client.list_rules(token="", tenant_id=TENANT)
+
+
+def test_readiness_parses_ready_and_not_ready() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/v1/tenants/{TENANT}/subjects/{SUBJECT}/audit/readiness"
+        assert request.method == "GET"
+        return httpx.Response(
+            200,
+            json=_envelope(
+                {
+                    "ready": ["PRICE_BOOKING_VS_INVOICE", "KYC_NAME_VS_BOOKING"],
+                    "notReady": [
+                        {"ruleCode": "EXCHANGE_VALUE_BELOW_MARKET", "reason": "no trade_in_valuation on file"},
+                        {"ruleCode": ""},  # dropped -- no usable rule_code
+                    ],
+                }
+            ),
+        )
+
+    with _client(handle) as client:
+        readiness = client.readiness(token=TOKEN, tenant_id=TENANT, subject_id=SUBJECT)
+
+    assert readiness.ready == ("PRICE_BOOKING_VS_INVOICE", "KYC_NAME_VS_BOOKING")
+    assert len(readiness.not_ready) == 1
+    assert readiness.not_ready[0].rule_code == "EXCHANGE_VALUE_BELOW_MARKET"
+    assert readiness.not_ready[0].reason == "no trade_in_valuation on file"
+
+
+def test_readiness_requires_token() -> None:
+    with _client(lambda r: httpx.Response(200)) as client, pytest.raises(ValueError):
+        client.readiness(token="", tenant_id=TENANT, subject_id=SUBJECT)
+
+
+def test_runs_parses_history() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/v1/tenants/{TENANT}/subjects/{SUBJECT}/audit/runs"
+        return httpx.Response(
+            200,
+            json=_envelope(
+                {
+                    "runs": [
+                        {
+                            "audit_run_id": "run-9",
+                            "audit_scope": "WITHIN_CASE",
+                            "trigger_mode": "EVENT_DRIVEN",
+                            "triggered_by": "BOOKING_REVIEW_CONFIRMED",
+                            "total_rules": 40,
+                            "pass_count": 35,
+                            "fail_count": 2,
+                            "skipped_count": 3,
+                            "critical_fail": 1,
+                            "warning_fail": 1,
+                            "info_fail": 0,
+                            "verdict": "CRITICAL_OPEN",
+                            "started_at_utc": "2026-09-12T00:00:00Z",
+                            "completed_at_utc": "2026-09-12T00:00:01Z",
+                        },
+                        {"audit_run_id": ""},  # dropped -- no usable id
+                    ]
+                }
+            ),
+        )
+
+    with _client(handle) as client:
+        runs = client.runs(token=TOKEN, tenant_id=TENANT, subject_id=SUBJECT)
+
+    assert len(runs) == 1
+    run = runs[0]
+    assert run.audit_run_id == "run-9"
+    assert run.total_rules == 40
+    assert run.pass_count == 35
+    assert run.fail_count == 2
+    assert run.skipped_count == 3
+    assert run.verdict == "CRITICAL_OPEN"
+
+
+def test_runs_requires_token() -> None:
+    with _client(lambda r: httpx.Response(200)) as client, pytest.raises(ValueError):
+        client.runs(token="", tenant_id=TENANT, subject_id=SUBJECT)

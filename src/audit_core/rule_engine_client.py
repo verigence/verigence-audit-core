@@ -58,6 +58,48 @@ class RuleEnginePhaseResult:
 
 
 @dataclass(frozen=True)
+class NotReadyRule:
+    rule_code: str
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class RuleEngineReadiness:
+    """``GET /v1/tenants/{t}/subjects/{s}/audit/readiness`` -- for every
+    WITHIN_CASE rule (regardless of phase), whether the rule-engine would
+    evaluate it right now (``ready``) or would SKIP it and why
+    (``not_ready``). This is the rule-engine's own live "executed vs not
+    applicable" answer -- audit-core's Execution Log relays it rather than
+    re-deriving applicability itself."""
+
+    ready: tuple[str, ...]
+    not_ready: tuple[NotReadyRule, ...]
+
+
+@dataclass(frozen=True)
+class RuleEngineRunSummary:
+    """One row of ``GET /v1/tenants/{t}/subjects/{s}/audit/runs`` -- an
+    aggregate summary of a past phase-audit run for one subject. Field
+    names mirror the rule-engine's raw ``audit.audit_runs`` columns
+    (snake_case; that endpoint returns the DB row shape unchanged)."""
+
+    audit_run_id: str
+    audit_scope: str | None
+    trigger_mode: str | None
+    triggered_by: str | None
+    total_rules: int
+    pass_count: int
+    fail_count: int
+    skipped_count: int
+    critical_fail: int
+    warning_fail: int
+    info_fail: int
+    verdict: str | None
+    started_at_utc: str | None
+    completed_at_utc: str | None
+
+
+@dataclass(frozen=True)
 class RuleEngineRule:
     """One row of the rule-engine's own ``audit.audit_rules`` catalog, as
     returned by ``GET /v1/tenants/{t}/audit/rules`` -- the source-of-truth
@@ -167,6 +209,82 @@ class RuleEngineClient:
                     )
                 )
         return tuple(rules)
+
+    def readiness(
+        self, *, token: str, tenant_id: str, subject_id: str
+    ) -> RuleEngineReadiness:
+        """``GET /v1/tenants/{t}/subjects/{s}/audit/readiness`` -- used by the
+        Execution Log to write a SKIPPED row (with the rule-engine's own
+        reason) for every rule that wasn't applicable, alongside PASS/FAIL
+        for the ones that were."""
+        if not token:
+            raise ValueError("rule-engine bearer token is required")
+        payload = self._request_data(
+            "GET",
+            f"/v1/tenants/{tenant_id}/subjects/{subject_id}/audit/readiness",
+            operation="readiness",
+            token=token,
+        )
+        ready = tuple(
+            str(code) for code in (payload.get("ready") or []) if str(code).strip()
+        )
+        not_ready: list[NotReadyRule] = []
+        raw_not_ready = payload.get("notReady")
+        if isinstance(raw_not_ready, list):
+            for raw in raw_not_ready:
+                if not isinstance(raw, dict):
+                    continue
+                rule_code = str(raw.get("ruleCode") or "").strip()
+                if not rule_code:
+                    continue
+                not_ready.append(
+                    NotReadyRule(rule_code=rule_code, reason=_opt_str(raw.get("reason")))
+                )
+        return RuleEngineReadiness(ready=ready, not_ready=tuple(not_ready))
+
+    def runs(
+        self, *, token: str, tenant_id: str, subject_id: str
+    ) -> tuple[RuleEngineRunSummary, ...]:
+        """``GET /v1/tenants/{t}/subjects/{s}/audit/runs`` -- historical
+        per-subject run summaries (aggregate counts only, not per-rule).
+        Not on the Execution Log write path today; kept for the future
+        run-history read surface Phase 5's UI will want."""
+        if not token:
+            raise ValueError("rule-engine bearer token is required")
+        payload = self._request_data(
+            "GET",
+            f"/v1/tenants/{tenant_id}/subjects/{subject_id}/audit/runs",
+            operation="runs",
+            token=token,
+        )
+        raw_runs = payload.get("runs")
+        runs: list[RuleEngineRunSummary] = []
+        if isinstance(raw_runs, list):
+            for raw in raw_runs:
+                if not isinstance(raw, dict):
+                    continue
+                audit_run_id = str(raw.get("audit_run_id") or "").strip()
+                if not audit_run_id:
+                    continue
+                runs.append(
+                    RuleEngineRunSummary(
+                        audit_run_id=audit_run_id,
+                        audit_scope=_opt_str(raw.get("audit_scope")),
+                        trigger_mode=_opt_str(raw.get("trigger_mode")),
+                        triggered_by=_opt_str(raw.get("triggered_by")),
+                        total_rules=int(raw.get("total_rules") or 0),
+                        pass_count=int(raw.get("pass_count") or 0),
+                        fail_count=int(raw.get("fail_count") or 0),
+                        skipped_count=int(raw.get("skipped_count") or 0),
+                        critical_fail=int(raw.get("critical_fail") or 0),
+                        warning_fail=int(raw.get("warning_fail") or 0),
+                        info_fail=int(raw.get("info_fail") or 0),
+                        verdict=_opt_str(raw.get("verdict")),
+                        started_at_utc=_opt_str(raw.get("started_at_utc")),
+                        completed_at_utc=_opt_str(raw.get("completed_at_utc")),
+                    )
+                )
+        return tuple(runs)
 
     # ── internals ────────────────────────────────────────────────────────────
 

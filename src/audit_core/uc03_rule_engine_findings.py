@@ -26,14 +26,24 @@ from audit_core.db import set_tenant_context
 from audit_core.rule_engine_client import (
     RULE_ENGINE_AUDIENCE,
     RuleEngineAnomaly,
+    RuleEngineClient,
     build_rule_engine_client,
 )
 from audit_core.security_integration import SecurityOAuthClient
 from audit_core.uc03_delivery_commands import _machine_flag
+from audit_core.uc03_rule_execution_log import record_executions_bulk
 
 logger = structlog.get_logger(__name__)
 
 _RULE_KEY_PREFIX = "RE_"
+
+# phase (as passed to evaluate_phase) -> the platform's own named trigger
+# event (see the rule-engine platform design's verified 9-event list). Falls
+# back to the bare phase name for any phase not seen at a real call site yet.
+_PHASE_TRIGGERING_EVENT = {
+    "BOOKING": "BOOKING_REVIEW_CONFIRMED",
+    "DELIVERY": "DELIVERY_COMPLETED",
+}
 
 # rule-engine severity (CRITICAL|WARNING|INFO) → audit-core severity.
 _SEVERITY_MAP = {
@@ -109,15 +119,19 @@ def _materialize_anomalies(
     anomalies: tuple[RuleEngineAnomaly, ...],
     correlation_id: str,
     audit_run_id: str | None,
-) -> list[str]:
-    flagged: list[str] = []
+) -> dict[str, UUID]:
+    """Raise one finding per anomaly. Returns {bare rule_code -> finding_id}
+    -- bare (not the audit_findings.rule_key "RE_" prefix) so it lines up
+    with GET /rule-catalog's ruleCode and can key straight into the
+    Execution Log's rule_code column."""
+    flagged: dict[str, UUID] = {}
     for anomaly in anomalies:
         severity = _SEVERITY_MAP.get(anomaly.severity, _DEFAULT_SEVERITY)
         finding_type = _FINDING_TYPE_BY_CATEGORY.get(
             (anomaly.category or "").upper(), _DEFAULT_FINDING_TYPE
         )
         rule_key = f"{_RULE_KEY_PREFIX}{anomaly.rule_code}"
-        _machine_flag(
+        finding_id = _machine_flag(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
@@ -139,8 +153,26 @@ def _materialize_anomalies(
             },
             blocking_completion=False,
         )
-        flagged.append(rule_key)
+        flagged[anomaly.rule_code] = finding_id
     return flagged
+
+
+def _rule_codes_for_phase(
+    client: RuleEngineClient, *, token: str, tenant_id: str, phase: str
+) -> frozenset[str]:
+    """Which rule codes readiness()/evaluate_phase() actually consider for
+    this phase -- a rule is relevant if its own phases list contains this
+    phase, or "FULL" (evaluated on every phase; see the rule-engine's own
+    evaluator.py). readiness() itself returns every WITHIN_CASE rule
+    regardless of phase, so this filter is what scopes its answer down to
+    "this trigger", matching what evaluate_phase() actually just ran."""
+    phase_upper = phase.strip().upper()
+    catalog = client.list_rules(token=token, tenant_id=tenant_id)
+    return frozenset(
+        rule.rule_code
+        for rule in catalog
+        if phase_upper in rule.phases or "FULL" in rule.phases
+    )
 
 
 def run_rule_engine_phase(
@@ -151,7 +183,8 @@ def run_rule_engine_phase(
     phase: str,
     correlation_id: str,
 ) -> None:
-    """Best-effort rule-engine phase audit + finding materialisation.
+    """Best-effort rule-engine phase audit + finding materialisation +
+    Execution Log recording (Phase 2 of the rule-engine platform).
 
     Safe to hand straight to ``BackgroundTasks.add_task``; never raises.
     """
@@ -194,15 +227,28 @@ def run_rule_engine_phase(
             phase=phase,
         )
 
-        if not result.anomalies:
-            logger.info(
-                "uc03_rule_engine_phase_clean",
+        # Best-effort, separate from the phase result itself: if either call
+        # fails, findings still materialize below -- only the Execution Log
+        # (a nice-to-have on top of the existing behaviour) is skipped.
+        relevant_codes: frozenset[str] = frozenset()
+        readiness = None
+        try:
+            relevant_codes = _rule_codes_for_phase(
+                client, token=token, tenant_id=tenant_id, phase=phase
+            )
+            readiness = client.readiness(
+                token=token, tenant_id=tenant_id, subject_id=str(subject_id)
+            )
+        except Exception:
+            logger.warning(
+                "uc03_rule_engine_readiness_failed",
                 tenant_id=tenant_id,
                 journey_id=str(journey_id),
                 phase=phase,
-                verdict=result.verdict,
+                exc_info=True,
             )
-            return
+
+        triggering_event = _PHASE_TRIGGERING_EVENT.get(phase.strip().upper(), phase)
 
         with engine.begin() as connection:
             set_tenant_context(connection, tenant_id)
@@ -215,6 +261,26 @@ def run_rule_engine_phase(
                 correlation_id=correlation_id,
                 audit_run_id=result.audit_run_id,
             )
+            if readiness is not None:
+                ready_relevant = tuple(
+                    code for code in readiness.ready if code in relevant_codes
+                )
+                pass_codes = tuple(code for code in ready_relevant if code not in flagged)
+                skipped_codes = {
+                    nr.rule_code: nr.reason
+                    for nr in readiness.not_ready
+                    if nr.rule_code in relevant_codes
+                }
+                record_executions_bulk(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    triggering_event=triggering_event,
+                    correlation_id=correlation_id,
+                    pass_rule_codes=pass_codes,
+                    fail_rule_codes=flagged,
+                    skipped_rule_codes=skipped_codes,
+                )
 
         logger.info(
             "uc03_rule_engine_phase_materialized",
@@ -223,7 +289,7 @@ def run_rule_engine_phase(
             phase=phase,
             verdict=result.verdict,
             anomaly_count=len(result.anomalies),
-            flagged_rule_keys=sorted(flagged),
+            flagged_rule_keys=sorted(f"{_RULE_KEY_PREFIX}{code}" for code in flagged),
         )
     except Exception:
         logger.warning(
