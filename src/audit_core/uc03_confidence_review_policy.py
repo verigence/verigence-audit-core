@@ -908,13 +908,20 @@ def _sync_booking_document(
     # Surface the low-confidence fields as a per-document MANUAL_VERIFICATION
     # finding the PC can work straight from the Review Queue (never raises).
     from audit_core.uc03_manual_verification import sync_manual_verification_findings
+    from audit_core.uc03_rule_execution_log import record_from_summary
 
-    sync_manual_verification_findings(
+    manual_verification_result = sync_manual_verification_findings(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
         stage_code=stage_code,
         correlation_id="",
+    )
+    record_from_summary(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+        rule_code="MANUAL_VERIFICATION", triggering_event="DOCUMENT_SYNCED",
+        result=manual_verification_result,
+        skipped_reason=f"no extracted fields for {stage_code} yet",
     )
 
     # Every document on this Journey must belong to the same customer.
