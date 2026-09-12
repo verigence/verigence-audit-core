@@ -266,3 +266,42 @@ def test_two_matching_receipts_record_fail_for_duplicate_receipt(synced_document
     # first sync: only one receipt on file yet -- PASS. second sync: now a
     # matching pair exists -- FAIL.
     assert [r["outcome"] for r in rows] == ["PASS", "FAIL"]
+
+
+def test_high_confidence_field_records_pass_for_manual_verification(synced_document_setup) -> None:
+    engine, tenant_id, journey_id = synced_document_setup
+    customer_id = _customer_id(engine, tenant_id, journey_id)
+
+    booking_form_id = uuid4()
+    _add_evidence(engine, tenant_id, journey_id, customer_id, booking_form_id, "booking_form")
+    di_client = _FakeDiClient()
+    di_client.add(
+        _confirmed(booking_form_id, "booking_form"),
+        [_fact("customer_name", "Sanjaya Kumar Mohanty", confidence=95.0)],
+    )
+    _sync(engine, tenant_id, journey_id, booking_form_id, di_client)
+
+    rows = _executions_for_rule(engine, tenant_id, "MANUAL_VERIFICATION")
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "PASS"
+
+
+def test_low_confidence_field_records_fail_for_manual_verification(synced_document_setup) -> None:
+    engine, tenant_id, journey_id = synced_document_setup
+    customer_id = _customer_id(engine, tenant_id, journey_id)
+
+    booking_form_id = uuid4()
+    _add_evidence(engine, tenant_id, journey_id, customer_id, booking_form_id, "booking_form")
+    di_client = _FakeDiClient()
+    di_client.add(
+        # _LOW_CONFIDENCE_SQL compares confidence_score directly against 0.90
+        # (a unit-interval threshold) regardless of confidence_scale -- a
+        # value has to be numerically below 0.90 to trip it, not "below 90%".
+        _confirmed(booking_form_id, "booking_form"),
+        [_fact("customer_name", "Sanjaya Kumar Mohanty", confidence=0.5)],
+    )
+    _sync(engine, tenant_id, journey_id, booking_form_id, di_client)
+
+    rows = _executions_for_rule(engine, tenant_id, "MANUAL_VERIFICATION")
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "FAIL"

@@ -103,6 +103,27 @@ def _by_document(rows: list[dict[str, Any]]) -> dict[UUID, list[dict[str, Any]]]
     return grouped
 
 
+def _extracted_field_count(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, stage_code: str
+) -> int:
+    """How many extracted fields exist at all for this stage, regardless of
+    confidence or review status -- distinguishes "nothing extracted for this
+    stage yet" (SKIPPED) from "checked, nothing currently below threshold"
+    (PASS) for the Execution Log, since _LOW_CONFIDENCE_SQL only ever
+    returns the rows that already have a problem."""
+    return connection.execute(
+        text(
+            """
+            SELECT count(*) FROM auditcore.journey_document_extracted_fields
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+              AND stage_code = :stage_code
+              AND extracted_value IS NOT NULL AND extracted_value <> 'null'::jsonb
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "stage_code": stage_code},
+    ).scalar_one()
+
+
 # ── producer ──────────────────────────────────────────────────────────────────
 def sync_manual_verification_findings(
     connection: Connection,
@@ -191,7 +212,10 @@ def sync_manual_verification_findings(
         resolved += 1
 
     _refresh_stage_flag_status(connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage_code)
-    return {"raised": raised, "resolved": resolved}
+    examined = _extracted_field_count(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage_code
+    )
+    return {"raised": raised, "resolved": resolved, "examined": examined}
 
 
 def _friendly_label(raw: Any, document_id: UUID) -> str:
