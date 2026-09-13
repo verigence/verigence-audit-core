@@ -687,6 +687,169 @@ def _delivery_audit_gaps(
     return gaps, list(dict.fromkeys(flags))
 
 
+def _start_delivery_core(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    actor_id: str,
+    actor_role: str,
+    idempotency_key: str,
+    correlation_id: str,
+) -> dict[str, Any]:
+    """Create Delivery's journey_stage_states row, business record,
+    DELIVERY_STARTED event, and the same 'Booking incomplete at Delivery
+    start' flag start_delivery always raised.
+
+    Shared by two callers: the explicit POST /start endpoint below (a human
+    action, hard-conflicts if Delivery already exists) and the unified
+    capture screen's auto-start-on-first-relevant-document path
+    (uc03_unified_document_capture.py -- silently idempotent if Delivery
+    already exists). This function itself assumes Delivery does NOT yet
+    exist and unconditionally creates it; the caller is responsible for the
+    aggregate lock, checking whether Delivery already exists, and deciding
+    what "already exists" should mean for its own caller (a real conflict
+    vs. a silent no-op).
+    """
+    booking = _booking_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if booking is None:
+        raise ConflictError(
+            error_code="VAC-CONFLICT-004",
+            title="Booking has not started",
+            detail="A Booking stage must exist before Delivery can start.",
+        )
+    if booking["business_status"] in {"BOOKING_CANCELLED", "DUPLICATE_BOOKING"}:
+        raise ConflictError(
+            error_code="VAC-CONFLICT-004",
+            title="Delivery sequence conflict",
+            detail="Delivery cannot start for a cancelled or duplicate Booking.",
+        )
+    if (
+        booking["business_status"] == "BOOKING_CLOSED"
+        and booking["closure_disposition"] != "PROCEED_TO_DELIVERY"
+    ):
+        raise ConflictError(
+            error_code="VAC-CONFLICT-004",
+            title="Delivery sequence conflict",
+            detail="This Booking was closed without Delivery.",
+        )
+
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.journey_stage_states (
+                tenant_id, journey_id, stage_code, business_status,
+                audit_state, audit_status, first_started_at_utc,
+                latest_activity_at_utc, version_no
+            ) VALUES (
+                :tenant_id, :journey_id, 'DELIVERY', 'DELIVERY_STARTED',
+                'NOT_STARTED', 'NOT_EVALUATED', now(), now(), 1
+            )
+            RETURNING journey_id, business_status, audit_state, audit_status,
+                      latest_activity_at_utc, version_no
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one()
+    _upsert_delivery_business_record(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        business_status="DELIVERY_STARTED",
+        actor_id=actor_id,
+        completed=False,
+    )
+    event_id = _append_delivery_event(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        event_type="DELIVERY_STARTED",
+        source_kind="HUMAN",
+        actor_id=actor_id,
+        actor_role_snapshot=actor_role,
+        idempotency_key=idempotency_key,
+        correlation_id=correlation_id,
+        safe_payload={"bookingBusinessStatus": booking["business_status"]},
+        aggregate_version=1,
+    )
+    flags: list[UUID] = []
+    if not (
+        booking["business_status"] == "BOOKING_CLOSED"
+        and booking["closure_disposition"] == "PROCEED_TO_DELIVERY"
+    ):
+        outstanding = _booking_outstanding_snapshot(
+            connection, tenant_id=tenant_id, journey_id=journey_id
+        )
+        flag_id = _machine_flag(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code="BOOKING",
+            rule_key=_BOOKING_INCOMPLETE_RULE,
+            finding_type="BOOKING_PREREQUISITES_INCOMPLETE_AT_DELIVERY",
+            severity="HIGH",
+            title="Booking prerequisites incomplete at Delivery Start",
+            description="Delivery was started while Booking remained incomplete. Delivery progression was recorded and continues.",
+            correlation_id=correlation_id,
+            safe_payload={"outstanding": outstanding},
+        )
+        flags.append(flag_id)
+        _append_delivery_event(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            event_type="FLAG_RAISED",
+            source_kind="MACHINE",
+            actor_id=None,
+            actor_role_snapshot="SYSTEM",
+            idempotency_key=idempotency_key,
+            correlation_id=correlation_id,
+            safe_payload={"findingId": str(flag_id), "ruleKey": _BOOKING_INCOMPLETE_RULE},
+            aggregate_version=1,
+        )
+    refreshed = _delivery_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return _delivery_response(refreshed, event_id=event_id, flags=flags)
+
+
+def ensure_delivery_started(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    actor_id: str,
+    actor_role: str,
+    correlation_id: str,
+) -> bool:
+    """Idempotently start Delivery if it hasn't started yet -- the unified
+    capture screen's auto-start path (uc03_unified_document_capture.py),
+    triggered by the first document that classifies as Delivery-relevant
+    rather than by a human clicking Start Delivery. Returns True if this
+    call actually started Delivery, False if it already existed or the
+    Booking's own state makes it invalid to start (matching
+    _start_delivery_core's own guards) -- either way the caller proceeds
+    without treating either outcome as an error.
+    """
+    _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
+    state = _delivery_state(
+        connection, tenant_id=tenant_id, journey_id=journey_id, for_update=True
+    )
+    if state is not None:
+        return False
+    try:
+        _start_delivery_core(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            actor_id=actor_id,
+            actor_role=actor_role,
+            idempotency_key=f"uc03.delivery.autostart:{journey_id}",
+            correlation_id=correlation_id,
+        )
+    except ConflictError:
+        return False
+    return True
+
+
 @router.post("/start", response_model=DeliveryCommandResponse)
 def start_delivery(
     tenant_id: str,
@@ -730,104 +893,15 @@ def start_delivery(
                 title="Delivery state conflict",
                 detail="Delivery has already been started.",
             )
-        booking = _booking_state(connection, tenant_id=tenant_id, journey_id=journey_id)
-        if booking is None:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-004",
-                title="Booking has not started",
-                detail="A Booking stage must exist before Delivery can start.",
-            )
-        if booking["business_status"] in {"BOOKING_CANCELLED", "DUPLICATE_BOOKING"}:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-004",
-                title="Delivery sequence conflict",
-                detail="Delivery cannot start for a cancelled or duplicate Booking.",
-            )
-        if (
-            booking["business_status"] == "BOOKING_CLOSED"
-            and booking["closure_disposition"] != "PROCEED_TO_DELIVERY"
-        ):
-            raise ConflictError(
-                error_code="VAC-CONFLICT-004",
-                title="Delivery sequence conflict",
-                detail="This Booking was closed without Delivery.",
-            )
-
-        connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.journey_stage_states (
-                    tenant_id, journey_id, stage_code, business_status,
-                    audit_state, audit_status, first_started_at_utc,
-                    latest_activity_at_utc, version_no
-                ) VALUES (
-                    :tenant_id, :journey_id, 'DELIVERY', 'DELIVERY_STARTED',
-                    'NOT_STARTED', 'NOT_EVALUATED', now(), now(), 1
-                )
-                RETURNING journey_id, business_status, audit_state, audit_status,
-                          latest_activity_at_utc, version_no
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).mappings().one()
-        _upsert_delivery_business_record(
+        return _start_delivery_core(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
-            business_status="DELIVERY_STARTED",
             actor_id=human_principal.subject,
-            completed=False,
-        )
-        event_id = _append_delivery_event(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            event_type="DELIVERY_STARTED",
-            source_kind="HUMAN",
-            actor_id=human_principal.subject,
-            actor_role_snapshot=context["operating_role"],
+            actor_role=context["operating_role"],
             idempotency_key=idempotency_key,
             correlation_id=correlation_id,
-            safe_payload={"bookingBusinessStatus": booking["business_status"]},
-            aggregate_version=1,
         )
-        flags: list[UUID] = []
-        if not (
-            booking["business_status"] == "BOOKING_CLOSED"
-            and booking["closure_disposition"] == "PROCEED_TO_DELIVERY"
-        ):
-            outstanding = _booking_outstanding_snapshot(
-                connection, tenant_id=tenant_id, journey_id=journey_id
-            )
-            flag_id = _machine_flag(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                stage_code="BOOKING",
-                rule_key=_BOOKING_INCOMPLETE_RULE,
-                finding_type="BOOKING_PREREQUISITES_INCOMPLETE_AT_DELIVERY",
-                severity="HIGH",
-                title="Booking prerequisites incomplete at Delivery Start",
-                description="Delivery was started while Booking remained incomplete. Delivery progression was recorded and continues.",
-                correlation_id=correlation_id,
-                safe_payload={"outstanding": outstanding},
-            )
-            flags.append(flag_id)
-            _append_delivery_event(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                event_type="FLAG_RAISED",
-                source_kind="MACHINE",
-                actor_id=None,
-                actor_role_snapshot="SYSTEM",
-                idempotency_key=idempotency_key,
-                correlation_id=correlation_id,
-                safe_payload={"findingId": str(flag_id), "ruleKey": _BOOKING_INCOMPLETE_RULE},
-                aggregate_version=1,
-            )
-        refreshed = _delivery_state(connection, tenant_id=tenant_id, journey_id=journey_id)
-        return _delivery_response(refreshed, event_id=event_id, flags=flags)
 
     body, _ = execute_idempotent_json_command(
         connection,

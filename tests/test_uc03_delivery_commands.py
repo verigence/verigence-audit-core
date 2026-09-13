@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
+from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_human_principal
 from audit_core.main import app
 from audit_core.security import HumanPrincipal
@@ -15,6 +16,7 @@ from audit_core.security_authorization import (
     SecurityAuthorizationDecision,
     get_security_authorization_client,
 )
+from audit_core.uc03_delivery_commands import ensure_delivery_started
 
 
 @dataclass
@@ -412,6 +414,79 @@ def test_delivery_start_with_incomplete_booking_flags_but_does_not_block(
         ).scalar_one()
     assert booking == "BOOKING_IN_PROGRESS"
     assert rule_key == "WF_BOOKING_INCOMPLETE_AT_DELIVERY_START"
+
+
+def test_ensure_delivery_started_creates_delivery_once(delivery_setup) -> None:
+    # Unified capture screen's auto-start path: the first Delivery-relevant
+    # document classified for a journey should silently start Delivery,
+    # exactly like a human clicking Start Delivery would -- same flags,
+    # same idempotency going forward.
+    setup = delivery_setup
+    journey_id = setup["journey_ids"][1]  # incomplete-Booking case
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        started = ensure_delivery_started(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=journey_id,
+            actor_id=setup["actor_id"],
+            actor_role="PC",
+            correlation_id="test-autostart-0001",
+        )
+        assert started is True
+
+        state = connection.execute(
+            text(
+                """
+                SELECT business_status FROM auditcore.journey_stage_states
+                WHERE tenant_id=:t AND journey_id=:j AND stage_code='DELIVERY'
+                """
+            ),
+            {"t": setup["tenant_id"], "j": journey_id},
+        ).scalar_one()
+        assert state == "DELIVERY_STARTED"
+
+        # Second call: Delivery already exists -- silent no-op, not a conflict.
+        started_again = ensure_delivery_started(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=journey_id,
+            actor_id=setup["actor_id"],
+            actor_role="PC",
+            correlation_id="test-autostart-0002",
+        )
+        assert started_again is False
+
+
+def test_ensure_delivery_started_is_a_silent_noop_for_cancelled_booking(delivery_setup) -> None:
+    # Mirrors start_delivery's own guard (VAC-CONFLICT-004 for a cancelled/
+    # duplicate Booking) -- but the auto-start path has no human waiting on
+    # an HTTP response to show an error to, so it swallows the conflict and
+    # simply doesn't start Delivery for this document.
+    setup = delivery_setup
+    journey_id = setup["journey_ids"][2]  # cancelled-Booking case
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        started = ensure_delivery_started(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=journey_id,
+            actor_id=setup["actor_id"],
+            actor_role="PC",
+            correlation_id="test-autostart-cancelled-0001",
+        )
+        assert started is False
+
+        state = connection.execute(
+            text(
+                """
+                SELECT 1 FROM auditcore.journey_stage_states
+                WHERE tenant_id=:t AND journey_id=:j AND stage_code='DELIVERY'
+                """
+            ),
+            {"t": setup["tenant_id"], "j": journey_id},
+        ).scalar_one_or_none()
+        assert state is None
 
 
 def test_delivery_rejects_cancelled_and_no_delivery_booking(delivery_setup) -> None:
