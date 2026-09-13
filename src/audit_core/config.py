@@ -16,12 +16,14 @@ class Settings:
     environment: str
     log_level: str = field(default="INFO")
     log_stdout: bool = field(default=True)
-    # Legacy direct-Axiom fields remain parseable for configuration compatibility but are no
-    # longer used. Phase-1 remote export uses standard OTEL_EXPORTER_OTLP_* variables only.
     log_axiom: bool = field(default=False)
     axiom_token: str = field(default="")
     axiom_dataset: str = field(default="")
     observability_enabled: bool = field(default=False)
+    observability_logs_enabled: bool = field(default=False)
+    observability_errors_enabled: bool = field(default=False)
+    observability_metrics_enabled: bool = field(default=False)
+    observability_traces_enabled: bool = field(default=False)
     success_events_enabled: bool = field(default=True)
     trace_spans_enabled: bool = field(default=False)
     slow_request_threshold_ms: float = field(default=2000.0)
@@ -38,6 +40,13 @@ def _required(environ: Mapping[str, str], name: str) -> str:
     if not value:
         raise SettingsError(f"Missing required runtime setting: {name}")
     return value
+
+
+def _bool_setting(environ: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() == "true"
 
 
 def _positive_float(environ: Mapping[str, str], name: str, default: float) -> float:
@@ -82,12 +91,9 @@ def _cors_allowed_origins(environ: Mapping[str, str], environment: str) -> tuple
 def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     source = os.environ if environ is None else environ
     environment = _required(source, "APP_ENV")
+    legacy_observability_enabled = _bool_setting(source, "OBSERVABILITY_ENABLED", False)
     max_queue_size = _positive_int(source, "OBSERVABILITY_MAX_QUEUE_SIZE", 2048)
-    max_export_batch_size = _positive_int(
-        source,
-        "OBSERVABILITY_MAX_EXPORT_BATCH_SIZE",
-        512,
-    )
+    max_export_batch_size = _positive_int(source, "OBSERVABILITY_MAX_EXPORT_BATCH_SIZE", 512)
     if max_export_batch_size > max_queue_size:
         raise SettingsError(
             "Invalid runtime setting: OBSERVABILITY_MAX_EXPORT_BATCH_SIZE exceeds queue size"
@@ -101,9 +107,17 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         log_axiom=(source.get("AUDIT_CORE_LOG_AXIOM", "false").strip().lower() == "true"),
         axiom_token=source.get("AUDIT_CORE_AXIOM_TOKEN", "").strip(),
         axiom_dataset=source.get("AUDIT_CORE_AXIOM_DATASET", "").strip(),
-        observability_enabled=(
-            source.get("OBSERVABILITY_ENABLED", "false").strip().lower() == "true"
+        observability_enabled=legacy_observability_enabled,
+        observability_logs_enabled=_bool_setting(
+            source, "OBSERVABILITY_LOGS_ENABLED", legacy_observability_enabled
         ),
+        observability_errors_enabled=_bool_setting(
+            source, "OBSERVABILITY_ERRORS_ENABLED", legacy_observability_enabled
+        ),
+        observability_metrics_enabled=_bool_setting(
+            source, "OBSERVABILITY_METRICS_ENABLED", legacy_observability_enabled
+        ),
+        observability_traces_enabled=_bool_setting(source, "OBSERVABILITY_TRACES_ENABLED", False),
         success_events_enabled=(
             source.get("AUDIT_CORE_SUCCESS_EVENTS_ENABLED", "true").strip().lower() != "false"
         ),
@@ -111,26 +125,18 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
             source.get("AUDIT_CORE_TRACE_SPANS_ENABLED", "false").strip().lower() == "true"
         ),
         slow_request_threshold_ms=_positive_float(
-            source,
-            "AUDIT_CORE_SLOW_REQUEST_THRESHOLD_MS",
-            2000.0,
+            source, "AUDIT_CORE_SLOW_REQUEST_THRESHOLD_MS", 2000.0
         ),
         observability_export_timeout_seconds=_positive_float(
-            source,
-            "OBSERVABILITY_EXPORT_TIMEOUT_SECONDS",
-            2.0,
+            source, "OBSERVABILITY_EXPORT_TIMEOUT_SECONDS", 2.0
         ),
         observability_batch_delay_ms=_positive_int(
-            source,
-            "OBSERVABILITY_BATCH_DELAY_MS",
-            1000,
+            source, "OBSERVABILITY_BATCH_DELAY_MS", 1000
         ),
         observability_max_queue_size=max_queue_size,
         observability_max_export_batch_size=max_export_batch_size,
         observability_metric_export_interval_ms=_positive_int(
-            source,
-            "OBSERVABILITY_METRIC_EXPORT_INTERVAL_MS",
-            60000,
+            source, "OBSERVABILITY_METRIC_EXPORT_INTERVAL_MS", 60000
         ),
         cors_allowed_origins=_cors_allowed_origins(source, environment),
     )
