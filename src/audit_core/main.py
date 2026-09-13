@@ -137,6 +137,9 @@ from audit_core.uc03_run_all_rules import router as uc03_run_all_rules_router
 from audit_core.uc03_sku_candidates import router as uc03_sku_candidates_router
 from audit_core.uc03_tl_scope_alignment import install_tl_scope_alignment
 from audit_core.uc03_tl_supervisory import router as uc03_tl_supervisory_router
+from audit_core.uc03_unified_document_capture import (
+    router as uc03_unified_document_capture_router,
+)
 from audit_core.uc03_work_item_enrichment import (
     router as uc03_work_item_enrichment_router,
 )
@@ -239,6 +242,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_booking_v2_router)
     application.include_router(uc03_sku_candidates_router)
     application.include_router(uc03_document_capture_v2_router)
+    application.include_router(uc03_unified_document_capture_router)
     application.include_router(uc03_capture_local_reads_router)
     application.include_router(uc03_document_review_v2_router)
     application.include_router(uc03_final_source_router)
