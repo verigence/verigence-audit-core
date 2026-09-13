@@ -234,3 +234,71 @@ def test_runs_parses_history() -> None:
 def test_runs_requires_token() -> None:
     with _client(lambda r: httpx.Response(200)) as client, pytest.raises(ValueError):
         client.runs(token="", tenant_id=TENANT, subject_id=SUBJECT)
+
+
+def test_create_rule_succeeds() -> None:
+    payload = {"ruleCode": "NEW_RULE", "category": "PRICE", "comparator": "GT",
+               "severity": "WARNING", "findingMessage": "msg"}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == f"Bearer {TOKEN}"
+        assert request.url.path == f"/v1/tenants/{TENANT}/audit/rules"
+        assert request.method == "POST"
+        return httpx.Response(201, json=_envelope({"created": "NEW_RULE"}))
+
+    with _client(handle) as client:
+        result = client.create_rule(token=TOKEN, tenant_id=TENANT, payload=payload)
+
+    assert result.created is True
+    assert result.error_code is None
+
+
+def test_create_rule_reports_duplicate_as_business_result() -> None:
+    def handle(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409, json={"errorCode": "409", "errorMessage": "Rule 'X' already exists"}
+        )
+
+    with _client(handle) as client:
+        result = client.create_rule(token=TOKEN, tenant_id=TENANT, payload={"ruleCode": "X"})
+
+    assert result.created is False
+    assert result.error_code == "DUPLICATE"
+    assert result.error_message == "Rule 'X' already exists"
+
+
+def test_create_rule_reports_validation_failure_as_business_result() -> None:
+    def handle(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"errorCode": "400", "errorMessage": "Invalid request",
+                       "detail": "comparator must be one of [...]"}
+        )
+
+    with _client(handle) as client:
+        result = client.create_rule(token=TOKEN, tenant_id=TENANT, payload={"comparator": "BOGUS"})
+
+    assert result.created is False
+    assert result.error_code == "VALIDATION"
+
+
+def test_create_rule_raises_on_unexpected_status() -> None:
+    def handle(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"errorCode": "500", "errorMessage": "boom"})
+
+    with _client(handle) as client, pytest.raises(RuleEngineClientError) as exc:
+        client.create_rule(token=TOKEN, tenant_id=TENANT, payload={})
+    assert exc.value.status_code == 500
+
+
+def test_create_rule_raises_on_transport_failure() -> None:
+    def handle(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom")
+
+    with _client(handle) as client, pytest.raises(RuleEngineClientError) as exc:
+        client.create_rule(token=TOKEN, tenant_id=TENANT, payload={})
+    assert exc.value.code == "RULE_ENGINE_UNAVAILABLE"
+
+
+def test_create_rule_requires_token() -> None:
+    with _client(lambda r: httpx.Response(200)) as client, pytest.raises(ValueError):
+        client.create_rule(token="", tenant_id=TENANT, payload={})

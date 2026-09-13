@@ -75,6 +75,14 @@ _DEFAULT_DISPLAY_CATEGORY = "Cross-Case / Fraud Detection"
 _RULE_ENGINE_CACHE_TTL_SECONDS = 300.0
 _rule_engine_cache: tuple[float, list[dict[str, Any]]] | None = None
 
+
+def invalidate_rule_engine_cache() -> None:
+    """Drop the cached rule-engine catalog so the next /rule-catalog read
+    is live -- called after a new DECLARATIVE rule is authored so it shows
+    up immediately instead of waiting out the TTL."""
+    global _rule_engine_cache
+    _rule_engine_cache = None
+
 # Every rule-engine row is VIOLATION/ADJUDICATED (see the class comment
 # above) -- same bound-action set migration 0084 backfilled for audit-core's
 # own ADJUDICATED rows. Kept in sync with that migration and with
