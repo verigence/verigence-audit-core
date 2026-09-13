@@ -466,20 +466,13 @@ def confirm_delivery_review_v2_effective_values(
     command = payload or ReviewConfirmCommand()
     corrections = _correction_map(documents, command.corrections)
 
-    # Uniform confidence policy: a populated DI value below the 90% threshold
-    # needs a PC's eyes before Delivery Review can complete, exactly like
-    # Booking's confirm gate (missing_keys derived from decision_required).
-    unresolved = _unresolved_low_confidence_fields(documents, corrections)
-    if unresolved:
-        raise ConflictError(
-            error_code="VAC-CONFLICT-012",
-            title="Review decisions are pending",
-            detail=(
-                f"{len(unresolved)} low-confidence extracted value"
-                f"{'s' if len(unresolved) != 1 else ''} still require a reviewed "
-                "correction before Delivery Review can be confirmed."
-            ),
-        )
+    # Document completeness is the sole criterion for Delivery to finish
+    # (2026-09-13 design change) -- confidence review is a separate,
+    # always-available concern (the Documents page) a PC or TL can act on
+    # any time, not a precondition for Confirm. Previously this blocked
+    # Confirm on any unresolved <90% field, exactly mirroring Booking's own
+    # now-removed gate (uc03_confidence_review_policy.py); removed to match.
+    # Confirm still applies whatever corrections were actually given.
 
     correlation_id = get_correlation_id(request)
 

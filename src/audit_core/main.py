@@ -103,6 +103,9 @@ from audit_core.uc03_document_capture_v2 import (
 from audit_core.uc03_document_capture_v2_rules import (
     install_uc03_v2_capture_business_rules,
 )
+from audit_core.uc03_document_field_corrections import (
+    router as uc03_document_field_corrections_router,
+)
 from audit_core.uc03_document_review_v2 import router as uc03_document_review_v2_router
 from audit_core.uc03_fast_work_items import router as uc03_fast_work_items_router
 from audit_core.uc03_final_source import router as uc03_final_source_router
@@ -255,6 +258,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_delivery_documents_router)
     application.include_router(uc03_document_assessments_router)
     application.include_router(uc03_audit_router)
+    application.include_router(uc03_document_field_corrections_router)
     application.include_router(uc03_daily_ops_flags_router)
     application.include_router(uc03_review_queue_router)
     application.include_router(uc03_rule_registry_router)
