@@ -55,6 +55,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import Connection, text
 
+from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
@@ -179,6 +180,7 @@ def get_rule_status(
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> RuleStatusResponse:
     _authorize(authorization_client, human_principal=human_principal, tenant_id=tenant_id)
+    set_tenant_context(connection, tenant_id)
     journey = _journey_scope(connection, tenant_id, journey_id)
     _require_business_scope(
         connection,
