@@ -79,6 +79,12 @@ _DOCUMENT_GAP_RULE_PREFIXES: frozenset[str] = frozenset({
 _DATA_GAP_RULE_PREFIXES: frozenset[str] = frozenset({
     "DL_NOT_INTIMATED",
     "PAY_UNVERIFIED_RECEIPT",
+    # Unified Documents review (2026-09-13): a <90%-confidence field
+    # correction is applied immediately (self-serve) -- the finding is a
+    # pure audit-trail record of what changed, not something needing a TL
+    # verdict. Compare DI_VALUE_CORRECTION_PROPOSED below, its >=90%
+    # sibling, which IS adjudicated because nothing was applied yet.
+    "DI_VALUE_CORRECTED",
 })
 _VIOLATION_RULE_PREFIXES: frozenset[str] = frozenset({
     "DL_VIN_RECONCILIATION",
