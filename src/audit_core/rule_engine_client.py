@@ -100,6 +100,21 @@ class RuleEngineRunSummary:
 
 
 @dataclass(frozen=True)
+class RuleEngineCreateResult:
+    """Outcome of ``POST /v1/tenants/{t}/audit/rules`` (create a new
+    DECLARATIVE rule). Two expected business-rule failure shapes are
+    returned rather than raised (``DUPLICATE`` for an existing rule_code,
+    ``VALIDATION`` for a bad enum/DSL value the rule-engine's own
+    RuleCreate schema rejected) so the caller can turn them into the right
+    HTTP status instead of a generic 503; anything else (auth, 5xx,
+    network) still raises RuleEngineClientError."""
+
+    created: bool
+    error_code: str | None  # None on success; else "DUPLICATE" | "VALIDATION"
+    error_message: str | None
+
+
+@dataclass(frozen=True)
 class RuleEngineRule:
     """One row of the rule-engine's own ``audit.audit_rules`` catalog, as
     returned by ``GET /v1/tenants/{t}/audit/rules`` -- the source-of-truth
@@ -209,6 +224,80 @@ class RuleEngineClient:
                     )
                 )
         return tuple(rules)
+
+    def create_rule(
+        self, *, token: str, tenant_id: str, payload: dict[str, Any]
+    ) -> RuleEngineCreateResult:
+        """``POST /v1/tenants/{t}/audit/rules`` -- author a brand-new
+        DECLARATIVE rule (Phase 5 rule-authoring UI). ``payload`` is the
+        rule-engine's own ``RuleCreate`` shape verbatim (camelCase keys:
+        ruleCode, category, auditScope, phases, comparator, threshold,
+        severity, findingMessage, conditionExpression, ...) -- audit-core
+        does not re-validate the enums/DSL itself, the rule-engine is the
+        source of truth for what's a legal rule."""
+        if not token:
+            raise ValueError("rule-engine bearer token is required")
+        path = f"/v1/tenants/{tenant_id}/audit/rules"
+        started = time.perf_counter()
+        result = "SUCCESS"
+        try:
+            with trace_span(
+                "audit_core.dependency.rule_engine",
+                attributes={
+                    "dependency": "rule_engine",
+                    "operation": "create_rule",
+                    "method": "POST",
+                },
+            ):
+                try:
+                    response = self._client.request(
+                        "POST", path,
+                        headers={"Authorization": f"Bearer {token}"},
+                        json=payload,
+                    )
+                except httpx.HTTPError as exc:
+                    result = "UNAVAILABLE"
+                    raise RuleEngineClientError(
+                        status_code=503, code="RULE_ENGINE_UNAVAILABLE"
+                    ) from exc
+
+                if response.status_code == 201:
+                    return RuleEngineCreateResult(
+                        created=True, error_code=None, error_message=None
+                    )
+
+                try:
+                    envelope = response.json()
+                except ValueError:
+                    envelope = None
+                error_message = (
+                    _opt_str(envelope.get("errorMessage"))
+                    if isinstance(envelope, dict) else None
+                )
+
+                if response.status_code == 409:
+                    result = "FAILURE"
+                    return RuleEngineCreateResult(
+                        created=False, error_code="DUPLICATE", error_message=error_message
+                    )
+                if response.status_code == 400:
+                    result = "FAILURE"
+                    return RuleEngineCreateResult(
+                        created=False, error_code="VALIDATION", error_message=error_message
+                    )
+
+                result = "FAILURE"
+                raise RuleEngineClientError(
+                    status_code=response.status_code, code="RULE_ENGINE_HTTP_ERROR"
+                )
+        finally:
+            logger.debug(
+                "rule_engine_dependency_call",
+                operation="create_rule",
+                method="POST",
+                result=result,
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+            )
 
     def readiness(
         self, *, token: str, tenant_id: str, subject_id: str
