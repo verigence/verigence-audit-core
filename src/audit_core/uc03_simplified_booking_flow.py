@@ -35,7 +35,6 @@ from audit_core.uc03_booking_commands import (
     _append_workflow_event,
     _parse_if_match,
 )
-from audit_core.uc03_confidence_review_policy import _unreviewed_low_confidence_count
 from audit_core.uc03_document_capture_v2 import (
     _base_requirements,
     _capture_phase_state,
@@ -165,23 +164,12 @@ def submit_booking_from_review(
                 detail="Booking V2 capture has already been completed.",
             )
 
-        # Condition 2: facts already extracted below 90% must be reviewed before
-        # submit. DI processing itself is not a submit blocker (Condition 1).
-        low_confidence = _unreviewed_low_confidence_count(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-        )
-        if low_confidence:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-012",
-                title="PC review is required before Booking submit",
-                detail=(
-                    f"Review {low_confidence} extracted DI field"
-                    f"{'s' if low_confidence != 1 else ''} below 90% confidence before submitting Booking."
-                ),
-            )
-
+        # Document completeness is the sole criterion for Booking to finish --
+        # confidence review is a separate, always-available concern (the
+        # Documents page) a PC or TL can act on any time, not a precondition
+        # for Submit. Previously this blocked Submit on any unreviewed <90%
+        # field (Condition 2); removed so PC can submit as soon as documents
+        # are uploaded and classified, exactly like Delivery already does.
         requirements = _base_requirements(connection, tenant_id, journey_id)
         documents = _linked_documents(connection, tenant_id, journey_id)
         mandatory_documents_complete = booking_v2._mandatory_booking_documents_complete(
