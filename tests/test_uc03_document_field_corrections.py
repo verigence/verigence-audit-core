@@ -17,7 +17,10 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_audit_flags import act_on_flag
-from audit_core.uc03_document_field_corrections import apply_confirmed_field_correction
+from audit_core.uc03_document_field_corrections import (
+    apply_confirmed_field_correction,
+    submit_field_correction,
+)
 
 
 @dataclass
@@ -191,7 +194,16 @@ def _set_role(setup, role: str) -> None:
     setup["active_actor"]["id"] = setup["actors"][role]
 
 
-def _propose(setup, *, key: str, field_key: str = "chassis_number", proposed="MA3ECORRECTED001"):
+def _submit(
+    setup,
+    *,
+    key: str,
+    field_key: str = "chassis_number",
+    new_value: str = "MA3ECORRECTED001",
+    confidence: float | None = 96.0,
+    remarks: str | None = "Chassis number was mis-read from a smudged booking form.",
+    source_fact_version: int = 1,
+):
     return _client().post(
         f"/v2/tenants/{setup['tenant_id']}/journeys/{setup['journey_id']}"
         f"/uc03/documents/{setup['document_id']}/field-corrections",
@@ -202,13 +214,19 @@ def _propose(setup, *, key: str, field_key: str = "chassis_number", proposed="MA
             "documentTypeKey": "booking_form",
             "fieldKey": field_key,
             "canonicalFieldId": "canon-chassis-1",
-            "sourceFactVersion": 1,
-            "confidenceScore": 96.0,
+            "sourceFactVersion": source_fact_version,
+            "confidenceScore": confidence,
             "originalValue": "MA3EWRONG00000",
-            "proposedValue": proposed,
-            "remarks": "Chassis number was mis-read from a smudged booking form.",
+            "newValue": new_value,
+            "remarks": remarks,
         },
     )
+
+
+# Kept as an alias so the >=90% (adjudicated) tests below read naturally as
+# "propose" -- the endpoint is the same submit_field_correction either way,
+# branching internally on confidence.
+_propose = _submit
 
 
 def test_propose_field_correction_raises_a_tl_owned_violation(correction_setup):
@@ -294,15 +312,128 @@ def test_mark_false_positive_leaves_the_original_value_untouched(correction_setu
     assert stored is None  # never applied -- MARK_FALSE_POSITIVE writes nothing
 
 
+def test_low_confidence_correction_applies_immediately_and_raises_an_info_flag(correction_setup):
+    # <90% (self-serve): the value must already be visible in Audit Core
+    # from THIS SAME response -- no separate Confirm/CONFIRM_BREACH step,
+    # and no remarks required (a PC could always do this directly on the
+    # old Review page; a mandatory remark here would just be new friction).
+    response = _submit(
+        correction_setup,
+        key="submit-lowconf-0001",
+        field_key="engine_number",
+        new_value="EN-CORRECTED-1",
+        confidence=72.0,
+        remarks=None,
+    )
+    assert response.status_code == 200, response.text
+    flag = response.json()["flag"]
+    assert flag["findingClass"] == "DATA_GAP"
+    assert flag["resolutionMode"] == "SELF_SERVICE"
+    assert flag["ownerRoleCode"] == "PC"
+    assert flag["severity"] == "INFO"
+    assert flag["ruleKey"] == "DI_VALUE_CORRECTED:engine_number"
+
+    with correction_setup["engine"].connect() as connection:
+        row = connection.execute(
+            text(
+                """
+                SELECT effective_value, is_modified
+                FROM auditcore.journey_document_extracted_fields
+                WHERE tenant_id=:t AND journey_id=:j AND field_key='engine_number'
+                """
+            ),
+            {"t": correction_setup["tenant_id"], "j": correction_setup["journey_id"]},
+        ).mappings().one()
+    assert row["effective_value"] == "EN-CORRECTED-1"
+    assert row["is_modified"] is True
+
+    with correction_setup["engine"].connect() as connection:
+        applied_at = connection.execute(
+            text(
+                """
+                SELECT applied_at_utc FROM auditcore.journey_document_field_correction_proposals
+                WHERE tenant_id=:t AND audit_finding_id=:f
+                """
+            ),
+            {"t": correction_setup["tenant_id"], "f": UUID(flag["flagId"])},
+        ).scalar_one()
+    assert applied_at is not None  # stamped at creation, not deferred to a later action
+
+
+def test_missing_confidence_is_treated_as_low_confidence(correction_setup):
+    # requires_pc_review(None) is True -- an unscored field gets the same
+    # self-serve, immediate-apply treatment as an explicit <90% score.
+    response = _submit(
+        correction_setup,
+        key="submit-noconf-0001",
+        field_key="unscored_field",
+        new_value="whatever",
+        confidence=None,
+        remarks=None,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["flag"]["findingClass"] == "DATA_GAP"
+
+
+def test_high_confidence_correction_requires_remarks(correction_setup):
+    response = _submit(
+        correction_setup,
+        key="submit-noremark-0001",
+        confidence=95.0,
+        remarks=None,
+    )
+    # This app's error handler translates a pydantic validation failure to
+    # 400/VAC-VAL-001, not FastAPI's default 422 -- matching every other
+    # request-validation error in this codebase.
+    assert response.status_code == 400, response.text
+    assert response.json()["errorCode"] == "VAC-VAL-001"
+
+
+def test_high_confidence_correction_does_not_apply_until_confirmed(correction_setup):
+    # The >=90% path's whole point: nothing is written to Audit Core at
+    # submit time, unlike the <90% path above.
+    response = _submit(correction_setup, key="submit-highconf-noapply-0001", field_key="vin_pending")
+    assert response.status_code == 200, response.text
+    with correction_setup["engine"].connect() as connection:
+        stored = connection.execute(
+            text(
+                """
+                SELECT effective_value FROM auditcore.journey_document_extracted_fields
+                WHERE tenant_id=:t AND journey_id=:j AND field_key='vin_pending'
+                """
+            ),
+            {"t": correction_setup["tenant_id"], "j": correction_setup["journey_id"]},
+        ).scalar_one_or_none()
+    assert stored is None
+
+
+def test_submit_field_correction_never_touches_the_stage_wide_confirm_gate() -> None:
+    # Regression guard for the exact bug this dual-path design fixes: the
+    # stage-wide Confirm endpoints (pc_verification_status PENDING ->
+    # VERIFIED, one-shot) must never be invoked from here -- doing so would
+    # silently "verify" the whole stage off one field correction and
+    # permanently lock out every later correction on any other document.
+    source = inspect.getsource(submit_field_correction)
+    assert "pc_verification_status" not in source
+    assert "confirm_booking_review_v2" not in source
+    assert "confirm_delivery_review_v2" not in source
+
+
 def test_apply_hook_does_not_invoke_the_heavy_materialization_pass() -> None:
-    # apply_confirmed_field_correction deliberately reuses only
-    # persist_reviewed_di_fields + the conditional typed-attribute
-    # projection, not materialize_reviewed_di_business_values -- see the
-    # module docstring for why. Source-inspected so a future edit that
-    # accidentally wires in the heavy pass fails loudly here.
-    source = inspect.getsource(apply_confirmed_field_correction)
-    assert "materialize_reviewed_di_business_values" not in source
-    assert "persist_reviewed_di_fields(" in source
+    # apply_confirmed_field_correction delegates to the shared
+    # _apply_field_value helper (also used by the <90% immediate-apply
+    # path), which reuses only persist_reviewed_di_fields + the conditional
+    # typed-attribute projection, not materialize_reviewed_di_business_
+    # values -- see the module docstring for why. Source-inspected so a
+    # future edit that accidentally wires in the heavy pass fails loudly.
+    from audit_core.uc03_document_field_corrections import _apply_field_value
+
+    hook_source = inspect.getsource(apply_confirmed_field_correction)
+    helper_source = inspect.getsource(_apply_field_value)
+    assert "_apply_field_value(" in hook_source
+    assert "materialize_reviewed_di_business_values" not in hook_source
+    assert "materialize_reviewed_di_business_values" not in helper_source
+    assert "persist_reviewed_di_fields(" in helper_source
 
 
 def test_act_on_flag_only_applies_the_correction_on_confirm_breach() -> None:

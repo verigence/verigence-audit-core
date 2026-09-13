@@ -1,39 +1,54 @@
-"""uc03_document_field_corrections.py — >=90%-confidence field correction
-approval flow (unified Documents review redesign, 2026-09-13).
+"""uc03_document_field_corrections.py — document field correction flow
+(unified Documents review redesign, 2026-09-13; confidence split added
+2026-09-13 after a design review of the first cut -- see below).
 
 Booking/Delivery's own Confirm gates were relaxed so document completeness
 alone finishes the stage (uc03_simplified_booking_flow.py,
-uc03_confidence_review_policy.py, uc03_review_effective_values.py). A DI
-field extracted below the 90% confidence threshold still goes through the
-existing Review Confirm's ``corrections`` payload (direct edit + confirm --
-see uc03_review_effective_values.py). A field extracted AT OR ABOVE 90%
-confidence that is nonetheless wrong is deliberately NOT directly editable:
-the design calls for a structured, TL-adjudicated correction instead of
-letting a PC silently overwrite a high-confidence DI value.
+uc03_confidence_review_policy.py, uc03_review_effective_values.py). This
+module is the ONE place a PC/TL corrects a DI-extracted field's value from
+the standalone Documents page, branching on confidence
+(``uc03_review_confidence.requires_pc_review``, the same 90% threshold used
+everywhere else):
 
-This module raises that correction as a VIOLATION finding (routed through
-the existing classification/routing machinery -- see the
-"DI_VALUE_CORRECTION_PROPOSED" entry in uc03_finding_routing.py's
-_VIOLATION_RULE_PREFIXES) and records the proposed replacement in
-``journey_document_field_correction_proposals``, keyed 1:1 by the finding's
-own audit_finding_id. A Team Lead then adjudicates it exactly like any other
-VIOLATION -- CONFIRM_BREACH or MARK_FALSE_POSITIVE via the existing
-``POST /flags/{flag_id}/actions`` endpoint (uc03_audit_flags.py::act_on_flag)
--- no new action codes. ``apply_confirmed_field_correction`` below is called
-from that handler's own execute() on CONFIRM_BREACH; MARK_FALSE_POSITIVE
-needs no extra step here -- the finding simply resolves as a false positive
-and the original DI value is left untouched (the proposal row's
-applied_at_utc stays NULL).
+  <90% (or missing confidence): the value is WRONG BY DEFINITION OF LOW
+  TRUST -- apply it immediately (self-serve, exactly like a PC always could
+  on the old Review page) and raise a DATA_GAP/INFO finding as a pure
+  audit-trail record of what changed. No accept/reject: the finding exists
+  so a TL can SEE every correction made, not so they must act on each one.
 
-Applying an approved correction reuses ``persist_reviewed_di_fields()`` --
-the same write path 5 existing Confirm handlers already use -- plus the
-same conditional typed-attribute projection those handlers use
-(``apply_supported_operational_attribute`` / ``record_attribute_resolution``
-when the field maps to a SUPPORTED attribute). It deliberately does NOT call
-the heavier ``materialize_reviewed_di_business_values`` journey-wide
-re-materialization pass -- disproportionate to approving one field on one
-document, and not needed: the typed projection above already carries the
-one business-owner write a single field's correction can require.
+  >=90%: the extracted value is presumed trustworthy, so overwriting it
+  needs a second pair of eyes -- raise a VIOLATION finding instead of
+  applying anything, and defer the write until a Team Lead calls
+  CONFIRM_BREACH on it (`apply_confirmed_field_correction`, invoked from
+  uc03_audit_flags.py::act_on_flag). MARK_FALSE_POSITIVE needs no extra
+  step -- the original DI value simply stands.
+
+Why this module does NOT call the stage-wide Confirm endpoints
+(confirm_booking_review_v2_confidence_policy / confirm_delivery_review_v2_
+effective_values, uc03_review_effective_values.py): those two exist for a
+different job -- the ONE-TIME "PC finishes reviewing everything, stage
+becomes VERIFIED" transition (pc_verification_status PENDING -> VERIFIED,
+enforced exactly once). Routing a single-field, single-document correction
+through them would (a) flip pc_verification_status to VERIFIED the first
+time ANY field on ANY document got corrected -- silently declaring the
+whole stage "PC verified" off the back of one field -- and (b) permanently
+lock out every later correction on every OTHER document, since that
+transition can only happen once (a second call fails with
+VAC-CONFLICT-010, "Review is not pending"). A per-document correction is a
+narrower, always-repeatable action; it needs its own narrow, always-
+repeatable write path, which is exactly what `_apply_field_value` below is.
+It reuses `persist_reviewed_di_fields()` -- the same durable write 5
+existing Confirm handlers already use -- plus the same conditional typed-
+attribute projection those handlers use (`apply_supported_operational_
+attribute` / `record_attribute_resolution`), deliberately NOT the heavier
+`materialize_reviewed_di_business_values` journey-wide re-materialization
+pass (disproportionate to one field on one document either way).
+
+Every correction, whichever band, gets its own ``journey_document_field_
+correction_proposals`` row (1:1 with the finding it raised) recording
+old/new value -- the ONLY difference is whether `applied_at_utc` is stamped
+at creation (<90%, self-serve) or left NULL until a TL's CONFIRM_BREACH
+(>=90%, adjudicated).
 """
 from __future__ import annotations
 
@@ -74,6 +89,7 @@ from audit_core.uc03_di_core_persistence import (
     persist_reviewed_di_fields,
 )
 from audit_core.uc03_finding_classification import resolve_classification
+from audit_core.uc03_review_confidence import requires_pc_review
 
 router = APIRouter(
     prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}/uc03/documents",
@@ -82,12 +98,15 @@ router = APIRouter(
 
 StageCode = Literal["BOOKING", "DELIVERY"]
 
-# Matched against uc03_finding_routing._VIOLATION_RULE_PREFIXES's stem so this
-# resolves to VIOLATION/ADJUDICATED with zero new routing plumbing.
-FINDING_TYPE_CODE = "DI_VALUE_CORRECTION_PROPOSED"
+# Matched against uc03_finding_routing.py's rule-prefix sets so each resolves
+# to its class with zero new routing plumbing: DI_VALUE_CORRECTION_PROPOSED
+# is a _VIOLATION_RULE_PREFIXES entry (adjudicated), DI_VALUE_CORRECTED is a
+# _DATA_GAP_RULE_PREFIXES entry (self-serve).
+_ADJUDICATED_FINDING_TYPE_CODE = "DI_VALUE_CORRECTION_PROPOSED"
+_APPLIED_FINDING_TYPE_CODE = "DI_VALUE_CORRECTED"
 
 
-class ProposeFieldCorrectionCommand(BaseModel):
+class FieldCorrectionCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     stage: StageCode
@@ -99,18 +118,27 @@ class ProposeFieldCorrectionCommand(BaseModel):
     confidenceScore: float | None = None
     evidenceId: UUID | None = None
     originalValue: Any | None = None
-    proposedValue: Any | None = Field(...)
-    # Same discipline as a human-raised flag (uc03_audit_flags.FlagCreateCommand):
-    # a proposal with no remark explaining why the DI value is wrong is exactly
-    # the "no one should be able to say the system has issues" gap this
-    # redesign exists to close.
-    remarks: str = Field(min_length=1, max_length=2000)
+    newValue: Any | None = Field(...)
+    # Required only for a >=90% correction (adjudicated -- a TL needs to know
+    # why a trusted value is being challenged). Optional for <90%, where the
+    # correction applies immediately and a remark would just add friction to
+    # something a PC could always do directly on the old Review page.
+    remarks: str | None = Field(default=None, max_length=2000)
 
     @model_validator(mode="after")
-    def require_non_blank_remarks(self):
-        if not self.remarks.strip():
-            raise ValueError("Remarks are required and cannot be blank.")
+    def require_remarks_for_adjudicated_corrections(self):
+        if requires_pc_review(self.confidenceScore):
+            return self
+        if not (self.remarks or "").strip():
+            raise ValueError(
+                "Remarks are required when correcting a value at or above "
+                "90% confidence -- a Team Lead needs to know why."
+            )
         return self
+
+
+def _json(value: Any) -> str | None:
+    return json.dumps(value, default=str)
 
 
 def _insert_proposal(
@@ -119,8 +147,9 @@ def _insert_proposal(
     tenant_id: str,
     journey_id: UUID,
     audit_finding_id: UUID,
-    command: ProposeFieldCorrectionCommand,
+    command: FieldCorrectionCommand,
     actor_id: str,
+    applied_now: bool,
 ) -> None:
     connection.execute(
         text(
@@ -129,13 +158,15 @@ def _insert_proposal(
                 tenant_id, audit_finding_id, journey_id, stage_code,
                 document_id, evidence_id, document_type_key, field_key,
                 canonical_field_id, source_fact_version, confidence_score,
-                original_value, proposed_value, proposed_by_actor_id
+                original_value, proposed_value, proposed_by_actor_id,
+                applied_at_utc
             ) VALUES (
                 :tenant_id, :audit_finding_id, :journey_id, :stage_code,
                 :document_id, :evidence_id, :document_type_key, :field_key,
                 :canonical_field_id, :source_fact_version, :confidence_score,
                 CAST(:original_value AS jsonb), CAST(:proposed_value AS jsonb),
-                :actor_id
+                :actor_id,
+                CASE WHEN :applied_now THEN now() ELSE NULL END
             )
             """
         ),
@@ -152,25 +183,100 @@ def _insert_proposal(
             "source_fact_version": command.sourceFactVersion,
             "confidence_score": command.confidenceScore,
             "original_value": _json(command.originalValue),
-            "proposed_value": _json(command.proposedValue),
+            "proposed_value": _json(command.newValue),
             "actor_id": actor_id,
+            "applied_now": applied_now,
         },
     )
 
 
-def _json(value: Any) -> str | None:
-    return json.dumps(value, default=str)
+def _apply_field_value(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    stage_code: str,
+    document_id: UUID,
+    evidence_id: UUID | None,
+    document_type_key: str | None,
+    field_key: str,
+    canonical_field_id: str | None,
+    source_fact_version: int,
+    confidence_score: float | None,
+    original_value: Any,
+    new_value: Any,
+    actor_id: str,
+) -> None:
+    """Write ``new_value`` as the field's new reviewed/effective value, plus
+    the same conditional typed-attribute projection the stage-wide Confirm
+    handlers use. Shared by both the immediate <90% apply path and the
+    >=90% CONFIRM_BREACH apply path -- identical write, different caller."""
+
+    reviewed_field = ReviewedDiField(
+        document_id=document_id,
+        evidence_id=evidence_id,
+        source_canonical_field_id=canonical_field_id,
+        source_document_type_key=document_type_key,
+        field_key=field_key,
+        source_fact_version=source_fact_version,
+        extracted_value=original_value,
+        modified_value=new_value,
+        effective_value=new_value,
+        is_modified=True,
+        confidence_score=confidence_score,
+        confidence_scale="PERCENT" if confidence_score is not None else None,
+    )
+    persist_reviewed_di_fields(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code=stage_code,
+        actor_id=actor_id,
+        fields=[reviewed_field],
+    )
+
+    spec = spec_for_field(field_key)
+    if spec is not None and spec.mapping_status == "SUPPORTED":
+        application = apply_supported_operational_attribute(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            spec=spec,
+            value=new_value,
+            actor_id=actor_id,
+            source_document_type_key=document_type_key,
+            source_field_key=field_key,
+            source_evidence_id=evidence_id,
+        )
+        if application is not None:
+            owning_domain_key, owning_record_reference, _status = application
+            record_attribute_resolution(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                stage_code=stage_code,
+                spec=spec,
+                source_di_document_id=document_id,
+                source_evidence_id=evidence_id,
+                source_canonical_field_id=canonical_field_id,
+                source_field_key=field_key,
+                source_fact_version=source_fact_version,
+                source_document_type_key=document_type_key,
+                actor_id=actor_id,
+                owning_domain_key=owning_domain_key,
+                owning_record_reference=owning_record_reference,
+            )
 
 
 @router.post(
     "/{document_id}/field-corrections",
     response_model=FlagMutationResponse,
 )
-def propose_field_correction(
+def submit_field_correction(
     tenant_id: str,
     journey_id: UUID,
     document_id: UUID,
-    payload: ProposeFieldCorrectionCommand,
+    payload: FieldCorrectionCommand,
     request: Request,
     response: Response,
     idempotency_key: Annotated[
@@ -221,15 +327,28 @@ def propose_field_correction(
             detail="This document is not on this journey's Booking/Delivery capture.",
         )
     correlation_id = get_correlation_id(request)
+    needs_adjudication = requires_pc_review(payload.confidenceScore) is False
 
     def execute() -> dict[str, Any]:
+        finding_type_code = (
+            _ADJUDICATED_FINDING_TYPE_CODE if needs_adjudication else _APPLIED_FINDING_TYPE_CODE
+        )
+        rule_key = f"{finding_type_code}:{payload.fieldKey}"
         routing = resolve_classification(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
-            rule_key=f"{FINDING_TYPE_CODE}:{payload.fieldKey}",
-            finding_type_code=FINDING_TYPE_CODE,
-            severity="MEDIUM",
+            rule_key=rule_key,
+            finding_type_code=finding_type_code,
+            severity="MEDIUM" if needs_adjudication else "INFO",
+        )
+        title = (
+            f"Proposed correction: {payload.fieldKey} on {payload.documentTypeKey}"
+            if needs_adjudication
+            else f"DI value corrected: {payload.fieldKey} on {payload.documentTypeKey}"
+        )
+        description = (payload.remarks or "").strip() or (
+            f"Corrected from {payload.originalValue!r} to {payload.newValue!r}."
         )
         flag_id = connection.execute(
             text(
@@ -241,7 +360,7 @@ def propose_field_correction(
                     origin_role_snapshot, rule_key, blocking_completion,
                     finding_class, owner_role_code, sla_due_at_utc
                 ) VALUES (
-                    :tenant_id, :journey_id, :finding_type_code, 'MEDIUM',
+                    :tenant_id, :journey_id, :finding_type_code, :severity,
                     'OPEN', :title, :description, :actor_id,
                     :correlation_id, :stage_code, 'HUMAN', :actor_id,
                     :actor_role, :rule_key, false,
@@ -252,14 +371,15 @@ def propose_field_correction(
             {
                 "tenant_id": tenant_id,
                 "journey_id": journey_id,
-                "finding_type_code": FINDING_TYPE_CODE,
-                "title": f"Proposed correction: {payload.fieldKey} on {payload.documentTypeKey}",
-                "description": payload.remarks.strip(),
+                "finding_type_code": finding_type_code,
+                "severity": "MEDIUM" if needs_adjudication else "INFO",
+                "title": title,
+                "description": description,
                 "actor_id": human_principal.subject,
                 "correlation_id": correlation_id,
                 "stage_code": payload.stage,
                 "actor_role": context["operating_role"],
-                "rule_key": f"{FINDING_TYPE_CODE}:{payload.fieldKey}",
+                "rule_key": rule_key,
                 **routing,
             },
         ).scalar_one()
@@ -270,7 +390,27 @@ def propose_field_correction(
             audit_finding_id=flag_id,
             command=payload,
             actor_id=human_principal.subject,
+            applied_now=not needs_adjudication,
         )
+        if not needs_adjudication:
+            # <90% confidence: self-serve, apply immediately -- see module
+            # docstring for why this bypasses the stage-wide Confirm path.
+            _apply_field_value(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                stage_code=payload.stage,
+                document_id=payload.documentId,
+                evidence_id=payload.evidenceId,
+                document_type_key=payload.documentTypeKey,
+                field_key=payload.fieldKey,
+                canonical_field_id=payload.canonicalFieldId,
+                source_fact_version=payload.sourceFactVersion,
+                confidence_score=payload.confidenceScore,
+                original_value=payload.originalValue,
+                new_value=payload.newValue,
+                actor_id=human_principal.subject,
+            )
         event_id = _append_finding_event(
             connection,
             tenant_id=tenant_id,
@@ -280,13 +420,14 @@ def propose_field_correction(
             event_type="RAISED",
             actor_id=human_principal.subject,
             actor_role=context["operating_role"],
-            reason=payload.remarks.strip(),
+            reason=description,
             correlation_id=correlation_id,
             safe_payload={
                 "originKind": "HUMAN",
-                "category": FINDING_TYPE_CODE,
+                "category": finding_type_code,
                 "fieldKey": payload.fieldKey,
                 "documentId": str(payload.documentId),
+                "appliedImmediately": not needs_adjudication,
             },
         )
         row = _finding(
@@ -306,7 +447,7 @@ def propose_field_correction(
     body, replay = execute_idempotent_json_command(
         connection,
         tenant_id=tenant_id,
-        operation_key=f"uc03.document-field-correction.propose:{journey_id}:{document_id}:{payload.fieldKey}:{payload.sourceFactVersion}",
+        operation_key=f"uc03.document-field-correction.submit:{journey_id}:{document_id}:{payload.fieldKey}:{payload.sourceFactVersion}",
         idempotency_key=idempotency_key,
         request_payload=payload.model_dump(mode="json"),
         execute=execute,
@@ -327,8 +468,10 @@ def apply_confirmed_field_correction(
     """Write the proposed value as the field's new reviewed/effective value.
 
     Called from uc03_audit_flags.py::act_on_flag's execute() on
-    CONFIRM_BREACH for a DI_VALUE_CORRECTION_PROPOSED finding, inside the
-    same transaction as the finding's own status update.
+    CONFIRM_BREACH for a DI_VALUE_CORRECTION_PROPOSED (>=90%) finding,
+    inside the same transaction as the finding's own status update. The
+    <90% path never reaches here -- its value was already applied at
+    submit_field_correction time.
     """
 
     proposal = connection.execute(
@@ -346,7 +489,7 @@ def apply_confirmed_field_correction(
     ).mappings().one_or_none()
     if proposal is None:
         # Defensive only: every DI_VALUE_CORRECTION_PROPOSED finding is created
-        # with its proposal row in the same transaction (propose_field_
+        # with its proposal row in the same transaction (submit_field_
         # correction above) -- this should be unreachable in practice.
         raise NotFoundError(
             error_code="VAC-NF-014",
@@ -355,60 +498,22 @@ def apply_confirmed_field_correction(
             detail="No proposed correction is recorded for this finding.",
         )
 
-    reviewed_field = ReviewedDiField(
-        document_id=proposal["document_id"],
-        evidence_id=proposal["evidence_id"],
-        source_canonical_field_id=proposal["canonical_field_id"],
-        source_document_type_key=proposal["document_type_key"],
-        field_key=proposal["field_key"],
-        source_fact_version=proposal["source_fact_version"],
-        extracted_value=proposal["original_value"],
-        modified_value=proposal["proposed_value"],
-        effective_value=proposal["proposed_value"],
-        is_modified=True,
-        confidence_score=proposal["confidence_score"],
-        confidence_scale="PERCENT" if proposal["confidence_score"] is not None else None,
-    )
-    persist_reviewed_di_fields(
+    _apply_field_value(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
         stage_code=proposal["stage_code"],
+        document_id=proposal["document_id"],
+        evidence_id=proposal["evidence_id"],
+        document_type_key=proposal["document_type_key"],
+        field_key=proposal["field_key"],
+        canonical_field_id=proposal["canonical_field_id"],
+        source_fact_version=proposal["source_fact_version"],
+        confidence_score=proposal["confidence_score"],
+        original_value=proposal["original_value"],
+        new_value=proposal["proposed_value"],
         actor_id=actor_id,
-        fields=[reviewed_field],
     )
-
-    spec = spec_for_field(proposal["field_key"])
-    if spec is not None and spec.mapping_status == "SUPPORTED":
-        application = apply_supported_operational_attribute(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            spec=spec,
-            value=proposal["proposed_value"],
-            actor_id=actor_id,
-            source_document_type_key=proposal["document_type_key"],
-            source_field_key=proposal["field_key"],
-            source_evidence_id=proposal["evidence_id"],
-        )
-        if application is not None:
-            owning_domain_key, owning_record_reference, _status = application
-            record_attribute_resolution(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                stage_code=proposal["stage_code"],
-                spec=spec,
-                source_di_document_id=proposal["document_id"],
-                source_evidence_id=proposal["evidence_id"],
-                source_canonical_field_id=proposal["canonical_field_id"],
-                source_field_key=proposal["field_key"],
-                source_fact_version=proposal["source_fact_version"],
-                source_document_type_key=proposal["document_type_key"],
-                actor_id=actor_id,
-                owning_domain_key=owning_domain_key,
-                owning_record_reference=owning_record_reference,
-            )
 
     connection.execute(
         text(
