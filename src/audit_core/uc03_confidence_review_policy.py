@@ -1637,20 +1637,14 @@ def confirm_booking_review_v2_confidence_policy(
         journey_id=journey_id,
         items=items,
     )
-    required_keys = sorted(
-        item.review_key for item in items.values() if item.decision_required
-    )
-    missing_keys = [key for key in required_keys if key not in decisions]
-    if missing_keys:
-        raise ConflictError(
-            error_code="VAC-CONFLICT-012",
-            title="Review decisions are pending",
-            detail=(
-                f"{len(missing_keys)} low-confidence extracted value"
-                f"{'s' if len(missing_keys) != 1 else ''} still require Accept or Reject."
-            ),
-        )
-
+    # Confirm no longer requires every low-confidence field to have an
+    # Accept/Reject decision first (dropped alongside submit_booking_from_
+    # review's own equivalent gate, uc03_simplified_booking_flow.py):
+    # document completeness is the sole criterion for Booking/Delivery to
+    # finish -- confidence review is a separate, always-available concern
+    # a PC or TL can act on any time, not a precondition for anything else.
+    # Confirm still applies whatever decisions/corrections were actually
+    # given; anything not yet decided just stays pending for later.
     rejected_keys = {
         key for key, decision in decisions.items() if decision == "REJECTED"
     }

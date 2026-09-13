@@ -171,3 +171,18 @@ def test_confirm_calls_attribute_resolution_directly_not_via_review_v2() -> None
     assert "review_v2.record_attribute_resolution" not in source
     assert "apply_supported_operational_attribute(" in source
     assert "record_attribute_resolution(" in source
+
+
+def test_confirm_no_longer_blocks_on_unresolved_low_confidence_decisions() -> None:
+    # Document completeness is the sole criterion for Booking/Delivery to
+    # finish (2026-09-13 design change) -- confidence review is a separate,
+    # always-available concern, not a precondition for Confirm or Submit.
+    # Source-inspected, not exercised end-to-end, for the same reason as the
+    # test above: the full execute() body needs a large attributes/documents/
+    # decisions fixture that adds nothing to this specific assertion.
+    source = inspect.getsource(confidence_policy.confirm_booking_review_v2_confidence_policy)
+    assert "missing_keys" not in source
+    assert "VAC-CONFLICT-012" not in source
+    # Confirm must still actually apply whatever was given, unconditionally.
+    assert "rejected_keys" in source
+    assert "materialize_reviewed_di_business_values(" in source
