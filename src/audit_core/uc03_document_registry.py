@@ -29,7 +29,10 @@ RECEIPT_DOCUMENT_TYPES = frozenset({"dealer_receipt", "payment_receipt"})
 BANK_STATEMENT_DOCUMENT_TYPE = "bank_statement_extract"
 """The single document_type_key DI emits for a reviewed bank statement
 (verigence-di ``schemas/bank_statement.py``; registered as a standing, non-
-checklist document type via migration 0070 for both Booking and Delivery)."""
+checklist document type via migration 0070, originally for both Booking and
+Delivery. Migration 0091 retired the Booking side -- a bank statement is a
+Delivery-only document now, so the unified capture screen's dispatch never
+has to fan one upload out to two stages)."""
 
 RECONCILIATION_TRIGGER_DOCUMENT_TYPES = RECEIPT_DOCUMENT_TYPES | {
     BANK_STATEMENT_DOCUMENT_TYPE
