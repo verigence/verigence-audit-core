@@ -84,6 +84,10 @@ _VIOLATION_RULE_PREFIXES: frozenset[str] = frozenset({
     "DL_VIN_RECONCILIATION",
     "WF_BOOKING_INCOMPLETE_AT_DELIVERY_START",
     "WF_DELIVERY_COMPLETED_WITH_AUDIT_INCOMPLETE",
+    # Unified Documents review (2026-09-13): a PC/TL-proposed correction to a
+    # >=90%-confidence extracted field is a TL-adjudicated call (Confirm-Breach
+    # applies it, Mark-False-Positive rejects it) -- not a self-serve gap.
+    "DI_VALUE_CORRECTION_PROPOSED",
 })
 
 _DOCUMENT_GAP_TYPES: frozenset[str] = frozenset({

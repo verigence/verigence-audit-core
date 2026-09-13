@@ -32,6 +32,7 @@ BASE = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
         ("RE_PRICE_BOOKING_VS_INVOICE", "PRICING_ANOMALY", "VIOLATION"),
         ("RE_INSURANCE_COVER_NOTE_MISSING", "INSURANCE_ANOMALY", "DOCUMENT_GAP"),
         ("RE_DUPLICATE_CHASSIS_ACROSS_INVOICES", "CROSS_CASE_DUPLICATE", "VIOLATION"),
+        ("DI_VALUE_CORRECTION_PROPOSED:vin_number", "DI_VALUE_CORRECTION_PROPOSED", "VIOLATION"),
         (None, "DOCUMENT_EXCEPTION", "DOCUMENT_GAP"),
         (None, "PAYMENT_EXCEPTION", "DATA_GAP"),
         (None, "COMMERCIAL_EXCEPTION", "VIOLATION"),
@@ -49,6 +50,19 @@ def test_classify_by_rule_key_returns_none_for_unknown_rules() -> None:
     assert classify_by_rule_key("RE_NDC_MISSING") == "DOCUMENT_GAP"
     assert classify_by_rule_key("SOME_UNKNOWN_RULE") is None
     assert classify_by_rule_key(None) is None
+
+
+def test_classify_by_rule_key_matches_the_di_correction_stem_explicitly() -> None:
+    # VIOLATION is also classify_finding's DEFAULT_CLASS, so a parametrized
+    # end-to-end assertion alone can't tell "matched the explicit prefix"
+    # from "fell through to the unclassified default" -- that distinction
+    # matters because falling through triggers a DB registry lookup and
+    # UNCLASSIFIED auto-registration (uc03_finding_classification.py) this
+    # rule_key is meant to skip. classify_by_rule_key returning non-None
+    # (rather than classify_finding returning VIOLATION either way) is the
+    # real assertion.
+    assert classify_by_rule_key("DI_VALUE_CORRECTION_PROPOSED:vin_number") == "VIOLATION"
+    assert classify_by_rule_key("DI_VALUE_CORRECTION_PROPOSED") == "VIOLATION"
 
 
 def test_classify_by_type_returns_none_for_unknown_types() -> None:

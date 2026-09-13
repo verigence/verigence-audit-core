@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from uuid import uuid4
 
 from fastapi.routing import APIRoute
@@ -91,3 +92,21 @@ def test_unpopulated_low_confidence_field_needs_no_correction() -> None:
     # nothing for a PC to review.
     document = _delivery_document(value=None, confidence=None)
     assert effective_values._unresolved_low_confidence_fields([document], corrections={}) == []
+
+
+def test_confirm_no_longer_blocks_on_unresolved_low_confidence_fields() -> None:
+    # Document completeness is the sole criterion for Delivery to finish
+    # (2026-09-13 design change), mirroring Booking's own equivalent gate
+    # removal (uc03_confidence_review_policy.py) -- confidence review is a
+    # separate, always-available concern (the Documents page), not a
+    # precondition for Confirm. Source-inspected rather than exercised
+    # end-to-end: the full execute() body needs a large documents/DI-client
+    # fixture that adds nothing to this specific assertion (which is purely
+    # about what condition gates Confirm). _unresolved_low_confidence_fields
+    # itself is kept -- still a pure helper other tests above exercise
+    # directly -- just no longer called from this handler.
+    source = inspect.getsource(effective_values.confirm_delivery_review_v2_effective_values)
+    assert "_unresolved_low_confidence_fields(" not in source
+    assert "VAC-CONFLICT-012" not in source
+    # Confirm must still actually apply whatever corrections were given.
+    assert "persist_reviewed_di_fields(" in source
