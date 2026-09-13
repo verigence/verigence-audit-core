@@ -213,6 +213,55 @@ def create_unified_upload_intents(
     return UploadIntentResponse(externalContextRef=context_ref, uploads=results)
 
 
+class FinalizeResponse(BaseModel):
+    documentId: UUID
+    state: str
+
+
+@router.post("/{document_id}/finalize", response_model=FinalizeResponse)
+def finalize_unified_document(
+    tenant_id: str,
+    journey_id: UUID,
+    document_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    engine: Annotated[Engine, Depends(get_engine)],
+    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
+    di_client: Annotated[DiClient, Depends(get_di_client)],
+    v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
+) -> FinalizeResponse:
+    _scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    context_ref, token = _ensure_di_context(
+        connection=connection,
+        engine=engine,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        security_client=security_client,
+        di_client=di_client,
+    )
+    try:
+        payload = v2_client.finalize_document(
+            token=token,
+            tenant_id=tenant_id,
+            external_context_ref=context_ref,
+            document_id=str(document_id),
+        )
+    except DiCaptureV2Error as exc:
+        _log_di_capture_v2_failure(
+            operation="finalize_document", exc=exc, tenant_id=tenant_id,
+            journey_id=journey_id, context_ref=context_ref,
+        )
+        raise DependencyUnavailableError(detail="Uploaded document could not be finalized.") from exc
+    return FinalizeResponse(documentId=document_id, state=str(payload["state"]))
+
+
 def resolve_document_stage(
     classified_type: str | None,
     *,
