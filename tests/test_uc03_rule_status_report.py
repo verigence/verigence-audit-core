@@ -163,6 +163,32 @@ def test_rule_status_classifies_all_three_buckets_plus_inferred_execution(
     assert len(response.rules) == len(by_code)
 
 
+def test_rule_status_sets_tenant_context_itself_under_rls(rule_status_setup) -> None:
+    """Regression test for a real bug: the endpoint originally never called
+    set_tenant_context() itself, and every other test here passed anyway
+    because the fixture's own `SELECT set_config('app.tenant_id', ...)`
+    line masked it. auditcore.journeys (and every other tenant-scoped
+    table here) is RLS-enforced for the audit_core_runtime role the real
+    service connects as -- switch to that role and clear the tenant
+    context right before calling, so this only passes if the endpoint
+    itself re-establishes it, matching how a fresh per-request connection
+    actually arrives in production (verified live: `audit_core_runtime`
+    has rolbypassrls=false, unlike this test suite's own superuser)."""
+    tenant_id, journey_id, actor_id, connection = rule_status_setup
+    connection.execute(text("SET LOCAL ROLE audit_core_runtime"))
+    connection.execute(text("SELECT set_config('app.tenant_id', '', true)"))
+
+    response = get_rule_status(
+        tenant_id, journey_id,
+        human_principal=HumanPrincipal(subject=actor_id),
+        authorization_client=_AllowAuthorization(),
+        connection=connection,
+    )
+
+    assert len(response.rules) > 0
+    assert any(r.ruleCode == "WRONG_DOCUMENT" for r in response.rules)
+
+
 def test_rule_status_summary_counts_match_the_rule_list(rule_status_setup) -> None:
     tenant_id, journey_id, actor_id, connection = rule_status_setup
 
