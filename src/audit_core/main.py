@@ -120,6 +120,9 @@ from audit_core.uc03_journey_search import router as uc03_journey_search_router
 from audit_core.uc03_manual_verification import (
     router as uc03_manual_verification_router,
 )
+from audit_core.uc03_nightly_reprocessing_reports import (
+    router as uc03_nightly_reprocessing_reports_router,
+)
 from audit_core.uc03_pc_booking_documents import (
     router as uc03_pc_booking_documents_router,
 )
@@ -233,6 +236,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_journey_overview_projection_router)
     application.include_router(uc03_journey_search_router)
     application.include_router(uc03_tl_supervisory_router)
+    application.include_router(uc03_nightly_reprocessing_reports_router)
     application.include_router(uc03_create_booking_router)
     application.include_router(uc03_booking_router)
     application.include_router(uc03_booking_exchange_router)
