@@ -390,6 +390,26 @@ def annotate_and_resolve_reviewed_fields(
             "precedenceReason": reason,
         }
 
+    # A PAN card conventionally prints "Father's Name" as its own labelled
+    # field, with no "S/O"/"D/O"/"W/O" prefix -- unlike Aadhaar, which does.
+    # pan_father_name (its own attribute, never applied to any typed
+    # column -- see uc03_attribute_mapping.py) already carries exactly the
+    # relationship fact customer_relationship_type/_name exist for; without
+    # this, a PAN-only customer showed the extracted father's name nowhere
+    # at all, while the generic relationship fields stayed genuinely empty
+    # because DI never populates them from a PAN card. Only fills a real
+    # gap -- never overrides an explicit S/O/W/O/D/O relationship already
+    # resolved from Aadhaar or a differently-formatted PAN.
+    father_name = resolved.get("pan_father_name")
+    if (
+        father_name
+        and father_name.get("value")
+        and not resolved.get("customer_relationship_type")
+        and not resolved.get("customer_relationship_name")
+    ):
+        resolved["customer_relationship_type"] = {**father_name, "value": "S/O"}
+        resolved["customer_relationship_name"] = dict(father_name)
+
     return annotated, resolved
 
 

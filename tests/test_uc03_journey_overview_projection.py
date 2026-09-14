@@ -60,10 +60,40 @@ def test_reviewed_booking_projection_only_uses_unambiguous_values() -> None:
             "vehicle_model": "THAR",
         },
     ]
-    projection = _reviewed_booking_projection(rows)
+    projection = _reviewed_booking_projection(rows, {})
     assert projection["booking_reference_number"] == "BK-42"
     assert projection["customer_email"] == "buyer@example.com"
     assert "vehicle_model" not in projection
+
+
+def test_reviewed_booking_projection_falls_back_to_eager_reviewed_values() -> None:
+    """Reported live: a Booking that had gone through the automatic
+    post-extraction materialization (real ex-showroom price already
+    sitting in commercial_lines/journey_document_extracted_fields) still
+    showed every Deal/offered value as blank on Journey 360, because this
+    projection had no fallback at all once booking_form_review_values was
+    empty pre-PC-Review-Confirm. resolved_reviewed uses a different key per
+    field (uc03_journey_reviewed_details.semantic_key remaps most Booking
+    Form fields, e.g. 'ex_showroom_price' -> 'booking_ex_showroom_price') --
+    the fallback must go through that same remapping, not the raw field name."""
+    resolved_reviewed = {
+        "booking_ex_showroom_price": {"value": "2131387"},
+        "model": {"value": "SCORPIO N"},
+    }
+    projection = _reviewed_booking_projection([], resolved_reviewed)
+    assert projection["ex_showroom_price"] == "2131387"
+    assert projection["vehicle_model"] == "SCORPIO N"
+
+
+def test_reviewed_booking_projection_prefers_confirmed_review_value(
+) -> None:
+    """booking_form_review_values (PC Review Confirm's own reconciled copy)
+    stays authoritative once it exists -- the eager fallback only fills a
+    genuinely empty gap, it never overrides a confirmed value."""
+    rows = [{"ex_showroom_price": "2100000"}]
+    resolved_reviewed = {"booking_ex_showroom_price": {"value": "2131387"}}
+    projection = _reviewed_booking_projection(rows, resolved_reviewed)
+    assert projection["ex_showroom_price"] == "2100000"
 
 
 def test_reviewed_legal_name_prefers_pan_then_aadhaar() -> None:

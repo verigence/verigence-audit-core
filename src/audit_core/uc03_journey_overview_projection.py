@@ -183,12 +183,37 @@ def _reviewed_identity_rows(
     return [dict(row) for row in rows]
 
 
-def _reviewed_booking_projection(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
-        field: value
-        for field in _BOOKING_REVIEW_FIELDS
-        if (value := _unambiguous(rows, field)) is not None
-    }
+def _reviewed_booking_projection(
+    rows: list[dict[str, Any]],
+    resolved_reviewed: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Deal/Booking-facts panel values, keyed by the Booking Form's own raw
+    field names (e.g. ``ex_showroom_price``) -- what Journey 360's
+    BookingCommercialFacts/Vehicle/Customer panels actually read.
+
+    ``booking_form_review_values`` (``rows``) is authoritative once populated
+    -- it's PC Review Confirm's own reconciled copy -- but that only happens
+    on an explicit human action. Reported live: a Booking that had gone
+    through the automatic post-extraction materialization (real
+    ex-showroom price, discounts, etc. already sitting in
+    auditcore.commercial_lines / journey_document_extracted_fields) still
+    showed every Deal/offered value as blank, because this projection had
+    no fallback at all once ``rows`` was empty pre-confirm. ``resolved_reviewed``
+    is the same eager, always-current data every other panel on this page
+    already relies on (e.g. Vehicle's model/variant/colour) -- it uses a
+    different key per field (``uc03_journey_reviewed_details.semantic_key``
+    remaps most Booking Form fields, e.g. ``ex_showroom_price`` ->
+    ``booking_ex_showroom_price``), so the fallback has to go through that
+    same remapping, not the raw field name.
+    """
+    projection: dict[str, Any] = {}
+    for field in _BOOKING_REVIEW_FIELDS:
+        value = _unambiguous(rows, field)
+        if value is None:
+            value = _resolved_value(resolved_reviewed, reviewed_details.semantic_key(field))
+        if value is not None:
+            projection[field] = value
+    return projection
 
 
 def _reviewed_legal_name(rows: list[dict[str, Any]]) -> str | None:
@@ -939,7 +964,7 @@ def get_journey_overview_projection(
         tenant_id=tenant_id,
         journey_id=journey_id,
     )
-    reviewed_booking = _reviewed_booking_projection(reviewed_booking_rows)
+    reviewed_booking = _reviewed_booking_projection(reviewed_booking_rows, resolved_reviewed)
 
     customer = dict(data["customer"])
     resolved_customer_name = resolved_reviewed.get("customer_name")

@@ -132,6 +132,55 @@ def test_delivery_wins_over_booking_for_overlapping_vehicle_fact() -> None:
     assert resolved["model"]["precedenceReason"] == "DELIVERY_OVER_BOOKING"
 
 
+def test_pan_father_name_fills_relationship_when_generic_pan_fields_are_empty() -> None:
+    """A real PAN card prints Father's Name as its own labelled field, with
+    no S/O prefix -- unlike Aadhaar. Reported live: a PAN-only customer
+    showed 'Relationship' and 'Relationship Name' as empty on Journey 360
+    despite the father's name being extracted correctly, because DI never
+    populates pan_relationship_type/_name from a PAN card."""
+    rows = [
+        _row(
+            field_key="pan_father_name",
+            value="Father Name",
+            document_type="pan_card",
+            stage="BOOKING",
+        ),
+    ]
+
+    _, resolved = annotate_and_resolve_reviewed_fields(rows)
+
+    assert resolved["customer_relationship_type"]["value"] == "S/O"
+    assert resolved["customer_relationship_name"]["value"] == "Father Name"
+
+
+def test_pan_father_name_fallback_never_overrides_an_explicit_relationship() -> None:
+    rows = [
+        _row(
+            field_key="pan_father_name",
+            value="Father Name",
+            document_type="pan_card",
+            stage="BOOKING",
+        ),
+        _row(
+            field_key="aadhaar_relationship_type",
+            value="W/O",
+            document_type="aadhaar",
+            stage="BOOKING",
+        ),
+        _row(
+            field_key="aadhaar_relationship_name",
+            value="Husband Name",
+            document_type="aadhaar",
+            stage="BOOKING",
+        ),
+    ]
+
+    _, resolved = annotate_and_resolve_reviewed_fields(rows)
+
+    assert resolved["customer_relationship_type"]["value"] == "W/O"
+    assert resolved["customer_relationship_name"]["value"] == "Husband Name"
+
+
 def test_booking_is_current_source_when_delivery_has_no_same_semantic_fact() -> None:
     rows = [
         _row(
