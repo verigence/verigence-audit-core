@@ -27,13 +27,12 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from audit_core.config import Settings
 from audit_core.telemetry import configure_otel_telemetry
 
-_REQUIRED_OTLP_ENDPOINTS = (
-    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-)
-
 _OTEL_LOGGER: Any | None = None
+_LOGGER_PROVIDER: LoggerProvider | None = None
+_METER_PROVIDER: MeterProvider | None = None
+_TRACER_PROVIDER: TracerProvider | None = None
+_EXPORT_ALL_LOGS = False
+_EXPORT_ERRORS = False
 
 _SAFE_LOG_ATTRIBUTES = {
     "correlation_id",
@@ -67,6 +66,7 @@ _SEVERITY = {
     "warning": SeverityNumber.WARN,
     "error": SeverityNumber.ERROR,
     "critical": SeverityNumber.FATAL,
+    "exception": SeverityNumber.ERROR,
 }
 
 
@@ -79,15 +79,33 @@ def _service_version() -> str:
     )
 
 
-def _otlp_endpoints_configured() -> bool:
-    return all(os.getenv(name, "").strip() for name in _REQUIRED_OTLP_ENDPOINTS)
+def _resource(settings: Settings) -> Resource:
+    return Resource.create(
+        {
+            "service.namespace": "verigence",
+            "service.name": settings.service_name,
+            "service.version": _service_version(),
+            "deployment.environment.name": settings.environment,
+        }
+    )
 
 
-def _bootstrap_warning(reason: str, exception_type: str | None = None) -> None:
+def _signal_endpoint_configured(signal: str) -> bool:
+    specific = os.getenv(f"OTEL_EXPORTER_OTLP_{signal.upper()}_ENDPOINT", "").strip()
+    generic = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    return bool(specific or generic)
+
+
+def _bootstrap_warning(
+    capability: str,
+    reason: str,
+    exception_type: str | None = None,
+) -> None:
     payload = {
         "severity": "WARNING",
-        "event_name": "observability_bootstrap_disabled",
+        "event_name": "observability_capability_disabled",
         "service_name": "verigence-audit-core",
+        "capability": capability,
         "reason": reason,
     }
     if exception_type:
@@ -95,22 +113,37 @@ def _bootstrap_warning(reason: str, exception_type: str | None = None) -> None:
     sys.stderr.write(json.dumps(payload, separators=(",", ":")) + "\n")
 
 
-def emit_otel_log(event_dict: Mapping[str, Any]) -> None:
-    """Queue one controlled structured log event for batched OTLP export.
+def _primitive_attribute(value: Any) -> Any | None:
+    if isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, (list, tuple)) and all(
+        isinstance(item, (str, bool, int, float)) for item in value
+    ):
+        return tuple(value)
+    return None
 
-    Only an explicit allow-list of operational fields is copied. The call never performs a
-    synchronous network request; the SDK BatchLogRecordProcessor owns remote export.
-    """
+
+def _is_error_event(event_dict: Mapping[str, Any]) -> bool:
+    level = str(event_dict.get("level", "info")).lower()
+    return level in {"error", "critical", "exception"} or bool(event_dict.get("error_code"))
+
+
+def emit_otel_log(event_dict: Mapping[str, Any]) -> None:
+    """Queue one controlled structured event for OTLP log/error export."""
     if _OTEL_LOGGER is None:
+        return
+    if not _EXPORT_ALL_LOGS and not (_EXPORT_ERRORS and _is_error_event(event_dict)):
         return
     try:
         event_name = str(event_dict.get("event", "audit_core_event"))
         level = str(event_dict.get("level", "info")).lower()
-        attributes = {
-            key: value
-            for key, value in event_dict.items()
-            if key in _SAFE_LOG_ATTRIBUTES and value is not None
-        }
+        attributes: dict[str, Any] = {}
+        for key, value in event_dict.items():
+            if key not in _SAFE_LOG_ATTRIBUTES or value is None:
+                continue
+            safe_value = _primitive_attribute(value)
+            if safe_value is not None:
+                attributes[key] = safe_value
         _OTEL_LOGGER.emit(
             severity_number=_SEVERITY.get(level, SeverityNumber.INFO),
             severity_text=level.upper(),
@@ -123,7 +156,7 @@ def emit_otel_log(event_dict: Mapping[str, Any]) -> None:
 
 
 def attach_trusted_user_id(user_id: str) -> None:
-    """Attach an authenticated opaque Verigence user ID to logs and the active trace."""
+    """Attach an authenticated opaque Verigence user ID to logs and active trace."""
     if not user_id:
         return
     structlog.contextvars.bind_contextvars(user_id=user_id)
@@ -163,48 +196,22 @@ async def _httpx_async_request_hook(span: Any, request: Any) -> None:
     _httpx_request_hook(span, request)
 
 
-def configure_otlp(app: FastAPI, settings: Settings) -> bool:
-    """Configure non-blocking, fail-open Phase-1 OpenTelemetry export."""
-    global _OTEL_LOGGER
-
-    if not settings.observability_enabled:
-        return False
-    if not _otlp_endpoints_configured():
-        _bootstrap_warning("missing_otlp_endpoint_configuration")
-        return False
-
+def _configure_logs(settings: Settings, resource: Resource) -> tuple[bool, bool]:
+    global _OTEL_LOGGER, _LOGGER_PROVIDER, _EXPORT_ALL_LOGS, _EXPORT_ERRORS
+    requested_logs = settings.observability_logs_enabled
+    requested_errors = settings.observability_errors_enabled
+    if not requested_logs and not requested_errors:
+        return False, False
+    if not _signal_endpoint_configured("logs"):
+        if requested_logs:
+            _bootstrap_warning("logs", "missing_otlp_endpoint")
+        if requested_errors:
+            _bootstrap_warning("errors", "missing_otlp_endpoint")
+        return False, False
     try:
-        resource = Resource.create(
-            {
-                "service.namespace": "verigence",
-                "service.name": settings.service_name,
-                "service.version": _service_version(),
-                "deployment.environment.name": settings.environment,
-            }
-        )
-
         export_timeout_ms = int(settings.observability_export_timeout_seconds * 1000)
-
-        tracer_provider = TracerProvider(resource=resource)
-        tracer_provider.add_span_processor(
-            BatchSpanProcessor(
-                OTLPSpanExporter(timeout=settings.observability_export_timeout_seconds),
-                max_queue_size=settings.observability_max_queue_size,
-                max_export_batch_size=settings.observability_max_export_batch_size,
-                schedule_delay_millis=settings.observability_batch_delay_ms,
-                export_timeout_millis=export_timeout_ms,
-            )
-        )
-
-        metric_reader = PeriodicExportingMetricReader(
-            OTLPMetricExporter(timeout=settings.observability_export_timeout_seconds),
-            export_interval_millis=settings.observability_metric_export_interval_ms,
-            export_timeout_millis=export_timeout_ms,
-        )
-        meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
-
-        logger_provider = LoggerProvider(resource=resource)
-        logger_provider.add_log_record_processor(
+        provider = LoggerProvider(resource=resource)
+        provider.add_log_record_processor(
             BatchLogRecordProcessor(
                 OTLPLogExporter(timeout=settings.observability_export_timeout_seconds),
                 max_queue_size=settings.observability_max_queue_size,
@@ -213,32 +220,94 @@ def configure_otlp(app: FastAPI, settings: Settings) -> bool:
                 export_timeout_millis=export_timeout_ms,
             )
         )
+        set_logger_provider(provider)
+        _LOGGER_PROVIDER = provider
+        _OTEL_LOGGER = provider.get_logger("audit_core")
+        _EXPORT_ALL_LOGS = requested_logs
+        _EXPORT_ERRORS = requested_errors
+        return requested_logs, requested_errors
+    except Exception as exc:  # pragma: no cover - defensive third-party boundary
+        _OTEL_LOGGER = None
+        _LOGGER_PROVIDER = None
+        _EXPORT_ALL_LOGS = False
+        _EXPORT_ERRORS = False
+        if requested_logs:
+            _bootstrap_warning("logs", "initialization_failed", type(exc).__name__)
+        if requested_errors:
+            _bootstrap_warning("errors", "initialization_failed", type(exc).__name__)
+        return False, False
 
-        trace.set_tracer_provider(tracer_provider)
-        metrics.set_meter_provider(meter_provider)
-        set_logger_provider(logger_provider)
-        _OTEL_LOGGER = logger_provider.get_logger("audit_core")
 
-        configure_otel_telemetry(
-            meter_provider.get_meter("audit_core"),
-            tracer_provider.get_tracer("audit_core"),
+def _configure_metrics(settings: Settings, resource: Resource) -> Any | None:
+    global _METER_PROVIDER
+    if not settings.observability_metrics_enabled:
+        return None
+    if not _signal_endpoint_configured("metrics"):
+        _bootstrap_warning("metrics", "missing_otlp_endpoint")
+        return None
+    try:
+        export_timeout_ms = int(settings.observability_export_timeout_seconds * 1000)
+        reader = PeriodicExportingMetricReader(
+            OTLPMetricExporter(timeout=settings.observability_export_timeout_seconds),
+            export_interval_millis=settings.observability_metric_export_interval_ms,
+            export_timeout_millis=export_timeout_ms,
         )
+        provider = MeterProvider(resource=resource, metric_readers=[reader])
+        metrics.set_meter_provider(provider)
+        _METER_PROVIDER = provider
+        return provider.get_meter("audit_core")
+    except Exception as exc:  # pragma: no cover - defensive third-party boundary
+        _METER_PROVIDER = None
+        _bootstrap_warning("metrics", "initialization_failed", type(exc).__name__)
+        return None
 
-        FastAPIInstrumentor.instrument_app(
-            app,
-            tracer_provider=tracer_provider,
-            meter_provider=meter_provider,
-            excluded_urls="/health",
+
+def _configure_traces(app: FastAPI, settings: Settings, resource: Resource) -> Any | None:
+    global _TRACER_PROVIDER
+    if not settings.observability_traces_enabled:
+        return None
+    if not _signal_endpoint_configured("traces"):
+        _bootstrap_warning("traces", "missing_otlp_endpoint")
+        return None
+    try:
+        export_timeout_ms = int(settings.observability_export_timeout_seconds * 1000)
+        provider = TracerProvider(resource=resource)
+        provider.add_span_processor(
+            BatchSpanProcessor(
+                OTLPSpanExporter(timeout=settings.observability_export_timeout_seconds),
+                max_queue_size=settings.observability_max_queue_size,
+                max_export_batch_size=settings.observability_max_export_batch_size,
+                schedule_delay_millis=settings.observability_batch_delay_ms,
+                export_timeout_millis=export_timeout_ms,
+            )
         )
+        trace.set_tracer_provider(provider)
+        _TRACER_PROVIDER = provider
+        FastAPIInstrumentor.instrument_app(app, tracer_provider=provider, excluded_urls="/health")
         HTTPXClientInstrumentor().instrument(
-            tracer_provider=tracer_provider,
-            meter_provider=meter_provider,
+            tracer_provider=provider,
             request_hook=_httpx_request_hook,
             async_request_hook=_httpx_async_request_hook,
         )
-        SQLAlchemyInstrumentor().instrument(tracer_provider=tracer_provider)
-        return True
+        SQLAlchemyInstrumentor().instrument(tracer_provider=provider)
+        return provider.get_tracer("audit_core")
     except Exception as exc:  # pragma: no cover - defensive third-party boundary
-        _OTEL_LOGGER = None
-        _bootstrap_warning("initialization_failed", type(exc).__name__)
-        return False
+        _TRACER_PROVIDER = None
+        _bootstrap_warning("traces", "initialization_failed", type(exc).__name__)
+        return None
+
+
+def configure_otlp(app: FastAPI, settings: Settings) -> bool:
+    """Configure only explicitly enabled OTLP capabilities, independently and fail-open."""
+    resource = _resource(settings)
+    logs_enabled, errors_enabled = _configure_logs(settings, resource)
+    meter = _configure_metrics(settings, resource)
+    tracer = _configure_traces(app, settings, resource)
+
+    if meter is not None or tracer is not None:
+        configure_otel_telemetry(
+            meter if meter is not None else metrics.get_meter("audit_core.noop"),
+            tracer if tracer is not None else trace.get_tracer("audit_core.noop"),
+        )
+
+    return bool(logs_enabled or errors_enabled or meter is not None or tracer is not None)
