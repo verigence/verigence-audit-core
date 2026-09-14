@@ -275,6 +275,29 @@ def test_hard_delete_removes_post_0026_uc03_children_before_parents() -> None:
             ),
             {"tenant_id": tenant_id, "journey_id": journey_id, "di_document_id": uuid4()},
         )
+        # Regression coverage for migration 0093: added in 0079, after this
+        # function was last updated in 0071, and never wired in -- a live
+        # Super Admin purge hit this exact gap (evidence still referenced by
+        # a Scrappage Certificate review-value row).
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.scrappage_certificate_review_values (
+                    tenant_id, journey_id, source_di_document_id, source_evidence_id,
+                    document_type_key, reviewed_by_actor_id
+                ) VALUES (
+                    :tenant_id, :journey_id, :di_document_id, :evidence_id,
+                    'scrappage_certificate_of_deposit', 'test-actor'
+                )
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "di_document_id": uuid4(),
+                "evidence_id": evidence_id,
+            },
+        )
         bank_statement_line_id = connection.execute(
             text(
                 """
@@ -334,6 +357,7 @@ def test_hard_delete_removes_post_0026_uc03_children_before_parents() -> None:
             "payment_bank_matches",
             "bank_statement_lines",
             "invoice_review_values",
+            "scrappage_certificate_review_values",
             "booking_form_review_values",
             "customer_identity_review_values",
             "dealer_receipt_review_values",
