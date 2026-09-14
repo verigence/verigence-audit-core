@@ -66,6 +66,15 @@ def test_classify_by_rule_key_matches_the_di_correction_stem_explicitly() -> Non
     assert classify_by_rule_key("DI_VALUE_CORRECTION_PROPOSED") == "VIOLATION"
 
 
+def test_classify_by_rule_key_matches_duplicate_receipt_explicitly() -> None:
+    # Same reasoning as the DI-correction case above: DUPLICATE_RECEIPT was
+    # previously reaching VIOLATION only via DEFAULT_CLASS -- this pins it
+    # to the explicit prefix so it can never silently change if the default
+    # ever does. Real rule_key shape: "DUPLICATE_RECEIPT:dealer_receipt:<no>:<amount>".
+    assert classify_by_rule_key("DUPLICATE_RECEIPT:dealer_receipt:AMC-B/20186/26-27:21000.00") == "VIOLATION"
+    assert classify_by_rule_key("DUPLICATE_RECEIPT") == "VIOLATION"
+
+
 def test_classify_by_type_returns_none_for_unknown_types() -> None:
     assert classify_by_type("DOCUMENT_EXCEPTION") == "DOCUMENT_GAP"
     assert classify_by_type("COMMERCIAL_EXCEPTION") == "VIOLATION"

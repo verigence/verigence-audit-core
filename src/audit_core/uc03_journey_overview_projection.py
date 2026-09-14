@@ -18,6 +18,12 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.uc03_duplicate_receipt_detection import (
+    ReceiptRecord,
+    compute_duplicate_groups,
+    normalize_receipt_date,
+    normalize_receipt_number,
+)
 from audit_core.uc03_masters_alignment import (
     canonical_discount_key,
     commercial_key_for_price_component,
@@ -363,6 +369,37 @@ def _receipts(
             else None
         )
         result.append(item)
+
+    # Flag duplicates (same physical receipt uploaded more than once) so the
+    # UI never counts the same money twice toward "Total collected" -- same
+    # grouping the DUPLICATE_RECEIPT finding uses (compute_duplicate_groups),
+    # so a document flagged here is exactly the one that finding is about.
+    # `result` is already in reviewed_at_utc order, so the first document in
+    # each group is the earliest reviewed one -- that one counts; the rest
+    # are marked excluded until a TL confirms they are not duplicates after
+    # all (correcting the receipt number/amount/date resolves the finding
+    # and un-marks it here on the next read).
+    receipt_records = [
+        ReceiptRecord(
+            document_id=item["documentId"],
+            stage_code=str(item.get("stageCode") or "BOOKING"),
+            document_type_key="dealer_receipt",
+            receipt_number=normalize_receipt_number(item.get("receiptNumber")),
+            amount=_to_decimal(item.get("amount")),
+            receipt_date=normalize_receipt_date(item.get("receiptDate")),
+        )
+        for item in result
+    ]
+    for item in result:
+        item["isDuplicate"] = False
+        item["duplicateBasis"] = None
+    for group in compute_duplicate_groups(receipt_records):
+        for document in group.documents[1:]:
+            for item in result:
+                if item["documentId"] == document.document_id:
+                    item["isDuplicate"] = True
+                    item["duplicateBasis"] = group.match_basis
+                    break
 
     pending_rows = connection.execute(
         text(
