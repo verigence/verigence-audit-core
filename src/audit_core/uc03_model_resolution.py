@@ -687,7 +687,14 @@ def sync_model_resolution(
             attr_matched, attr_stage = _attribute_decomposition_fallback(
                 connection, tenant_id=tenant_id, rows=rows, inputs=inputs
             )
-            if len(attr_matched) == 1 or (not matched and attr_matched):
+            # Adopt the attribute fallback whenever it's strictly narrower
+            # than the price-based match, not only when it reaches exactly
+            # one -- e.g. price alone can leave 24 model-only candidates
+            # while the Booking Form's own fuel/transmission text narrows
+            # that to 2 real contenders. Reporting 2 candidates a PC can
+            # actually choose between is strictly better than reporting all
+            # 24, even when it still isn't unique enough to auto-pin.
+            if attr_matched and (not matched or len(attr_matched) < len(matched)):
                 matched, stage = attr_matched, attr_stage
 
         if len(matched) == 1:

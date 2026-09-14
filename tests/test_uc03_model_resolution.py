@@ -556,6 +556,41 @@ def test_integration_still_raises_when_decomposition_also_ambiguous(mahindra_jou
     assert result.get("candidateCount") == 2
 
 
+def test_integration_reports_narrower_candidates_even_when_still_ambiguous(mahindra_journey) -> None:
+    """Reproduces a live production finding verbatim: model_name_snapshot
+    ('SCORPIO N') already equals the master's model_name exactly -- no
+    folded text to resolve -- so the price-only pass matches every Scorpio N
+    SKU (4 here) unfiltered. The Booking Form's own variant text ('Z8L (P)
+    MT') decodes to fuel=PETROL/transmission=MT and narrows that to the 2
+    real Petrol-MT contenders (a Diesel sibling and an unrelated trim are
+    correctly excluded) -- still not unique, but a PC choosing between 2
+    named candidates is a materially different, usable finding from being
+    told 4 (or, in production, 24)."""
+    c = mahindra_journey
+    _seed_price_list(c, [
+        {"model": "SCORPIO N", "variant": "Z8 L G MT 2WD 6 STR BS6.2 - N - ADAS",
+         "fuel": "PETROL", "transmission": "MT", "drive": "2WD", "seater": "6",
+         "components": {"EX_SHOWROOM": "2113699.58"}},
+        {"model": "SCORPIO N", "variant": "Z8 L G MT 2WD 7 STR BS6.2 - N - ADAS",
+         "fuel": "PETROL", "transmission": "MT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "2131499.58"}},
+        {"model": "SCORPIO N", "variant": "Z8 S G MT 2WD 7 STR BS6.2 - N",
+         "fuel": "PETROL", "transmission": "MT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "2075499.58"}},
+        {"model": "SCORPIO N", "variant": "Z8 L D MT 2WD 7 STR BS6.2 - N - ADAS",
+         "fuel": "DIESEL", "transmission": "MT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "2131499.58"}},
+    ])
+    _set_journey_product(c, "SCORPIO N", "Z8L (P) MT")
+
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("raised") is True
+    assert result.get("matchStage") == "ATTRIBUTE_DECOMPOSITION"
+    assert result.get("candidateCount") == 2
+
+
 def test_integration_falls_back_to_latest_master_when_booking_predates_it(journey) -> None:
     """Regression: a real Booking Form's own extracted booking_date is often
     well in the past (this one -- a real production case -- was 2024-08-12),
