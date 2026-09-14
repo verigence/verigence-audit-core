@@ -314,9 +314,15 @@ def test_delivery_checklist_read_seeds_requirements_before_any_upload(unified_ca
             {"t": setup["tenant_id"], "j": setup["journey_id"]},
         )
 
+        # seed_delivery_document_requirements seeds this journey's whole
+        # Delivery catalog (this fixture's own custom NDC item plus every
+        # standing tenant-wide Delivery requirement -- wholesale invoice,
+        # customer invoice, etc.), not just the one item this fixture added
+        # -- the point of this test is that it went from nothing to
+        # something, not the exact count.
         after = _delivery_requirements(connection, setup["tenant_id"], setup["journey_id"])
-        assert len(after) == 1
-        assert after[0]["requirement_key"] == "NDC"
+        assert len(after) > 0
+        assert any(item["requirement_key"] == "NDC" for item in after)
 
         # Idempotent -- opening the checklist twice must not duplicate rows.
         connection.execute(
@@ -324,4 +330,4 @@ def test_delivery_checklist_read_seeds_requirements_before_any_upload(unified_ca
             {"t": setup["tenant_id"], "j": setup["journey_id"]},
         )
         again = _delivery_requirements(connection, setup["tenant_id"], setup["journey_id"])
-        assert len(again) == 1
+        assert len(again) == len(after)
