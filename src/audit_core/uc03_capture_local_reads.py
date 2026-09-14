@@ -4,7 +4,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import Connection
+from sqlalchemy import Connection, text
 
 from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.security import HumanPrincipal
@@ -87,6 +87,16 @@ def get_delivery_capture_local_v2(
         journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
+    )
+    # Delivery's requirement rows are otherwise only seeded lazily -- by the
+    # unified upload-intents endpoint, or by Delivery actually starting. A
+    # PC opening the combined checklist before uploading anything (the
+    # normal Capture New Booking flow) must still see what Delivery will
+    # expect, so seed here too. Idempotent, no business-meaningful side
+    # effect (see auditcore.seed_delivery_document_requirements).
+    connection.execute(
+        text("SELECT auditcore.seed_delivery_document_requirements(:tenant_id, :journey_id)"),
+        {"tenant_id": tenant_id, "journey_id": str(journey_id)},
     )
     return _build_local_delivery_capture_response(
         journey_id=journey_id,
