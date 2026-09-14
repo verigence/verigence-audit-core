@@ -153,6 +153,57 @@ def test_pan_father_name_fills_relationship_when_generic_pan_fields_are_empty() 
     assert resolved["customer_relationship_name"]["value"] == "Father Name"
 
 
+def test_pan_father_name_fills_relationship_even_when_generic_pan_fields_extracted_empty() -> None:
+    """Live bug (journey 6c4d527f-...): DI can extract
+    pan_relationship_type/_name and aadhaar_relationship_type/_name with
+    hasEffectiveValue=True but an actual value of None -- has_effective can
+    be set on a row DI never really filled in. A dict is always truthy, so
+    checking mere key presence on `resolved` never let the pan_father_name
+    fallback fire in this exact, real shape; the empty-valued candidate row
+    already "occupied" customer_relationship_type/_name."""
+    rows = [
+        _row(
+            field_key="pan_father_name",
+            value="Father Name",
+            document_type="pan_card",
+            stage="BOOKING",
+        ),
+        _row(
+            field_key="pan_relationship_type",
+            value=None,
+            document_type="pan_card",
+            stage="BOOKING",
+            has_effective=True,
+        ),
+        _row(
+            field_key="pan_relationship_name",
+            value=None,
+            document_type="pan_card",
+            stage="BOOKING",
+            has_effective=True,
+        ),
+        _row(
+            field_key="aadhaar_relationship_type",
+            value=None,
+            document_type="aadhaar",
+            stage="BOOKING",
+            has_effective=True,
+        ),
+        _row(
+            field_key="aadhaar_relationship_name",
+            value=None,
+            document_type="aadhaar",
+            stage="BOOKING",
+            has_effective=True,
+        ),
+    ]
+
+    _, resolved = annotate_and_resolve_reviewed_fields(rows)
+
+    assert resolved["customer_relationship_type"]["value"] == "S/O"
+    assert resolved["customer_relationship_name"]["value"] == "Father Name"
+
+
 def test_pan_father_name_fallback_never_overrides_an_explicit_relationship() -> None:
     rows = [
         _row(
