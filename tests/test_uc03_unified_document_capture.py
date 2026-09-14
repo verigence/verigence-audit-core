@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from audit_core.db import set_tenant_context
+from audit_core.uc03_delivery_capture_v2 import _delivery_requirements
 from audit_core.uc03_unified_document_capture import (
     reconcile_unified_documents,
     resolve_document_stage,
@@ -286,3 +287,41 @@ def test_reconcile_unified_documents_leaves_booking_type_alone(unified_capture_s
             {"t": setup["tenant_id"], "j": setup["journey_id"]},
         ).scalar_one_or_none()
         assert delivery_state is None
+
+
+def test_delivery_checklist_read_seeds_requirements_before_any_upload(unified_capture_setup) -> None:
+    """Reported live: the combined Booking+Delivery checklist on Capture New
+    Booking showed a Delivery section only after a document had been
+    uploaded (upload-intents is what eagerly seeds Delivery's requirement
+    rows). Opening the checklist on a brand-new Journey -- zero uploads --
+    must show what Delivery will expect too, which means the read path
+    itself (get_delivery_capture_local_v2) has to seed, not only the
+    upload/reconcile paths. This proves the seed call the route makes."""
+    setup = unified_capture_setup
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+
+        # Before anything is seeded: no DELIVERY journey_document_requirements
+        # rows exist yet (nothing has ever uploaded a document or started
+        # Delivery on this fresh Journey).
+        before = _delivery_requirements(connection, setup["tenant_id"], setup["journey_id"])
+        assert before == []
+
+        # The exact call get_delivery_capture_local_v2 now makes before
+        # building its response.
+        connection.execute(
+            text("SELECT auditcore.seed_delivery_document_requirements(:t, :j)"),
+            {"t": setup["tenant_id"], "j": setup["journey_id"]},
+        )
+
+        after = _delivery_requirements(connection, setup["tenant_id"], setup["journey_id"])
+        assert len(after) == 1
+        assert after[0]["requirement_key"] == "NDC"
+
+        # Idempotent -- opening the checklist twice must not duplicate rows.
+        connection.execute(
+            text("SELECT auditcore.seed_delivery_document_requirements(:t, :j)"),
+            {"t": setup["tenant_id"], "j": setup["journey_id"]},
+        )
+        again = _delivery_requirements(connection, setup["tenant_id"], setup["journey_id"])
+        assert len(again) == 1
