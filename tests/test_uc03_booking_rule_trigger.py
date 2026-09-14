@@ -165,6 +165,38 @@ def test_bk_min_booking_proof_present_fires_on_a_real_seeded_journey() -> None:
                  "VALUES (:t, :pc, 'BKT', :o, :cat, CURRENT_DATE)"),
             {"t": tenant_id, "pc": f"BKT-{suffix}", "o": oem_id, "cat": category_id},
         )
+        # The seeding trigger only inserts profile-driven rows for items
+        # belonging to the journey's OWN document_requirement_profile_version_id
+        # (the two or three unconditional inserts it also makes are all
+        # OPTIONAL level, filtered out by _requirement_snapshot) -- a real
+        # journey always has one of these, so the fixture needs one too.
+        profile_id = connection.execute(
+            text("INSERT INTO auditcore.document_requirement_profiles "
+                 "(tenant_id, profile_code, profile_name) VALUES (:t, :c, 'BKT Profile') "
+                 "RETURNING document_requirement_profile_id"),
+            {"t": tenant_id, "c": f"BKT-PROFILE-{suffix}"},
+        ).scalar_one()
+        profile_version_id = connection.execute(
+            text("INSERT INTO auditcore.document_requirement_profile_versions "
+                 "(tenant_id, document_requirement_profile_id, version_no, lifecycle_status, "
+                 "effective_from) VALUES (:t, :p, 1, 'DRAFT', CURRENT_DATE) "
+                 "RETURNING document_requirement_profile_version_id"),
+            {"t": tenant_id, "p": profile_id},
+        ).scalar_one()
+        connection.execute(
+            text("INSERT INTO auditcore.document_requirement_items (tenant_id, "
+                 "document_requirement_profile_version_id, requirement_key, document_type_key, "
+                 "process_area, requirement_level, condition_config, sort_order) VALUES "
+                 "(:t, :p, 'minimum_booking_payment_proof', 'minimum_booking_payment_proof', "
+                 "'BOOKING', 'REQUIRED', '{}'::jsonb, 40)"),
+            {"t": tenant_id, "p": profile_version_id},
+        )
+        connection.execute(
+            text("UPDATE auditcore.document_requirement_profile_versions "
+                 "SET lifecycle_status='PUBLISHED' WHERE tenant_id=:t AND "
+                 "document_requirement_profile_version_id=:p"),
+            {"t": tenant_id, "p": profile_version_id},
+        )
         dealer_id = connection.execute(
             text("INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
                  "VALUES (:t, :c, 'D') RETURNING dealer_id"),
@@ -183,13 +215,18 @@ def test_bk_min_booking_proof_present_fires_on_a_real_seeded_journey() -> None:
         ).scalar_one()
         journey_id = connection.execute(
             text("INSERT INTO auditcore.journeys (tenant_id, dealer_id, outlet_id, customer_id, "
-                 "journey_reference) VALUES (:t, :d, :o, :cu, :r) RETURNING journey_id"),
-            {"t": tenant_id, "d": dealer_id, "o": outlet_id, "cu": customer_id, "r": f"BKT-J-{suffix}"},
+                 "journey_reference, document_requirement_profile_version_id) "
+                 "VALUES (:t, :d, :o, :cu, :r, :pv) RETURNING journey_id"),
+            {"t": tenant_id, "d": dealer_id, "o": outlet_id, "cu": customer_id,
+             "r": f"BKT-J-{suffix}", "pv": profile_version_id},
         ).scalar_one()
         # Starting Booking fires trg_uc03_booking_initialize_requirements,
         # which snapshots the real per-journey journey_document_requirements
         # rows -- no payment receipt has been uploaded, so
-        # booking_payment_receipt is left outstanding.
+        # booking_payment_receipt is left outstanding. The trigger itself
+        # renames the profile item's key (minimum_booking_payment_proof,
+        # matching the tenant-wide default profile's own naming -- see
+        # migration 0022) to booking_payment_receipt on the way in.
         connection.execute(
             text("INSERT INTO auditcore.journey_stage_states (tenant_id, journey_id, stage_code, "
                  "business_status, audit_state, audit_status, first_started_at_utc, "
