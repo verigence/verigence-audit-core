@@ -170,6 +170,9 @@ def test_bk_min_booking_proof_present_fires_on_a_real_seeded_journey() -> None:
         # (the two or three unconditional inserts it also makes are all
         # OPTIONAL level, filtered out by _requirement_snapshot) -- a real
         # journey always has one of these, so the fixture needs one too.
+        # A version can only publish with at least one Booking AND one
+        # Delivery requirement (validate_document_profile_publish) -- the
+        # Delivery item here is otherwise unused by this test.
         profile_id = connection.execute(
             text("INSERT INTO auditcore.document_requirement_profiles "
                  "(tenant_id, profile_code, profile_name) VALUES (:t, :c, 'BKT Profile') "
@@ -184,11 +187,17 @@ def test_bk_min_booking_proof_present_fires_on_a_real_seeded_journey() -> None:
             {"t": tenant_id, "p": profile_id},
         ).scalar_one()
         connection.execute(
-            text("INSERT INTO auditcore.document_requirement_items (tenant_id, "
-                 "document_requirement_profile_version_id, requirement_key, document_type_key, "
-                 "process_area, requirement_level, condition_config, sort_order) VALUES "
-                 "(:t, :p, 'minimum_booking_payment_proof', 'minimum_booking_payment_proof', "
-                 "'BOOKING', 'REQUIRED', '{}'::jsonb, 40)"),
+            text("""
+                INSERT INTO auditcore.document_requirement_items (
+                    tenant_id, document_requirement_profile_version_id,
+                    requirement_key, document_type_key, process_area,
+                    requirement_level, condition_config, sort_order
+                ) VALUES
+                (:t, :p, 'minimum_booking_payment_proof', 'minimum_booking_payment_proof',
+                 'BOOKING', 'REQUIRED', '{}'::jsonb, 40),
+                (:t, :p, 'delivery_placeholder', 'delivery_placeholder',
+                 'DELIVERY', 'REQUIRED', '{}'::jsonb, 100)
+                """),
             {"t": tenant_id, "p": profile_version_id},
         )
         connection.execute(
