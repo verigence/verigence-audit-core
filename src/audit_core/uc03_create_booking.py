@@ -19,6 +19,13 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_booking_commands import _authorize_security
+from audit_core.uc03_document_capture_v2 import (
+    BookingCaptureV2Response,
+    _base_requirements,
+    _build_local_capture_response,
+    _declarations,
+    _linked_documents,
+)
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/uc03", tags=["uc03-create-booking"])
 
@@ -39,6 +46,13 @@ class CreateBookingResponse(BaseModel):
     outletId: UUID
     businessStatus: str
     aggregateVersion: int
+    # Folds the checklist/counters read (otherwise the workspace's own,
+    # separate first `/booking/capture` round trip) into this same response --
+    # a brand-new booking has no documents yet, so this is a handful of cheap,
+    # deterministic reads (config-driven requirements, no DI/Security calls),
+    # not a second network hop the web client has to wait through before the
+    # checklist can paint.
+    booking: BookingCaptureV2Response
 
 
 def _selected_pc_outlet(
@@ -492,4 +506,12 @@ def create_booking(
         idempotency_key=idempotency_key,
         request_payload=request_payload,
     )
-    return CreateBookingResponse.model_validate(body)
+
+    journey_id = UUID(str(body["journeyId"]))
+    capture = _build_local_capture_response(
+        journey_id=journey_id,
+        requirements=_base_requirements(connection, tenant_id, journey_id),
+        declaration_rows=_declarations(connection, tenant_id, journey_id),
+        audit_documents=_linked_documents(connection, tenant_id, journey_id),
+    )
+    return CreateBookingResponse.model_validate({**body, "booking": capture.model_dump(mode="json")})
