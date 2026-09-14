@@ -400,12 +400,21 @@ def annotate_and_resolve_reviewed_fields(
     # because DI never populates them from a PAN card. Only fills a real
     # gap -- never overrides an explicit S/O/W/O/D/O relationship already
     # resolved from Aadhaar or a differently-formatted PAN.
+    #
+    # Note: resolved.get("customer_relationship_type") can already hold a
+    # candidate row (e.g. from pan_relationship_type/aadhaar_relationship_type)
+    # whose own "value" is None -- has_effective_value can be true on a row
+    # DI never actually filled in. A non-empty dict is always truthy, so
+    # checking mere key presence never lets this fallback fire in that case;
+    # it's the resolved value itself that must be empty.
     father_name = resolved.get("pan_father_name")
+    existing_type = resolved.get("customer_relationship_type") or {}
+    existing_name = resolved.get("customer_relationship_name") or {}
     if (
         father_name
         and father_name.get("value")
-        and not resolved.get("customer_relationship_type")
-        and not resolved.get("customer_relationship_name")
+        and not existing_type.get("value")
+        and not existing_name.get("value")
     ):
         resolved["customer_relationship_type"] = {**father_name, "value": "S/O"}
         resolved["customer_relationship_name"] = dict(father_name)
