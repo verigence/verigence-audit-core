@@ -12,6 +12,7 @@ from audit_core.uc03_v2_review_materialization import (
     _BOOKING_FORM_FIELDS,
     _PAN_FIELDS,
     _RECEIPT_FIELDS,
+    _payment_values,
     _reviewed_receipt_values,
     receipt_document_ordinals,
     receipt_review_key,
@@ -173,6 +174,20 @@ def test_dealer_receipt_di_contract_has_core_review_owner_for_every_field() -> N
         "remarks",
         "amount_in_words",
     }
+
+
+def test_payment_values_sets_payment_at_utc_from_receipt_date() -> None:
+    """Reported live: every auto-materialized Booking receipt showed
+    'Not available' in the Payments ledger's own Date column, despite the
+    receipt's own date being extracted correctly -- payment_at_utc (the
+    ledger's canonical date column) was never written at all."""
+    values = _payment_values({"receipt_date": "2026-09-11", "amount_paid": "21000"})
+    assert values["payment_at_utc"] == "2026-09-11"
+
+
+def test_payment_values_falls_back_to_payment_reference_date() -> None:
+    values = _payment_values({"payment_reference_date": "2026-09-12", "amount_paid": "5000"})
+    assert values["payment_at_utc"] == "2026-09-12"
 
 
 def test_receipt_review_key_is_receipt_scoped() -> None:

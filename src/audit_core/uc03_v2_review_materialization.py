@@ -859,6 +859,15 @@ def _payment_values(receipt_values: dict[str, Any]) -> dict[str, Any]:
     return {
         "receipt_number": receipt_values.get("receipt_number"),
         "receipt_date": receipt_values.get("receipt_date"),
+        # The ledger's own canonical "when" column -- distinct from
+        # receipt_date/payment_reference_date (both raw receipt-provenance
+        # columns kept verbatim for audit purposes). Never written before,
+        # so every auto-materialized Booking receipt showed "Not available"
+        # in the Payments ledger's own Date column despite the date being
+        # right there on the receipt. receipt_date is the receipt's own
+        # printed date; payment_reference_date (e.g. a bank transfer's UTR
+        # date) is the fallback when a receipt has no date of its own.
+        "payment_at_utc": receipt_values.get("receipt_date") or receipt_values.get("payment_reference_date"),
         "amount": receipt_values.get("amount_paid"),
         "payment_method_code": receipt_values.get("payment_mode"),
         "payment_reference": receipt_values.get("payment_reference_no"),
@@ -885,7 +894,7 @@ def _existing_payment(
 ):
     select_sql = """
         SELECT payment_id, source_evidence_id, source_di_document_id,
-               receipt_number, receipt_date, amount, payment_method_code,
+               receipt_number, receipt_date, payment_at_utc, amount, payment_method_code,
                payment_reference, receipt_dealer_name, receipt_dealer_gstin,
                receipt_customer_name, receipt_customer_phone,
                payment_reference_date, receipt_bank_name, receipt_bank_location,
@@ -946,6 +955,7 @@ def _same_payment_state(
     columns = (
         "receipt_number",
         "receipt_date",
+        "payment_at_utc",
         "amount",
         "payment_method_code",
         "payment_reference",
@@ -1054,6 +1064,7 @@ def materialize_reviewed_booking_receipts(
             "payment_reference",
             "receipt_number",
             "receipt_date",
+            "payment_at_utc",
             "receipt_dealer_name",
             "receipt_dealer_gstin",
             "receipt_customer_name",
