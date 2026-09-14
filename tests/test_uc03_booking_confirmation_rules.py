@@ -356,3 +356,87 @@ def test_minimum_booking_amount_sequential_aggregation() -> None:
     assert _violation_status()["finding_status"] == "RESOLVED"
 
     engine.dispose()
+
+
+def test_minimum_booking_amount_excludes_duplicate_receipt_from_the_running_total() -> None:
+    """Reported live: the same physical receipt uploaded twice (identical
+    receipt number, amount and date) must not count twice toward the
+    minimum booking amount -- that would let Booking Confirm off a real
+    underpayment. A single 21000 receipt duplicated must behave exactly
+    like one 21000 receipt, not like 42000 received."""
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for this integration test")
+
+    engine = create_engine(database_url)
+    suffix = uuid4().hex
+    tenant_id = f"tenant-bcr-dup-{suffix}"
+    journey_id = _seed_journey(engine, tenant_id=tenant_id, suffix=suffix)
+    customer_id = _customer_id(engine, tenant_id=tenant_id, journey_id=journey_id)
+
+    di_client = _FakeDiClient()
+
+    def _sync_receipt(*, amount: str, receipt_date: str, receipt_number: str):
+        document_id = _link_evidence(
+            engine, tenant_id=tenant_id, journey_id=journey_id, customer_id=customer_id,
+            document_type_key="dealer_receipt",
+        )
+        di_client.add(
+            _confirmed_document(document_id, "dealer_receipt"),
+            [
+                _fact(f"amount-{document_id}", "amount_paid", amount),
+                _fact(f"receipt_date-{document_id}", "receipt_date", receipt_date),
+                _fact(f"receipt_number-{document_id}", "receipt_number", receipt_number),
+            ],
+        )
+        with engine.begin() as connection:
+            confidence_policy._sync_booking_document(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                document_id=document_id,
+                service_id="di-service",
+                security_client=_FakeSecurityClient(),
+                di_client=di_client,
+                bump_version=True,
+            )
+
+    def _state():
+        with engine.begin() as connection:
+            return connection.execute(
+                text(
+                    "SELECT booking_confirm_date, booking_confirmed_at_utc "
+                    "FROM auditcore.journey_stage_states "
+                    "WHERE tenant_id=:t AND journey_id=:j AND stage_code='BOOKING'"
+                ),
+                {"t": tenant_id, "j": journey_id},
+            ).mappings().one()
+
+    def _duplicate_finding():
+        with engine.begin() as connection:
+            return connection.execute(
+                text(
+                    "SELECT finding_status FROM auditcore.audit_findings "
+                    "WHERE tenant_id=:t AND journey_id=:j "
+                    "AND finding_type_code='DUPLICATE_RECEIPT'"
+                ),
+                {"t": tenant_id, "j": journey_id},
+            ).mappings().one_or_none()
+
+    # Default minimum is 11000. One real 21000 receipt would clear it alone
+    # -- uploaded twice (same number, amount, date), it must still confirm
+    # exactly as if received once, not be double-blocked or double-counted.
+    _sync_receipt(amount="21000", receipt_date="2026-08-12", receipt_number="AMC-B/20186/26-27")
+    state = _state()
+    assert str(state["booking_confirm_date"]) == "2026-08-12"
+    assert state["booking_confirmed_at_utc"] is not None
+
+    _sync_receipt(amount="21000", receipt_date="2026-08-12", receipt_number="AMC-B/20186/26-27")
+    assert _duplicate_finding() is not None
+    assert _duplicate_finding()["finding_status"] == "OPEN"
+    # Still confirmed on the same original date -- the duplicate's amount
+    # was excluded from the running total, not added on top of it.
+    state = _state()
+    assert str(state["booking_confirm_date"]) == "2026-08-12"
+
+    engine.dispose()

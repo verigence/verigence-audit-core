@@ -2,12 +2,61 @@ from __future__ import annotations
 
 import json
 import os
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, text
 
 from audit_core import uc03_duplicate_receipt_detection as drd
+
+
+def _record(document_id, *, receipt_number=None, amount="21000.00", receipt_date="2026-08-12"):
+    return drd.ReceiptRecord(
+        document_id=document_id,
+        stage_code="BOOKING",
+        document_type_key="dealer_receipt",
+        receipt_number=receipt_number,
+        amount=Decimal(amount) if amount is not None else None,
+        receipt_date=receipt_date,
+    )
+
+
+def test_compute_duplicate_groups_matches_same_receipt_number_and_amount_and_date():
+    """The exact shape reported live: same receipt number, amount, and date
+    on two documents. Must be flagged with dates_match=True."""
+    a, b = uuid4(), uuid4()
+    groups = drd.compute_duplicate_groups([
+        _record(a, receipt_number="AMC-B/20186/26-27"),
+        _record(b, receipt_number="AMC-B/20186/26-27"),
+    ])
+    assert len(groups) == 1
+    assert groups[0].match_basis == "RECEIPT_NUMBER_AND_AMOUNT"
+    assert groups[0].dates_match is True
+    assert {d.document_id for d in groups[0].documents} == {a, b}
+
+
+def test_compute_duplicate_groups_still_matches_when_only_date_differs():
+    """Same receipt number and amount is still flagged even if one scan's
+    date was misread -- dealers do not reuse receipt numbers, so this is
+    still almost certainly the same physical receipt. dates_match reports
+    the discrepancy rather than suppressing the finding."""
+    a, b = uuid4(), uuid4()
+    groups = drd.compute_duplicate_groups([
+        _record(a, receipt_number="AMC-B/20186/26-27", receipt_date="2026-08-12"),
+        _record(b, receipt_number="AMC-B/20186/26-27", receipt_date="2026-08-13"),
+    ])
+    assert len(groups) == 1
+    assert groups[0].dates_match is False
+
+
+def test_compute_duplicate_groups_no_match_for_distinct_receipt_numbers():
+    a, b = uuid4(), uuid4()
+    groups = drd.compute_duplicate_groups([
+        _record(a, receipt_number="AMC-B/20186/26-27"),
+        _record(b, receipt_number="AMC-B/20222/26-27"),
+    ])
+    assert groups == []
 
 
 @pytest.fixture

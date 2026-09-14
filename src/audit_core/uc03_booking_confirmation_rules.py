@@ -321,7 +321,7 @@ def evaluate_minimum_booking_payment(
     payments = connection.execute(
         text(
             """
-            SELECT amount, receipt_date
+            SELECT payment_id, amount, receipt_date, receipt_number
             FROM auditcore.payments
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
               AND payment_stage='BOOKING'
@@ -332,10 +332,41 @@ def evaluate_minimum_booking_payment(
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
 
+    # The same physical receipt uploaded twice must not count twice toward
+    # the minimum booking amount -- that would let Booking Confirm off a
+    # real underpayment. Same grouping DUPLICATE_RECEIPT itself raises on
+    # (compute_duplicate_groups); payments already come out in receipt-date
+    # order above, so the first payment in each group is the earliest one
+    # and is the one that counts -- the rest are excluded here.
+    from audit_core.uc03_duplicate_receipt_detection import (
+        ReceiptRecord,
+        compute_duplicate_groups,
+        normalize_receipt_date,
+        normalize_receipt_number,
+    )
+
+    excluded_payment_ids: set[Any] = set()
+    duplicate_groups = compute_duplicate_groups([
+        ReceiptRecord(
+            document_id=payment["payment_id"],
+            stage_code="BOOKING",
+            document_type_key="dealer_receipt",
+            receipt_number=normalize_receipt_number(payment["receipt_number"]),
+            amount=Decimal(str(payment["amount"])),
+            receipt_date=normalize_receipt_date(payment["receipt_date"]),
+        )
+        for payment in payments
+    ])
+    for group in duplicate_groups:
+        for document in group.documents[1:]:
+            excluded_payment_ids.add(document.document_id)
+
     minimum = _minimum_booking_amount(connection, tenant_id=tenant_id)
     running_total = Decimal(0)
     confirming_date = None
     for payment in payments:
+        if payment["payment_id"] in excluded_payment_ids:
+            continue
         running_total += Decimal(str(payment["amount"]))
         if confirming_date is None and running_total >= minimum:
             confirming_date = payment["receipt_date"]

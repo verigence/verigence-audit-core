@@ -94,6 +94,12 @@ _VIOLATION_RULE_PREFIXES: frozenset[str] = frozenset({
     # >=90%-confidence extracted field is a TL-adjudicated call (Confirm-Breach
     # applies it, Mark-False-Positive rejects it) -- not a self-serve gap.
     "DI_VALUE_CORRECTION_PROPOSED",
+    # 2026-09-14: was previously reaching this class only via DEFAULT_CLASS
+    # (unknown rule -> VIOLATION) -- made explicit so it never silently
+    # changes if DEFAULT_CLASS ever does. A duplicate receipt is money that
+    # may not actually have been paid; TL must confirm or reject it, not PC
+    # self-serve.
+    "DUPLICATE_RECEIPT",
 })
 
 _DOCUMENT_GAP_TYPES: frozenset[str] = frozenset({
@@ -115,6 +121,7 @@ _VIOLATION_TYPES: frozenset[str] = frozenset({
     "CUSTOMER_IDENTITY_CONCERN",
     "PHYSICAL_OBSERVATION",
     "DELIVERY_EXCEPTION",
+    "DUPLICATE_RECEIPT",
     # rule-engine categories mapped by uc03_rule_engine_findings
     "PRICING_ANOMALY",
     "DISCOUNT_ANOMALY",
