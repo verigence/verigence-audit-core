@@ -154,7 +154,14 @@ def _booking_requirement_rule_specs(rows: list[dict[str, Any]]) -> list[_RuleSpe
             )
         )
 
-    if "minimum_booking_payment_proof" in outstanding_by_key:
+    # 2026-09-14: this checked "minimum_booking_payment_proof" -- the key
+    # document_capture_v2_requirement_policy (the *label* table) used, not
+    # the key every real journey_document_requirements row for this
+    # requirement has always actually carried (booking_payment_receipt,
+    # since migration 0020/0022). The two never matched, so this rule could
+    # never fire on real data -- silently dead since it was introduced. See
+    # migration 0094 for the matching label-table fix.
+    if "booking_payment_receipt" in outstanding_by_key:
         specs.append(
             _RuleSpec(
                 rule_key="BK_MIN_BOOKING_PROOF_PRESENT",
@@ -162,7 +169,7 @@ def _booking_requirement_rule_specs(rows: list[dict[str, Any]]) -> list[_RuleSpe
                 severity="HIGH",
                 title="Minimum Booking payment proof requires follow-up",
                 description="The minimum Booking payment proof requirement is not fully satisfied at Review confirmation.",
-                requirement_keys=("minimum_booking_payment_proof",),
+                requirement_keys=("booking_payment_receipt",),
             )
         )
 
@@ -191,7 +198,7 @@ def _booking_requirement_rule_specs(rows: list[dict[str, Any]]) -> list[_RuleSpe
         "booking_docket",
         "pan_card",
         "aadhaar",
-        "minimum_booking_payment_proof",
+        "booking_payment_receipt",
         *conditional_keys,
     }
     other_required = tuple(
