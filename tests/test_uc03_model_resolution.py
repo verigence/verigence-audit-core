@@ -283,6 +283,23 @@ def _set_commercial(c, key, amount):
     )
 
 
+def _set_booking_form_ex_showroom(c, amount) -> None:
+    """A row in the reviewed Booking Form table itself, with NO matching
+    auditcore.commercial_lines row -- the shape a document whose Booking
+    Form has finished review but whose separate commercial_lines
+    materialization pass (uc03_v2_review_materialization.py::
+    _materialize_commercial_lines) has not yet run, or ran before this
+    field was populated."""
+    c.execute(
+        text(
+            "INSERT INTO auditcore.booking_form_review_values "
+            "(tenant_id, journey_id, source_di_document_id, ex_showroom_price, reviewed_by_actor_id) "
+            "VALUES (:t, :j, :doc, :amount, 'test-actor')"
+        ),
+        {"t": c.tenant_id, "j": c.journey_id, "doc": uuid4(), "amount": amount},
+    )
+
+
 def _open_model_flags(c) -> int:
     return c.execute(
         text("SELECT count(*) FROM auditcore.audit_findings "
@@ -339,6 +356,38 @@ def test_integration_resolves_via_ex_showroom_when_total_ambiguous(journey) -> N
     _set_journey_product(c, "Thar", None)
     _set_commercial(c, "ex_showroom_price", "1400000")
     _set_commercial(c, "total_price", "1730000")
+
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("resolved") is True
+    assert result.get("matchStage") == "EX_SHOWROOM"
+    assert _open_model_flags(c) == 0
+
+
+def test_integration_resolves_via_ex_showroom_from_booking_form_without_commercial_lines(journey) -> None:
+    # Regression for a real bug reported live: a Booking whose model text
+    # matched 24 price-master SKUs never disambiguated by ex-showroom price
+    # even though the Booking Form's own ex_showroom_price had been read and
+    # reviewed -- because _resolution_inputs read offered_ex_showroom only
+    # from commercial_lines, with no fallback to booking_form_review_values
+    # (offered_total has always had exactly this fallback; offered_ex_showroom
+    # did not). Same THAR fixture as the test above, but ex_showroom_price
+    # lives ONLY in booking_form_review_values here -- no commercial_lines
+    # row for it at all (total_price is still commercial_lines-backed, as it
+    # would be for a Booking Form whose overall total materialized fine).
+    c = journey
+    _seed_price_list(c, [
+        {"model": "THAR", "variant": "LX",
+         "components": {"EX_SHOWROOM": "1500000", "INSURANCE": "60000",
+                        "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "200000"}},
+        {"model": "THAR", "variant": "AX",
+         "components": {"EX_SHOWROOM": "1400000", "INSURANCE": "160000",
+                        "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "200000"}},
+    ])
+    _set_journey_product(c, "Thar", None)
+    _set_commercial(c, "total_price", "1730000")
+    _set_booking_form_ex_showroom(c, "1400000")
 
     result = mr.sync_model_resolution(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",

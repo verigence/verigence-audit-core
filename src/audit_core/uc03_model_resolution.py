@@ -162,10 +162,13 @@ def _resolution_inputs(
     ).mappings().all()
     by_key = {row["component_key"]: _to_decimal(row["actual_amount"]) for row in commercials}
 
-    booking_total = connection.execute(
+    booking_prices = connection.execute(
         text(
             """
             SELECT NULLIF(regexp_replace(COALESCE(total_price::text, ''), '[^0-9.\\-]', '', 'g'), '')
+                       AS total_price,
+                   NULLIF(regexp_replace(COALESCE(ex_showroom_price::text, ''), '[^0-9.\\-]', '', 'g'), '')
+                       AS ex_showroom_price
             FROM auditcore.booking_form_review_values
             WHERE tenant_id = :tenant_id AND journey_id = :journey_id
             ORDER BY reviewed_at_utc DESC NULLS LAST
@@ -173,13 +176,24 @@ def _resolution_inputs(
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).scalar_one_or_none()
+    ).mappings().one_or_none() or {}
 
     offered_total = (
         by_key.get("total_price")
-        or _to_decimal(booking_total)
+        or _to_decimal(booking_prices.get("total_price"))
     )
-    offered_ex_showroom = by_key.get("ex_showroom_price")
+    # commercial_lines is only written once the Booking Form document has
+    # actually finished materializing (see uc03_v2_review_materialization.py
+    # ::_materialize_commercial_lines) -- until then this fell back to None
+    # even when booking_form_review_values.ex_showroom_price itself was
+    # already populated, unlike offered_total above (which has always had
+    # this same fallback). A live journey with 24 model-name-only price-
+    # master matches and a legible ex-showroom price on its Booking Form
+    # still failed to disambiguate for exactly this reason.
+    offered_ex_showroom = (
+        by_key.get("ex_showroom_price")
+        or _to_decimal(booking_prices.get("ex_showroom_price"))
+    )
 
     return {
         "product_sku_id": jp["product_sku_id"],
