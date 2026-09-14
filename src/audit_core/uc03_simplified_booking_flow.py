@@ -37,7 +37,9 @@ from audit_core.uc03_booking_commands import (
 )
 from audit_core.uc03_document_capture_v2 import (
     _base_requirements,
+    _build_local_capture_response,
     _capture_phase_state,
+    _declarations,
     _linked_documents,
 )
 from audit_core.uc03_simplified_create_atomic import (
@@ -113,7 +115,23 @@ def create_booking_journey_first_reference(
 
     # journey_workflow_events remains append-only; BOOKING_CREATED is written once
     # as part of the same atomic create statement.
-    return create_booking.CreateBookingResponse.model_validate(body)
+    #
+    # Folds the checklist/counters read (otherwise the workspace's own,
+    # separate first GET /booking/capture round trip) into this same
+    # response -- reported live as a visible lag on the counters after
+    # opening a brand-new booking. A fresh booking has no documents yet, so
+    # this is a handful of cheap, deterministic reads (config-driven
+    # requirements, no DI/Security calls), not a second network hop.
+    journey_id = UUID(str(body["journeyId"]))
+    capture = _build_local_capture_response(
+        journey_id=journey_id,
+        requirements=_base_requirements(connection, tenant_id, journey_id),
+        declaration_rows=_declarations(connection, tenant_id, journey_id),
+        audit_documents=_linked_documents(connection, tenant_id, journey_id),
+    )
+    return create_booking.CreateBookingResponse.model_validate(
+        {**body, "booking": capture.model_dump(mode="json")}
+    )
 
 
 def submit_booking_from_review(
