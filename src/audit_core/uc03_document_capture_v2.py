@@ -500,6 +500,17 @@ def _reconcile_documents(
     requirements: list[dict[str, Any]],
     di_documents: list[dict[str, Any]],
 ) -> None:
+    # The UPDATE below is scoped to stage_code='BOOKING' (matching
+    # uc03_delivery_capture_v2._reconcile_delivery_documents' own, already-
+    # correct scoping -- this function was missing it). Without that scope,
+    # every read of this Booking screen re-runs this reconciliation against
+    # every di_document_id it sees at DI regardless of which stage it now
+    # belongs to, and requirements here is BOOKING-only -- so a document the
+    # unified upload screen (uc03_unified_document_capture.py) had already
+    # correctly routed to DELIVERY, with a real Delivery requirement_key,
+    # got that requirement_key silently nulled back out on the very next
+    # Booking-screen poll, every time, because its classified type matches
+    # nothing in this function's Booking-only lookup table.
     type_to_requirement: dict[str, str] = {}
     for requirement in requirements:
         raw_key = str(requirement["document_type_key"])
@@ -521,7 +532,7 @@ def _reconcile_documents(
                     requirement_key=:requirement_key,
                     updated_at_utc=now()
                 WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND di_document_id=:document_id
+                  AND stage_code='BOOKING' AND di_document_id=:document_id
                 """
             ),
             {

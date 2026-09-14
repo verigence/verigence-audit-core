@@ -245,6 +245,44 @@ def test_reconcile_unified_documents_dispatches_delivery_type_and_autostarts(uni
         ).scalar_one()
         assert delivery_started == "DELIVERY_STARTED"
 
+        # Reported live: the Booking screen's own "live" read (unrelated to
+        # this module) re-runs its own reconciliation against every
+        # DI document it sees, using a Booking-only requirement lookup --
+        # before it was scoped to stage_code='BOOKING' (matching
+        # uc03_delivery_capture_v2._reconcile_delivery_documents' own,
+        # already-correct scoping), it would find this Delivery-routed
+        # document (still visible in DI's BOOKING-phase list -- this module
+        # always uses that one phase, see the module docstring), fail to
+        # match NO_DUES_CERTIFICATE against Booking's own requirements, and
+        # null the requirement_key this reconcile just correctly set.
+        from audit_core.uc03_document_capture_v2 import (
+            _base_requirements,
+            _reconcile_documents,
+        )
+
+        booking_requirements = _base_requirements(connection, setup["tenant_id"], setup["journey_id"])
+        _reconcile_documents(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=setup["journey_id"],
+            requirements=booking_requirements,
+            di_documents=[{
+                "documentId": str(setup["document_id"]),
+                "state": "CLASSIFIED",
+                "classifiedDocumentTypeKey": "NO_DUES_CERTIFICATE",
+            }],
+        )
+        row_after_booking_poll = connection.execute(
+            text("""
+                SELECT stage_code, requirement_key
+                FROM auditcore.document_capture_v2_documents
+                WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:doc
+                """),
+            {"t": setup["tenant_id"], "j": setup["journey_id"], "doc": setup["document_id"]},
+        ).mappings().one()
+        assert row_after_booking_poll["stage_code"] == "DELIVERY"
+        assert row_after_booking_poll["requirement_key"] == "NDC"
+
 
 def test_reconcile_unified_documents_leaves_booking_type_alone(unified_capture_setup) -> None:
     setup = unified_capture_setup
