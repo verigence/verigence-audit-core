@@ -29,6 +29,7 @@ from audit_core.uc03_booking_commands import (
     _set_etag,
 )
 from audit_core.uc03_finding_classification import resolve_classification
+from audit_core.workflow import create_workflow_task
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/journeys/{journey_id}/delivery",
@@ -329,6 +330,29 @@ def _machine_flag(
             "correlation_id": correlation_id,
         },
     )
+    # v1.1 design: "a PC never opens a Finding" -- a self-serve gap (DATA_GAP/
+    # DOCUMENT_GAP) auto-spawns a Task for PC the instant it's raised, no TL
+    # step, since PC no longer has a RESOLVE path directly on the finding.
+    # Role-only assignment (no specific actor): _responsible_pc_actor (the
+    # lookup TL's own Take-Action path uses) only resolves for BOOKING stage
+    # today, and would raise outright with no submitter recorded yet for a
+    # Delivery-stage finding -- role-only lets any PC with business-scope
+    # access claim it instead of failing finding creation over an assignee
+    # that doesn't exist yet.
+    if routing.get("finding_class") in {"DATA_GAP", "DOCUMENT_GAP"}:
+        create_workflow_task(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            workflow_type="UC03_SELF_SERVE_FINDING",
+            process_area=stage_code,
+            task_type="AUTO_SELF_SERVE",
+            assigned_role_code="PC",
+            related_finding_id=finding_id,
+            task_payload={"ruleKey": rule_key, "findingId": str(finding_id)},
+            effect_key=f"task:{finding_id}:round:0",
+            correlation_id=correlation_id,
+        )
     _set_stage_flag_status(
         connection,
         tenant_id=tenant_id,
