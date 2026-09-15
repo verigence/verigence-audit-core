@@ -433,7 +433,14 @@ def _ensure_post_submit_review_flag(
             ) VALUES (
                 :tenant_id, :journey_id, 'DOCUMENT_EXCEPTION', 'INFO',
                 'OPEN', 'DI extraction requires PC review', :description,
-                :service_id, 'BOOKING', 'RULE',
+                -- origin_kind='RULE' was never a valid value here --
+                -- ck_audit_findings_uc03_origin (migration 0011) only ever
+                -- allowed 'MACHINE' or 'HUMAN', and the frontend's own type
+                -- (uc03Audit.ts) only ever declared 'MACHINE' | 'HUMAN' | null.
+                -- This insert has been failing every time it runs since the
+                -- day this function was added -- confirmed live (2026-09-15)
+                -- via a real CheckViolation against the actual schema.
+                :service_id, 'BOOKING', 'MACHINE',
                 :service_id, 'SYSTEM', :rule_key, false,
                 :finding_class, :owner_role_code, :sla_due_at_utc
             )
