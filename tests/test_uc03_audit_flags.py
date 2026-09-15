@@ -261,6 +261,9 @@ def _create_flag_category(
 # ── finding routing / SLA / adjudication ────────────────────────────────────────
 
 def test_violation_flag_is_routed_to_tl_with_sla(audit_setup):
+    # _create_flag_category posts as TL (PC can no longer raise) -- the
+    # response's own permittedActions reflects TL's view, the role that
+    # actually made this request, not PC's.
     flag = _create_flag_category(
         audit_setup, category="COMMERCIAL_EXCEPTION", key="route-violation-01"
     )
@@ -270,28 +273,34 @@ def test_violation_flag_is_routed_to_tl_with_sla(audit_setup):
     assert flag["slaDueAtUtc"] is not None
     assert flag["escalationLevel"] == 0
     assert flag["overdue"] is False
-    # v1.1: PC raised it but has zero actions on a VIOLATION -- not even a comment.
-    assert flag["permittedActions"] == []
+    assert set(flag["permittedActions"]) == {
+        "REMARK", "ACKNOWLEDGE", "CONFIRM_BREACH", "MARK_FALSE_POSITIVE",
+        "TAKE_ACTION", "ESCALATE", "RESOLVE",
+    }
+
+    # PC has zero actions on a VIOLATION -- not even a comment.
+    as_pc = _client().get(f"{_base(audit_setup)}/flags?stage=BOOKING").json()
+    pc_view = next(item for item in as_pc if item["flagId"] == flag["flagId"])
+    assert pc_view["permittedActions"] == []
 
 
 def test_document_gap_flag_is_routed_to_pc(audit_setup):
+    # Same reason as above -- this response reflects TL (the creator), not PC.
     flag = _create_flag_category(
         audit_setup, category="DOCUMENT_EXCEPTION", key="route-docgap-01"
     )
     assert flag["findingClass"] == "DOCUMENT_GAP"
     assert flag["resolutionMode"] == "SELF_SERVICE"
     assert flag["ownerRoleCode"] == "PC"
+    assert set(flag["permittedActions"]) == {"REMARK", "RESOLVE"}
+
     # v1.1: PC never acts on a Finding directly, even a self-serve one -- it
     # normally closes itself once PC's auto-spawned Task is completed and
     # the underlying gap is actually fixed. TL/PM's RESOLVE here is a manual
     # override.
-    assert flag["permittedActions"] == []
-    _set_role(audit_setup, "TL")
-    as_tl = _client().get(
-        f"{_base(audit_setup)}/flags?stage=BOOKING"
-    ).json()
-    tl_view = next(item for item in as_tl if item["flagId"] == flag["flagId"])
-    assert "RESOLVE" in tl_view["permittedActions"]
+    as_pc = _client().get(f"{_base(audit_setup)}/flags?stage=BOOKING").json()
+    pc_view = next(item for item in as_pc if item["flagId"] == flag["flagId"])
+    assert pc_view["permittedActions"] == []
 
 
 def test_document_gap_flag_auto_spawns_a_pc_task(audit_setup):
