@@ -56,9 +56,12 @@ lifecycle one tier up, not a different one.
 
 **Manual observations** (TL/PM raising something the rule engine didn't
 catch, case-specific, never promoted to a reusable rule) go through this
-exact same four-verdict lifecycle once raised — raising one is just a new
-entry point into the same Finding record, everything after that is
-identical.
+exact same four-verdict lifecycle once raised, with one fixed rule: **a
+TL-raised observation is always verdicted by PM, never by the TL who
+raised it** — segregation of duties, decided as a universal rule rather
+than severity-gated (see "Open questions: decided" below). A PM raising
+one verdicts it themselves, same as PM already does for anything
+escalated to them.
 
 Word-count validation (the 50-word cap) is new — no existing remark field
 enforces anything but a character limit. Needs a real word-counter, not a
@@ -142,84 +145,90 @@ context); Task/Review/Audit simply stop being an on-ramp to them.
 - `origin_kind='HUMAN'` already covers manual observations; no schema
   change needed there, only wiring into the four-verdict lifecycle.
 
-## Race conditions and gaps this design must resolve before implementation
+## Race conditions: decided, filtered through "don't build for what's rare"
 
-Found by deliberately stress-testing the model above, not raised during
-the original discussion — these need an answer, not just a footnote.
+Explicit instruction applied here: fix what's cheap and/or common; for
+anything genuinely rare where the fix would mean touching a different
+subsystem, record it as an accepted shortcoming instead of building
+speculative machinery for it. Four of the five below are either the
+common/primary path or a near-zero-cost reuse of an existing pattern —
+worth doing regardless of how often they'd actually fire. The fifth is
+neither, and is deliberately deferred.
 
-1. **Duplicate task creation on retry.** The existing
-   `PC_DOCUMENT_REUPLOAD` mechanism already solves this correctly
-   (`effect_key` + a DB unique constraint, checked before creating). Both
-   auto-spawn (self-serve) and Take-Action task creation must use the
-   same discipline — an `effect_key` scoped to (finding_id, current open
-   round), or a retried request / redelivered webhook creates two tasks
-   for one finding.
-2. **A completion write touches both the Task and the Finding — needs one
-   transaction, not two.** If TL is mid-verdict on a Task's current state
-   while PC is simultaneously completing it, TL's write can land against
-   data that's already stale. The existing If-Match/`version_no`
-   optimistic-concurrency pattern must cover both records together (an
-   aggregate lock spanning both, matching the existing per-journey
-   advisory-lock pattern already used for document sync), not just the
-   Finding alone.
-3. **Escalating to PM while a PC Task is still open is undefined.**
-   Sequence: TL sends to PC (Task open) → before PC responds, TL (or
-   someone else with access) escalates to PM. Nothing supersedes the now-
-   orphaned PC Task. Decide one of: escalation is blocked while a PC Task
-   is outstanding, or escalating auto-cancels the outstanding PC Task.
-   Leaving both open at once means two people each think they're the
-   next step.
-4. **Automated rule re-evaluation must never auto-close a Finding a human
-   is actively tracking.** PC completing a Take-Action task usually means
-   uploading a document, which runs through the *entire* existing
-   document-sync pipeline — the same rule that raised the original
-   VIOLATION can re-fire right then. Today's `_machine_flag` pattern
-   (raise-if-absent, else just touch stage status) was built for a world
-   with no human verdict loop layered on top of it. Explicit rule needed:
-   automated re-evaluation only ever detects *new* issues on a Finding
-   that's mid-human-loop; it never resolves or silently overwrites one a
-   TL/PM is actively deciding on. Only a human verdict (Accept/Reject)
-   closes a Finding once a loop has started.
-5. **Journey/booking cancellation doesn't cascade to open Tasks.** If a
-   booking is voided while a PC Task is open against it, nothing closes
-   that Task — it sits live in PC's queue for a case that no longer
-   exists. Needs a cancellation path triggered off booking/journey
-   cancellation, not left to go stale.
+1. **Decided — duplicate task creation on retry.** Reuse the exact
+   `effect_key` pattern `PC_DOCUMENT_REUPLOAD` already proves:
+   `effect_key = f"task:{finding_id}:open"`. Cheap (the DB unique
+   constraint already exists), and retries/redeliveries are a routine
+   occurrence in this codebase, not an edge case — worth doing regardless.
+2. **Decided — one transaction, not two.** Route a PC completion through
+   the same per-journey advisory lock `_sync_booking_document` already
+   uses. Zero new locking primitive; every multi-write completion (update
+   Finding, resolve Task, raise the next Task) happens inside it.
+3. **Decided, simplified from the original proposal — don't block
+   escalation, just make closure clean up after itself.** Rather than add
+   a specific "refuse to escalate while a task is open" check (a new
+   validation path, a new error case the UI has to handle), the simpler,
+   more general rule: **whenever a Finding transitions to a terminal
+   state (Accept, Reject, or PM's own verdict), auto-cancel any of its
+   still-open Tasks.** One rule, applies everywhere a Finding closes, not
+   a special case for escalation specifically — and it fully resolves the
+   original concern (an orphaned task with nobody sure who's the next
+   step) without adding a new blocking action anywhere.
+4. **Decided — automated re-evaluation never touches a Finding mid-human-
+   loop.** This is not the rare case — it's the *expected* path, since
+   completing a Take-Action task normally means uploading a document,
+   which runs the full document-sync pipeline immediately. One guard
+   before `_machine_flag`-style logic touches a finding: if it has an
+   open Task, log that the rule re-fired (the execution log already has a
+   place for this) and stop there. Only a human verdict closes a Finding
+   once a loop has started.
+5. **Deferred — accepted as a known shortcoming, not built now.**
+   Journey/booking cancellation does **not** cascade to open Findings/
+   Tasks. If a booking is voided mid-loop, its open items stay open until
+   a human notices. Real fix means reaching into a different subsystem
+   (whatever owns booking cancellation) for a genuinely uncommon
+   intersection — not worth the surface area against how rarely a booking
+   is cancelled specifically while a Finding is mid-review. Documented
+   here as the deliberate gap it is, revisit if it turns out to matter in
+   practice.
 
-## Open questions, not guessed at
+## Open questions: decided
 
-- **Segregation of duties for manual observations.** A TL raising their
-  own observation and then also Accepting/Rejecting it themselves is a
-  self-review — standard GRC practice would want a second reviewer (PM)
-  for anything above a low severity. Worth a deliberate policy call
-  rather than defaulting to "TL can close their own raise."
-- **No notification path exists.** Every step here relies on someone
-  opening a queue to discover new work — no push/email/in-app alert on
-  assignment, unlike Jira/ServiceNow/PagerDuty. May be an accepted
-  limitation for launch; worth saying so explicitly rather than leaving
-  it implicit.
-- **No SLA/timeout on the Task itself.** The Finding has SLA/escalation
-  machinery already; a Task a PC simply never opens has no equivalent —
-  it can sit indefinitely with no reminder or auto-escalation.
-- **Multiple open PC Tasks on one journey.** If three VIOLATIONs on the
-  same booking are all Take-Actioned close together, does PC get three
-  separate tasks (three separate visits, three separate TL/PM review
-  tasks generated back), or do they consolidate into one visit covering
-  all three? Not decided either way.
-- **PC reassignment/turnover.** Tasks are assigned to a specific actor;
-  no stated path for reassigning one if that person is unavailable or
-  leaves.
-- **Daily Ops findings under this same lifecycle is unconfirmed.** Every
-  Daily Ops finding today is already TL/PM-raised manually (no rule
-  engine involved there at all) — does a TL verdict their own manual
-  raise under the same four-verdict flow, or does Daily Ops need a
-  different shape? Not addressed either way.
-- **Reject/send-back reason is free text only.** Good for forcing a real
-  answer (the 50-word floor), but harder to aggregate later (Compliance
-  Report can't answer "why do most rejections happen" without reading
-  every one). A lightweight reason *category* alongside the free text is
-  the more standard shape for this kind of GRC reporting — not a
-  blocker, worth a note for later.
+- **Segregation of duties — simplified to one universal rule.** Every
+  TL-raised manual observation is reviewed by **PM**, always — not
+  severity-gated. Simpler than a conditional threshold, and correctly
+  folds Daily Ops in for free: every Daily Ops finding is already
+  manually raised (no rule engine involved there), so "manual
+  observation → PM reviews" already covers Daily Ops without a separate
+  rule.
+- **Notifications — badge + banner only, decided for launch.** No push/
+  email. Reuses the existing badge-count pattern (Review Queue already
+  has one); a "you have N new tasks" banner on dashboard load is the
+  extent of it for now.
+- **Task-level SLA — decided, and effectively free.** Reuse
+  `uc03_finding_routing.py`'s existing `sla_due_at`/`_DEFAULT_SLA_HOURS`
+  table directly for a Task's own `due_at_utc`, keyed off the linked
+  Finding's class and the Task's own severity (TL-set at Take-Action
+  time). No new SLA table, no new policy surface — the exact same
+  function call, pointed at a Task instead of only a Finding.
+- **Multiple open PC Tasks on one journey — decided, UI-level only.**
+  Each Finding keeps its own Task record and its own independent review
+  loop underneath (clean data model, nothing merged). Task Queue
+  presents multiple open tasks on the same journey as **one visit** to
+  `JourneyDocumentsPage` — which already shows every document for a
+  journey at once, so this is close to "already works" rather than new
+  UI.
+- **PC reassignment — decided.** An explicit reassign action, available
+  to TL/PM, not automatic turnover detection. A one-click fix for a human
+  problem, not a system to build.
+- **Daily Ops findings — decided.** Same four-verdict lifecycle,
+  uniformly. The universal "manual observation → PM reviews" rule above
+  already gives Daily Ops its own answer without a separate policy.
+- **Reject/send-back reason — decided.** A required category dropdown
+  (Not applicable / Data already correct / System misclassified /
+  Duplicate / Other) alongside the existing 50-word free-text remark.
+  Cheap now; retrofitting categorization onto historical rejections later
+  is real, avoidable work.
 
 ## Explicitly not decided yet (next conversation, not assumed)
 
