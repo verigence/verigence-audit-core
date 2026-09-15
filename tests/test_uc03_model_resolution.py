@@ -864,6 +864,29 @@ def test_confirm_model_resolution_sku_pins_resolves_and_completes_task(journey) 
     mr._pin_sku(c, tenant_id=c.tenant_id, journey_id=c.journey_id, product_sku_id=sku_b)
     assert _status() == "READY", f"status after _pin_sku alone: {_status()!r}"
 
+    # Isolate further: call _complete_self_serve_tasks directly, with the
+    # Finding still OPEN (skipping its own UPDATE/INSERT entirely), to tell
+    # apart "the Finding mutation itself does something to workflow_tasks"
+    # from "_complete_self_serve_tasks / complete_workflow_task itself is
+    # the one behaving unexpectedly".
+    mr._complete_self_serve_tasks(
+        c, tenant_id=c.tenant_id, related_finding_id=finding_id, actor_id="pc-test-actor",
+    )
+    status_after_direct_complete = _status()
+    if status_after_direct_complete != "COMPLETED":
+        events = c.execute(
+            text(
+                "SELECT event_type, from_status, to_status, actor_id, actor_type, reason, "
+                "occurred_at_utc FROM auditcore.workflow_task_events "
+                "WHERE tenant_id=:t AND workflow_task_id=:tid ORDER BY occurred_at_utc"
+            ),
+            {"t": c.tenant_id, "tid": task_id},
+        ).mappings().all()
+        raise AssertionError(
+            f"status after _complete_self_serve_tasks called DIRECTLY (finding still OPEN): "
+            f"{status_after_direct_complete!r}; event history: {[dict(e) for e in events]}"
+        )
+
     resolved = mr._resolve_open_flag(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="", actor_id="pc-test-actor",
     )
