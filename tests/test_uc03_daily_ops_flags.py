@@ -170,6 +170,62 @@ def test_tl_can_accept_a_violation(daily_ops_setup) -> None:
     assert result.flag.disposition == "CONFIRMED_BREACH"
 
 
+def test_tl_take_action_spawns_a_pc_task(daily_ops_setup) -> None:
+    """Parity fix: Take Action previously only spawned a Task on the journey
+    endpoint (uc03_audit_flags.py) -- both endpoints now go through the
+    shared apply_finding_verdict(), so this works here too."""
+    raised = _raise_flag(daily_ops_setup, actor_id=daily_ops_setup.pc_actor_id, category="PROCESS_NON_COMPLIANCE")
+    result = act_on_daily_ops_flag(
+        daily_ops_setup.tenant_id, daily_ops_setup.outlet_id, daily_ops_setup.run_id, raised.flag.flagId,
+        FlagLifecycleCommand(action="TAKE_ACTION", remarks="Please provide the missing receipt.", severity="HIGH"),
+        _request(), Response(), idempotency_key=f"idem-{uuid4()}", if_match=f'"{raised.flag.version}"',
+        principal=_principal(daily_ops_setup.tl_actor_id, daily_ops_setup.tenant_id),
+        connection=daily_ops_setup.connection,
+    )
+    assert result.flag.status == "ACKNOWLEDGED"
+
+    task = daily_ops_setup.connection.execute(
+        text(
+            "SELECT daily_ops_run_id, journey_id, task_type, assigned_role_code, severity, "
+            "task_payload FROM auditcore.workflow_tasks "
+            "WHERE tenant_id=:t AND related_finding_id=:f"
+        ),
+        {"t": daily_ops_setup.tenant_id, "f": raised.flag.flagId},
+    ).mappings().one()
+    assert task["daily_ops_run_id"] == daily_ops_setup.run_id
+    assert task["journey_id"] is None
+    assert task["task_type"] == "TL_TAKE_ACTION"
+    assert task["assigned_role_code"] == "PC"
+    assert task["severity"] == "HIGH"
+    assert task["task_payload"]["comment"] == "Please provide the missing receipt."
+
+
+def test_tl_reject_persists_the_required_category(daily_ops_setup) -> None:
+    """Bug fix: act_on_daily_ops_flag's own UPDATE never referenced
+    rejection_category before it went through apply_finding_verdict, so a
+    Reject's mandatory category was silently dropped."""
+    raised = _raise_flag(daily_ops_setup, actor_id=daily_ops_setup.pc_actor_id, category="PROCESS_NON_COMPLIANCE")
+    result = act_on_daily_ops_flag(
+        daily_ops_setup.tenant_id, daily_ops_setup.outlet_id, daily_ops_setup.run_id, raised.flag.flagId,
+        FlagLifecycleCommand(
+            action="MARK_FALSE_POSITIVE", resolutionReason="Within approved deviation",
+            rejectionCategory="NOT_APPLICABLE",
+        ),
+        _request(), Response(), idempotency_key=f"idem-{uuid4()}", if_match=f'"{raised.flag.version}"',
+        principal=_principal(daily_ops_setup.tl_actor_id, daily_ops_setup.tenant_id),
+        connection=daily_ops_setup.connection,
+    )
+    assert result.flag.status == "RESOLVED"
+    stored_category = daily_ops_setup.connection.execute(
+        text(
+            "SELECT rejection_category FROM auditcore.audit_findings "
+            "WHERE tenant_id=:t AND audit_finding_id=:f"
+        ),
+        {"t": daily_ops_setup.tenant_id, "f": raised.flag.flagId},
+    ).scalar_one()
+    assert stored_category == "NOT_APPLICABLE"
+
+
 def test_remark_bumps_version_without_changing_status(daily_ops_setup) -> None:
     raised = _raise_flag(daily_ops_setup, actor_id=daily_ops_setup.pc_actor_id, category="OTHER")
     result = add_daily_ops_flag_remark(

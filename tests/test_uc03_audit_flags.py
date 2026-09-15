@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -281,6 +281,33 @@ def test_document_gap_flag_is_routed_to_pc(audit_setup):
     assert "RESOLVE" in tl_view["permittedActions"]
 
 
+def test_document_gap_flag_auto_spawns_a_pc_task(audit_setup):
+    """The other half of "a PC never opens a Finding": a self-serve gap
+    (human- or machine-raised) auto-spawns a Task the instant it's raised,
+    so PC's actual work surface is the Task, not the Finding."""
+    flag = _create_flag_category(
+        audit_setup, category="DOCUMENT_EXCEPTION", key="route-docgap-task-01"
+    )
+    with audit_setup["engine"].begin() as connection:
+        task = connection.execute(
+            text(
+                """
+                SELECT journey_id, daily_ops_run_id, task_type, assigned_role_code,
+                       severity, task_status
+                FROM auditcore.workflow_tasks
+                WHERE tenant_id=:tenant_id AND related_finding_id=:flag_id
+                """
+            ),
+            {"tenant_id": audit_setup["tenant_id"], "flag_id": UUID(flag["flagId"])},
+        ).mappings().one()
+    assert task["journey_id"] == audit_setup["journey_id"]
+    assert task["daily_ops_run_id"] is None
+    assert task["task_type"] == "AUTO_SELF_SERVE"
+    assert task["assigned_role_code"] == "PC"
+    assert task["severity"] == "HIGH"
+    assert task["task_status"] == "READY"
+
+
 def test_tl_accepts_violation_and_records_confirmed_breach(audit_setup):
     flag = _create_flag_category(
         audit_setup, category="COMMERCIAL_EXCEPTION", key="adj-accept-01"
@@ -373,6 +400,32 @@ def test_review_queue_routes_by_role_and_supports_scope(audit_setup):
     summary = _client().get(f"{_queue(audit_setup)}/summary").json()
     assert summary["mine"] >= 1
     assert summary["byClass"].get("VIOLATION", 0) >= 1
+
+
+def test_review_queue_tasks_are_opt_in(audit_setup):
+    """includeTasks defaults False so the endpoint's live behavior doesn't
+    change under a frontend that doesn't know about itemKind yet -- the
+    auto-spawned Task for a self-serve gap is invisible until asked for."""
+    doc_gap = _create_flag_category(
+        audit_setup, category="DOCUMENT_EXCEPTION", key="q-taskoptin-01"
+    )
+
+    default_items = _client().get(f"{_queue(audit_setup)}").json()["items"]
+    assert all(item["itemKind"] == "FINDING" for item in default_items)
+
+    with_tasks = _client().get(f"{_queue(audit_setup)}?includeTasks=true").json()["items"]
+    kinds_by_flag = {item["flagId"]: item["itemKind"] for item in with_tasks}
+    assert kinds_by_flag[doc_gap["flagId"]] == "FINDING"
+    tasks = [item for item in with_tasks if item["itemKind"] == "EXECUTION_TASK"]
+    assert len(tasks) == 1
+    assert tasks[0]["relatedFindingId"] == doc_gap["flagId"]
+    assert tasks[0]["category"] == "AUTO_SELF_SERVE"
+    assert tasks[0]["permittedActions"] == []
+
+    summary_default = _client().get(f"{_queue(audit_setup)}/summary").json()
+    assert summary_default["byKind"] == {"FINDING": 1}
+    summary_with_tasks = _client().get(f"{_queue(audit_setup)}/summary?includeTasks=true").json()
+    assert summary_with_tasks["byKind"] == {"FINDING": 1, "EXECUTION_TASK": 1}
 
 
 def test_pc_flag_create_is_idempotent_and_preserves_provenance(audit_setup):

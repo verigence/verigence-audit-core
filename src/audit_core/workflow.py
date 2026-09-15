@@ -17,7 +17,8 @@ def create_workflow_task(
     connection: Connection,
     *,
     tenant_id: str,
-    journey_id: UUID,
+    journey_id: UUID | None = None,
+    daily_ops_run_id: UUID | None = None,
     workflow_type: str,
     process_area: str,
     task_type: str,
@@ -29,20 +30,33 @@ def create_workflow_task(
     effect_key: str | None = None,
     correlation_id: str | None = None,
     related_finding_id: UUID | None = None,
+    severity: str | None = None,
 ) -> UUID:
+    # A task is always scoped to exactly one subject -- a journey (Booking/
+    # Delivery) or a Daily Operations run -- mirroring audit_findings' own
+    # subject_kind split (migration 0080) and enforced again by
+    # ck_workflow_tasks_subject / ck_workflow_instances_subject (0099).
+    if (journey_id is None) == (daily_ops_run_id is None):
+        raise AuditCoreError(
+            error_code="VAC-VAL-006",
+            status_code=500,
+            title="A workflow task needs exactly one subject",
+            detail="Pass exactly one of journey_id or daily_ops_run_id.",
+        )
     workflow_instance_id = connection.execute(
         text(
             """
             INSERT INTO auditcore.workflow_instances (
-                tenant_id, journey_id, workflow_type, correlation_id
+                tenant_id, journey_id, daily_ops_run_id, workflow_type, correlation_id
             ) VALUES (
-                :tenant_id, :journey_id, :workflow_type, :correlation_id
+                :tenant_id, :journey_id, :daily_ops_run_id, :workflow_type, :correlation_id
             ) RETURNING workflow_instance_id
             """
         ),
         {
             "tenant_id": tenant_id,
             "journey_id": journey_id,
+            "daily_ops_run_id": daily_ops_run_id,
             "workflow_type": workflow_type,
             "correlation_id": correlation_id,
         },
@@ -51,17 +65,17 @@ def create_workflow_task(
         text(
             """
             INSERT INTO auditcore.workflow_tasks (
-                tenant_id, workflow_instance_id, journey_id,
+                tenant_id, workflow_instance_id, journey_id, daily_ops_run_id,
                 process_area, task_type, assigned_role_code,
                 assigned_actor_id, dealer_id, outlet_id,
                 task_payload, effect_key, correlation_id,
-                related_finding_id
+                related_finding_id, severity
             ) VALUES (
-                :tenant_id, :workflow_instance_id, :journey_id,
+                :tenant_id, :workflow_instance_id, :journey_id, :daily_ops_run_id,
                 :process_area, :task_type, :assigned_role_code,
                 :assigned_actor_id, :dealer_id, :outlet_id,
                 CAST(:task_payload AS jsonb), :effect_key, :correlation_id,
-                :related_finding_id
+                :related_finding_id, :severity
             ) RETURNING workflow_task_id
             """
         ),
@@ -69,6 +83,7 @@ def create_workflow_task(
             "tenant_id": tenant_id,
             "workflow_instance_id": workflow_instance_id,
             "journey_id": journey_id,
+            "daily_ops_run_id": daily_ops_run_id,
             "process_area": process_area,
             "task_type": task_type,
             "assigned_role_code": assigned_role_code,
@@ -79,6 +94,7 @@ def create_workflow_task(
             "effect_key": effect_key,
             "correlation_id": correlation_id,
             "related_finding_id": related_finding_id,
+            "severity": (severity or "").strip().upper() or None,
         },
     ).scalar_one()
     _append_task_event(
@@ -98,7 +114,8 @@ def create_workflow_task(
         "workflow_task_created",
         task_id=str(task_id),
         task_type=task_type,
-        journey_id=str(journey_id),
+        journey_id=str(journey_id) if journey_id else None,
+        daily_ops_run_id=str(daily_ops_run_id) if daily_ops_run_id else None,
         tenant_id=tenant_id,
     )
     return task_id
@@ -666,7 +683,7 @@ def _append_task_event(
     tenant_id: str,
     task_id: UUID,
     workflow_instance_id: UUID,
-    journey_id: UUID,
+    journey_id: UUID | None,
     event_type: str,
     from_status: str | None,
     to_status: str,

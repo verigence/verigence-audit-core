@@ -1161,6 +1161,33 @@ def create_flag(
             evidence_ids=payload.evidenceIds,
             purpose="FLAG_RAISED",
         )
+        # v1.1 design: "a PC never opens a Finding" applies no matter who
+        # raised it -- a TL/PM observation against a self-serve category
+        # (e.g. DOCUMENT_EXCEPTION) needs the same auto-spawned Task PC
+        # gets from a machine-raised gap (uc03_delivery_commands.py::
+        # _machine_flag carries the identical block for that path).
+        if routing.get("finding_class") in {"DATA_GAP", "DOCUMENT_GAP"}:
+            try:
+                pc_actor_id = _responsible_pc_actor(
+                    connection, tenant_id=tenant_id, journey_id=journey_id
+                )
+            except AuditCoreError:
+                pc_actor_id = None
+            create_workflow_task(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                workflow_type="UC03_SELF_SERVE_FINDING",
+                process_area=payload.stage,
+                task_type="AUTO_SELF_SERVE",
+                assigned_role_code="PC",
+                assigned_actor_id=pc_actor_id,
+                related_finding_id=flag_id,
+                severity=severity,
+                task_payload={"category": category, "findingId": str(flag_id)},
+                effect_key=f"task:{flag_id}:round:0",
+                correlation_id=correlation_id,
+            )
         event_id = _append_finding_event(
             connection,
             tenant_id=tenant_id,
@@ -1224,6 +1251,209 @@ def create_flag(
     return FlagMutationResponse(flag=flag, eventId=UUID(body["eventId"]), idempotent=replay)
 
 
+def apply_finding_verdict(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    flag_id: UUID,
+    journey_id: UUID | None,
+    daily_ops_run_id: UUID | None,
+    process_area: str,
+    finding_class: str,
+    resolution_mode: str,
+    current_status: str,
+    current_owner_role: str | None,
+    payload: FlagLifecycleCommand,
+    operating_role: str,
+    actor_id: str,
+    correlation_id: str | None,
+) -> dict[str, Any]:
+    """Apply one of TL/PM's verdicts (Accept/Reject/Take Action/Escalate), or
+    a plain Resolve/Reopen/Void/Acknowledge/Review, to a Finding -- shared by
+    the journey (this module's own act_on_flag) and Daily Operations
+    (uc03_daily_ops_flags.py::act_on_daily_ops_flag) endpoints, which
+    otherwise differ only in which subject (journey vs daily_ops_run) and
+    case-context columns they carry. Journey-only side effects (evidence
+    linking, the DI-value-correction auto-apply, journey_stage_states
+    bookkeeping) stay local to act_on_flag; this covers everything
+    genuinely shared: the guards, the audit_findings UPDATE, and the
+    Take-Action task spawn.
+
+    Returns the fields the caller needs to append its own finding event and
+    build its response.
+    """
+    # Accept / Reject / Take Action / Escalate are TL's four verdicts on a
+    # rule breach -- only for adjudicated findings (VIOLATION). A data /
+    # document gap is fixed by its auto-spawned Task, not adjudicated.
+    if (
+        payload.action in {"CONFIRM_BREACH", "MARK_FALSE_POSITIVE", "TAKE_ACTION", "ESCALATE"}
+        and resolution_mode != "ADJUDICATED"
+    ):
+        raise AuthorizationError(
+            error_code="VAC-AUTH-005",
+            status_code=403,
+            title=(
+                f"{_ACTION_LABEL.get(payload.action, payload.action)} is not "
+                f"available for a {finding_class.replace('_', ' ').lower()}"
+            ),
+        )
+    # Race-condition guardrail (v1.1 design): at most one open Task per
+    # Finding at a time. Take Action always creates one; Escalate must not
+    # leave an existing one orphaned with two people each thinking they're
+    # the next step.
+    if payload.action in {"TAKE_ACTION", "ESCALATE"}:
+        open_task = connection.execute(
+            text(
+                """
+                SELECT workflow_task_id FROM auditcore.workflow_tasks
+                WHERE tenant_id=:tenant_id AND related_finding_id=:flag_id
+                  AND task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT')
+                LIMIT 1
+                """
+            ),
+            {"tenant_id": tenant_id, "flag_id": flag_id},
+        ).scalar_one_or_none()
+        if open_task is not None:
+            raise ConflictError(
+                error_code="VAC-CONFLICT-011",
+                title="A task is already open on this finding",
+                detail="Wait for the assigned Task to complete, or cancel it, before taking this action again.",
+            )
+    # A PC may close their own data / document gap, but never a VIOLATION --
+    # that needs a TL / PM verdict.
+    if (
+        payload.action == "RESOLVE"
+        and _normalize_role(operating_role) == "PC"
+        and resolution_mode == "ADJUDICATED"
+    ):
+        raise AuthorizationError(
+            error_code="VAC-AUTH-005",
+            status_code=403,
+            title="A violation must be Confirmed Breach or Marked False Positive by a Team Lead or PM",
+        )
+    next_status = _transition(payload.action, current_status)
+    reason = (payload.resolutionReason or payload.remarks or "").strip() or None
+    disposition = _ACTION_DISPOSITION.get(payload.action)
+    rejection_category = (
+        payload.rejectionCategory.strip().upper()
+        if payload.action == "MARK_FALSE_POSITIVE" and payload.rejectionCategory
+        else None
+    )
+    # Escalate hands ownership to the next role up the ladder (TL -> PM, PM
+    # -> EXECUTIVE) and tags the escalation itself high-priority -- the
+    # finding's own severity (the rule's original assessment) is
+    # deliberately never overwritten (v1.1 design).
+    escalated_owner_role = None
+    escalation_priority = None
+    if payload.action == "ESCALATE":
+        try:
+            current_rank = _ROLE_LADDER.index(_normalize_role(current_owner_role or "TL"))
+        except ValueError:
+            current_rank = _ROLE_LADDER.index("TL")
+        escalated_owner_role = _ROLE_LADDER[min(current_rank + 1, len(_ROLE_LADDER) - 1)]
+        escalation_priority = "HIGH"
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.audit_findings
+            SET finding_status=:status,
+                resolution_reason=CASE
+                    WHEN :action IN ('RESOLVE','VOID','CONFIRM_BREACH','MARK_FALSE_POSITIVE')
+                        THEN CAST(:reason AS text)
+                    WHEN :action='REOPEN' THEN NULL
+                    ELSE resolution_reason
+                END,
+                disposition=CASE
+                    WHEN :action='REOPEN' THEN NULL
+                    WHEN :set_disposition THEN CAST(:disposition AS varchar)
+                    ELSE disposition
+                END,
+                rejection_category=CASE
+                    WHEN :action='MARK_FALSE_POSITIVE' THEN CAST(:rejection_category AS varchar)
+                    ELSE rejection_category
+                END,
+                owner_role_code=COALESCE(CAST(:escalated_owner_role AS varchar), owner_role_code),
+                escalation_priority=COALESCE(CAST(:escalation_priority AS varchar), escalation_priority),
+                updated_at_utc=now(), version_no=version_no+1
+            WHERE tenant_id=:tenant_id AND audit_finding_id=:flag_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "flag_id": flag_id,
+            "status": next_status,
+            "action": payload.action,
+            "reason": reason,
+            "set_disposition": disposition is not None,
+            "disposition": disposition,
+            "rejection_category": rejection_category,
+            "escalated_owner_role": escalated_owner_role,
+            "escalation_priority": escalation_priority,
+        },
+    )
+    # Race-condition guardrail (v1.1 design): closing a Finding always
+    # cleans up after itself instead of being blocked while a Task is open
+    # -- implemented once, as a trigger on auditcore.audit_findings
+    # (migration 0098), not duplicated here.
+    if payload.action == "TAKE_ACTION":
+        # Best-effort specific assignee -- a Delivery-stage journey finding
+        # (no recorded Booking-capture submitter yet) or a Daily Operations
+        # finding (no such lookup exists at all) falls back to role-only
+        # assignment (any PC with business-scope access can claim it)
+        # rather than failing the whole Take Action over an assignee that
+        # doesn't resolve.
+        pc_actor_id = None
+        if journey_id is not None:
+            try:
+                pc_actor_id = _responsible_pc_actor(
+                    connection, tenant_id=tenant_id, journey_id=journey_id
+                )
+            except AuditCoreError:
+                pc_actor_id = None
+        round_no = int(
+            connection.execute(
+                text(
+                    """
+                    SELECT count(*) FROM auditcore.workflow_tasks
+                    WHERE tenant_id=:tenant_id AND related_finding_id=:flag_id
+                      AND task_type='TL_TAKE_ACTION'
+                    """
+                ),
+                {"tenant_id": tenant_id, "flag_id": flag_id},
+            ).scalar_one()
+        ) + 1
+        create_workflow_task(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            daily_ops_run_id=daily_ops_run_id,
+            workflow_type="UC03_FINDING_TAKE_ACTION",
+            process_area=process_area,
+            task_type="TL_TAKE_ACTION",
+            assigned_role_code="PC",
+            assigned_actor_id=pc_actor_id,
+            related_finding_id=flag_id,
+            severity=payload.severity,
+            task_payload={
+                "comment": reason,
+                "severity": (payload.severity or "").strip().upper(),
+                "issuedByActorId": actor_id,
+                "issuedByRole": operating_role,
+                "round": round_no,
+            },
+            effect_key=f"task:{flag_id}:round:{round_no}",
+            correlation_id=correlation_id,
+        )
+    return {
+        "next_status": next_status,
+        "reason": reason,
+        "disposition": disposition,
+        "rejection_category": rejection_category,
+        "escalated_owner_role": escalated_owner_role,
+        "escalation_priority": escalation_priority,
+    }
+
+
 @router.post("/flags/{flag_id}/actions", response_model=FlagMutationResponse)
 def act_on_flag(
     tenant_id: str,
@@ -1271,56 +1501,6 @@ def act_on_flag(
             row["rule_key"], row["finding_type_code"]
         )
         resolution_mode = class_profile(finding_class).resolution_mode
-        # Accept / Reject / Take Action / Escalate are TL's four verdicts on
-        # a rule breach — only for adjudicated findings (VIOLATION). A data /
-        # document gap is fixed by its auto-spawned Task, not adjudicated.
-        if (
-            payload.action in {"CONFIRM_BREACH", "MARK_FALSE_POSITIVE", "TAKE_ACTION", "ESCALATE"}
-            and resolution_mode != "ADJUDICATED"
-        ):
-            raise AuthorizationError(
-                error_code="VAC-AUTH-005",
-                status_code=403,
-                title=(
-                    f"{_ACTION_LABEL.get(payload.action, payload.action)} is not "
-                    f"available for a {finding_class.replace('_', ' ').lower()}"
-                ),
-            )
-        # Race-condition guardrail (v1.1 design): at most one open Task per
-        # Finding at a time. Take Action always creates one; Escalate must
-        # not leave an existing one orphaned with two people each thinking
-        # they're the next step.
-        if payload.action in {"TAKE_ACTION", "ESCALATE"}:
-            open_task = connection.execute(
-                text(
-                    """
-                    SELECT workflow_task_id FROM auditcore.workflow_tasks
-                    WHERE tenant_id=:tenant_id AND related_finding_id=:flag_id
-                      AND task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT')
-                    LIMIT 1
-                    """
-                ),
-                {"tenant_id": tenant_id, "flag_id": flag_id},
-            ).scalar_one_or_none()
-            if open_task is not None:
-                raise ConflictError(
-                    error_code="VAC-CONFLICT-011",
-                    title="A task is already open on this finding",
-                    detail="Wait for the assigned Task to complete, or cancel it, before taking this action again.",
-                )
-        # A PC may close their own data / document gap, but never a VIOLATION —
-        # that needs a TL / PM verdict.
-        if (
-            payload.action == "RESOLVE"
-            and _normalize_role(context["operating_role"]) == "PC"
-            and resolution_mode == "ADJUDICATED"
-        ):
-            raise AuthorizationError(
-                error_code="VAC-AUTH-005",
-                status_code=403,
-                title="A violation must be Confirmed Breach or Marked False Positive by a Team Lead or PM",
-            )
-        next_status = _transition(payload.action, row["finding_status"])
         _validate_evidence(
             connection,
             tenant_id=tenant_id,
@@ -1334,117 +1514,23 @@ def act_on_flag(
             evidence_ids=payload.evidenceIds,
             purpose=f"FLAG_{payload.action}",
         )
-        reason = (payload.resolutionReason or payload.remarks or "").strip() or None
-        disposition = _ACTION_DISPOSITION.get(payload.action)
-        rejection_category = (
-            payload.rejectionCategory.strip().upper()
-            if payload.action == "MARK_FALSE_POSITIVE" and payload.rejectionCategory
-            else None
+        verdict = apply_finding_verdict(
+            connection,
+            tenant_id=tenant_id,
+            flag_id=flag_id,
+            journey_id=journey_id,
+            daily_ops_run_id=None,
+            process_area=row["stage_code"],
+            finding_class=finding_class,
+            resolution_mode=resolution_mode,
+            current_status=row["finding_status"],
+            current_owner_role=row["owner_role_code"],
+            payload=payload,
+            operating_role=context["operating_role"],
+            actor_id=human_principal.subject,
+            correlation_id=correlation_id,
         )
-        # Escalate hands ownership to the next role up the ladder (TL -> PM,
-        # PM -> EXECUTIVE) and tags the escalation itself high-priority --
-        # the finding's own severity (the rule's original assessment) is
-        # deliberately never overwritten (v1.1 design).
-        escalated_owner_role = None
-        escalation_priority = None
-        if payload.action == "ESCALATE":
-            try:
-                current_rank = _ROLE_LADDER.index(_normalize_role(row["owner_role_code"] or "TL"))
-            except ValueError:
-                current_rank = _ROLE_LADDER.index("TL")
-            escalated_owner_role = _ROLE_LADDER[min(current_rank + 1, len(_ROLE_LADDER) - 1)]
-            escalation_priority = "HIGH"
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.audit_findings
-                SET finding_status=:status,
-                    resolution_reason=CASE
-                        WHEN :action IN ('RESOLVE','VOID','CONFIRM_BREACH','MARK_FALSE_POSITIVE')
-                            THEN CAST(:reason AS text)
-                        WHEN :action='REOPEN' THEN NULL
-                        ELSE resolution_reason
-                    END,
-                    disposition=CASE
-                        WHEN :action='REOPEN' THEN NULL
-                        WHEN :set_disposition THEN CAST(:disposition AS varchar)
-                        ELSE disposition
-                    END,
-                    rejection_category=CASE
-                        WHEN :action='MARK_FALSE_POSITIVE' THEN CAST(:rejection_category AS varchar)
-                        ELSE rejection_category
-                    END,
-                    owner_role_code=COALESCE(CAST(:escalated_owner_role AS varchar), owner_role_code),
-                    escalation_priority=COALESCE(CAST(:escalation_priority AS varchar), escalation_priority),
-                    updated_at_utc=now(), version_no=version_no+1
-                WHERE tenant_id=:tenant_id AND audit_finding_id=:flag_id
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "flag_id": flag_id,
-                "status": next_status,
-                "action": payload.action,
-                "reason": reason,
-                "set_disposition": disposition is not None,
-                "disposition": disposition,
-                "rejection_category": rejection_category,
-                "escalated_owner_role": escalated_owner_role,
-                "escalation_priority": escalation_priority,
-            },
-        )
-        # Race-condition guardrail (v1.1 design), simplified from an earlier
-        # proposal to block Escalate while a Task is open: closing a Finding
-        # always cleans up after itself instead. This one rule needs to
-        # apply no matter WHICH of this codebase's several finding-resolving
-        # code paths closes it (this handler, or any of the automated
-        # self-serve auto-resolvers) -- implemented once, as a trigger on
-        # auditcore.audit_findings (migration 0098), not duplicated here.
-        if payload.action == "TAKE_ACTION":
-            # Best-effort specific assignee; a Delivery-stage finding (or any
-            # journey without a recorded Booking-capture submitter yet) has
-            # no resolvable actor for this lookup -- fall back to role-only
-            # assignment (any PC with business-scope access can claim it)
-            # rather than failing the whole Take Action over an assignee
-            # that doesn't exist yet.
-            try:
-                pc_actor_id = _responsible_pc_actor(
-                    connection, tenant_id=tenant_id, journey_id=journey_id
-                )
-            except AuditCoreError:
-                pc_actor_id = None
-            round_no = int(
-                connection.execute(
-                    text(
-                        """
-                        SELECT count(*) FROM auditcore.workflow_tasks
-                        WHERE tenant_id=:tenant_id AND related_finding_id=:flag_id
-                          AND task_type='TL_TAKE_ACTION'
-                        """
-                    ),
-                    {"tenant_id": tenant_id, "flag_id": flag_id},
-                ).scalar_one()
-            ) + 1
-            create_workflow_task(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                workflow_type="UC03_FINDING_TAKE_ACTION",
-                process_area=row["stage_code"],
-                task_type="TL_TAKE_ACTION",
-                assigned_role_code="PC",
-                assigned_actor_id=pc_actor_id,
-                related_finding_id=flag_id,
-                task_payload={
-                    "comment": reason,
-                    "severity": (payload.severity or "").strip().upper(),
-                    "issuedByActorId": human_principal.subject,
-                    "issuedByRole": context["operating_role"],
-                    "round": round_no,
-                },
-                effect_key=f"task:{flag_id}:round:{round_no}",
-                correlation_id=correlation_id,
-            )
+        next_status = verdict["next_status"]
         # Unified Documents review (2026-09-13): a Confirm-Breach verdict on a
         # DI_VALUE_CORRECTION_PROPOSED finding actually applies the proposed
         # value -- the one place this generic handler has a finding-type-

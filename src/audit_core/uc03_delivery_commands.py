@@ -349,6 +349,7 @@ def _machine_flag(
             task_type="AUTO_SELF_SERVE",
             assigned_role_code="PC",
             related_finding_id=finding_id,
+            severity=severity,
             task_payload={"ruleKey": rule_key, "findingId": str(finding_id)},
             effect_key=f"task:{finding_id}:round:0",
             correlation_id=correlation_id,
