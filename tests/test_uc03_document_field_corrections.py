@@ -240,8 +240,9 @@ def test_propose_field_correction_raises_a_tl_owned_violation(correction_setup):
     assert flag["ruleKey"] == "DI_VALUE_CORRECTION_PROPOSED:chassis_number"
     # Self-serve documents-complete criterion must never be blocked by this.
     assert flag["blockingCompletion"] is False
-    # A PC may only comment on it, matching every other VIOLATION.
-    assert flag["permittedActions"] == ["REMARK"]
+    # v1.1: PC has zero actions on a VIOLATION, matching every other one --
+    # TL's Take Action is how PC gets involved, never a direct edit here.
+    assert flag["permittedActions"] == []
 
 
 def test_confirm_breach_applies_the_proposed_value(correction_setup):
@@ -292,7 +293,11 @@ def test_mark_false_positive_leaves_the_original_value_untouched(correction_setu
         f"/v1/tenants/{correction_setup['tenant_id']}/journeys/{correction_setup['journey_id']}"
         f"/uc03/flags/{flag['flagId']}/actions",
         headers={"Idempotency-Key": "confirm-0003", "If-Match": f'"{flag["version"]}"'},
-        json={"action": "MARK_FALSE_POSITIVE", "resolutionReason": "The scanned value was actually correct."},
+        json={
+            "action": "MARK_FALSE_POSITIVE",
+            "resolutionReason": "The scanned value was actually correct.",
+            "rejectionCategory": "DATA_ALREADY_CORRECT",
+        },
     )
     assert action.status_code == 200, action.text
     resolved = action.json()["flag"]

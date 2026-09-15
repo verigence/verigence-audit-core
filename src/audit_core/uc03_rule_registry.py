@@ -84,11 +84,13 @@ def invalidate_rule_engine_cache() -> None:
     _rule_engine_cache = None
 
 # Every rule-engine row is VIOLATION/ADJUDICATED (see the class comment
-# above) -- same bound-action set migration 0084 backfilled for audit-core's
-# own ADJUDICATED rows. Kept in sync with that migration and with
+# above) -- same bound-action set migration 0084 backfilled (and 0098
+# extended, for v1.1's Take Action/Escalate verdicts) for audit-core's own
+# ADJUDICATED rows. Kept in sync with those migrations and with
 # uc03_finding_routing.py::permitted_actions's ADJUDICATED branch.
 _ADJUDICATED_ACTIONS: list[str] = [
-    "REMARK", "ACKNOWLEDGE", "CONFIRM_BREACH", "MARK_FALSE_POSITIVE", "RESOLVE",
+    "REMARK", "ACKNOWLEDGE", "CONFIRM_BREACH", "MARK_FALSE_POSITIVE",
+    "TAKE_ACTION", "ESCALATE", "RESOLVE",
 ]
 
 

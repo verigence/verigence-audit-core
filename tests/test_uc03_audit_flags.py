@@ -305,7 +305,11 @@ def test_tl_rejects_violation_and_records_not_a_breach(audit_setup):
     rejected = _client().post(
         f"{_base(audit_setup)}/flags/{flag['flagId']}/actions",
         headers={"Idempotency-Key": "adj-reject-act-01", "If-Match": '"1"'},
-        json={"action": "MARK_FALSE_POSITIVE", "resolutionReason": "Within approved deviation"},
+        json={
+            "action": "MARK_FALSE_POSITIVE",
+            "resolutionReason": "Within approved deviation",
+            "rejectionCategory": "NOT_APPLICABLE",
+        },
     )
     assert rejected.status_code == 200, rejected.text
     assert rejected.json()["flag"]["disposition"] == "FALSE_POSITIVE"

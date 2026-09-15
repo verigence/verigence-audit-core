@@ -34,6 +34,14 @@ The Unified Work Items mirror trigger (migration 0097) is updated to
 carry these three columns into ``work_items``/``work_item_finding_detail``/
 ``work_item_task_detail`` too, so the spine doesn't silently fall behind
 the tables it mirrors.
+
+Also a small data update: migration 0084 backfilled
+``rule_definitions.bound_actions`` for every ADJUDICATED rule with the
+action verbs meaningful for it (the rule catalog's per-rule "what can
+happen here" display). Take Action/Escalate are two more such verbs as
+of this migration -- appended here to every ADJUDICATED row so that
+display doesn't silently fall behind the same way the work_items spine
+above would have without its own trigger update.
 """
 from __future__ import annotations
 
@@ -279,9 +287,35 @@ def upgrade() -> None:
         )
     )
 
+    # -- keep the rule catalog's bound_actions display in sync (see module
+    # docstring) -- append the two new verbs to every ADJUDICATED row,
+    # de-duplicated, order-preserved.
+    conn.execute(
+        text(
+            """
+            UPDATE auditcore.rule_definitions
+            SET bound_actions = (
+                SELECT array_agg(DISTINCT action ORDER BY action)
+                FROM unnest(bound_actions || ARRAY['TAKE_ACTION','ESCALATE']) AS action
+            )
+            WHERE resolution_mode = 'ADJUDICATED'
+              AND NOT bound_actions @> ARRAY['TAKE_ACTION','ESCALATE']
+            """
+        )
+    )
+
 
 def downgrade() -> None:
     conn = op.get_bind()
+    conn.execute(
+        text(
+            """
+            UPDATE auditcore.rule_definitions
+            SET bound_actions = array_remove(array_remove(bound_actions, 'TAKE_ACTION'), 'ESCALATE')
+            WHERE resolution_mode = 'ADJUDICATED'
+            """
+        )
+    )
     conn.execute(text("ALTER TABLE auditcore.work_item_task_detail DROP COLUMN IF EXISTS related_finding_id"))
     conn.execute(
         text(

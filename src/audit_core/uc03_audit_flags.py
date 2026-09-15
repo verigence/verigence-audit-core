@@ -848,6 +848,8 @@ def _role_permitted_actions(context: dict[str, Any]) -> list[str]:
         "REVIEW",
         "CONFIRM_BREACH",
         "MARK_FALSE_POSITIVE",
+        "TAKE_ACTION",
+        "ESCALATE",
         "RESOLVE",
         "REOPEN",
         "VOID",
