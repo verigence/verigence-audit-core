@@ -864,33 +864,48 @@ def test_confirm_model_resolution_sku_pins_resolves_and_completes_task(journey) 
     mr._pin_sku(c, tenant_id=c.tenant_id, journey_id=c.journey_id, product_sku_id=sku_b)
     assert _status() == "READY", f"status after _pin_sku alone: {_status()!r}"
 
-    # Isolate further: call _complete_self_serve_tasks directly, with the
-    # Finding still OPEN (skipping its own UPDATE/INSERT entirely), to tell
-    # apart "the Finding mutation itself does something to workflow_tasks"
-    # from "_complete_self_serve_tasks / complete_workflow_task itself is
-    # the one behaving unexpectedly".
+    # Isolate the exact ordering _resolve_open_flag uses: the Finding's own
+    # UPDATE/INSERT FIRST (mirroring its SQL verbatim), THEN a status check
+    # BEFORE _complete_self_serve_tasks runs at all -- to see whether the
+    # Finding mutation alone (with zero task involvement) already corrupts
+    # the task row, or whether it's specifically _complete_self_serve_tasks
+    # running AFTER that mutation (in the same transaction) that misbehaves
+    # (the earlier bisection calling _complete_self_serve_tasks BEFORE the
+    # Finding mutation passed, which doesn't rule out that ordering).
+    c.execute(
+        text(
+            """
+            UPDATE auditcore.audit_findings
+            SET finding_status = 'RESOLVED', disposition = 'FIXED',
+                resolved_at_utc = now(), updated_at_utc = now()
+            WHERE tenant_id = :t AND audit_finding_id = :fid
+              AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
+            """
+        ),
+        {"t": c.tenant_id, "fid": finding_id},
+    )
+    c.execute(
+        text(
+            """
+            INSERT INTO auditcore.audit_finding_events (
+                tenant_id, audit_finding_id, journey_id, stage_code,
+                event_type, actor_id, actor_role_snapshot, safe_payload, correlation_id
+            ) VALUES (
+                :t, :fid, :j, 'BOOKING', 'RESOLVED', NULL, 'SYSTEM', '{}'::jsonb, ''
+            )
+            """
+        ),
+        {"t": c.tenant_id, "fid": finding_id, "j": c.journey_id},
+    )
+    status_after_finding_mutation_alone = _status()
+    assert status_after_finding_mutation_alone == "READY", (
+        f"status after the Finding's own UPDATE/INSERT, before "
+        f"_complete_self_serve_tasks ran at all: {status_after_finding_mutation_alone!r}"
+    )
+
     mr._complete_self_serve_tasks(
         c, tenant_id=c.tenant_id, related_finding_id=finding_id, actor_id="pc-test-actor",
     )
-    status_after_direct_complete = _status()
-    if status_after_direct_complete != "COMPLETED":
-        events = c.execute(
-            text(
-                "SELECT event_type, from_status, to_status, actor_id, actor_type, reason, "
-                "occurred_at_utc FROM auditcore.workflow_task_events "
-                "WHERE tenant_id=:t AND workflow_task_id=:tid ORDER BY occurred_at_utc"
-            ),
-            {"t": c.tenant_id, "tid": task_id},
-        ).mappings().all()
-        raise AssertionError(
-            f"status after _complete_self_serve_tasks called DIRECTLY (finding still OPEN): "
-            f"{status_after_direct_complete!r}; event history: {[dict(e) for e in events]}"
-        )
-
-    resolved = mr._resolve_open_flag(
-        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="", actor_id="pc-test-actor",
-    )
-    assert resolved == 1
     status_after_resolve = _status()
     if status_after_resolve != "COMPLETED":
         events = c.execute(
