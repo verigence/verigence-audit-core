@@ -212,3 +212,94 @@ def test_workflow_tasks_persist_and_support_command_lifecycle() -> None:
             }
     finally:
         restarted_engine.dispose()
+
+
+def test_create_workflow_task_resolves_dealer_and_outlet_from_the_journey() -> None:
+    """A caller that doesn't already know dealer_id/outlet_id (every uc03
+    auto-spawn / Take-Action call site) must not silently create a task
+    invisible to tasks_api.py's own business-scoped GET /tasks and
+    unscoped for its /complete -- create_workflow_task resolves both from
+    the journey when neither is passed."""
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for workflow persistence test")
+
+    engine = create_engine(database_url)
+    suffix = uuid4().hex
+    tenant_id = f"tenant-workflow-scope-{suffix}"
+
+    with engine.begin() as connection:
+        category_id = connection.execute(
+            text(
+                "INSERT INTO auditcore.product_categories (category_code, category_name) "
+                "VALUES (:code, 'Vehicle') RETURNING product_category_id"
+            ),
+            {"code": f"WSCAT-{suffix}"},
+        ).scalar_one()
+        oem_id = connection.execute(
+            text("INSERT INTO auditcore.oems (oem_code, oem_name) VALUES (:code, 'O') RETURNING oem_id"),
+            {"code": f"WSOEM-{suffix}"},
+        ).scalar_one()
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.projects (
+                    tenant_id, project_code, project_name, oem_id,
+                    product_category_id, effective_start_date
+                ) VALUES (:tenant_id, :code, 'P', :oem_id, :category_id, CURRENT_DATE)
+                """
+            ),
+            {"tenant_id": tenant_id, "code": f"WSP-{suffix}", "oem_id": oem_id, "category_id": category_id},
+        )
+        dealer_id = connection.execute(
+            text(
+                "INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
+                "VALUES (:tenant_id, :code, 'D') RETURNING dealer_id"
+            ),
+            {"tenant_id": tenant_id, "code": f"WSD-{suffix}"},
+        ).scalar_one()
+        outlet_id = connection.execute(
+            text(
+                "INSERT INTO auditcore.dealer_outlets (tenant_id, dealer_id, outlet_code, outlet_name) "
+                "VALUES (:tenant_id, :dealer_id, :code, 'O') RETURNING outlet_id"
+            ),
+            {"tenant_id": tenant_id, "dealer_id": dealer_id, "code": f"WSO-{suffix}"},
+        ).scalar_one()
+        customer_id = connection.execute(
+            text(
+                "INSERT INTO auditcore.customers (tenant_id, dealer_id, outlet_id, customer_type_code, display_name) "
+                "VALUES (:tenant_id, :dealer_id, :outlet_id, 'RETAIL', 'C') RETURNING customer_id"
+            ),
+            {"tenant_id": tenant_id, "dealer_id": dealer_id, "outlet_id": outlet_id},
+        ).scalar_one()
+        journey_id = connection.execute(
+            text(
+                "INSERT INTO auditcore.journeys (tenant_id, dealer_id, outlet_id, customer_id, journey_reference) "
+                "VALUES (:tenant_id, :dealer_id, :outlet_id, :customer_id, 'WS-JOURNEY') RETURNING journey_id"
+            ),
+            {"tenant_id": tenant_id, "dealer_id": dealer_id, "outlet_id": outlet_id, "customer_id": customer_id},
+        ).scalar_one()
+
+        task_id = create_workflow_task(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            workflow_type="UC03_SELF_SERVE_FINDING",
+            process_area="BOOKING",
+            task_type="AUTO_SELF_SERVE",
+            assigned_role_code="PC",
+            # dealer_id/outlet_id deliberately omitted -- every uc03 call
+            # site does this today.
+        )
+        task = get_workflow_task(connection, tenant_id=tenant_id, workflow_task_id=task_id)
+        assert task["dealer_id"] == dealer_id
+        assert task["outlet_id"] == outlet_id
+
+        # And completion needs no claim/start ceremony for a human
+        # self-completing their own task -- straight from READY works.
+        complete_workflow_task(connection, tenant_id=tenant_id, workflow_task_id=task_id, actor_id="pc-1")
+        completed = get_workflow_task(connection, tenant_id=tenant_id, workflow_task_id=task_id)
+        assert completed["task_status"] == "COMPLETED"
+        assert completed["completed_at_utc"] is not None
+
+    engine.dispose()

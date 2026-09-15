@@ -43,6 +43,43 @@ def create_workflow_task(
             title="A workflow task needs exactly one subject",
             detail="Pass exactly one of journey_id or daily_ops_run_id.",
         )
+    # Resolve dealer_id/outlet_id from the subject when a caller doesn't
+    # already know them cheaply -- tasks_api.py's generic /tasks/{id}/*
+    # endpoints only enforce business-scope when dealer_id is set, and
+    # its own GET /tasks listing joins business_assignments on dealer_id/
+    # outlet_id too, so leaving both NULL isn't a harmless default: it
+    # silently drops the task out of a normally dealer-scoped actor's own
+    # "My Work" list, and skips the scope check entirely for anyone who
+    # already has the task_id. One indexed lookup, done once here, so
+    # every caller gets correct scoping without having to remember it.
+    if dealer_id is None and outlet_id is None:
+        if journey_id is not None:
+            row = connection.execute(
+                text(
+                    "SELECT dealer_id, outlet_id FROM auditcore.journeys "
+                    "WHERE tenant_id=:tenant_id AND journey_id=:journey_id"
+                ),
+                {"tenant_id": tenant_id, "journey_id": journey_id},
+            ).mappings().one_or_none()
+        else:
+            row = connection.execute(
+                text(
+                    "SELECT NULL::uuid AS dealer_id, outlet_id FROM auditcore.daily_ops_runs "
+                    "WHERE tenant_id=:tenant_id AND daily_ops_run_id=:daily_ops_run_id"
+                ),
+                {"tenant_id": tenant_id, "daily_ops_run_id": daily_ops_run_id},
+            ).mappings().one_or_none()
+        if row is not None:
+            dealer_id = row["dealer_id"]
+            outlet_id = row["outlet_id"]
+            if dealer_id is None and outlet_id is not None:
+                dealer_id = connection.execute(
+                    text(
+                        "SELECT dealer_id FROM auditcore.dealer_outlets "
+                        "WHERE tenant_id=:tenant_id AND outlet_id=:outlet_id"
+                    ),
+                    {"tenant_id": tenant_id, "outlet_id": outlet_id},
+                ).scalar_one_or_none()
     workflow_instance_id = connection.execute(
         text(
             """
@@ -206,11 +243,21 @@ def complete_workflow_task(
     workflow_task_id: UUID,
     actor_id: str,
 ) -> None:
+    # Was IN_PROGRESS-only -- correct for a machine worker's claim/start/
+    # complete lease lifecycle, wrong ceremony for a human self-completing
+    # their own Task Queue item (Take Action response, a self-serve gap
+    # marked done). Completing straight from any still-open status is a
+    # pure relaxation: every existing caller already claims+starts first,
+    # so this changes nothing for them (mirrors cancel_workflow_task's own
+    # already-multi-status acceptance, just for the COMPLETED transition).
+    task = get_workflow_task(connection, tenant_id=tenant_id, workflow_task_id=workflow_task_id)
+    if task["task_status"] not in {"PENDING", "READY", "CLAIMED", "IN_PROGRESS", "RETRY_WAIT"}:
+        raise _transition_error(task["task_status"], "COMPLETED")
     _transition_task(
         connection,
         tenant_id=tenant_id,
         workflow_task_id=workflow_task_id,
-        expected_status="IN_PROGRESS",
+        expected_status=task["task_status"],
         next_status="COMPLETED",
         event_type="COMPLETED",
         actor_id=actor_id,
