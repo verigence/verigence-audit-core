@@ -13,6 +13,7 @@ from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_principal
 from audit_core.errors import NotFoundError
 from audit_core.security import Principal
+from audit_core.uc03_payment_mode import classify_payment_mode
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["payments-finance"])
 
@@ -92,6 +93,7 @@ class PaymentResponse(BaseModel):
     amount: Decimal
     currencyCode: str
     paymentMethodCode: str | None
+    paymentModeCode: str
     paymentReference: str | None
     actualStatusCode: str | None
     statusSource: str | None
@@ -194,7 +196,7 @@ def _payment_response(connection: Connection, tenant_id: str, payment_id: UUID):
         text(
             """
             SELECT payment_id, journey_id, payment_at_utc, amount, currency_code,
-                   payment_method_code, payment_reference, actual_status_code,
+                   payment_method_code, payment_mode_code, payment_reference, actual_status_code,
                    status_source, source_evidence_id, version_no
             FROM auditcore.payments
             WHERE tenant_id = :tenant_id AND payment_id = :payment_id
@@ -215,6 +217,7 @@ def _payment_response(connection: Connection, tenant_id: str, payment_id: UUID):
         amount=row["amount"],
         currencyCode=row["currency_code"],
         paymentMethodCode=row["payment_method_code"],
+        paymentModeCode=row["payment_mode_code"],
         paymentReference=row["payment_reference"],
         actualStatusCode=row["actual_status_code"],
         statusSource=row["status_source"],
@@ -278,11 +281,11 @@ def create_payment(
             """
             INSERT INTO auditcore.payments (
                 tenant_id, journey_id, payment_at_utc, amount, currency_code,
-                payment_method_code, payment_reference, actual_status_code,
+                payment_method_code, payment_mode_code, payment_reference, actual_status_code,
                 status_source, source_evidence_id
             ) VALUES (
                 :tenant_id, :journey_id, :payment_at_utc, :amount, :currency_code,
-                :payment_method_code, :payment_reference, :actual_status_code,
+                :payment_method_code, :payment_mode_code, :payment_reference, :actual_status_code,
                 :status_source, :source_evidence_id
             ) RETURNING payment_id
             """
@@ -294,6 +297,7 @@ def create_payment(
             "amount": payload.amount,
             "currency_code": payload.currencyCode.upper(),
             "payment_method_code": payload.paymentMethodCode,
+            "payment_mode_code": classify_payment_mode(payload.paymentMethodCode),
             "payment_reference": payload.paymentReference,
             "actual_status_code": payload.actualStatusCode,
             "status_source": payload.statusSource,
@@ -354,8 +358,13 @@ def patch_payment(
     }
     if updates:
         assignments = [f"{column_by_field[field]} = :{field}" for field in updates]
-        assignments.extend(["updated_at_utc = now()", "version_no = version_no + 1"])
         params = {field: getattr(payload, field) for field in updates}
+        # Re-derive the canonical type whenever the raw payment method text
+        # changes -- otherwise payment_mode_code would silently go stale.
+        if "paymentMethodCode" in updates:
+            assignments.append("payment_mode_code = :payment_mode_code")
+            params["payment_mode_code"] = classify_payment_mode(payload.paymentMethodCode)
+        assignments.extend(["updated_at_utc = now()", "version_no = version_no + 1"])
         params.update({"tenant_id": tenant_id, "payment_id": payload.paymentId})
         connection.execute(
             text(

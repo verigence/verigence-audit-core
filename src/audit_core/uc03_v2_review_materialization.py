@@ -11,6 +11,7 @@ from audit_core import uc03_booking_capture
 from audit_core.uc03_attribute_mapping import spec_for_field
 from audit_core.uc03_booking_receipt_capture import _RECEIPT_CAPTURE_MAP
 from audit_core.uc03_document_registry import is_receipt_document_type
+from audit_core.uc03_payment_mode import classify_payment_mode
 
 logger = logging.getLogger(__name__)
 
@@ -870,6 +871,10 @@ def _payment_values(receipt_values: dict[str, Any]) -> dict[str, Any]:
         "payment_at_utc": receipt_values.get("receipt_date") or receipt_values.get("payment_reference_date"),
         "amount": receipt_values.get("amount_paid"),
         "payment_method_code": receipt_values.get("payment_mode"),
+        # Canonical classification of the raw, as-extracted payment_method_code
+        # above -- see uc03_payment_mode.py. Always resolves to one of a
+        # small closed set (OTHERS when nothing matches), never left blank.
+        "payment_mode_code": classify_payment_mode(receipt_values.get("payment_mode")),
         "payment_reference": receipt_values.get("payment_reference_no"),
         "receipt_dealer_name": receipt_values.get("dealer_name"),
         "receipt_dealer_gstin": receipt_values.get("dealer_gstin"),
@@ -895,6 +900,7 @@ def _existing_payment(
     select_sql = """
         SELECT payment_id, source_evidence_id, source_di_document_id,
                receipt_number, receipt_date, payment_at_utc, amount, payment_method_code,
+               payment_mode_code,
                payment_reference, receipt_dealer_name, receipt_dealer_gstin,
                receipt_customer_name, receipt_customer_phone,
                payment_reference_date, receipt_bank_name, receipt_bank_location,
@@ -958,6 +964,7 @@ def _same_payment_state(
         "payment_at_utc",
         "amount",
         "payment_method_code",
+        "payment_mode_code",
         "payment_reference",
         "receipt_dealer_name",
         "receipt_dealer_gstin",
@@ -1061,6 +1068,7 @@ def materialize_reviewed_booking_receipts(
         payment_columns = (
             "amount",
             "payment_method_code",
+            "payment_mode_code",
             "payment_reference",
             "receipt_number",
             "receipt_date",

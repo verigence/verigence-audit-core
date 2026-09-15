@@ -218,6 +218,27 @@ def test_bank_statement_line_persisted(journey) -> None:
     assert row["credit_amount"] == Decimal(50000)
 
 
+def test_bank_statement_line_classifies_payment_mode_from_narration(journey) -> None:
+    """bank_statement_extract has no discrete payment-mode field of its own --
+    classified here from transaction_description/reference_no, same as a
+    human reading the narration would."""
+    c = journey
+    pr.materialize_reviewed_bank_statements(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[_bank_doc({
+            "bank_name": "HDFC Bank", "transaction_date": "2026-09-02",
+            "transaction_description": "NEFT-CMS12345-ABC MOTORS",
+            "reference_no": "UTR99887766", "credit_amount": "50000",
+        })],
+    )
+    mode = c.execute(
+        text("SELECT payment_mode_code FROM auditcore.bank_statement_lines "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert mode == "NEFT"
+
+
 def test_matched_payment_is_verified(journey) -> None:
     c = journey
     pid = _add_payment(c, amount=50000, ref="UTR99887766")

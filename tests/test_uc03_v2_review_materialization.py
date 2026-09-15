@@ -190,6 +190,17 @@ def test_payment_values_falls_back_to_payment_reference_date() -> None:
     assert values["payment_at_utc"] == "2026-09-12"
 
 
+def test_payment_values_classifies_payment_mode_code_from_the_raw_payment_mode() -> None:
+    values = _payment_values({"payment_mode": "NEFT", "amount_paid": "21000"})
+    assert values["payment_method_code"] == "NEFT"
+    assert values["payment_mode_code"] == "NEFT"
+
+
+def test_payment_values_falls_back_to_others_when_payment_mode_is_unrecognized_or_missing() -> None:
+    assert _payment_values({"payment_mode": "UPI", "amount_paid": "5000"})["payment_mode_code"] == "OTHERS"
+    assert _payment_values({"amount_paid": "5000"})["payment_mode_code"] == "OTHERS"
+
+
 def test_receipt_review_key_is_receipt_scoped() -> None:
     assert receipt_review_key(1, "amount_paid") != receipt_review_key(
         2, "amount_paid"
