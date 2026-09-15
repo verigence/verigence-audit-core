@@ -158,15 +158,14 @@ def test_machine_finding_mirrors_with_machine_origin(seeded_journey) -> None:
     assert detail["stage_code"] == "BOOKING"
 
 
-def test_manual_verification_rule_origin_maps_to_system(seeded_journey) -> None:
-    engine = seeded_journey["engine"]
-    tenant_id = seeded_journey["tenant_id"]
-    finding_id = _insert_finding(
-        engine, tenant_id=tenant_id, journey_id=seeded_journey["journey_id"], origin_kind="RULE",
-    )
-
-    item = _work_item(engine, tenant_id=tenant_id, work_item_id=finding_id)
-    assert item["origin_kind"] == "SYSTEM"
+# No test for origin_kind='RULE' -> 'SYSTEM' via a live insert: CI proved
+# ck_audit_findings_uc03_origin (migration 0011) only allows origin_kind
+# IN ('MACHINE','HUMAN') on the real audit_findings table -- the one place
+# in the codebase that inserts 'RULE' (uc03_confidence_review_policy.py's
+# Manual Verification flag) can never actually succeed against the real
+# schema, a genuine pre-existing bug unrelated to this migration, flagged
+# separately rather than fixed here. The trigger's 'RULE' -> 'SYSTEM' case
+# is kept anyway (forward-safe, zero cost) in case that gets fixed later.
 
 
 def test_human_flag_origin_and_no_assignee(seeded_journey) -> None:
