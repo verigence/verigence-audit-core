@@ -33,11 +33,22 @@ import json
 import logging
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
+from fastapi import APIRouter, Depends, Request
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Connection, text
 
+from audit_core.dependencies import get_connection, get_human_principal
+from audit_core.errors import AuditCoreError, NotFoundError
+from audit_core.observability import get_correlation_id
+from audit_core.security import HumanPrincipal
+from audit_core.security_authorization import (
+    SecurityAuthorizationClient,
+    get_security_authorization_client,
+)
+from audit_core.uc03_booking_capture import _scope
 from audit_core.uc03_delivery_commands import _machine_flag
 from audit_core.uc03_masters_alignment import registration_basis
 from audit_core.uc03_model_attribute_matching import (
@@ -382,8 +393,29 @@ def _pin_sku(connection: Connection, *, tenant_id: str, journey_id: UUID, produc
 
 
 def _resolve_open_flag(
-    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    correlation_id: str,
+    actor_id: str | None = None,
 ) -> int:
+    """Resolve any open MODEL_NOT_IDENTIFIED finding for this journey.
+
+    Never needs to touch the linked Task itself: ``sync_finding_work_item``'s
+    trigger (migration 0098) already cancels every still-open Task for a
+    finding the instant its ``finding_status`` flips to RESOLVED/VOIDED, as
+    a codebase-wide guardrail covering every resolve path, not just this
+    one -- adding a second, Python-side completion here would only race
+    that trigger and lose (confirmed: the trigger fires synchronously as
+    part of the very UPDATE below, before any later statement in this same
+    transaction runs).
+
+    ``actor_id`` -- set only by the PC-driven confirm path (the automatic
+    match keeps this NULL/SYSTEM) -- records who actually resolved it in
+    the finding's own event history, instead of every resolution reading
+    as an anonymous system action.
+    """
     open_ids = connection.execute(
         text(
             """
@@ -417,7 +449,7 @@ def _resolve_open_flag(
                     event_type, actor_id, actor_role_snapshot, safe_payload, correlation_id
                 ) VALUES (
                     :tenant_id, :fid, :journey_id, :stage,
-                    'RESOLVED', NULL, 'SYSTEM', CAST(:payload AS jsonb), :correlation_id
+                    'RESOLVED', :actor_id, :actor_role, CAST(:payload AS jsonb), :correlation_id
                 )
                 """
             ),
@@ -426,6 +458,8 @@ def _resolve_open_flag(
                 "fid": finding_id,
                 "journey_id": journey_id,
                 "stage": _STAGE,
+                "actor_id": actor_id,
+                "actor_role": "HUMAN" if actor_id else "SYSTEM",
                 "payload": json.dumps({"disposition": "FIXED", "note": "Model resolved to a single SKU."}),
                 "correlation_id": correlation_id,
             },
@@ -631,6 +665,378 @@ def sync_model_resolution_from_invoice(
         return {"error": True}
 
 
+def _current_match(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, inputs: dict[str, Any]
+) -> dict[str, Any]:
+    """Compute today's candidate SKU rows for a journey's reviewed model text
+    against the tenant's current effective price list.
+
+    Returns ``{"skipped": True, "reason": ...}`` when there is nothing to
+    compute against (no effective price list, or an empty one), else
+    ``{"matched": [...], "matchStage": ...}``. Shared by ``sync_model_
+    resolution`` (which pins/raises from this) and the read-only candidates
+    endpoint (``get_model_resolution_candidates``, which never mutates
+    anything) -- one matching implementation, not two that could drift.
+    """
+    effective_on = date.fromisoformat(
+        connection.execute(
+            text(
+                """
+                SELECT COALESCE(b.booking_date, CURRENT_DATE)
+                FROM auditcore.journeys j
+                LEFT JOIN auditcore.bookings b
+                  ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
+                WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one().isoformat()
+    )
+    try:
+        plan = _price_plan_for_journey(
+            connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on
+        )
+    except Exception:  # noqa: BLE001 - no effective price list yet
+        return {"skipped": True, "reason": "no_effective_price_list"}
+
+    rows = _sku_rows_for_version(
+        connection, tenant_id=tenant_id, price_list_version_id=plan["price_list_version_id"]
+    )
+    if not rows:
+        return {"skipped": True, "reason": "empty_price_list"}
+
+    matched, stage = _match(rows, inputs)
+
+    if len(matched) != 1:
+        # Either the whole-string model compare found nothing at all, or
+        # it matched >1 rows that price alone couldn't disambiguate (e.g.
+        # the model text itself already equals the master's model_name,
+        # but the Booking Form gives no usable total/ex-showroom to pick
+        # a variant). Either way, try narrowing by decomposed attributes.
+        attr_matched, attr_stage = _attribute_decomposition_fallback(
+            connection, tenant_id=tenant_id, rows=rows, inputs=inputs
+        )
+        # Adopt the attribute fallback whenever it's strictly narrower
+        # than the price-based match, not only when it reaches exactly
+        # one -- e.g. price alone can leave 24 model-only candidates
+        # while the Booking Form's own fuel/transmission text narrows
+        # that to 2 real contenders. Reporting 2 candidates a PC can
+        # actually choose between is strictly better than reporting all
+        # 24, even when it still isn't unique enough to auto-pin.
+        if attr_matched and (not matched or len(attr_matched) < len(matched)):
+            matched, stage = attr_matched, attr_stage
+
+    return {"matched": matched, "matchStage": stage}
+
+
+def _format_candidate_line(row: dict[str, Any], basis: str) -> str:
+    label = str(row["model_name"])
+    if row.get("variant_name"):
+        label += f" {row['variant_name']}"
+    if row.get("colour_name"):
+        label += f" ({row['colour_name']})"
+    ex_showroom = _to_decimal(row.get("master_ex_showroom"))
+    total = _master_total(row, basis)
+    price_bits = []
+    if ex_showroom is not None:
+        price_bits.append(f"ex-showroom {ex_showroom:,.2f}")
+    if total is not None:
+        price_bits.append(f"on-road total {total:,.2f}")
+    price_text = f" — {', '.join(price_bits)}" if price_bits else ""
+    return f"{row['sku_code']} · {label}{price_text}"
+
+
+def _candidate_task_payload(
+    inputs: dict[str, Any], matched: list[dict[str, Any]], *, multiple: bool
+) -> dict[str, Any]:
+    """The PC-facing shortlist for the auto-spawned Task: business-readable
+    comment text naming each candidate model/variant/colour with its
+    ex-showroom price, plus the same list structured for a UI picker."""
+    basis = inputs["registration_basis"]
+    shortlist = matched[:5]
+    if multiple:
+        intro = (
+            f"The booking model text matched {len(matched)} possible vehicle SKUs and "
+            "could not be narrowed to one automatically. Open the scanned Booking Form "
+            "on the Journey Documents page and select the SKU that matches it:"
+        )
+    else:
+        intro = (
+            "The booking model text did not match any SKU in the current price masters. "
+            "Open the scanned Booking Form on the Journey Documents page, check the exact "
+            "model/variant/colour printed on it, and select the matching SKU there."
+        )
+    lines = [f"{i}. {_format_candidate_line(r, basis)}" for i, r in enumerate(shortlist, start=1)]
+    comment = intro if not lines else intro + "\n" + "\n".join(lines)
+    return {
+        "comment": comment,
+        "candidates": [
+            {
+                "productSkuId": str(r["product_sku_id"]),
+                "skuCode": r["sku_code"],
+                "modelName": r["model_name"],
+                "variantName": r["variant_name"],
+                "colourName": r["colour_name"],
+                "exShowroomPrice": (
+                    str(_to_decimal(r.get("master_ex_showroom")))
+                    if _to_decimal(r.get("master_ex_showroom")) is not None
+                    else None
+                ),
+                "totalPrice": str(_master_total(r, basis)) if _master_total(r, basis) is not None else None,
+            }
+            for r in shortlist
+        ],
+    }
+
+
+def get_model_resolution_candidates(
+    connection: Connection, *, tenant_id: str, journey_id: UUID
+) -> dict[str, Any]:
+    """Read-only: today's shortlist for an open MODEL_NOT_IDENTIFIED gap,
+    computed fresh against the tenant's current effective price list (never
+    a stale snapshot from whenever the finding/Task was originally raised)."""
+    finding_id = connection.execute(
+        text(
+            """
+            SELECT audit_finding_id
+            FROM auditcore.audit_findings
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+              AND finding_type_code = :ft
+              AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
+            ORDER BY created_at_utc DESC
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "ft": _FINDING_TYPE},
+    ).scalar_one_or_none()
+    if finding_id is None:
+        raise NotFoundError(
+            error_code="VAC-NF-010",
+            title="No open model-resolution gap",
+            detail="There is no open vehicle-model gap to resolve for this Journey.",
+        )
+
+    inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if inputs is None:
+        raise NotFoundError(
+            error_code="VAC-NF-010",
+            title="No reviewed booking model",
+            detail="The Booking Form has not been reviewed yet -- nothing to shortlist.",
+        )
+
+    outcome = _current_match(connection, tenant_id=tenant_id, journey_id=journey_id, inputs=inputs)
+    matched = outcome.get("matched", [])
+    stage = outcome.get("matchStage", "NONE")
+    basis = inputs["registration_basis"]
+    return {
+        "journeyId": journey_id,
+        "findingId": finding_id,
+        "reviewedModelName": inputs["model_name"],
+        "reviewedVariantName": inputs["variant_name"],
+        "reviewedColourName": inputs["colour_name"],
+        "matchStage": stage,
+        "candidates": [
+            {
+                "productSkuId": r["product_sku_id"],
+                "skuCode": r["sku_code"],
+                "modelName": r["model_name"],
+                "variantName": r["variant_name"],
+                "colourName": r["colour_name"],
+                "exShowroomPrice": _to_decimal(r.get("master_ex_showroom")),
+                "totalPrice": _master_total(r, basis),
+            }
+            for r in matched[:10]
+        ],
+    }
+
+
+def confirm_model_resolution_sku(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    product_sku_id: UUID,
+    actor_id: str,
+    correlation_id: str,
+) -> dict[str, Any]:
+    """A PC's manual pick when MODEL_NOT_IDENTIFIED could not auto-resolve.
+
+    Validates the chosen SKU against the same tenant-scoped, currently-
+    effective price-list rows the shortlist itself is built from (never
+    trusts a client-supplied id blindly), pins it, resolves the open
+    finding, completes its linked Task, and runs deal reconciliation -- the
+    same closing sequence an automatic match runs.
+    """
+    inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if inputs is None:
+        raise NotFoundError(
+            error_code="VAC-NF-010",
+            title="No reviewed booking model",
+            detail="The Booking Form has not been reviewed yet -- nothing to confirm.",
+        )
+
+    effective_on = date.fromisoformat(
+        connection.execute(
+            text(
+                """
+                SELECT COALESCE(b.booking_date, CURRENT_DATE)
+                FROM auditcore.journeys j
+                LEFT JOIN auditcore.bookings b
+                  ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
+                WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one().isoformat()
+    )
+    try:
+        plan = _price_plan_for_journey(
+            connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on
+        )
+    except Exception as exc:
+        raise AuditCoreError(
+            error_code="VAC-SKU-003",
+            status_code=422,
+            title="No effective price list",
+            detail="There is no effective price list for this Journey to confirm a SKU against.",
+        ) from exc
+
+    rows = _sku_rows_for_version(
+        connection, tenant_id=tenant_id, price_list_version_id=plan["price_list_version_id"]
+    )
+    row = next((r for r in rows if str(r["product_sku_id"]) == str(product_sku_id)), None)
+    if row is None:
+        raise AuditCoreError(
+            error_code="VAC-SKU-002",
+            status_code=422,
+            title="Unknown or inactive SKU",
+            detail="The selected SKU is not in this Journey's current effective price list.",
+        )
+
+    _pin_sku(connection, tenant_id=tenant_id, journey_id=journey_id, product_sku_id=product_sku_id)
+    resolved = _resolve_open_flag(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        correlation_id=correlation_id,
+        actor_id=actor_id,
+    )
+    _run_deal_reconciliation(
+        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
+    )
+    return {
+        "resolved": True,
+        "flagsResolved": resolved,
+        "productSkuId": row["product_sku_id"],
+        "skuCode": row["sku_code"],
+        "modelName": row["model_name"],
+        "variantName": row["variant_name"],
+        "colourName": row["colour_name"],
+    }
+
+
+router = APIRouter(
+    prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}/booking/model-resolution",
+    tags=["uc03-model-resolution"],
+)
+
+
+class ModelResolutionCandidateOut(BaseModel):
+    productSkuId: UUID
+    skuCode: str
+    modelName: str
+    variantName: str | None = None
+    colourName: str | None = None
+    exShowroomPrice: Decimal | None = None
+    totalPrice: Decimal | None = None
+
+
+class ModelResolutionCandidatesResponse(BaseModel):
+    journeyId: UUID
+    findingId: UUID
+    reviewedModelName: str | None = None
+    reviewedVariantName: str | None = None
+    reviewedColourName: str | None = None
+    matchStage: str
+    candidates: list[ModelResolutionCandidateOut]
+
+
+class ConfirmModelResolutionSkuRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    productSkuId: UUID
+
+
+class ConfirmModelResolutionSkuResponse(BaseModel):
+    journeyId: UUID
+    productSkuId: UUID
+    skuCode: str
+    modelName: str
+    variantName: str | None = None
+    colourName: str | None = None
+    flagsResolved: int
+
+
+@router.get("", response_model=ModelResolutionCandidatesResponse)
+def read_model_resolution_candidates(
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> ModelResolutionCandidatesResponse:
+    _scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    return ModelResolutionCandidatesResponse(
+        **get_model_resolution_candidates(connection, tenant_id=tenant_id, journey_id=journey_id)
+    )
+
+
+@router.post("/confirm-sku", response_model=ConfirmModelResolutionSkuResponse)
+def confirm_model_resolution_sku_endpoint(
+    tenant_id: str,
+    journey_id: UUID,
+    payload: ConfirmModelResolutionSkuRequest,
+    request: Request,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> ConfirmModelResolutionSkuResponse:
+    _scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    result = confirm_model_resolution_sku(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        product_sku_id=payload.productSkuId,
+        actor_id=human_principal.subject,
+        correlation_id=get_correlation_id(request),
+    )
+    return ConfirmModelResolutionSkuResponse(
+        journeyId=journey_id,
+        productSkuId=result["productSkuId"],
+        skuCode=result["skuCode"],
+        modelName=result["modelName"],
+        variantName=result["variantName"],
+        colourName=result["colourName"],
+        flagsResolved=result["flagsResolved"],
+    )
+
+
 def sync_model_resolution(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
 ) -> dict[str, Any]:
@@ -649,53 +1055,10 @@ def sync_model_resolution(
             )
             return {"resolved": True, "flagsResolved": resolved}
 
-        effective_on = date.fromisoformat(
-            connection.execute(
-                text(
-                    """
-                    SELECT COALESCE(b.booking_date, CURRENT_DATE)
-                    FROM auditcore.journeys j
-                    LEFT JOIN auditcore.bookings b
-                      ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
-                    WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
-                    """
-                ),
-                {"tenant_id": tenant_id, "journey_id": journey_id},
-            ).scalar_one().isoformat()
-        )
-        try:
-            plan = _price_plan_for_journey(
-                connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on
-            )
-        except Exception:  # noqa: BLE001 - no effective price list yet
-            return {"skipped": True, "reason": "no_effective_price_list"}
-
-        rows = _sku_rows_for_version(
-            connection, tenant_id=tenant_id, price_list_version_id=plan["price_list_version_id"]
-        )
-        if not rows:
-            return {"skipped": True, "reason": "empty_price_list"}
-
-        matched, stage = _match(rows, inputs)
-
-        if len(matched) != 1:
-            # Either the whole-string model compare found nothing at all, or
-            # it matched >1 rows that price alone couldn't disambiguate (e.g.
-            # the model text itself already equals the master's model_name,
-            # but the Booking Form gives no usable total/ex-showroom to pick
-            # a variant). Either way, try narrowing by decomposed attributes.
-            attr_matched, attr_stage = _attribute_decomposition_fallback(
-                connection, tenant_id=tenant_id, rows=rows, inputs=inputs
-            )
-            # Adopt the attribute fallback whenever it's strictly narrower
-            # than the price-based match, not only when it reaches exactly
-            # one -- e.g. price alone can leave 24 model-only candidates
-            # while the Booking Form's own fuel/transmission text narrows
-            # that to 2 real contenders. Reporting 2 candidates a PC can
-            # actually choose between is strictly better than reporting all
-            # 24, even when it still isn't unique enough to auto-pin.
-            if attr_matched and (not matched or len(attr_matched) < len(matched)):
-                matched, stage = attr_matched, attr_stage
+        outcome = _current_match(connection, tenant_id=tenant_id, journey_id=journey_id, inputs=inputs)
+        if outcome.get("skipped"):
+            return outcome
+        matched, stage = outcome["matched"], outcome["matchStage"]
 
         if len(matched) == 1:
             _pin_sku(
@@ -759,10 +1122,16 @@ def sync_model_resolution(
                             if _master_total(r, inputs["registration_basis"]) is not None
                             else None
                         ),
+                        "exShowroom": (
+                            str(_to_decimal(r.get("master_ex_showroom")))
+                            if _to_decimal(r.get("master_ex_showroom")) is not None
+                            else None
+                        ),
                     }
                     for r in matched[:10]
                 ],
             },
+            task_payload_extra=_candidate_task_payload(inputs, matched, multiple=multiple),
         )
         return {"raised": True, "matchStage": stage, "candidateCount": len(matched)}
     except Exception:

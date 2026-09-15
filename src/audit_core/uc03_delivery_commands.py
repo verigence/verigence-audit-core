@@ -237,6 +237,7 @@ def _machine_flag(
     correlation_id: str,
     safe_payload: dict[str, Any],
     blocking_completion: bool = False,
+    task_payload_extra: dict[str, Any] | None = None,
 ) -> UUID:
     existing = connection.execute(
         text(
@@ -350,7 +351,11 @@ def _machine_flag(
             assigned_role_code="PC",
             related_finding_id=finding_id,
             severity=severity,
-            task_payload={"ruleKey": rule_key, "findingId": str(finding_id)},
+            task_payload={
+                "ruleKey": rule_key,
+                "findingId": str(finding_id),
+                **(task_payload_extra or {}),
+            },
             effect_key=f"task:{finding_id}:round:0",
             correlation_id=correlation_id,
         )

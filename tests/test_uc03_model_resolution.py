@@ -775,6 +775,159 @@ def test_invoice_fallback_resolves_with_no_model_snapshot_at_all(journey) -> Non
     assert pinned == sku_id
 
 
+# ── PC self-serve SKU selection (candidates endpoint + manual confirm) ──────
+def _seed_ambiguous_thar(c):
+    """Two THAR SKUs with an identical on-road total (so total alone can't
+    disambiguate) but different ex-showroom prices and colours -- the same
+    "matched multiple models" shape sync_model_resolution raises against a
+    real ambiguous Booking Form."""
+    return _seed_price_list(c, [
+        {"model": "THAR", "variant": "LX", "colour": "RED",
+         "components": {"EX_SHOWROOM": "1500000", "REGISTRATION_INDIVIDUAL": "170000",
+                        "REGISTRATION_CORPORATE": "200000"}},
+        {"model": "THAR", "variant": "AX", "colour": "WHITE",
+         "components": {"EX_SHOWROOM": "1550000", "REGISTRATION_INDIVIDUAL": "120000",
+                        "REGISTRATION_CORPORATE": "200000"}},
+    ])
+
+
+def _related_task_payload(c, finding_id):
+    return c.execute(
+        text("SELECT task_payload FROM auditcore.workflow_tasks "
+             "WHERE tenant_id=:t AND related_finding_id=:f"),
+        {"t": c.tenant_id, "f": finding_id},
+    ).scalar_one()
+
+
+def _open_model_finding_id(c):
+    return c.execute(
+        text("SELECT audit_finding_id FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND finding_type_code='MODEL_NOT_IDENTIFIED' "
+             "AND finding_status IN ('OPEN','ACKNOWLEDGED')"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+
+
+def test_self_serve_task_carries_shortlist_comment_and_candidates(journey) -> None:
+    """The auto-spawned Task for a multi-match gap must carry a business-
+    readable shortlist (model/variant/colour + ex-showroom price), not just
+    a bare ruleKey/findingId a PC has no way to act on directly."""
+    c = journey
+    sku_a, sku_b = _seed_ambiguous_thar(c)
+    _set_journey_product(c, "Thar", None)
+    _set_commercial(c, "total_price", "1670000")  # matches both SKUs' total
+
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("raised") is True
+    assert result.get("candidateCount") == 2
+
+    finding_id = _open_model_finding_id(c)
+    payload = _related_task_payload(c, finding_id)
+    assert "ex-showroom" in payload["comment"]
+    assert "Journey Documents" in payload["comment"]
+    candidate_ids = {row["productSkuId"] for row in payload["candidates"]}
+    assert candidate_ids == {str(sku_a), str(sku_b)}
+    for row in payload["candidates"]:
+        assert row["exShowroomPrice"] is not None
+
+
+def test_confirm_model_resolution_sku_pins_resolves_and_closes_task(journey) -> None:
+    """Confirming a shortlisted SKU pins it, resolves the finding (recording
+    the confirming PC as the resolving actor), and -- via the codebase-wide
+    ``sync_finding_work_item`` trigger (migration 0098) that cancels every
+    still-open Task the instant its Finding closes, not any Python code of
+    this module's own -- leaves the spawned Task no longer actionable."""
+    c = journey
+    _sku_a, sku_b = _seed_ambiguous_thar(c)
+    _set_journey_product(c, "Thar", None)
+    _set_commercial(c, "total_price", "1670000")
+    mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    finding_id = _open_model_finding_id(c)
+    task_id = c.execute(
+        text("SELECT workflow_task_id FROM auditcore.workflow_tasks "
+             "WHERE tenant_id=:t AND related_finding_id=:f"),
+        {"t": c.tenant_id, "f": finding_id},
+    ).scalar_one()
+
+    result = mr.confirm_model_resolution_sku(
+        c,
+        tenant_id=c.tenant_id,
+        journey_id=c.journey_id,
+        product_sku_id=sku_b,
+        actor_id="pc-test-actor",
+        correlation_id="",
+    )
+    assert result["resolved"] is True
+    assert result["productSkuId"] == sku_b
+
+    row = c.execute(
+        text("SELECT product_sku_id, selection_status FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one()
+    assert row["product_sku_id"] == sku_b
+    assert row["selection_status"] == "CONFIRMED"
+    assert _open_model_flags(c) == 0
+
+    resolve_event = c.execute(
+        text("SELECT actor_id, actor_role_snapshot FROM auditcore.audit_finding_events "
+             "WHERE tenant_id=:t AND audit_finding_id=:f AND event_type='RESOLVED'"),
+        {"t": c.tenant_id, "f": finding_id},
+    ).mappings().one()
+    assert resolve_event["actor_id"] == "pc-test-actor"
+    assert resolve_event["actor_role_snapshot"] == "HUMAN"
+
+    task = c.execute(
+        text("SELECT task_status, cancel_reason FROM auditcore.workflow_tasks "
+             "WHERE tenant_id=:t AND workflow_task_id=:tid"),
+        {"t": c.tenant_id, "tid": task_id},
+    ).mappings().one()
+    assert task["task_status"] == "CANCELLED"
+    assert task["cancel_reason"] == "Finding closed"
+
+
+def test_confirm_model_resolution_sku_rejects_sku_outside_price_list(journey) -> None:
+    from audit_core.errors import AuditCoreError
+
+    c = journey
+    _seed_ambiguous_thar(c)
+    _set_journey_product(c, "Thar", None)
+    _set_commercial(c, "total_price", "1670000")
+    mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    with pytest.raises(AuditCoreError) as exc_info:
+        mr.confirm_model_resolution_sku(
+            c,
+            tenant_id=c.tenant_id,
+            journey_id=c.journey_id,
+            product_sku_id=uuid4(),
+            actor_id="pc-test-actor",
+            correlation_id="",
+        )
+    assert exc_info.value.error_code == "VAC-SKU-002"
+    assert _open_model_flags(c) == 1  # nothing changed on rejection
+
+
+def test_get_model_resolution_candidates(journey) -> None:
+    from audit_core.errors import NotFoundError
+
+    c = journey
+    with pytest.raises(NotFoundError):
+        mr.get_model_resolution_candidates(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+
+    sku_a, sku_b = _seed_ambiguous_thar(c)
+    _set_journey_product(c, "Thar", None)
+    _set_commercial(c, "total_price", "1670000")
+    mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    data = mr.get_model_resolution_candidates(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    assert data["reviewedModelName"] == "Thar"
+    assert {row["productSkuId"] for row in data["candidates"]} == {sku_a, sku_b}
+    assert all(row["exShowroomPrice"] is not None for row in data["candidates"])
+
+
 def test_invoice_fallback_resolves_with_null_model_snapshot(journey) -> None:
     # Same regression, the other shape of the bug: a journey_products row
     # DOES exist (e.g. a partial materialization ran) but its
