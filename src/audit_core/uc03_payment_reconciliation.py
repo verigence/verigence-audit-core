@@ -29,6 +29,7 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from audit_core.uc03_document_registry import is_bank_statement_document_type
+from audit_core.uc03_payment_mode import classify_payment_mode
 from audit_core.uc03_v2_review_materialization import _upsert_review_value_row
 
 logger = logging.getLogger(__name__)
@@ -169,6 +170,12 @@ def materialize_reviewed_bank_statements(
         values = _line_values(raw)
         if values.get("credit_amount") is None and values.get("debit_amount") is None:
             continue
+        # Not a DI-extracted field -- bank_statement_extract has no discrete
+        # payment-mode field of its own, only free-text narration. Classified
+        # here from the same narration a human would read it off of.
+        values["payment_mode_code"] = classify_payment_mode(
+            values.get("transaction_description"), values.get("reference_no"),
+        )
         _upsert_review_value_row(
             connection,
             table_name="bank_statement_lines",
@@ -178,7 +185,7 @@ def materialize_reviewed_bank_statements(
             document_id=document.documentId,
             evidence_id=getattr(document, "evidenceId", None),
             actor_id=actor_id,
-            columns=_BANK_LINE_FIELDS,
+            columns=_BANK_LINE_FIELDS + ("payment_mode_code",),
             values=values,
         )
         written += 1

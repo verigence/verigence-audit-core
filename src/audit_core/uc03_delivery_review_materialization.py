@@ -929,6 +929,7 @@ def _same_delivery_payment_state(
         "receipt_date",
         "amount",
         "payment_method_code",
+        "payment_mode_code",
         "payment_reference",
         "receipt_dealer_name",
         "receipt_dealer_gstin",
@@ -1014,6 +1015,7 @@ def materialize_delivery_receipts(
         payment_columns = (
             "amount",
             "payment_method_code",
+            "payment_mode_code",
             "payment_reference",
             "receipt_number",
             "receipt_date",

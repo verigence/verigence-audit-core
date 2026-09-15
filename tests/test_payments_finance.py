@@ -149,6 +149,10 @@ def test_multiple_payments_verification_exception_and_finance_are_recorded() -> 
         )
         assert first.status_code == 201, first.text
         first_id = first.json()["paymentId"]
+        # "CARD" isn't one of the requested canonical types (IMPS/RTGS/NEFT/
+        # Bank Transfer/Banker's Order/Pay Order/Cash/Cheque/Trade-In/Refund)
+        # -- it falls through to OTHERS rather than being left unclassified.
+        assert first.json()["paymentModeCode"] == "OTHERS"
 
         # A receipt/payment lazily establishes the Journey's Booking linkage but
         # does not guess whether the receipt belongs to Booking or Delivery.
@@ -192,6 +196,16 @@ def test_multiple_payments_verification_exception_and_finance_are_recorded() -> 
         assert verified.json()["verifications"][0]["result"] == "EXCEPTION"
         assert Decimal(str(verified.json()["amount"])) == Decimal("30000.00")
 
+        # Changing the raw payment method re-derives the canonical type too --
+        # otherwise paymentModeCode would silently go stale after a PATCH.
+        recoded = client.patch(
+            payments_url,
+            json={"paymentId": first_id, "paymentMethodCode": "NEFT"},
+        )
+        assert recoded.status_code == 200, recoded.text
+        assert recoded.json()["paymentMethodCode"] == "NEFT"
+        assert recoded.json()["paymentModeCode"] == "NEFT"
+
         second = client.post(
             payments_url,
             json={
@@ -202,6 +216,7 @@ def test_multiple_payments_verification_exception_and_finance_are_recorded() -> 
             },
         )
         assert second.status_code == 201, second.text
+        assert second.json()["paymentModeCode"] == "BANK_TRANSFER"
         second_id = second.json()["paymentId"]
         assert second_id != first_id
 
