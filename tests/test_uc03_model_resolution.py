@@ -870,7 +870,16 @@ def test_confirm_model_resolution_sku_pins_resolves_and_completes_task(journey) 
         text("SELECT task_status FROM auditcore.workflow_tasks WHERE tenant_id=:t AND workflow_task_id=:tid"),
         {"t": c.tenant_id, "tid": task_id},
     ).scalar_one()
-    assert task_status == "COMPLETED"
+    if task_status != "COMPLETED":
+        events = c.execute(
+            text(
+                "SELECT event_type, from_status, to_status, actor_id, actor_type, reason, "
+                "occurred_at_utc FROM auditcore.workflow_task_events "
+                "WHERE tenant_id=:t AND workflow_task_id=:tid ORDER BY occurred_at_utc"
+            ),
+            {"t": c.tenant_id, "tid": task_id},
+        ).mappings().all()
+        raise AssertionError(f"expected COMPLETED, got {task_status!r}; event history: {[dict(e) for e in events]}")
 
 
 def test_confirm_model_resolution_sku_rejects_sku_outside_price_list(journey) -> None:
