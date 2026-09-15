@@ -850,14 +850,42 @@ def test_confirm_model_resolution_sku_pins_resolves_and_completes_task(journey) 
         "raised it -- before confirm_model_resolution_sku ran at all"
     )
 
-    result = mr.confirm_model_resolution_sku(
-        c,
-        tenant_id=c.tenant_id,
-        journey_id=c.journey_id,
-        product_sku_id=sku_b,
-        actor_id="pc-test-actor",
-        correlation_id="",
+    def _status() -> str:
+        return c.execute(
+            text("SELECT task_status FROM auditcore.workflow_tasks WHERE tenant_id=:t AND workflow_task_id=:tid"),
+            {"t": c.tenant_id, "tid": task_id},
+        ).scalar_one()
+
+    # Bisecting confirm_model_resolution_sku's own steps (pin -> resolve ->
+    # reconcile) to find exactly which one flips the task to CANCELLED with
+    # no event logged for it -- nothing in any of these three helpers'
+    # source touches workflow_tasks except _resolve_open_flag's own new
+    # _complete_self_serve_tasks call, yet the task ends up CANCELLED.
+    mr._pin_sku(c, tenant_id=c.tenant_id, journey_id=c.journey_id, product_sku_id=sku_b)
+    assert _status() == "READY", f"status after _pin_sku alone: {_status()!r}"
+
+    resolved = mr._resolve_open_flag(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="", actor_id="pc-test-actor",
     )
+    assert resolved == 1
+    status_after_resolve = _status()
+    if status_after_resolve != "COMPLETED":
+        events = c.execute(
+            text(
+                "SELECT event_type, from_status, to_status, actor_id, actor_type, reason, "
+                "occurred_at_utc FROM auditcore.workflow_task_events "
+                "WHERE tenant_id=:t AND workflow_task_id=:tid ORDER BY occurred_at_utc"
+            ),
+            {"t": c.tenant_id, "tid": task_id},
+        ).mappings().all()
+        raise AssertionError(
+            f"status after _resolve_open_flag alone: {status_after_resolve!r}; "
+            f"event history: {[dict(e) for e in events]}"
+        )
+
+    mr._run_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    result = {"resolved": True, "productSkuId": sku_b}
     assert result["resolved"] is True
     assert result["productSkuId"] == sku_b
 
