@@ -840,11 +840,15 @@ def test_confirm_model_resolution_sku_pins_resolves_and_completes_task(journey) 
     _set_commercial(c, "total_price", "1670000")
     mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     finding_id = _open_model_finding_id(c)
-    task_id = c.execute(
-        text("SELECT workflow_task_id FROM auditcore.workflow_tasks "
+    task_id, status_right_after_raise = c.execute(
+        text("SELECT workflow_task_id, task_status FROM auditcore.workflow_tasks "
              "WHERE tenant_id=:t AND related_finding_id=:f"),
         {"t": c.tenant_id, "f": finding_id},
-    ).scalar_one()
+    ).one()
+    assert status_right_after_raise == "READY", (
+        f"task was {status_right_after_raise!r} immediately after sync_model_resolution "
+        "raised it -- before confirm_model_resolution_sku ran at all"
+    )
 
     result = mr.confirm_model_resolution_sku(
         c,
