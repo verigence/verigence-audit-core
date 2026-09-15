@@ -85,10 +85,13 @@ pipeline changes — only *where* the upload control is mounted changes.
 **Completing a PC Task**:
 1. Updates the underlying Finding (links the new evidence/comment to it).
 2. Marks the PC Task resolved.
-3. **Auto-raises a new Task for TL**: "review PC's response and close."
-   This is the loop-closing step that doesn't exist anywhere today —
-   without it, a PC finishing their part has no way to surface back to
-   the TL who asked for it.
+3. **Auto-raises a new review-and-close Task for whoever issued the Take
+   Action that spawned this PC Task** — TL in the normal case, but **PM**
+   if this round was PM's own Take Action after an escalation. Not
+   hardcoded to TL: caught as a real bug in an earlier draft of this doc
+   (if PM escalated and then Took Action, "always route back to TL"
+   would silently drop PM out of a loop they escalated into). Track the
+   issuing actor/role on the Task itself and return to it.
 
 ## When TL isn't satisfied with PC's response
 
@@ -138,6 +141,85 @@ context); Task/Review/Audit simply stop being an on-ramp to them.
   the Finding side for the round-counter guardrail.
 - `origin_kind='HUMAN'` already covers manual observations; no schema
   change needed there, only wiring into the four-verdict lifecycle.
+
+## Race conditions and gaps this design must resolve before implementation
+
+Found by deliberately stress-testing the model above, not raised during
+the original discussion — these need an answer, not just a footnote.
+
+1. **Duplicate task creation on retry.** The existing
+   `PC_DOCUMENT_REUPLOAD` mechanism already solves this correctly
+   (`effect_key` + a DB unique constraint, checked before creating). Both
+   auto-spawn (self-serve) and Take-Action task creation must use the
+   same discipline — an `effect_key` scoped to (finding_id, current open
+   round), or a retried request / redelivered webhook creates two tasks
+   for one finding.
+2. **A completion write touches both the Task and the Finding — needs one
+   transaction, not two.** If TL is mid-verdict on a Task's current state
+   while PC is simultaneously completing it, TL's write can land against
+   data that's already stale. The existing If-Match/`version_no`
+   optimistic-concurrency pattern must cover both records together (an
+   aggregate lock spanning both, matching the existing per-journey
+   advisory-lock pattern already used for document sync), not just the
+   Finding alone.
+3. **Escalating to PM while a PC Task is still open is undefined.**
+   Sequence: TL sends to PC (Task open) → before PC responds, TL (or
+   someone else with access) escalates to PM. Nothing supersedes the now-
+   orphaned PC Task. Decide one of: escalation is blocked while a PC Task
+   is outstanding, or escalating auto-cancels the outstanding PC Task.
+   Leaving both open at once means two people each think they're the
+   next step.
+4. **Automated rule re-evaluation must never auto-close a Finding a human
+   is actively tracking.** PC completing a Take-Action task usually means
+   uploading a document, which runs through the *entire* existing
+   document-sync pipeline — the same rule that raised the original
+   VIOLATION can re-fire right then. Today's `_machine_flag` pattern
+   (raise-if-absent, else just touch stage status) was built for a world
+   with no human verdict loop layered on top of it. Explicit rule needed:
+   automated re-evaluation only ever detects *new* issues on a Finding
+   that's mid-human-loop; it never resolves or silently overwrites one a
+   TL/PM is actively deciding on. Only a human verdict (Accept/Reject)
+   closes a Finding once a loop has started.
+5. **Journey/booking cancellation doesn't cascade to open Tasks.** If a
+   booking is voided while a PC Task is open against it, nothing closes
+   that Task — it sits live in PC's queue for a case that no longer
+   exists. Needs a cancellation path triggered off booking/journey
+   cancellation, not left to go stale.
+
+## Open questions, not guessed at
+
+- **Segregation of duties for manual observations.** A TL raising their
+  own observation and then also Accepting/Rejecting it themselves is a
+  self-review — standard GRC practice would want a second reviewer (PM)
+  for anything above a low severity. Worth a deliberate policy call
+  rather than defaulting to "TL can close their own raise."
+- **No notification path exists.** Every step here relies on someone
+  opening a queue to discover new work — no push/email/in-app alert on
+  assignment, unlike Jira/ServiceNow/PagerDuty. May be an accepted
+  limitation for launch; worth saying so explicitly rather than leaving
+  it implicit.
+- **No SLA/timeout on the Task itself.** The Finding has SLA/escalation
+  machinery already; a Task a PC simply never opens has no equivalent —
+  it can sit indefinitely with no reminder or auto-escalation.
+- **Multiple open PC Tasks on one journey.** If three VIOLATIONs on the
+  same booking are all Take-Actioned close together, does PC get three
+  separate tasks (three separate visits, three separate TL/PM review
+  tasks generated back), or do they consolidate into one visit covering
+  all three? Not decided either way.
+- **PC reassignment/turnover.** Tasks are assigned to a specific actor;
+  no stated path for reassigning one if that person is unavailable or
+  leaves.
+- **Daily Ops findings under this same lifecycle is unconfirmed.** Every
+  Daily Ops finding today is already TL/PM-raised manually (no rule
+  engine involved there at all) — does a TL verdict their own manual
+  raise under the same four-verdict flow, or does Daily Ops need a
+  different shape? Not addressed either way.
+- **Reject/send-back reason is free text only.** Good for forcing a real
+  answer (the 50-word floor), but harder to aggregate later (Compliance
+  Report can't answer "why do most rejections happen" without reading
+  every one). A lightweight reason *category* alongside the free text is
+  the more standard shape for this kind of GRC reporting — not a
+  blocker, worth a note for later.
 
 ## Explicitly not decided yet (next conversation, not assumed)
 
