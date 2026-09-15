@@ -212,17 +212,25 @@ def _set_role(setup, role: str) -> None:
 
 
 def _create_flag(setup, *, key: str = "flag-create-0001"):
-    response = _client().post(
-        f"{_base(setup)}/flags",
-        headers={"Idempotency-Key": key, "If-Match": '"1"'},
-        json={
-            "stage": "BOOKING",
-            "category": "PROCESS_NON_COMPLIANCE",
-            "severity": "HIGH",
-            "summary": "Manual audit exception",
-            "remarks": "Observed during Booking review",
-        },
-    )
+    # v1.1 correction: PC never raises a Finding either -- only TL/PM/
+    # EXECUTIVE do. Post as TL, then restore whichever role the caller had
+    # active (most callers rely on remaining PC immediately afterward).
+    previous_actor = setup["active_actor"]["id"]
+    _set_role(setup, "TL")
+    try:
+        response = _client().post(
+            f"{_base(setup)}/flags",
+            headers={"Idempotency-Key": key, "If-Match": '"1"'},
+            json={
+                "stage": "BOOKING",
+                "category": "PROCESS_NON_COMPLIANCE",
+                "severity": "HIGH",
+                "summary": "Manual audit exception",
+                "remarks": "Observed during Booking review",
+            },
+        )
+    finally:
+        setup["active_actor"]["id"] = previous_actor
     assert response.status_code == 200, response.text
     return response
 
@@ -230,17 +238,22 @@ def _create_flag(setup, *, key: str = "flag-create-0001"):
 def _create_flag_category(
     setup, *, category: str, key: str, severity: str = "HIGH", if_match: str = '"1"'
 ):
-    response = _client().post(
-        f"{_base(setup)}/flags",
-        headers={"Idempotency-Key": key, "If-Match": if_match},
-        json={
-            "stage": "BOOKING",
-            "category": category,
-            "severity": severity,
-            "summary": f"{category} raised",
-            "remarks": f"{category} observed during audit review",
-        },
-    )
+    previous_actor = setup["active_actor"]["id"]
+    _set_role(setup, "TL")
+    try:
+        response = _client().post(
+            f"{_base(setup)}/flags",
+            headers={"Idempotency-Key": key, "If-Match": if_match},
+            json={
+                "stage": "BOOKING",
+                "category": category,
+                "severity": severity,
+                "summary": f"{category} raised",
+                "remarks": f"{category} observed during audit review",
+            },
+        )
+    finally:
+        setup["active_actor"]["id"] = previous_actor
     assert response.status_code == 200, response.text
     return response.json()["flag"]
 
@@ -428,11 +441,51 @@ def test_review_queue_tasks_are_opt_in(audit_setup):
     assert summary_with_tasks["byKind"] == {"FINDING": 1, "EXECUTION_TASK": 1}
 
 
-def test_pc_flag_create_is_idempotent_and_preserves_provenance(audit_setup):
-    response = _create_flag(audit_setup)
+def test_pc_cannot_raise_a_flag(audit_setup):
+    """v1.1 correction: an earlier reading of "PC can't edit/update
+    Findings" wrongly left RAISE open to PC. PC raises nothing -- every
+    observation is TL/PM's to record, or the machine's."""
+    denied = _client().post(
+        f"{_base(audit_setup)}/flags",
+        headers={"Idempotency-Key": "flag-pc-denied", "If-Match": '"1"'},
+        json={
+            "stage": "BOOKING",
+            "category": "PROCESS_NON_COMPLIANCE",
+            "severity": "HIGH",
+            "summary": "Attempted PC-raised exception",
+            "remarks": "Should never be recorded",
+        },
+    )
+    assert denied.status_code == 403, denied.text
+    with audit_setup["engine"].begin() as connection:
+        finding_count = connection.execute(
+            text(
+                """
+                SELECT count(*) FROM auditcore.audit_findings
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                """
+            ),
+            {"tenant_id": audit_setup["tenant_id"], "journey_id": audit_setup["journey_id"]},
+        ).scalar_one()
+    assert finding_count == 0
+
+
+def test_tl_flag_create_is_idempotent_and_preserves_provenance(audit_setup):
+    _set_role(audit_setup, "TL")
+    response = _client().post(
+        f"{_base(audit_setup)}/flags",
+        headers={"Idempotency-Key": "flag-create-0001", "If-Match": '"1"'},
+        json={
+            "stage": "BOOKING",
+            "category": "PROCESS_NON_COMPLIANCE",
+            "severity": "HIGH",
+            "summary": "Manual audit exception",
+            "remarks": "Observed during Booking review",
+        },
+    )
     body = response.json()
     assert body["flag"]["originKind"] == "HUMAN"
-    assert body["flag"]["originRole"] == "PC"
+    assert body["flag"]["originRole"] == "TL"
     assert body["flag"]["status"] == "OPEN"
     assert body["flag"]["blockingCompletion"] is False
     assert response.headers["etag"] == '"1"'
@@ -484,6 +537,7 @@ def test_pc_flag_create_is_idempotent_and_preserves_provenance(audit_setup):
 
 
 def test_human_flag_cannot_self_declare_completion_guard(audit_setup):
+    _set_role(audit_setup, "TL")
     response = _client().post(
         f"{_base(audit_setup)}/flags",
         headers={"Idempotency-Key": "flag-human-guard", "If-Match": '"1"'},
@@ -518,6 +572,7 @@ def test_human_flag_requires_non_blank_remarks(audit_setup):
     # flag whose Remarks was left blank landed with nothing beyond its
     # one-line title to explain it. Required now, both a missing key and a
     # whitespace-only one.
+    _set_role(audit_setup, "TL")
     missing = _client().post(
         f"{_base(audit_setup)}/flags",
         headers={"Idempotency-Key": "flag-no-remarks", "If-Match": '"1"'},
@@ -869,10 +924,10 @@ def test_timeline_is_bounded(audit_setup):
 def test_summary_exposes_role_capabilities_without_client_side_authority(audit_setup):
     pc = _client().get(f"{_base(audit_setup)}/audit-summary")
     assert pc.status_code == 200
-    # v1.1: PC can still RAISE a new observation, but never touches an
-    # existing Finding directly -- not even its own self-serve gap, which
+    # v1.1 correction: PC raises nothing, new or existing -- every
+    # observation is TL/PM's to record, or the machine's. A self-serve gap
     # normally closes itself via PC's own auto-spawned Task instead.
-    assert "RAISE" in pc.json()["permittedActions"]
+    assert "RAISE" not in pc.json()["permittedActions"]
     assert "RESOLVE" not in pc.json()["permittedActions"]
     assert "REMARK" not in pc.json()["permittedActions"]
     assert "CONFIRM_BREACH" not in pc.json()["permittedActions"]

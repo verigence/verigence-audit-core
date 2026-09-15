@@ -299,7 +299,12 @@ def submit_field_correction(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
-        operation="RAISE",
+        # A distinct operation key from the Audit Review "Raise Audit Flag"
+        # form's RAISE -- a PC proposing a correction to a low-confidence
+        # extracted field keeps its own, already-shipped role policy
+        # (uc03_audit_flags.py's _DEFAULT_ROLE_POLICY) even after RAISE
+        # itself became TL/PM/EXECUTIVE-only.
+        operation="PROPOSE_CORRECTION",
         human_principal=human_principal,
         authorization_client=authorization_client,
     )

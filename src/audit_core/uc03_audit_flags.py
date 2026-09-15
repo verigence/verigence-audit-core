@@ -98,6 +98,15 @@ _SEVERITY_ORDER = {"INFO": 1, "LOW": 2, "MEDIUM": 3, "HIGH": 4, "CRITICAL": 5}
 _PERMISSION_BY_OPERATION = {
     "READ": "audit.finding.read",
     "RAISE": "audit.finding.create",
+    # A separate operation key from RAISE, deliberately -- both call
+    # _scope() with the same underlying Security permission
+    # (audit.finding.create), but RAISE (create a brand-new Audit Flag
+    # observation) and PROPOSE_CORRECTION (submit_field_correction in
+    # uc03_document_field_corrections.py -- a PC correcting a low-
+    # confidence extracted field) now have genuinely different role
+    # policies below. Collapsing them back onto one key would silently
+    # re-open or re-close the wrong one.
+    "PROPOSE_CORRECTION": "audit.finding.create",
     "REMARK": "audit.finding.update",
     "ACKNOWLEDGE": "audit.review.decide",
     "REVIEW": "audit.review.decide",
@@ -111,19 +120,24 @@ _PERMISSION_BY_OPERATION = {
     "COMPLETE_AUDIT": "audit.journey.update",
 }
 
-# v1.1 design: "PC can't edit or update Audit Findings directly, PC should
-# only work on Task Assigned" -- read narrowly as touching an EXISTING
-# finding (REMARK/RESOLVE/verdict actions), not as removing a PC's ability
-# to raise a brand-new observation (a physical-inspection note at delivery,
-# PHYSICAL_OBSERVATION, is a real and still-legitimate PC action; nothing
-# in the discussion asked for that to go away). RAISE stays open to PC;
-# every action that touches a finding already on record now requires TL+.
+# v1.1 correction: an earlier reading of "PC can't edit or update Audit
+# Findings directly" narrowed this to touching an EXISTING finding only,
+# leaving RAISE (a brand-new observation) open to PC. Corrected per direct
+# instruction -- PC never raises a Finding either; every observation is
+# TL/PM's to record (manually) or the machine's (automatically). PC's own
+# work is exclusively the Task Queue.
 # A self-serve finding still normally closes itself once its auto-spawned
 # Task is completed and the underlying gap is actually fixed -- TL/PM's own
 # RESOLVE here is a manual override, not how PC participates.
 _DEFAULT_ROLE_POLICY: dict[str, set[str]] = {
     "READ": {"PC", "TL", "PM", "EXECUTIVE"},
-    "RAISE": {"PC", "TL", "PM", "EXECUTIVE"},
+    "RAISE": {"TL", "PM", "EXECUTIVE"},
+    # Unaffected by the RAISE change above -- a PC proposing a correction to
+    # a low-confidence extracted field (Journey Documents, not the Audit
+    # Review "Raise Audit Flag" form) is a different, already-shipped
+    # workflow: the Unified document review redesign made <90%-confidence
+    # corrections PC's own, immediate, self-serve action.
+    "PROPOSE_CORRECTION": {"PC", "TL", "PM", "EXECUTIVE"},
     "REMARK": {"TL", "PM", "EXECUTIVE"},
     "ACKNOWLEDGE": {"TL", "PM", "EXECUTIVE"},
     "REVIEW": {"TL", "PM", "EXECUTIVE"},
@@ -1082,6 +1096,16 @@ def create_flag(
         human_principal=human_principal,
         authorization_client=authorization_client,
     )
+    # Hard guard, not just a hidden button: PC never raises a Finding,
+    # regardless of what Security's own RBAC grant for audit.finding.create
+    # happens to allow -- corrected per direct instruction (an earlier
+    # reading of "PC can't edit/update Findings" wrongly left RAISE open).
+    if _normalize_role(context["operating_role"]) == "PC":
+        raise AuthorizationError(
+            error_code="VAC-AUTH-005",
+            status_code=403,
+            title="A Process Coordinator raises no Audit Findings -- record this via your assigned Task, or ask a Team Lead to raise it.",
+        )
     category = payload.category.strip().upper()
     severity = payload.severity.strip().upper()
     if category not in _HUMAN_FLAG_CATEGORIES or severity not in _SEVERITIES:
