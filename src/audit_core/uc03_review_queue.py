@@ -583,6 +583,8 @@ def _tasks_to_items(
         is_open = row["task_status"] in _OPEN_TASK_STATUSES
         due_at = row["due_at_utc"]
         payload = row["task_payload"] or {}
+        rule_key = payload.get("ruleKey") if isinstance(payload, dict) else None
+        rule_key_stem = rule_key.split(":")[0] if rule_key else None
 
         item = QueueItem(
             flagId=row["workflow_task_id"],
@@ -600,12 +602,15 @@ def _tasks_to_items(
             status=row["task_status"],
             isOpen=is_open,
             version=int(row["version_no"]),
-            title=_TASK_TITLE.get(row["task_type"], row["task_type"].replace("_", " ").title()),
+            title=(
+                _TASK_TITLE_BY_RULE_KEY_STEM.get(rule_key_stem)
+                or _TASK_TITLE.get(row["task_type"], row["task_type"].replace("_", " ").title())
+            ),
             description=payload.get("comment") if isinstance(payload, dict) else None,
             ownerRoleCode=assigned_role,
             disposition=None,
             originKind="SYSTEM",
-            ruleKey=(payload.get("ruleKey") if isinstance(payload, dict) else None),
+            ruleKey=rule_key,
             createdAtUtc=row["created_at_utc"],
             slaDueAtUtc=due_at,
             escalationLevel=0,
@@ -628,6 +633,13 @@ def _tasks_to_items(
 _TASK_TITLE = {
     "AUTO_SELF_SERVE": "Resolve data / document gap",
     "TL_TAKE_ACTION": "Take Action requested",
+}
+
+# AUTO_SELF_SERVE's generic title tells a PC nothing about what to actually
+# do -- override it per rule_key stem wherever a specific, actionable title
+# exists, so the Task Queue reads as an instruction, not a category label.
+_TASK_TITLE_BY_RULE_KEY_STEM = {
+    "MODEL_NOT_IDENTIFIED": "Select the vehicle SKU",
 }
 
 
