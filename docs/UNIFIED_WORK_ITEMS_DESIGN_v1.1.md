@@ -14,6 +14,31 @@ something — reaches PC only as a Task. Findings are TL/PM's domain
 object; Tasks are PC's. This is the one rule everything below exists to
 implement correctly.
 
+## Two cross-cutting rules, not just for the PC-upload case
+
+**Booking and Delivery are a process distinction, not a data distinction.**
+One journey, one `journey_id`; `stage_code` (`BOOKING`/`DELIVERY`) is an
+attribute on a Finding or Task, never a reason to route someone to a
+different screen or maintain parallel Booking-only/Delivery-only logic.
+This already matches the data model (`journey_stage_states` is
+per-stage rows under one journey) and the existing unified capture
+screen (one `BookingCaptureV2WorkspacePage`, DI classification decides
+which stage a document belongs to, not the PC). Task Queue, Review
+Queue, and Audit all operate at the journey level; stage is a filter/tag
+on an item, exactly like `severity` or `findingClass` — never a basis
+for a second version of a screen or a second workflow.
+
+**Reuse existing screens and components wherever the job is already
+done, everywhere in this feature — not only for PC's upload.** The
+inline-upload decision below is one instance of this, not a special
+case. Before adding any new UI surface for Task Queue, Review Queue, or
+the Finding-verdict actions, the first move is checking what
+`JourneyDocumentsPage`, `Journey360Page`, `ReviewQueuePage`, and their
+existing shared components (`PageHeader`, `SectionCard`, `StatusPill`,
+`DocumentCard`, etc.) already cover, and extending or embedding those
+rather than building a parallel bespoke screen. A new screen is the
+last resort, not the default.
+
 ## Finding lifecycle: TL/PM verdicts
 
 A TL (or, identically, a PM once escalated to) reviewing an open Finding
