@@ -137,7 +137,11 @@ def test_visibility_ladder() -> None:
 # ── permitted actions ───────────────────────────────────────────────────────────
 
 def test_self_serve_actions() -> None:
-    assert set(permitted_actions(finding_class="DOCUMENT_GAP", role="PC", finding_status="OPEN")) == {
+    # v1.1: "a PC never opens a Finding" -- a self-serve gap normally closes
+    # itself via its own auto-spawned Task, not a PC action on the finding
+    # directly. TL/PM's own RESOLVE here is the manual override.
+    assert permitted_actions(finding_class="DOCUMENT_GAP", role="PC", finding_status="OPEN") == []
+    assert set(permitted_actions(finding_class="DOCUMENT_GAP", role="TL", finding_status="OPEN")) == {
         "REMARK",
         "RESOLVE",
     }
@@ -145,10 +149,13 @@ def test_self_serve_actions() -> None:
 
 
 def test_adjudicated_actions() -> None:
+    # v1.1: PC has zero actions on a VIOLATION -- not even REMARK.
     pc = permitted_actions(finding_class="VIOLATION", role="PC", finding_status="OPEN")
-    assert pc == ["REMARK"]  # PC can only comment on a violation
+    assert pc == []
     tl = permitted_actions(finding_class="VIOLATION", role="TL", finding_status="ACKNOWLEDGED")
     assert "CONFIRM_BREACH" in tl and "MARK_FALSE_POSITIVE" in tl
+    # TL's other two verdicts: Take Action (assign to PC) and Escalate (hand to PM).
+    assert "TAKE_ACTION" in tl and "ESCALATE" in tl
     # RESOLVE stays available as a plain close for TL and above
     assert "RESOLVE" in tl
 

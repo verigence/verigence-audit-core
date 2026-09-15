@@ -37,6 +37,15 @@ from audit_core.uc03_finding_routing import (
     sla_due_at,
 )
 
+# Reused, not duplicated: uc03_tl_supervisory.py already looks up "the PC
+# who submitted this Booking" for its own document-reupload-request Task;
+# Take Action needs the exact same lookup. Importing a private helper
+# across these modules already matches this codebase's own convention
+# (uc03_tl_supervisory.py itself imports _aggregate_lock/_parse_if_match
+# from uc03_booking_commands the same way).
+from audit_core.uc03_tl_supervisory import _responsible_pc_actor
+from audit_core.workflow import create_workflow_task
+
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/journeys/{journey_id}/uc03",
     tags=["uc03-audit"],
@@ -45,7 +54,7 @@ router = APIRouter(
 StageCode = Literal["BOOKING", "DELIVERY"]
 FlagAction = Literal[
     "ACKNOWLEDGE", "REVIEW", "RESOLVE", "REOPEN", "VOID",
-    "CONFIRM_BREACH", "MARK_FALSE_POSITIVE",
+    "CONFIRM_BREACH", "MARK_FALSE_POSITIVE", "TAKE_ACTION", "ESCALATE",
 ]
 
 # Human-readable label for an action code -- used in error titles instead of
@@ -58,7 +67,20 @@ _ACTION_LABEL: dict[str, str] = {
     "VOID": "Void",
     "CONFIRM_BREACH": "Confirm Breach",
     "MARK_FALSE_POSITIVE": "Mark False Positive",
+    "TAKE_ACTION": "Take Action",
+    "ESCALATE": "Escalate to PM",
 }
+
+# v1.1 design: a required category alongside the existing 50-word free-text
+# remark on Reject (Mark False Positive) -- cheap now, avoids retrofitting
+# categorization onto historical rejections later for Compliance reporting.
+_REJECTION_CATEGORIES = {
+    "NOT_APPLICABLE", "DATA_ALREADY_CORRECT", "SYSTEM_MISCLASSIFIED",
+    "DUPLICATE", "OTHER",
+}
+_REJECT_REMARK_MAX_WORDS = 50
+# Escalate walks one step up this ladder from the finding's current owner.
+_ROLE_LADDER = ("PC", "TL", "PM", "EXECUTIVE")
 
 _HUMAN_FLAG_CATEGORIES = {
     "PHYSICAL_OBSERVATION",
@@ -81,24 +103,38 @@ _PERMISSION_BY_OPERATION = {
     "REVIEW": "audit.review.decide",
     "CONFIRM_BREACH": "audit.review.decide",
     "MARK_FALSE_POSITIVE": "audit.review.decide",
+    "TAKE_ACTION": "audit.review.decide",
+    "ESCALATE": "audit.review.decide",
     "RESOLVE": "audit.finding.resolve",
     "REOPEN": "audit.finding.resolve",
     "VOID": "audit.finding.resolve",
     "COMPLETE_AUDIT": "audit.journey.update",
 }
 
+# v1.1 design: "PC can't edit or update Audit Findings directly, PC should
+# only work on Task Assigned" -- read narrowly as touching an EXISTING
+# finding (REMARK/RESOLVE/verdict actions), not as removing a PC's ability
+# to raise a brand-new observation (a physical-inspection note at delivery,
+# PHYSICAL_OBSERVATION, is a real and still-legitimate PC action; nothing
+# in the discussion asked for that to go away). RAISE stays open to PC;
+# every action that touches a finding already on record now requires TL+.
+# A self-serve finding still normally closes itself once its auto-spawned
+# Task is completed and the underlying gap is actually fixed -- TL/PM's own
+# RESOLVE here is a manual override, not how PC participates.
 _DEFAULT_ROLE_POLICY: dict[str, set[str]] = {
     "READ": {"PC", "TL", "PM", "EXECUTIVE"},
     "RAISE": {"PC", "TL", "PM", "EXECUTIVE"},
-    "REMARK": {"PC", "TL", "PM", "EXECUTIVE"},
+    "REMARK": {"TL", "PM", "EXECUTIVE"},
     "ACKNOWLEDGE": {"TL", "PM", "EXECUTIVE"},
     "REVIEW": {"TL", "PM", "EXECUTIVE"},
-    # Confirm Breach / Mark False Positive a VIOLATION: TL first, PM on escalation.
+    # TL's four verdicts on a VIOLATION: Accept (Confirm Breach) / Reject
+    # (Mark False Positive) / Take Action (assign to PC) / Escalate (hand
+    # to PM). PM has the identical set once escalated to.
     "CONFIRM_BREACH": {"TL", "PM", "EXECUTIVE"},
     "MARK_FALSE_POSITIVE": {"TL", "PM", "EXECUTIVE"},
-    # A self-serve DATA_GAP / DOCUMENT_GAP is resolved by its PC owner; TL/PM may
-    # also close it. Adjudicated findings never take the plain RESOLVE path.
-    "RESOLVE": {"PC", "TL", "PM", "EXECUTIVE"},
+    "TAKE_ACTION": {"TL", "PM", "EXECUTIVE"},
+    "ESCALATE": {"TL", "PM", "EXECUTIVE"},
+    "RESOLVE": {"TL", "PM", "EXECUTIVE"},
     "REOPEN": {"TL", "PM", "EXECUTIVE"},
     # TL/PM void is configurable in the catalog; the conservative Phase-1 default
     # is Executive only unless the published Project policy overrides it.
@@ -138,13 +174,35 @@ class FlagLifecycleCommand(BaseModel):
     remarks: str | None = Field(default=None, max_length=4000)
     resolutionReason: str | None = Field(default=None, max_length=4000)
     evidenceIds: list[UUID] = Field(default_factory=list, max_length=20)
+    # TAKE_ACTION only: the severity TL sets on the Task it spawns for PC.
+    severity: str | None = Field(default=None, max_length=20)
+    # MARK_FALSE_POSITIVE only: the required category alongside the
+    # existing free-text remark (v1.1 design).
+    rejectionCategory: str | None = Field(default=None, max_length=40)
 
     @model_validator(mode="after")
     def require_reason_for_terminal_or_reopen(self):
-        if self.action in {"RESOLVE", "REOPEN", "VOID", "CONFIRM_BREACH", "MARK_FALSE_POSITIVE"}:
+        if self.action in {
+            "RESOLVE", "REOPEN", "VOID", "CONFIRM_BREACH", "MARK_FALSE_POSITIVE",
+            "TAKE_ACTION", "ESCALATE",
+        }:
             reason = (self.resolutionReason or self.remarks or "").strip()
             if not reason:
-                raise ValueError("A reason is required for resolve, reopen, or void actions")
+                raise ValueError("A reason is required for this action.")
+            if self.action == "MARK_FALSE_POSITIVE":
+                word_count = len(reason.split())
+                if word_count > _REJECT_REMARK_MAX_WORDS:
+                    raise ValueError(
+                        f"Reject remarks must be {_REJECT_REMARK_MAX_WORDS} words "
+                        f"or fewer (got {word_count})."
+                    )
+                if (self.rejectionCategory or "").strip().upper() not in _REJECTION_CATEGORIES:
+                    raise ValueError(
+                        "rejectionCategory is required to Reject a finding, and must "
+                        f"be one of {sorted(_REJECTION_CATEGORIES)}."
+                    )
+        if self.action == "TAKE_ACTION" and not (self.severity or "").strip():
+            raise ValueError("severity is required when taking action.")
         return self
 
 
@@ -190,6 +248,14 @@ class FlagView(BaseModel):
     escalationLevel: int
     overdue: bool
     permittedActions: list[str] = Field(default_factory=list)
+    # v1.1 additions
+    rejectionCategory: str | None = None
+    escalationPriority: str | None = None
+    # How many times this finding has bounced PC->TL->PC (count of
+    # TL_TAKE_ACTION tasks raised against it) -- the visible round-counter
+    # guardrail from the v1.1 design, so a stuck item is visible without
+    # anyone having to notice by hand.
+    bounceCount: int = 0
 
 
 class FlagMutationResponse(BaseModel):
@@ -416,7 +482,8 @@ def _finding(
                    observed_summary, resolution_reason, stage_code, origin_kind,
                    origin_actor_id, origin_role_snapshot, rule_key, rule_version_id,
                    blocking_completion, version_no, created_at_utc, updated_at_utc,
-                   finding_class, owner_role_code, sla_due_at_utc, disposition
+                   finding_class, owner_role_code, sla_due_at_utc, disposition,
+                   rejection_category, escalation_priority
             FROM auditcore.audit_findings
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
               AND audit_finding_id=:flag_id
@@ -655,6 +722,20 @@ def _flag_view(
             role=role,
             finding_status=row["finding_status"],
         ),
+        rejectionCategory=row.get("rejection_category"),
+        escalationPriority=row.get("escalation_priority"),
+        bounceCount=int(
+            connection.execute(
+                text(
+                    """
+                    SELECT count(*) FROM auditcore.workflow_tasks
+                    WHERE tenant_id=:tenant_id AND related_finding_id=:flag_id
+                      AND task_type='TL_TAKE_ACTION'
+                    """
+                ),
+                {"tenant_id": tenant_id, "flag_id": row["audit_finding_id"]},
+            ).scalar_one()
+        ),
     )
 
 
@@ -664,7 +745,8 @@ _FLAG_LIST_COLUMNS = """
     observed_summary, resolution_reason, stage_code, origin_kind,
     origin_actor_id, origin_role_snapshot, rule_key, rule_version_id,
     blocking_completion, version_no, created_at_utc, updated_at_utc,
-    finding_class, owner_role_code, sla_due_at_utc, disposition
+    finding_class, owner_role_code, sla_due_at_utc, disposition,
+    rejection_category, escalation_priority
 """
 
 
@@ -766,6 +848,8 @@ def _role_permitted_actions(context: dict[str, Any]) -> list[str]:
         "REVIEW",
         "CONFIRM_BREACH",
         "MARK_FALSE_POSITIVE",
+        "TAKE_ACTION",
+        "ESCALATE",
         "RESOLVE",
         "REOPEN",
         "VOID",
@@ -804,6 +888,11 @@ def _transition(action: FlagAction, current_status: str) -> str:
         "RESOLVE": ({"OPEN", "ACKNOWLEDGED"}, "RESOLVED"),
         "CONFIRM_BREACH": ({"OPEN", "ACKNOWLEDGED"}, "RESOLVED"),
         "MARK_FALSE_POSITIVE": ({"OPEN", "ACKNOWLEDGED"}, "RESOLVED"),
+        # Neither closes the finding -- Take Action hands work to PC and
+        # Escalate hands the verdict to PM; both leave it open, acknowledged
+        # by whoever just acted, awaiting the next step.
+        "TAKE_ACTION": ({"OPEN", "ACKNOWLEDGED"}, "ACKNOWLEDGED"),
+        "ESCALATE": ({"OPEN", "ACKNOWLEDGED"}, "ACKNOWLEDGED"),
         "REOPEN": ({"RESOLVED"}, "OPEN"),
         "VOID": ({"OPEN", "ACKNOWLEDGED", "RESOLVED"}, "VOIDED"),
     }
@@ -1182,10 +1271,13 @@ def act_on_flag(
             row["rule_key"], row["finding_type_code"]
         )
         resolution_mode = class_profile(finding_class).resolution_mode
-        # Confirm Breach / Mark False Positive are verdicts on a rule breach —
-        # only for adjudicated findings (VIOLATION). A data / document gap is
-        # fixed, not adjudicated.
-        if payload.action in {"CONFIRM_BREACH", "MARK_FALSE_POSITIVE"} and resolution_mode != "ADJUDICATED":
+        # Accept / Reject / Take Action / Escalate are TL's four verdicts on
+        # a rule breach — only for adjudicated findings (VIOLATION). A data /
+        # document gap is fixed by its auto-spawned Task, not adjudicated.
+        if (
+            payload.action in {"CONFIRM_BREACH", "MARK_FALSE_POSITIVE", "TAKE_ACTION", "ESCALATE"}
+            and resolution_mode != "ADJUDICATED"
+        ):
             raise AuthorizationError(
                 error_code="VAC-AUTH-005",
                 status_code=403,
@@ -1194,6 +1286,28 @@ def act_on_flag(
                     f"available for a {finding_class.replace('_', ' ').lower()}"
                 ),
             )
+        # Race-condition guardrail (v1.1 design): at most one open Task per
+        # Finding at a time. Take Action always creates one; Escalate must
+        # not leave an existing one orphaned with two people each thinking
+        # they're the next step.
+        if payload.action in {"TAKE_ACTION", "ESCALATE"}:
+            open_task = connection.execute(
+                text(
+                    """
+                    SELECT workflow_task_id FROM auditcore.workflow_tasks
+                    WHERE tenant_id=:tenant_id AND related_finding_id=:flag_id
+                      AND task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT')
+                    LIMIT 1
+                    """
+                ),
+                {"tenant_id": tenant_id, "flag_id": flag_id},
+            ).scalar_one_or_none()
+            if open_task is not None:
+                raise ConflictError(
+                    error_code="VAC-CONFLICT-011",
+                    title="A task is already open on this finding",
+                    detail="Wait for the assigned Task to complete, or cancel it, before taking this action again.",
+                )
         # A PC may close their own data / document gap, but never a VIOLATION —
         # that needs a TL / PM verdict.
         if (
@@ -1222,6 +1336,24 @@ def act_on_flag(
         )
         reason = (payload.resolutionReason or payload.remarks or "").strip() or None
         disposition = _ACTION_DISPOSITION.get(payload.action)
+        rejection_category = (
+            payload.rejectionCategory.strip().upper()
+            if payload.action == "MARK_FALSE_POSITIVE" and payload.rejectionCategory
+            else None
+        )
+        # Escalate hands ownership to the next role up the ladder (TL -> PM,
+        # PM -> EXECUTIVE) and tags the escalation itself high-priority --
+        # the finding's own severity (the rule's original assessment) is
+        # deliberately never overwritten (v1.1 design).
+        escalated_owner_role = None
+        escalation_priority = None
+        if payload.action == "ESCALATE":
+            try:
+                current_rank = _ROLE_LADDER.index(_normalize_role(row["owner_role_code"] or "TL"))
+            except ValueError:
+                current_rank = _ROLE_LADDER.index("TL")
+            escalated_owner_role = _ROLE_LADDER[min(current_rank + 1, len(_ROLE_LADDER) - 1)]
+            escalation_priority = "HIGH"
         connection.execute(
             text(
                 """
@@ -1238,6 +1370,12 @@ def act_on_flag(
                         WHEN :set_disposition THEN CAST(:disposition AS varchar)
                         ELSE disposition
                     END,
+                    rejection_category=CASE
+                        WHEN :action='MARK_FALSE_POSITIVE' THEN CAST(:rejection_category AS varchar)
+                        ELSE rejection_category
+                    END,
+                    owner_role_code=COALESCE(CAST(:escalated_owner_role AS varchar), owner_role_code),
+                    escalation_priority=COALESCE(CAST(:escalation_priority AS varchar), escalation_priority),
                     updated_at_utc=now(), version_no=version_no+1
                 WHERE tenant_id=:tenant_id AND audit_finding_id=:flag_id
                 """
@@ -1250,8 +1388,63 @@ def act_on_flag(
                 "reason": reason,
                 "set_disposition": disposition is not None,
                 "disposition": disposition,
+                "rejection_category": rejection_category,
+                "escalated_owner_role": escalated_owner_role,
+                "escalation_priority": escalation_priority,
             },
         )
+        # Race-condition guardrail (v1.1 design), simplified from an earlier
+        # proposal to block Escalate while a Task is open: closing a Finding
+        # always cleans up after itself instead. This one rule needs to
+        # apply no matter WHICH of this codebase's several finding-resolving
+        # code paths closes it (this handler, or any of the automated
+        # self-serve auto-resolvers) -- implemented once, as a trigger on
+        # auditcore.audit_findings (migration 0098), not duplicated here.
+        if payload.action == "TAKE_ACTION":
+            # Best-effort specific assignee; a Delivery-stage finding (or any
+            # journey without a recorded Booking-capture submitter yet) has
+            # no resolvable actor for this lookup -- fall back to role-only
+            # assignment (any PC with business-scope access can claim it)
+            # rather than failing the whole Take Action over an assignee
+            # that doesn't exist yet.
+            try:
+                pc_actor_id = _responsible_pc_actor(
+                    connection, tenant_id=tenant_id, journey_id=journey_id
+                )
+            except AuditCoreError:
+                pc_actor_id = None
+            round_no = int(
+                connection.execute(
+                    text(
+                        """
+                        SELECT count(*) FROM auditcore.workflow_tasks
+                        WHERE tenant_id=:tenant_id AND related_finding_id=:flag_id
+                          AND task_type='TL_TAKE_ACTION'
+                        """
+                    ),
+                    {"tenant_id": tenant_id, "flag_id": flag_id},
+                ).scalar_one()
+            ) + 1
+            create_workflow_task(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                workflow_type="UC03_FINDING_TAKE_ACTION",
+                process_area=row["stage_code"],
+                task_type="TL_TAKE_ACTION",
+                assigned_role_code="PC",
+                assigned_actor_id=pc_actor_id,
+                related_finding_id=flag_id,
+                task_payload={
+                    "comment": reason,
+                    "severity": (payload.severity or "").strip().upper(),
+                    "issuedByActorId": human_principal.subject,
+                    "issuedByRole": context["operating_role"],
+                    "round": round_no,
+                },
+                effect_key=f"task:{flag_id}:round:{round_no}",
+                correlation_id=correlation_id,
+            )
         # Unified Documents review (2026-09-13): a Confirm-Breach verdict on a
         # DI_VALUE_CORRECTION_PROPOSED finding actually applies the proposed
         # value -- the one place this generic handler has a finding-type-

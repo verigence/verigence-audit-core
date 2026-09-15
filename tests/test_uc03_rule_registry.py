@@ -87,9 +87,11 @@ def test_rule_catalog_returns_seeded_audit_core_rules_grouped_by_category(
     assert wrong_document.rerunPolicy == "RERUNNABLE"
     assert wrong_document.findingClass == "VIOLATION"
     assert "DOCUMENT_SYNCED" in wrong_document.triggerEvents
-    # VIOLATION -> ADJUDICATED -> the adjudicated bound-action set (0084).
+    # VIOLATION -> ADJUDICATED -> the adjudicated bound-action set (0084,
+    # extended by 0098 with v1.1's Take Action/Escalate verdicts).
     assert set(wrong_document.boundActions) == {
-        "REMARK", "ACKNOWLEDGE", "CONFIRM_BREACH", "MARK_FALSE_POSITIVE", "RESOLVE",
+        "REMARK", "ACKNOWLEDGE", "CONFIRM_BREACH", "MARK_FALSE_POSITIVE",
+        "TAKE_ACTION", "ESCALATE", "RESOLVE",
     }
     assert wrong_document.blockingCompletion is False
 

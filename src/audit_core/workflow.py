@@ -28,6 +28,7 @@ def create_workflow_task(
     task_payload: dict[str, Any] | None = None,
     effect_key: str | None = None,
     correlation_id: str | None = None,
+    related_finding_id: UUID | None = None,
 ) -> UUID:
     workflow_instance_id = connection.execute(
         text(
@@ -53,12 +54,14 @@ def create_workflow_task(
                 tenant_id, workflow_instance_id, journey_id,
                 process_area, task_type, assigned_role_code,
                 assigned_actor_id, dealer_id, outlet_id,
-                task_payload, effect_key, correlation_id
+                task_payload, effect_key, correlation_id,
+                related_finding_id
             ) VALUES (
                 :tenant_id, :workflow_instance_id, :journey_id,
                 :process_area, :task_type, :assigned_role_code,
                 :assigned_actor_id, :dealer_id, :outlet_id,
-                CAST(:task_payload AS jsonb), :effect_key, :correlation_id
+                CAST(:task_payload AS jsonb), :effect_key, :correlation_id,
+                :related_finding_id
             ) RETURNING workflow_task_id
             """
         ),
@@ -75,6 +78,7 @@ def create_workflow_task(
             "task_payload": json.dumps(task_payload or {}),
             "effect_key": effect_key,
             "correlation_id": correlation_id,
+            "related_finding_id": related_finding_id,
         },
     ).scalar_one()
     _append_task_event(

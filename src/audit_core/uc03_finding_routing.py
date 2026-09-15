@@ -266,28 +266,41 @@ def permitted_actions(
     role: str,
     finding_status: str,
 ) -> list[str]:
-    """Actions this role may take on a finding of this class in this state."""
+    """Actions this role may take on a finding of this class in this state.
+
+    A PC never acts on a Finding directly (v1.1 design: PC's whole world is
+    the Task it's assigned, not the Finding record) -- every action here
+    requires TL or above, for both self-serve and adjudicated findings.
+    A self-serve finding still normally resolves itself once its
+    auto-spawned Task is completed and the underlying gap is actually
+    fixed; TL/PM's own RESOLVE here is the manual override, not the normal
+    path.
+    """
     profile = class_profile(finding_class)
     role_norm = (role or "").strip().upper()
     if role_norm in {"EXEC", "EXECUTIVE"}:
         role_norm = "EXECUTIVE"
     rank = _role_rank(role_norm)
+    is_tl_or_above = rank >= _role_rank("TL")
     status = (finding_status or "").upper()
     actions: list[str] = []
 
-    if status in _OPEN_STATUSES:
+    if status in _OPEN_STATUSES and is_tl_or_above:
         actions.append("REMARK")
 
     if profile.resolution_mode == "SELF_SERVICE":
-        # the PC owner and anyone above can mark a self-serve gap fixed
-        if status in _OPEN_STATUSES and rank >= 0:
+        if status in _OPEN_STATUSES and is_tl_or_above:
             actions.append("RESOLVE")
-    elif status in _OPEN_STATUSES and rank >= _role_rank("TL"):  # ADJUDICATED
-        # Confirm Breach / Mark False Positive are the meaningful verdicts on
-        # a violation; RESOLVE stays available as a plain close for TL+.
+    elif status in _OPEN_STATUSES and is_tl_or_above:  # ADJUDICATED
+        # Accept (Confirm Breach) / Reject (Mark False Positive) / Take
+        # Action (assign to PC with a comment + severity) / Escalate (hand
+        # to PM) are TL's four verdicts on a violation; RESOLVE stays
+        # available as a plain close for TL+.
         actions.append("ACKNOWLEDGE")
         actions.append("CONFIRM_BREACH")
         actions.append("MARK_FALSE_POSITIVE")
+        actions.append("TAKE_ACTION")
+        actions.append("ESCALATE")
         actions.append("RESOLVE")
 
     if status == "RESOLVED" and rank >= _role_rank("TL"):

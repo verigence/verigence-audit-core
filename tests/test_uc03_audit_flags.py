@@ -257,8 +257,8 @@ def test_violation_flag_is_routed_to_tl_with_sla(audit_setup):
     assert flag["slaDueAtUtc"] is not None
     assert flag["escalationLevel"] == 0
     assert flag["overdue"] is False
-    # PC raised it but may only comment
-    assert flag["permittedActions"] == ["REMARK"]
+    # v1.1: PC raised it but has zero actions on a VIOLATION -- not even a comment.
+    assert flag["permittedActions"] == []
 
 
 def test_document_gap_flag_is_routed_to_pc(audit_setup):
@@ -268,7 +268,17 @@ def test_document_gap_flag_is_routed_to_pc(audit_setup):
     assert flag["findingClass"] == "DOCUMENT_GAP"
     assert flag["resolutionMode"] == "SELF_SERVICE"
     assert flag["ownerRoleCode"] == "PC"
-    assert "RESOLVE" in flag["permittedActions"]
+    # v1.1: PC never acts on a Finding directly, even a self-serve one -- it
+    # normally closes itself once PC's auto-spawned Task is completed and
+    # the underlying gap is actually fixed. TL/PM's RESOLVE here is a manual
+    # override.
+    assert flag["permittedActions"] == []
+    _set_role(audit_setup, "TL")
+    as_tl = _client().get(
+        f"{_base(audit_setup)}/flags?stage=BOOKING"
+    ).json()
+    tl_view = next(item for item in as_tl if item["flagId"] == flag["flagId"])
+    assert "RESOLVE" in tl_view["permittedActions"]
 
 
 def test_tl_accepts_violation_and_records_confirmed_breach(audit_setup):
@@ -295,7 +305,11 @@ def test_tl_rejects_violation_and_records_not_a_breach(audit_setup):
     rejected = _client().post(
         f"{_base(audit_setup)}/flags/{flag['flagId']}/actions",
         headers={"Idempotency-Key": "adj-reject-act-01", "If-Match": '"1"'},
-        json={"action": "MARK_FALSE_POSITIVE", "resolutionReason": "Within approved deviation"},
+        json={
+            "action": "MARK_FALSE_POSITIVE",
+            "resolutionReason": "Within approved deviation",
+            "rejectionCategory": "NOT_APPLICABLE",
+        },
     )
     assert rejected.status_code == 200, rejected.text
     assert rejected.json()["flag"]["disposition"] == "FALSE_POSITIVE"
@@ -802,9 +816,12 @@ def test_timeline_is_bounded(audit_setup):
 def test_summary_exposes_role_capabilities_without_client_side_authority(audit_setup):
     pc = _client().get(f"{_base(audit_setup)}/audit-summary")
     assert pc.status_code == 200
+    # v1.1: PC can still RAISE a new observation, but never touches an
+    # existing Finding directly -- not even its own self-serve gap, which
+    # normally closes itself via PC's own auto-spawned Task instead.
     assert "RAISE" in pc.json()["permittedActions"]
-    # A PC may close their own data / document gap, but never adjudicate:
-    assert "RESOLVE" in pc.json()["permittedActions"]
+    assert "RESOLVE" not in pc.json()["permittedActions"]
+    assert "REMARK" not in pc.json()["permittedActions"]
     assert "CONFIRM_BREACH" not in pc.json()["permittedActions"]
     assert "MARK_FALSE_POSITIVE" not in pc.json()["permittedActions"]
     assert "ACKNOWLEDGE" not in pc.json()["permittedActions"]
@@ -814,6 +831,8 @@ def test_summary_exposes_role_capabilities_without_client_side_authority(audit_s
     assert tl.status_code == 200
     assert "RESOLVE" in tl.json()["permittedActions"]
     assert "CONFIRM_BREACH" in tl.json()["permittedActions"]
+    assert "TAKE_ACTION" in tl.json()["permittedActions"]
+    assert "ESCALATE" in tl.json()["permittedActions"]
     assert "VOID" not in tl.json()["permittedActions"]
 
     _set_role(audit_setup, "EXECUTIVE")
