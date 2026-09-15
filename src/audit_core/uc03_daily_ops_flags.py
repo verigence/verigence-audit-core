@@ -54,13 +54,11 @@ from audit_core.idempotency import execute_idempotent_json_command
 from audit_core.observability import get_correlation_id
 from audit_core.security import Principal
 from audit_core.uc03_audit_flags import (
-    _ACTION_DISPOSITION,
-    _ACTION_LABEL,
     _HUMAN_FLAG_CATEGORIES,
     FlagLifecycleCommand,
     FlagRemarkCommand,
     _normalize_role,
-    _transition,
+    apply_finding_verdict,
 )
 from audit_core.uc03_finding_routing import (
     class_profile,
@@ -70,6 +68,7 @@ from audit_core.uc03_finding_routing import (
     resolve_sla_policy,
     sla_due_at,
 )
+from audit_core.workflow import create_workflow_task
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/outlets/{outlet_id}/daily-ops/{daily_ops_run_id}",
@@ -390,6 +389,24 @@ def create_daily_ops_flag(
                 "owner_role_code": profile.owner_role, "sla_due_at": due_at,
             },
         ).scalar_one()
+        # v1.1 design: "a PC never opens a Finding" -- a self-serve gap
+        # auto-spawns a Task for PC the instant it's raised, matching the
+        # journey-side create_flag/​_machine_flag behaviour exactly.
+        if finding_class in {"DATA_GAP", "DOCUMENT_GAP"}:
+            create_workflow_task(
+                connection,
+                tenant_id=tenant_id,
+                daily_ops_run_id=daily_ops_run_id,
+                workflow_type="UC03_SELF_SERVE_FINDING",
+                process_area="DAILY_OPS",
+                task_type="AUTO_SELF_SERVE",
+                assigned_role_code="PC",
+                related_finding_id=flag_id,
+                severity=severity,
+                task_payload={"category": category, "findingId": str(flag_id)},
+                effect_key=f"task:{flag_id}:round:0",
+                correlation_id=correlation_id,
+            )
         event_id = _append_event(
             connection, tenant_id=tenant_id, daily_ops_run_id=daily_ops_run_id, flag_id=flag_id,
             event_type="RAISED", actor_id=principal.subject, actor_role=context["operating_role"],
@@ -445,43 +462,27 @@ def act_on_daily_ops_flag(
             )
         finding_class = row["finding_class"] or classify_finding(None, row["finding_type_code"])
         resolution_mode = class_profile(finding_class).resolution_mode
-        if payload.action in {"CONFIRM_BREACH", "MARK_FALSE_POSITIVE"} and resolution_mode != "ADJUDICATED":
-            raise AuthorizationError(
-                error_code="VAC-AUTH-005", status_code=403,
-                title=f"{_ACTION_LABEL.get(payload.action, payload.action)} is not available for a {finding_class.replace('_', ' ').lower()}",
-            )
-        if payload.action == "RESOLVE" and context["operating_role"] == "PC" and resolution_mode == "ADJUDICATED":
-            raise AuthorizationError(
-                error_code="VAC-AUTH-005", status_code=403,
-                title="A violation must be Confirmed Breach or Marked False Positive by a Team Lead or PM",
-            )
-        next_status = _transition(payload.action, row["finding_status"])
-        reason = (payload.resolutionReason or payload.remarks or "").strip() or None
-        disposition = _ACTION_DISPOSITION.get(payload.action)
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.audit_findings
-                SET finding_status=:status,
-                    resolution_reason=CASE
-                        WHEN :action IN ('RESOLVE','VOID','CONFIRM_BREACH','MARK_FALSE_POSITIVE') THEN CAST(:reason AS text)
-                        WHEN :action='REOPEN' THEN NULL
-                        ELSE resolution_reason
-                    END,
-                    disposition=CASE
-                        WHEN :action='REOPEN' THEN NULL
-                        WHEN :set_disposition THEN CAST(:disposition AS varchar)
-                        ELSE disposition
-                    END,
-                    updated_at_utc=now(), version_no=version_no+1
-                WHERE tenant_id=:tenant_id AND audit_finding_id=:flag_id
-                """
-            ),
-            {
-                "tenant_id": tenant_id, "flag_id": flag_id, "status": next_status, "action": payload.action,
-                "reason": reason, "set_disposition": disposition is not None, "disposition": disposition,
-            },
+        # Shared with the journey flag-actions endpoint (uc03_audit_flags.py)
+        # -- same four TL/PM verdicts (Accept/Reject/Take Action/Escalate),
+        # the same guards, and the same Take-Action task spawn, just scoped
+        # to daily_ops_run_id instead of journey_id.
+        verdict = apply_finding_verdict(
+            connection,
+            tenant_id=tenant_id,
+            flag_id=flag_id,
+            journey_id=None,
+            daily_ops_run_id=daily_ops_run_id,
+            process_area="DAILY_OPS",
+            finding_class=finding_class,
+            resolution_mode=resolution_mode,
+            current_status=row["finding_status"],
+            current_owner_role=row["owner_role_code"],
+            payload=payload,
+            operating_role=context["operating_role"],
+            actor_id=principal.subject,
+            correlation_id=correlation_id,
         )
+        next_status = verdict["next_status"]
         event_id = _append_event(
             connection, tenant_id=tenant_id, daily_ops_run_id=daily_ops_run_id, flag_id=flag_id,
             event_type=payload.action, actor_id=principal.subject, actor_role=context["operating_role"],

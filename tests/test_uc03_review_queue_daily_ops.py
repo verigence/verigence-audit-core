@@ -22,7 +22,10 @@ from audit_core.uc03_daily_ops_flags import (
     create_daily_ops_flag,
 )
 from audit_core.uc03_finding_routing import resolve_sla_policy
-from audit_core.uc03_review_queue import _load_daily_ops_queue
+from audit_core.uc03_review_queue import (
+    _load_daily_ops_queue,
+    _load_daily_ops_task_queue,
+)
 
 
 def _principal(actor_id: str, tenant_id: str) -> Principal:
@@ -116,4 +119,35 @@ def test_daily_ops_flag_appears_in_the_shared_review_queue(daily_ops_queue_setup
     assert item.stage is None
     assert item.findingClass == "DATA_GAP"
     assert item.isMine is True
+    assert escalated is False
+
+
+def test_daily_ops_self_serve_flag_auto_spawns_a_task(daily_ops_queue_setup) -> None:
+    """v1.1: "a PC never opens a Finding" applies to Daily Operations too --
+    a self-serve (DATA_GAP/DOCUMENT_GAP) flag auto-spawns a Task the same
+    way a journey one does (uc03_audit_flags.py::create_flag), now that
+    workflow_tasks/workflow_instances can be Daily-Ops-scoped (migration
+    0099)."""
+    setup = daily_ops_queue_setup
+    raised = create_daily_ops_flag(
+        setup.tenant_id, setup.outlet_id, setup.run_id,
+        DailyOpsFlagCreateCommand(category="PAYMENT_EXCEPTION", severity="HIGH", summary="Cash count mismatch"),
+        _request(), Response(), idempotency_key=f"idem-{uuid4()}", if_match='"1"',
+        principal=_principal(setup.pc_actor_id, setup.tenant_id), connection=setup.connection,
+    )
+
+    tasks = _load_daily_ops_task_queue(
+        setup.connection, tenant_id=setup.tenant_id, actor_id=setup.pc_actor_id,
+        roles=["PC"], now=datetime.now(UTC),
+    )
+    assert len(tasks) == 1
+    task, escalated = tasks[0]
+    assert task.itemKind == "EXECUTION_TASK"
+    assert task.subjectKind == "DAILY_OPS"
+    assert task.dailyOpsRunId == setup.run_id
+    assert task.relatedFindingId == raised.flag.flagId
+    assert task.category == "AUTO_SELF_SERVE"
+    assert task.severity == "HIGH"
+    assert task.isOpen is True
+    assert task.isMine is True
     assert escalated is False
