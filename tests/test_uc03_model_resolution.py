@@ -872,6 +872,17 @@ def test_confirm_model_resolution_sku_pins_resolves_and_completes_task(journey) 
     # running AFTER that mutation (in the same transaction) that misbehaves
     # (the earlier bisection calling _complete_self_serve_tasks BEFORE the
     # Finding mutation passed, which doesn't rule out that ordering).
+    def _full_row() -> dict:
+        return dict(c.execute(
+            text(
+                "SELECT task_status, version_no, updated_at_utc, cancelled_at_utc, "
+                "cancel_reason, completed_at_utc, lease_owner, effect_key "
+                "FROM auditcore.workflow_tasks WHERE tenant_id=:t AND workflow_task_id=:tid"
+            ),
+            {"t": c.tenant_id, "tid": task_id},
+        ).mappings().one())
+
+    row_before = _full_row()
     c.execute(
         text(
             """
@@ -884,6 +895,7 @@ def test_confirm_model_resolution_sku_pins_resolves_and_completes_task(journey) 
         ),
         {"t": c.tenant_id, "fid": finding_id},
     )
+    row_after_update = _full_row()
     c.execute(
         text(
             """
@@ -897,10 +909,10 @@ def test_confirm_model_resolution_sku_pins_resolves_and_completes_task(journey) 
         ),
         {"t": c.tenant_id, "fid": finding_id, "j": c.journey_id},
     )
-    status_after_finding_mutation_alone = _status()
-    assert status_after_finding_mutation_alone == "READY", (
-        f"status after the Finding's own UPDATE/INSERT, before "
-        f"_complete_self_serve_tasks ran at all: {status_after_finding_mutation_alone!r}"
+    row_after_insert = _full_row()
+    assert row_after_update["task_status"] == "READY" and row_after_insert["task_status"] == "READY", (
+        f"before={row_before}; after UPDATE audit_findings={row_after_update}; "
+        f"after INSERT audit_finding_events={row_after_insert}"
     )
 
     mr._complete_self_serve_tasks(
