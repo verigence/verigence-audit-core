@@ -62,7 +62,6 @@ from audit_core.uc03_sku_candidates import (
 from audit_core.uc03_v2_review_materialization import (
     _INVOICE_DOCUMENT_TYPES as _DELIVERY_INVOICE_DOCUMENT_TYPES,
 )
-from audit_core.workflow import complete_workflow_task
 
 logger = logging.getLogger(__name__)
 
@@ -393,31 +392,6 @@ def _pin_sku(connection: Connection, *, tenant_id: str, journey_id: UUID, produc
     )
 
 
-def _complete_self_serve_tasks(
-    connection: Connection, *, tenant_id: str, related_finding_id: UUID, actor_id: str
-) -> None:
-    """Complete any still-open Task spawned for a finding once that finding
-    itself resolves -- otherwise the Task Queue keeps showing a PC an action
-    item for a gap that no longer exists (the automatic-match path used to
-    leave these orphaned since only a human's own "Mark done" click ever
-    completed a Task; a system/PC-driven resolve now closes it directly)."""
-    task_ids = connection.execute(
-        text(
-            """
-            SELECT workflow_task_id
-            FROM auditcore.workflow_tasks
-            WHERE tenant_id = :tenant_id AND related_finding_id = :finding_id
-              AND task_status NOT IN ('COMPLETED', 'CANCELLED', 'FAILED', 'DEAD_LETTER')
-            """
-        ),
-        {"tenant_id": tenant_id, "finding_id": related_finding_id},
-    ).scalars().all()
-    for task_id in task_ids:
-        complete_workflow_task(
-            connection, tenant_id=tenant_id, workflow_task_id=task_id, actor_id=actor_id
-        )
-
-
 def _resolve_open_flag(
     connection: Connection,
     *,
@@ -426,6 +400,22 @@ def _resolve_open_flag(
     correlation_id: str,
     actor_id: str | None = None,
 ) -> int:
+    """Resolve any open MODEL_NOT_IDENTIFIED finding for this journey.
+
+    Never needs to touch the linked Task itself: ``sync_finding_work_item``'s
+    trigger (migration 0098) already cancels every still-open Task for a
+    finding the instant its ``finding_status`` flips to RESOLVED/VOIDED, as
+    a codebase-wide guardrail covering every resolve path, not just this
+    one -- adding a second, Python-side completion here would only race
+    that trigger and lose (confirmed: the trigger fires synchronously as
+    part of the very UPDATE below, before any later statement in this same
+    transaction runs).
+
+    ``actor_id`` -- set only by the PC-driven confirm path (the automatic
+    match keeps this NULL/SYSTEM) -- records who actually resolved it in
+    the finding's own event history, instead of every resolution reading
+    as an anonymous system action.
+    """
     open_ids = connection.execute(
         text(
             """
@@ -459,7 +449,7 @@ def _resolve_open_flag(
                     event_type, actor_id, actor_role_snapshot, safe_payload, correlation_id
                 ) VALUES (
                     :tenant_id, :fid, :journey_id, :stage,
-                    'RESOLVED', NULL, 'SYSTEM', CAST(:payload AS jsonb), :correlation_id
+                    'RESOLVED', :actor_id, :actor_role, CAST(:payload AS jsonb), :correlation_id
                 )
                 """
             ),
@@ -468,15 +458,11 @@ def _resolve_open_flag(
                 "fid": finding_id,
                 "journey_id": journey_id,
                 "stage": _STAGE,
+                "actor_id": actor_id,
+                "actor_role": "HUMAN" if actor_id else "SYSTEM",
                 "payload": json.dumps({"disposition": "FIXED", "note": "Model resolved to a single SKU."}),
                 "correlation_id": correlation_id,
             },
-        )
-        _complete_self_serve_tasks(
-            connection,
-            tenant_id=tenant_id,
-            related_finding_id=finding_id,
-            actor_id=actor_id or "SYSTEM",
         )
     return len(open_ids)
 

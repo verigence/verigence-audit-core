@@ -833,109 +833,32 @@ def test_self_serve_task_carries_shortlist_comment_and_candidates(journey) -> No
         assert row["exShowroomPrice"] is not None
 
 
-def test_confirm_model_resolution_sku_pins_resolves_and_completes_task(journey) -> None:
+def test_confirm_model_resolution_sku_pins_resolves_and_closes_task(journey) -> None:
+    """Confirming a shortlisted SKU pins it, resolves the finding (recording
+    the confirming PC as the resolving actor), and -- via the codebase-wide
+    ``sync_finding_work_item`` trigger (migration 0098) that cancels every
+    still-open Task the instant its Finding closes, not any Python code of
+    this module's own -- leaves the spawned Task no longer actionable."""
     c = journey
     _sku_a, sku_b = _seed_ambiguous_thar(c)
     _set_journey_product(c, "Thar", None)
     _set_commercial(c, "total_price", "1670000")
     mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     finding_id = _open_model_finding_id(c)
-    task_id, status_right_after_raise = c.execute(
-        text("SELECT workflow_task_id, task_status FROM auditcore.workflow_tasks "
+    task_id = c.execute(
+        text("SELECT workflow_task_id FROM auditcore.workflow_tasks "
              "WHERE tenant_id=:t AND related_finding_id=:f"),
         {"t": c.tenant_id, "f": finding_id},
-    ).one()
-    assert status_right_after_raise == "READY", (
-        f"task was {status_right_after_raise!r} immediately after sync_model_resolution "
-        "raised it -- before confirm_model_resolution_sku ran at all"
+    ).scalar_one()
+
+    result = mr.confirm_model_resolution_sku(
+        c,
+        tenant_id=c.tenant_id,
+        journey_id=c.journey_id,
+        product_sku_id=sku_b,
+        actor_id="pc-test-actor",
+        correlation_id="",
     )
-
-    def _status() -> str:
-        return c.execute(
-            text("SELECT task_status FROM auditcore.workflow_tasks WHERE tenant_id=:t AND workflow_task_id=:tid"),
-            {"t": c.tenant_id, "tid": task_id},
-        ).scalar_one()
-
-    # Bisecting confirm_model_resolution_sku's own steps (pin -> resolve ->
-    # reconcile) to find exactly which one flips the task to CANCELLED with
-    # no event logged for it -- nothing in any of these three helpers'
-    # source touches workflow_tasks except _resolve_open_flag's own new
-    # _complete_self_serve_tasks call, yet the task ends up CANCELLED.
-    mr._pin_sku(c, tenant_id=c.tenant_id, journey_id=c.journey_id, product_sku_id=sku_b)
-    assert _status() == "READY", f"status after _pin_sku alone: {_status()!r}"
-
-    # Isolate the exact ordering _resolve_open_flag uses: the Finding's own
-    # UPDATE/INSERT FIRST (mirroring its SQL verbatim), THEN a status check
-    # BEFORE _complete_self_serve_tasks runs at all -- to see whether the
-    # Finding mutation alone (with zero task involvement) already corrupts
-    # the task row, or whether it's specifically _complete_self_serve_tasks
-    # running AFTER that mutation (in the same transaction) that misbehaves
-    # (the earlier bisection calling _complete_self_serve_tasks BEFORE the
-    # Finding mutation passed, which doesn't rule out that ordering).
-    def _full_row() -> dict:
-        return dict(c.execute(
-            text(
-                "SELECT task_status, version_no, updated_at_utc, cancelled_at_utc, "
-                "cancel_reason, completed_at_utc, lease_owner, effect_key "
-                "FROM auditcore.workflow_tasks WHERE tenant_id=:t AND workflow_task_id=:tid"
-            ),
-            {"t": c.tenant_id, "tid": task_id},
-        ).mappings().one())
-
-    row_before = _full_row()
-    c.execute(
-        text(
-            """
-            UPDATE auditcore.audit_findings
-            SET finding_status = 'RESOLVED', disposition = 'FIXED',
-                resolved_at_utc = now(), updated_at_utc = now()
-            WHERE tenant_id = :t AND audit_finding_id = :fid
-              AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
-            """
-        ),
-        {"t": c.tenant_id, "fid": finding_id},
-    )
-    row_after_update = _full_row()
-    c.execute(
-        text(
-            """
-            INSERT INTO auditcore.audit_finding_events (
-                tenant_id, audit_finding_id, journey_id, stage_code,
-                event_type, actor_id, actor_role_snapshot, safe_payload, correlation_id
-            ) VALUES (
-                :t, :fid, :j, 'BOOKING', 'RESOLVED', NULL, 'SYSTEM', '{}'::jsonb, ''
-            )
-            """
-        ),
-        {"t": c.tenant_id, "fid": finding_id, "j": c.journey_id},
-    )
-    row_after_insert = _full_row()
-    assert row_after_update["task_status"] == "READY" and row_after_insert["task_status"] == "READY", (
-        f"before={row_before}; after UPDATE audit_findings={row_after_update}; "
-        f"after INSERT audit_finding_events={row_after_insert}"
-    )
-
-    mr._complete_self_serve_tasks(
-        c, tenant_id=c.tenant_id, related_finding_id=finding_id, actor_id="pc-test-actor",
-    )
-    status_after_resolve = _status()
-    if status_after_resolve != "COMPLETED":
-        events = c.execute(
-            text(
-                "SELECT event_type, from_status, to_status, actor_id, actor_type, reason, "
-                "occurred_at_utc FROM auditcore.workflow_task_events "
-                "WHERE tenant_id=:t AND workflow_task_id=:tid ORDER BY occurred_at_utc"
-            ),
-            {"t": c.tenant_id, "tid": task_id},
-        ).mappings().all()
-        raise AssertionError(
-            f"status after _resolve_open_flag alone: {status_after_resolve!r}; "
-            f"event history: {[dict(e) for e in events]}"
-        )
-
-    mr._run_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
-
-    result = {"resolved": True, "productSkuId": sku_b}
     assert result["resolved"] is True
     assert result["productSkuId"] == sku_b
 
@@ -948,20 +871,21 @@ def test_confirm_model_resolution_sku_pins_resolves_and_completes_task(journey) 
     assert row["selection_status"] == "CONFIRMED"
     assert _open_model_flags(c) == 0
 
-    task_status = c.execute(
-        text("SELECT task_status FROM auditcore.workflow_tasks WHERE tenant_id=:t AND workflow_task_id=:tid"),
+    resolve_event = c.execute(
+        text("SELECT actor_id, actor_role_snapshot FROM auditcore.audit_finding_events "
+             "WHERE tenant_id=:t AND audit_finding_id=:f AND event_type='RESOLVED'"),
+        {"t": c.tenant_id, "f": finding_id},
+    ).mappings().one()
+    assert resolve_event["actor_id"] == "pc-test-actor"
+    assert resolve_event["actor_role_snapshot"] == "HUMAN"
+
+    task = c.execute(
+        text("SELECT task_status, cancel_reason FROM auditcore.workflow_tasks "
+             "WHERE tenant_id=:t AND workflow_task_id=:tid"),
         {"t": c.tenant_id, "tid": task_id},
-    ).scalar_one()
-    if task_status != "COMPLETED":
-        events = c.execute(
-            text(
-                "SELECT event_type, from_status, to_status, actor_id, actor_type, reason, "
-                "occurred_at_utc FROM auditcore.workflow_task_events "
-                "WHERE tenant_id=:t AND workflow_task_id=:tid ORDER BY occurred_at_utc"
-            ),
-            {"t": c.tenant_id, "tid": task_id},
-        ).mappings().all()
-        raise AssertionError(f"expected COMPLETED, got {task_status!r}; event history: {[dict(e) for e in events]}")
+    ).mappings().one()
+    assert task["task_status"] == "CANCELLED"
+    assert task["cancel_reason"] == "Finding closed"
 
 
 def test_confirm_model_resolution_sku_rejects_sku_outside_price_list(journey) -> None:
