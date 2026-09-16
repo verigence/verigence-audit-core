@@ -851,6 +851,7 @@ def schedule_delivery_document_checkpoint(
     tenant_id: str,
     journey_id: UUID,
     correlation_id: str,
+    raise_new: bool = True,
 ) -> tuple[list[UUID], list[UUID]]:
     """Re-evaluate Delivery's document-gap findings against current durable
     state: raise DL_V2_REQUIRED_DOCUMENT_MISSING / DL_V2_DOCUMENT_PROCESSING_
@@ -870,6 +871,18 @@ def schedule_delivery_document_checkpoint(
     free connection. Skipping when contended costs nothing -- the document
     that's already running this reads the same current state, and the very
     next confirmed document re-triggers it anyway.
+
+    raise_new=False (the per-document DI-webhook trigger, see
+    uc03_confidence_review_policy.py) still resolves findings that have
+    cleared, but never raises a new one: Delivery routinely has 5-10
+    required documents and a PC uploads them one at a time, so evaluating
+    "is anything still missing" after every single confirm would flag every
+    not-yet-uploaded document as a gap mid-upload -- a false alarm, not a
+    real one, since the PC isn't done yet and nothing has actually been
+    skipped. The genuine gap check -- raising for whatever is still missing
+    once the PC believes Delivery is complete -- runs at Submit
+    (raise_new's default), the same moment schedule_booking_checkpoint_rules
+    plays for Booking.
     """
     acquired = connection.execute(
         text("SELECT pg_try_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
@@ -880,13 +893,17 @@ def schedule_delivery_document_checkpoint(
 
     requirements = _delivery_requirements(connection, tenant_id, journey_id)
     documents = _linked_delivery_documents(connection, tenant_id, journey_id)
-    raised = _raise_delivery_capture_exceptions(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        requirements=requirements,
-        documents=documents,
-        correlation_id=correlation_id,
+    raised = (
+        _raise_delivery_capture_exceptions(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            requirements=requirements,
+            documents=documents,
+            correlation_id=correlation_id,
+        )
+        if raise_new
+        else []
     )
     resolved = _resolve_delivery_capture_exceptions(
         connection,

@@ -174,6 +174,41 @@ def test_processing_failed_finding_self_heals_once_the_document_recovers(deliver
     assert _finding_status(c, rule_key=f"DL_V2_DOCUMENT_PROCESSING_FAILED:{document_id}") == "RESOLVED"
 
 
+def test_raise_new_false_never_raises_but_still_resolves(delivery_journey) -> None:
+    """Regression: the per-document DI-webhook trigger passes raise_new=False
+    so uploading document 1 of 5 doesn't flag documents 2-5 as "missing"
+    while the PC is still mid-upload -- only Submit (raise_new's default)
+    should raise for whatever is genuinely still missing. A finding already
+    raised by an earlier Submit must still self-heal on this path, though --
+    that's a pure improvement, never premature noise."""
+    c = delivery_journey
+    _required_requirement(c, requirement_key="accessory_invoice_dms")
+
+    raised, resolved = schedule_delivery_document_checkpoint(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="test", raise_new=False,
+    )
+    assert not raised
+    assert not resolved
+    assert _finding_status(c, rule_key="DL_V2_REQUIRED_DOCUMENT_MISSING:accessory_invoice_dms") is None
+
+    # A prior Submit already raised it -- the per-document trigger must
+    # still be able to clear it once the document lands.
+    raised, resolved = schedule_delivery_document_checkpoint(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="test",
+    )
+    assert raised
+
+    _capture_document(
+        c, di_document_id=uuid4(), requirement_key="accessory_invoice_dms", capture_status="CLASSIFIED",
+    )
+    raised, resolved = schedule_delivery_document_checkpoint(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="test", raise_new=False,
+    )
+    assert not raised
+    assert resolved
+    assert _finding_status(c, rule_key="DL_V2_REQUIRED_DOCUMENT_MISSING:accessory_invoice_dms") == "RESOLVED"
+
+
 def test_not_applicable_requirement_never_raises_a_missing_document_finding(delivery_journey) -> None:
     c = delivery_journey
     requirement_id = _required_requirement(c, requirement_key="ew_invoice")

@@ -12,14 +12,21 @@ card status only distinguishes PROCESSED/FAILED -- everything else, UNKNOWN
 included, renders as plain "Uploaded". A PC had no way to tell "still being
 classified" from "DI gave up, a human needs to look at this."
 
-This raises one ``DOCUMENT_UNRECOGNIZED`` finding per such document, the
-moment a capture-screen read reconciles Delivery's or Booking's live DI
-document list (uc03_delivery_capture_v2.py / uc03_document_capture_v2.py --
-the same place that state already gets written durably into
-document_capture_v2_documents.capture_status). Carries the document's
-filename and a direct view link so the PC/TL can open it without hunting
-through the capture list themselves. Resolves automatically once the
-document is reclassified (a later DI pass changes its mind) or removed.
+DI simply not recognizing a document isn't a rule violation or a compliance
+gap on its own -- it's a "someone please look at this and say what it
+actually is" -- so this raises a standalone PC_VERIFY_UNRECOGNIZED_DOCUMENT
+Task (no backing Audit Finding at all: workflow_tasks.related_finding_id is
+left NULL) per such document, the moment a capture-screen read reconciles
+Delivery's or Booking's live DI document list (uc03_delivery_capture_v2.py /
+uc03_document_capture_v2.py -- the same place that state already gets
+written durably into document_capture_v2_documents.capture_status). Carries
+the document's filename and a direct view link so the PC can open it without
+hunting through the capture list themselves. The Task auto-cancels once the
+document is reclassified (a later DI pass changes its mind) or removed; a
+PC completing it records one of two outcomes (tasks_api.py's complete_task):
+CORRECT (dismiss, nothing to fix) or INCORRECT (soft-deletes the document by
+marking it SUPERSEDED, same terminal status a re-upload already uses, so a
+later upload can take its place against the same requirement).
 """
 from __future__ import annotations
 
@@ -28,16 +35,17 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
-from audit_core.uc03_delivery_commands import _machine_flag
+from audit_core.workflow import cancel_workflow_task, create_workflow_task
 
-_FINDING_TYPE = "DOCUMENT_UNRECOGNIZED"
-_RULE_PREFIX = "DOCUMENT_UNRECOGNIZED"
+TASK_TYPE = "PC_VERIFY_UNRECOGNIZED_DOCUMENT"
+_WORKFLOW_TYPE = "UC03_DOCUMENT_VERIFICATION"
+_OPEN_TASK_STATUSES = {"PENDING", "READY", "CLAIMED", "IN_PROGRESS", "RETRY_WAIT"}
 
 StageCode = Literal["BOOKING", "DELIVERY"]
 
 
-def _rule_key(stage_code: str, document_id: UUID) -> str:
-    return f"{_RULE_PREFIX}:{stage_code}:{document_id}"
+def _effect_key(tenant_id: str, journey_id: UUID, stage_code: str, document_id: UUID) -> str:
+    return f"task:document-unrecognized:{tenant_id}:{journey_id}:{stage_code}:{document_id}"
 
 
 def _friendly_filename(raw: Any, document_id: UUID) -> str:
@@ -54,9 +62,9 @@ def sync_document_unrecognized_findings(
     di_documents: list[dict[str, Any]],
     correlation_id: str,
 ) -> dict[str, Any]:
-    """Raise a DOCUMENT_UNRECOGNIZED finding for each currently-UNKNOWN
-    document in this read's live DI list; resolve one whose document is no
-    longer UNKNOWN (reclassified, or gone).
+    """Raise a PC_VERIFY_UNRECOGNIZED_DOCUMENT task for each currently-
+    UNKNOWN document in this read's live DI list; cancel one whose document
+    is no longer UNKNOWN (reclassified, or gone).
 
     Best-effort and idempotent -- safe to call on every capture-screen read.
     Never raises; a failure here must never break the read it's piggybacking on.
@@ -70,103 +78,120 @@ def sync_document_unrecognized_findings(
         return {"raised": 0, "resolved": 0, "error": True}
 
     raised = 0
-    live_rules: set[str] = set()
+    live_effect_keys: set[str] = set()
     for item in unrecognized:
         try:
             document_id = UUID(str(item["documentId"]))
         except (KeyError, ValueError):
             continue
-        live_rules.add(_rule_key(stage_code, document_id))
+        effect_key = _effect_key(tenant_id, journey_id, stage_code, document_id)
+        live_effect_keys.add(effect_key)
+        existing = connection.execute(
+            text(
+                "SELECT 1 FROM auditcore.workflow_tasks "
+                "WHERE tenant_id = :tenant_id AND effect_key = :effect_key"
+            ),
+            {"tenant_id": tenant_id, "effect_key": effect_key},
+        ).scalar_one_or_none()
+        if existing is not None:
+            continue
         filename = _friendly_filename(item.get("originalFilename"), document_id)
-        _machine_flag(
+        create_workflow_task(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
-            stage_code=stage_code,
-            rule_key=_rule_key(stage_code, document_id),
-            finding_type=_FINDING_TYPE,
-            severity="LOW",
-            title=f"Unrecognized document: {filename}",
-            description=(
-                f'"{filename}" was uploaded but Document Intelligence could not '
-                "confidently identify it as any known document type. Open the "
-                "document, confirm what it actually is, and either re-upload it "
-                "as the correct type or ask an Admin to register a new document "
-                "type if this is a legitimate document DI has never seen before."
-            ),
-            correlation_id=correlation_id,
-            safe_payload={
+            workflow_type=_WORKFLOW_TYPE,
+            process_area=stage_code,
+            task_type=TASK_TYPE,
+            assigned_role_code="PC",
+            task_payload={
                 "diDocumentId": str(document_id),
                 "originalFilename": filename,
                 "contentUrl": item.get("contentUrl"),
+                "stageCode": stage_code,
+                "comment": (
+                    f'"{filename}" was uploaded but Document Intelligence could not '
+                    "confidently identify it as any known document type. Open it, "
+                    "confirm what it actually is, and record whether it's the "
+                    "correct document (DI just couldn't classify it) or the wrong "
+                    "one (it gets removed so you can upload the right one)."
+                ),
             },
+            effect_key=effect_key,
+            correlation_id=correlation_id,
         )
         raised += 1
 
-    open_findings = connection.execute(
+    open_tasks = connection.execute(
         text(
             """
-            SELECT audit_finding_id, rule_key
-            FROM auditcore.audit_findings
+            SELECT workflow_task_id, effect_key
+            FROM auditcore.workflow_tasks
             WHERE tenant_id = :tenant_id AND journey_id = :journey_id
-              AND stage_code = :stage_code
-              AND finding_type_code = :finding_type
-              AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
+              AND task_type = :task_type AND process_area = :stage_code
+              AND task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT')
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "task_type": TASK_TYPE,
+            "stage_code": stage_code,
+        },
+    ).mappings().all()
+
+    resolved = 0
+    for task in open_tasks:
+        if task["effect_key"] in live_effect_keys:
+            continue
+        cancel_workflow_task(
+            connection,
+            tenant_id=tenant_id,
+            workflow_task_id=task["workflow_task_id"],
+            actor_id="SYSTEM",
+            reason="Document reclassified or removed.",
+        )
+        resolved += 1
+
+    return {"raised": raised, "resolved": resolved}
+
+
+def apply_unrecognized_document_verification(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    stage_code: str,
+    di_document_id: UUID,
+    outcome: str,
+) -> None:
+    """Completion side effect for a PC_VERIFY_UNRECOGNIZED_DOCUMENT task
+    (tasks_api.py::complete_task). CORRECT is a plain dismissal -- DI just
+    couldn't classify it, nothing to change. INCORRECT soft-deletes the
+    document: capture_status becomes SUPERSEDED, the same terminal status a
+    re-upload already leaves behind, so the row and its audit trail survive
+    but it's no longer live, and a fresh upload can take its place. No hard
+    delete and no outbound DI call, unlike the capture screen's own
+    still-mid-review "remove" action -- this can fire well after that
+    window (Booking/Delivery need not still be open), so it only ever
+    touches Audit Core's own durable record.
+    """
+    if outcome != "INCORRECT":
+        return
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.document_capture_v2_documents
+            SET capture_status = 'SUPERSEDED', updated_at_utc = now()
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+              AND stage_code = :stage_code AND di_document_id = :document_id
+              AND capture_status <> 'SUPERSEDED'
             """
         ),
         {
             "tenant_id": tenant_id,
             "journey_id": journey_id,
             "stage_code": stage_code,
-            "finding_type": _FINDING_TYPE,
+            "document_id": di_document_id,
         },
-    ).mappings().all()
-
-    resolved = 0
-    for finding in open_findings:
-        if finding["rule_key"] in live_rules:
-            continue
-        updated = connection.execute(
-            text(
-                """
-                UPDATE auditcore.audit_findings
-                SET finding_status = 'RESOLVED',
-                    disposition = 'FIXED',
-                    resolved_at_utc = now(),
-                    resolved_by_actor_id = NULL,
-                    updated_at_utc = now()
-                WHERE tenant_id = :tenant_id AND audit_finding_id = :finding_id
-                  AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
-                """
-            ),
-            {"tenant_id": tenant_id, "finding_id": finding["audit_finding_id"]},
-        )
-        if updated.rowcount != 1:
-            continue
-        connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.audit_finding_events (
-                    tenant_id, audit_finding_id, journey_id, stage_code,
-                    event_type, actor_id, actor_role_snapshot, safe_payload, correlation_id
-                ) VALUES (
-                    :tenant_id, :finding_id, :journey_id, :stage_code,
-                    'RESOLVED', NULL, 'SYSTEM', CAST(:payload AS jsonb), :correlation_id
-                )
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "finding_id": finding["audit_finding_id"],
-                "journey_id": journey_id,
-                "stage_code": stage_code,
-                "payload": '{"disposition": "FIXED", "note": "Document reclassified or removed."}',
-                "correlation_id": correlation_id,
-            },
-        )
-        resolved += 1
-
-    from audit_core.uc03_delivery_commands import _set_stage_flag_status
-
-    _set_stage_flag_status(connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage_code)
-    return {"raised": raised, "resolved": resolved}
+    )

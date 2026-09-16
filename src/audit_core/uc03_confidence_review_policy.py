@@ -1327,7 +1327,12 @@ def _run_sync_booking_document_task(
         # afterward never cleared the flag it was meant to resolve, since
         # nothing re-ran the check. This is the Delivery-side equivalent of
         # schedule_booking_checkpoint_rules above: cheap and idempotent (no
-        # external I/O), safe to call after every confirmed document.
+        # external I/O), safe to call after every confirmed document. Only
+        # ever asked to resolve here (raise_new=False) -- raising a fresh
+        # "still missing" finding after each individual confirm flagged
+        # every not-yet-uploaded document while the PC was still mid-upload,
+        # not once Delivery is actually being closed. Submit still raises
+        # for whatever is genuinely missing once the PC is done.
         try:
             from audit_core.uc03_delivery_capture_v2 import (
                 schedule_delivery_document_checkpoint,
@@ -1340,6 +1345,7 @@ def _run_sync_booking_document_task(
                     tenant_id=tenant_id,
                     journey_id=journey_id,
                     correlation_id="",
+                    raise_new=False,
                 )
         except Exception:
             logger.warning(
