@@ -1042,6 +1042,68 @@ def get_model_resolution_candidates(
     }
 
 
+def get_model_catalog(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """Every SKU in this Journey's currently effective price list, unconditionally.
+
+    Unlike ``get_model_resolution_candidates`` (which requires an OPEN
+    MODEL_NOT_IDENTIFIED finding and raises 404 without one), this exists
+    for the *other* case: a Journey whose SKU is already CONFIRMED, where a
+    PC wants to browse the full catalogue to propose a correction
+    (``uc03_model_selection_corrections.py``). No finding, no gate --
+    just the masters as they stand today.
+    """
+    effective_on = date.fromisoformat(
+        connection.execute(
+            text(
+                """
+                SELECT COALESCE(b.booking_date, CURRENT_DATE)
+                FROM auditcore.journeys j
+                LEFT JOIN auditcore.bookings b
+                  ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
+                WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one().isoformat()
+    )
+    try:
+        plan = _price_plan_for_journey(
+            connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on
+        )
+    except Exception as exc:
+        raise AuditCoreError(
+            error_code="VAC-SKU-003",
+            status_code=422,
+            title="No effective price list",
+            detail="There is no effective price list for this Journey to browse.",
+        ) from exc
+
+    rows = _sku_rows_for_version(
+        connection, tenant_id=tenant_id, price_list_version_id=plan["price_list_version_id"]
+    )
+    inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id)
+    basis = inputs["registration_basis"] if inputs is not None else "INDIVIDUAL"
+    return {
+        "journeyId": journey_id,
+        "skus": [
+            {
+                "productSkuId": r["product_sku_id"],
+                "skuCode": r["sku_code"],
+                "modelName": r["model_name"],
+                "variantName": r["variant_name"],
+                "colourName": r["colour_name"],
+                "fuel": r.get("fuel_powertrain"),
+                "transmission": r.get("transmission"),
+                "drive": r.get("drive"),
+                "seater": r.get("seater"),
+                "exShowroomPrice": _to_decimal(r.get("master_ex_showroom")),
+                "totalPrice": _master_total(r, basis),
+            }
+            for r in rows
+        ],
+    }
+
+
 def confirm_model_resolution_sku(
     connection: Connection,
     *,
@@ -1153,6 +1215,25 @@ class ModelResolutionCandidatesResponse(BaseModel):
     candidates: list[ModelResolutionCandidateOut]
 
 
+class ModelCatalogSkuOut(BaseModel):
+    productSkuId: UUID
+    skuCode: str
+    modelName: str
+    variantName: str | None = None
+    colourName: str | None = None
+    fuel: str | None = None
+    transmission: str | None = None
+    drive: str | None = None
+    seater: str | None = None
+    exShowroomPrice: Decimal | None = None
+    totalPrice: Decimal | None = None
+
+
+class ModelCatalogResponse(BaseModel):
+    journeyId: UUID
+    skus: list[ModelCatalogSkuOut]
+
+
 class ConfirmModelResolutionSkuRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1189,6 +1270,26 @@ def read_model_resolution_candidates(
     return ModelResolutionCandidatesResponse(
         **get_model_resolution_candidates(connection, tenant_id=tenant_id, journey_id=journey_id)
     )
+
+
+@router.get("/catalog", response_model=ModelCatalogResponse)
+def read_model_catalog(
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> ModelCatalogResponse:
+    _scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    return ModelCatalogResponse(**get_model_catalog(connection, tenant_id=tenant_id, journey_id=journey_id))
 
 
 @router.post("/confirm-sku", response_model=ConfirmModelResolutionSkuResponse)

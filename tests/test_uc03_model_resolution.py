@@ -412,6 +412,35 @@ def test_integration_resolves_and_pins_sku(journey) -> None:
     assert again.get("resolved") is True
 
 
+def test_integration_get_model_catalog_lists_every_sku_unconditionally(journey) -> None:
+    """Unlike get_model_resolution_candidates, this must work whether or not
+    a MODEL_NOT_IDENTIFIED finding is open -- it's for browsing to propose a
+    correction on an already-CONFIRMED journey, which by definition has no
+    open finding to gate on."""
+    c = journey
+    _seed_price_list(c, [
+        {"model": "SCORPIO N", "variant": "Z8L",
+         "fuel": "PETROL", "transmission": "MT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "1600000"}},
+        {"model": "SCORPIO N", "variant": "Z8T",
+         "fuel": "DIESEL", "transmission": "AT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "1700000"}},
+    ])
+    _set_journey_product(c, "Scorpio N", "Z8L")
+    _set_commercial(c, "ex_showroom_price", "1600000")
+
+    result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert result.get("resolved") is True
+    assert _open_model_flags(c) == 0  # confirmed, no open finding at all
+
+    catalog = mr.get_model_catalog(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    assert len(catalog["skus"]) == 2
+    variants = {sku["variantName"] for sku in catalog["skus"]}
+    assert variants == {"Z8L", "Z8T"}
+    fuels = {sku["fuel"] for sku in catalog["skus"]}
+    assert fuels == {"PETROL", "DIESEL"}
+
+
 def test_integration_resolves_via_ex_showroom_when_total_ambiguous(journey) -> None:
     c = journey
     # both THAR variants total 1,730,000 individual — only ex-showroom disambiguates
