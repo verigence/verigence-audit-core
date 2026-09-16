@@ -75,6 +75,13 @@ def test_classify_by_rule_key_matches_duplicate_receipt_explicitly() -> None:
     assert classify_by_rule_key("DUPLICATE_RECEIPT") == "VIOLATION"
 
 
+def test_classify_by_rule_key_matches_model_selection_correction_explicitly() -> None:
+    # Same reasoning as the DI-correction case above -- pinned so it can
+    # never silently change if DEFAULT_CLASS ever does.
+    assert classify_by_rule_key("MODEL_SELECTION_CORRECTION_PROPOSED:journey-1") == "VIOLATION"
+    assert classify_by_rule_key("MODEL_SELECTION_CORRECTION_PROPOSED") == "VIOLATION"
+
+
 def test_classify_by_type_returns_none_for_unknown_types() -> None:
     assert classify_by_type("DOCUMENT_EXCEPTION") == "DOCUMENT_GAP"
     assert classify_by_type("COMMERCIAL_EXCEPTION") == "VIOLATION"
