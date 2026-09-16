@@ -30,6 +30,7 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from audit_core.uc03_attribute_mapping import spec_for_field
+from audit_core.uc03_deal_source_history import record_source_value
 from audit_core.uc03_masters_alignment import canonical_discount_key
 from audit_core.uc03_v2_review_materialization import (
     _INVOICE_DOCUMENT_TYPES as INVOICE_DOCUMENT_TYPES,
@@ -317,6 +318,20 @@ def _upsert_commercial_line(
     document_id: UUID,
     evidence_id: UUID | None,
 ) -> bool:
+    # Recorded unconditionally, before the win/lose decision below -- a losing
+    # invoice's own reported value is exactly what the Journey Line comparison
+    # panel needs to show next to whatever the booking form reported.
+    record_source_value(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        line_kind="COMMERCIAL",
+        component_key=component_key,
+        source_document_type=document_type,
+        amount=amount,
+        evidence_id=evidence_id,
+        document_id=document_id,
+    )
     spec = spec_for_field(component_key)
     priority = spec.source_priority if spec is not None else (document_type,)
     existing = connection.execute(
@@ -434,6 +449,18 @@ def _upsert_invoice_discount(
     ranks ahead in the discount source priority; a booking-form / calculated
     row's actual is always superseded by an invoice.
     """
+    # Recorded unconditionally -- see the equivalent call in _upsert_commercial_line.
+    record_source_value(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        line_kind="DISCOUNT",
+        component_key=discount_key,
+        source_document_type=document_type,
+        amount=amount,
+        evidence_id=evidence_id,
+        document_id=document_id,
+    )
     priority = ("tax_invoice_tally", "customer_invoice_dms", "wholesale_invoice",
                 "invoice_generic", "accessory_invoice_dms", "accessory_invoice_tally",
                 "ew_invoice", "rsa_invoice")

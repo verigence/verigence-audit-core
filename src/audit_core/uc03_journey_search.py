@@ -21,6 +21,7 @@ from audit_core.security_authorization import (
     SecurityAuthorizationError,
     get_security_authorization_client,
 )
+from audit_core.uc03_deal_source_history import load_source_breakdown
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/uc03", tags=["uc03-journey-search"])
 logger = structlog.get_logger(__name__)
@@ -73,6 +74,12 @@ class JourneyOverviewResponse(BaseModel):
     delivery: dict[str, Any] | None = None
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     findings: list[dict[str, Any]] = Field(default_factory=list)
+    # Per-source breakdown for commercialLines/discounts: one row per
+    # (lineKind, componentKey, sourceDocumentType) whenever more than one
+    # document has ever reported a value for that line, so the panel can show
+    # what the booking form said next to what a later invoice said instead of
+    # only whichever currently wins. See uc03_deal_source_history.
+    dealSourceBreakdown: list[dict[str, Any]] = Field(default_factory=list)
 
 
 def _authorize_read(
@@ -961,6 +968,9 @@ def get_journey_overview(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
+    deal_source_breakdown = load_source_breakdown(
+        connection, tenant_id=tenant_id, journey_id=journey_id
+    )
 
     _t_queries = time.perf_counter()
     logger.info(
@@ -989,4 +999,5 @@ def get_journey_overview(
         delivery=_as_dict(delivery),
         evidence=_as_dicts(evidence),
         findings=_as_dicts(findings),
+        dealSourceBreakdown=deal_source_breakdown,
     )
