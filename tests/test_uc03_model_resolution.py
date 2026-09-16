@@ -981,7 +981,13 @@ def test_backfills_missing_task_for_a_preexisting_open_finding(journey) -> None:
     finding_id = _open_model_finding_id(c)
 
     # Simulate the "predates task-spawning" state: delete the task the
-    # first raise created. The finding itself must survive untouched.
+    # first raise created (its own events first -- workflow_task_events FKs
+    # to workflow_tasks). The finding itself must survive untouched.
+    c.execute(
+        text("DELETE FROM auditcore.workflow_task_events WHERE tenant_id=:t AND workflow_task_id IN "
+             "(SELECT workflow_task_id FROM auditcore.workflow_tasks WHERE tenant_id=:t AND related_finding_id=:f)"),
+        {"t": c.tenant_id, "f": finding_id},
+    )
     c.execute(
         text("DELETE FROM auditcore.workflow_tasks WHERE tenant_id=:t AND related_finding_id=:f"),
         {"t": c.tenant_id, "f": finding_id},
