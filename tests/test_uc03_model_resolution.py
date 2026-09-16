@@ -706,6 +706,79 @@ def test_integration_resolves_across_generations_via_ex_showroom_price(mahindra_
     assert _open_model_flags(c) == 0
 
 
+def test_integration_a_stated_attribute_outranks_a_conflicting_price(mahindra_journey) -> None:
+    """Direct user ask: ex-showroom price must be the *last* resort, not the
+    first. Seed two SKUs differing only in fuel, at swapped prices from what
+    a careless price-first resolver would expect; the Booking Form states
+    fuel=DIESEL explicitly (a real, decomposed signal) while its own
+    captured ex-showroom price happens to equal the PETROL sibling's price
+    instead (a plausible real-world mismatch -- a discount, an add-on, or a
+    simple data-entry slip). The stated fuel fact must win; price must never
+    be allowed to override a signal already confirmed as reliable."""
+    c = mahindra_journey
+    _seed_price_list(c, [
+        {"model": "SCORPIO N", "variant": "Z8T D AT 2WD 7 STR BS6.2 - N",
+         "fuel": "DIESEL", "transmission": "AT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "2000000"}},
+        {"model": "SCORPIO N", "variant": "Z8T G AT 2WD 7 STR BS6.2 - N",
+         "fuel": "PETROL", "transmission": "AT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "1900000"}},
+    ])
+    _set_journey_product(c, "SCORPIO N", "Z8T D AT")
+    _set_booking_form_ex_showroom(c, "1900000")  # the PETROL sibling's price, not the diesel one
+
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("resolved") is True
+    assert result.get("matchStage") == "ATTRIBUTE_DECOMPOSITION"
+
+    pinned_fuel = c.execute(
+        text("SELECT pv.fuel_powertrain FROM auditcore.journey_products jp "
+             "JOIN auditcore.product_skus s ON s.product_sku_id = jp.product_sku_id "
+             "JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id "
+             "WHERE jp.tenant_id=:t AND jp.journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert pinned_fuel == "DIESEL"
+
+
+def test_integration_trim_alone_disambiguates_when_it_genuinely_discriminates(mahindra_journey) -> None:
+    """Direct user ask: trim is one of the six things that should count as
+    real signal, not just fuel/transmission/drive/seater. Three SKUs share
+    every other attribute and differ ONLY by trim code (Z8S/Z8T/Z8L) -- the
+    Booking Form states just the bare trim, nothing else, and that alone
+    is enough to resolve uniquely, without ever needing price."""
+    c = mahindra_journey
+    _seed_price_list(c, [
+        {"model": "SCORPIO N", "variant": "Z8S G MT 2WD 7 STR BS6.2 - N",
+         "fuel": "PETROL", "transmission": "MT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "1800000"}},
+        {"model": "SCORPIO N", "variant": "Z8T G MT 2WD 7 STR BS6.2 - N",
+         "fuel": "PETROL", "transmission": "MT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "1900000"}},
+        {"model": "SCORPIO N", "variant": "Z8L G MT 2WD 7 STR BS6.2 - N",
+         "fuel": "PETROL", "transmission": "MT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "2000000"}},
+    ])
+    _set_journey_product(c, "SCORPIO N", "Z8T")  # bare trim only -- no fuel/transmission/etc.
+
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("resolved") is True
+    assert result.get("matchStage") == "ATTRIBUTE_DECOMPOSITION"
+
+    pinned_variant = c.execute(
+        text("SELECT pv.variant_name FROM auditcore.journey_products jp "
+             "JOIN auditcore.product_skus s ON s.product_sku_id = jp.product_sku_id "
+             "JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id "
+             "WHERE jp.tenant_id=:t AND jp.journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert pinned_variant == "Z8T G MT 2WD 7 STR BS6.2 - N"
+
+
 def test_integration_falls_back_to_latest_master_when_booking_predates_it(journey) -> None:
     """Regression: a real Booking Form's own extracted booking_date is often
     well in the past (this one -- a real production case -- was 2024-08-12),

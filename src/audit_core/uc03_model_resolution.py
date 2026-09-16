@@ -52,6 +52,7 @@ from audit_core.uc03_booking_capture import _scope
 from audit_core.uc03_delivery_commands import _machine_flag
 from audit_core.uc03_masters_alignment import registration_basis
 from audit_core.uc03_model_attribute_matching import (
+    has_qualifying_signal,
     match_by_attributes,
     resolve_model_via_aliases,
 )
@@ -401,6 +402,39 @@ def _match(
     return model_rows, "TOTAL" if total is not None else "NONE"
 
 
+def _price_disambiguate(
+    rows: list[dict[str, Any]], inputs: dict[str, Any]
+) -> tuple[list[dict[str, Any]], str]:
+    """Narrow an already-established candidate set to one, purely by an
+    exact price match -- no name/variant/model filtering of its own (the
+    caller has already decided which rows are plausible). Total first, then
+    ex-showroom; never a fuzzy tolerance. Used as the deliberate *last*
+    resort in ``_current_match``, after attribute decomposition has had its
+    chance -- price can coincidentally collide between unrelated SKUs and
+    can legitimately drift for reasons that have nothing to do with which
+    vehicle was actually sold (accessories, discounts, rounding), unlike a
+    stated fuel/transmission/drive/seater fact.
+    """
+    basis = inputs["registration_basis"]
+    total = inputs["offered_total"]
+    if total is not None:
+        by_total = [r for r in rows if _master_total(r, basis) == total]
+        by_total = _narrow(by_total, variant=inputs["variant_name"], colour=inputs["colour_name"])
+        if len(by_total) == 1:
+            return by_total, "TOTAL"
+        if len(by_total) > 1:
+            rows = by_total
+
+    ex = inputs["offered_ex_showroom"]
+    if ex is not None:
+        by_ex = [r for r in rows if _to_decimal(r["master_ex_showroom"]) == ex]
+        by_ex = _narrow(by_ex, variant=inputs["variant_name"], colour=inputs["colour_name"])
+        if by_ex:
+            return by_ex, "EX_SHOWROOM"
+
+    return rows, "TOTAL" if total is not None else "NONE"
+
+
 # ── persistence ───────────────────────────────────────────────────────────────
 def _pin_sku(connection: Connection, *, tenant_id: str, journey_id: UUID, product_sku_id: UUID) -> None:
     connection.execute(
@@ -536,30 +570,41 @@ def _run_deal_reconciliation(
 
 def _attribute_decomposition_fallback(
     connection: Connection, *, tenant_id: str, rows: list[dict[str, Any]], inputs: dict[str, Any]
-) -> tuple[list[dict[str, Any]], str]:
-    """Second attempt when the whole-string model match found nothing.
+) -> tuple[list[dict[str, Any]], str, bool]:
+    """Narrow by decomposed fuel/transmission/drive/seater signal, tried
+    whether or not the whole-string model match already succeeded.
 
     Booking Forms fold trim/fuel/transmission/drive/seater into the same
     free-text field as the model name (see ``uc03_model_attribute_matching``);
     resolve the model via ``oem_model_aliases`` and re-filter by the variant's
     own structured attributes instead of comparing one flat string. Still
     zero fuzzy text matching — every check is exact, on a decomposed signal.
-    Returns ``([], "NONE")`` (the caller's existing empty case) when this
-    OEM has no alias/vocabulary coverage or nothing survives the filters.
+    Returns ``([], "NONE", False)`` (the caller's existing empty case) when
+    this OEM has no alias/vocabulary coverage or nothing survives the
+    filters.
+
+    The third element is whether the result is trustworthy enough to
+    out-rank an exact price match on its own: only when the starting
+    candidate set actually had more than one row (real ambiguity to
+    resolve) *and* the combined text supplied a genuine fuel/transmission/
+    drive/seater signal (``has_qualifying_signal``) -- not a bare trim code,
+    which only "matches" via a loose prefix/suffix check because there was
+    nothing else in the candidate set to eliminate it against, and carries
+    no more certainty than a plain name/variant equality check.
     """
     oem_code = _oem_code_for_tenant(connection, tenant_id=tenant_id)
     if not oem_code:
-        return [], "NONE"
+        return [], "NONE", False
 
     aliases = _oem_model_aliases(connection, oem_code=oem_code)
     resolved = resolve_model_via_aliases(model_name=inputs["model_name"], oem_aliases=aliases)
     if resolved is None:
-        return [], "NONE"
+        return [], "NONE", False
 
     canonical_model, remainder = resolved
     model_rows = [r for r in rows if r["model_name"] == canonical_model]
     if not model_rows:
-        return [], "NONE"
+        return [], "NONE", False
 
     matched = match_by_attributes(
         model_rows,
@@ -567,7 +612,13 @@ def _attribute_decomposition_fallback(
         model_remainder=remainder,
         variant_text=inputs["variant_name"],
     )
-    return matched, "ATTRIBUTE_DECOMPOSITION"
+    trustworthy = len(model_rows) > 1 and has_qualifying_signal(
+        oem_code=oem_code,
+        model_remainder=remainder,
+        variant_text=inputs["variant_name"],
+        candidate_rows=model_rows,
+    )
+    return matched, "ATTRIBUTE_DECOMPOSITION", trustworthy
 
 
 def _latest_invoice_field(
@@ -761,26 +812,49 @@ def _current_match(
     if not rows:
         return {"skipped": True, "reason": "empty_price_list"}
 
-    matched, stage = _match(rows, inputs)
+    # Attribute decomposition first, always attempted -- not only once a
+    # price-based match has already failed. A fuel/transmission/drive/
+    # seater token the Booking Form actually states is a literal fact
+    # about the specific vehicle; price is tried only afterward, as the
+    # deliberate last resort, because it can coincidentally collide
+    # between unrelated SKUs and can legitimately drift for reasons that
+    # have nothing to do with which vehicle was actually sold (accessories,
+    # discounts, rounding). Only trusted to decide on its own when it
+    # actually resolved real ambiguity with a genuine signal -- see
+    # ``_attribute_decomposition_fallback``'s own docstring for why a bare
+    # trim-code match doesn't qualify.
+    attr_matched, attr_stage, attr_trustworthy = _attribute_decomposition_fallback(
+        connection, tenant_id=tenant_id, rows=rows, inputs=inputs
+    )
+    if len(attr_matched) == 1 and attr_trustworthy:
+        return {"matched": attr_matched, "matchStage": attr_stage}
 
-    if len(matched) != 1:
-        # Either the whole-string model compare found nothing at all, or
-        # it matched >1 rows that price alone couldn't disambiguate (e.g.
-        # the model text itself already equals the master's model_name,
-        # but the Booking Form gives no usable total/ex-showroom to pick
-        # a variant). Either way, try narrowing by decomposed attributes.
-        attr_matched, attr_stage = _attribute_decomposition_fallback(
-            connection, tenant_id=tenant_id, rows=rows, inputs=inputs
-        )
-        # Adopt the attribute fallback whenever it's strictly narrower
-        # than the price-based match, not only when it reaches exactly
-        # one -- e.g. price alone can leave 24 model-only candidates
-        # while the Booking Form's own fuel/transmission text narrows
-        # that to 2 real contenders. Reporting 2 candidates a PC can
-        # actually choose between is strictly better than reporting all
-        # 24, even when it still isn't unique enough to auto-pin.
-        if attr_matched and (not matched or len(attr_matched) < len(matched)):
-            matched, stage = attr_matched, attr_stage
+    if attr_trustworthy:
+        # attr_matched genuinely narrowed a real ambiguity using a stated
+        # fuel/transmission/drive/seater fact (len > 1 here, since the ==1
+        # case already returned above) -- price arbitrates only *within*
+        # it, never a wider, independent search that could contradict a
+        # signal already confirmed as reliable.
+        price_matched, price_stage = _price_disambiguate(attr_matched, inputs)
+        if len(price_matched) == 1:
+            return {"matched": price_matched, "matchStage": price_stage}
+        if len(price_matched) < len(attr_matched):
+            return {"matched": price_matched, "matchStage": price_stage}
+        return {"matched": attr_matched, "matchStage": attr_stage}
+
+    # No trustworthy attribute signal at all (no OEM vocabulary, no
+    # qualifying token, or too little starting ambiguity to mean anything)
+    # -- price is the deciding mechanism, exactly as before, including the
+    # generation-refresh price bridge (see _generation_sibling_rows) for a
+    # nameplate that never matched literally in the first place.
+    matched, stage = _match(rows, inputs)
+    if len(matched) == 1:
+        return {"matched": matched, "matchStage": stage}
+
+    # Neither pass reached exactly one on its own -- report whichever
+    # leaves the smaller, more defensible shortlist.
+    if attr_matched and (not matched or len(attr_matched) < len(matched)):
+        matched, stage = attr_matched, attr_stage
 
     return {"matched": matched, "matchStage": stage}
 
