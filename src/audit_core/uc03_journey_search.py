@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Annotated, Any
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
@@ -21,6 +23,7 @@ from audit_core.security_authorization import (
 )
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/uc03", tags=["uc03-journey-search"])
+logger = structlog.get_logger(__name__)
 
 _JOURNEY_READ_PERMISSION = "audit.journey.read"
 _FULL_CONTACT_PERMISSION = "audit.customer.contact.full.read"
@@ -595,6 +598,14 @@ def get_journey_overview(
 ) -> JourneyOverviewResponse:
     """Return a read-only Journey 360 projection using only Audit Core-owned data."""
 
+    # Coarse timing instrumentation -- a real user report timed this endpoint
+    # at 19.4s (browser Network tab), far past this function's own documented
+    # ~5s auth worst case, and nothing in its ~15 queries looks like an N+1.
+    # Logging the boundary between "external auth round trip" / "the Journey
+    # lookup" / "the bulk of the read queries" turns the next slow request
+    # into an answer instead of another guess.
+    _t_start = time.perf_counter()
+
     # Both permission checks run concurrently -- see
     # _authorize_read_and_check_full_contact's own docstring. This does mean
     # a 404 (Journey outside scope) now also pays for the full-contact check
@@ -605,6 +616,7 @@ def get_journey_overview(
         human_principal=human_principal,
         tenant_id=tenant_id,
     )
+    _t_auth = time.perf_counter()
     set_tenant_context(connection, tenant_id)
     header = _scoped_overview_header(
         connection,
@@ -612,6 +624,7 @@ def get_journey_overview(
         journey_id=journey_id,
         actor_id=human_principal.subject,
     )
+    _t_header = time.perf_counter()
     if header is None:
         # Do not disclose whether a Journey exists outside the caller's business scope.
         raise NotFoundError(
@@ -948,6 +961,17 @@ def get_journey_overview(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
+
+    _t_queries = time.perf_counter()
+    logger.info(
+        "journey_overview_timing",
+        tenant_id=tenant_id,
+        journey_id=str(journey_id),
+        auth_ms=round((_t_auth - _t_start) * 1000, 1),
+        header_ms=round((_t_header - _t_auth) * 1000, 1),
+        queries_ms=round((_t_queries - _t_header) * 1000, 1),
+        total_ms=round((_t_queries - _t_start) * 1000, 1),
+    )
 
     return JourneyOverviewResponse(
         journey=dict(header),
