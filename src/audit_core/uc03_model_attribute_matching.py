@@ -199,6 +199,24 @@ def resolve_model_via_aliases(
     return canonical, " ".join(text_words[consumed:])
 
 
+def has_qualifying_signal(*, oem_code: str, model_remainder: str, variant_text: str | None) -> bool:
+    """True only when the combined text states at least one recognized
+    fuel/transmission/drive/seater token -- not merely a bare trim code.
+
+    A bare trim code alone (e.g. "Z8L" with nothing else) still lets
+    ``match_by_attributes`` "match" via its trim-residue prefix check even
+    when there is nothing to actually eliminate a wrong candidate with --
+    that is no more certain than a plain name/variant equality check, and
+    callers must not let it outrank an exact price match the way a real
+    fuel/transmission/drive/seater signal should.
+    """
+    combined = " ".join(w for w in (model_remainder, variant_text) if w)
+    decomposed = _decompose(combined, oem_code=oem_code)
+    if decomposed is None:
+        return False
+    return bool(decomposed.fuel or decomposed.transmission or decomposed.drive or decomposed.seater)
+
+
 # ── attribute-filtered variant matching ─────────────────────────────────────
 def match_by_attributes(
     rows: list[dict[str, Any]],

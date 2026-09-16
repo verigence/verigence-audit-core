@@ -113,3 +113,22 @@ def test_unknown_oem_is_a_no_op() -> None:
         rows, oem_code="HYUNDAI", model_remainder="Z8 (S)", variant_text="DAT 2WD 7STR"
     )
     assert matched == []
+
+
+# ── has_qualifying_signal ─────────────────────────────────────────────────────
+def test_has_qualifying_signal_true_for_a_recognized_fuel_token() -> None:
+    assert m.has_qualifying_signal(oem_code="MAHINDRA", model_remainder="", variant_text="Z8T D AT")
+
+
+def test_has_qualifying_signal_false_for_a_bare_trim_code() -> None:
+    # "Z8L" alone carries no fuel/transmission/drive/seater fact -- it must
+    # not be treated as more reliable than an exact price match.
+    assert not m.has_qualifying_signal(oem_code="MAHINDRA", model_remainder="", variant_text="Z8L")
+
+
+def test_has_qualifying_signal_false_when_nothing_supplied() -> None:
+    assert not m.has_qualifying_signal(oem_code="MAHINDRA", model_remainder="", variant_text=None)
+
+
+def test_has_qualifying_signal_false_for_unknown_oem() -> None:
+    assert not m.has_qualifying_signal(oem_code="HYUNDAI", model_remainder="", variant_text="D AT")
