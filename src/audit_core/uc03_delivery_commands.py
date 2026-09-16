@@ -223,6 +223,82 @@ def _set_stage_flag_status(
     )
 
 
+def _ensure_self_serve_task(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    finding_id: UUID,
+    rule_key: str,
+    stage_code: str,
+    severity: str,
+    correlation_id: str,
+    task_payload_extra: dict[str, Any] | None,
+) -> None:
+    """Backfill a self-serve Task for a still-open finding that has none.
+
+    A real gap for any finding raised before this rule's task-spawning
+    branch existed (or before its own producer started passing a richer
+    ``task_payload_extra``) -- without this, re-raising the same duplicate
+    finding on every subsequent trigger leaves a PC with only the Finding
+    to click through to, which routes to Audit Review and offers no fix
+    action for a self-serve gap by v1.1 design ("a PC never opens a
+    Finding"). Self-healing: only creates one when none is currently open,
+    so this converges to exactly one live Task per finding regardless of
+    how many times the underlying rule re-evaluates.
+    """
+    row = connection.execute(
+        text(
+            "SELECT finding_class, finding_status FROM auditcore.audit_findings "
+            "WHERE tenant_id=:tenant_id AND audit_finding_id=:fid"
+        ),
+        {"tenant_id": tenant_id, "fid": finding_id},
+    ).mappings().one_or_none()
+    if row is None or row["finding_status"] not in {"OPEN", "ACKNOWLEDGED"}:
+        return
+    if row["finding_class"] not in {"DATA_GAP", "DOCUMENT_GAP"}:
+        return
+
+    open_task_count = connection.execute(
+        text(
+            """
+            SELECT count(*) FROM auditcore.workflow_tasks
+            WHERE tenant_id=:tenant_id AND related_finding_id=:fid
+              AND task_status NOT IN ('COMPLETED', 'CANCELLED', 'FAILED', 'DEAD_LETTER')
+            """
+        ),
+        {"tenant_id": tenant_id, "fid": finding_id},
+    ).scalar_one()
+    if open_task_count > 0:
+        return
+
+    round_no = connection.execute(
+        text(
+            "SELECT count(*) FROM auditcore.workflow_tasks "
+            "WHERE tenant_id=:tenant_id AND related_finding_id=:fid"
+        ),
+        {"tenant_id": tenant_id, "fid": finding_id},
+    ).scalar_one()
+    create_workflow_task(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        workflow_type="UC03_SELF_SERVE_FINDING",
+        process_area=stage_code,
+        task_type="AUTO_SELF_SERVE",
+        assigned_role_code="PC",
+        related_finding_id=finding_id,
+        severity=severity,
+        task_payload={
+            "ruleKey": rule_key,
+            "findingId": str(finding_id),
+            **(task_payload_extra or {}),
+        },
+        effect_key=f"task:{finding_id}:round:{round_no}",
+        correlation_id=correlation_id,
+    )
+
+
 def _machine_flag(
     connection: Connection,
     *,
@@ -264,6 +340,17 @@ def _machine_flag(
             tenant_id=tenant_id,
             journey_id=journey_id,
             stage_code=stage_code,
+        )
+        _ensure_self_serve_task(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            finding_id=existing,
+            rule_key=rule_key,
+            stage_code=stage_code,
+            severity=severity,
+            correlation_id=correlation_id,
+            task_payload_extra=task_payload_extra,
         )
         return existing
 
