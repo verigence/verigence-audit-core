@@ -31,6 +31,8 @@ down_revision = "0100_uc03_identity_check_hold"
 branch_labels = None
 depends_on = None
 
+_RUNTIME_ROLE = "audit_core_runtime"
+
 
 def upgrade() -> None:
     conn = op.get_bind()
@@ -63,6 +65,49 @@ def upgrade() -> None:
             """
             CREATE INDEX ix_commercial_line_source_values_lookup
             ON auditcore.commercial_line_source_values (tenant_id, journey_id, line_kind, component_key)
+            """
+        )
+    )
+    # Tenant-scoped like every other per-journey table -- RLS + the runtime
+    # role's grants, or every read/write from the API (which runs as
+    # audit_core_runtime, not the migration's own role) fails with a
+    # permission error the moment this table is touched.
+    conn.execute(
+        text(
+            """
+            ALTER TABLE auditcore.commercial_line_source_values ENABLE ROW LEVEL SECURITY
+            """
+        )
+    )
+    conn.execute(
+        text(
+            """
+            ALTER TABLE auditcore.commercial_line_source_values FORCE ROW LEVEL SECURITY
+            """
+        )
+    )
+    conn.execute(
+        text(
+            """
+            CREATE POLICY tenant_isolation_commercial_line_source_values
+            ON auditcore.commercial_line_source_values
+            USING (tenant_id = auditcore.current_tenant_id())
+            WITH CHECK (tenant_id = auditcore.current_tenant_id())
+            """
+        )
+    )
+    conn.execute(
+        text(
+            f"""
+            GRANT SELECT, INSERT, UPDATE ON auditcore.commercial_line_source_values
+            TO {_RUNTIME_ROLE}
+            """
+        )
+    )
+    conn.execute(
+        text(
+            f"""
+            REVOKE DELETE ON auditcore.commercial_line_source_values FROM {_RUNTIME_ROLE}
             """
         )
     )
