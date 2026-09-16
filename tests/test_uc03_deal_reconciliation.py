@@ -364,6 +364,148 @@ def _invoice_doc(document_type: str, fields: dict[str, object]):
     )
 
 
+def _link_evidence(c, document_type_key: str) -> None:
+    c.execute(
+        text(
+            """
+            INSERT INTO auditcore.evidence (
+                tenant_id, journey_id, customer_id,
+                di_subject_id, di_document_id,
+                document_type_key, evidence_purpose
+            ) VALUES (:t, :j, :cu, :subject, :doc, :doc_type, 'BOOKING')
+            """
+        ),
+        {
+            "t": c.tenant_id, "j": c.journey_id, "cu": c.customer_id,
+            "subject": uuid4(), "doc": uuid4(), "doc_type": document_type_key,
+        },
+    )
+
+
+def _evidence_status(c, discount_key: str) -> str | None:
+    return c.execute(
+        text("SELECT evidence_status FROM auditcore.discount_applications "
+             "WHERE tenant_id=:t AND journey_id=:j AND discount_key=:k"),
+        {"t": c.tenant_id, "j": c.journey_id, "k": discount_key},
+    ).scalar_one_or_none()
+
+
+def _open_finding(c, rule_key: str):
+    return c.execute(
+        text("SELECT audit_finding_id, finding_class, severity, finding_status "
+             "FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND rule_key=:k "
+             "AND finding_status IN ('OPEN', 'ACKNOWLEDGED')"),
+        {"t": c.tenant_id, "j": c.journey_id, "k": rule_key},
+    ).mappings().one_or_none()
+
+
+def test_conditional_discount_without_evidence_is_missing_and_flagged(journey) -> None:
+    c = journey
+    seeded = _seed_pinned_sku(c, model="XUV700", variant="AX7L", components={"EX_SHOWROOM": "2000000"})
+    _seed_scheme(c, category="CORPORATE", benefit_key="CORPORATE_PRIVILEGE", amount="40000",
+                 model_id=seeded["model_id"], customer_type_code="CORPORATE")
+    c.execute(
+        text("UPDATE auditcore.customers SET customer_type_code='CORPORATE' WHERE customer_id=:id"),
+        {"id": c.customer_id},
+    )
+    _seed_reviewed_booking(c, corporate_discount_amount="40000")
+
+    result = dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert result.get("evidenceRowsChecked", 0) >= 1
+
+    assert _evidence_status(c, "CORPORATE_PRIVILEGE") == "MISSING"
+    finding = _open_finding(c, "BK_DISCOUNT_EVIDENCE_MISSING:corporate_discount")
+    assert finding is not None
+    assert finding["finding_class"] == "DOCUMENT_GAP"
+    assert finding["severity"] == "HIGH"
+
+    task = c.execute(
+        text("SELECT task_type, assigned_role_code FROM auditcore.workflow_tasks "
+             "WHERE tenant_id=:t AND journey_id=:j AND related_finding_id=:f"),
+        {"t": c.tenant_id, "j": c.journey_id, "f": finding["audit_finding_id"]},
+    ).mappings().one()
+    assert task["assigned_role_code"] == "PC"
+
+
+def test_conditional_discount_with_evidence_is_verified(journey) -> None:
+    c = journey
+    seeded = _seed_pinned_sku(c, model="THAR", variant="LX", components={"EX_SHOWROOM": "1500000"})
+    _seed_scheme(c, category="EXCHANGE", benefit_key="EXCHANGE_BONUS", amount="25000",
+                 model_id=seeded["model_id"])
+    _seed_reviewed_booking(c, bonus_amount="25000")
+    _link_evidence(c, "vehicle_rc")
+
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    assert _evidence_status(c, "EXCHANGE_BONUS") == "VERIFIED"
+    assert _open_finding(c, "BK_DISCOUNT_EVIDENCE_MISSING:exchange_bonus") is None
+
+
+def test_evidence_finding_resolves_once_document_appears(journey) -> None:
+    c = journey
+    seeded = _seed_pinned_sku(c, model="BOLERO", variant="B4", components={"EX_SHOWROOM": "1000000"})
+    _seed_scheme(c, category="EXCHANGE", benefit_key="EXCHANGE_BONUS", amount="25000",
+                 model_id=seeded["model_id"])
+    _seed_reviewed_booking(c, bonus_amount="25000")
+
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert _evidence_status(c, "EXCHANGE_BONUS") == "MISSING"
+    assert _open_finding(c, "BK_DISCOUNT_EVIDENCE_MISSING:exchange_bonus") is not None
+
+    _link_evidence(c, "vehicle_rc")
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    assert _evidence_status(c, "EXCHANGE_BONUS") == "VERIFIED"
+    assert _open_finding(c, "BK_DISCOUNT_EVIDENCE_MISSING:exchange_bonus") is None
+
+
+def test_unclaimed_conditional_discount_is_pending_not_missing(journey) -> None:
+    c = journey
+    seeded = _seed_pinned_sku(c, model="BOLERO NEO", variant="N10", components={"EX_SHOWROOM": "900000"})
+    _seed_scheme(c, category="EXCHANGE", benefit_key="EXCHANGE_BONUS", amount="25000",
+                 model_id=seeded["model_id"])
+    # no reviewed booking discount value at all -- masters-eligible, unclaimed
+
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    assert _evidence_status(c, "EXCHANGE_BONUS") == "PENDING"
+    assert _open_finding(c, "BK_DISCOUNT_EVIDENCE_MISSING:exchange_bonus") is None
+
+
+def test_cash_discount_is_not_required(journey) -> None:
+    c = journey
+    seeded = _seed_pinned_sku(c, model="MARAZZO", variant="M2", components={"EX_SHOWROOM": "1400000"})
+    _seed_scheme(c, category="CONSUMER", benefit_key="CASH_DISCOUNT", amount="10000",
+                 model_id=seeded["model_id"])
+    _seed_reviewed_booking(c, discount_amount="8000")
+
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    assert _evidence_status(c, "CASH_DISCOUNT") == "NOT_REQUIRED"
+
+
+def test_scrappage_amount_now_flows_to_actual_discount(journey) -> None:
+    """Regression: scrappage_discount_amount was never mapped at all, so a
+    scrappage amount on the Booking Form never reached actual_discount_amount."""
+    c = journey
+    seeded = _seed_pinned_sku(c, model="XUV400", variant="EL", components={"EX_SHOWROOM": "1700000"})
+    _seed_scheme(c, category="SCRAPPAGE", benefit_key="SCRAPPAGE_BONUS_DEALER", amount="20000",
+                 model_id=seeded["model_id"])
+    _seed_reviewed_booking(c, scrappage_discount_amount="20000")
+
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    row = _discount(c, "SCRAPPAGE_BONUS_DEALER")
+    assert row is not None
+    assert row["actual_discount_amount"] == Decimal(20000)
+    assert _evidence_status(c, "SCRAPPAGE_BONUS_DEALER") == "MISSING"
+
+    _link_evidence(c, "scrappage_certificate_of_deposit")
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert _evidence_status(c, "SCRAPPAGE_BONUS_DEALER") == "VERIFIED"
+
+
 def test_invoice_discount_survives_booking_form_reheal(journey) -> None:
     """Regression: once an invoice has won a discount's actual value, a routine
     sync_deal_reconciliation self-heal off the booking form must never regress

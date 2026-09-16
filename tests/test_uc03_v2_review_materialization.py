@@ -116,6 +116,7 @@ def test_booking_form_di_contract_has_core_review_owner_for_every_field() -> Non
         "oem_referral_discount_amount",
         "other_discount_amount",
         "free_accessory_discount_amount",
+        "scrappage_discount_amount",
         "bonus_amount",
         "total_price",
         "net_amount",
