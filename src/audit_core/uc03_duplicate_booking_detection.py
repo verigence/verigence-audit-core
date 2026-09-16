@@ -179,10 +179,14 @@ def _addresses_match(a: str | None, b: str | None) -> bool:
     return SequenceMatcher(None, normalized_a, normalized_b).ratio() >= _ADDRESS_MATCH_THRESHOLD
 
 
-def _extract_signals(rows: list[Any]) -> dict[str, Any] | None:
+def _extract_signals(rows: list[Any], *, gst: str | None) -> dict[str, Any] | None:
     """Shared shape-building for both this journey's own signals and a
     candidate's: pick the highest-confidence value per field, then merge
-    into one flat, comparison-ready record."""
+    into one flat, comparison-ready record. gst is looked up separately
+    (invoice_review_values, not journey_document_extracted_fields) and
+    passed in rather than derived here -- a journey whose only identifying
+    signal is its buyer GSTIN (no KYC extraction at all yet) must still
+    count as having something to compare, not be silently dropped."""
     by_field = {r["field_key"]: str(r["effective_value"] or "").strip() for r in rows}
     name = None
     for kyc_type in _KYC_DOCUMENT_TYPES:
@@ -197,12 +201,12 @@ def _extract_signals(rows: list[Any]) -> dict[str, Any] | None:
     aadhaar = by_field.get("aadhaar_number") or None
     pincode = by_field.get("address_pincode") or None
     mobile = _normalize_mobile(by_field.get("customer_phone"))
-    if not (pan or aadhaar or name or mobile or address):
+    if not (pan or aadhaar or name or mobile or address or gst):
         return None
     return {
         "pan": pan, "aadhaar": aadhaar, "name": name, "pincode": pincode,
         "mobile": mobile, "address": address, "relative_name": relative_name,
-        "surname": _surname(name), "gst": None,  # gst filled in by caller
+        "surname": _surname(name), "gst": gst,
     }
 
 
@@ -210,9 +214,9 @@ def _identity_signals(
     connection: Connection, *, tenant_id: str, journey_id: UUID
 ) -> dict[str, Any] | None:
     """This journey's own PAN / Aadhaar / KYC name / mobile / address /
-    relationship name / pincode, each the latest-confidence extracted
-    value. None when nothing identifying has been extracted yet -- nothing
-    to compare other journeys against."""
+    relationship name / pincode / buyer GSTIN, each the latest-confidence
+    extracted value. None when nothing identifying has been captured yet
+    -- nothing to compare other journeys against."""
     rows = connection.execute(
         text(
             """
@@ -232,11 +236,8 @@ def _identity_signals(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id, "field_keys": _IDENTITY_FIELD_KEYS},
     ).mappings().all()
-    signals = _extract_signals(rows)
-    if signals is None:
-        return None
-    signals["gst"] = _buyer_gstin(connection, tenant_id=tenant_id, journey_id=journey_id)
-    return signals
+    gst = _buyer_gstin(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return _extract_signals(rows, gst=gst)
 
 
 def _buyer_gstin(connection: Connection, *, tenant_id: str, journey_id: UUID) -> str | None:
@@ -296,22 +297,29 @@ def _candidate_journeys(
     gst_rows = connection.execute(
         text(
             """
-            SELECT DISTINCT ON (journey_id) journey_id, buyer_gstin
-            FROM auditcore.invoice_review_values
-            WHERE tenant_id = :tenant_id AND journey_id <> :journey_id AND buyer_gstin IS NOT NULL
-            ORDER BY journey_id, created_at_utc DESC
+            SELECT DISTINCT ON (v.journey_id) v.journey_id, v.buyer_gstin, j.created_at_utc
+            FROM auditcore.invoice_review_values v
+            JOIN auditcore.journeys j ON j.tenant_id = v.tenant_id AND j.journey_id = v.journey_id
+            WHERE v.tenant_id = :tenant_id AND v.journey_id <> :journey_id AND v.buyer_gstin IS NOT NULL
+            ORDER BY v.journey_id, v.created_at_utc DESC
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
     gst_by_journey = {row["journey_id"]: row["buyer_gstin"] for row in gst_rows}
+    for row in gst_rows:
+        created_at_by_journey.setdefault(row["journey_id"], row["created_at_utc"])
 
     candidates = []
-    for candidate_journey_id, journey_rows in by_journey.items():
-        signals = _extract_signals(journey_rows)
+    # A journey whose only identifying signal is its buyer GSTIN (no KYC
+    # extraction at all yet) has no entry in by_journey -- iterate the
+    # union of both sources, or GST-only candidates are silently dropped
+    # before ever being compared (the exact bug this fixes).
+    for candidate_journey_id in by_journey.keys() | gst_by_journey.keys():
+        journey_rows = by_journey.get(candidate_journey_id, [])
+        signals = _extract_signals(journey_rows, gst=gst_by_journey.get(candidate_journey_id))
         if signals is None:
             continue
-        signals["gst"] = gst_by_journey.get(candidate_journey_id)
         signals["journey_id"] = candidate_journey_id
         signals["created_at_utc"] = created_at_by_journey[candidate_journey_id]
         candidates.append(signals)
