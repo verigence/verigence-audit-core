@@ -47,11 +47,21 @@ from audit_core.uc03_masters_alignment import (
     registration_basis,
 )
 from audit_core.uc03_sku_candidates import _price_plan_for_journey
+from audit_core.workflow import create_workflow_task
 
 logger = logging.getLogger(__name__)
 
 _CALCULATED = "CALCULATED"
 _DISCOUNT_EVIDENCE_FINDING_TYPE = "DOCUMENT_EXCEPTION"
+
+# Total Standard vs Total Actual (net of discounts) across the whole deal.
+# COMMERCIAL_EXCEPTION already classifies VIOLATION via
+# uc03_finding_routing._VIOLATION_TYPES -- no rule_key prefix registration
+# needed, same as BK_MIN_BOOKING_AMOUNT_NOT_MET.
+_TOTAL_VARIANCE_FINDING_TYPE = "COMMERCIAL_EXCEPTION"
+_TOTAL_VARIANCE_RULE_KEY = "DEAL_TOTAL_VARIANCE_NEGATIVE"
+_TOTAL_VARIANCE_WORKFLOW_TYPE = "UC03_DEAL_TOTAL_VARIANCE"
+_TOTAL_VARIANCE_TASK_TYPE = "DEAL_TOTAL_VARIANCE_REVIEW"
 
 
 def _to_decimal(value: Any) -> Decimal | None:
@@ -560,6 +570,150 @@ def _sync_conditional_discount_evidence(
 
 
 # ── producer ──────────────────────────────────────────────────────────────────
+def _sync_total_variance(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
+) -> dict[str, Any]:
+    """Total Standard vs Total Actual, net of discounts, across the whole deal.
+
+    Standard net = every commercial line's standard_amount, less every
+    discount's standard_eligible_amount (what the masters say the customer
+    should pay). Actual net = the same, using each row's actual instead
+    (what the customer is actually being charged). A positive variance
+    (actual > standard -- paying more than standard, e.g. extra options) is
+    informational only, for the Deal page to highlight. A negative variance
+    (actual < standard -- undercollection / over-discounting) raises a
+    HIGH-priority finding + Team Lead task, per explicit instruction. Never
+    raises; self-heals (resolves) once the variance is no longer negative.
+    """
+    # A partially-reviewed deal (e.g. only a discount reviewed, the vehicle
+    # price itself not yet) must never be compared -- summing a complete
+    # standard total against an incomplete actual total (each missing line
+    # coalescing to zero) always looks like a huge false shortfall. Require
+    # every commercial line that has a standard price to also have an
+    # actual before this comparison means anything; discounts don't gate
+    # this (an unclaimed/PENDING discount legitimately has no actual and
+    # contributes zero to actual_net, which is correct, not incomplete).
+    is_ready = connection.execute(
+        text(
+            """
+            SELECT
+                NOT EXISTS(
+                    SELECT 1 FROM auditcore.commercial_lines
+                    WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+                      AND standard_amount IS NOT NULL AND actual_amount IS NULL
+                )
+                AND EXISTS(
+                    SELECT 1 FROM auditcore.commercial_lines
+                    WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+                      AND actual_amount IS NOT NULL
+                )
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalar_one()
+    if not is_ready:
+        return {"skipped": True, "reason": "actuals_not_fully_reviewed_yet"}
+
+    totals = connection.execute(
+        text(
+            """
+            SELECT
+                COALESCE((SELECT SUM(standard_amount) FROM auditcore.commercial_lines
+                          WHERE tenant_id = :tenant_id AND journey_id = :journey_id), 0)
+                - COALESCE((SELECT SUM(standard_eligible_amount) FROM auditcore.discount_applications
+                            WHERE tenant_id = :tenant_id AND journey_id = :journey_id), 0)
+                AS standard_net,
+                COALESCE((SELECT SUM(actual_amount) FROM auditcore.commercial_lines
+                          WHERE tenant_id = :tenant_id AND journey_id = :journey_id), 0)
+                - COALESCE((SELECT SUM(actual_discount_amount) FROM auditcore.discount_applications
+                            WHERE tenant_id = :tenant_id AND journey_id = :journey_id), 0)
+                AS actual_net
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one()
+
+    standard_net = Decimal(totals["standard_net"] or 0)
+    actual_net = Decimal(totals["actual_net"] or 0)
+    variance = actual_net - standard_net
+
+    existing_finding_id = connection.execute(
+        text(
+            """
+            SELECT audit_finding_id FROM auditcore.audit_findings
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+              AND rule_key = :rule_key AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "rule_key": _TOTAL_VARIANCE_RULE_KEY},
+    ).scalar_one_or_none()
+
+    if variance < 0:
+        finding_id = _machine_flag(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code="BOOKING",
+            rule_key=_TOTAL_VARIANCE_RULE_KEY,
+            finding_type=_TOTAL_VARIANCE_FINDING_TYPE,
+            severity="HIGH",
+            title="Deal total is below the standard price",
+            description=(
+                f"This deal's actual net total (₹{actual_net:,.2f}) is below the standard net "
+                f"total per the price masters (₹{standard_net:,.2f}) by ₹{-variance:,.2f}. "
+                f"A Team Lead must validate this shortfall."
+            ),
+            correlation_id=correlation_id,
+            safe_payload={
+                "standardNet": str(standard_net), "actualNet": str(actual_net), "variance": str(variance),
+            },
+            blocking_completion=False,
+        )
+        open_task_count = connection.execute(
+            text(
+                """
+                SELECT count(*) FROM auditcore.workflow_tasks
+                WHERE tenant_id=:tenant_id AND related_finding_id=:fid
+                  AND task_status NOT IN ('COMPLETED', 'CANCELLED', 'FAILED', 'DEAD_LETTER')
+                """
+            ),
+            {"tenant_id": tenant_id, "fid": finding_id},
+        ).scalar_one()
+        if open_task_count == 0:
+            create_workflow_task(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                workflow_type=_TOTAL_VARIANCE_WORKFLOW_TYPE,
+                process_area="BOOKING",
+                task_type=_TOTAL_VARIANCE_TASK_TYPE,
+                assigned_role_code="TL",
+                related_finding_id=finding_id,
+                severity="HIGH",
+                task_payload={
+                    "ruleKey": _TOTAL_VARIANCE_RULE_KEY,
+                    "findingId": str(finding_id),
+                    "standardNet": str(standard_net),
+                    "actualNet": str(actual_net),
+                },
+                effect_key=f"task:{finding_id}:total-variance",
+                correlation_id=correlation_id,
+            )
+    elif existing_finding_id is not None:
+        _resolve_finding(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code="BOOKING",
+            finding_id=existing_finding_id,
+            actor_id=None,
+            correlation_id=correlation_id,
+            note="The deal total no longer falls below the standard price.",
+        )
+
+    return {"standardNet": str(standard_net), "actualNet": str(actual_net), "variance": str(variance)}
+
+
 def sync_deal_reconciliation(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
 ) -> dict[str, Any]:
@@ -610,7 +764,15 @@ def sync_deal_reconciliation(
         evidence_rows = _sync_conditional_discount_evidence(
             connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
         )
-        return {"priceLines": price_lines, "evidenceRowsChecked": evidence_rows, **discount}
+        totals = _sync_total_variance(
+            connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
+        )
+        return {
+            "priceLines": price_lines,
+            "evidenceRowsChecked": evidence_rows,
+            "totals": totals,
+            **discount,
+        }
     except Exception:
         logger.warning("sync_deal_reconciliation failed", exc_info=True)
         return {"error": True}

@@ -737,6 +737,7 @@ def get_journey_overview(
                 standard_eligible_amount AS "standardEligibleAmount",
                 actual_discount_amount AS "actualDiscountAmount",
                 eligibility_result AS "eligibilityResult",
+                evidence_status AS "evidenceStatus",
                 actual_source_kind AS "sourceKind",
                 source_evidence_id AS "sourceEvidenceId",
                 details AS "details"

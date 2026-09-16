@@ -547,6 +547,112 @@ def test_invoice_discount_survives_booking_form_reheal(journey) -> None:
     assert row["actual_discount_amount"] == Decimal(25000)
 
 
+def test_positive_variance_is_not_flagged(journey) -> None:
+    """Actual net above standard net (customer effectively paying more, e.g.
+    extra options) is informational only -- no flag, per explicit
+    instruction."""
+    c = journey
+    _seed_pinned_sku(c, model="XUV700", variant="AX7L", components={"EX_SHOWROOM": "2000000"})
+    # First run materializes the standard commercial line; only then can its
+    # actual_amount be set directly to simulate an invoice-given value above
+    # standard (extra options) without any discount involved.
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    c.execute(
+        text("UPDATE auditcore.commercial_lines SET actual_amount=2100000 "
+             "WHERE tenant_id=:t AND journey_id=:j AND component_key='ex_showroom_price'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    )
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    finding = c.execute(
+        text("SELECT finding_status FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND rule_key='DEAL_TOTAL_VARIANCE_NEGATIVE'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one_or_none()
+    assert finding is None
+
+
+def test_partially_reviewed_deal_does_not_false_flag_variance(journey) -> None:
+    """Regression: a discount already reviewed while the vehicle price
+    itself is not yet must never be compared -- an incomplete actual total
+    (missing lines coalescing to zero) would otherwise always look like a
+    huge false shortfall against the complete standard total."""
+    c = journey
+    seeded = _seed_pinned_sku(c, model="THAR", variant="LX", components={"EX_SHOWROOM": "1500000"})
+    _seed_scheme(c, category="CONSUMER", benefit_key="CASH_DISCOUNT", amount="20000",
+                 model_id=seeded["model_id"])
+    _seed_reviewed_booking(c, discount_amount="15000")
+
+    # The discount actual is reviewed, but ex_showroom_price's own actual
+    # never was -- the deal is not ready for a total comparison yet.
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    assert c.execute(
+        text("SELECT finding_status FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND rule_key='DEAL_TOTAL_VARIANCE_NEGATIVE'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one_or_none() is None
+
+
+def test_negative_variance_raises_high_finding_and_tl_task(journey) -> None:
+    c = journey
+    _seed_pinned_sku(c, model="THAR", variant="LX", components={"EX_SHOWROOM": "1500000"})
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    c.execute(
+        text("UPDATE auditcore.commercial_lines SET actual_amount=1400000 "
+             "WHERE tenant_id=:t AND journey_id=:j AND component_key='ex_showroom_price'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    )
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    finding = c.execute(
+        text("SELECT audit_finding_id, finding_class, severity, finding_status "
+             "FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND rule_key='DEAL_TOTAL_VARIANCE_NEGATIVE'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one()
+    assert finding["finding_class"] == "VIOLATION"
+    assert finding["severity"] == "HIGH"
+    assert finding["finding_status"] == "OPEN"
+
+    task = c.execute(
+        text("SELECT task_type, assigned_role_code FROM auditcore.workflow_tasks "
+             "WHERE tenant_id=:t AND journey_id=:j AND related_finding_id=:f"),
+        {"t": c.tenant_id, "j": c.journey_id, "f": finding["audit_finding_id"]},
+    ).mappings().one()
+    assert task["task_type"] == "DEAL_TOTAL_VARIANCE_REVIEW"
+    assert task["assigned_role_code"] == "TL"
+
+
+def test_negative_variance_resolves_once_corrected(journey) -> None:
+    c = journey
+    _seed_pinned_sku(c, model="BOLERO", variant="B4", components={"EX_SHOWROOM": "1000000"})
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    c.execute(
+        text("UPDATE auditcore.commercial_lines SET actual_amount=900000 "
+             "WHERE tenant_id=:t AND journey_id=:j AND component_key='ex_showroom_price'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    )
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert c.execute(
+        text("SELECT finding_status FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND rule_key='DEAL_TOTAL_VARIANCE_NEGATIVE'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one() == "OPEN"
+
+    c.execute(
+        text("UPDATE auditcore.commercial_lines SET actual_amount=1000000 "
+             "WHERE tenant_id=:t AND journey_id=:j AND component_key='ex_showroom_price'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    )
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert c.execute(
+        text("SELECT finding_status FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND rule_key='DEAL_TOTAL_VARIANCE_NEGATIVE'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one() == "RESOLVED"
+
+
 def test_skipped_when_sku_not_pinned(journey) -> None:
     c = journey
     _seed_pinned_sku(c, model="THAR ROXX", variant="MX", components={"EX_SHOWROOM": "1600000"},
