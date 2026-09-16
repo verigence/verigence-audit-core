@@ -8,9 +8,9 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-from audit_core.dependencies import get_human_principal
+from audit_core.dependencies import get_human_principal, get_principal
 from audit_core.main import app
-from audit_core.security import HumanPrincipal
+from audit_core.security import HumanPrincipal, Principal
 from audit_core.security_authorization import (
     SecurityAuthorizationDecision,
     get_security_authorization_client,
@@ -152,6 +152,11 @@ def correction_setup():
 
     active_actor = {"id": actors["PC"]}
     app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=active_actor["id"])
+    app.dependency_overrides[get_principal] = lambda: Principal(
+        subject=active_actor["id"],
+        tenant_id=tenant_id,
+        permissions=("audit.work.read", "audit.work.update", "audit.work.manage"),
+    )
     app.dependency_overrides[get_security_authorization_client] = lambda: AllowedAuthorization()
     try:
         yield {
@@ -165,6 +170,7 @@ def correction_setup():
         }
     finally:
         app.dependency_overrides.pop(get_human_principal, None)
+        app.dependency_overrides.pop(get_principal, None)
         app.dependency_overrides.pop(get_security_authorization_client, None)
         engine.dispose()
 
@@ -186,14 +192,22 @@ def _propose(setup, *, key: str, product_sku_id, reason: str = "Document reader 
     )
 
 
-def test_propose_correction_raises_a_tl_owned_violation(correction_setup):
+def test_propose_correction_creates_a_tl_task(correction_setup):
     response = _propose(correction_setup, key="propose-0001", product_sku_id=correction_setup["right_sku"])
     assert response.status_code == 200, response.text
-    flag = response.json()["flag"]
-    assert flag["findingClass"] == "VIOLATION"
-    assert flag["resolutionMode"] == "ADJUDICATED"
-    assert flag["ownerRoleCode"] == "TL"
-    assert flag["status"] == "OPEN"
+    body = response.json()
+    assert body["proposedProductSkuId"] == str(correction_setup["right_sku"])
+    assert body["previousProductSkuId"] == str(correction_setup["wrong_sku"])
+
+    with correction_setup["engine"].connect() as c:
+        task = c.execute(
+            text("SELECT task_type, assigned_role_code, task_status FROM auditcore.workflow_tasks "
+                 "WHERE tenant_id=:t AND workflow_task_id=:tid"),
+            {"t": correction_setup["tenant_id"], "tid": UUID(body["taskId"])},
+        ).mappings().one()
+    assert task["task_type"] == "MODEL_SELECTION_CORRECTION_REVIEW"
+    assert task["assigned_role_code"] == "TL"
+    assert task["task_status"] in ("PENDING", "READY")
 
 
 def test_propose_correction_fails_when_nothing_is_confirmed_yet(correction_setup):
@@ -217,21 +231,17 @@ def test_propose_correction_fails_for_a_sku_outside_the_effective_price_list(cor
     assert response.status_code == 422, response.text
 
 
-def test_confirm_breach_reassigns_the_sku_and_recomputes_the_deal(correction_setup):
-    flag = _propose(
+def test_completing_the_task_reassigns_the_sku_and_recomputes_the_deal(correction_setup):
+    task_id = _propose(
         correction_setup, key="propose-0005", product_sku_id=correction_setup["right_sku"]
-    ).json()["flag"]
+    ).json()["taskId"]
     _set_role(correction_setup, "TL")
     action = _client().post(
-        f"/v1/tenants/{correction_setup['tenant_id']}/journeys/{correction_setup['journey_id']}"
-        f"/uc03/flags/{flag['flagId']}/actions",
-        headers={"Idempotency-Key": "confirm-0005", "If-Match": f'"{flag["version"]}"'},
-        json={"action": "CONFIRM_BREACH", "resolutionReason": "Verified against the booking form scan."},
+        f"/v1/tenants/{correction_setup['tenant_id']}/tasks/{task_id}/complete",
+        headers={"Idempotency-Key": "complete-0005"},
     )
     assert action.status_code == 200, action.text
-    resolved = action.json()["flag"]
-    assert resolved["status"] == "RESOLVED"
-    assert resolved["disposition"] == "CONFIRMED_BREACH"
+    assert action.json()["status"] == "COMPLETED"
 
     with correction_setup["engine"].connect() as c:
         row = c.execute(
@@ -245,13 +255,13 @@ def test_confirm_breach_reassigns_the_sku_and_recomputes_the_deal(correction_set
     with correction_setup["engine"].connect() as c:
         applied_at = c.execute(
             text("SELECT applied_at_utc FROM auditcore.model_selection_correction_proposals "
-                 "WHERE tenant_id=:t AND audit_finding_id=:f"),
-            {"t": correction_setup["tenant_id"], "f": UUID(flag["flagId"])},
+                 "WHERE tenant_id=:t AND workflow_task_id=:tid"),
+            {"t": correction_setup["tenant_id"], "tid": UUID(task_id)},
         ).scalar_one()
     assert applied_at is not None
 
     # Deal reconciliation re-ran against the corrected SKU -- a commercial
-    # line now exists for it (never overwritten with the wrong SKU's price).
+    # line now exists for it (never left showing the wrong SKU's price).
     with correction_setup["engine"].connect() as c:
         commercial_count = c.execute(
             text("SELECT count(*) FROM auditcore.commercial_lines "
@@ -261,25 +271,18 @@ def test_confirm_breach_reassigns_the_sku_and_recomputes_the_deal(correction_set
     assert commercial_count > 0
 
 
-def test_mark_false_positive_leaves_the_original_sku_untouched(correction_setup):
-    flag = _propose(
+def test_cancelling_the_task_leaves_the_original_sku_untouched(correction_setup):
+    task_id = _propose(
         correction_setup, key="propose-0006", product_sku_id=correction_setup["right_sku"]
-    ).json()["flag"]
+    ).json()["taskId"]
     _set_role(correction_setup, "TL")
     action = _client().post(
-        f"/v1/tenants/{correction_setup['tenant_id']}/journeys/{correction_setup['journey_id']}"
-        f"/uc03/flags/{flag['flagId']}/actions",
-        headers={"Idempotency-Key": "confirm-0006", "If-Match": f'"{flag["version"]}"'},
-        json={
-            "action": "MARK_FALSE_POSITIVE",
-            "resolutionReason": "The original SKU was actually correct.",
-            "rejectionCategory": "DATA_ALREADY_CORRECT",
-        },
+        f"/v1/tenants/{correction_setup['tenant_id']}/tasks/{task_id}/cancel",
+        headers={"Idempotency-Key": "cancel-0006"},
+        json={"reason": "The original SKU was actually correct."},
     )
     assert action.status_code == 200, action.text
-    resolved = action.json()["flag"]
-    assert resolved["status"] == "RESOLVED"
-    assert resolved["disposition"] == "FALSE_POSITIVE"
+    assert action.json()["status"] == "CANCELLED"
 
     with correction_setup["engine"].connect() as c:
         row = c.execute(
@@ -292,7 +295,7 @@ def test_mark_false_positive_leaves_the_original_sku_untouched(correction_setup)
     with correction_setup["engine"].connect() as c:
         applied_at = c.execute(
             text("SELECT applied_at_utc FROM auditcore.model_selection_correction_proposals "
-                 "WHERE tenant_id=:t AND audit_finding_id=:f"),
-            {"t": correction_setup["tenant_id"], "f": UUID(flag["flagId"])},
+                 "WHERE tenant_id=:t AND workflow_task_id=:tid"),
+            {"t": correction_setup["tenant_id"], "tid": UUID(task_id)},
         ).scalar_one()
     assert applied_at is None
