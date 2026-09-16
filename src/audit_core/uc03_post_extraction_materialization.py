@@ -188,6 +188,15 @@ def _receipt_documents(annotated: list[dict[str, Any]]) -> list[Any]:
             continue
         if not row.get("hasEffectiveValue"):
             continue
+        # A receipt is its own named document (see
+        # uc03_customer_identity_consistency.py's customer-name check) and
+        # doesn't go through the precedence-candidacy filter above (every
+        # receipt becomes its own payment, not a single winner per
+        # semantic) -- so the hold has to be checked again here directly,
+        # or a receipt whose name doesn't match the customer's KYC would
+        # still materialize a payment record.
+        if str(row.get("identityCheckStatus") or "PASSED").upper() != "PASSED":
+            continue
         document_id = UUID(str(row["documentId"]))
         item = grouped.setdefault(
             document_id,

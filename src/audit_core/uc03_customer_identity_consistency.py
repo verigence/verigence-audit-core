@@ -7,10 +7,21 @@ document that also carries a person's name (Booking Form, Insurance Cover, a
 Bank Approval Letter, any tax/customer invoice) -- uploaded before or after
 that KYC document, order does not matter -- is checked against it. A
 mismatch raises one HIGH-severity ``WRONG_DOCUMENT`` finding per mismatching
-document: the wrong customer's paperwork may have been attached to this
-Journey. This is a VIOLATION (TL adjudicates: Accept confirms the wrong
-document was attached, Reject records a legitimate name variant this check's
-fuzzy match under-scored), not a PC self-serve data gap.
+document, and -- unlike every other machine-raised finding in this codebase
+-- also holds that document's extracted fields out of materialization
+(``evidence.identity_check_status='HELD'``): the wrong customer's paperwork
+must not silently become this Journey's source of truth for a price, a
+model, or anything else while a human is still deciding whether it belongs
+here. This is a VIOLATION (TL adjudicates via Confirm Breach / Mark False
+Positive on the finding -- Confirm Breach soft-deletes the document
+(``reject_wrong_document``) and asks PC to upload the right one; Mark False
+Positive releases the hold (``release_wrong_document_hold``), recording that
+this check's fuzzy match under-scored a legitimate name variant), not a PC
+self-serve data gap. The same hold applies, with no finding of its own,
+when no KYC document has been extracted at all yet -- there's nothing to
+verify any other document's name against, so nothing is trusted until one
+arrives (the existing document-completeness rules already tell PC to
+upload it).
 
 Independently, every receipt (dealer_receipt / payment_receipt -- both
 schemas require DI to read a dealer_name off the document) is checked
@@ -18,7 +29,8 @@ against this Journey's own dealer, from the master record
 (auditcore.dealers), not another document. A mismatch means a receipt from a
 different dealership was attached here -- same finding type, same severity,
 its own rule_key so it tracks and self-heals independently of the
-customer-name check on the same document.
+customer-name check on the same document. This narrower check does not
+hold anything -- see the module's own reasoning at the customer-name loop.
 
 ``sync_customer_identity_consistency`` is the producer: idempotent, self-heals
 (a later correction that now matches resolves the finding), never raises.
@@ -37,6 +49,7 @@ from sqlalchemy import Connection, text
 from audit_core.uc03_delivery_commands import _machine_flag
 from audit_core.uc03_manual_verification import _resolve_finding
 from audit_core.uc03_v2_review_materialization import _INVOICE_DOCUMENT_TYPES
+from audit_core.workflow import create_workflow_task
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +142,7 @@ def _named_documents(
             ranked AS (
                 SELECT
                     f.di_document_id,
+                    f.evidence_id,
                     f.stage_code,
                     f.source_document_type_key AS document_type_key,
                     f.effective_value,
@@ -143,7 +157,7 @@ def _named_documents(
                 WHERE f.tenant_id = :tenant_id AND f.journey_id = :journey_id
                   AND f.effective_value IS NOT NULL
             )
-            SELECT di_document_id, stage_code, document_type_key, effective_value
+            SELECT di_document_id, evidence_id, stage_code, document_type_key, effective_value
             FROM ranked WHERE row_rank = 1
             """
         ),
@@ -221,6 +235,123 @@ def _receipt_dealer_names(
     return [dict(row) for row in rows]
 
 
+def _set_identity_check_status(
+    connection: Connection, *, tenant_id: str, evidence_id: UUID | None, status: str
+) -> None:
+    """Move a document's evidence row between PASSED/HELD -- never touches a
+    row a Team Lead already REJECTED (a genuinely re-uploaded replacement
+    gets its own fresh evidence row with its own default, not this one
+    flipped back)."""
+    if evidence_id is None:
+        return
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.evidence
+            SET identity_check_status = :status
+            WHERE tenant_id = :tenant_id AND evidence_id = :evidence_id
+              AND identity_check_status <> 'REJECTED'
+            """
+        ),
+        {"tenant_id": tenant_id, "evidence_id": evidence_id, "status": status},
+    )
+
+
+def reject_wrong_document(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    di_document_id: UUID,
+    stage_code: str,
+    actor_id: str,
+    reason: str | None,
+    correlation_id: str,
+    related_finding_id: UUID | None = None,
+) -> None:
+    """A Team Lead confirmed via Confirm Breach that this really is the
+    wrong customer's document: soft-delete it (VOIDED -- the row and its
+    audit trail survive, but it's no longer the active evidence for its
+    requirement, exactly like the existing supersede-on-reupload pattern)
+    and ask PC to upload the correct one against the same requirement, the
+    same way a Team Lead's own "request reupload" action does.
+    Idempotent: a no-op if the evidence is already not ACTIVE (e.g. this
+    verdict is applied twice, or the document was independently replaced).
+    """
+    evidence_row = connection.execute(
+        text(
+            """
+            SELECT evidence_id, journey_document_requirement_id, document_type_key
+            FROM auditcore.evidence
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+              AND di_document_id = :di_document_id AND association_status = 'ACTIVE'
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "di_document_id": di_document_id},
+    ).mappings().one_or_none()
+    if evidence_row is None:
+        return
+
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.evidence
+            SET association_status = 'VOIDED',
+                identity_check_status = 'REJECTED',
+                void_reason = :reason,
+                voided_by_actor_id = :actor_id,
+                voided_at_utc = now()
+            WHERE tenant_id = :tenant_id AND evidence_id = :evidence_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "evidence_id": evidence_row["evidence_id"],
+            "reason": reason or "Confirmed as the wrong customer's document (identity check).",
+            "actor_id": actor_id,
+        },
+    )
+
+    if evidence_row["journey_document_requirement_id"] is not None:
+        create_workflow_task(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            workflow_type="UC03_DOCUMENT_REUPLOAD",
+            process_area=stage_code,
+            task_type="PC_DOCUMENT_REUPLOAD",
+            assigned_role_code="PC",
+            related_finding_id=related_finding_id,
+            task_payload={
+                "documentId": str(di_document_id),
+                "requirementRef": str(evidence_row["journey_document_requirement_id"]),
+                "reason": reason or "The uploaded document's name did not match the customer's KYC and was confirmed as the wrong document.",
+            },
+            effect_key=f"task:identity-reject:{evidence_row['evidence_id']}",
+            correlation_id=correlation_id,
+        )
+
+
+def release_wrong_document_hold(
+    connection: Connection, *, tenant_id: str, di_document_id: UUID
+) -> None:
+    """A Team Lead Marked False Positive: this check's fuzzy match under-
+    scored a legitimate name variant. Release the hold so the document's
+    fields are eligible for materialization again on the next resolution
+    pass -- the caller is responsible for actually re-running it."""
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.evidence
+            SET identity_check_status = 'PASSED'
+            WHERE tenant_id = :tenant_id AND di_document_id = :di_document_id
+              AND identity_check_status = 'HELD'
+            """
+        ),
+        {"tenant_id": tenant_id, "di_document_id": di_document_id},
+    )
+
+
 def _resolve_if_open(
     connection: Connection,
     *,
@@ -286,6 +417,12 @@ def sync_customer_identity_consistency(
                 examined += 1
                 rule_key = f"{_RULE_PREFIX}:{document_id}"
                 if not document_name or _names_match(reference_name, document_name):
+                    _set_identity_check_status(
+                        connection,
+                        tenant_id=tenant_id,
+                        evidence_id=document.get("evidence_id"),
+                        status="PASSED",
+                    )
                     if _resolve_if_open(
                         connection,
                         tenant_id=tenant_id,
@@ -298,6 +435,18 @@ def sync_customer_identity_consistency(
                         resolved += 1
                     continue
 
+                # Held out of materialization the instant the mismatch is
+                # detected -- this same sync pass' later materialization
+                # step (uc03_confidence_review_policy._sync_booking_document)
+                # runs after this producer, so a freshly-flagged document's
+                # data is protected before it ever gets a chance to
+                # materialize wrongly, not just on some later pass.
+                _set_identity_check_status(
+                    connection,
+                    tenant_id=tenant_id,
+                    evidence_id=document.get("evidence_id"),
+                    status="HELD",
+                )
                 _machine_flag(
                     connection,
                     tenant_id=tenant_id,
@@ -323,6 +472,23 @@ def sync_customer_identity_consistency(
                     },
                 )
                 raised += 1
+        else:
+            # No KYC document has been extracted on this Journey yet, so
+            # there is nothing to check any other named document against --
+            # hold them all rather than trusting an unverifiable name. This
+            # doesn't raise its own finding: the existing document-
+            # completeness rules (e.g. BK_PAN_PRESENT) already tell PC to
+            # upload KYC; once one is extracted, the very next sync
+            # re-evaluates every held document through the branch above.
+            for document in documents:
+                if document["document_type_key"] in _KYC_DOCUMENT_TYPES:
+                    continue
+                _set_identity_check_status(
+                    connection,
+                    tenant_id=tenant_id,
+                    evidence_id=document.get("evidence_id"),
+                    status="HELD",
+                )
 
         dealer_name = _journey_dealer_name(connection, tenant_id=tenant_id, journey_id=journey_id)
         if dealer_name:
@@ -380,4 +546,8 @@ def sync_customer_identity_consistency(
         return {"error": True}
 
 
-__all__ = ["sync_customer_identity_consistency"]
+__all__ = [
+    "reject_wrong_document",
+    "release_wrong_document_hold",
+    "sync_customer_identity_consistency",
+]

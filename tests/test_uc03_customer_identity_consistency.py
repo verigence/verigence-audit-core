@@ -375,3 +375,209 @@ def test_non_receipt_document_types_are_not_dealer_checked(journey) -> None:
 
     assert result["raised"] == 0
     assert _open_wrong_document_findings(c) == []
+
+
+# ── identity-check hold (evidence.identity_check_status) ────────────────────
+def _link_evidence(c, *, di_document_id, document_type_key, requirement_id=None):
+    customer_id = c.execute(
+        text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    return c.execute(
+        text(
+            """
+            INSERT INTO auditcore.evidence (
+                tenant_id, journey_id, customer_id, di_subject_id, di_document_id,
+                document_type_key, evidence_purpose, journey_document_requirement_id,
+                association_status
+            ) VALUES (
+                :t, :j, :cu, :subj, :doc, :dtk, 'BOOKING_DOCUMENT', :req, 'ACTIVE'
+            )
+            RETURNING evidence_id
+            """
+        ),
+        {
+            "t": c.tenant_id, "j": c.journey_id, "cu": customer_id, "subj": uuid4(),
+            "doc": di_document_id, "dtk": document_type_key, "req": requirement_id,
+        },
+    ).scalar_one()
+
+
+def _set_named_field_with_evidence(
+    c, *, stage_code, document_type_key, field_key, value, confidence=0.95,
+    document_id=None, requirement_id=None,
+):
+    document_id = document_id or uuid4()
+    evidence_id = _link_evidence(
+        c, di_document_id=document_id, document_type_key=document_type_key,
+        requirement_id=requirement_id,
+    )
+    c.execute(
+        text(
+            """
+            INSERT INTO auditcore.journey_document_extracted_fields (
+                tenant_id, journey_id, evidence_id, di_document_id,
+                source_fact_ref, source_fact_version, stage_code,
+                source_document_type_key, source_canonical_field_id, field_key,
+                extracted_value, effective_value, confidence_score, is_modified
+            ) VALUES (
+                :t, :j, :ev, :doc,
+                NULL, 1, :stage,
+                :dtk, NULL, :fk,
+                CAST(:v AS jsonb), CAST(:v AS jsonb), :conf, false
+            )
+            """
+        ),
+        {"t": c.tenant_id, "j": c.journey_id, "ev": evidence_id, "doc": document_id, "stage": stage_code,
+         "dtk": document_type_key, "fk": field_key, "v": json.dumps(value), "conf": confidence},
+    )
+    return document_id, evidence_id
+
+
+def _evidence_row(c, evidence_id):
+    return dict(c.execute(
+        text(
+            "SELECT association_status, identity_check_status, void_reason "
+            "FROM auditcore.evidence WHERE tenant_id=:t AND evidence_id=:e"
+        ),
+        {"t": c.tenant_id, "e": evidence_id},
+    ).mappings().one())
+
+
+def test_mismatch_holds_the_document_out_of_materialization(journey) -> None:
+    c = journey
+    _set_named_field(
+        c, stage_code="BOOKING", document_type_key="aadhaar",
+        field_key="aadhaar_name", value="Sanjaya Kumar Mohanty",
+    )
+    _document_id, evidence_id = _set_named_field_with_evidence(
+        c, stage_code="BOOKING", document_type_key="booking_form",
+        field_key="customer_name", value="Priya Nair",
+    )
+
+    result = cic.sync_customer_identity_consistency(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+
+    assert result["raised"] == 1
+    assert _evidence_row(c, evidence_id)["identity_check_status"] == "HELD"
+    # Not a delete -- still ACTIVE, still visibly "Received" on the checklist.
+    assert _evidence_row(c, evidence_id)["association_status"] == "ACTIVE"
+
+
+def test_matching_name_keeps_evidence_passed(journey) -> None:
+    c = journey
+    _set_named_field(
+        c, stage_code="BOOKING", document_type_key="aadhaar",
+        field_key="aadhaar_name", value="Sanjaya Kumar Mohanty",
+    )
+    _document_id, evidence_id = _set_named_field_with_evidence(
+        c, stage_code="BOOKING", document_type_key="booking_form",
+        field_key="customer_name", value="Sanjaya Kumar Mohanty",
+    )
+
+    cic.sync_customer_identity_consistency(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+
+    assert _evidence_row(c, evidence_id)["identity_check_status"] == "PASSED"
+
+
+def test_no_kyc_yet_holds_every_named_document(journey) -> None:
+    # Real requirement (clarified after this rule shipped): a non-KYC named
+    # document's data can't be trusted for materialization until there's a
+    # KYC name to check it against at all -- held, not just skipped.
+    c = journey
+    _document_id, evidence_id = _set_named_field_with_evidence(
+        c, stage_code="BOOKING", document_type_key="booking_form",
+        field_key="customer_name", value="Sanjaya Kumar Mohanty",
+    )
+
+    result = cic.sync_customer_identity_consistency(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+
+    assert result["raised"] == 0  # no finding -- BK_PAN_PRESENT-style rules cover "upload KYC"
+    assert _evidence_row(c, evidence_id)["identity_check_status"] == "HELD"
+
+
+def test_reject_wrong_document_voids_evidence_and_creates_pc_reupload_task(journey) -> None:
+    c = journey
+    requirement_id = uuid4()
+    document_id, evidence_id = _set_named_field_with_evidence(
+        c, stage_code="BOOKING", document_type_key="booking_form",
+        field_key="customer_name", value="Priya Nair", requirement_id=requirement_id,
+    )
+
+    cic.reject_wrong_document(
+        c,
+        tenant_id=c.tenant_id,
+        journey_id=c.journey_id,
+        di_document_id=document_id,
+        stage_code="BOOKING",
+        actor_id="tl-test-actor",
+        reason="Confirmed wrong customer's document.",
+        correlation_id="",
+    )
+
+    row = _evidence_row(c, evidence_id)
+    assert row["association_status"] == "VOIDED"
+    assert row["identity_check_status"] == "REJECTED"
+    assert row["void_reason"] == "Confirmed wrong customer's document."
+
+    task = c.execute(
+        text(
+            "SELECT task_type, assigned_role_code, task_payload FROM auditcore.workflow_tasks "
+            "WHERE tenant_id=:t AND journey_id=:j AND task_type='PC_DOCUMENT_REUPLOAD'"
+        ),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one()
+    assert task["assigned_role_code"] == "PC"
+    assert task["task_payload"]["documentId"] == str(document_id)
+    assert task["task_payload"]["requirementRef"] == str(requirement_id)
+
+
+def test_reject_wrong_document_is_idempotent(journey) -> None:
+    c = journey
+    document_id, evidence_id = _set_named_field_with_evidence(
+        c, stage_code="BOOKING", document_type_key="booking_form",
+        field_key="customer_name", value="Priya Nair",
+    )
+    cic.reject_wrong_document(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, di_document_id=document_id,
+        stage_code="BOOKING", actor_id="tl-test-actor", reason=None, correlation_id="",
+    )
+    # A second call (e.g. a retried request) must not raise or double-void.
+    cic.reject_wrong_document(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, di_document_id=document_id,
+        stage_code="BOOKING", actor_id="tl-test-actor", reason=None, correlation_id="",
+    )
+    assert _evidence_row(c, evidence_id)["association_status"] == "VOIDED"
+
+
+def test_release_wrong_document_hold_clears_held_but_never_rejected(journey) -> None:
+    c = journey
+    held_document_id, held_evidence_id = _set_named_field_with_evidence(
+        c, stage_code="BOOKING", document_type_key="booking_form",
+        field_key="customer_name", value="Priya Nair",
+    )
+    c.execute(
+        text("UPDATE auditcore.evidence SET identity_check_status='HELD' "
+             "WHERE tenant_id=:t AND evidence_id=:e"),
+        {"t": c.tenant_id, "e": held_evidence_id},
+    )
+    rejected_document_id, rejected_evidence_id = _set_named_field_with_evidence(
+        c, stage_code="BOOKING", document_type_key="insurance_cover",
+        field_key="insured_name", value="Priya Nair",
+    )
+    c.execute(
+        text("UPDATE auditcore.evidence SET identity_check_status='REJECTED' "
+             "WHERE tenant_id=:t AND evidence_id=:e"),
+        {"t": c.tenant_id, "e": rejected_evidence_id},
+    )
+
+    cic.release_wrong_document_hold(c, tenant_id=c.tenant_id, di_document_id=held_document_id)
+    cic.release_wrong_document_hold(c, tenant_id=c.tenant_id, di_document_id=rejected_document_id)
+
+    assert _evidence_row(c, held_evidence_id)["identity_check_status"] == "PASSED"
+    assert _evidence_row(c, rejected_evidence_id)["identity_check_status"] == "REJECTED"

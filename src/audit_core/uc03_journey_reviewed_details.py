@@ -247,7 +247,8 @@ def load_reviewed_field_details(
                 r.confidence_scale AS "confidenceScale",
                 r.source_fact_version AS "sourceFactVersion",
                 r.reviewed_by_actor_id AS "reviewedByActorId",
-                r.reviewed_at_utc AS "reviewedAtUtc"
+                r.reviewed_at_utc AS "reviewedAtUtc",
+                COALESCE(e.identity_check_status, 'PASSED') AS "identityCheckStatus"
             FROM ranked r
             LEFT JOIN auditcore.document_capture_v2_documents d
               ON d.tenant_id=r.tenant_id
@@ -368,7 +369,16 @@ def annotate_and_resolve_reviewed_fields(
         item["isPreferred"] = False
         item["precedenceReason"] = None
         annotated.append(item)
-        if item.get("hasEffectiveValue"):
+        # A document HELD or REJECTED by the customer-identity check (see
+        # uc03_customer_identity_consistency.py) stays fully visible here --
+        # Journey Details must preserve what DI extracted regardless -- but
+        # never wins precedence while its identity is unresolved. It's
+        # simply excluded from candidacy, not deleted from `annotated`: the
+        # next-best candidate wins now, and this document becomes eligible
+        # again the moment a Team Lead releases the hold (or never, if
+        # instead confirmed as the wrong document entirely).
+        identity_status = str(item.get("identityCheckStatus") or "PASSED").upper()
+        if item.get("hasEffectiveValue") and identity_status == "PASSED":
             candidates_by_semantic[semantic].append(item)
 
     resolved: dict[str, dict[str, Any]] = {}

@@ -17,6 +17,7 @@ def _row(
     stage: str,
     has_effective: bool = True,
     version: int = 1,
+    identity_check_status: str = "PASSED",
 ):
     return {
         "reviewedFieldId": uuid4(),
@@ -38,6 +39,7 @@ def _row(
         "sourceFactVersion": version,
         "reviewedByActorId": "reviewer-1",
         "reviewedAtUtc": None,
+        "identityCheckStatus": identity_check_status,
     }
 
 
@@ -265,6 +267,70 @@ def test_rejected_field_is_visible_but_never_becomes_preferred_value() -> None:
     assert annotated[0]["displayValue"] == "22AAAAA0000A1Z5"
     assert annotated[0]["isPreferred"] is False
     assert "gstin" not in resolved
+
+
+def test_held_identity_check_document_is_visible_but_never_becomes_preferred() -> None:
+    """A document HELD by uc03_customer_identity_consistency.py (its
+    extracted name doesn't match the customer's KYC name, pending a Team
+    Lead's verdict) must not win precedence over another, unheld source --
+    the whole point of the hold is that a wrong customer's paperwork must
+    not silently become this Journey's source of truth while a human is
+    still deciding whether it belongs here."""
+    rows = [
+        _row(
+            field_key="customer_name",
+            value="Wrong Customer",
+            document_type="booking_form",
+            stage="BOOKING",
+            identity_check_status="HELD",
+        ),
+    ]
+
+    annotated, resolved = annotate_and_resolve_reviewed_fields(rows)
+
+    assert len(annotated) == 1
+    assert annotated[0]["displayValue"] == "Wrong Customer"  # still visible
+    assert annotated[0]["isPreferred"] is False
+    assert "customer_name" not in resolved  # never wins, even with no other candidate
+
+
+def test_held_identity_check_document_loses_to_a_passed_one() -> None:
+    rows = [
+        _row(
+            field_key="customer_name",
+            value="Wrong Customer",
+            document_type="booking_form",
+            stage="BOOKING",
+            identity_check_status="HELD",
+        ),
+        _row(
+            field_key="pan_name",
+            value="Real Customer",
+            document_type="pan_card",
+            stage="BOOKING",
+            identity_check_status="PASSED",
+        ),
+    ]
+
+    _, resolved = annotate_and_resolve_reviewed_fields(rows)
+
+    assert resolved["customer_name"]["value"] == "Real Customer"
+
+
+def test_rejected_identity_check_document_is_excluded_the_same_as_held() -> None:
+    rows = [
+        _row(
+            field_key="buyer_name",
+            value="Wrong Customer",
+            document_type="customer_invoice_dms",
+            stage="DELIVERY",
+            identity_check_status="REJECTED",
+        ),
+    ]
+
+    _, resolved = annotate_and_resolve_reviewed_fields(rows)
+
+    assert "buyer_name" not in resolved
 
 
 def test_gst_corporate_warranty_and_accessory_sources_get_explicit_categories() -> None:
