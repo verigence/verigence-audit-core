@@ -50,6 +50,7 @@ from audit_core.security_authorization import (
 )
 from audit_core.uc03_booking_capture import _scope
 from audit_core.uc03_delivery_commands import _machine_flag
+from audit_core.uc03_manual_verification import _resolve_finding
 from audit_core.uc03_masters_alignment import registration_basis
 from audit_core.uc03_model_attribute_matching import (
     has_qualifying_signal,
@@ -64,6 +65,7 @@ from audit_core.uc03_sku_candidates import (
 from audit_core.uc03_v2_review_materialization import (
     _INVOICE_DOCUMENT_TYPES as _DELIVERY_INVOICE_DOCUMENT_TYPES,
 )
+from audit_core.workflow import create_workflow_task
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,15 @@ _INVOICE_SKU_CODE_FIELD_KEYS = ("sku_code",)
 _INVOICE_MODEL_FIELD_KEYS = ("model_name_raw",)
 _INVOICE_VARIANT_FIELD_KEYS = ("variant_raw",)
 _INVOICE_SELECTION_METHOD = "MODEL_RESOLUTION_INVOICE_FALLBACK_V1"
+
+# A SKU already on the journey (CONFIRMED or merely tentative) is never
+# re-pinned from the invoice -- but the invoice's own implied vehicle can
+# still disagree with it, and that disagreement must not be silently
+# dropped. See check_invoice_sku_mismatch below.
+_SKU_MISMATCH_FINDING_TYPE = "INVOICE_SKU_MISMATCH"
+_SKU_MISMATCH_RULE_KEY = "INVOICE_SKU_MISMATCH"
+_SKU_MISMATCH_WORKFLOW_TYPE = "UC03_INVOICE_SKU_MISMATCH"
+_SKU_MISMATCH_TASK_TYPE = "INVOICE_SKU_MISMATCH_REASON"
 
 
 def _to_decimal(value: Any) -> Decimal | None:
@@ -715,11 +726,109 @@ def _latest_invoice_field(
     return text_value or None
 
 
+def check_invoice_sku_mismatch(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    confirmed_sku_id: UUID,
+    invoice_sku_id: UUID,
+    invoice_sku_code: str,
+    correlation_id: str,
+) -> None:
+    """The Delivery invoice's own implied vehicle disagrees with the SKU
+    already on the journey (CONFIRMED or merely tentative) -- raise a finding
+    and ask the PC for the reason, per explicit instruction, rather than
+    silently pinning over it or silently ignoring the disagreement. Nothing
+    here changes ``journey_products`` on its own; a Team Lead adjudicates the
+    finding once PC has explained (the usual ACKNOWLEDGE / CONFIRM_BREACH /
+    MARK_FALSE_POSITIVE verdicts). Self-heals: resolves once the invoice's
+    implied SKU matches the confirmed one again.
+    """
+    if invoice_sku_id == confirmed_sku_id:
+        finding_id = connection.execute(
+            text(
+                """
+                SELECT audit_finding_id FROM auditcore.audit_findings
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND rule_key=:rule_key AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "rule_key": _SKU_MISMATCH_RULE_KEY},
+        ).scalar_one_or_none()
+        if finding_id is not None:
+            _resolve_finding(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                stage_code="DELIVERY",
+                finding_id=finding_id,
+                actor_id=None,
+                correlation_id=correlation_id,
+                note="The invoice's vehicle now matches the confirmed SKU.",
+            )
+        return
+
+    confirmed_code = connection.execute(
+        text("SELECT sku_code FROM auditcore.product_skus WHERE product_sku_id=:id"),
+        {"id": confirmed_sku_id},
+    ).scalar_one_or_none()
+
+    finding_id = _machine_flag(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code="DELIVERY",
+        rule_key=_SKU_MISMATCH_RULE_KEY,
+        finding_type=_SKU_MISMATCH_FINDING_TYPE,
+        severity="HIGH",
+        title="Invoice shows a different vehicle than the confirmed SKU",
+        description=(
+            f"The confirmed vehicle is {confirmed_code}, but the Delivery invoice implies "
+            f"{invoice_sku_code}. A PC must explain the reason for the change."
+        ),
+        correlation_id=correlation_id,
+        safe_payload={"confirmedSkuCode": confirmed_code, "invoiceSkuCode": invoice_sku_code},
+        blocking_completion=False,
+    )
+    open_task_count = connection.execute(
+        text(
+            """
+            SELECT count(*) FROM auditcore.workflow_tasks
+            WHERE tenant_id=:tenant_id AND related_finding_id=:fid
+              AND task_status NOT IN ('COMPLETED', 'CANCELLED', 'FAILED', 'DEAD_LETTER')
+            """
+        ),
+        {"tenant_id": tenant_id, "fid": finding_id},
+    ).scalar_one()
+    if open_task_count == 0:
+        create_workflow_task(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            workflow_type=_SKU_MISMATCH_WORKFLOW_TYPE,
+            process_area="DELIVERY",
+            task_type=_SKU_MISMATCH_TASK_TYPE,
+            assigned_role_code="PC",
+            related_finding_id=finding_id,
+            severity="HIGH",
+            task_payload={
+                "ruleKey": _SKU_MISMATCH_RULE_KEY,
+                "findingId": str(finding_id),
+                "confirmedSkuCode": confirmed_code,
+                "invoiceSkuCode": invoice_sku_code,
+            },
+            effect_key=f"task:{finding_id}:invoice-sku-mismatch",
+            correlation_id=correlation_id,
+        )
+
+
 # ── producer ──────────────────────────────────────────────────────────────────
 def sync_model_resolution_from_invoice(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
 ) -> dict[str, Any]:
-    """Delivery-side fallback for a Booking that never pinned a SKU.
+    """Delivery-side fallback for a Booking that never pinned a SKU, and a
+    cross-check for one that already has.
 
     ``sync_model_resolution`` already covers the Booking Form, including using
     its ex-showroom price to break a tie when the model text alone matches
@@ -728,8 +837,12 @@ def sync_model_resolution_from_invoice(
     ``sku_code`` (an explicit master code, when the invoice prints one -- the
     strongest possible signal) or, failing that, its ``model_name_raw`` /
     ``variant_raw`` free text, and resolves against the same price masters
-    the Booking resolver uses. Idempotent, self-heals on read, never raises;
-    a no-op once a SKU is already pinned, by either path.
+    the Booking resolver uses. Idempotent, self-heals on read, never raises.
+
+    When a SKU is already on the journey (CONFIRMED or merely tentative),
+    this never re-pins it -- but it still computes what the invoice itself
+    implies and hands it to ``check_invoice_sku_mismatch`` so a genuine
+    disagreement is never silently dropped.
     """
     try:
         already_resolved = connection.execute(
@@ -741,8 +854,6 @@ def sync_model_resolution_from_invoice(
             ),
             {"tenant_id": tenant_id, "journey_id": journey_id},
         ).scalar_one_or_none()
-        if already_resolved is not None:
-            return {"skipped": True, "reason": "already_resolved"}
 
         sku_code = _latest_invoice_field(
             connection, tenant_id=tenant_id, journey_id=journey_id,
@@ -809,6 +920,24 @@ def sync_model_resolution_from_invoice(
             invoice_inputs["model_name"] = invoice_model
             invoice_inputs["variant_name"] = invoice_variant or inputs["variant_name"]
             matched, stage = _match(rows, invoice_inputs)
+
+        if already_resolved is not None:
+            # Never re-pin an already-resolved SKU (CONFIRMED or merely
+            # tentative) -- but a single clear invoice match is exactly the
+            # signal that must be cross-checked against it, not dropped.
+            mismatch_flagged = False
+            if len(matched) == 1:
+                mismatch_flagged = matched[0]["product_sku_id"] != already_resolved
+                check_invoice_sku_mismatch(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    confirmed_sku_id=already_resolved,
+                    invoice_sku_id=matched[0]["product_sku_id"],
+                    invoice_sku_code=matched[0]["sku_code"],
+                    correlation_id=correlation_id,
+                )
+            return {"skipped": True, "reason": "already_resolved", "mismatchFlagged": mismatch_flagged}
 
         if len(matched) == 1:
             _pin_sku(
@@ -1433,6 +1562,7 @@ def sync_model_resolution(
 
 
 __all__ = [
+    "check_invoice_sku_mismatch",
     "reassign_confirmed_sku",
     "sync_model_resolution",
     "sync_model_resolution_from_invoice",
