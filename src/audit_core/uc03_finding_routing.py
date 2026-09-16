@@ -100,6 +100,12 @@ _VIOLATION_RULE_PREFIXES: frozenset[str] = frozenset({
     # may not actually have been paid; TL must confirm or reject it, not PC
     # self-serve.
     "DUPLICATE_RECEIPT",
+    # 2026-09-16: a PC-proposed reassignment of an already-CONFIRMED SKU
+    # selection (uc03_model_selection_corrections.py) -- always adjudicated,
+    # unlike DI_VALUE_CORRECTION_PROPOSED's confidence-gated split, since
+    # the original selection was already fully confirmed and every
+    # correction to it has commercial consequences (price, discounts).
+    "MODEL_SELECTION_CORRECTION_PROPOSED",
 })
 
 _DOCUMENT_GAP_TYPES: frozenset[str] = frozenset({

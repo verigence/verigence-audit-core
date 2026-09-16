@@ -482,6 +482,68 @@ def _pin_sku(connection: Connection, *, tenant_id: str, journey_id: UUID, produc
     )
 
 
+_CORRECTION_SELECTION_METHOD = "MODEL_SELECTION_CORRECTION_V1"
+
+
+def reassign_confirmed_sku(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, product_sku_id: UUID
+) -> None:
+    """Deliberately overwrite an already-CONFIRMED SKU selection.
+
+    ``_pin_sku`` above refuses to touch a row whose ``selection_status`` is
+    already 'CONFIRMED' -- correct for the automatic resolver and the PC's
+    own first-pick "confirm SKU" endpoint, which must never silently flip a
+    locked-in deal. This is the one place that guard is intentionally
+    bypassed: called only from ``uc03_model_selection_corrections.py``'s
+    ``apply_confirmed_model_selection_correction``, itself only reachable
+    after a PC has proposed a specific replacement SKU and a Team Lead has
+    called CONFIRM_BREACH on the finding it raised -- a real human
+    decision, not a routine re-run.
+    """
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.journey_products (
+                tenant_id, journey_id, product_sku_id,
+                model_code_snapshot, model_name_snapshot,
+                variant_code_snapshot, variant_name_snapshot,
+                colour_code_snapshot, colour_name_snapshot,
+                selection_source, selection_status, selection_method
+            )
+            SELECT
+                :tenant_id, :journey_id, s.product_sku_id,
+                pm.model_code, pm.model_name,
+                pv.variant_code, pv.variant_name,
+                c.colour_code, c.colour_name,
+                'EVIDENCE', 'CONFIRMED', :method
+            FROM auditcore.product_skus s
+            JOIN auditcore.product_models pm ON pm.model_id = s.model_id
+            JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id
+            LEFT JOIN auditcore.colours c ON c.colour_id = s.colour_id
+            WHERE s.product_sku_id = :product_sku_id
+            ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
+                product_sku_id = EXCLUDED.product_sku_id,
+                model_code_snapshot = EXCLUDED.model_code_snapshot,
+                model_name_snapshot = EXCLUDED.model_name_snapshot,
+                variant_code_snapshot = EXCLUDED.variant_code_snapshot,
+                variant_name_snapshot = EXCLUDED.variant_name_snapshot,
+                colour_code_snapshot = EXCLUDED.colour_code_snapshot,
+                colour_name_snapshot = EXCLUDED.colour_name_snapshot,
+                selection_source = 'EVIDENCE',
+                selection_status = 'CONFIRMED',
+                selection_method = :method,
+                updated_at_utc = now()
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "product_sku_id": product_sku_id,
+            "method": _CORRECTION_SELECTION_METHOD,
+        },
+    )
+
+
 def _resolve_open_flag(
     connection: Connection,
     *,
@@ -1269,4 +1331,8 @@ def sync_model_resolution(
         return {"error": True}
 
 
-__all__ = ["sync_model_resolution", "sync_model_resolution_from_invoice"]
+__all__ = [
+    "reassign_confirmed_sku",
+    "sync_model_resolution",
+    "sync_model_resolution_from_invoice",
+]

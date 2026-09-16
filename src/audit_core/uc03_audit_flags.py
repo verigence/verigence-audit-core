@@ -1628,6 +1628,28 @@ def act_on_flag(
                         materialize_machine_booking_values(
                             connection, tenant_id=tenant_id, journey_id=journey_id,
                         )
+        # Same pattern, a third finding-type-specific side effect: a
+        # Confirm-Breach on a PC-proposed correction to an already-CONFIRMED
+        # SKU selection actually reassigns it (uc03_model_selection_
+        # corrections.py) -- the one path allowed to bypass _pin_sku's own
+        # guard against overwriting a locked-in deal, precisely because this
+        # IS the deliberate human override that guard exists to require.
+        # Mark-False-Positive needs no extra step: the original SKU stands.
+        if (
+            payload.action == "CONFIRM_BREACH"
+            and row["finding_type_code"] == "MODEL_SELECTION_CORRECTION_PROPOSED"
+        ):
+            from audit_core.uc03_model_selection_corrections import (
+                apply_confirmed_model_selection_correction,
+            )
+
+            apply_confirmed_model_selection_correction(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                audit_finding_id=flag_id,
+                correlation_id=correlation_id,
+            )
         event_id = _append_finding_event(
             connection,
             tenant_id=tenant_id,
