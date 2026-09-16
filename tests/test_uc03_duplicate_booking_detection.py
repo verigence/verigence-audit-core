@@ -235,6 +235,109 @@ def test_confirmed_minimum_booking_amount_wins_originality_over_creation_order(t
     assert _open_findings(c, c.journey_b) == []
 
 
+def _set_buyer_gstin(c, *, journey_id, gstin: str) -> None:
+    c.execute(
+        text(
+            """
+            INSERT INTO auditcore.invoice_review_values (
+                tenant_id, journey_id, source_di_document_id, document_type_key,
+                buyer_gstin, reviewed_by_actor_id
+            ) VALUES (:t, :j, :doc, 'tax_invoice_dms', :gstin, 'test-actor')
+            """
+        ),
+        {"t": c.tenant_id, "j": journey_id, "doc": uuid4(), "gstin": gstin},
+    )
+
+
+def test_exact_gst_match_flags_as_moderate_severity(two_journeys) -> None:
+    c = two_journeys
+    _set_buyer_gstin(c, journey_id=c.journey_a, gstin="27ABCDE1234F1Z5")
+    _set_buyer_gstin(c, journey_id=c.journey_b, gstin="27ABCDE1234F1Z5")
+    # Neither journey has any journey_document_extracted_fields row yet --
+    # GST alone (from invoice_review_values) must still be enough to compare.
+    _set_field(c, journey_id=c.journey_a, document_type_key="booking_form", field_key="customer_phone", value="9999999999")
+
+    result_a = dbd.sync_duplicate_booking_detection(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="",
+    )
+    result_b = dbd.sync_duplicate_booking_detection(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="",
+    )
+    findings = _open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "MEDIUM"
+    assert (result_a["raised"], result_b["raised"]) in {(0, 1), (1, 0)}
+
+
+def test_exact_mobile_match_flags_as_moderate_severity(two_journeys) -> None:
+    c = two_journeys
+    _set_field(c, journey_id=c.journey_a, document_type_key="booking_form", field_key="customer_phone", value="+91 98765 43210")
+    _set_field(c, journey_id=c.journey_b, document_type_key="booking_form", field_key="customer_phone", value="09876543210")
+
+    _assert_exactly_one_flagged_as_duplicate_of_the_other(c)
+    findings = _open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)
+    assert findings[0]["severity"] == "MEDIUM"
+
+
+def test_customer_matches_relative_on_other_booking_flags_as_strong(two_journeys) -> None:
+    c = two_journeys
+    _set_field(c, journey_id=c.journey_a, document_type_key="aadhaar", field_key="aadhaar_name", value="Ramesh Gupta")
+    _set_field(c, journey_id=c.journey_b, document_type_key="aadhaar", field_key="aadhaar_relationship_name", value="Ramesh Gupta")
+    _set_field(c, journey_id=c.journey_b, document_type_key="aadhaar", field_key="aadhaar_name", value="Sunita Gupta")
+
+    _assert_exactly_one_flagged_as_duplicate_of_the_other(c)
+    findings = _open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)
+    assert findings[0]["severity"] == "CRITICAL"
+
+
+def test_surname_and_pincode_without_full_name_match_flags_as_weak(two_journeys) -> None:
+    c = two_journeys
+    _set_field(c, journey_id=c.journey_a, document_type_key="aadhaar", field_key="aadhaar_name", value="Ramesh Gupta")
+    _set_field(c, journey_id=c.journey_a, document_type_key="aadhaar", field_key="address_pincode", value="110001")
+    _set_field(c, journey_id=c.journey_b, document_type_key="aadhaar", field_key="aadhaar_name", value="Priya Gupta")
+    _set_field(c, journey_id=c.journey_b, document_type_key="aadhaar", field_key="address_pincode", value="110001")
+
+    _assert_exactly_one_flagged_as_duplicate_of_the_other(c)
+    findings = _open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)
+    assert findings[0]["severity"] == "LOW"
+
+
+def test_similar_address_without_matching_pincode_flags_as_weak(two_journeys) -> None:
+    c = two_journeys
+    address = "Flat 402, Sunrise Apartments, MG Road, Near City Mall, Bengaluru"
+    _set_field(c, journey_id=c.journey_a, document_type_key="aadhaar", field_key="aadhaar_address", value=address)
+    _set_field(c, journey_id=c.journey_b, document_type_key="aadhaar", field_key="aadhaar_address", value=address + ", Karnataka")
+
+    _assert_exactly_one_flagged_as_duplicate_of_the_other(c)
+    findings = _open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)
+    assert findings[0]["severity"] == "LOW"
+
+
+def test_dissimilar_address_does_not_flag(two_journeys) -> None:
+    c = two_journeys
+    _set_field(c, journey_id=c.journey_a, document_type_key="aadhaar", field_key="aadhaar_address", value="Flat 402, Sunrise Apartments, MG Road, Bengaluru")
+    _set_field(c, journey_id=c.journey_b, document_type_key="aadhaar", field_key="aadhaar_address", value="Plot 17, Sector 21, Gurugram, Haryana")
+
+    result = dbd.sync_duplicate_booking_detection(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="",
+    )
+    assert result["raised"] == 0
+
+
+def test_pan_match_wins_over_a_coincidental_mobile_match(two_journeys) -> None:
+    """Strongest applicable basis wins -- a pair is never flagged twice."""
+    c = two_journeys
+    _set_field(c, journey_id=c.journey_a, document_type_key="pan_card", field_key="pan_number", value="FFFFF6666F")
+    _set_field(c, journey_id=c.journey_a, document_type_key="booking_form", field_key="customer_phone", value="9123456789")
+    _set_field(c, journey_id=c.journey_b, document_type_key="pan_card", field_key="pan_number", value="FFFFF6666F")
+    _set_field(c, journey_id=c.journey_b, document_type_key="booking_form", field_key="customer_phone", value="9123456789")
+
+    _assert_exactly_one_flagged_as_duplicate_of_the_other(c)
+    findings = _open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "CRITICAL"
+
+
 def test_pairing_that_no_longer_matches_self_heals(two_journeys) -> None:
     c = two_journeys
     _set_field(c, journey_id=c.journey_a, document_type_key="pan_card", field_key="pan_number", value="DDDDD4444D")
