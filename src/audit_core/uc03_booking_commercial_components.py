@@ -24,6 +24,14 @@ _BOOKING_COMMERCIAL_COMPONENT_FIELDS = (
     "oem_referral_discount_amount",
     "other_discount_amount",
     "free_accessory_discount_amount",
+    # Confirmed bug (2026-09-16): DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY has
+    # always listed this field, but it was never installed as a Core-owned
+    # Booking field alongside its corporate/exchange siblings, and the
+    # column didn't exist on booking_form_review_values -- so a scrappage
+    # amount the Booking Form itself shows could never reach
+    # discount_applications.actual_discount_amount at all (migration
+    # 0105_scrappage_discount_column adds the column this now writes to).
+    "scrappage_discount_amount",
     "essential_kit_amount",
     "genuine_accessories_amount",
     "non_genuine_accessories_amount",
@@ -44,6 +52,7 @@ _COMPONENT_SPECS = (
     ("booking_oem_referral_discount_amount", "OEM Referral Discount", "oem_referral_discount_amount"),
     ("booking_other_discount_amount", "Other Discount", "other_discount_amount"),
     ("booking_free_accessory_discount_amount", "Free Accessory Discount", "free_accessory_discount_amount"),
+    ("booking_scrappage_discount_amount", "Scrappage Discount", "scrappage_discount_amount"),
     ("booking_essential_kit_amount", "Essential Kit", "essential_kit_amount"),
     ("booking_genuine_accessories_amount", "Genuine Accessories", "genuine_accessories_amount"),
     ("booking_non_genuine_accessories_amount", "Non-Genuine Accessories", "non_genuine_accessories_amount"),

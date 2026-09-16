@@ -34,7 +34,12 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_booking_confirmation_rules import _has_active_document
+from audit_core.uc03_delivery_commands import _machine_flag
+from audit_core.uc03_manual_verification import _resolve_finding
 from audit_core.uc03_masters_alignment import (
+    CONDITIONAL_DISCOUNT_EVIDENCE_DOCUMENT,
+    CONDITIONAL_DISCOUNT_LABEL,
     DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY,
     canonical_discount_key,
     commercial_amounts_are_additive,
@@ -46,6 +51,7 @@ from audit_core.uc03_sku_candidates import _price_plan_for_journey
 logger = logging.getLogger(__name__)
 
 _CALCULATED = "CALCULATED"
+_DISCOUNT_EVIDENCE_FINDING_TYPE = "DOCUMENT_EXCEPTION"
 
 
 def _to_decimal(value: Any) -> Decimal | None:
@@ -442,6 +448,117 @@ def _materialize_discount_standards(
     return {"eligible": eligible, "unclaimed": unclaimed, "overGranted": over}
 
 
+# ── conditional-discount evidence status ────────────────────────────────────
+def _sync_conditional_discount_evidence(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
+) -> int:
+    """Set ``evidence_status`` on every discount row for this journey, and
+    raise/resolve the shared missing-evidence finding for a conditional
+    discount that's claimed without its proof document on file.
+
+    Reads the canonical, already invoice-first-resolved
+    ``actual_discount_amount`` -- not any one document's raw field -- so a
+    corporate/exchange/scrappage discount revealed by an invoice is checked
+    exactly the same way as one the Booking Form itself shows (the rule_key
+    matches uc03_booking_confirmation_rules.py's own
+    BK_DISCOUNT_EVIDENCE_MISSING:<label> exactly, so both converge on one
+    finding per category rather than raising two for the same gap).
+    """
+    rows = connection.execute(
+        text(
+            """
+            SELECT discount_application_id, discount_key, actual_discount_amount
+            FROM auditcore.discount_applications
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+
+    updated = 0
+    for row in rows:
+        discount_key = row["discount_key"]
+        required_document = CONDITIONAL_DISCOUNT_EVIDENCE_DOCUMENT.get(discount_key)
+        claimed = row["actual_discount_amount"]
+
+        if required_document is None:
+            status = "NOT_REQUIRED"
+        elif claimed is None:
+            status = "PENDING"
+        elif _has_active_document(
+            connection, tenant_id=tenant_id, journey_id=journey_id, document_type_key=required_document
+        ):
+            status = "VERIFIED"
+        else:
+            status = "MISSING"
+
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.discount_applications
+                SET evidence_status = :status
+                WHERE tenant_id = :tenant_id AND discount_application_id = :id
+                  AND evidence_status IS DISTINCT FROM :status
+                """
+            ),
+            {"tenant_id": tenant_id, "id": row["discount_application_id"], "status": status},
+        )
+        updated += 1
+
+        if required_document is None:
+            continue
+        label = CONDITIONAL_DISCOUNT_LABEL.get(discount_key)
+        if label is None:
+            continue
+        rule_key = f"BK_DISCOUNT_EVIDENCE_MISSING:{label}"
+        if status == "MISSING":
+            _machine_flag(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                stage_code="BOOKING",
+                rule_key=rule_key,
+                finding_type=_DISCOUNT_EVIDENCE_FINDING_TYPE,
+                severity="HIGH",
+                title=f"{label.replace('_', ' ').title()} evidence is missing",
+                description=(
+                    f"A {label.replace('_', ' ')} of ₹{claimed:,.2f} is on record for this "
+                    f"deal, but no supporting document is on file."
+                ),
+                correlation_id=correlation_id,
+                safe_payload={
+                    "trigger": "DEAL_RECONCILIATION",
+                    "discountKey": discount_key,
+                    "amount": str(claimed),
+                    "requiredDocumentType": required_document,
+                },
+                blocking_completion=False,
+            )
+        else:
+            finding_id = connection.execute(
+                text(
+                    """
+                    SELECT audit_finding_id FROM auditcore.audit_findings
+                    WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                      AND rule_key=:rule_key AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
+                    """
+                ),
+                {"tenant_id": tenant_id, "journey_id": journey_id, "rule_key": rule_key},
+            ).scalar_one_or_none()
+            if finding_id is not None:
+                _resolve_finding(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    stage_code="BOOKING",
+                    finding_id=finding_id,
+                    actor_id=None,
+                    correlation_id=correlation_id,
+                    note="Supporting document is now on file.",
+                )
+    return updated
+
+
 # ── producer ──────────────────────────────────────────────────────────────────
 def sync_deal_reconciliation(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
@@ -490,7 +607,10 @@ def sync_deal_reconciliation(
             benefits=benefits,
             actuals=actuals,
         )
-        return {"priceLines": price_lines, **discount}
+        evidence_rows = _sync_conditional_discount_evidence(
+            connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
+        )
+        return {"priceLines": price_lines, "evidenceRowsChecked": evidence_rows, **discount}
     except Exception:
         logger.warning("sync_deal_reconciliation failed", exc_info=True)
         return {"error": True}

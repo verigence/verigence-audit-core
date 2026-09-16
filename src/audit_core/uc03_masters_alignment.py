@@ -185,6 +185,41 @@ DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY: dict[str, str] = {
     "mr_discount_amount":               "OTHER_SCHEME",
     "oem_referral_discount_amount":     "OTHER_SCHEME",
     "other_discount_amount":            "OTHER_SCHEME",
+    # Confirmed bug (2026-09-16): this field was never mapped at all, so a
+    # scrappage amount the Booking Form itself shows never reached
+    # discount_applications.actual_discount_amount -- a scrappage
+    # discrepancy could never surface on the Deal page. The booking form
+    # carries one undifferentiated total, not a dealer-vs-COD split, so it
+    # maps onto the dealer-funded bucket (the one a dealer's own form would
+    # be recording); an over-grant against SCRAPPAGE_BONUS_COD specifically
+    # is out of scope for a single free-text field.
+    "scrappage_discount_amount":        "SCRAPPAGE_BONUS_DEALER",
+}
+
+# Conditional discounts -- genuinely applicable only when a matching proof
+# document is on file, unlike a plain cash discount or a value-in-kind
+# benefit (ACCESSORIES_KIT) which has no such proof concept. Mirrors
+# uc03_booking_confirmation_rules.py's _DISCOUNT_EVIDENCE map (same document
+# types) but keyed by the canonical discount_key so uc03_deal_reconciliation
+# can compute evidence status off the canonical, already invoice-first-
+# resolved actual, not a single document's raw field.
+CONDITIONAL_DISCOUNT_EVIDENCE_DOCUMENT: dict[str, str] = {
+    "CORPORATE_PRIVILEGE": "corporate_id",
+    "EXCHANGE_BONUS": "vehicle_rc",
+    "SCRAPPAGE_BONUS_DEALER": "scrappage_certificate_of_deposit",
+    "SCRAPPAGE_BONUS_COD": "scrappage_certificate_of_deposit",
+}
+
+# The exact label strings uc03_booking_confirmation_rules.py's
+# BK_DISCOUNT_EVIDENCE_MISSING:<label> rule_key already uses -- reusing them
+# here converges both checks (the booking-form-specific one and the
+# canonical, invoice-aware one) onto the same finding per category, rather
+# than raising two differently-keyed findings for the same underlying gap.
+CONDITIONAL_DISCOUNT_LABEL: dict[str, str] = {
+    "CORPORATE_PRIVILEGE": "corporate_discount",
+    "EXCHANGE_BONUS": "exchange_bonus",
+    "SCRAPPAGE_BONUS_DEALER": "scrappage_discount",
+    "SCRAPPAGE_BONUS_COD": "scrappage_discount",
 }
 
 # OEM scheme_category -> the canonical discount keys it can grant.  Used to pick
@@ -209,6 +244,8 @@ def canonical_discount_key(raw_key: str) -> str:
 
 __all__ = [
     "CANONICAL_DISCOUNT_KEYS",
+    "CONDITIONAL_DISCOUNT_EVIDENCE_DOCUMENT",
+    "CONDITIONAL_DISCOUNT_LABEL",
     "DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY",
     "DISCOUNT_ACTUAL_FIELD_TO_CANONICAL_KEY",
     "LEGACY_DISCOUNT_KEY_TO_CANONICAL",
