@@ -2,6 +2,7 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 
+import anyio.to_thread
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -181,6 +182,23 @@ _CORS_EXPOSE_HEADERS = ["ETag", "X-Correlation-ID", "X-Trace-ID"]
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
+    # PR #278 doubled the SQLAlchemy pool (5+10 -> 10+20 = 30 connections)
+    # to fix a reported 17.1s-observed/6.2s-internal Journey overview gap,
+    # attributed at the time to queueing for a DB connection. A repeat
+    # report after that fix (19.8s observed / 6.1s internal -- the same
+    # shape, unchanged) shows that wasn't the whole story: this service
+    # runs as a single uvicorn process (railway.toml has no --workers), and
+    # virtually every route here is a sync `def` -- Starlette bridges those
+    # through anyio's run_in_threadpool, which caps concurrent worker
+    # threads at a hardcoded default of 40 *per process*, shared across
+    # every endpoint and every sync dependency (get_connection,
+    # get_bearer_token, get_human_principal, ...) in this app. That cap is
+    # reached before a request's own code ever runs, so it's invisible to
+    # any in-handler timing log and was never touched by widening the DB
+    # pool. Raise it well past the pool's own 30-connection ceiling so the
+    # DB pool -- already sized deliberately -- is the binding constraint
+    # again, not this default.
+    anyio.to_thread.current_default_thread_limiter().total_tokens = 100
     warm_runtime_dependencies()
     sweep_interval = float(
         os.environ.get(
