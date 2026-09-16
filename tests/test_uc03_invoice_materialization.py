@@ -277,6 +277,47 @@ def test_accessory_invoice_projects_accessories_cost(journey) -> None:
     assert addon == Decimal(48000)
 
 
+def test_accessory_invoice_replaces_booking_form_accessories_cost(journey) -> None:
+    """Regression: accessory/EW/RSA invoices were missing from the priority
+    list used to rank commercial-line sources, so once a booking-form value
+    existed they could never win — silently losing to a weaker source."""
+    c = journey
+    c.execute(
+        text("INSERT INTO auditcore.commercial_lines "
+             "(tenant_id, journey_id, component_key, actual_amount, actual_source_kind, source_reference) "
+             "VALUES (:t, :j, 'accessories_cost', 30000, 'EVIDENCE', :ref)"),
+        {"t": c.tenant_id, "j": c.journey_id, "ref": f"booking_form:{uuid4()}"},
+    )
+    im.materialize_reviewed_invoices(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[_doc("accessory_invoice_dms", {
+            "invoice_purpose": "ACCESSORY", "grand_total_amount": "25000",
+        })],
+    )
+    accessories = _commercial(c, "accessories_cost")
+    assert accessories["actual_amount"] == Decimal(25000)
+    assert accessories["source_reference"].startswith("accessory_invoice_dms:")
+
+
+def test_ew_invoice_replaces_booking_form_warranty_amount(journey) -> None:
+    c = journey
+    c.execute(
+        text("INSERT INTO auditcore.commercial_lines "
+             "(tenant_id, journey_id, component_key, actual_amount, actual_source_kind, source_reference) "
+             "VALUES (:t, :j, 'additional_warranty_amount', 10000, 'EVIDENCE', :ref)"),
+        {"t": c.tenant_id, "j": c.journey_id, "ref": f"booking_form:{uuid4()}"},
+    )
+    im.materialize_reviewed_invoices(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[_doc("ew_invoice", {
+            "invoice_purpose": "EXTENDED_WARRANTY", "grand_total_amount": "18000",
+        })],
+    )
+    warranty = _commercial(c, "additional_warranty_amount")
+    assert warranty["actual_amount"] == Decimal(18000)
+    assert warranty["source_reference"].startswith("ew_invoice:")
+
+
 def test_invoice_replaces_booking_form_commercial(journey) -> None:
     c = journey
     c.execute(

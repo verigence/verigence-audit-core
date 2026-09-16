@@ -56,6 +56,18 @@ _INVOICE = (
     "invoice_generic",
     "customer_invoice_dms_v2",
     "tax_invoice",
+    "tax_invoice_dms",
+    # Single-purpose invoices (uc03_invoice_materialization.py's
+    # _PURPOSE_TO_COMPONENT) — each is the authoritative document for its own
+    # commercial line (accessories_cost / additional_warranty_amount /
+    # rsa_amount) and must outrank the booking form there, same as the main
+    # sale invoice does. A credit note adjusts an earlier invoice's discount,
+    # never a fresh commercial line, but ranks here too for consistency.
+    "accessory_invoice_dms",
+    "accessory_invoice_tally",
+    "ew_invoice",
+    "rsa_invoice",
+    "credit_note",
 )
 # The dealer's own deal sheet / Tally ledger — authoritative for the discounts
 # actually applied, below a GST invoice for the priced components.

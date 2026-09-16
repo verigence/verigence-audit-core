@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import os
 from decimal import Decimal
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, text
 
 import audit_core.uc03_deal_reconciliation as dr
+import audit_core.uc03_invoice_materialization as im
 
 
 # ── unit: reviewed booking discount fields -> OEM benefit keys ────────────────
@@ -350,6 +352,57 @@ def test_idempotent(journey) -> None:
     ).scalar_one()
     assert lines == 2
     assert apps == 1
+
+
+def _invoice_doc(document_type: str, fields: dict[str, object]):
+    return SimpleNamespace(
+        documentId=uuid4(),
+        evidenceId=None,
+        documentTypeKey=document_type,
+        extractionState="READY",
+        fields=[SimpleNamespace(fieldKey=k, value=v) for k, v in fields.items()],
+    )
+
+
+def test_invoice_discount_survives_booking_form_reheal(journey) -> None:
+    """Regression: once an invoice has won a discount's actual value, a routine
+    sync_deal_reconciliation self-heal off the booking form must never regress
+    it back — invoice always outranks the booking form (VAC-... invoice-first
+    precedence), including on repeat runs, not just the first one."""
+    c = journey
+    seeded = _seed_pinned_sku(c, model="XUV700", variant="AX7L", components={"EX_SHOWROOM": "2000000"})
+    _seed_scheme(c, category="CONSUMER", benefit_key="CASH_DISCOUNT", amount="30000",
+                 model_id=seeded["model_id"])
+    _seed_reviewed_booking(c, discount_amount="15000")
+
+    # Only the booking form is on file so far.
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    row = _discount(c, "CASH_DISCOUNT")
+    assert row["actual_discount_amount"] == Decimal(15000)
+
+    # A tax invoice arrives reporting a different discount — invoice wins.
+    im.materialize_reviewed_invoices(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[_invoice_doc("tax_invoice_tally", {
+            "invoice_purpose": "VEHICLE_SALE",
+            "taxable_amount": "2000000",
+            "invoice_discount_amount": "25000",
+        })],
+    )
+    row = _discount(c, "CASH_DISCOUNT")
+    assert row["actual_discount_amount"] == Decimal(25000)
+
+    # Re-running deal reconciliation (the routine self-heal on every overview
+    # read) must not regress the actual back to the booking form's 15000.
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    row = _discount(c, "CASH_DISCOUNT")
+    assert row["actual_discount_amount"] == Decimal(25000)
+    assert row["eligibility_result"] == "ELIGIBLE"
+
+    # A second, redundant self-heal is still a no-op on the invoice's value.
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    row = _discount(c, "CASH_DISCOUNT")
+    assert row["actual_discount_amount"] == Decimal(25000)
 
 
 def test_skipped_when_sku_not_pinned(journey) -> None:
