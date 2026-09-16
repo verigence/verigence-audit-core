@@ -378,12 +378,30 @@ def test_non_receipt_document_types_are_not_dealer_checked(journey) -> None:
 
 
 # ── identity-check hold (evidence.identity_check_status) ────────────────────
-def _link_evidence(c, *, di_document_id, document_type_key, requirement_id=None):
+def _create_requirement(c, *, document_type_key):
+    return c.execute(
+        text(
+            """
+            INSERT INTO auditcore.journey_document_requirements (
+                tenant_id, journey_id, requirement_key, document_type_key,
+                process_area, requirement_level
+            ) VALUES (
+                :t, :j, :rk, :dtk, 'BOOKING', 'REQUIRED'
+            )
+            RETURNING journey_document_requirement_id
+            """
+        ),
+        {"t": c.tenant_id, "j": c.journey_id, "rk": f"req-{uuid4().hex[:10]}", "dtk": document_type_key},
+    ).scalar_one()
+
+
+def _link_evidence(c, *, di_document_id, document_type_key, with_requirement=False):
     customer_id = c.execute(
         text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
         {"t": c.tenant_id, "j": c.journey_id},
     ).scalar_one()
-    return c.execute(
+    requirement_id = _create_requirement(c, document_type_key=document_type_key) if with_requirement else None
+    evidence_id = c.execute(
         text(
             """
             INSERT INTO auditcore.evidence (
@@ -401,16 +419,17 @@ def _link_evidence(c, *, di_document_id, document_type_key, requirement_id=None)
             "doc": di_document_id, "dtk": document_type_key, "req": requirement_id,
         },
     ).scalar_one()
+    return evidence_id, requirement_id
 
 
 def _set_named_field_with_evidence(
     c, *, stage_code, document_type_key, field_key, value, confidence=0.95,
-    document_id=None, requirement_id=None,
+    document_id=None, with_requirement=False,
 ):
     document_id = document_id or uuid4()
-    evidence_id = _link_evidence(
+    evidence_id, requirement_id = _link_evidence(
         c, di_document_id=document_id, document_type_key=document_type_key,
-        requirement_id=requirement_id,
+        with_requirement=with_requirement,
     )
     c.execute(
         text(
@@ -431,7 +450,7 @@ def _set_named_field_with_evidence(
         {"t": c.tenant_id, "j": c.journey_id, "ev": evidence_id, "doc": document_id, "stage": stage_code,
          "dtk": document_type_key, "fk": field_key, "v": json.dumps(value), "conf": confidence},
     )
-    return document_id, evidence_id
+    return document_id, evidence_id, requirement_id
 
 
 def _evidence_row(c, evidence_id):
@@ -450,7 +469,7 @@ def test_mismatch_holds_the_document_out_of_materialization(journey) -> None:
         c, stage_code="BOOKING", document_type_key="aadhaar",
         field_key="aadhaar_name", value="Sanjaya Kumar Mohanty",
     )
-    _document_id, evidence_id = _set_named_field_with_evidence(
+    _document_id, evidence_id, _requirement_id = _set_named_field_with_evidence(
         c, stage_code="BOOKING", document_type_key="booking_form",
         field_key="customer_name", value="Priya Nair",
     )
@@ -471,7 +490,7 @@ def test_matching_name_keeps_evidence_passed(journey) -> None:
         c, stage_code="BOOKING", document_type_key="aadhaar",
         field_key="aadhaar_name", value="Sanjaya Kumar Mohanty",
     )
-    _document_id, evidence_id = _set_named_field_with_evidence(
+    _document_id, evidence_id, _requirement_id = _set_named_field_with_evidence(
         c, stage_code="BOOKING", document_type_key="booking_form",
         field_key="customer_name", value="Sanjaya Kumar Mohanty",
     )
@@ -488,7 +507,7 @@ def test_no_kyc_yet_holds_every_named_document(journey) -> None:
     # document's data can't be trusted for materialization until there's a
     # KYC name to check it against at all -- held, not just skipped.
     c = journey
-    _document_id, evidence_id = _set_named_field_with_evidence(
+    _document_id, evidence_id, _requirement_id = _set_named_field_with_evidence(
         c, stage_code="BOOKING", document_type_key="booking_form",
         field_key="customer_name", value="Sanjaya Kumar Mohanty",
     )
@@ -503,10 +522,9 @@ def test_no_kyc_yet_holds_every_named_document(journey) -> None:
 
 def test_reject_wrong_document_voids_evidence_and_creates_pc_reupload_task(journey) -> None:
     c = journey
-    requirement_id = uuid4()
-    document_id, evidence_id = _set_named_field_with_evidence(
+    document_id, evidence_id, requirement_id = _set_named_field_with_evidence(
         c, stage_code="BOOKING", document_type_key="booking_form",
-        field_key="customer_name", value="Priya Nair", requirement_id=requirement_id,
+        field_key="customer_name", value="Priya Nair", with_requirement=True,
     )
 
     cic.reject_wrong_document(
@@ -539,7 +557,7 @@ def test_reject_wrong_document_voids_evidence_and_creates_pc_reupload_task(journ
 
 def test_reject_wrong_document_is_idempotent(journey) -> None:
     c = journey
-    document_id, evidence_id = _set_named_field_with_evidence(
+    document_id, evidence_id, _requirement_id = _set_named_field_with_evidence(
         c, stage_code="BOOKING", document_type_key="booking_form",
         field_key="customer_name", value="Priya Nair",
     )
@@ -557,7 +575,7 @@ def test_reject_wrong_document_is_idempotent(journey) -> None:
 
 def test_release_wrong_document_hold_clears_held_but_never_rejected(journey) -> None:
     c = journey
-    held_document_id, held_evidence_id = _set_named_field_with_evidence(
+    held_document_id, held_evidence_id, _req1 = _set_named_field_with_evidence(
         c, stage_code="BOOKING", document_type_key="booking_form",
         field_key="customer_name", value="Priya Nair",
     )
@@ -566,7 +584,7 @@ def test_release_wrong_document_hold_clears_held_but_never_rejected(journey) -> 
              "WHERE tenant_id=:t AND evidence_id=:e"),
         {"t": c.tenant_id, "e": held_evidence_id},
     )
-    rejected_document_id, rejected_evidence_id = _set_named_field_with_evidence(
+    rejected_document_id, rejected_evidence_id, _req2 = _set_named_field_with_evidence(
         c, stage_code="BOOKING", document_type_key="insurance_cover",
         field_key="insured_name", value="Priya Nair",
     )
