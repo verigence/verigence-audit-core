@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Request
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Connection, text
 
@@ -13,6 +13,7 @@ from audit_core.business_assignments import require_business_scope
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_principal
 from audit_core.idempotency import execute_idempotent_json_command
+from audit_core.observability import get_correlation_id
 from audit_core.security import Principal
 from audit_core.workflow import (
     cancel_workflow_task,
@@ -192,6 +193,7 @@ def start_task(
 def complete_task(
     tenant_id: str,
     task_id: UUID,
+    request: Request,
     idempotency_key: Annotated[
         str,
         Header(alias="Idempotency-Key", min_length=8, max_length=200),
@@ -199,7 +201,7 @@ def complete_task(
     principal: Annotated[Principal, Depends(get_principal)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> TaskResponse:
-    _task(
+    task = _task(
         connection,
         principal,
         tenant_id=tenant_id,
@@ -214,6 +216,27 @@ def complete_task(
             workflow_task_id=task_id,
             actor_id=principal.subject,
         )
+        # One finding-type-specific side effect, same shape as uc03_audit_
+        # flags.py::act_on_flag's own special cases -- Completing a
+        # MODEL_SELECTION_CORRECTION_REVIEW task is what actually
+        # reassigns the SKU (uc03_model_selection_corrections.py); every
+        # other task_type completes exactly as before. Cancelling needs no
+        # equivalent hook in cancel_task below -- the original SKU stands.
+        from audit_core.uc03_model_selection_corrections import (
+            TASK_TYPE as _MODEL_SELECTION_CORRECTION_TASK_TYPE,
+        )
+        from audit_core.uc03_model_selection_corrections import (
+            apply_confirmed_model_selection_correction,
+        )
+
+        if task["task_type"] == _MODEL_SELECTION_CORRECTION_TASK_TYPE:
+            apply_confirmed_model_selection_correction(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=task["journey_id"],
+                workflow_task_id=task_id,
+                correlation_id=get_correlation_id(request),
+            )
         response = _response(
             get_workflow_task(connection, tenant_id=tenant_id, workflow_task_id=task_id)
         )
