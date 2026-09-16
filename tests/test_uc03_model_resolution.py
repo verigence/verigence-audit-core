@@ -977,21 +977,31 @@ def test_backfills_missing_task_for_a_preexisting_open_finding(journey) -> None:
     _set_commercial(c, "ex_showroom_price", "1600000")
     _set_commercial(c, "total_price", "1830000")
 
-    mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
-    finding_id = _open_model_finding_id(c)
-
-    # Simulate the "predates task-spawning" state: delete the task the
-    # first raise created (its own events first -- workflow_task_events FKs
-    # to workflow_tasks). The finding itself must survive untouched.
-    c.execute(
-        text("DELETE FROM auditcore.workflow_task_events WHERE tenant_id=:t AND workflow_task_id IN "
-             "(SELECT workflow_task_id FROM auditcore.workflow_tasks WHERE tenant_id=:t AND related_finding_id=:f)"),
-        {"t": c.tenant_id, "f": finding_id},
-    )
-    c.execute(
-        text("DELETE FROM auditcore.workflow_tasks WHERE tenant_id=:t AND related_finding_id=:f"),
-        {"t": c.tenant_id, "f": finding_id},
-    )
+    # Simulate the "predates task-spawning" state directly: insert the same
+    # OPEN/DATA_GAP finding _machine_flag would have inserted, without ever
+    # calling create_workflow_task -- exactly the shape a finding raised
+    # before that branch existed (or before it existed for this rule) would
+    # have. workflow_task_events is append-only, so a raise-then-delete
+    # approach can't simulate this state -- inserting directly is the only
+    # way, and it's the more faithful reproduction anyway.
+    finding_id = c.execute(
+        text(
+            """
+            INSERT INTO auditcore.audit_findings (
+                tenant_id, journey_id, finding_type_code, severity, finding_status,
+                title, description, stage_code, origin_kind, origin_role_snapshot,
+                rule_key, finding_class, owner_role_code
+            ) VALUES (
+                :t, :j, 'MODEL_NOT_IDENTIFIED', 'MEDIUM', 'OPEN',
+                'Vehicle model could not be matched to the price masters', NULL,
+                'BOOKING', 'MACHINE', 'SYSTEM',
+                'MODEL_NOT_IDENTIFIED:BOOKING', 'DATA_GAP', 'PC'
+            )
+            RETURNING audit_finding_id
+            """
+        ),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
     assert c.execute(
         text("SELECT count(*) FROM auditcore.workflow_tasks WHERE tenant_id=:t AND related_finding_id=:f"),
         {"t": c.tenant_id, "f": finding_id},
