@@ -24,22 +24,34 @@ import json
 import logging
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from sqlalchemy import Connection, text
 
 from audit_core.uc03_attribute_mapping import spec_for_field
 from audit_core.uc03_deal_source_history import record_source_value
+from audit_core.uc03_delivery_commands import _machine_flag
+from audit_core.uc03_manual_verification import _resolve_finding
 from audit_core.uc03_masters_alignment import canonical_discount_key
 from audit_core.uc03_v2_review_materialization import (
     _INVOICE_DOCUMENT_TYPES as INVOICE_DOCUMENT_TYPES,
 )
 from audit_core.uc03_v2_review_materialization import _upsert_review_value_row
+from audit_core.workflow import create_workflow_task
 
 logger = logging.getLogger(__name__)
 
 _ORIGIN = "INVOICE_MATERIALIZATION"
+
+# Wholesale (dealer<->OEM stock-transfer) invoices are a different
+# transaction entirely -- comparing their numbers against a customer-facing
+# invoice for the same field would just manufacture false "discrepancies".
+_CUSTOMER_FACING_INVOICE_TYPES = tuple(t for t in INVOICE_DOCUMENT_TYPES if t != "wholesale_invoice")
+
+_DISCREPANCY_FINDING_TYPE = "INVOICE_DISCREPANCY"
+_DISCREPANCY_WORKFLOW_TYPE = "UC03_INVOICE_DISCREPANCY"
+_DISCREPANCY_TASK_TYPE = "INVOICE_DISCREPANCY_REVIEW"
 
 # invoice header scalar fields persisted verbatim in invoice_review_values.
 _HEADER_TEXT_FIELDS = (
@@ -545,6 +557,163 @@ def _upsert_invoice_discount(
     )
 
 
+# ── cross-invoice field disagreement ─────────────────────────────────────────
+# Two invoices reporting different values for the same commercial/discount
+# field is not the ordinary booking-form-vs-invoice comparison (that's the
+# expected everyday case, shown by the per-source breakdown panel) -- two of
+# the dealer's own business documents disagreeing is a red flag on its own,
+# regardless of which one the canonical column currently prefers. Per explicit
+# instruction: never silently pick a winner here, always surface it for a
+# Team Lead to validate.
+def _ensure_invoice_discrepancy_task(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    finding_id: UUID,
+    process_area: str,
+    correlation_id: str,
+    payload: dict[str, Any],
+) -> None:
+    open_task_count = connection.execute(
+        text(
+            """
+            SELECT count(*) FROM auditcore.workflow_tasks
+            WHERE tenant_id=:tenant_id AND related_finding_id=:fid
+              AND task_status NOT IN ('COMPLETED', 'CANCELLED', 'FAILED', 'DEAD_LETTER')
+            """
+        ),
+        {"tenant_id": tenant_id, "fid": finding_id},
+    ).scalar_one()
+    if open_task_count > 0:
+        return
+    create_workflow_task(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        workflow_type=_DISCREPANCY_WORKFLOW_TYPE,
+        process_area=process_area,
+        task_type=_DISCREPANCY_TASK_TYPE,
+        assigned_role_code="TL",
+        related_finding_id=finding_id,
+        severity="HIGH",
+        task_payload=payload,
+        effect_key=f"task:{finding_id}:invoice-discrepancy",
+        correlation_id=correlation_id,
+    )
+
+
+def check_invoice_field_discrepancies(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    stage_code: Literal["BOOKING", "DELIVERY"],
+    correlation_id: str = "",
+) -> dict[str, int]:
+    """Raise a HIGH finding + Team Lead task whenever two customer-facing
+    invoices disagree on the same commercial/discount field; self-heals
+    (resolves) once they agree again -- e.g. a corrected invoice replaces the
+    disagreeing one. Reads the per-source breakdown table every producer
+    invoice write already populates, so this stays accurate without
+    re-deriving anything. Never raises -- best-effort, safe on every call.
+    """
+    try:
+        rows = connection.execute(
+            text(
+                """
+                SELECT line_kind, component_key, source_document_type, amount
+                FROM auditcore.commercial_line_source_values
+                WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+                  AND source_document_type = ANY(:invoice_types)
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "invoice_types": list(_CUSTOMER_FACING_INVOICE_TYPES),
+            },
+        ).mappings().all()
+    except Exception:  # noqa: BLE001 - producer must never break the caller
+        return {"raised": 0, "resolved": 0, "error": 1}
+
+    grouped: dict[tuple[str, str], dict[str, Decimal]] = {}
+    for row in rows:
+        by_source = grouped.setdefault((row["line_kind"], row["component_key"]), {})
+        by_source[row["source_document_type"]] = row["amount"]
+
+    raised = 0
+    resolved = 0
+    for (line_kind, component_key), by_source in grouped.items():
+        rule_key = f"INVOICE_FIELD_DISAGREEMENT:{line_kind}:{component_key}"
+        distinct_amounts = {amount for amount in by_source.values() if amount is not None}
+        if len(distinct_amounts) <= 1:
+            finding_id = connection.execute(
+                text(
+                    """
+                    SELECT audit_finding_id FROM auditcore.audit_findings
+                    WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                      AND rule_key=:rule_key AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
+                    """
+                ),
+                {"tenant_id": tenant_id, "journey_id": journey_id, "rule_key": rule_key},
+            ).scalar_one_or_none()
+            if finding_id is not None:
+                _resolve_finding(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    stage_code=stage_code,
+                    finding_id=finding_id,
+                    actor_id=None,
+                    correlation_id=correlation_id,
+                    note="The disagreeing invoices now report the same value.",
+                )
+                resolved += 1
+            continue
+
+        raised += 1
+        label = component_key.replace("_", " ").title()
+        breakdown = ", ".join(f"{doc}: {amount}" for doc, amount in sorted(by_source.items()))
+        finding_id = _machine_flag(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code=stage_code,
+            rule_key=rule_key,
+            finding_type=_DISCREPANCY_FINDING_TYPE,
+            severity="HIGH",
+            title=f"Invoices disagree on {label}",
+            description=(
+                f"More than one invoice reports a different value for {label}: {breakdown}. "
+                "A Team Lead must validate which figure is correct."
+            ),
+            correlation_id=correlation_id,
+            safe_payload={
+                "lineKind": line_kind,
+                "componentKey": component_key,
+                "bySource": {doc: str(amount) for doc, amount in by_source.items()},
+            },
+            blocking_completion=False,
+        )
+        _ensure_invoice_discrepancy_task(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            finding_id=finding_id,
+            process_area=stage_code,
+            correlation_id=correlation_id,
+            payload={
+                "ruleKey": rule_key,
+                "findingId": str(finding_id),
+                "lineKind": line_kind,
+                "componentKey": component_key,
+                "bySource": {doc: str(amount) for doc, amount in by_source.items()},
+            },
+        )
+    return {"raised": raised, "resolved": resolved}
+
+
 # ── producer ────────────────────────────────────────────────────────────────
 def materialize_reviewed_invoices(
     connection: Connection,
@@ -553,6 +722,8 @@ def materialize_reviewed_invoices(
     journey_id: UUID,
     documents: list[Any],
     actor_id: str,
+    stage_code: Literal["BOOKING", "DELIVERY"] = "DELIVERY",
+    correlation_id: str = "",
 ) -> dict[str, int]:
     """Persist every reviewed invoice and project its derived commercial +
     discount amounts into the canonical reconciliation tables."""
@@ -643,11 +814,21 @@ def materialize_reviewed_invoices(
             )
             discount_rows_written += 1
 
+    discrepancies = check_invoice_field_discrepancies(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code=stage_code,
+        correlation_id=correlation_id,
+    )
+
     result = {
         "invoices": invoices_written,
         "commercialLines": commercial_lines_written,
         "discountApplications": discount_rows_written,
         "journeyAddons": addons_written,
+        "discrepanciesRaised": discrepancies.get("raised", 0),
+        "discrepanciesResolved": discrepancies.get("resolved", 0),
     }
     if invoices_written:
         logger.info(
@@ -659,6 +840,7 @@ def materialize_reviewed_invoices(
 
 __all__ = [
     "INVOICE_DOCUMENT_TYPES",
+    "check_invoice_field_discrepancies",
     "derive_commercials",
     "derive_discounts",
     "materialize_reviewed_invoices",
