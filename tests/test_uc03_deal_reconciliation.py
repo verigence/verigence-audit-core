@@ -400,6 +400,41 @@ def _open_finding(c, rule_key: str):
     ).mappings().one_or_none()
 
 
+def test_raise_findings_false_skips_evidence_and_variance_checks(journey) -> None:
+    """Regression: sync_deal_reconciliation runs unconditionally on every
+    Journey Overview page view (via sync_model_resolution's self-heal on
+    read) for any journey with a resolved SKU -- the vast majority of
+    traffic. Running the evidence-status and total-variance checks (each a
+    handful of sequential DB round-trips per discount row) on every single
+    page view, not just on the document-sync events that actually change
+    these facts, was a measured latency regression. raise_findings=False
+    must still materialize standard/actual values -- just skip the two
+    finding-raising checks entirely."""
+    c = journey
+    seeded = _seed_pinned_sku(c, model="XUV700", variant="AX7L", components={"EX_SHOWROOM": "2000000"})
+    _seed_scheme(c, category="CORPORATE", benefit_key="CORPORATE_PRIVILEGE", amount="40000",
+                 model_id=seeded["model_id"], customer_type_code="CORPORATE")
+    c.execute(
+        text("UPDATE auditcore.customers SET customer_type_code='CORPORATE' WHERE customer_id=:id"),
+        {"id": c.customer_id},
+    )
+    _seed_reviewed_booking(c, corporate_discount_amount="40000")
+
+    result = dr.sync_deal_reconciliation(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="", raise_findings=False,
+    )
+    assert "evidenceRowsChecked" not in result
+    assert "totals" not in result
+    # Standard/actual materialization itself is unaffected.
+    row = _discount(c, "CORPORATE_PRIVILEGE")
+    assert row is not None
+    assert row["actual_discount_amount"] == Decimal(40000)
+    # But no evidence_status was computed, and no finding was raised --
+    # exactly the expensive part this flag exists to skip.
+    assert _evidence_status(c, "CORPORATE_PRIVILEGE") is None
+    assert _open_finding(c, "BK_DISCOUNT_EVIDENCE_MISSING:corporate_discount") is None
+
+
 def test_conditional_discount_without_evidence_is_missing_and_flagged(journey) -> None:
     c = journey
     seeded = _seed_pinned_sku(c, model="XUV700", variant="AX7L", components={"EX_SHOWROOM": "2000000"})

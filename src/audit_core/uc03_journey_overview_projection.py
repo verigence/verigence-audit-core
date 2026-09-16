@@ -908,8 +908,17 @@ def get_journey_overview_projection(
     # Self-heal on read: resolve the SKU against the OEM price masters (or raise
     # MODEL_NOT_IDENTIFIED) so the Deal panel and findings below reflect it.
     set_tenant_context(connection, tenant_id)
+    # raise_findings=False: this runs on every page view of this endpoint --
+    # still pin/resolve the SKU itself so the Deal panel reflects it, but
+    # skip deal reconciliation's evidence/total-variance checks (each a
+    # handful of sequential DB round-trips per discount row). Real
+    # document-sync events (uc03_confidence_review_policy.py,
+    # uc03_run_all_rules.py) already run those with the full checks, so
+    # they stay current without paying their cost on every single read --
+    # this specific unconditional-per-request cost was confirmed as a real
+    # latency regression (a live 23s overview load), not a hypothetical one.
     sync_model_resolution(
-        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=""
+        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id="", raise_findings=False,
     )
     reconcile_payments(
         connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=""

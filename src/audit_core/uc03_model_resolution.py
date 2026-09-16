@@ -631,13 +631,22 @@ def _resolve_open_flag(
 
 
 def _run_deal_reconciliation(
-    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    correlation_id: str,
+    raise_findings: bool = True,
 ) -> None:
     """Materialise price + discount standards for a resolved SKU (never raises)."""
     from audit_core.uc03_deal_reconciliation import sync_deal_reconciliation
 
     sync_deal_reconciliation(
-        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        correlation_id=correlation_id,
+        raise_findings=raise_findings,
     )
 
 
@@ -1460,9 +1469,23 @@ def confirm_model_resolution_sku_endpoint(
 
 
 def sync_model_resolution(
-    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    correlation_id: str,
+    raise_findings: bool = True,
 ) -> dict[str, Any]:
-    """Resolve the SKU or raise MODEL_NOT_IDENTIFIED. Idempotent; never raises."""
+    """Resolve the SKU or raise MODEL_NOT_IDENTIFIED. Idempotent; never raises.
+
+    ``raise_findings=False`` is for the read-only self-heal on every Journey
+    Overview page view: still pins/resolves the SKU itself (cheap, and
+    genuinely needed so the Deal panel reflects it), but skips the deal
+    reconciliation's evidence/total-variance checks, which real
+    document-sync events already keep current -- see
+    uc03_deal_reconciliation.sync_deal_reconciliation's own docstring for
+    why running those on every page view was a measured regression.
+    """
     try:
         inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id)
         if inputs is None:
@@ -1473,7 +1496,8 @@ def sync_model_resolution(
                 connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
             )
             _run_deal_reconciliation(
-                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
+                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                raise_findings=raise_findings,
             )
             return {"resolved": True, "flagsResolved": resolved}
 
@@ -1493,7 +1517,8 @@ def sync_model_resolution(
                 connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
             )
             _run_deal_reconciliation(
-                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
+                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                raise_findings=raise_findings,
             )
             return {"resolved": True, "skuCode": matched[0]["sku_code"], "matchStage": stage}
 
