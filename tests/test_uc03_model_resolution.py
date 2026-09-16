@@ -957,3 +957,50 @@ def test_invoice_fallback_resolves_with_null_model_snapshot(journey) -> None:
         {"t": c.tenant_id, "j": c.journey_id},
     ).scalar_one()
     assert pinned == sku_id
+
+
+def test_backfills_missing_task_for_a_preexisting_open_finding(journey) -> None:
+    """A real production gap: a MODEL_NOT_IDENTIFIED finding raised before
+    self-serve task-spawning existed for it (or before this session's own
+    task_payload_extra shipped) has no linked Task at all -- a PC's only
+    click-through is then "Open case" -> Audit Review, which offers no fix
+    action for a self-serve gap by v1.1 design. Re-triggering the same rule
+    (any later DOCUMENT_SYNCED event) must backfill the missing Task, not
+    just silently re-confirm the finding still stands."""
+    c = journey
+    _seed_price_list(c, [{
+        "model": "THAR ROXX", "variant": "AX",
+        "components": {"EX_SHOWROOM": "1400000", "REGISTRATION_INDIVIDUAL": "150000",
+                       "REGISTRATION_CORPORATE": "180000"},
+    }])
+    _set_journey_product(c, "Scorpio N", "Z8L")  # not in the price list
+    _set_commercial(c, "ex_showroom_price", "1600000")
+    _set_commercial(c, "total_price", "1830000")
+
+    mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    finding_id = _open_model_finding_id(c)
+
+    # Simulate the "predates task-spawning" state: delete the task the
+    # first raise created. The finding itself must survive untouched.
+    c.execute(
+        text("DELETE FROM auditcore.workflow_tasks WHERE tenant_id=:t AND related_finding_id=:f"),
+        {"t": c.tenant_id, "f": finding_id},
+    )
+    assert c.execute(
+        text("SELECT count(*) FROM auditcore.workflow_tasks WHERE tenant_id=:t AND related_finding_id=:f"),
+        {"t": c.tenant_id, "f": finding_id},
+    ).scalar_one() == 0
+
+    # Re-trigger the same rule -- _machine_flag's existing-finding branch
+    # must notice the missing Task and backfill one, not just no-op.
+    mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    assert _open_model_flags(c) == 1  # still exactly one finding, not a duplicate
+    task = c.execute(
+        text("SELECT task_type, assigned_role_code, task_status FROM auditcore.workflow_tasks "
+             "WHERE tenant_id=:t AND related_finding_id=:f"),
+        {"t": c.tenant_id, "f": finding_id},
+    ).mappings().one()
+    assert task["task_type"] == "AUTO_SELF_SERVE"
+    assert task["assigned_role_code"] == "PC"
+    assert task["task_status"] == "READY"
