@@ -363,6 +363,94 @@ def test_weaker_invoice_does_not_override_stronger(journey) -> None:
     }
 
 
+def _finding(c, rule_key):
+    return c.execute(
+        text("SELECT audit_finding_id, finding_class, severity, finding_status "
+             "FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND rule_key=:k "
+             "ORDER BY created_at_utc DESC LIMIT 1"),
+        {"t": c.tenant_id, "j": c.journey_id, "k": rule_key},
+    ).mappings().one_or_none()
+
+
+def test_cross_invoice_disagreement_raises_high_finding_and_tl_task(journey) -> None:
+    """Two of the dealer's own invoices disagreeing on the same field is a red
+    flag distinct from the ordinary booking-form-vs-invoice comparison --
+    explicit instruction: never silently pick a winner, always raise a HIGH
+    finding + a Team Lead task to validate."""
+    c = journey
+    im.materialize_reviewed_invoices(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[
+            _doc("tax_invoice_tally", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000"}),
+            _doc("invoice_generic", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "999999"}),
+        ],
+    )
+    rule_key = "INVOICE_FIELD_DISAGREEMENT:COMMERCIAL:ex_showroom_price"
+    finding = _finding(c, rule_key)
+    assert finding is not None
+    assert finding["finding_class"] == "VIOLATION"
+    assert finding["severity"] == "HIGH"
+    assert finding["finding_status"] == "OPEN"
+
+    task = c.execute(
+        text("SELECT task_type, assigned_role_code, severity, related_finding_id "
+             "FROM auditcore.workflow_tasks WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one()
+    assert task["task_type"] == "INVOICE_DISCREPANCY_REVIEW"
+    assert task["assigned_role_code"] == "TL"
+    assert task["severity"] == "HIGH"
+    assert task["related_finding_id"] == finding["audit_finding_id"]
+
+
+def test_agreeing_invoices_do_not_raise_a_discrepancy(journey) -> None:
+    c = journey
+    im.materialize_reviewed_invoices(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[
+            _doc("tax_invoice_tally", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000"}),
+            _doc("customer_invoice_dms", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000"}),
+        ],
+    )
+    assert _finding(c, "INVOICE_FIELD_DISAGREEMENT:COMMERCIAL:ex_showroom_price") is None
+
+
+def test_wholesale_invoice_excluded_from_discrepancy_check(journey) -> None:
+    """Wholesale (dealer<->OEM) invoices are a different transaction entirely
+    -- comparing their figures against a customer-facing invoice would just
+    manufacture a false discrepancy."""
+    c = journey
+    im.materialize_reviewed_invoices(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[
+            _doc("tax_invoice_tally", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000"}),
+            _doc("wholesale_invoice", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1450000"}),
+        ],
+    )
+    assert _finding(c, "INVOICE_FIELD_DISAGREEMENT:COMMERCIAL:ex_showroom_price") is None
+
+
+def test_discrepancy_resolves_once_invoices_agree(journey) -> None:
+    c = journey
+    im.materialize_reviewed_invoices(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[
+            _doc("tax_invoice_tally", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000"}),
+            _doc("invoice_generic", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "999999"}),
+        ],
+    )
+    rule_key = "INVOICE_FIELD_DISAGREEMENT:COMMERCIAL:ex_showroom_price"
+    assert _finding(c, rule_key)["finding_status"] == "OPEN"
+
+    # A corrected "invoice_generic" document now reports the same value.
+    im.materialize_reviewed_invoices(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[_doc("invoice_generic", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000"})],
+    )
+    assert _finding(c, rule_key)["finding_status"] == "RESOLVED"
+
+
 def test_idempotent(journey) -> None:
     c = journey
     docs = [_doc("tax_invoice_tally", {

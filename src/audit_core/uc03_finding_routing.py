@@ -100,6 +100,10 @@ _VIOLATION_RULE_PREFIXES: frozenset[str] = frozenset({
     # may not actually have been paid; TL must confirm or reject it, not PC
     # self-serve.
     "DUPLICATE_RECEIPT",
+    # 2026-09-16: two of the dealer's own invoices disagreeing on the same
+    # commercial/discount value -- explicit instruction to never silently
+    # pick a winner, always route to a Team Lead to validate which is right.
+    "INVOICE_FIELD_DISAGREEMENT",
 })
 
 _DOCUMENT_GAP_TYPES: frozenset[str] = frozenset({

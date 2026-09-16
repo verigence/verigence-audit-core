@@ -1137,6 +1137,7 @@ def materialize_reviewed_delivery_business_values(
         journey_id=journey_id,
         documents=documents,
         actor_id=actor_id,
+        stage_code="DELIVERY",
     )
     scrappage_certificates = materialize_reviewed_scrappage_certificates(
         connection,
