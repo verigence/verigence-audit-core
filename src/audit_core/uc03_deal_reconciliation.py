@@ -259,6 +259,33 @@ def _actual_discounts_by_benefit(reviewed_booking: dict[str, Any]) -> dict[str, 
     return out
 
 
+def _existing_discount_row(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, discount_key: str
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        text(
+            """
+            SELECT discount_application_id, details, actual_discount_amount
+            FROM auditcore.discount_applications
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id AND discount_key = :discount_key
+            FOR UPDATE
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "discount_key": discount_key},
+    ).mappings().one_or_none()
+    if row is None:
+        return None
+    data = dict(row)
+    details = data.get("details") or {}
+    if isinstance(details, str):
+        try:
+            details = json.loads(details)
+        except ValueError:
+            details = {}
+    data["details"] = details
+    return data
+
+
 def _materialize_discount_standards(
     connection: Connection,
     *,
@@ -278,6 +305,42 @@ def _materialize_discount_standards(
         seen_keys.add(canonical)
 
         standard = _to_decimal(benefit["amount_value"]) if str(benefit["benefit_type"]).upper() == "AMOUNT" else None
+
+        existing = _existing_discount_row(
+            connection, tenant_id=tenant_id, journey_id=journey_id, discount_key=canonical
+        )
+        # An invoice has already won this discount's actual value (see
+        # uc03_invoice_materialization.py::_upsert_invoice_discount) -- a
+        # routine self-heal off the booking form must never regress it back.
+        # The standard-side fields (entitlement, scheme version) still refresh
+        # every run regardless of which source currently holds the actual.
+        if existing is not None and existing["details"].get("origin") == "INVOICE_MATERIALIZATION":
+            effective_actual = existing["actual_discount_amount"]
+            result = "ELIGIBLE" if effective_actual is not None else "ELIGIBLE_UNCLAIMED"
+            if effective_actual is None:
+                unclaimed += 1
+            eligible += 1
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.discount_applications
+                    SET standard_eligible_amount = :standard,
+                        discount_scheme_version_id = :dsv,
+                        eligibility_result = :result,
+                        updated_at_utc = now()
+                    WHERE tenant_id = :tenant_id AND discount_application_id = :application_id
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "application_id": existing["discount_application_id"],
+                    "standard": standard,
+                    "dsv": benefit["discount_scheme_version_id"],
+                    "result": result,
+                },
+            )
+            continue
+
         actual = actuals.get(benefit_key)
         result = "ELIGIBLE" if actual is not None else "ELIGIBLE_UNCLAIMED"
         if actual is None:
