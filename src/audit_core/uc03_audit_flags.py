@@ -1579,6 +1579,55 @@ def act_on_flag(
                 audit_finding_id=flag_id,
                 actor_id=human_principal.subject,
             )
+        # Same pattern, a second finding-type-specific side effect: WRONG_
+        # DOCUMENT holds its document's fields out of materialization the
+        # instant it's raised (uc03_customer_identity_consistency.py) --
+        # the TL's verdict here is what actually resolves that hold, one
+        # way or the other. Only the customer-name variant of this finding
+        # (rule_key "WRONG_DOCUMENT:{document_id}", two segments) carries a
+        # hold to resolve; the sibling receipt-vs-dealer check (three
+        # segments, "WRONG_DOCUMENT:DEALER:{document_id}") is a narrower
+        # question with nothing to release or reject.
+        if row["finding_type_code"] == "WRONG_DOCUMENT":
+            rule_parts = str(row["rule_key"] or "").split(":")
+            if len(rule_parts) == 2:
+                from audit_core.uc03_customer_identity_consistency import (
+                    reject_wrong_document,
+                    release_wrong_document_hold,
+                )
+
+                di_document_id = UUID(rule_parts[1])
+                if payload.action == "CONFIRM_BREACH":
+                    reject_wrong_document(
+                        connection,
+                        tenant_id=tenant_id,
+                        journey_id=journey_id,
+                        di_document_id=di_document_id,
+                        stage_code=row["stage_code"],
+                        actor_id=human_principal.subject,
+                        reason=verdict["reason"],
+                        correlation_id=correlation_id,
+                        related_finding_id=flag_id,
+                    )
+                elif payload.action == "MARK_FALSE_POSITIVE":
+                    release_wrong_document_hold(
+                        connection, tenant_id=tenant_id, di_document_id=di_document_id,
+                    )
+                    # The hold's whole point is to keep a wrong document's
+                    # data out of materialization before a human decides --
+                    # releasing it must take effect now, not wait for some
+                    # unrelated future document sync to happen to re-run
+                    # materialization. Booking-only: materialize_machine_
+                    # booking_values' own scope, matching every other
+                    # caller of it.
+                    if str(row["stage_code"]).upper() == "BOOKING":
+                        from audit_core.uc03_post_extraction_materialization import (
+                            materialize_machine_booking_values,
+                        )
+
+                        materialize_machine_booking_values(
+                            connection, tenant_id=tenant_id, journey_id=journey_id,
+                        )
         event_id = _append_finding_event(
             connection,
             tenant_id=tenant_id,
