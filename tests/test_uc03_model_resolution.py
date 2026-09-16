@@ -931,20 +931,123 @@ def test_invoice_fallback_is_noop_once_already_resolved(journey) -> None:
              "WHERE tenant_id=:t AND journey_id=:j"),
         {"s": sku_id, "t": c.tenant_id, "j": c.journey_id},
     )
-    # A different SKU code on the invoice must NOT override an already-pinned SKU.
+    # An invoice code that matches nothing in the masters must NOT override an
+    # already-pinned SKU -- and isn't a genuine mismatch either (there's
+    # nothing to cross-check against, just an unmatched code).
     _set_invoice_field(c, "sku_code", "SOME-OTHER-CODE")
 
     result = mr.sync_model_resolution_from_invoice(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
 
-    assert result == {"skipped": True, "reason": "already_resolved"}
+    assert result == {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False}
     pinned = c.execute(
         text("SELECT product_sku_id FROM auditcore.journey_products "
              "WHERE tenant_id=:t AND journey_id=:j"),
         {"t": c.tenant_id, "j": c.journey_id},
     ).scalar_one()
     assert pinned == sku_id
+
+
+def test_invoice_mismatch_raises_finding_and_pc_task_without_repinning(journey) -> None:
+    """The invoice implies a real, matched SKU that disagrees with the one
+    already on the journey -- must raise a finding + PC task, per explicit
+    instruction, without ever repinning journey_products itself."""
+    c = journey
+    confirmed_sku_id, invoice_sku_id = _seed_price_list(c, [
+        {"model": "XUV700", "variant": "AX7L", "components": {"EX_SHOWROOM": "2000000"}},
+        {"model": "SCORPIO N", "variant": "Z8L", "components": {"EX_SHOWROOM": "1600000"}},
+    ])
+    invoice_sku_code = c.execute(
+        text("SELECT sku_code FROM auditcore.product_skus WHERE product_sku_id=:s"),
+        {"s": invoice_sku_id},
+    ).scalar_one()
+    _set_journey_product(c, "XUV700", "AX7L")
+    c.execute(
+        text("UPDATE auditcore.journey_products SET product_sku_id=:s, selection_status='CONFIRMED' "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"s": confirmed_sku_id, "t": c.tenant_id, "j": c.journey_id},
+    )
+    _set_invoice_field(c, "sku_code", invoice_sku_code)
+
+    result = mr.sync_model_resolution_from_invoice(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result == {"skipped": True, "reason": "already_resolved", "mismatchFlagged": True}
+
+    # journey_products itself is untouched -- this never repins.
+    pinned = c.execute(
+        text("SELECT product_sku_id FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert pinned == confirmed_sku_id
+
+    finding = c.execute(
+        text("SELECT audit_finding_id, finding_class, severity, finding_status "
+             "FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND rule_key='INVOICE_SKU_MISMATCH'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one()
+    assert finding["finding_class"] == "VIOLATION"
+    assert finding["severity"] == "HIGH"
+    assert finding["finding_status"] == "OPEN"
+
+    task = c.execute(
+        text("SELECT task_type, assigned_role_code, related_finding_id "
+             "FROM auditcore.workflow_tasks WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one()
+    assert task["task_type"] == "INVOICE_SKU_MISMATCH_REASON"
+    assert task["assigned_role_code"] == "PC"
+    assert task["related_finding_id"] == finding["audit_finding_id"]
+
+
+def test_invoice_mismatch_resolves_once_invoice_matches_confirmed_sku(journey) -> None:
+    c = journey
+    confirmed_sku_id, other_sku_id = _seed_price_list(c, [
+        {"model": "XUV700", "variant": "AX7L", "components": {"EX_SHOWROOM": "2000000"}},
+        {"model": "SCORPIO N", "variant": "Z8L", "components": {"EX_SHOWROOM": "1600000"}},
+    ])
+    other_sku_code = c.execute(
+        text("SELECT sku_code FROM auditcore.product_skus WHERE product_sku_id=:s"),
+        {"s": other_sku_id},
+    ).scalar_one()
+    confirmed_sku_code = c.execute(
+        text("SELECT sku_code FROM auditcore.product_skus WHERE product_sku_id=:s"),
+        {"s": confirmed_sku_id},
+    ).scalar_one()
+    _set_journey_product(c, "XUV700", "AX7L")
+    c.execute(
+        text("UPDATE auditcore.journey_products SET product_sku_id=:s, selection_status='CONFIRMED' "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"s": confirmed_sku_id, "t": c.tenant_id, "j": c.journey_id},
+    )
+    _set_invoice_field(c, "sku_code", other_sku_code)
+    mr.sync_model_resolution_from_invoice(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert c.execute(
+        text("SELECT finding_status FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND rule_key='INVOICE_SKU_MISMATCH'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one() == "OPEN"
+
+    # A corrected invoice now shows the confirmed vehicle's own code.
+    c.execute(
+        text("DELETE FROM auditcore.journey_document_extracted_fields "
+             "WHERE tenant_id=:t AND journey_id=:j AND field_key='sku_code'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    )
+    _set_invoice_field(c, "sku_code", confirmed_sku_code)
+    mr.sync_model_resolution_from_invoice(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert c.execute(
+        text("SELECT finding_status FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND rule_key='INVOICE_SKU_MISMATCH'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one() == "RESOLVED"
 
 
 def test_invoice_fallback_skips_without_any_invoice_data(journey) -> None:

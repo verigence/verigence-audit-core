@@ -104,6 +104,10 @@ _VIOLATION_RULE_PREFIXES: frozenset[str] = frozenset({
     # commercial/discount value -- explicit instruction to never silently
     # pick a winner, always route to a Team Lead to validate which is right.
     "INVOICE_FIELD_DISAGREEMENT",
+    # 2026-09-16: a Delivery invoice implies a different vehicle than the
+    # already-resolved SKU -- PC explains the reason for the change, TL
+    # adjudicates; never silently pinned over, never silently ignored.
+    "INVOICE_SKU_MISMATCH",
 })
 
 _DOCUMENT_GAP_TYPES: frozenset[str] = frozenset({
