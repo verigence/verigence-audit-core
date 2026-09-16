@@ -96,6 +96,21 @@ def _engine() -> Engine:
     engine_options: dict[str, object] = {"pool_pre_ping": True}
     if _postgresql_url(database_url):
         engine_options.update(
+            # Confirmed live (2026-09-16, correlation_id 8bae0aeb-...): a
+            # single dashboard load fires several concurrent read endpoints
+            # (work-items-fast, pc-stats, review-queue/summary, landing-
+            # metrics) that each independently exceed the 2s slow-request
+            # threshold, and a Journey overview call dispatched alongside
+            # them measured 17.1s total while its OWN work (per its internal
+            # auth/header/queries timing log) took only 6.2s -- the other
+            # ~11s was time spent queued for a pool connection, not query
+            # execution. SQLAlchemy's un-set defaults (pool_size=5,
+            # max_overflow=10 -> 15 concurrent connections) are too small
+            # for this many concurrent per-page requests; doubling both
+            # gives real headroom without doing anything for a single
+            # request's own query cost.
+            pool_size=10,
+            max_overflow=20,
             pool_timeout=5,
             pool_recycle=600,
             pool_use_lifo=True,
