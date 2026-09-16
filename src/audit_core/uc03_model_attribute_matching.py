@@ -199,22 +199,52 @@ def resolve_model_via_aliases(
     return canonical, " ".join(text_words[consumed:])
 
 
-def has_qualifying_signal(*, oem_code: str, model_remainder: str, variant_text: str | None) -> bool:
-    """True only when the combined text states at least one recognized
-    fuel/transmission/drive/seater token -- not merely a bare trim code.
+def has_qualifying_signal(
+    *,
+    oem_code: str,
+    model_remainder: str,
+    variant_text: str | None,
+    candidate_rows: list[dict[str, Any]] | None = None,
+) -> bool:
+    """True when the combined text states model + trim + at least one real,
+    exact-valued fact -- all six of model, trim, fuel, transmission, drive,
+    seater are in play, not only the last four.
 
-    A bare trim code alone (e.g. "Z8L" with nothing else) still lets
-    ``match_by_attributes`` "match" via its trim-residue prefix check even
-    when there is nothing to actually eliminate a wrong candidate with --
-    that is no more certain than a plain name/variant equality check, and
-    callers must not let it outrank an exact price match the way a real
-    fuel/transmission/drive/seater signal should.
+    Model is already handled upstream (``resolve_model_via_aliases`` is
+    what got the caller this far at all). Fuel/transmission/drive/seater
+    each qualify on their own -- they are exact-value facts about the
+    specific vehicle.
+
+    Trim only qualifies when it is doing real work: ``candidate_rows`` (the
+    same pool ``match_by_attributes`` is about to filter) must contain more
+    than one *distinct* trim residue to choose between. A bare trim code
+    with nothing else, filtered against a candidate pool that only ever
+    had one trim to begin with, "matches" via ``match_by_attributes``'
+    trim-residue prefix check purely because there was nothing to eliminate
+    it with -- that is no more certain than a plain name/variant equality
+    check, and must not be allowed to outrank an exact price match. Confirmed
+    this is a real, not theoretical, distinction: hand-tracing an early
+    version of this function's "any non-empty trim counts" against a real
+    Mahindra generation-refresh case showed the lone remaining candidate
+    trivially "matching" a bare trim code that was never actually
+    disambiguating anything.
     """
     combined = " ".join(w for w in (model_remainder, variant_text) if w)
     decomposed = _decompose(combined, oem_code=oem_code)
     if decomposed is None:
         return False
-    return bool(decomposed.fuel or decomposed.transmission or decomposed.drive or decomposed.seater)
+    if decomposed.fuel or decomposed.transmission or decomposed.drive or decomposed.seater:
+        return True
+    if not decomposed.trim_key or not candidate_rows:
+        return False
+    master_trim_keys = {
+        master.trim_key
+        for master in (
+            _decompose(str(row.get("variant_name") or ""), oem_code=oem_code) for row in candidate_rows
+        )
+        if master is not None and master.trim_key
+    }
+    return len(master_trim_keys) > 1
 
 
 # ── attribute-filtered variant matching ─────────────────────────────────────

@@ -132,3 +132,40 @@ def test_has_qualifying_signal_false_when_nothing_supplied() -> None:
 
 def test_has_qualifying_signal_false_for_unknown_oem() -> None:
     assert not m.has_qualifying_signal(oem_code="HYUNDAI", model_remainder="", variant_text="D AT")
+
+
+def test_has_qualifying_signal_true_for_trim_that_genuinely_discriminates() -> None:
+    # Trim is one of the six things that should count as real signal, not
+    # just fuel/transmission/drive/seater -- but only when the candidate
+    # pool actually has more than one distinct trim to choose between.
+    rows = [
+        _row("SCORPIO N", "Z8S G MT 2WD 7 STR BS6.2 - N", fuel="PETROL", transmission="MT", drive="2WD", seater="7"),
+        _row("SCORPIO N", "Z8T G MT 2WD 7 STR BS6.2 - N", fuel="PETROL", transmission="MT", drive="2WD", seater="7"),
+    ]
+    assert m.has_qualifying_signal(
+        oem_code="MAHINDRA", model_remainder="", variant_text="Z8T", candidate_rows=rows
+    )
+
+
+def test_has_qualifying_signal_false_for_a_bare_trim_with_only_one_candidate() -> None:
+    # The exact case that broke a naive "any non-empty trim counts" draft:
+    # a single leftover candidate trivially "matches" a bare trim code that
+    # was never actually disambiguating anything.
+    rows = [
+        _row("SCORPIO N", "Z8L G MT 2WD 7 STR BS6.2 - N - ADAS", fuel="PETROL", transmission="MT", drive="2WD", seater="7"),
+    ]
+    assert not m.has_qualifying_signal(
+        oem_code="MAHINDRA", model_remainder="", variant_text="Z8L", candidate_rows=rows
+    )
+
+
+def test_has_qualifying_signal_false_when_every_candidate_shares_the_same_trim() -> None:
+    # Same trim code across the whole pool (they differ only by
+    # transmission) -- trim itself carries no discriminating power here.
+    rows = [
+        _row("SCORPIO N", "Z8T D AT 2WD 7 STR BS6.2 - N", fuel="DIESEL", transmission="AT", drive="2WD", seater="7"),
+        _row("SCORPIO N", "Z8T D MT 2WD 7 STR BS6.2 - N", fuel="DIESEL", transmission="MT", drive="2WD", seater="7"),
+    ]
+    assert not m.has_qualifying_signal(
+        oem_code="MAHINDRA", model_remainder="Z8T", variant_text=None, candidate_rows=rows
+    )

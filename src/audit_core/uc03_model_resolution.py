@@ -613,7 +613,10 @@ def _attribute_decomposition_fallback(
         variant_text=inputs["variant_name"],
     )
     trustworthy = len(model_rows) > 1 and has_qualifying_signal(
-        oem_code=oem_code, model_remainder=remainder, variant_text=inputs["variant_name"]
+        oem_code=oem_code,
+        model_remainder=remainder,
+        variant_text=inputs["variant_name"],
+        candidate_rows=model_rows,
     )
     return matched, "ATTRIBUTE_DECOMPOSITION", trustworthy
 
