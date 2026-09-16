@@ -57,6 +57,7 @@ from audit_core.uc03_model_attribute_matching import (
 )
 from audit_core.uc03_sku_candidates import (
     _label_similarity,
+    _normalize_label,
     _price_plan_for_journey,
 )
 from audit_core.uc03_v2_review_materialization import (
@@ -314,6 +315,50 @@ def _master_total(row: dict[str, Any], basis: str) -> Decimal | None:
     return _to_decimal(row.get(key))
 
 
+def _strip_new_prefix(name: str) -> str:
+    """``"New Scorpio N"`` -> ``"SCORPIO N"``; a plain name is returned
+    normalised, unchanged."""
+    words = _normalize_label(name).split()
+    if words and words[0] == "NEW":
+        words = words[1:]
+    return " ".join(words)
+
+
+def _generation_sibling_rows(
+    rows: list[dict[str, Any]], model_rows: list[dict[str, Any]], *, model_name: str
+) -> list[dict[str, Any]]:
+    """Rows for the OEM's "New <Model>" refresh of the same nameplate, or vice
+    versa, when the Booking Form's own model text omits that qualifier.
+
+    Confirmed directly against a real ingested Mahindra price list: a
+    generation refresh keeps selling under a name that's the old one with a
+    "New " prefix (``"SCORPIO N"`` -- an ADAS-trim generation still on sale --
+    alongside ``"NEW SCORPIO N"``, a Refresh-trim generation, in the exact
+    same currently-effective price list; ``"THAR"``/``"NEW THAR ..."`` is the
+    same pattern). Real paperwork very often just writes the bare name,
+    which otherwise permanently walls off the refresh generation from ever
+    matching, however exactly its price agrees with what's on the form.
+
+    Exact-per-name only, after the same normalisation ``_label_similarity``
+    already applies (never fuzzy) -- and this list is only ever consulted
+    to arbitrate by an EXACT price match (see ``_match``), never to widen
+    what gets reported as an ambiguous candidate set on its own.
+
+    Computed even when ``model_rows`` is empty -- the tenant's currently
+    effective price list may carry only the refresh generation at all (the
+    old one fully retired), which is exactly the case this exists for.
+    """
+    base = _strip_new_prefix(model_name)
+    if not base:
+        return []
+    already = {r["product_sku_id"] for r in model_rows}
+    return [
+        r
+        for r in rows
+        if r["product_sku_id"] not in already and _strip_new_prefix(str(r["model_name"])) == base
+    ]
+
+
 def _match(
     rows: list[dict[str, Any]], inputs: dict[str, Any]
 ) -> tuple[list[dict[str, Any]], str]:
@@ -321,7 +366,8 @@ def _match(
     model = inputs["model_name"]
     basis = inputs["registration_basis"]
     model_rows = [r for r in rows if _label_similarity(model, str(r["model_name"])) == Decimal(1)]
-    if not model_rows:
+    sibling_rows = _generation_sibling_rows(rows, model_rows, model_name=model)
+    if not model_rows and not sibling_rows:
         return [], "NONE"
 
     total = inputs["offered_total"]
@@ -330,6 +376,10 @@ def _match(
         by_total = _narrow(by_total, variant=inputs["variant_name"], colour=inputs["colour_name"])
         if len(by_total) == 1:
             return by_total, "TOTAL"
+        if not by_total and sibling_rows:
+            sibling_total = [r for r in sibling_rows if _master_total(r, basis) == total]
+            if len(sibling_total) == 1:
+                return sibling_total, "TOTAL"
         if len(by_total) > 1:
             model_rows = by_total  # keep the ambiguity for reporting unless ex-showroom disambiguates
 
@@ -339,9 +389,15 @@ def _match(
         by_ex = _narrow(by_ex, variant=inputs["variant_name"], colour=inputs["colour_name"])
         if len(by_ex) == 1:
             return by_ex, "EX_SHOWROOM"
+        if not by_ex and sibling_rows:
+            sibling_ex = [r for r in sibling_rows if _to_decimal(r["master_ex_showroom"]) == ex]
+            if len(sibling_ex) == 1:
+                return sibling_ex, "EX_SHOWROOM"
         if len(by_ex) > 1:
             return by_ex, "EX_SHOWROOM"
 
+    if not model_rows:
+        return [], "NONE"
     return model_rows, "TOTAL" if total is not None else "NONE"
 
 

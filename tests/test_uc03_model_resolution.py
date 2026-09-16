@@ -100,6 +100,76 @@ def test_no_price_data_returns_empty() -> None:
     assert matched == [rows[0]] or matched == []  # model matched but nothing to disambiguate
 
 
+# ── unit: generation-refresh bridge ──────────────────────────────────────────
+# Real, confirmed live data: a Mahindra price list can carry an old-generation
+# "SCORPIO N" (still on sale) alongside a "NEW SCORPIO N" refresh in the exact
+# same currently-effective price list, sharing overlapping variant codes at
+# different prices. A Booking Form's own free text very often drops "New" --
+# these prove price alone can still resolve across that gap instead of
+# permanently walling the refresh generation off.
+def test_strip_new_prefix() -> None:
+    assert mr._strip_new_prefix("New Scorpio N") == "SCORPIO N"
+    assert mr._strip_new_prefix("NEW THAR 2WD & 4WD") == "THAR 2WD 4WD"
+    assert mr._strip_new_prefix("Scorpio N") == "SCORPIO N"
+
+
+def test_match_bridges_to_the_refresh_generation_via_exact_price() -> None:
+    rows = [
+        _row("OLD-Z8L", "SCORPIO N", variant="Z8L", total="2000000", ex="2075499.58"),
+        _row("NEW-Z8L", "NEW SCORPIO N", variant="Z8L", total="2200000", ex="2131387.08"),
+    ]
+    matched, stage = mr._match(
+        rows, _inputs(model="Scorpio N", variant="Z8L", ex="2131387.08")
+    )
+    assert stage == "EX_SHOWROOM"
+    assert [r["sku_code"] for r in matched] == ["NEW-Z8L"]
+
+
+def test_match_prefers_the_named_generation_when_its_own_price_matches() -> None:
+    """The bridge only ever fires when the named bucket's own price search
+    comes up empty -- it must never override a price that already uniquely
+    resolves within the generation the Booking Form actually named."""
+    rows = [
+        _row("OLD-Z8L", "SCORPIO N", variant="Z8L", total="2000000", ex="2075499.58"),
+        _row("NEW-Z8L", "NEW SCORPIO N", variant="Z8L", total="2200000", ex="2131387.08"),
+    ]
+    matched, stage = mr._match(
+        rows, _inputs(model="Scorpio N", variant="Z8L", ex="2075499.58")
+    )
+    assert stage == "EX_SHOWROOM"
+    assert [r["sku_code"] for r in matched] == ["OLD-Z8L"]
+
+
+def test_match_bridge_does_not_fire_when_price_is_ambiguous_in_both_generations() -> None:
+    rows = [
+        _row("OLD-Z8L-MT", "SCORPIO N", variant="Z8L", total="2000000", ex="2075499.58"),
+        _row("OLD-Z8L-AT", "SCORPIO N", variant="Z8L", total="2000000", ex="2075499.58"),
+        _row("NEW-Z8L", "NEW SCORPIO N", variant="Z8L", total="2200000", ex="2131387.08"),
+    ]
+    matched, stage = mr._match(
+        rows, _inputs(model="Scorpio N", variant="Z8L", ex="2075499.58")
+    )
+    assert stage == "EX_SHOWROOM"
+    assert {r["sku_code"] for r in matched} == {"OLD-Z8L-MT", "OLD-Z8L-AT"}
+
+
+def test_match_bridge_reaches_the_refresh_generation_when_the_old_one_no_longer_exists() -> None:
+    """The tenant's currently effective price list may only carry the refresh
+    generation at all (the old one fully retired) -- the bridge must still
+    resolve it even though model_rows itself is empty from the start."""
+    rows = [_row("NEW-Z8L", "NEW SCORPIO N", variant="Z8L", ex="2131387.08")]
+    matched, stage = mr._match(rows, _inputs(model="Scorpio N", variant="Z8L", ex="2131387.08"))
+    assert stage == "EX_SHOWROOM"
+    assert [r["sku_code"] for r in matched] == ["NEW-Z8L"]
+
+
+def test_match_bridge_is_a_no_op_for_unrelated_models() -> None:
+    rows = [_row("A", "THAR", total="1000000")]
+    matched, stage = mr._match(rows, _inputs(model="XUV700", total="1000000"))
+    assert matched == []
+    assert stage == "NONE"
+
+
 # ── integration ──────────────────────────────────────────────────────────────
 @pytest.fixture
 def journey():
@@ -589,6 +659,51 @@ def test_integration_reports_narrower_candidates_even_when_still_ambiguous(mahin
     assert result.get("raised") is True
     assert result.get("matchStage") == "ATTRIBUTE_DECOMPOSITION"
     assert result.get("candidateCount") == 2
+
+
+def test_integration_resolves_across_generations_via_ex_showroom_price(mahindra_journey) -> None:
+    """Reproduces a real, user-reported case verbatim: a Booking Form writes
+    the bare nameplate ('Scorpio N') and a trim code ('Z8L') with no fuel/
+    transmission/seater qualifiers captured at all -- so the attribute
+    decomposition fallback has nothing to decompose. The tenant's actual,
+    currently effective price list (confirmed against the real ingested
+    workbook) carries BOTH an old-generation 'SCORPIO N' (ADAS trim) and a
+    'NEW SCORPIO N' refresh, each with their own 'Z8L' variant at a
+    different price. Ex-showroom price is the one thing this Booking Form
+    genuinely does capture, and it matches the refresh generation's Z8L
+    exactly -- proving the resolver bridges to it instead of reporting the
+    old generation's Z8L (or every Z8L across both) as equally ambiguous."""
+    c = mahindra_journey
+    _seed_price_list(c, [
+        {"model": "SCORPIO N", "variant": "Z8 L G MT 2WD 7 STR BS6.2 - N - ADAS",
+         "fuel": "PETROL", "transmission": "MT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "2075499.58"}},
+        {"model": "NEW SCORPIO N", "variant": "Z8 L G MT 2WD 7 STR BS6.2 - Refresh",
+         "fuel": "PETROL", "transmission": "MT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "2131387.08"}},
+    ])
+    _set_journey_product(c, "Scorpio N", "Z8L")
+    _set_booking_form_ex_showroom(c, "2131387.08")  # matches the refresh generation only
+
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("resolved") is True
+    assert result.get("matchStage") == "EX_SHOWROOM"
+
+    sku = c.execute(
+        text("SELECT product_sku_id FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    pinned_model = c.execute(
+        text("SELECT pm.model_name FROM auditcore.product_skus s "
+             "JOIN auditcore.product_models pm ON pm.model_id = s.model_id "
+             "WHERE s.product_sku_id = :sku"),
+        {"sku": sku},
+    ).scalar_one()
+    assert pinned_model == "NEW SCORPIO N"
+    assert _open_model_flags(c) == 0
 
 
 def test_integration_falls_back_to_latest_master_when_booking_predates_it(journey) -> None:
