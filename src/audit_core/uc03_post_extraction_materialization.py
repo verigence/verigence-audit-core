@@ -33,6 +33,7 @@ from audit_core.security_authorization import (
 from audit_core.uc03_attribute_mapping import spec_for_field
 from audit_core.uc03_attribute_resolution import apply_supported_operational_attribute
 from audit_core.uc03_booking_rule_trigger import schedule_booking_checkpoint_rules
+from audit_core.uc03_deal_source_history import record_source_value
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +176,19 @@ def _materialize_commercial(
             "evidence_id": evidence_id,
             "source_reference": f"{document_type}:{document_id}",
         },
+    )
+    # Recorded regardless of whether this source currently wins the canonical
+    # row above -- see uc03_deal_source_history's own docstring.
+    record_source_value(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        line_kind="COMMERCIAL",
+        component_key=field_key,
+        source_document_type=document_type,
+        amount=amount,
+        evidence_id=evidence_id,
+        document_id=document_id,
     )
     return True
 

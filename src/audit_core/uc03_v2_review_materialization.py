@@ -10,6 +10,7 @@ from sqlalchemy import Connection, text
 from audit_core import uc03_booking_capture
 from audit_core.uc03_attribute_mapping import spec_for_field
 from audit_core.uc03_booking_receipt_capture import _RECEIPT_CAPTURE_MAP
+from audit_core.uc03_deal_source_history import record_source_value
 from audit_core.uc03_document_registry import is_receipt_document_type
 from audit_core.uc03_payment_mode import classify_payment_mode
 
@@ -418,6 +419,17 @@ def _materialize_commercial_lines(
         amount = values.get(component_key)
         if amount is None:
             continue
+        record_source_value(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            line_kind="COMMERCIAL",
+            component_key=component_key,
+            source_document_type=_BOOKING_FORM_DOCUMENT_TYPE,
+            amount=amount,
+            evidence_id=evidence_id,
+            document_id=document_id,
+        )
         connection.execute(
             text(
                 """
@@ -459,6 +471,18 @@ def _upsert_evidence_discount_application(
     amount: Any,
     evidence_id: UUID | None,
 ) -> None:
+    # Recorded unconditionally -- this is the booking-form side of the same
+    # per-source breakdown the invoice path writes in uc03_invoice_materialization.
+    record_source_value(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        line_kind="DISCOUNT",
+        component_key=discount_key,
+        source_document_type=_BOOKING_FORM_DOCUMENT_TYPE,
+        amount=amount,
+        evidence_id=evidence_id,
+    )
     existing_id = connection.execute(
         text(
             """

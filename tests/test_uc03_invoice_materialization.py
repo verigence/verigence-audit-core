@@ -305,6 +305,22 @@ def test_weaker_invoice_does_not_override_stronger(journey) -> None:
     )
     assert _commercial(c, "ex_showroom_price")["actual_amount"] == Decimal(1600000)
 
+    # Real user report: the Journey Line panel silently collapsed to whichever
+    # source currently wins, so a disagreement between sources was invisible.
+    # The canonical row still shows one winner (above) -- but the *weaker*,
+    # losing invoice's own reported value must still survive for the
+    # comparison panel to show, not just the winner's.
+    rows = c.execute(
+        text("SELECT source_document_type, amount FROM auditcore.commercial_line_source_values "
+             "WHERE tenant_id=:t AND journey_id=:j AND line_kind='COMMERCIAL' AND component_key='ex_showroom_price'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().all()
+    by_source = {r["source_document_type"]: r["amount"] for r in rows}
+    assert by_source == {
+        "tax_invoice_tally": Decimal(1600000),
+        "invoice_generic": Decimal(999999),
+    }
+
 
 def test_idempotent(journey) -> None:
     c = journey
