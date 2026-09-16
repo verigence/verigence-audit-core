@@ -715,9 +715,27 @@ def _sync_total_variance(
 
 
 def sync_deal_reconciliation(
-    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    correlation_id: str,
+    raise_findings: bool = True,
 ) -> dict[str, Any]:
-    """Materialise price + discount standards from the OEM masters. Never raises."""
+    """Materialise price + discount standards from the OEM masters. Never raises.
+
+    ``raise_findings=False`` skips the two evidence/variance checks below
+    (still materialises standard/actual values) -- every real caller that
+    triggers off an actual document-sync/review event keeps the default,
+    genuinely re-checking evidence and total variance when the underlying
+    facts change. The one caller that runs on every Journey Overview page
+    view (self-heals SKU resolution on every read) passes False: those two
+    checks each do a handful of sequential DB round-trips per discount row
+    (has_active_document + a finding raise/resolve chain), and running that
+    on every page view rather than on the events that actually change
+    these facts was a real, measured latency regression -- confirmed via a
+    live 23s overview load -- not a hypothetical one.
+    """
     try:
         ctx = _context(connection, tenant_id=tenant_id, journey_id=journey_id)
         if ctx is None:
@@ -761,6 +779,9 @@ def sync_deal_reconciliation(
             benefits=benefits,
             actuals=actuals,
         )
+        if not raise_findings:
+            return {"priceLines": price_lines, **discount}
+
         evidence_rows = _sync_conditional_discount_evidence(
             connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
         )
