@@ -1,6 +1,6 @@
 """Per-source breakdown of commercial-line and discount actual values.
 
-Revision ID: 0101_commercial_line_source_values
+Revision ID: 0101_deal_source_values
 Revises: 0100_uc03_identity_check_hold
 Create Date: 2026-09-16
 
@@ -26,7 +26,7 @@ from __future__ import annotations
 from alembic import op
 from sqlalchemy import text
 
-revision = "0101_commercial_line_source_values"
+revision = "0101_deal_source_values"
 down_revision = "0100_uc03_identity_check_hold"
 branch_labels = None
 depends_on = None
