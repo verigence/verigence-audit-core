@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -10,10 +10,10 @@ import audit_core.uc03_document_unrecognized as du
 
 
 # ── unit ──────────────────────────────────────────────────────────────────────
-def test_rule_key_is_namespaced_per_stage_and_document() -> None:
+def test_effect_key_is_namespaced_per_tenant_stage_and_document() -> None:
     doc = uuid4()
-    assert du._rule_key("DELIVERY", doc) == f"DOCUMENT_UNRECOGNIZED:DELIVERY:{doc}"
-    assert du._rule_key("BOOKING", doc) == f"DOCUMENT_UNRECOGNIZED:BOOKING:{doc}"
+    assert du._effect_key("t1", "j1", "DELIVERY", doc) == f"task:document-unrecognized:t1:j1:DELIVERY:{doc}"
+    assert du._effect_key("t1", "j1", "BOOKING", doc) == f"task:document-unrecognized:t1:j1:BOOKING:{doc}"
 
 
 def test_friendly_filename_falls_back_to_short_document_id() -> None:
@@ -101,7 +101,20 @@ def _unknown_document(filename: str) -> dict:
     }
 
 
-def test_producer_raises_one_finding_per_unrecognized_document(journey) -> None:
+def _open_task(c, *, tenant_id: str, task_type: str) -> dict | None:
+    return c.execute(
+        text(
+            "SELECT workflow_task_id, task_status, related_finding_id, task_payload, "
+            "assigned_role_code, process_area FROM auditcore.workflow_tasks "
+            "WHERE tenant_id = :t AND task_type = :tt"
+        ),
+        {"t": tenant_id, "tt": task_type},
+    ).mappings().one_or_none()
+
+
+def test_producer_raises_one_standalone_task_per_unrecognized_document_no_finding(journey) -> None:
+    """No Audit Finding at all -- DI not recognizing a document is a "please
+    verify" job for PC, not a rule violation or a compliance gap."""
     tenant_id, journey_id = journey.tenant_id, journey.journey_id
     unknown = _unknown_document("gst_declaration.pdf")
     classified = {
@@ -120,38 +133,32 @@ def test_producer_raises_one_finding_per_unrecognized_document(journey) -> None:
     )
     assert result["raised"] == 1  # only the UNKNOWN one
 
-    rows = journey.execute(
-        text("SELECT audit_finding_id, rule_key, finding_type_code, finding_class, owner_role_code, title "
-             "FROM auditcore.audit_findings WHERE tenant_id = :t AND journey_id = :j"),
-        {"t": tenant_id, "j": journey_id},
-    ).mappings().all()
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["finding_type_code"] == "DOCUMENT_UNRECOGNIZED"
-    assert row["finding_class"] == "DATA_GAP"
-    assert row["owner_role_code"] == "PC"
-    assert row["rule_key"] == du._rule_key("DELIVERY", UUID(unknown["documentId"]))
-    assert "gst_declaration.pdf" in row["title"]
+    assert journey.execute(
+        text("SELECT count(*) FROM auditcore.audit_findings WHERE tenant_id = :t"), {"t": tenant_id}
+    ).scalar_one() == 0
 
-    event_payload = journey.execute(
-        text("SELECT safe_payload FROM auditcore.audit_finding_events "
-             "WHERE tenant_id = :t AND audit_finding_id = :f AND event_type = 'RAISED'"),
-        {"t": tenant_id, "f": row["audit_finding_id"]},
-    ).scalar_one()
-    assert event_payload["contentUrl"] == unknown["contentUrl"]
+    task = _open_task(journey, tenant_id=tenant_id, task_type=du.TASK_TYPE)
+    assert task is not None
+    assert task["task_status"] == "READY"
+    assert task["related_finding_id"] is None
+    assert task["assigned_role_code"] == "PC"
+    assert task["process_area"] == "DELIVERY"
+    assert task["task_payload"]["diDocumentId"] == unknown["documentId"]
+    assert "gst_declaration.pdf" in task["task_payload"]["comment"]
 
     # idempotent -- calling again with the same live document doesn't duplicate
     again = du.sync_document_unrecognized_findings(
         journey, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
         di_documents=[unknown, classified], correlation_id="",
     )
-    assert again["raised"] == 1
+    assert again["raised"] == 0
     assert journey.execute(
-        text("SELECT count(*) FROM auditcore.audit_findings WHERE tenant_id = :t"), {"t": tenant_id}
+        text("SELECT count(*) FROM auditcore.workflow_tasks WHERE tenant_id = :t AND task_type = :tt"),
+        {"t": tenant_id, "tt": du.TASK_TYPE},
     ).scalar_one() == 1
 
 
-def test_reclassified_document_resolves_its_finding(journey) -> None:
+def test_reclassified_document_cancels_its_task(journey) -> None:
     tenant_id, journey_id = journey.tenant_id, journey.journey_id
     unknown = _unknown_document("mystery.pdf")
 
@@ -159,11 +166,7 @@ def test_reclassified_document_resolves_its_finding(journey) -> None:
         journey, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
         di_documents=[unknown], correlation_id="",
     )
-    open_status = journey.execute(
-        text("SELECT finding_status FROM auditcore.audit_findings WHERE tenant_id = :t"),
-        {"t": tenant_id},
-    ).scalar_one()
-    assert open_status == "OPEN"
+    assert _open_task(journey, tenant_id=tenant_id, task_type=du.TASK_TYPE)["task_status"] == "READY"
 
     # A later DI pass reclassifies it -- the document is no longer in the
     # UNKNOWN set on the next capture-screen read.
@@ -174,9 +177,54 @@ def test_reclassified_document_resolves_its_finding(journey) -> None:
     )
     assert result["resolved"] == 1
 
-    closed = journey.execute(
-        text("SELECT finding_status, disposition FROM auditcore.audit_findings WHERE tenant_id = :t"),
-        {"t": tenant_id},
-    ).mappings().one()
-    assert closed["finding_status"] == "RESOLVED"
-    assert closed["disposition"] == "FIXED"
+    status = journey.execute(
+        text("SELECT task_status FROM auditcore.workflow_tasks WHERE tenant_id = :t AND task_type = :tt"),
+        {"t": tenant_id, "tt": du.TASK_TYPE},
+    ).scalar_one()
+    assert status == "CANCELLED"
+
+
+def test_apply_verification_correct_outcome_leaves_document_untouched(journey) -> None:
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    document_id = uuid4()
+    journey.execute(
+        text("""INSERT INTO auditcore.document_capture_v2_documents
+            (tenant_id, journey_id, stage_code, di_document_id, client_upload_id, capture_status, created_by_actor_id)
+            VALUES (:t, :j, 'DELIVERY', :doc_id, 'upload-1', 'UNKNOWN', 'test-actor')"""),
+        {"t": tenant_id, "j": journey_id, "doc_id": document_id},
+    )
+
+    du.apply_unrecognized_document_verification(
+        journey, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
+        di_document_id=document_id, outcome="CORRECT",
+    )
+
+    status = journey.execute(
+        text("SELECT capture_status FROM auditcore.document_capture_v2_documents "
+             "WHERE tenant_id = :t AND di_document_id = :d"),
+        {"t": tenant_id, "d": document_id},
+    ).scalar_one()
+    assert status == "UNKNOWN"
+
+
+def test_apply_verification_incorrect_outcome_supersedes_the_document(journey) -> None:
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    document_id = uuid4()
+    journey.execute(
+        text("""INSERT INTO auditcore.document_capture_v2_documents
+            (tenant_id, journey_id, stage_code, di_document_id, client_upload_id, capture_status, created_by_actor_id)
+            VALUES (:t, :j, 'DELIVERY', :doc_id, 'upload-1', 'UNKNOWN', 'test-actor')"""),
+        {"t": tenant_id, "j": journey_id, "doc_id": document_id},
+    )
+
+    du.apply_unrecognized_document_verification(
+        journey, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
+        di_document_id=document_id, outcome="INCORRECT",
+    )
+
+    status = journey.execute(
+        text("SELECT capture_status FROM auditcore.document_capture_v2_documents "
+             "WHERE tenant_id = :t AND di_document_id = :d"),
+        {"t": tenant_id, "d": document_id},
+    ).scalar_one()
+    assert status == "SUPERSEDED"

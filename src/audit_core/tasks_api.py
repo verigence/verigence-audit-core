@@ -12,6 +12,7 @@ from audit_core.authorization import authorize
 from audit_core.business_assignments import require_business_scope
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_principal
+from audit_core.errors import AuditCoreError
 from audit_core.idempotency import execute_idempotent_json_command
 from audit_core.observability import get_correlation_id
 from audit_core.security import Principal
@@ -22,6 +23,8 @@ from audit_core.workflow import (
     get_workflow_task,
     start_workflow_task,
 )
+
+_DOCUMENT_VERIFICATION_OUTCOMES = {"CORRECT", "INCORRECT"}
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/tasks", tags=["audit-tasks"])
 
@@ -39,6 +42,16 @@ class TaskCancelInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: str
+
+
+class TaskCompleteInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # PC_VERIFY_UNRECOGNIZED_DOCUMENT only today: 'CORRECT' (DI just
+    # couldn't classify it, dismiss) or 'INCORRECT' (wrong document,
+    # soft-delete it). Every other task_type ignores this field entirely --
+    # optional so their existing no-body completion calls keep working.
+    outcome: str | None = None
 
 
 class TaskHistoryEventResponse(BaseModel):
@@ -200,6 +213,7 @@ def complete_task(
     ],
     principal: Annotated[Principal, Depends(get_principal)],
     connection: Annotated[Connection, Depends(get_connection)],
+    payload: TaskCompleteInput | None = None,
 ) -> TaskResponse:
     task = _task(
         connection,
@@ -209,6 +223,19 @@ def complete_task(
         permission="audit.work.update",
     )
 
+    from audit_core.uc03_document_unrecognized import (
+        TASK_TYPE as _DOCUMENT_VERIFICATION_TASK_TYPE,
+    )
+
+    outcome = (payload.outcome or "").strip().upper() if payload else ""
+    if task["task_type"] == _DOCUMENT_VERIFICATION_TASK_TYPE and outcome not in _DOCUMENT_VERIFICATION_OUTCOMES:
+        raise AuditCoreError(
+            error_code="VAC-VAL-007",
+            status_code=400,
+            title="Validation failed",
+            detail="outcome must be 'CORRECT' or 'INCORRECT' to complete this task.",
+        )
+
     def execute() -> dict:
         complete_workflow_task(
             connection,
@@ -216,12 +243,13 @@ def complete_task(
             workflow_task_id=task_id,
             actor_id=principal.subject,
         )
-        # One finding-type-specific side effect, same shape as uc03_audit_
-        # flags.py::act_on_flag's own special cases -- Completing a
-        # MODEL_SELECTION_CORRECTION_REVIEW task is what actually
-        # reassigns the SKU (uc03_model_selection_corrections.py); every
-        # other task_type completes exactly as before. Cancelling needs no
-        # equivalent hook in cancel_task below -- the original SKU stands.
+        # Finding-type-specific side effects, same shape as uc03_audit_
+        # flags.py::act_on_flag's own special cases. Every other task_type
+        # completes exactly as before. Cancelling needs no equivalent hook
+        # in cancel_task below -- neither side effect has anything to undo.
+        from audit_core.uc03_document_unrecognized import (
+            apply_unrecognized_document_verification,
+        )
         from audit_core.uc03_model_selection_corrections import (
             TASK_TYPE as _MODEL_SELECTION_CORRECTION_TASK_TYPE,
         )
@@ -237,6 +265,16 @@ def complete_task(
                 workflow_task_id=task_id,
                 correlation_id=get_correlation_id(request),
             )
+        elif task["task_type"] == _DOCUMENT_VERIFICATION_TASK_TYPE:
+            document_payload = task["task_payload"] or {}
+            apply_unrecognized_document_verification(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=task["journey_id"],
+                stage_code=task["process_area"],
+                di_document_id=UUID(str(document_payload["diDocumentId"])),
+                outcome=outcome,
+            )
         response = _response(
             get_workflow_task(connection, tenant_id=tenant_id, workflow_task_id=task_id)
         )
@@ -247,7 +285,7 @@ def complete_task(
         tenant_id=tenant_id,
         operation_key=f"task.complete:{task_id}",
         idempotency_key=idempotency_key,
-        request_payload={"taskId": str(task_id)},
+        request_payload={"taskId": str(task_id), "outcome": outcome or None},
         execute=execute,
         logical_result_id=str(task_id),
     )
