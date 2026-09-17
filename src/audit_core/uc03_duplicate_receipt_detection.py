@@ -20,7 +20,19 @@ that basis is called out explicitly in the finding's payload for the TL who
 adjudicates it.
 
 ``sync_duplicate_receipt_detection`` is the producer: idempotent, self-heals
-(a correction that no longer matches resolves the finding), never raises.
+(a correction that no longer matches cancels the task), never raises.
+
+Direct user correction (2026-09-17): this used to raise a VIOLATION finding,
+TL-adjudicated (Confirm Breach / Mark False Positive). But the adjudication
+never actually did anything -- the exclusion from money totals is computed
+live, everywhere it matters (evaluate_minimum_booking_payment,
+uc03_journey_overview_projection.py), straight off compute_duplicate_groups
+itself, never off a finding's own disposition. A TL's decision here was
+pure ceremony around a fact the system had already acted on. This is a
+plain informational Task instead: tell PC which document is the duplicate
+and that it won't be counted, no decision required -- PC dismisses it once
+seen (the ordinary Complete action, no special hook: there is nothing left
+to apply), or it cancels itself if a correction breaks the match.
 """
 from __future__ import annotations
 
@@ -32,13 +44,15 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
-from audit_core.uc03_delivery_commands import _machine_flag
+from audit_core.workflow import cancel_workflow_task, create_workflow_task
 
 logger = logging.getLogger(__name__)
 
 _FINDING_TYPE = "DUPLICATE_RECEIPT"
 _RULE_PREFIX = "DUPLICATE_RECEIPT"
-_SEVERITY = "HIGH"
+TASK_TYPE = "DUPLICATE_RECEIPT_NOTICE"
+_WORKFLOW_TYPE = "UC03_DUPLICATE_RECEIPT"
+_OPEN_TASK_STATUSES = {"PENDING", "READY", "CLAIMED", "IN_PROGRESS", "RETRY_WAIT"}
 
 # Same-type only, by design (see module docstring) -- these are compared
 # within each type separately, never against each other.
@@ -222,7 +236,36 @@ def compute_duplicate_groups(documents: list[ReceiptRecord]) -> list[DuplicateGr
 
 
 
-def _resolve_stale_duplicate_findings(
+def _effect_key(tenant_id: str, journey_id: UUID, rule_key: str) -> str:
+    return f"task:duplicate-receipt:{tenant_id}:{journey_id}:{rule_key}"
+
+
+def _notice_text(group: DuplicateGroup) -> str:
+    kind = group.document_type_key.replace("_", " ")
+    base = f"{len(group.documents)} {kind} documents on this Journey all show ₹{group.amount}"
+    if group.match_basis == "RECEIPT_NUMBER_AND_AMOUNT":
+        if group.dates_match:
+            return (
+                f"{base} with the same receipt number and the same date -- almost certainly "
+                "the same physical receipt uploaded more than once. Only the earliest one is "
+                "counted toward what the customer paid; the other(s) are excluded automatically, "
+                "no action needed unless this doesn't look right to you."
+            )
+        return (
+            f"{base} with the same receipt number, but the date differs between them -- still "
+            "almost certainly the same physical receipt (dealers do not reuse receipt numbers), "
+            "most likely with one date misread. Only the earliest one is counted toward what the "
+            "customer paid; the other(s) are excluded automatically."
+        )
+    return (
+        f"{base} and the same date, with no receipt number legible on either -- flagged as a "
+        "likely duplicate and only the earliest is counted toward what the customer paid. If "
+        "these are genuinely two separate payments, re-upload with a legible receipt number to "
+        "clear this."
+    )
+
+
+def _resolve_stale_legacy_findings(
     connection: Connection,
     *,
     tenant_id: str,
@@ -230,6 +273,11 @@ def _resolve_stale_duplicate_findings(
     current_rule_keys: set[str],
     correlation_id: str,
 ) -> int:
+    """A DUPLICATE_RECEIPT finding raised before this producer moved onto
+    the Task Queue -- nothing else in the codebase resolves it any more, so
+    without this it would sit open forever even after a correction breaks
+    the match. Safe to delete once no tenant has one of these findings open
+    any longer."""
     from audit_core.uc03_manual_verification import _resolve_finding
 
     rows = connection.execute(
@@ -265,59 +313,89 @@ def _resolve_stale_duplicate_findings(
 def sync_duplicate_receipt_detection(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
 ) -> dict[str, Any]:
-    """Raise DUPLICATE_RECEIPT for each group of same-type receipts that look
-    like the same physical receipt uploaded more than once; resolve a group
-    once a correction breaks the match. Idempotent, self-heals, never raises."""
+    """Raise a DUPLICATE_RECEIPT_NOTICE task for each group of same-type
+    receipts that look like the same physical receipt uploaded more than
+    once; cancel the task once a correction breaks the match. Idempotent,
+    self-heals, never raises."""
     try:
         documents = _receipt_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
         groups = compute_duplicate_groups(documents)
 
+        # raised counts every currently-outstanding group, not just ones
+        # that got a brand new Task this call -- matches this producer's
+        # own pre-Task-Queue behavior (and uc03_run_all_rules.py's FAIL
+        # derivation, which depends on it staying non-zero for as long as
+        # the duplicate remains unaddressed).
         raised = 0
+        live_effect_keys: set[str] = set()
         for group in groups:
-            document_ids = [str(d.document_id) for d in group.documents]
-            _machine_flag(
+            raised += 1
+            effect_key = _effect_key(tenant_id, journey_id, group.rule_key)
+            live_effect_keys.add(effect_key)
+            existing = connection.execute(
+                text(
+                    "SELECT 1 FROM auditcore.workflow_tasks "
+                    "WHERE tenant_id = :tenant_id AND effect_key = :effect_key"
+                ),
+                {"tenant_id": tenant_id, "effect_key": effect_key},
+            ).scalar_one_or_none()
+            if existing is not None:
+                continue
+            create_workflow_task(
                 connection,
                 tenant_id=tenant_id,
                 journey_id=journey_id,
-                stage_code=group.stage_code,
-                rule_key=group.rule_key,
-                finding_type=_FINDING_TYPE,
-                severity=_SEVERITY,
-                title=f"Possible duplicate {group.document_type_key.replace('_', ' ')} (₹{group.amount})",
-                description=(
-                    f"{len(group.documents)} {group.document_type_key.replace('_', ' ')} documents "
-                    f"on this Journey all show ₹{group.amount}"
-                    + (
-                        (
-                            " with the same receipt number and the same date -- almost certainly "
-                            "the same physical receipt uploaded more than once. Only the earliest "
-                            "one is counted toward what the customer paid; reject this document "
-                            "if it is confirmed to be the duplicate."
-                            if group.dates_match
-                            else " with the same receipt number, but the date differs between "
-                            "them -- still almost certainly the same physical receipt (dealers do "
-                            "not reuse receipt numbers), most likely with one date misread. Only "
-                            "the earliest one is counted toward what the customer paid; confirm "
-                            "or reject."
-                        )
-                        if group.match_basis == "RECEIPT_NUMBER_AND_AMOUNT"
-                        else " and the same date, with no receipt number legible on either -- "
-                        "check whether this is one receipt uploaded twice or two separate "
-                        "payments before counting both toward what the customer paid."
-                    )
-                ),
-                correlation_id=correlation_id,
-                safe_payload={
+                workflow_type=_WORKFLOW_TYPE,
+                process_area=group.stage_code,
+                task_type=TASK_TYPE,
+                assigned_role_code="PC",
+                task_payload={
+                    "ruleKey": group.rule_key,
                     "documentTypeKey": group.document_type_key,
                     "matchBasis": group.match_basis,
                     "datesMatch": group.dates_match,
                     "amount": str(group.amount),
-                    "diDocumentIds": document_ids,
+                    "diDocumentIds": [str(d.document_id) for d in group.documents],
+                    "comment": _notice_text(group),
                 },
+                effect_key=effect_key,
+                correlation_id=correlation_id,
             )
-            raised += 1
 
-        resolved = _resolve_stale_duplicate_findings(
+        # Cancel a Task whose group no longer matches -- a correction to the
+        # amount, receipt number or date genuinely changed the underlying
+        # fact (as opposed to manual verification's own self-heal, where
+        # the only way out is a PC actively reviewing it), so cancel is the
+        # right terminal state here, same as DOCUMENT_UNRECOGNIZED's own
+        # "went away on its own" case. A PC dismissing the notice after
+        # reading it (the ordinary Complete action -- nothing to apply, see
+        # module docstring) is the other, and more common, way this closes.
+        open_tasks = connection.execute(
+            text(
+                """
+                SELECT workflow_task_id, effect_key
+                FROM auditcore.workflow_tasks
+                WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+                  AND task_type = :task_type
+                  AND task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT')
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "task_type": TASK_TYPE},
+        ).mappings().all()
+        resolved = 0
+        for task in open_tasks:
+            if task["effect_key"] in live_effect_keys:
+                continue
+            cancel_workflow_task(
+                connection,
+                tenant_id=tenant_id,
+                workflow_task_id=task["workflow_task_id"],
+                actor_id="SYSTEM",
+                reason="No longer a duplicate after correction (amount, receipt number, or date changed).",
+            )
+            resolved += 1
+
+        resolved += _resolve_stale_legacy_findings(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
@@ -336,6 +414,7 @@ def sync_duplicate_receipt_detection(
 
 
 __all__ = [
+    "TASK_TYPE",
     "DuplicateGroup",
     "ReceiptRecord",
     "compute_duplicate_groups",

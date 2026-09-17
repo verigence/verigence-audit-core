@@ -653,6 +653,7 @@ _TASK_TITLE = {
     "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE": "Re-upload a document that failed processing",
     "FIELD_CORRECTION_REVIEW": "Review proposed field correction",
     "MANUAL_VERIFICATION_REVIEW": "Verify low-confidence fields",
+    "DUPLICATE_RECEIPT_NOTICE": "Duplicate receipt -- won't be counted",
 }
 
 # AUTO_SELF_SERVE's generic title tells a PC nothing about what to actually
