@@ -190,9 +190,17 @@ def sync_manual_verification_findings(
     except Exception:  # noqa: BLE001 - producer must never break the caller
         return {"raised": 0, "resolved": 0, "error": True}
 
+    # raised counts every currently-outstanding pending document, not just
+    # ones that got a brand new Task this call -- uc03_run_all_rules.py
+    # derives FAIL from this being non-zero, on every evaluation run, for
+    # as long as the underlying gap stays open (matching this producer's
+    # own pre-Task-Queue behavior, which always incremented raised per
+    # pending item regardless of whether the finding it idempotently
+    # touched already existed).
     raised = 0
     live_effect_keys: set[str] = set()
     for document_id, fields in pending.items():
+        raised += 1
         label = _friendly_label(fields[0].get("document_label"), document_id)
         effect_key = _effect_key(tenant_id, journey_id, stage_code, document_id)
         live_effect_keys.add(effect_key)
@@ -227,7 +235,6 @@ def sync_manual_verification_findings(
             effect_key=effect_key,
             correlation_id=correlation_id,
         )
-        raised += 1
 
     # Complete a Task whose document is now clear -- the only way a field
     # ever leaves _unreviewed_low_confidence is a PC actually reviewing it
