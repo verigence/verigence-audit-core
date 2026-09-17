@@ -1302,7 +1302,13 @@ def _run_sync_booking_document_task(
     # PC remembering to click Confirm/Submit. Each branch opens its own
     # connection and runs only after the sync above has already committed,
     # so it always evaluates the just-synced data, never a stale pre-commit
-    # snapshot.
+    # snapshot. raise_new=False: keep already-open findings current and
+    # self-heal ones that have cleared, but never raise a NEW one off a
+    # partial Booking -- a PC uploads required documents one at a time, so
+    # "is anything still missing" is true for most of the process by
+    # construction, not because anything was actually skipped. The genuine
+    # gap check runs at Review Confirm instead (raise_new's default there),
+    # matching Delivery's own Submit-time equivalent.
     if stage_code == "BOOKING":
         try:
             schedule_booking_checkpoint_rules(
@@ -1311,6 +1317,7 @@ def _run_sync_booking_document_task(
                 journey_id=journey_id,
                 correlation_id="",
                 trigger="ASYNC_DOCUMENT_SYNC",
+                raise_new=False,
             )
         except Exception:
             logger.warning(
@@ -1878,13 +1885,14 @@ def confirm_booking_review_v2_confidence_policy(
         execute=execute,
     )
     response.headers["ETag"] = f'"{body["aggregateVersion"]}"'
-    # Safety net, not the trigger -- the async document-sync path (see
-    # _run_sync_booking_document_task) already schedules this per document
-    # confirmation. Scheduling it again here, keyed on the current aggregate
-    # version, costs nothing when nothing changed (create_workflow_task_once
-    # returns the existing task, which run_booking_review_rule_task then
-    # no-ops on) and catches a PC correction made at confirm itself, which
-    # bumps the version through this path alone.
+    # This is the genuine gap check (raise_new's default, True) -- the async
+    # document-sync path (see _run_sync_booking_document_task) only ever
+    # self-heals (raise_new=False) for exactly this reason: it runs on every
+    # partial upload, long before the PC is done. This call, keyed on the
+    # current aggregate version with its own effect_key (see
+    # schedule_booking_checkpoint_rules), is idempotent for repeated confirms
+    # of the same version and always fresh for a version bump (a PC
+    # correction made at confirm itself).
     background_tasks.add_task(
         schedule_booking_checkpoint_rules,
         engine,
@@ -1892,6 +1900,7 @@ def confirm_booking_review_v2_confidence_policy(
         journey_id=journey_id,
         correlation_id=get_correlation_id(request),
         trigger="PC_BOOKING_ATTRIBUTE_REVIEW_CONFIRMED",
+        raise_new=True,
     )
     return booking_review.BookingReviewV2ConfirmWithDecisionsResponse.model_validate(body)
 

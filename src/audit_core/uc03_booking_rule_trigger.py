@@ -350,6 +350,7 @@ def _run_booking_rules(
     workflow_task_id: UUID,
     correlation_id: str,
     aggregate_version: int,
+    raise_new: bool = True,
 ) -> tuple[list[str], list[str]]:
     rows = _requirement_snapshot(
         connection,
@@ -384,23 +385,36 @@ def _run_booking_rules(
     )
 
     for spec in specs:
-        _machine_flag(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            stage_code="BOOKING",
-            rule_key=spec.rule_key,
-            finding_type=spec.finding_type,
-            severity=spec.severity,
-            title=spec.title,
-            description=spec.description,
-            correlation_id=correlation_id,
-            safe_payload={
-                "trigger": "PC_BOOKING_ATTRIBUTE_REVIEW_CONFIRMED",
-                "requirementKeys": list(spec.requirement_keys),
-            },
-            blocking_completion=False,
-        )
+        # raise_new=False (the async per-document-sync trigger) evaluates
+        # exactly like the real check, but never raises off a partial
+        # Booking -- a PC uploads these one at a time, so "is anything
+        # still missing" is true for most of the process by construction,
+        # not because anything was actually skipped. `flagged` still
+        # records the spec as currently outstanding either way (see the
+        # self-heal loop below): what raise_new gates is only the write,
+        # never the applicability computation. The genuine gap check --
+        # raising for whatever is still missing once the PC believes
+        # Booking is complete -- runs at Review Confirm (raise_new's
+        # default), the same moment Delivery's own equivalent runs at
+        # Submit.
+        if raise_new:
+            _machine_flag(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                stage_code="BOOKING",
+                rule_key=spec.rule_key,
+                finding_type=spec.finding_type,
+                severity=spec.severity,
+                title=spec.title,
+                description=spec.description,
+                correlation_id=correlation_id,
+                safe_payload={
+                    "trigger": "PC_BOOKING_ATTRIBUTE_REVIEW_CONFIRMED",
+                    "requirementKeys": list(spec.requirement_keys),
+                },
+                blocking_completion=False,
+            )
         flagged.append(spec.rule_key)
 
     # Self-heal: a rule that was evaluated this pass but did not fire (its
@@ -484,6 +498,7 @@ def run_booking_review_rule_task(
     workflow_task_id: UUID,
     correlation_id: str,
     aggregate_version: int,
+    raise_new: bool = True,
 ) -> None:
     try:
         with engine.begin() as connection:
@@ -514,16 +529,20 @@ def run_booking_review_rule_task(
                     lease_seconds=120,
                 )
             except AuditCoreError:
-                # Two independent triggers call schedule_booking_checkpoint_rules
-                # for the same task by design (the async document-sync path and
-                # PC Review Confirm's safety net) -- claim_worker_task's UPDATE is
-                # atomic, so losing this race just means the other trigger claimed
-                # it between our READY check above and this call. Expected, not a
-                # failure: whoever won proceeds to evaluate, we have nothing left
-                # to do. (Previously fell through to the broad `except Exception`
-                # below, logging a full traceback as uc03_booking_rule_evaluation_
-                # failed for a routine race -- noisy, and easy to mistake for a
-                # real defect.)
+                # Several calls of the SAME kind (two async document syncs in
+                # quick succession, or a retried Review Confirm) can race for
+                # the same task by design -- raise_new=False and raise_new=True
+                # no longer share a task for the same version (see
+                # schedule_booking_checkpoint_rules's own effect_key), so this
+                # is only ever same-kind-vs-same-kind now. claim_worker_task's
+                # UPDATE is atomic, so losing this race just means the other
+                # caller claimed it between our READY check above and this
+                # call. Expected, not a failure: whoever won proceeds to
+                # evaluate, we have nothing left to do. (Previously fell
+                # through to the broad `except Exception` below, logging a
+                # full traceback as uc03_booking_rule_evaluation_failed for a
+                # routine race -- noisy, and easy to mistake for a real
+                # defect.)
                 logger.info(
                     "uc03_booking_rule_task_already_claimed",
                     tenant_id=tenant_id,
@@ -545,6 +564,7 @@ def run_booking_review_rule_task(
                 workflow_task_id=workflow_task_id,
                 correlation_id=correlation_id,
                 aggregate_version=aggregate_version,
+                raise_new=raise_new,
             )
             _complete_worker_task(
                 connection,
@@ -581,27 +601,38 @@ def schedule_booking_checkpoint_rules(
     journey_id: UUID,
     correlation_id: str,
     trigger: str,
+    raise_new: bool = True,
 ) -> None:
     """Evaluate Booking checkpoint rules + the external rule-engine phase for
     the journey's CURRENT aggregate version, deduped per version.
 
     Async by design, matching the document-sync pipeline's own philosophy
     (see _sync_booking_document): rule evaluation must not depend on the PC
-    remembering to click Confirm. This is called from three places --
+    remembering to click Confirm. Called from two places, with different
+    ``raise_new`` --
     - the DI document-link webhook's background sync, every time a document
-      confirms (the primary trigger: fully async, fires whether or not the
-      PC has looked at the Booking since);
-    - PC Review Confirm, as a final safety net, exactly like Submit is a
-      safety net for document sync rather than the trigger;
-    each call reads the journey's current journey_stage_states.version_no
-    and keys the workflow task's effect_key on it
-    (uc03.booking.review-rule-evaluation:{journey_id}:{version}), so several
-    calls for the same unchanged version collapse to the one task
-    create_workflow_task_once already returns, and a version bump (a new
-    document synced, or a PC correction at confirm) always gets a fresh
-    evaluation. Opens its own connection deliberately -- callers must invoke
-    this only after their own transaction has committed, never nested inside
-    one, or it would evaluate rules against not-yet-visible data.
+      confirms (raise_new=False: keeps already-open findings current and
+      self-heals ones that have cleared, but never raises a NEW one -- a PC
+      uploads Booking's required documents one at a time, so "is anything
+      still missing" is true for most of the process by construction, not
+      because anything was actually skipped);
+    - PC Review Confirm (raise_new=True, the default: the genuine gap
+      check, exactly like Delivery's own equivalent runs at Submit, not on
+      every per-document sync).
+    Each call reads the journey's current journey_stage_states.version_no
+    and keys the workflow task's effect_key on it (plus a ``:self-heal``
+    suffix for raise_new=False, so the two kinds of evaluation for the same
+    version are independent tasks -- otherwise a raise_new=False task
+    completing first for a version would leave create_workflow_task_once
+    handing back an already-COMPLETED task to the raise_new=True caller for
+    that same version, silently skipping the one evaluation that actually
+    needed to run). Several calls of the SAME kind for the same unchanged
+    version still collapse to the one task create_workflow_task_once
+    already returns, and a version bump (a new document synced, or a PC
+    correction at confirm) always gets a fresh evaluation. Opens its own
+    connection deliberately -- callers must invoke this only after their
+    own transaction has committed, never nested inside one, or it would
+    evaluate rules against not-yet-visible data.
     """
 
     with engine.begin() as connection:
@@ -633,6 +664,8 @@ def schedule_booking_checkpoint_rules(
         ).mappings().one()
 
         effect_key = f"uc03.booking.review-rule-evaluation:{journey_id}:{aggregate_version}"
+        if not raise_new:
+            effect_key += ":self-heal"
         task_id = create_workflow_task_once(
             connection,
             tenant_id=tenant_id,
@@ -643,7 +676,7 @@ def schedule_booking_checkpoint_rules(
             task_type=_TASK_TYPE,
             dealer_id=journey["dealer_id"],
             outlet_id=journey["outlet_id"],
-            task_payload={"trigger": trigger, "aggregateVersion": aggregate_version},
+            task_payload={"trigger": trigger, "aggregateVersion": aggregate_version, "raiseNew": raise_new},
             correlation_id=correlation_id,
         )
 
@@ -654,6 +687,7 @@ def schedule_booking_checkpoint_rules(
         task_id,
         correlation_id,
         aggregate_version,
+        raise_new=raise_new,
     )
 
 

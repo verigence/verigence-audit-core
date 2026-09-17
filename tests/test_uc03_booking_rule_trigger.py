@@ -8,6 +8,7 @@ from audit_core.uc03_booking_rule_trigger import (
     _booking_requirement_rule_specs,
     _requirement_satisfied,
     _requirement_snapshot,
+    _run_booking_rules,
 )
 
 
@@ -297,6 +298,91 @@ def _minimal_booking_journey(connection, *, tenant_id: str, suffix: str) -> str:
         {"t": tenant_id, "d": dealer_id, "o": outlet_id, "cu": customer_id, "r": f"BKC-J-{suffix}"},
     ).scalar_one()
     return journey_id
+
+
+def test_raise_new_false_never_creates_a_finding_but_still_self_heals() -> None:
+    """The exact fix requested: Booking's async per-document-sync trigger
+    must behave like Delivery's own equivalent (schedule_delivery_document_
+    checkpoint's raise_new=False) -- keep resolving findings that have
+    cleared, but never raise a brand new one off a partial Booking, since a
+    PC uploads required documents one at a time and "still missing" is true
+    for most of the process by construction, not because anything was
+    skipped. The genuine gap check (raise_new=True, the default) only runs
+    once the PC believes Booking is actually complete."""
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for this integration test")
+    engine = create_engine(database_url)
+    suffix = uuid4().hex[:10]
+    tenant_id = f"tenant-bkr-{suffix}"
+    with engine.begin() as connection:
+        journey_id = _minimal_booking_journey(connection, tenant_id=tenant_id, suffix=suffix)
+        connection.execute(
+            text("""INSERT INTO auditcore.journey_stage_states (
+                tenant_id, journey_id, stage_code, business_status,
+                audit_state, audit_status, first_started_at_utc,
+                latest_activity_at_utc, version_no
+            ) VALUES (:t, :j, 'BOOKING', 'BOOKING_IN_PROGRESS', 'NOT_STARTED',
+                'NOT_EVALUATED', now(), now(), 1)"""),
+            {"t": tenant_id, "j": journey_id},
+        )
+        connection.execute(
+            text("""INSERT INTO auditcore.journey_document_requirements (
+                tenant_id, journey_id, requirement_key, document_type_key,
+                process_area, requirement_level, condition_snapshot
+            ) VALUES (:t, :j, 'booking_docket', 'booking_docket', 'BOOKING',
+                'REQUIRED', '{}'::jsonb)"""),
+            {"t": tenant_id, "j": journey_id},
+        )
+
+        def _open_rule_keys() -> set[str]:
+            return set(
+                connection.execute(
+                    text(
+                        "SELECT rule_key FROM auditcore.audit_findings "
+                        "WHERE tenant_id=:t AND journey_id=:j "
+                        "AND finding_status IN ('OPEN','ACKNOWLEDGED')"
+                    ),
+                    {"t": tenant_id, "j": journey_id},
+                ).scalars().all()
+            )
+
+        # Mid-process (PC has only uploaded some documents so far):
+        # raise_new=False must not create anything, even though the docket
+        # requirement is genuinely still outstanding.
+        _run_booking_rules(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            workflow_task_id=uuid4(), correlation_id="", aggregate_version=1,
+            raise_new=False,
+        )
+        assert "BK_DOCKET_PRESENT" not in _open_rule_keys()
+
+        # PC believes Booking is complete: the genuine gap check raises it.
+        _run_booking_rules(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            workflow_task_id=uuid4(), correlation_id="", aggregate_version=2,
+            raise_new=True,
+        )
+        assert "BK_DOCKET_PRESENT" in _open_rule_keys()
+
+        # The docket requirement is no longer outstanding -- even a
+        # raise_new=False pass must still self-heal the now-resolved
+        # finding, not leave it stuck open forever waiting for another
+        # raise_new=True evaluation that may never come.
+        connection.execute(
+            text("UPDATE auditcore.journey_document_requirements "
+                 "SET requirement_status='NOT_APPLICABLE' "
+                 "WHERE tenant_id=:t AND journey_id=:j AND requirement_key='booking_docket'"),
+            {"t": tenant_id, "j": journey_id},
+        )
+        _run_booking_rules(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            workflow_task_id=uuid4(), correlation_id="", aggregate_version=3,
+            raise_new=False,
+        )
+        assert "BK_DOCKET_PRESENT" not in _open_rule_keys()
+
+    engine.dispose()
 
 
 def test_corporate_conditional_requirement_excluded_when_no_corporate_discount_claimed() -> None:

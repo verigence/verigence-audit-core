@@ -471,9 +471,10 @@ def close_booking_ready_with_lazy_v2_sync(
     # Same safety net as PC Review Confirm (see confirm_booking_review_v2_
     # confidence_policy): Submit is where the pre-submit loop above may have
     # just synced a document that never made it through the async webhook
-    # path, so schedule checkpoint-rule evaluation here too. Keyed on the
-    # current aggregate version like every other caller, so this is a cheap
-    # no-op whenever the async trigger already covered it.
+    # path, so schedule checkpoint-rule evaluation here too -- raise_new=True
+    # (explicit; it's also the default), since Submit is PC declaring
+    # Booking complete, exactly the genuine-gap-check moment, not the
+    # async per-document trigger's self-heal-only pass.
     background_tasks.add_task(
         schedule_booking_checkpoint_rules,
         get_engine(),
@@ -481,6 +482,7 @@ def close_booking_ready_with_lazy_v2_sync(
         journey_id=journey_id,
         correlation_id=get_correlation_id(request),
         trigger="BOOKING_SUBMIT",
+        raise_new=True,
     )
     return booking_capture.close_booking_ready(
         tenant_id=tenant_id,
