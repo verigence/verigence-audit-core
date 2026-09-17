@@ -37,6 +37,7 @@ from audit_core.uc03_document_capture_v2 import (
     get_di_client,
     get_security_oauth_client,
 )
+from audit_core.workflow import cancel_workflow_task, create_workflow_task
 
 router = APIRouter(
     prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}/delivery",
@@ -44,6 +45,17 @@ router = APIRouter(
 )
 
 _TERMINAL_FAILURE_STATES = {"FAILED", "ERROR", "REJECTED"}
+
+# A document that failed processing (corrupt file, unreadable scan, unsupported
+# format) isn't a rule breach -- there's nothing to adjudicate, only a document
+# for PC to re-upload. Standalone task (no backing Audit Finding), same shape
+# as uc03_document_unrecognized.py's PC_VERIFY_UNRECOGNIZED_DOCUMENT.
+_PROCESSING_FAILED_TASK_TYPE = "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE"
+_PROCESSING_FAILED_WORKFLOW_TYPE = "UC03_DOCUMENT_VERIFICATION"
+
+
+def _processing_failed_effect_key(tenant_id: str, journey_id: UUID, document_id: str) -> str:
+    return f"task:document-processing-failed:{tenant_id}:{journey_id}:{document_id}"
 
 
 class DeliveryCaptureV2Response(BaseModel):
@@ -724,22 +736,31 @@ def _raise_delivery_capture_exceptions(
         state = str(row.get("capture_status") or "").upper()
         if state in _TERMINAL_FAILURE_STATES:
             document_id = str(row["di_document_id"])
-            flags.append(
-                _machine_flag(
+            effect_key = _processing_failed_effect_key(tenant_id, journey_id, document_id)
+            existing = connection.execute(
+                text(
+                    "SELECT 1 FROM auditcore.workflow_tasks "
+                    "WHERE tenant_id = :tenant_id AND effect_key = :effect_key"
+                ),
+                {"tenant_id": tenant_id, "effect_key": effect_key},
+            ).scalar_one_or_none()
+            if existing is None:
+                create_workflow_task(
                     connection,
                     tenant_id=tenant_id,
                     journey_id=journey_id,
-                    stage_code="DELIVERY",
-                    rule_key=f"DL_V2_DOCUMENT_PROCESSING_FAILED:{document_id}",
-                    finding_type="DOCUMENT_EXCEPTION",
-                    severity="MEDIUM",
-                    title="Delivery document requires follow-up",
-                    description="A submitted Delivery document could not be processed successfully. Delivery progression remains unaffected.",
+                    workflow_type=_PROCESSING_FAILED_WORKFLOW_TYPE,
+                    process_area="DELIVERY",
+                    task_type=_PROCESSING_FAILED_TASK_TYPE,
+                    assigned_role_code="PC",
+                    task_payload={
+                        "diDocumentId": document_id,
+                        "capturePath": "V2",
+                        "comment": "A submitted Delivery document could not be processed successfully. Re-upload a clearer copy.",
+                    },
+                    effect_key=effect_key,
                     correlation_id=correlation_id,
-                    safe_payload={"diDocumentId": document_id, "capturePath": "V2"},
-                    blocking_completion=False,
                 )
-            )
     return list(dict.fromkeys(flags))
 
 
@@ -752,11 +773,12 @@ def _resolve_delivery_capture_exceptions(
     documents: list[dict[str, Any]],
     correlation_id: str,
 ) -> list[UUID]:
-    """Self-heal the two document-gap finding families _raise_delivery_capture_
+    """Self-heal the two document-gap exceptions _raise_delivery_capture_
     exceptions raises: a DL_V2_REQUIRED_DOCUMENT_MISSING finding closes once its
-    requirement has an active classified document; a DL_V2_DOCUMENT_PROCESSING_
-    FAILED finding closes once that document is no longer in a terminal failure
-    state (retried successfully, replaced, or removed).
+    requirement has an active classified document; the standalone
+    PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE task cancels once that document is
+    no longer in a terminal failure state (retried successfully, replaced, or
+    removed).
 
     _raise_delivery_capture_exceptions was, until now, only ever called once --
     at Submit. Nothing ever re-evaluated it afterward, so a document uploaded
@@ -815,33 +837,29 @@ def _resolve_delivery_capture_exceptions(
         for row in documents
         if str(row.get("capture_status") or "").upper() in _TERMINAL_FAILURE_STATES
     }
-    open_processing_findings = connection.execute(
+    open_processing_tasks = connection.execute(
         text(
             """
-            SELECT audit_finding_id, rule_key
-            FROM auditcore.audit_findings
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND rule_key LIKE 'DL_V2_DOCUMENT_PROCESSING_FAILED:%'
-              AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
+            SELECT workflow_task_id, effect_key
+            FROM auditcore.workflow_tasks
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+              AND task_type = :task_type
+              AND task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT')
             """
         ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
+        {"tenant_id": tenant_id, "journey_id": journey_id, "task_type": _PROCESSING_FAILED_TASK_TYPE},
     ).mappings().all()
-    for row in open_processing_findings:
-        document_id = str(row["rule_key"]).split(":", 1)[1]
+    for task in open_processing_tasks:
+        document_id = str(task["effect_key"]).rsplit(":", 1)[-1]
         if document_id in failing_document_ids:
             continue
-        _resolve_finding(
+        cancel_workflow_task(
             connection,
             tenant_id=tenant_id,
-            journey_id=journey_id,
-            stage_code="DELIVERY",
-            finding_id=row["audit_finding_id"],
-            actor_id=None,
-            correlation_id=correlation_id,
-            note="The document no longer requires follow-up.",
+            workflow_task_id=task["workflow_task_id"],
+            actor_id="SYSTEM",
+            reason="The document no longer requires follow-up.",
         )
-        resolved.append(row["audit_finding_id"])
     return resolved
 
 
@@ -853,10 +871,13 @@ def schedule_delivery_document_checkpoint(
     correlation_id: str,
     raise_new: bool = True,
 ) -> tuple[list[UUID], list[UUID]]:
-    """Re-evaluate Delivery's document-gap findings against current durable
-    state: raise DL_V2_REQUIRED_DOCUMENT_MISSING / DL_V2_DOCUMENT_PROCESSING_
-    FAILED for whatever is still missing/failing, and resolve any that have
-    since cleared. Called once per confirmed document, the same trigger
+    """Re-evaluate Delivery's document gaps against current durable state:
+    raise the DL_V2_REQUIRED_DOCUMENT_MISSING finding for whatever's still
+    missing, raise the standalone PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE
+    task for whatever's still failing (no finding -- a document that failed
+    processing isn't a rule breach, just a re-upload PC owns), and resolve/
+    cancel whichever of those have since cleared. Called once per confirmed
+    document, the same trigger
     Booking's schedule_booking_checkpoint_rules uses -- Delivery routinely
     confirms 10-15 documents in a tight burst (real dealership upload
     behaviour, already the cause of one live lock-contention incident this
