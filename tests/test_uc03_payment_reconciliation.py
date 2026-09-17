@@ -291,6 +291,35 @@ def test_unmatched_raises_flag_then_resolves(journey) -> None:
     assert _verified(c, pid) == 1
 
 
+def test_receipt_with_no_bank_statement_yet_does_not_raise(journey) -> None:
+    """Direct user correction (2026-09-17): a receipt uploaded before any
+    bank statement exists must not be flagged -- there is nothing to check
+    it against yet. Once the bank statement actually arrives (still not
+    matching this payment), the real UNMATCHED flag raises as normal."""
+    c = journey
+    pid = _add_payment(c, amount=50000, ref="UTRBBB222")
+
+    result = pr.reconcile_payments(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert result["unmatched"] == 0
+    assert result["pendingBankStatement"] == 1
+    assert result["skipped"] is True
+    assert _open_flags(c, pid) == 0
+    assert _match(c, pid)["match_status"] == "UNMATCHED"
+
+    # A non-matching bank statement now arrives -- this is when the real
+    # check should actually happen.
+    pr.materialize_reviewed_bank_statements(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[_bank_doc({
+            "transaction_date": "2026-09-02", "reference_no": "OTHERREF", "credit_amount": "40000",
+        })],
+    )
+    result2 = pr.reconcile_payments(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert result2["unmatched"] == 1
+    assert result2.get("skipped") is None
+    assert _open_flags(c, pid) == 1
+
+
 def test_cash_payment_not_applicable(journey) -> None:
     c = journey
     pid = _add_payment(c, amount=25000, ref="", method="Cash")
@@ -346,6 +375,15 @@ def test_unmatched_delivery_payment_flag_stamped_with_delivery_stage(journey) ->
         {"t": c.tenant_id, "j": c.journey_id},
     )
     pid = _add_payment(c, amount=60000, ref="UTR-DELIVERY-1", stage="DELIVERY")
+    # A non-matching bank statement must already exist for this to actually
+    # raise -- see test_receipt_with_no_bank_statement_yet_does_not_raise
+    # for the "no bank statement at all yet" case, which no longer raises.
+    pr.materialize_reviewed_bank_statements(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[_bank_doc({
+            "transaction_date": "2026-09-02", "reference_no": "OTHERREF", "credit_amount": "40000",
+        })],
+    )
     pr.reconcile_payments(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     stage = c.execute(
         text("SELECT stage_code FROM auditcore.audit_findings "

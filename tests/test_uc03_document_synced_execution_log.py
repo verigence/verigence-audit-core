@@ -10,12 +10,14 @@ _sync_booking_document directly.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, text
 
 from audit_core import uc03_confidence_review_policy as confidence_policy
+from audit_core import uc03_payment_reconciliation as pr
 from audit_core.di_client import DiDocument, DiFact
 
 
@@ -346,7 +348,11 @@ def test_no_payments_yet_records_skipped_for_payment_reconciliation(synced_docum
     assert all(row["outcome"] == "PASS" for row in sync_failure_rows)
 
 
-def test_unmatched_payment_records_fail_for_payment_reconciliation(synced_document_setup) -> None:
+def test_no_bank_statement_yet_records_skipped_for_payment_reconciliation(synced_document_setup) -> None:
+    # Direct user correction (2026-09-17): a receipt uploaded before any
+    # bank statement exists must not be flagged -- there is nothing to
+    # check it against yet. See test below for the real FAIL case, once a
+    # (non-matching) bank statement has actually arrived.
     engine, tenant_id, journey_id = synced_document_setup
     customer_id = _customer_id(engine, tenant_id, journey_id)
     _add_payment(engine, tenant_id, journey_id, amount=50000, ref="UTR-NO-MATCH")
@@ -359,7 +365,50 @@ def test_unmatched_payment_records_fail_for_payment_reconciliation(synced_docume
 
     rows = _executions_for_rule(engine, tenant_id, "PAYMENT_BANK_UNMATCHED")
     assert len(rows) == 1
-    assert rows[0]["outcome"] == "FAIL"
+    assert rows[0]["outcome"] == "SKIPPED"
+
+
+def test_unmatched_payment_records_fail_for_payment_reconciliation(synced_document_setup) -> None:
+    engine, tenant_id, journey_id = synced_document_setup
+    customer_id = _customer_id(engine, tenant_id, journey_id)
+    _add_payment(engine, tenant_id, journey_id, amount=50000, ref="UTR-NO-MATCH")
+
+    receipt_id = uuid4()
+    _add_evidence(engine, tenant_id, journey_id, customer_id, receipt_id, "dealer_receipt")
+    di_client = _FakeDiClient()
+    di_client.add(_confirmed(receipt_id, "dealer_receipt"), [])
+    _sync(engine, tenant_id, journey_id, receipt_id, di_client)
+
+    # The real check only happens once a bank statement actually exists --
+    # a non-matching one here, so this payment genuinely stays unmatched.
+    # materialize_reviewed_bank_statements only runs from the batch Delivery/
+    # v2 review-materialization flows, not the single-document real-time
+    # sync this test otherwise drives -- seed the line directly, matching
+    # what that batch flow would have persisted.
+    bank_id = uuid4()
+    with engine.begin() as c:
+        pr.materialize_reviewed_bank_statements(
+            c, tenant_id=tenant_id, journey_id=journey_id, actor_id="tester",
+            documents=[SimpleNamespace(
+                documentId=bank_id, evidenceId=None, documentTypeKey="bank_statement_extract",
+                extractionState="READY",
+                fields=[
+                    SimpleNamespace(fieldKey="reference_no", value="SOME-OTHER-REF"),
+                    SimpleNamespace(fieldKey="credit_amount", value="40000"),
+                    SimpleNamespace(fieldKey="transaction_date", value="2026-09-02"),
+                ],
+            )],
+        )
+
+    # Any reconciliation-trigger document sync now re-evaluates against the
+    # bank line that's actually on file.
+    bank_client = _FakeDiClient()
+    bank_client.add(_confirmed(bank_id, "bank_statement_extract"), [])
+    _add_evidence(engine, tenant_id, journey_id, customer_id, bank_id, "bank_statement_extract")
+    _sync(engine, tenant_id, journey_id, bank_id, bank_client)
+
+    rows = _executions_for_rule(engine, tenant_id, "PAYMENT_BANK_UNMATCHED")
+    assert rows[-1]["outcome"] == "FAIL"
 
 
 def test_cash_payment_records_pass_for_payment_reconciliation(synced_document_setup) -> None:
