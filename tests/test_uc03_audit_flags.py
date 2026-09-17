@@ -426,23 +426,47 @@ def test_review_queue_routes_by_role_and_supports_scope(audit_setup):
 
 def test_review_queue_tasks_are_opt_in(audit_setup):
     """includeTasks defaults False so the endpoint's live behavior doesn't
-    change under a frontend that doesn't know about itemKind yet -- the
-    auto-spawned Task for a self-serve gap is invisible until asked for."""
-    doc_gap = _create_flag_category(
-        audit_setup, category="DOCUMENT_EXCEPTION", key="q-taskoptin-01"
+    change under a frontend that doesn't know about itemKind yet -- a
+    genuinely distinct Task (TL_TAKE_ACTION, spawned by a TL's own verdict
+    on a Violation) is invisible until asked for."""
+    violation = _create_flag_category(
+        audit_setup, category="COMMERCIAL_EXCEPTION", key="q-taskoptin-01"
     )
+    _set_role(audit_setup, "TL")
+    take_action = _client().post(
+        f"{_base(audit_setup)}/flags/{violation['flagId']}/actions",
+        headers={"Idempotency-Key": "q-taskoptin-act-01", "If-Match": '"1"'},
+        json={"action": "TAKE_ACTION", "resolutionReason": "Please provide supporting evidence.", "severity": "HIGH"},
+    )
+    assert take_action.status_code == 200, take_action.text
 
     default_items = _client().get(f"{_queue(audit_setup)}").json()["items"]
     assert all(item["itemKind"] == "FINDING" for item in default_items)
 
     with_tasks = _client().get(f"{_queue(audit_setup)}?includeTasks=true").json()["items"]
     kinds_by_flag = {item["flagId"]: item["itemKind"] for item in with_tasks}
-    assert kinds_by_flag[doc_gap["flagId"]] == "FINDING"
+    assert kinds_by_flag[violation["flagId"]] == "FINDING"
     tasks = [item for item in with_tasks if item["itemKind"] == "EXECUTION_TASK"]
     assert len(tasks) == 1
-    assert tasks[0]["relatedFindingId"] == doc_gap["flagId"]
-    assert tasks[0]["category"] == "AUTO_SELF_SERVE"
+    assert tasks[0]["relatedFindingId"] == violation["flagId"]
+    assert tasks[0]["category"] == "TL_TAKE_ACTION"
     assert tasks[0]["permittedActions"] == []
+
+
+def test_review_queue_never_duplicates_a_self_serve_gap_as_its_own_task(audit_setup):
+    """AUTO_SELF_SERVE is always spawned 1:1 from the DATA_GAP/DOCUMENT_GAP
+    finding it was raised for -- showing both was the same gap twice, once
+    correctly classified (Missing Document) and once under a generic
+    "Self-serve gap" label that told nobody anything new. Excluded from the
+    queue entirely, even with includeTasks=true; the finding is still there."""
+    doc_gap = _create_flag_category(
+        audit_setup, category="DOCUMENT_EXCEPTION", key="q-noselfservedup-01"
+    )
+
+    with_tasks = _client().get(f"{_queue(audit_setup)}?includeTasks=true").json()["items"]
+    kinds_by_flag = {item["flagId"]: item["itemKind"] for item in with_tasks}
+    assert kinds_by_flag[doc_gap["flagId"]] == "FINDING"
+    assert not [item for item in with_tasks if item["itemKind"] == "EXECUTION_TASK"]
 
     summary_default = _client().get(f"{_queue(audit_setup)}/summary").json()
     assert summary_default["byKind"] == {"FINDING": 1}
