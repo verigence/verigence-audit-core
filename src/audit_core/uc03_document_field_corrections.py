@@ -1,6 +1,7 @@
 """uc03_document_field_corrections.py — document field correction flow
 (unified Documents review redesign, 2026-09-13; confidence split added
-2026-09-13 after a design review of the first cut -- see below).
+2026-09-13; reworked onto the Task Queue 2026-09-17, direct user
+correction -- see below).
 
 Booking/Delivery's own Confirm gates were relaxed so document completeness
 alone finishes the stage (uc03_simplified_booking_flow.py,
@@ -12,16 +13,33 @@ everywhere else):
 
   <90% (or missing confidence): the value is WRONG BY DEFINITION OF LOW
   TRUST -- apply it immediately (self-serve, exactly like a PC always could
-  on the old Review page) and raise a DATA_GAP/INFO finding as a pure
-  audit-trail record of what changed. No accept/reject: the finding exists
-  so a TL can SEE every correction made, not so they must act on each one.
+  on the old Review page). Nothing is pending once this returns -- no
+  finding, no task, just this module's own ``journey_document_field_
+  correction_proposals`` row as the audit-trail record of what changed
+  and when, searchable by journey_id like every other row here.
 
   >=90%: the extracted value is presumed trustworthy, so overwriting it
-  needs a second pair of eyes -- raise a VIOLATION finding instead of
-  applying anything, and defer the write until a Team Lead calls
-  CONFIRM_BREACH on it (`apply_confirmed_field_correction`, invoked from
-  uc03_audit_flags.py::act_on_flag). MARK_FALSE_POSITIVE needs no extra
-  step -- the original DI value simply stands.
+  needs a second pair of eyes -- creates an ordinary ``workflow_tasks`` row
+  (task_type ``FIELD_CORRECTION_REVIEW``, assigned to TL) instead of
+  applying anything, and defers the write until a Team Lead Completes it
+  (`apply_confirmed_field_correction`, invoked from tasks_api.py's generic
+  Complete-task action). Cancelling the task needs no equivalent hook --
+  the original DI value simply stands.
+
+Direct user correction of this module's first cut (2026-09-13), which
+raised an ``audit_findings`` row for BOTH bands and adjudicated the >=90%
+one through the finding-verdict machinery -- mirroring the exact mistake
+``uc03_model_selection_corrections.py`` made and then fixed one migration
+later (0102 -> 0103). A PC/TL-proposed field correction is a human review-
+and-decide (or self-serve) workflow item, not a rule-detected violation or
+a compliance gap: Audit Review stays reserved for what a rule actually
+found wrong with the business process, and the Task Queue already gives
+PC/TL/PM full workflow visibility for a given Journey. See migration
+0106_field_correction_as_task for the schema side of this change --
+historical >=90% findings raised before this fix keep resolving through
+the existing CONFIRM_BREACH/MARK_FALSE_POSITIVE path
+(uc03_audit_flags.py::act_on_flag's own hook, kept unchanged for exactly
+that backward-compatibility reason).
 
 Why this module does NOT call the stage-wide Confirm endpoints
 (confirm_booking_review_v2_confidence_policy / confirm_delivery_review_v2_
@@ -45,10 +63,12 @@ attribute` / `record_attribute_resolution`), deliberately NOT the heavier
 pass (disproportionate to one field on one document either way).
 
 Every correction, whichever band, gets its own ``journey_document_field_
-correction_proposals`` row (1:1 with the finding it raised) recording
-old/new value -- the ONLY difference is whether `applied_at_utc` is stamped
-at creation (<90%, self-serve) or left NULL until a TL's CONFIRM_BREACH
-(>=90%, adjudicated).
+correction_proposals`` row recording old/new value -- keyed by
+``workflow_task_id`` for a new >=90% row (NULL for a new <90% row, since
+nothing is pending for it), or by the legacy ``audit_finding_id`` for a
+row created before this fix. The ONLY difference between the two live
+bands is whether `applied_at_utc` is stamped at creation (<90%, self-serve)
+or left NULL until a TL Completes the task (>=90%, adjudicated).
 """
 from __future__ import annotations
 
@@ -56,7 +76,7 @@ import json
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Request, Response
+from fastapi import APIRouter, Depends, Header, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import Connection, text
 
@@ -74,22 +94,13 @@ from audit_core.uc03_attribute_resolution import (
     apply_supported_operational_attribute,
     record_attribute_resolution,
 )
-from audit_core.uc03_audit_flags import (
-    FlagMutationResponse,
-    FlagView,
-    _append_finding_event,
-    _finding,
-    _flag_view,
-    _scope,
-    _set_etag,
-    _view_context,
-)
+from audit_core.uc03_audit_flags import _scope
 from audit_core.uc03_di_core_persistence import (
     ReviewedDiField,
     persist_reviewed_di_fields,
 )
-from audit_core.uc03_finding_classification import resolve_classification
 from audit_core.uc03_review_confidence import requires_pc_review
+from audit_core.workflow import create_workflow_task
 
 router = APIRouter(
     prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}/uc03/documents",
@@ -98,12 +109,8 @@ router = APIRouter(
 
 StageCode = Literal["BOOKING", "DELIVERY"]
 
-# Matched against uc03_finding_routing.py's rule-prefix sets so each resolves
-# to its class with zero new routing plumbing: DI_VALUE_CORRECTION_PROPOSED
-# is a _VIOLATION_RULE_PREFIXES entry (adjudicated), DI_VALUE_CORRECTED is a
-# _DATA_GAP_RULE_PREFIXES entry (self-serve).
-_ADJUDICATED_FINDING_TYPE_CODE = "DI_VALUE_CORRECTION_PROPOSED"
-_APPLIED_FINDING_TYPE_CODE = "DI_VALUE_CORRECTED"
+TASK_TYPE = "FIELD_CORRECTION_REVIEW"
+_WORKFLOW_TYPE = "UC03_FIELD_CORRECTION"
 
 
 class FieldCorrectionCommand(BaseModel):
@@ -137,6 +144,16 @@ class FieldCorrectionCommand(BaseModel):
         return self
 
 
+class FieldCorrectionResult(BaseModel):
+    documentId: UUID
+    fieldKey: str
+    # True: applied immediately (<90% confidence), nothing pending. False:
+    # a FIELD_CORRECTION_REVIEW task was raised instead (taskId set) -- the
+    # value is not yet written anywhere.
+    applied: bool
+    taskId: UUID | None = None
+
+
 def _json(value: Any) -> str | None:
     return json.dumps(value, default=str)
 
@@ -146,22 +163,22 @@ def _insert_proposal(
     *,
     tenant_id: str,
     journey_id: UUID,
-    audit_finding_id: UUID,
     command: FieldCorrectionCommand,
     actor_id: str,
+    workflow_task_id: UUID | None,
     applied_now: bool,
 ) -> None:
     connection.execute(
         text(
             """
             INSERT INTO auditcore.journey_document_field_correction_proposals (
-                tenant_id, audit_finding_id, journey_id, stage_code,
+                tenant_id, workflow_task_id, journey_id, stage_code,
                 document_id, evidence_id, document_type_key, field_key,
                 canonical_field_id, source_fact_version, confidence_score,
                 original_value, proposed_value, proposed_by_actor_id,
                 applied_at_utc
             ) VALUES (
-                :tenant_id, :audit_finding_id, :journey_id, :stage_code,
+                :tenant_id, :workflow_task_id, :journey_id, :stage_code,
                 :document_id, :evidence_id, :document_type_key, :field_key,
                 :canonical_field_id, :source_fact_version, :confidence_score,
                 CAST(:original_value AS jsonb), CAST(:proposed_value AS jsonb),
@@ -172,7 +189,7 @@ def _insert_proposal(
         ),
         {
             "tenant_id": tenant_id,
-            "audit_finding_id": audit_finding_id,
+            "workflow_task_id": workflow_task_id,
             "journey_id": journey_id,
             "stage_code": command.stage,
             "document_id": command.documentId,
@@ -210,7 +227,7 @@ def _apply_field_value(
     """Write ``new_value`` as the field's new reviewed/effective value, plus
     the same conditional typed-attribute projection the stage-wide Confirm
     handlers use. Shared by both the immediate <90% apply path and the
-    >=90% CONFIRM_BREACH apply path -- identical write, different caller."""
+    >=90% Complete-task apply path -- identical write, different caller."""
 
     reviewed_field = ReviewedDiField(
         document_id=document_id,
@@ -270,7 +287,7 @@ def _apply_field_value(
 
 @router.post(
     "/{document_id}/field-corrections",
-    response_model=FlagMutationResponse,
+    response_model=FieldCorrectionResult,
 )
 def submit_field_correction(
     tenant_id: str,
@@ -278,7 +295,6 @@ def submit_field_correction(
     document_id: UUID,
     payload: FieldCorrectionCommand,
     request: Request,
-    response: Response,
     idempotency_key: Annotated[
         str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
     ],
@@ -287,7 +303,7 @@ def submit_field_correction(
         SecurityAuthorizationClient, Depends(get_security_authorization_client)
     ],
     connection: Annotated[Connection, Depends(get_connection)],
-) -> FlagMutationResponse:
+) -> FieldCorrectionResult:
     if payload.documentId != document_id:
         raise NotFoundError(
             error_code="VAC-NF-014",
@@ -295,15 +311,13 @@ def submit_field_correction(
             title="Document not found",
             detail="The document in the URL does not match the correction payload.",
         )
-    context = _scope(
+    _scope(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
-        # A distinct operation key from the Audit Review "Raise Audit Flag"
-        # form's RAISE -- a PC proposing a correction to a low-confidence
-        # extracted field keeps its own, already-shipped role policy
-        # (uc03_audit_flags.py's _DEFAULT_ROLE_POLICY) even after RAISE
-        # itself became TL/PM/EXECUTIVE-only.
+        # Kept from before this module moved off Audit Review -- still the
+        # right role policy (PC/TL/PM/EXECUTIVE may propose a correction),
+        # just no longer tied to "create a finding" in what it actually does.
         operation="PROPOSE_CORRECTION",
         human_principal=human_principal,
         authorization_client=authorization_client,
@@ -331,125 +345,78 @@ def submit_field_correction(
             title="Document not found",
             detail="This document is not on this journey's Booking/Delivery capture.",
         )
-    correlation_id = get_correlation_id(request)
-    needs_adjudication = requires_pc_review(payload.confidenceScore) is False
+    needs_review = requires_pc_review(payload.confidenceScore)
 
     def execute() -> dict[str, Any]:
-        finding_type_code = (
-            _ADJUDICATED_FINDING_TYPE_CODE if needs_adjudication else _APPLIED_FINDING_TYPE_CODE
-        )
-        rule_key = f"{finding_type_code}:{payload.fieldKey}"
-        routing = resolve_classification(
+        if needs_review:
+            task_id = create_workflow_task(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                workflow_type=_WORKFLOW_TYPE,
+                process_area=payload.stage,
+                task_type=TASK_TYPE,
+                assigned_role_code="TL",
+                task_payload={
+                    "fieldKey": payload.fieldKey,
+                    "documentTypeKey": payload.documentTypeKey,
+                    "originalValue": payload.originalValue,
+                    "proposedValue": payload.newValue,
+                    "comment": (payload.remarks or "").strip(),
+                },
+                correlation_id=get_correlation_id(request),
+            )
+            _insert_proposal(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                command=payload,
+                actor_id=human_principal.subject,
+                workflow_task_id=task_id,
+                applied_now=False,
+            )
+            return FieldCorrectionResult(
+                documentId=payload.documentId,
+                fieldKey=payload.fieldKey,
+                applied=False,
+                taskId=task_id,
+            ).model_dump(mode="json")
+
+        # <90% confidence (or missing): self-serve, apply immediately -- see
+        # module docstring for why this bypasses the stage-wide Confirm path.
+        _apply_field_value(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
-            rule_key=rule_key,
-            finding_type_code=finding_type_code,
-            severity="MEDIUM" if needs_adjudication else "INFO",
+            stage_code=payload.stage,
+            document_id=payload.documentId,
+            evidence_id=payload.evidenceId,
+            document_type_key=payload.documentTypeKey,
+            field_key=payload.fieldKey,
+            canonical_field_id=payload.canonicalFieldId,
+            source_fact_version=payload.sourceFactVersion,
+            confidence_score=payload.confidenceScore,
+            original_value=payload.originalValue,
+            new_value=payload.newValue,
+            actor_id=human_principal.subject,
         )
-        title = (
-            f"Proposed correction: {payload.fieldKey} on {payload.documentTypeKey}"
-            if needs_adjudication
-            else f"DI value corrected: {payload.fieldKey} on {payload.documentTypeKey}"
-        )
-        description = (payload.remarks or "").strip() or (
-            f"Corrected from {payload.originalValue!r} to {payload.newValue!r}."
-        )
-        flag_id = connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.audit_findings (
-                    tenant_id, journey_id, finding_type_code, severity,
-                    finding_status, title, description, created_by_actor_id,
-                    correlation_id, stage_code, origin_kind, origin_actor_id,
-                    origin_role_snapshot, rule_key, blocking_completion,
-                    finding_class, owner_role_code, sla_due_at_utc
-                ) VALUES (
-                    :tenant_id, :journey_id, :finding_type_code, :severity,
-                    'OPEN', :title, :description, :actor_id,
-                    :correlation_id, :stage_code, 'HUMAN', :actor_id,
-                    :actor_role, :rule_key, false,
-                    :finding_class, :owner_role_code, :sla_due_at_utc
-                ) RETURNING audit_finding_id
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "finding_type_code": finding_type_code,
-                "severity": "MEDIUM" if needs_adjudication else "INFO",
-                "title": title,
-                "description": description,
-                "actor_id": human_principal.subject,
-                "correlation_id": correlation_id,
-                "stage_code": payload.stage,
-                "actor_role": context["operating_role"],
-                "rule_key": rule_key,
-                **routing,
-            },
-        ).scalar_one()
         _insert_proposal(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
-            audit_finding_id=flag_id,
             command=payload,
             actor_id=human_principal.subject,
-            applied_now=not needs_adjudication,
+            workflow_task_id=None,
+            applied_now=True,
         )
-        if not needs_adjudication:
-            # <90% confidence: self-serve, apply immediately -- see module
-            # docstring for why this bypasses the stage-wide Confirm path.
-            _apply_field_value(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                stage_code=payload.stage,
-                document_id=payload.documentId,
-                evidence_id=payload.evidenceId,
-                document_type_key=payload.documentTypeKey,
-                field_key=payload.fieldKey,
-                canonical_field_id=payload.canonicalFieldId,
-                source_fact_version=payload.sourceFactVersion,
-                confidence_score=payload.confidenceScore,
-                original_value=payload.originalValue,
-                new_value=payload.newValue,
-                actor_id=human_principal.subject,
-            )
-        event_id = _append_finding_event(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            flag_id=flag_id,
-            stage_code=payload.stage,
-            event_type="RAISED",
-            actor_id=human_principal.subject,
-            actor_role=context["operating_role"],
-            reason=description,
-            correlation_id=correlation_id,
-            safe_payload={
-                "originKind": "HUMAN",
-                "category": finding_type_code,
-                "fieldKey": payload.fieldKey,
-                "documentId": str(payload.documentId),
-                "appliedImmediately": not needs_adjudication,
-            },
-        )
-        row = _finding(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            flag_id=flag_id,
-        )
-        role, policy = _view_context(context)
-        return {
-            "flag": _flag_view(
-                connection, tenant_id=tenant_id, row=row, role=role, policy=policy
-            ).model_dump(mode="json"),
-            "eventId": str(event_id),
-        }
+        return FieldCorrectionResult(
+            documentId=payload.documentId,
+            fieldKey=payload.fieldKey,
+            applied=True,
+            taskId=None,
+        ).model_dump(mode="json")
 
-    body, replay = execute_idempotent_json_command(
+    body, _replay = execute_idempotent_json_command(
         connection,
         tenant_id=tenant_id,
         operation_key=f"uc03.document-field-correction.submit:{journey_id}:{document_id}:{payload.fieldKey}:{payload.sourceFactVersion}",
@@ -457,52 +424,17 @@ def submit_field_correction(
         request_payload=payload.model_dump(mode="json"),
         execute=execute,
     )
-    flag = FlagView.model_validate(body["flag"])
-    _set_etag(response, flag.version)
-    return FlagMutationResponse(flag=flag, eventId=UUID(body["eventId"]), idempotent=replay)
+    return FieldCorrectionResult.model_validate(body)
 
 
-def apply_confirmed_field_correction(
+def _apply_proposal(
     connection: Connection,
     *,
     tenant_id: str,
     journey_id: UUID,
-    audit_finding_id: UUID,
     actor_id: str,
+    proposal: dict[str, Any],
 ) -> None:
-    """Write the proposed value as the field's new reviewed/effective value.
-
-    Called from uc03_audit_flags.py::act_on_flag's execute() on
-    CONFIRM_BREACH for a DI_VALUE_CORRECTION_PROPOSED (>=90%) finding,
-    inside the same transaction as the finding's own status update. The
-    <90% path never reaches here -- its value was already applied at
-    submit_field_correction time.
-    """
-
-    proposal = connection.execute(
-        text(
-            """
-            SELECT stage_code, document_id, evidence_id, document_type_key,
-                   field_key, canonical_field_id, source_fact_version,
-                   confidence_score, original_value, proposed_value
-            FROM auditcore.journey_document_field_correction_proposals
-            WHERE tenant_id=:tenant_id AND audit_finding_id=:audit_finding_id
-            FOR UPDATE
-            """
-        ),
-        {"tenant_id": tenant_id, "audit_finding_id": audit_finding_id},
-    ).mappings().one_or_none()
-    if proposal is None:
-        # Defensive only: every DI_VALUE_CORRECTION_PROPOSED finding is created
-        # with its proposal row in the same transaction (submit_field_
-        # correction above) -- this should be unreachable in practice.
-        raise NotFoundError(
-            error_code="VAC-NF-014",
-            status_code=404,
-            title="Correction proposal not found",
-            detail="No proposed correction is recorded for this finding.",
-        )
-
     _apply_field_value(
         connection,
         tenant_id=tenant_id,
@@ -520,6 +452,103 @@ def apply_confirmed_field_correction(
         actor_id=actor_id,
     )
 
+
+_PROPOSAL_COLUMNS = """
+    stage_code, document_id, evidence_id, document_type_key,
+    field_key, canonical_field_id, source_fact_version,
+    confidence_score, original_value, proposed_value
+"""
+
+
+def apply_confirmed_field_correction(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    workflow_task_id: UUID,
+    actor_id: str,
+) -> None:
+    """Write the proposed value as the field's new reviewed/effective value.
+
+    Called from tasks_api.py's generic Complete-task action when the task
+    being completed is a FIELD_CORRECTION_REVIEW -- the ordinary "TL
+    completes a task" gesture is what actually applies the correction here,
+    exactly matching uc03_model_selection_corrections.py's own Complete
+    hook. Cancelling the task (the ordinary "reject" gesture) needs no
+    equivalent hook: the original value simply stands. The <90% path never
+    reaches here -- its value was already applied at submit_field_
+    correction time.
+    """
+    proposal = connection.execute(
+        text(
+            f"""
+            SELECT {_PROPOSAL_COLUMNS}
+            FROM auditcore.journey_document_field_correction_proposals
+            WHERE tenant_id=:tenant_id AND workflow_task_id=:workflow_task_id
+            FOR UPDATE
+            """
+        ),
+        {"tenant_id": tenant_id, "workflow_task_id": workflow_task_id},
+    ).mappings().one_or_none()
+    if proposal is None:
+        # Defensive only: every FIELD_CORRECTION_REVIEW task is created with
+        # its proposal row in the same transaction (submit_field_correction
+        # above) -- this should be unreachable in practice.
+        raise NotFoundError(
+            error_code="VAC-NF-014",
+            status_code=404,
+            title="Correction proposal not found",
+            detail="No proposed correction is recorded for this task.",
+        )
+    _apply_proposal(connection, tenant_id=tenant_id, journey_id=journey_id, actor_id=actor_id, proposal=proposal)
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.journey_document_field_correction_proposals
+            SET applied_at_utc=now(), updated_at_utc=now(), version_no=version_no+1
+            WHERE tenant_id=:tenant_id AND workflow_task_id=:workflow_task_id
+            """
+        ),
+        {"tenant_id": tenant_id, "workflow_task_id": workflow_task_id},
+    )
+
+
+def apply_confirmed_field_correction_legacy(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    audit_finding_id: UUID,
+    actor_id: str,
+) -> None:
+    """Same write as apply_confirmed_field_correction, keyed by
+    audit_finding_id instead of workflow_task_id -- for a
+    DI_VALUE_CORRECTION_PROPOSED finding raised before this module moved
+    onto the Task Queue (migration 0106_field_correction_as_task). Called
+    only from uc03_audit_flags.py::act_on_flag's own CONFIRM_BREACH hook,
+    kept exactly for this backward-compatibility case. Safe to delete,
+    along with that hook, once no tenant has one of these findings open
+    any longer.
+    """
+    proposal = connection.execute(
+        text(
+            f"""
+            SELECT {_PROPOSAL_COLUMNS}
+            FROM auditcore.journey_document_field_correction_proposals
+            WHERE tenant_id=:tenant_id AND audit_finding_id=:audit_finding_id
+            FOR UPDATE
+            """
+        ),
+        {"tenant_id": tenant_id, "audit_finding_id": audit_finding_id},
+    ).mappings().one_or_none()
+    if proposal is None:
+        raise NotFoundError(
+            error_code="VAC-NF-014",
+            status_code=404,
+            title="Correction proposal not found",
+            detail="No proposed correction is recorded for this finding.",
+        )
+    _apply_proposal(connection, tenant_id=tenant_id, journey_id=journey_id, actor_id=actor_id, proposal=proposal)
     connection.execute(
         text(
             """
@@ -530,3 +559,11 @@ def apply_confirmed_field_correction(
         ),
         {"tenant_id": tenant_id, "audit_finding_id": audit_finding_id},
     )
+
+
+__all__ = [
+    "TASK_TYPE",
+    "apply_confirmed_field_correction",
+    "apply_confirmed_field_correction_legacy",
+    "submit_field_correction",
+]

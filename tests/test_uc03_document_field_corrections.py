@@ -229,35 +229,48 @@ def _submit(
 _propose = _submit
 
 
-def test_propose_field_correction_raises_a_tl_owned_violation(correction_setup):
+def test_propose_field_correction_creates_a_tl_owned_task(correction_setup):
     response = _propose(correction_setup, key="propose-0001")
     assert response.status_code == 200, response.text
-    flag = response.json()["flag"]
-    assert flag["findingClass"] == "VIOLATION"
-    assert flag["resolutionMode"] == "ADJUDICATED"
-    assert flag["ownerRoleCode"] == "TL"
-    assert flag["status"] == "OPEN"
-    assert flag["ruleKey"] == "DI_VALUE_CORRECTION_PROPOSED:chassis_number"
-    # Self-serve documents-complete criterion must never be blocked by this.
-    assert flag["blockingCompletion"] is False
-    # v1.1: PC has zero actions on a VIOLATION, matching every other one --
-    # TL's Take Action is how PC gets involved, never a direct edit here.
-    assert flag["permittedActions"] == []
+    body = response.json()
+    assert body["applied"] is False
+    assert body["taskId"]
+    assert body["fieldKey"] == "chassis_number"
+
+    with correction_setup["engine"].connect() as connection:
+        task = connection.execute(
+            text(
+                "SELECT task_type, assigned_role_code, task_status FROM auditcore.workflow_tasks "
+                "WHERE tenant_id=:t AND workflow_task_id=:tid"
+            ),
+            {"t": correction_setup["tenant_id"], "tid": UUID(body["taskId"])},
+        ).mappings().one()
+    assert task["task_type"] == "FIELD_CORRECTION_REVIEW"
+    assert task["assigned_role_code"] == "TL"
+    assert task["task_status"] in ("PENDING", "READY")
+
+    # Not in Audit at all -- this is a Task Queue item, not a rule-classified
+    # finding, per the exact user correction this module was rebuilt for.
+    with correction_setup["engine"].connect() as connection:
+        finding_count = connection.execute(
+            text(
+                "SELECT count(*) FROM auditcore.audit_findings "
+                "WHERE tenant_id=:t AND journey_id=:j"
+            ),
+            {"t": correction_setup["tenant_id"], "j": correction_setup["journey_id"]},
+        ).scalar_one()
+    assert finding_count == 0
 
 
-def test_confirm_breach_applies_the_proposed_value(correction_setup):
-    flag = _propose(correction_setup, key="propose-0002").json()["flag"]
+def test_completing_the_task_applies_the_proposed_value(correction_setup):
+    task_id = _propose(correction_setup, key="propose-0002").json()["taskId"]
     _set_role(correction_setup, "TL")
     action = _client().post(
-        f"/v1/tenants/{correction_setup['tenant_id']}/journeys/{correction_setup['journey_id']}"
-        f"/uc03/flags/{flag['flagId']}/actions",
-        headers={"Idempotency-Key": "confirm-0002", "If-Match": f'"{flag["version"]}"'},
-        json={"action": "CONFIRM_BREACH", "resolutionReason": "Verified against the chassis plate photo."},
+        f"/v1/tenants/{correction_setup['tenant_id']}/tasks/{task_id}/complete",
+        headers={"Idempotency-Key": "complete-0002"},
     )
     assert action.status_code == 200, action.text
-    resolved = action.json()["flag"]
-    assert resolved["status"] == "RESOLVED"
-    assert resolved["disposition"] == "CONFIRMED_BREACH"
+    assert action.json()["status"] == "COMPLETED"
 
     with correction_setup["engine"].connect() as connection:
         row = connection.execute(
@@ -274,35 +287,26 @@ def test_confirm_breach_applies_the_proposed_value(correction_setup):
     assert row["is_modified"] is True
 
     with correction_setup["engine"].connect() as connection:
-        proposal = connection.execute(
+        applied_at = connection.execute(
             text(
-                """
-                SELECT applied_at_utc FROM auditcore.journey_document_field_correction_proposals
-                WHERE tenant_id=:t AND audit_finding_id=:f
-                """
+                "SELECT applied_at_utc FROM auditcore.journey_document_field_correction_proposals "
+                "WHERE tenant_id=:t AND workflow_task_id=:tid"
             ),
-            {"t": correction_setup["tenant_id"], "f": UUID(flag["flagId"])},
+            {"t": correction_setup["tenant_id"], "tid": UUID(task_id)},
         ).scalar_one()
-    assert proposal is not None
+    assert applied_at is not None
 
 
-def test_mark_false_positive_leaves_the_original_value_untouched(correction_setup):
-    flag = _propose(correction_setup, key="propose-0003").json()["flag"]
+def test_cancelling_the_task_leaves_the_original_value_untouched(correction_setup):
+    task_id = _propose(correction_setup, key="propose-0003").json()["taskId"]
     _set_role(correction_setup, "TL")
     action = _client().post(
-        f"/v1/tenants/{correction_setup['tenant_id']}/journeys/{correction_setup['journey_id']}"
-        f"/uc03/flags/{flag['flagId']}/actions",
-        headers={"Idempotency-Key": "confirm-0003", "If-Match": f'"{flag["version"]}"'},
-        json={
-            "action": "MARK_FALSE_POSITIVE",
-            "resolutionReason": "The scanned value was actually correct.",
-            "rejectionCategory": "DATA_ALREADY_CORRECT",
-        },
+        f"/v1/tenants/{correction_setup['tenant_id']}/tasks/{task_id}/cancel",
+        headers={"Idempotency-Key": "cancel-0003"},
+        json={"reason": "The scanned value was actually correct."},
     )
     assert action.status_code == 200, action.text
-    resolved = action.json()["flag"]
-    assert resolved["status"] == "RESOLVED"
-    assert resolved["disposition"] == "FALSE_POSITIVE"
+    assert action.json()["status"] == "CANCELLED"
 
     with correction_setup["engine"].connect() as connection:
         stored = connection.execute(
@@ -314,14 +318,22 @@ def test_mark_false_positive_leaves_the_original_value_untouched(correction_setu
             ),
             {"t": correction_setup["tenant_id"], "j": correction_setup["journey_id"]},
         ).scalar_one_or_none()
-    assert stored is None  # never applied -- MARK_FALSE_POSITIVE writes nothing
+    assert stored is None  # never applied -- cancelling writes nothing
+
+    with correction_setup["engine"].connect() as connection:
+        applied_at = connection.execute(
+            text(
+                "SELECT applied_at_utc FROM auditcore.journey_document_field_correction_proposals "
+                "WHERE tenant_id=:t AND workflow_task_id=:tid"
+            ),
+            {"t": correction_setup["tenant_id"], "tid": UUID(task_id)},
+        ).scalar_one()
+    assert applied_at is None
 
 
-def test_low_confidence_correction_applies_immediately_and_raises_an_info_flag(correction_setup):
+def test_low_confidence_correction_applies_immediately_with_no_finding_or_task(correction_setup):
     # <90% (self-serve): the value must already be visible in Audit Core
-    # from THIS SAME response -- no separate Confirm/CONFIRM_BREACH step,
-    # and no remarks required (a PC could always do this directly on the
-    # old Review page; a mandatory remark here would just be new friction).
+    # from THIS SAME response -- no Task, no finding, nothing pending.
     response = _submit(
         correction_setup,
         key="submit-lowconf-0001",
@@ -331,12 +343,9 @@ def test_low_confidence_correction_applies_immediately_and_raises_an_info_flag(c
         remarks=None,
     )
     assert response.status_code == 200, response.text
-    flag = response.json()["flag"]
-    assert flag["findingClass"] == "DATA_GAP"
-    assert flag["resolutionMode"] == "SELF_SERVICE"
-    assert flag["ownerRoleCode"] == "PC"
-    assert flag["severity"] == "INFO"
-    assert flag["ruleKey"] == "DI_VALUE_CORRECTED:engine_number"
+    body = response.json()
+    assert body["applied"] is True
+    assert body["taskId"] is None
 
     with correction_setup["engine"].connect() as connection:
         row = connection.execute(
@@ -353,16 +362,29 @@ def test_low_confidence_correction_applies_immediately_and_raises_an_info_flag(c
     assert row["is_modified"] is True
 
     with correction_setup["engine"].connect() as connection:
-        applied_at = connection.execute(
+        proposal = connection.execute(
             text(
                 """
-                SELECT applied_at_utc FROM auditcore.journey_document_field_correction_proposals
-                WHERE tenant_id=:t AND audit_finding_id=:f
+                SELECT applied_at_utc, workflow_task_id, audit_finding_id
+                FROM auditcore.journey_document_field_correction_proposals
+                WHERE tenant_id=:t AND journey_id=:j AND field_key='engine_number'
                 """
             ),
-            {"t": correction_setup["tenant_id"], "f": UUID(flag["flagId"])},
+            {"t": correction_setup["tenant_id"], "j": correction_setup["journey_id"]},
+        ).mappings().one()
+    assert proposal["applied_at_utc"] is not None  # stamped at creation, not deferred
+    assert proposal["workflow_task_id"] is None
+    assert proposal["audit_finding_id"] is None
+
+    with correction_setup["engine"].connect() as connection:
+        finding_count = connection.execute(
+            text(
+                "SELECT count(*) FROM auditcore.audit_findings "
+                "WHERE tenant_id=:t AND journey_id=:j"
+            ),
+            {"t": correction_setup["tenant_id"], "j": correction_setup["journey_id"]},
         ).scalar_one()
-    assert applied_at is not None  # stamped at creation, not deferred to a later action
+    assert finding_count == 0
 
 
 def test_missing_confidence_is_treated_as_low_confidence(correction_setup):
@@ -377,7 +399,7 @@ def test_missing_confidence_is_treated_as_low_confidence(correction_setup):
         remarks=None,
     )
     assert response.status_code == 200, response.text
-    assert response.json()["flag"]["findingClass"] == "DATA_GAP"
+    assert response.json()["applied"] is True
 
 
 def test_high_confidence_correction_requires_remarks(correction_setup):
@@ -394,7 +416,7 @@ def test_high_confidence_correction_requires_remarks(correction_setup):
     assert response.json()["errorCode"] == "VAC-VAL-001"
 
 
-def test_high_confidence_correction_does_not_apply_until_confirmed(correction_setup):
+def test_high_confidence_correction_does_not_apply_until_the_task_completes(correction_setup):
     # The >=90% path's whole point: nothing is written to Audit Core at
     # submit time, unlike the <90% path above.
     response = _submit(correction_setup, key="submit-highconf-noapply-0001", field_key="vin_pending")
@@ -435,14 +457,30 @@ def test_apply_hook_does_not_invoke_the_heavy_materialization_pass() -> None:
 
     hook_source = inspect.getsource(apply_confirmed_field_correction)
     helper_source = inspect.getsource(_apply_field_value)
-    assert "_apply_field_value(" in hook_source
+    assert "_apply_proposal(" in hook_source
     assert "materialize_reviewed_di_business_values" not in hook_source
     assert "materialize_reviewed_di_business_values" not in helper_source
     assert "persist_reviewed_di_fields(" in helper_source
 
 
-def test_act_on_flag_only_applies_the_correction_on_confirm_breach() -> None:
+def test_field_correction_task_is_wired_into_the_generic_complete_action() -> None:
+    # The Task-Queue-side half of this module's own design: tasks_api.py's
+    # generic Complete action must dispatch to this module's own apply hook
+    # for a FIELD_CORRECTION_REVIEW task, the same shape
+    # MODEL_SELECTION_CORRECTION_REVIEW already uses.
+    from audit_core import tasks_api
+
+    source = inspect.getsource(tasks_api.complete_task)
+    assert "_FIELD_CORRECTION_TASK_TYPE" in source
+    assert "apply_confirmed_field_correction(" in source
+
+
+def test_act_on_flag_keeps_the_legacy_confirm_breach_hook() -> None:
+    # LEGACY: a DI_VALUE_CORRECTION_PROPOSED finding is never raised by a
+    # NEW correction any more (see submit_field_correction), but this hook
+    # must stay in place so a finding raised before this module moved onto
+    # the Task Queue still resolves the way it always did.
     source = inspect.getsource(act_on_flag)
-    assert "apply_confirmed_field_correction" in source
+    assert "apply_confirmed_field_correction_legacy" in source
     assert 'payload.action == "CONFIRM_BREACH"' in source
     assert "DI_VALUE_CORRECTION_PROPOSED" in source
