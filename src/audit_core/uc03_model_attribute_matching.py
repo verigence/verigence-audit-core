@@ -26,9 +26,13 @@ still exact, on a decomposed signal instead of the whole string:
      zero-candidate behaviour for it).
   3. Filter that model's variants to the ones whose own structured attributes
      agree with every signal the Booking Form actually supplied, and whose
-     variant-name "trim residue" (the same tokenizer applied to the master's
-     own ``variant_name``, with every recognized token removed) is a
-     normalized prefix/suffix of the Booking Form's own trim residue.
+     trim is a normalized prefix/suffix of the Booking Form's own trim
+     residue -- the master's real, stored Trim
+     (``product_variants.attributes->>'trim'``, the masters sheet's own Trim
+     column, populated by ``oem_price_masters.py``) when present, falling
+     back to a variant-name "trim residue" (the same tokenizer applied to
+     the master's own ``variant_name``, with every recognized token removed)
+     only for a variant ingested before that column existed.
 
 A signal the Booking Form never supplied is never used to eliminate a
 candidate — this only adds evidence, it never invents it.
@@ -159,6 +163,27 @@ def _decompose(text: str | None, *, oem_code: str) -> _Decomposed | None:
     )
 
 
+def _master_trim_key(row: dict[str, Any], *, oem_code: str) -> str:
+    """A master variant row's own trim, normalized -- the authoritative
+    value from the masters sheet's own Trim column
+    (``product_variants.attributes->>'trim'``, populated by
+    ``oem_price_masters.py``, selected as ``row["trim"]`` by
+    ``_sku_rows_for_version``) when present. Falls back to the residue-
+    derived trim_key (whatever's left in ``variant_name`` after removing
+    every recognized fuel/transmission/drive/seater token) only for a
+    variant ingested before that column existed and not yet re-uploaded --
+    the fallback this whole module originally relied on, kept only as a
+    transition path, not the primary signal anymore.
+    """
+    real_trim = row.get("trim")
+    if real_trim:
+        glued = "".join(_words(str(real_trim)))
+        if glued:
+            return glued
+    master = _decompose(str(row.get("variant_name") or ""), oem_code=oem_code)
+    return master.trim_key if master else ""
+
+
 # ── model resolution via oem_model_aliases ──────────────────────────────────
 def resolve_model_via_aliases(
     *, model_name: str, oem_aliases: list[tuple[str, str]]
@@ -238,11 +263,9 @@ def has_qualifying_signal(
     if not decomposed.trim_key or not candidate_rows:
         return False
     master_trim_keys = {
-        master.trim_key
-        for master in (
-            _decompose(str(row.get("variant_name") or ""), oem_code=oem_code) for row in candidate_rows
-        )
-        if master is not None and master.trim_key
+        key
+        for key in (_master_trim_key(row, oem_code=oem_code) for row in candidate_rows)
+        if key
     }
     return len(master_trim_keys) > 1
 
@@ -279,8 +302,7 @@ def match_by_attributes(
         if booking.seater and row.get("seater") and booking.seater != str(row["seater"]):
             continue
 
-        master = _decompose(str(row.get("variant_name") or ""), oem_code=oem_code)
-        master_key = master.trim_key if master else ""
+        master_key = _master_trim_key(row, oem_code=oem_code)
         if not master_key:
             continue
         if not (booking.trim_key.startswith(master_key) or master_key.startswith(booking.trim_key)):

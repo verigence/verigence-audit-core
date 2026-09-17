@@ -15,7 +15,7 @@ _MAHINDRA_ALIASES = [
 ]
 
 
-def _row(model, variant, *, fuel=None, transmission=None, drive=None, seater=None, sku="SKU1"):
+def _row(model, variant, *, fuel=None, transmission=None, drive=None, seater=None, trim=None, sku="SKU1"):
     return {
         "product_sku_id": sku,
         "sku_code": sku,
@@ -26,6 +26,7 @@ def _row(model, variant, *, fuel=None, transmission=None, drive=None, seater=Non
         "transmission": transmission,
         "drive": drive,
         "seater": seater,
+        "trim": trim,
     }
 
 
@@ -107,6 +108,39 @@ def test_ambiguous_when_booking_form_gives_no_disambiguating_signal() -> None:
     assert {r["sku_code"] for r in matched} == {"AT", "MT"}
 
 
+def test_master_trim_field_takes_priority_over_variant_name_residue() -> None:
+    """oem_price_masters.py now persists the masters sheet's own Trim
+    column (product_variants.attributes->>'trim') -- this must be used
+    directly instead of re-deriving it from variant_name, which can be
+    polluted by words the vocabulary doesn't recognize (e.g. a leading
+    "NEW" on a refreshed variant's own name, confirmed on a real Mahindra
+    generation-refresh masters sheet). Residue-derivation here would
+    produce "NEWZ4" for the master side, which doesn't prefix/suffix-match
+    the Booking Form's own "Z4" trim residue at all -- only the real trim
+    field lets this match."""
+    row = _row(
+        "SCORPIO N", "NEW Z4 G MT 2WD 7 STR - E BS6.2",
+        fuel="PETROL", transmission="MT", drive="2WD", seater="7", trim="Z4", sku="Z4NEW",
+    )
+    matched = m.match_by_attributes(
+        [row], oem_code="MAHINDRA", model_remainder="Z4", variant_text="G MT 2WD 7STR"
+    )
+    assert [r["sku_code"] for r in matched] == ["Z4NEW"]
+
+
+def test_falls_back_to_variant_name_residue_when_no_trim_field_stored() -> None:
+    # A variant ingested before oem_price_masters.py carried trim through
+    # (or not yet re-uploaded) -- must keep working exactly as before.
+    row = _row(
+        "SCORPIO N", "Z8 S D AT 2WD 7 STR BS6.2 - N",
+        fuel="DIESEL", transmission="AT", drive="2WD", seater="7", sku="Z8S",
+    )
+    matched = m.match_by_attributes(
+        [row], oem_code="MAHINDRA", model_remainder="Z8 (S)", variant_text="DAT 2WD 7STR"
+    )
+    assert [r["sku_code"] for r in matched] == ["Z8S"]
+
+
 def test_unknown_oem_is_a_no_op() -> None:
     rows = [_row("SCORPIO N", "Z8 S D AT 2WD 7 STR BS6.2 - N", fuel="DIESEL", transmission="AT", drive="2WD", seater="7")]
     matched = m.match_by_attributes(
@@ -156,6 +190,19 @@ def test_has_qualifying_signal_false_for_a_bare_trim_with_only_one_candidate() -
     ]
     assert not m.has_qualifying_signal(
         oem_code="MAHINDRA", model_remainder="", variant_text="Z8L", candidate_rows=rows
+    )
+
+
+def test_has_qualifying_signal_true_using_the_real_trim_field_not_residue() -> None:
+    # The exact live scenario reported: Z2/Z4/Z8 S/Z8T/Z8 L on the same
+    # model share an identical fuel/transmission/drive/seater combination --
+    # only their real Trim actually tells them apart.
+    rows = [
+        _row("SCORPIO N", "Z4 G MT 2WD 7 STR - E BS6.2 - New", fuel="PETROL", transmission="MT", drive="2WD", seater="7", trim="Z4"),
+        _row("SCORPIO N", "Z8 S G MT 2WD 7 STR BS6.2 - Refresh", fuel="PETROL", transmission="MT", drive="2WD", seater="7", trim="Z8 S"),
+    ]
+    assert m.has_qualifying_signal(
+        oem_code="MAHINDRA", model_remainder="", variant_text="Z4", candidate_rows=rows
     )
 
 
