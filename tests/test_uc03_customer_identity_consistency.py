@@ -124,16 +124,18 @@ def _set_named_field(
     return document_id
 
 
-def _open_wrong_document_findings(c) -> list[dict]:
-    return [
-        dict(row)
-        for row in c.execute(
-            text("SELECT rule_key, severity, finding_status FROM auditcore.audit_findings "
-                 "WHERE tenant_id=:t AND journey_id=:j AND finding_type_code='WRONG_DOCUMENT' "
-                 "AND finding_status IN ('OPEN','ACKNOWLEDGED')"),
-            {"t": c.tenant_id, "j": c.journey_id},
-        ).mappings().all()
-    ]
+def _open_wrong_document_tasks(c, task_type=None) -> list[dict]:
+    query = (
+        "SELECT task_type, process_area, assigned_role_code, severity, task_payload, task_status "
+        "FROM auditcore.workflow_tasks "
+        "WHERE tenant_id=:t AND journey_id=:j "
+        "AND task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT')"
+    )
+    params = {"t": c.tenant_id, "j": c.journey_id}
+    if task_type is not None:
+        query += " AND task_type=:tt"
+        params["tt"] = task_type
+    return [dict(row) for row in c.execute(text(query), params).mappings().all()]
 
 
 def test_customer_name_check_is_a_noop_without_kyc_but_dealer_check_still_runs(journey) -> None:
@@ -151,7 +153,7 @@ def test_customer_name_check_is_a_noop_without_kyc_but_dealer_check_still_runs(j
     )
 
     assert result == {"raised": 0, "resolved": 0, "examined": 0, "referenceName": None}
-    assert _open_wrong_document_findings(c) == []
+    assert _open_wrong_document_tasks(c) == []
 
 
 def test_matching_names_raise_nothing(journey) -> None:
@@ -175,10 +177,10 @@ def test_matching_names_raise_nothing(journey) -> None:
 
     assert result["raised"] == 0
     assert result["examined"] == 2  # booking_form + insurance_cover vs the aadhaar reference
-    assert _open_wrong_document_findings(c) == []
+    assert _open_wrong_document_tasks(c) == []
 
 
-def test_mismatched_invoice_raises_high_severity_wrong_document(journey) -> None:
+def test_mismatched_invoice_raises_wrong_document_review_task(journey) -> None:
     c = journey
     _set_named_field(
         c, stage_code="BOOKING", document_type_key="aadhaar",
@@ -194,19 +196,18 @@ def test_mismatched_invoice_raises_high_severity_wrong_document(journey) -> None
     )
 
     assert result["raised"] == 1
-    findings = _open_wrong_document_findings(c)
-    assert len(findings) == 1
-    assert findings[0]["severity"] == "HIGH"
-    assert findings[0]["rule_key"] == f"WRONG_DOCUMENT:{invoice_doc}"
+    tasks = _open_wrong_document_tasks(c, cic.TASK_TYPE)
+    assert len(tasks) == 1
+    assert tasks[0]["severity"] == "HIGH"
+    assert tasks[0]["assigned_role_code"] == "PC"
+    assert tasks[0]["task_payload"]["ruleKey"] == f"WRONG_DOCUMENT:{invoice_doc}"
 
-    # finding_types registry classification actually applied (migration 0081).
-    classified = c.execute(
-        text("SELECT finding_class, owner_role_code FROM auditcore.audit_findings "
-             "WHERE tenant_id=:t AND journey_id=:j AND finding_type_code='WRONG_DOCUMENT'"),
-        {"t": c.tenant_id, "j": c.journey_id},
-    ).mappings().one()
-    assert classified["finding_class"] == "VIOLATION"
-    assert classified["owner_role_code"] == "TL"
+    # Not in Audit at all -- this is a Task Queue item, not a
+    # rule-classified finding.
+    assert c.execute(
+        text("SELECT count(*) FROM auditcore.audit_findings WHERE tenant_id=:t"),
+        {"t": c.tenant_id},
+    ).scalar_one() == 0
 
 
 def test_kyc_uploaded_after_a_mismatching_document_still_catches_it(journey) -> None:
@@ -243,7 +244,7 @@ def test_correction_to_a_matching_name_self_heals(journey) -> None:
     cic.sync_customer_identity_consistency(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
-    assert len(_open_wrong_document_findings(c)) == 1
+    assert len(_open_wrong_document_tasks(c, cic.TASK_TYPE)) == 1
 
     # The PC re-uploads / DI re-extracts the same document with the correct name.
     c.execute(
@@ -258,7 +259,13 @@ def test_correction_to_a_matching_name_self_heals(journey) -> None:
     )
 
     assert result["resolved"] == 1
-    assert _open_wrong_document_findings(c) == []
+    assert _open_wrong_document_tasks(c, cic.TASK_TYPE) == []
+    cancelled = c.execute(
+        text("SELECT task_status FROM auditcore.workflow_tasks "
+             "WHERE tenant_id=:t AND journey_id=:j AND task_type=:tt"),
+        {"t": c.tenant_id, "j": c.journey_id, "tt": cic.TASK_TYPE},
+    ).scalar_one()
+    assert cancelled == "CANCELLED"
 
 
 def test_kyc_document_itself_is_not_checked_against_its_own_name(journey) -> None:
@@ -293,10 +300,10 @@ def test_receipt_dealer_name_check_runs_even_without_kyc(journey) -> None:
     )
 
     assert result["raised"] == 1
-    findings = _open_wrong_document_findings(c)
-    assert len(findings) == 1
-    assert findings[0]["severity"] == "HIGH"
-    assert findings[0]["rule_key"].startswith("WRONG_DOCUMENT:DEALER:")
+    tasks = _open_wrong_document_tasks(c, cic.DEALER_TASK_TYPE)
+    assert len(tasks) == 1
+    assert tasks[0]["severity"] == "HIGH"
+    assert tasks[0]["task_payload"]["ruleKey"].startswith("WRONG_DOCUMENT:DEALER:")
 
 
 def test_matching_dealer_name_raises_nothing(journey) -> None:
@@ -311,7 +318,7 @@ def test_matching_dealer_name_raises_nothing(journey) -> None:
     )
 
     assert result["raised"] == 0
-    assert _open_wrong_document_findings(c) == []
+    assert _open_wrong_document_tasks(c) == []
 
 
 def test_dealer_check_and_customer_check_track_independently_on_one_document(journey) -> None:
@@ -338,14 +345,14 @@ def test_dealer_check_and_customer_check_track_independently_on_one_document(jou
     )
 
     assert result["raised"] == 2
-    findings = {f["rule_key"] for f in _open_wrong_document_findings(c)}
-    assert findings == {
+    rule_keys = {t["task_payload"]["ruleKey"] for t in _open_wrong_document_tasks(c)}
+    assert rule_keys == {
         f"WRONG_DOCUMENT:{receipt_doc}",
         f"WRONG_DOCUMENT:DEALER:{receipt_doc}",
     }
 
-    # Correcting only the dealer name resolves that one finding and leaves
-    # the customer-name mismatch open.
+    # Correcting only the dealer name cancels that one task and leaves
+    # the customer-name mismatch's task open.
     c.execute(
         text("UPDATE auditcore.journey_document_extracted_fields "
              "SET effective_value = CAST(:v AS jsonb) "
@@ -356,7 +363,7 @@ def test_dealer_check_and_customer_check_track_independently_on_one_document(jou
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
     assert result2["resolved"] == 1
-    remaining = {f["rule_key"] for f in _open_wrong_document_findings(c)}
+    remaining = {t["task_payload"]["ruleKey"] for t in _open_wrong_document_tasks(c)}
     assert remaining == {f"WRONG_DOCUMENT:{receipt_doc}"}
 
 
@@ -374,7 +381,7 @@ def test_non_receipt_document_types_are_not_dealer_checked(journey) -> None:
     )
 
     assert result["raised"] == 0
-    assert _open_wrong_document_findings(c) == []
+    assert _open_wrong_document_tasks(c) == []
 
 
 # ── identity-check hold (evidence.identity_check_status) ────────────────────
@@ -599,3 +606,98 @@ def test_release_wrong_document_hold_clears_held_but_never_rejected(journey) -> 
 
     assert _evidence_row(c, held_evidence_id)["identity_check_status"] == "PASSED"
     assert _evidence_row(c, rejected_evidence_id)["identity_check_status"] == "REJECTED"
+
+
+# ── WRONG_DOCUMENT_REVIEW task completion (tasks_api.py::complete_task) ─────
+def test_apply_wrong_document_verification_incorrect_voids_and_reuploads(journey) -> None:
+    c = journey
+    document_id, evidence_id, requirement_id = _set_named_field_with_evidence(
+        c, stage_code="BOOKING", document_type_key="booking_form",
+        field_key="customer_name", value="Priya Nair", with_requirement=True,
+    )
+
+    cic.apply_wrong_document_verification(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, stage_code="BOOKING",
+        di_document_id=document_id, outcome="INCORRECT", actor_id="pc-test-actor",
+        correlation_id="",
+    )
+
+    row = _evidence_row(c, evidence_id)
+    assert row["association_status"] == "VOIDED"
+    assert row["identity_check_status"] == "REJECTED"
+    task = c.execute(
+        text("SELECT task_payload FROM auditcore.workflow_tasks "
+             "WHERE tenant_id=:t AND journey_id=:j AND task_type='PC_DOCUMENT_REUPLOAD'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one()
+    assert task["task_payload"]["requirementRef"] == str(requirement_id)
+
+
+def test_apply_wrong_document_verification_correct_releases_the_hold(journey) -> None:
+    c = journey
+    document_id, evidence_id, _req = _set_named_field_with_evidence(
+        c, stage_code="BOOKING", document_type_key="booking_form",
+        field_key="customer_name", value="Priya Nair",
+    )
+    c.execute(
+        text("UPDATE auditcore.evidence SET identity_check_status='HELD' "
+             "WHERE tenant_id=:t AND evidence_id=:e"),
+        {"t": c.tenant_id, "e": evidence_id},
+    )
+
+    cic.apply_wrong_document_verification(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, stage_code="BOOKING",
+        di_document_id=document_id, outcome="CORRECT", actor_id="pc-test-actor",
+        correlation_id="",
+    )
+
+    assert _evidence_row(c, evidence_id)["identity_check_status"] == "PASSED"
+
+
+def test_legacy_wrong_document_finding_still_resolves_after_the_task_queue_move(journey) -> None:
+    """A WRONG_DOCUMENT finding raised before this producer moved onto the
+    Task Queue must still resolve once a correction breaks the match --
+    nothing else in the codebase closes it on its own any more (a Team
+    Lead can still act on it directly, see uc03_audit_flags.py)."""
+    c = journey
+    _set_named_field(
+        c, stage_code="BOOKING", document_type_key="aadhaar",
+        field_key="aadhaar_name", value="Sanjaya Kumar Mohanty",
+    )
+    invoice_doc = _set_named_field(
+        c, stage_code="DELIVERY", document_type_key="customer_invoice_dms",
+        field_key="buyer_name", value="Priya Nair",
+    )
+    c.execute(
+        text(
+            """
+            INSERT INTO auditcore.audit_findings (
+                tenant_id, journey_id, finding_type_code, severity, finding_status,
+                title, stage_code, origin_kind, origin_role_snapshot, rule_key,
+                finding_class, owner_role_code
+            ) VALUES (
+                :t, :j, 'WRONG_DOCUMENT', 'HIGH', 'OPEN', 'legacy test',
+                'DELIVERY', 'MACHINE', 'SYSTEM', :rule_key, 'VIOLATION', 'TL'
+            )
+            """
+        ),
+        {"t": c.tenant_id, "j": c.journey_id, "rule_key": f"WRONG_DOCUMENT:{invoice_doc}"},
+    )
+
+    c.execute(
+        text("UPDATE auditcore.journey_document_extracted_fields "
+             "SET effective_value = CAST(:v AS jsonb) "
+             "WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:doc"),
+        {"v": json.dumps("Sanjaya Kumar Mohanty"), "t": c.tenant_id, "j": c.journey_id, "doc": invoice_doc},
+    )
+
+    result = cic.sync_customer_identity_consistency(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result["resolved"] == 1
+    status = c.execute(
+        text("SELECT finding_status FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND finding_type_code='WRONG_DOCUMENT'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert status == "RESOLVED"
