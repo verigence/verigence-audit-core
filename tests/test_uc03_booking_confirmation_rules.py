@@ -412,13 +412,17 @@ def test_minimum_booking_amount_excludes_duplicate_receipt_from_the_running_tota
                 {"t": tenant_id, "j": journey_id},
             ).mappings().one()
 
-    def _duplicate_finding():
+    def _duplicate_task():
+        # DUPLICATE_RECEIPT moved from an Audit finding onto a plain
+        # DUPLICATE_RECEIPT_NOTICE Task Queue item (audit-core#305) -- the
+        # exclusion from the running total below is computed independently
+        # off compute_duplicate_groups, but this still confirms PC is told.
         with engine.begin() as connection:
             return connection.execute(
                 text(
-                    "SELECT finding_status FROM auditcore.audit_findings "
+                    "SELECT task_status FROM auditcore.workflow_tasks "
                     "WHERE tenant_id=:t AND journey_id=:j "
-                    "AND finding_type_code='DUPLICATE_RECEIPT'"
+                    "AND task_type='DUPLICATE_RECEIPT_NOTICE'"
                 ),
                 {"t": tenant_id, "j": journey_id},
             ).mappings().one_or_none()
@@ -432,8 +436,8 @@ def test_minimum_booking_amount_excludes_duplicate_receipt_from_the_running_tota
     assert state["booking_confirmed_at_utc"] is not None
 
     _sync_receipt(amount="21000", receipt_date="2026-08-12", receipt_number="AMC-B/20186/26-27")
-    assert _duplicate_finding() is not None
-    assert _duplicate_finding()["finding_status"] == "OPEN"
+    assert _duplicate_task() is not None
+    assert _duplicate_task()["task_status"] in ("PENDING", "READY")
     # Still confirmed on the same original date -- the duplicate's amount
     # was excluded from the running total, not added on top of it.
     state = _state()

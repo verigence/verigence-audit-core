@@ -397,13 +397,13 @@ def _receipts(
 
     # Flag duplicates (same physical receipt uploaded more than once) so the
     # UI never counts the same money twice toward "Total collected" -- same
-    # grouping the DUPLICATE_RECEIPT finding uses (compute_duplicate_groups),
-    # so a document flagged here is exactly the one that finding is about.
+    # grouping the DUPLICATE_RECEIPT_NOTICE task uses (compute_duplicate_groups),
+    # so a document flagged here is exactly the one that task is about.
     # `result` is already in reviewed_at_utc order, so the first document in
     # each group is the earliest reviewed one -- that one counts; the rest
-    # are marked excluded until a TL confirms they are not duplicates after
-    # all (correcting the receipt number/amount/date resolves the finding
-    # and un-marks it here on the next read).
+    # stay marked excluded automatically, no PC/TL decision required
+    # (correcting the receipt number/amount/date breaks the match and
+    # un-marks it here on the next read).
     receipt_records = [
         ReceiptRecord(
             document_id=item["documentId"],

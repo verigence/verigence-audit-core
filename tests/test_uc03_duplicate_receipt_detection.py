@@ -150,19 +150,20 @@ def _seed_receipt(c, *, stage_code, document_type_key, receipt_number=None, amou
     return document_id
 
 
-def _open_duplicate_findings(c) -> list[dict]:
+def _open_duplicate_tasks(c) -> list[dict]:
     return [
         dict(row)
         for row in c.execute(
-            text("SELECT rule_key, severity, finding_status FROM auditcore.audit_findings "
-                 "WHERE tenant_id=:t AND journey_id=:j AND finding_type_code='DUPLICATE_RECEIPT' "
-                 "AND finding_status IN ('OPEN','ACKNOWLEDGED')"),
+            text("SELECT task_type, process_area, assigned_role_code, task_payload, task_status "
+                 "FROM auditcore.workflow_tasks "
+                 "WHERE tenant_id=:t AND journey_id=:j AND task_type='DUPLICATE_RECEIPT_NOTICE' "
+                 "AND task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT')"),
             {"t": c.tenant_id, "j": c.journey_id},
         ).mappings().all()
     ]
 
 
-def test_same_receipt_uploaded_five_times_is_one_duplicate_group(journey) -> None:
+def test_same_receipt_uploaded_five_times_is_one_duplicate_task(journey) -> None:
     c = journey
     for _ in range(5):
         _seed_receipt(c, stage_code="BOOKING", document_type_key="dealer_receipt",
@@ -173,17 +174,26 @@ def test_same_receipt_uploaded_five_times_is_one_duplicate_group(journey) -> Non
     )
 
     assert result["groupCount"] == 1
-    findings = _open_duplicate_findings(c)
-    assert len(findings) == 1
-    assert findings[0]["severity"] == "HIGH"
+    assert result["raised"] == 1
+    tasks = _open_duplicate_tasks(c)
+    assert len(tasks) == 1
+    assert tasks[0]["process_area"] == "BOOKING"
+    assert tasks[0]["assigned_role_code"] == "PC"
+    assert tasks[0]["task_payload"]["matchBasis"] == "RECEIPT_NUMBER_AND_AMOUNT"
 
-    classified = c.execute(
-        text("SELECT finding_class, owner_role_code FROM auditcore.audit_findings "
-             "WHERE tenant_id=:t AND journey_id=:j AND finding_type_code='DUPLICATE_RECEIPT'"),
-        {"t": c.tenant_id, "j": c.journey_id},
-    ).mappings().one()
-    assert classified["finding_class"] == "VIOLATION"
-    assert classified["owner_role_code"] == "TL"
+    # Not in Audit at all -- this is a Task Queue item, not a
+    # rule-classified finding.
+    assert c.execute(
+        text("SELECT count(*) FROM auditcore.audit_findings WHERE tenant_id=:t"),
+        {"t": c.tenant_id},
+    ).scalar_one() == 0
+
+    # idempotent
+    again = drd.sync_duplicate_receipt_detection(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert again["raised"] == 1
+    assert len(_open_duplicate_tasks(c)) == 1
 
 
 def test_different_receipt_numbers_same_amount_are_not_flagged(journey) -> None:
@@ -200,7 +210,7 @@ def test_different_receipt_numbers_same_amount_are_not_flagged(journey) -> None:
     )
 
     assert result["groupCount"] == 0
-    assert _open_duplicate_findings(c) == []
+    assert _open_duplicate_tasks(c) == []
 
 
 def test_dealer_receipt_and_payment_receipt_same_amount_are_not_cross_flagged(journey) -> None:
@@ -217,7 +227,7 @@ def test_dealer_receipt_and_payment_receipt_same_amount_are_not_cross_flagged(jo
     )
 
     assert result["groupCount"] == 0
-    assert _open_duplicate_findings(c) == []
+    assert _open_duplicate_tasks(c) == []
 
 
 def test_no_receipt_number_falls_back_to_amount_and_date(journey) -> None:
@@ -232,8 +242,9 @@ def test_no_receipt_number_falls_back_to_amount_and_date(journey) -> None:
     )
 
     assert result["groupCount"] == 1
-    findings = _open_duplicate_findings(c)
-    assert len(findings) == 1
+    tasks = _open_duplicate_tasks(c)
+    assert len(tasks) == 1
+    assert tasks[0]["task_payload"]["matchBasis"] == "AMOUNT_AND_DATE_NO_RECEIPT_NUMBER"
 
 
 def test_no_receipt_number_different_dates_are_not_flagged(journey) -> None:
@@ -248,10 +259,10 @@ def test_no_receipt_number_different_dates_are_not_flagged(journey) -> None:
     )
 
     assert result["groupCount"] == 0
-    assert _open_duplicate_findings(c) == []
+    assert _open_duplicate_tasks(c) == []
 
 
-def test_correction_that_breaks_the_match_self_heals(journey) -> None:
+def test_correction_that_breaks_the_match_cancels_the_task(journey) -> None:
     c = journey
     doc_a = _seed_receipt(c, stage_code="BOOKING", document_type_key="dealer_receipt",
                           receipt_number="RC-4001", amount="200000", receipt_date="2026-08-01")
@@ -261,7 +272,7 @@ def test_correction_that_breaks_the_match_self_heals(journey) -> None:
     drd.sync_duplicate_receipt_detection(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
-    assert len(_open_duplicate_findings(c)) == 1
+    assert len(_open_duplicate_tasks(c)) == 1
 
     # A PC correction reveals these were actually two different receipt numbers.
     c.execute(
@@ -276,4 +287,56 @@ def test_correction_that_breaks_the_match_self_heals(journey) -> None:
     )
 
     assert result["resolved"] == 1
-    assert _open_duplicate_findings(c) == []
+    assert _open_duplicate_tasks(c) == []
+    status = c.execute(
+        text("SELECT task_status FROM auditcore.workflow_tasks "
+             "WHERE tenant_id=:t AND journey_id=:j AND task_type='DUPLICATE_RECEIPT_NOTICE'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert status == "CANCELLED"
+
+
+def test_legacy_finding_still_resolves_after_the_task_queue_move(journey) -> None:
+    """A DUPLICATE_RECEIPT finding raised before this producer moved onto
+    the Task Queue must still resolve once the correction breaks the
+    match -- nothing else in the codebase ever closes it any more."""
+    c = journey
+    doc_a = _seed_receipt(c, stage_code="BOOKING", document_type_key="dealer_receipt",
+                          receipt_number="RC-5001", amount="200000", receipt_date="2026-08-01")
+    c.execute(
+        text(
+            """
+            INSERT INTO auditcore.audit_findings (
+                tenant_id, journey_id, finding_type_code, severity, finding_status,
+                title, stage_code, origin_kind, origin_role_snapshot, rule_key,
+                finding_class, owner_role_code
+            ) VALUES (
+                :t, :j, 'DUPLICATE_RECEIPT', 'HIGH', 'OPEN', 'legacy test',
+                'BOOKING', 'MACHINE', 'SYSTEM', :rule_key, 'VIOLATION', 'TL'
+            )
+            """
+        ),
+        {"t": c.tenant_id, "j": c.journey_id,
+         "rule_key": "DUPLICATE_RECEIPT:dealer_receipt:RC-5001:200000"},
+    )
+
+    # The correction that would have broken this match, had it still been
+    # a group of two -- resolving purely from current_rule_keys no longer
+    # containing this rule_key.
+    c.execute(
+        text("UPDATE auditcore.journey_document_extracted_fields "
+             "SET effective_value = CAST(:v AS jsonb) "
+             "WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:doc AND field_key='receipt_number'"),
+        {"v": json.dumps("RC-5001-A"), "t": c.tenant_id, "j": c.journey_id, "doc": doc_a},
+    )
+
+    result = drd.sync_duplicate_receipt_detection(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result["resolved"] == 1
+    status = c.execute(
+        text("SELECT finding_status FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND finding_type_code='DUPLICATE_RECEIPT'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert status == "RESOLVED"
