@@ -10,12 +10,14 @@ _sync_booking_document directly.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, text
 
 from audit_core import uc03_confidence_review_policy as confidence_policy
+from audit_core import uc03_payment_reconciliation as pr
 from audit_core.di_client import DiDocument, DiFact
 
 
@@ -379,17 +381,30 @@ def test_unmatched_payment_records_fail_for_payment_reconciliation(synced_docume
 
     # The real check only happens once a bank statement actually exists --
     # a non-matching one here, so this payment genuinely stays unmatched.
+    # materialize_reviewed_bank_statements only runs from the batch Delivery/
+    # v2 review-materialization flows, not the single-document real-time
+    # sync this test otherwise drives -- seed the line directly, matching
+    # what that batch flow would have persisted.
     bank_id = uuid4()
-    _add_evidence(engine, tenant_id, journey_id, customer_id, bank_id, "bank_statement_extract")
+    with engine.begin() as c:
+        pr.materialize_reviewed_bank_statements(
+            c, tenant_id=tenant_id, journey_id=journey_id, actor_id="tester",
+            documents=[SimpleNamespace(
+                documentId=bank_id, evidenceId=None, documentTypeKey="bank_statement_extract",
+                extractionState="READY",
+                fields=[
+                    SimpleNamespace(fieldKey="reference_no", value="SOME-OTHER-REF"),
+                    SimpleNamespace(fieldKey="credit_amount", value="40000"),
+                    SimpleNamespace(fieldKey="transaction_date", value="2026-09-02"),
+                ],
+            )],
+        )
+
+    # Any reconciliation-trigger document sync now re-evaluates against the
+    # bank line that's actually on file.
     bank_client = _FakeDiClient()
-    bank_client.add(
-        _confirmed(bank_id, "bank_statement_extract"),
-        [
-            _fact("reference_no", "SOME-OTHER-REF"),
-            _fact("credit_amount", "40000"),
-            _fact("transaction_date", "2026-09-02"),
-        ],
-    )
+    bank_client.add(_confirmed(bank_id, "bank_statement_extract"), [])
+    _add_evidence(engine, tenant_id, journey_id, customer_id, bank_id, "bank_statement_extract")
     _sync(engine, tenant_id, journey_id, bank_id, bank_client)
 
     rows = _executions_for_rule(engine, tenant_id, "PAYMENT_BANK_UNMATCHED")

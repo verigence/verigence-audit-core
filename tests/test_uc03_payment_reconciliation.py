@@ -375,6 +375,15 @@ def test_unmatched_delivery_payment_flag_stamped_with_delivery_stage(journey) ->
         {"t": c.tenant_id, "j": c.journey_id},
     )
     pid = _add_payment(c, amount=60000, ref="UTR-DELIVERY-1", stage="DELIVERY")
+    # A non-matching bank statement must already exist for this to actually
+    # raise -- see test_receipt_with_no_bank_statement_yet_does_not_raise
+    # for the "no bank statement at all yet" case, which no longer raises.
+    pr.materialize_reviewed_bank_statements(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[_bank_doc({
+            "transaction_date": "2026-09-02", "reference_no": "OTHERREF", "credit_amount": "40000",
+        })],
+    )
     pr.reconcile_payments(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     stage = c.execute(
         text("SELECT stage_code FROM auditcore.audit_findings "
