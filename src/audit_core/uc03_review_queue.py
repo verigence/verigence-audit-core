@@ -155,6 +155,13 @@ class ReviewQueueSummary(BaseModel):
     byClass: dict[str, int]
     byStage: dict[str, int]
     byKind: dict[str, int]
+    # Manual Verification is a rule (ruleKey starting "MANUAL_VERIFICATION:"),
+    # not its own findingClass -- every one of these is also counted under
+    # byClass.DATA_GAP. Computed here, not just client-side, so the counter
+    # tile is accurate regardless of which class filter is currently active
+    # (the frontend's own items list is narrowed by class filter server-side;
+    # this summary query never is).
+    manualVerification: int
 
 
 def _authorize(
@@ -780,17 +787,21 @@ def get_review_queue_summary(
     by_class: dict[str, int] = {}
     by_stage: dict[str, int] = {}
     by_kind: dict[str, int] = {}
+    manual_verification = 0
     for item, _ in loaded:
         if item.findingClass:
             by_class[item.findingClass] = by_class.get(item.findingClass, 0) + 1
         if item.stage:
             by_stage[item.stage] = by_stage.get(item.stage, 0) + 1
         by_kind[item.itemKind] = by_kind.get(item.itemKind, 0) + 1
+        if (item.ruleKey or "").startswith("MANUAL_VERIFICATION:"):
+            manual_verification += 1
     return ReviewQueueSummary(
         roles=roles,
         total=len(loaded),
         mine=sum(1 for item, _ in loaded if item.isMine),
         escalatedToMe=sum(1 for _, escalated in loaded if escalated),
+        manualVerification=manual_verification,
         overdue=sum(1 for item, _ in loaded if item.overdue),
         byClass=by_class,
         byStage=by_stage,

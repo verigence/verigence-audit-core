@@ -476,6 +476,43 @@ def test_review_queue_never_duplicates_a_self_serve_gap_as_its_own_task(audit_se
     assert summary_with_tasks["byKind"] == {"FINDING": 1}
 
 
+def test_review_queue_summary_counts_manual_verification_separately_from_data_gap(audit_setup):
+    """Manual Verification is a rule-key-based subset of DATA_GAP, not its
+    own findingClass -- the Task Queue's counter tiles need this computed
+    server-side (from the full, unfiltered item set) so it stays accurate
+    no matter which class filter is currently active on the client."""
+    with audit_setup["engine"].begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.audit_findings (
+                    tenant_id, journey_id, finding_type_code, severity,
+                    finding_status, title, stage_code, origin_kind,
+                    origin_role_snapshot, rule_key, blocking_completion
+                ) VALUES (
+                    :tenant_id, :journey_id, 'MANUAL_VERIFICATION', 'LOW',
+                    'OPEN', 'Low-confidence extracted field', 'BOOKING', 'MACHINE',
+                    'SYSTEM', 'MANUAL_VERIFICATION:BOOKING:aadhaar_card', false
+                )
+                """
+            ),
+            {
+                "tenant_id": audit_setup["tenant_id"],
+                "journey_id": audit_setup["journey_id"],
+            },
+        )
+    other_gap = _create_flag_category(
+        audit_setup, category="DOCUMENT_EXCEPTION", key="q-mvsummary-01"
+    )
+    assert other_gap["flagId"]
+
+    summary = _client().get(f"{_queue(audit_setup)}/summary").json()
+    assert summary["manualVerification"] == 1
+    # The manual-verification finding is still a DATA_GAP for byClass purposes
+    # -- manualVerification is an additional, narrower count, not a swap.
+    assert summary["byClass"].get("DATA_GAP", 0) >= 1
+
+
 def test_pc_cannot_raise_a_flag(audit_setup):
     """v1.1 correction: an earlier reading of "PC can't edit/update
     Findings" wrongly left RAISE open to PC. PC raises nothing -- every
