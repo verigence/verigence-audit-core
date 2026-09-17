@@ -311,6 +311,15 @@ _TASK_QUEUE_SQL = """
       ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
     WHERE t.tenant_id = :tenant_id
       AND t.journey_id IS NOT NULL
+      -- AUTO_SELF_SERVE is always spawned 1:1 from the DATA_GAP/DOCUMENT_GAP
+      -- finding it was raised for (related_finding_id), and _load_queue
+      -- already includes that finding, correctly classified, with the same
+      -- "go fix it" CTA the task itself carries. Concatenating both here
+      -- doubled every self-serve gap into two cards -- the real finding
+      -- (tagged Missing Document / Missing Data) plus a second, generically-
+      -- labeled "Self-serve gap" card for the exact same thing. Excluded
+      -- entirely: the finding row is the one and only place this belongs.
+      AND t.task_type <> 'AUTO_SELF_SERVE'
       AND (:include_closed OR t.task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT'))
       AND EXISTS (
             SELECT 1 FROM auditcore.business_assignments ba
@@ -345,6 +354,9 @@ _DAILY_OPS_TASK_QUEUE_SQL = """
       ON d.tenant_id = o.tenant_id AND d.dealer_id = o.dealer_id
     WHERE t.tenant_id = :tenant_id
       AND t.daily_ops_run_id IS NOT NULL
+      -- Same reasoning as _TASK_QUEUE_SQL above: AUTO_SELF_SERVE duplicates
+      -- its own already-shown finding.
+      AND t.task_type <> 'AUTO_SELF_SERVE'
       AND (:include_closed OR t.task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT'))
       AND EXISTS (
             SELECT 1 FROM auditcore.business_assignments ba

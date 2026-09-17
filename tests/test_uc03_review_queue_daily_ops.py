@@ -122,12 +122,16 @@ def test_daily_ops_flag_appears_in_the_shared_review_queue(daily_ops_queue_setup
     assert escalated is False
 
 
-def test_daily_ops_self_serve_flag_auto_spawns_a_task(daily_ops_queue_setup) -> None:
+def test_daily_ops_self_serve_flag_auto_spawns_a_task_but_it_never_duplicates_the_queue(
+    daily_ops_queue_setup,
+) -> None:
     """v1.1: "a PC never opens a Finding" applies to Daily Operations too --
     a self-serve (DATA_GAP/DOCUMENT_GAP) flag auto-spawns a Task the same
     way a journey one does (uc03_audit_flags.py::create_flag), now that
     workflow_tasks/workflow_instances can be Daily-Ops-scoped (migration
-    0099)."""
+    0099). But since that Task is always 1:1 with the Finding this same
+    queue already lists (correctly classified), _load_daily_ops_task_queue
+    excludes it -- otherwise every self-serve gap doubled into two items."""
     setup = daily_ops_queue_setup
     raised = create_daily_ops_flag(
         setup.tenant_id, setup.outlet_id, setup.run_id,
@@ -136,18 +140,20 @@ def test_daily_ops_self_serve_flag_auto_spawns_a_task(daily_ops_queue_setup) -> 
         principal=_principal(setup.pc_actor_id, setup.tenant_id), connection=setup.connection,
     )
 
+    task_row = setup.connection.execute(
+        text(
+            "SELECT task_type, assigned_role_code, severity, task_status "
+            "FROM auditcore.workflow_tasks WHERE tenant_id=:t AND related_finding_id=:f"
+        ),
+        {"t": setup.tenant_id, "f": raised.flag.flagId},
+    ).mappings().one()
+    assert task_row["task_type"] == "AUTO_SELF_SERVE"
+    assert task_row["assigned_role_code"] == "PC"
+    assert task_row["severity"] == "HIGH"
+    assert task_row["task_status"] == "READY"
+
     tasks = _load_daily_ops_task_queue(
         setup.connection, tenant_id=setup.tenant_id, actor_id=setup.pc_actor_id,
         roles=["PC"], now=datetime.now(UTC),
     )
-    assert len(tasks) == 1
-    task, escalated = tasks[0]
-    assert task.itemKind == "EXECUTION_TASK"
-    assert task.subjectKind == "DAILY_OPS"
-    assert task.dailyOpsRunId == setup.run_id
-    assert task.relatedFindingId == raised.flag.flagId
-    assert task.category == "AUTO_SELF_SERVE"
-    assert task.severity == "HIGH"
-    assert task.isOpen is True
-    assert task.isMine is True
-    assert escalated is False
+    assert tasks == []
