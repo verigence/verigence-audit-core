@@ -204,29 +204,73 @@ def test_matching_name_without_matching_pincode_does_not_flag(two_journeys) -> N
     assert result["raised"] == 0
 
 
-def test_confirmed_minimum_booking_amount_wins_originality_over_creation_order(two_journeys) -> None:
+def _set_booking_confirm_date(c, *, journey_id, confirm_date: str) -> None:
+    """The real "who paid the minimum booking amount, and on what date"
+    signal -- normally written by evaluate_minimum_booking_payment(), set
+    directly here since these tests don't run a full receipt pipeline."""
+    c.execute(
+        text(
+            """
+            INSERT INTO auditcore.journey_stage_states (
+                tenant_id, journey_id, stage_code, business_status,
+                audit_state, audit_status, first_started_at_utc,
+                latest_activity_at_utc, version_no,
+                booking_confirm_date, booking_confirmed_at_utc
+            ) VALUES (
+                :t, :j, 'BOOKING', 'BOOKING_IN_PROGRESS',
+                'IN_PROGRESS', 'NOT_EVALUATED', now(), now(), 1,
+                :confirm_date, now()
+            )
+            ON CONFLICT (tenant_id, journey_id, stage_code)
+            DO UPDATE SET booking_confirm_date = EXCLUDED.booking_confirm_date
+            """
+        ),
+        {"t": c.tenant_id, "j": journey_id, "confirm_date": confirm_date},
+    )
+
+
+def test_only_one_side_having_paid_the_minimum_wins_originality_over_creation_order(two_journeys) -> None:
     c = two_journeys
     _set_field(c, journey_id=c.journey_a, document_type_key="pan_card", field_key="pan_number", value="CCCCC3333C")
     _set_field(c, journey_id=c.journey_b, document_type_key="pan_card", field_key="pan_number", value="CCCCC3333C")
 
-    # journey_a was created first, but journey_b has its minimum booking
-    # amount confirmed (no open BK_MIN_BOOKING_AMOUNT_NOT_MET) while
-    # journey_a's is still open -- journey_b should win originality despite
-    # being created later.
-    c.execute(
-        text("""INSERT INTO auditcore.audit_findings
-            (tenant_id, journey_id, finding_type_code, severity, finding_status,
-             title, stage_code, origin_kind, origin_role_snapshot, rule_key, correlation_id)
-            VALUES (:t, :j, 'COMMERCIAL_EXCEPTION', 'HIGH', 'OPEN', 'test',
-                    'BOOKING', 'MACHINE', 'SYSTEM', 'BK_MIN_BOOKING_AMOUNT_NOT_MET', '')"""),
-        {"t": c.tenant_id, "j": c.journey_a},
-    )
+    # journey_a was created first, but journey_b actually reached its
+    # minimum booking amount (journey_a hasn't paid anything toward it yet)
+    # -- journey_b should hold the booking despite being created later.
+    _set_booking_confirm_date(c, journey_id=c.journey_b, confirm_date="2026-01-15")
 
     result_a = dbd.sync_duplicate_booking_detection(
         c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="",
     )
     assert result_a["raised"] == 1
     assert _open_findings(c, c.journey_a)[0]["rule_key"] == f"DUPLICATE_BOOKING:{c.journey_b}"
+
+    result_b = dbd.sync_duplicate_booking_detection(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="",
+    )
+    assert result_b["raised"] == 0
+    assert _open_findings(c, c.journey_b) == []
+
+
+def test_earlier_of_two_payment_dates_wins_originality_regardless_of_creation_order(two_journeys) -> None:
+    """The exact enhancement requested: not just "confirmed or not", but
+    whichever journey actually paid the minimum booking amount EARLIER --
+    even when both sides have since reached it."""
+    c = two_journeys
+    _set_field(c, journey_id=c.journey_a, document_type_key="pan_card", field_key="pan_number", value="GGGGG7777G")
+    _set_field(c, journey_id=c.journey_b, document_type_key="pan_card", field_key="pan_number", value="GGGGG7777G")
+
+    # journey_a was created first and confirmed second -- journey_b's
+    # earlier payment date should still win, overriding creation order.
+    _set_booking_confirm_date(c, journey_id=c.journey_a, confirm_date="2026-02-01")
+    _set_booking_confirm_date(c, journey_id=c.journey_b, confirm_date="2026-01-01")
+
+    result_a = dbd.sync_duplicate_booking_detection(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="",
+    )
+    assert result_a["raised"] == 1
+    duplicate = _open_findings(c, c.journey_a)[0]
+    assert duplicate["rule_key"] == f"DUPLICATE_BOOKING:{c.journey_b}"
 
     result_b = dbd.sync_duplicate_booking_detection(
         c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="",
