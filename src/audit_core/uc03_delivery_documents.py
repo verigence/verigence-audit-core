@@ -314,6 +314,17 @@ def _resolve_condition(
         )
     if key == "registrationbydealer":
         return _registration_by_dealer(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if key == "corporatecustomer":
+        # Booking's gst_certificate/corporate_id requirements (migration
+        # 0017/0036) are both keyed off this condition -- resolved the same
+        # way "was an exchange bonus actually claimed" is: a claimed
+        # corporate discount on the Booking Form is the actual evidence
+        # this is a corporate booking, same field
+        # uc03_booking_confirmation_rules.py's own discount-evidence check
+        # already keys the corporate_discount label off.
+        return _commercial_amount_taken(
+            connection, tenant_id=tenant_id, journey_id=journey_id, component_key="corporate_discount_amount",
+        )
     return None
 
 

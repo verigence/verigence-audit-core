@@ -55,6 +55,8 @@ def _requirement_snapshot(
             """
             SELECT jdr.requirement_key, jdr.requirement_level,
                    jdr.requirement_status, jdr.document_type_key,
+                   jdr.condition_snapshot,
+                   COALESCE(p.display_label, jdr.requirement_key) AS display_label,
                    COALESCE(jda.answer, 'UNANSWERED') AS answer,
                    EXISTS (
                        SELECT 1 FROM auditcore.evidence e
@@ -68,6 +70,10 @@ def _requirement_snapshot(
              AND jda.journey_id=jdr.journey_id
              AND jda.stage_code='BOOKING'
              AND jda.requirement_key=jdr.requirement_key
+            LEFT JOIN auditcore.document_capture_v2_requirement_policy p
+              ON p.requirement_key=jdr.requirement_key
+             AND p.process_area='BOOKING'
+             AND p.is_active=true
             WHERE jdr.tenant_id=:tenant_id
               AND jdr.journey_id=:journey_id
               AND upper(jdr.process_area)='BOOKING'
@@ -78,6 +84,29 @@ def _requirement_snapshot(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
+
+    # Booking has never had Delivery's own applicability resolution
+    # (resolve_requirement_applicability_if_conditional is gated to
+    # process_area == 'DELIVERY' only) -- a CONDITIONAL Booking requirement
+    # whose triggering fact is known and false (e.g. no corporate discount
+    # was actually claimed) was never excluded, so every non-corporate
+    # Booking still saw its gst_certificate/corporate_id requirement as
+    # perpetually outstanding. Resolve it here, read-only (never writes
+    # requirement_status back -- Booking's own write path for this doesn't
+    # exist yet; this only affects what this rule considers outstanding).
+    from audit_core.uc03_delivery_documents import _resolve_condition
+
+    resolved_rows = []
+    for row in rows:
+        row = dict(row)
+        if str(row["requirement_level"]).upper() == "CONDITIONAL":
+            condition_key = str((row.get("condition_snapshot") or {}).get("conditionKey") or "").strip().lower()
+            if condition_key and _resolve_condition(
+                connection, tenant_id=tenant_id, journey_id=journey_id, condition_key=condition_key,
+            ) is False:
+                continue  # known not applicable -- drop it, not just "satisfied"
+        resolved_rows.append(row)
+    rows = resolved_rows
     return [dict(row) for row in rows]
 
 
@@ -124,6 +153,16 @@ def _booking_requirement_rule_specs(rows: list[dict[str, Any]]) -> list[_RuleSpe
         ]
 
     outstanding_by_key = {str(row["requirement_key"]): row for row in outstanding}
+    # Every one of this function's findings used to say only "one or more
+    # requirements are not fully satisfied" -- true, but useless to a PC/TL
+    # who then has to go hunt for which one. The actual keys were always
+    # captured (safe_payload.requirementKeys), just never rendered into the
+    # text a human reads.
+    label_by_key = {str(row["requirement_key"]): str(row.get("display_label") or row["requirement_key"]) for row in rows}
+
+    def _named(keys: tuple[str, ...]) -> str:
+        return ", ".join(label_by_key.get(key, key) for key in keys)
+
     specs: list[_RuleSpec] = []
 
     if "booking_docket" in outstanding_by_key:
@@ -141,16 +180,15 @@ def _booking_requirement_rule_specs(rows: list[dict[str, Any]]) -> list[_RuleSpe
     if not identity_satisfied and any(
         key in outstanding_by_key for key in ("pan_card", "aadhaar")
     ):
+        identity_keys = tuple(key for key in ("pan_card", "aadhaar") if key in outstanding_by_key)
         specs.append(
             _RuleSpec(
                 rule_key="BK_PAN_PRESENT",
                 finding_type="CUSTOMER_IDENTITY_CONCERN",
                 severity="HIGH",
                 title="Customer identity evidence requires follow-up",
-                description="Neither configured Booking identity document is fully satisfied at Review confirmation.",
-                requirement_keys=tuple(
-                    key for key in ("pan_card", "aadhaar") if key in outstanding_by_key
-                ),
+                description=f"Neither configured Booking identity document is fully satisfied at Review confirmation. Outstanding: {_named(identity_keys)}.",
+                requirement_keys=identity_keys,
             )
         )
 
@@ -189,7 +227,7 @@ def _booking_requirement_rule_specs(rows: list[dict[str, Any]]) -> list[_RuleSpe
                 finding_type="DOCUMENT_EXCEPTION",
                 severity="HIGH",
                 title="Applicable conditional Booking evidence requires follow-up",
-                description="One or more applicable conditional Booking requirements are not fully satisfied.",
+                description=f"Outstanding: {_named(conditional_keys)}.",
                 requirement_keys=conditional_keys,
             )
         )
@@ -216,7 +254,7 @@ def _booking_requirement_rule_specs(rows: list[dict[str, Any]]) -> list[_RuleSpe
                 finding_type="PROCESS_NON_COMPLIANCE",
                 severity="HIGH",
                 title="Required Booking capture requires follow-up",
-                description="One or more required Booking evidence requirements are not fully satisfied.",
+                description=f"Outstanding: {_named(other_required)}.",
                 requirement_keys=other_required,
             )
         )

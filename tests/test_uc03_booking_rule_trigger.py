@@ -254,3 +254,138 @@ def test_bk_min_booking_proof_present_fires_on_a_real_seeded_journey() -> None:
         assert "BK_MIN_BOOKING_PROOF_PRESENT" in {spec.rule_key for spec in specs}
 
     engine.dispose()
+
+
+def _minimal_booking_journey(connection, *, tenant_id: str, suffix: str) -> str:
+    """A journey with no document_requirement_profile trigger wiring --
+    requirements are inserted directly, for a focused test of one
+    requirement's applicability resolution rather than the whole seed."""
+    category_id = connection.execute(
+        text("INSERT INTO auditcore.product_categories (category_code, category_name) "
+             "VALUES (:c, 'V') RETURNING product_category_id"),
+        {"c": f"BKC-CAT-{suffix}"},
+    ).scalar_one()
+    oem_id = connection.execute(
+        text("INSERT INTO auditcore.oems (oem_code, oem_name) VALUES (:c, 'O') RETURNING oem_id"),
+        {"c": f"BKC-OEM-{suffix}"},
+    ).scalar_one()
+    connection.execute(
+        text("INSERT INTO auditcore.projects (tenant_id, project_code, project_name, oem_id, "
+             "product_category_id, effective_start_date) "
+             "VALUES (:t, :pc, 'BKC', :o, :cat, CURRENT_DATE)"),
+        {"t": tenant_id, "pc": f"BKC-{suffix}", "o": oem_id, "cat": category_id},
+    )
+    dealer_id = connection.execute(
+        text("INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
+             "VALUES (:t, :c, 'D') RETURNING dealer_id"),
+        {"t": tenant_id, "c": f"BKC-D-{suffix}"},
+    ).scalar_one()
+    outlet_id = connection.execute(
+        text("INSERT INTO auditcore.dealer_outlets (tenant_id, dealer_id, outlet_code, outlet_name) "
+             "VALUES (:t, :d, :c, 'O') RETURNING outlet_id"),
+        {"t": tenant_id, "d": dealer_id, "c": f"BKC-O-{suffix}"},
+    ).scalar_one()
+    customer_id = connection.execute(
+        text("INSERT INTO auditcore.customers (tenant_id, dealer_id, outlet_id, "
+             "customer_type_code, display_name) VALUES (:t, :d, :o, 'INDIVIDUAL', 'C') "
+             "RETURNING customer_id"),
+        {"t": tenant_id, "d": dealer_id, "o": outlet_id},
+    ).scalar_one()
+    journey_id = connection.execute(
+        text("INSERT INTO auditcore.journeys (tenant_id, dealer_id, outlet_id, customer_id, "
+             "journey_reference) VALUES (:t, :d, :o, :cu, :r) RETURNING journey_id"),
+        {"t": tenant_id, "d": dealer_id, "o": outlet_id, "cu": customer_id, "r": f"BKC-J-{suffix}"},
+    ).scalar_one()
+    return journey_id
+
+
+def test_corporate_conditional_requirement_excluded_when_no_corporate_discount_claimed() -> None:
+    """Booking never had Delivery's own applicability resolution -- a
+    gst_certificate/corporate_id requirement (conditionKey=corporateCustomer)
+    stayed outstanding forever on every non-corporate Booking, since nothing
+    ever told this rule the condition was known and false. Confirmed
+    root-caused live; this proves the fix."""
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for this integration test")
+    engine = create_engine(database_url)
+    suffix = uuid4().hex[:10]
+    tenant_id = f"tenant-bkc-{suffix}"
+    with engine.begin() as connection:
+        journey_id = _minimal_booking_journey(connection, tenant_id=tenant_id, suffix=suffix)
+        connection.execute(
+            text("""
+                INSERT INTO auditcore.journey_document_requirements (
+                    tenant_id, journey_id, requirement_key, document_type_key,
+                    process_area, requirement_level, condition_snapshot
+                ) VALUES (
+                    :t, :j, 'gst_certificate', 'gst_certificate', 'BOOKING', 'CONDITIONAL',
+                    '{"conditionKey": "corporateCustomer"}'::jsonb
+                )
+            """),
+            {"t": tenant_id, "j": journey_id},
+        )
+
+        # No commercial_lines row at all yet -- genuinely unknown, must stay
+        # outstanding (never guess NOT_APPLICABLE from silence).
+        rows = _requirement_snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
+        specs = _booking_requirement_rule_specs(rows)
+        assert "BK_CONDITIONAL_DOCS_ADDRESSED" in {s.rule_key for s in specs}
+
+        # The Booking Form has since synced and confirms no corporate
+        # discount was actually claimed -- now resolvable and excluded.
+        connection.execute(
+            text("INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, actual_amount) "
+                 "VALUES (:t, :j, 'corporate_discount_amount', 0)"),
+            {"t": tenant_id, "j": journey_id},
+        )
+        rows = _requirement_snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
+        specs = _booking_requirement_rule_specs(rows)
+        assert "BK_CONDITIONAL_DOCS_ADDRESSED" not in {s.rule_key for s in specs}
+        assert not rows, "the requirement should be dropped entirely, not merely marked satisfied"
+
+    engine.dispose()
+
+
+def test_corporate_conditional_requirement_still_flagged_when_discount_actually_claimed() -> None:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for this integration test")
+    engine = create_engine(database_url)
+    suffix = uuid4().hex[:10]
+    tenant_id = f"tenant-bkc2-{suffix}"
+    with engine.begin() as connection:
+        journey_id = _minimal_booking_journey(connection, tenant_id=tenant_id, suffix=suffix)
+        connection.execute(
+            text("""
+                INSERT INTO auditcore.journey_document_requirements (
+                    tenant_id, journey_id, requirement_key, document_type_key,
+                    process_area, requirement_level, condition_snapshot
+                ) VALUES (
+                    :t, :j, 'gst_certificate', 'gst_certificate', 'BOOKING', 'CONDITIONAL',
+                    '{"conditionKey": "corporateCustomer"}'::jsonb
+                )
+            """),
+            {"t": tenant_id, "j": journey_id},
+        )
+        connection.execute(
+            text("INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, actual_amount) "
+                 "VALUES (:t, :j, 'corporate_discount_amount', 15000)"),
+            {"t": tenant_id, "j": journey_id},
+        )
+
+        rows = _requirement_snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
+        specs = _booking_requirement_rule_specs(rows)
+        by_rule = {s.rule_key: s for s in specs}
+        assert "BK_CONDITIONAL_DOCS_ADDRESSED" in by_rule
+        assert by_rule["BK_CONDITIONAL_DOCS_ADDRESSED"].requirement_keys == ("gst_certificate",)
+        # The description now names the actual outstanding requirement
+        # instead of a generic "one or more" sentence -- by its real
+        # display label (document_capture_v2_requirement_policy already
+        # has a seeded row for gst_certificate), not the raw key.
+        assert "Outstanding:" in by_rule["BK_CONDITIONAL_DOCS_ADDRESSED"].description
+        assert by_rule["BK_CONDITIONAL_DOCS_ADDRESSED"].description != (
+            "One or more applicable conditional Booking requirements are not fully satisfied."
+        )
+
+    engine.dispose()
