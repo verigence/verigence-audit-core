@@ -475,8 +475,18 @@ def _reconcile_payments(
     if not payments:
         return {"skipped": True, "reason": "no_payments"}
     lines = _bank_lines(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # Direct user correction (2026-09-17): a receipt uploaded before any
+    # bank statement must not be flagged -- there is nothing to check it
+    # against yet, and a PAYMENT_BANK_UNMATCHED finding here would send a
+    # TL looking for a bank credit that was never expected to exist yet.
+    # Uniform across Booking and Delivery (this producer already reads
+    # every payment on the Journey regardless of stage): the real trigger
+    # is a bank statement actually being uploaded, which already re-runs
+    # this producer (see is_reconciliation_trigger_document_type) and
+    # matches it against every payment on file at that point.
+    no_bank_statement_yet = not lines
 
-    matched = unmatched = not_applicable = ambiguous = 0
+    matched = unmatched = not_applicable = ambiguous = pending_bank_statement = 0
     for payment in payments:
         payment_id = payment["payment_id"]
         rule_key = f"{_RULE_PREFIX}:{payment_id}"
@@ -522,6 +532,20 @@ def _reconcile_payments(
                 details={"candidateCount": len(candidates)},
             )
             ambiguous += 1
+        elif no_bank_statement_yet:
+            # Genuinely not evaluable yet, not "wrong" -- record the match
+            # row (idempotency, Overview projection) and self-heal any flag
+            # raised under the old behavior, but don't raise a new one.
+            _upsert_match(
+                connection, tenant_id=tenant_id, journey_id=journey_id, payment_id=payment_id,
+                line_id=None, match_status="UNMATCHED", match_method="NONE",
+                candidate_line_ids=[], details={"reason": "no_bank_statement_uploaded_yet"},
+            )
+            _resolve_flag(
+                connection, tenant_id=tenant_id, journey_id=journey_id,
+                rule_key=rule_key, correlation_id=correlation_id,
+            )
+            pending_bank_statement += 1
         else:
             _upsert_match(
                 connection, tenant_id=tenant_id, journey_id=journey_id, payment_id=payment_id,
@@ -534,13 +558,27 @@ def _reconcile_payments(
             )
             unmatched += 1
 
-    return {
+    result: dict[str, Any] = {
         "matched": matched,
         "unmatched": unmatched,
         "notApplicable": not_applicable,
         "ambiguous": ambiguous,
+        "pendingBankStatement": pending_bank_statement,
         "bankLines": len(lines),
     }
+    if pending_bank_statement > 0:
+        # At least one payment was genuinely deferred for lack of a bank
+        # statement -- not the same as "every payment here was cash"
+        # (that's a real PASS, nothing to defer). Both callers
+        # (uc03_confidence_review_policy.py, uc03_run_all_rules.py)
+        # already treat a "skipped" result as SKIPPED rather than PASS/
+        # FAIL for the PAYMENT_BANK_UNMATCHED rule-execution-log row --
+        # the honest signal here, and it can never mask a real FAIL since
+        # unmatched only counts payments actually checked against a
+        # present bank statement.
+        result["skipped"] = True
+        result["reason"] = "no_bank_statement_uploaded_yet"
+    return result
 
 
 __all__ = ["materialize_reviewed_bank_statements", "reconcile_payments"]
