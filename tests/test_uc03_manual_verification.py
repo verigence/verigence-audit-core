@@ -11,11 +11,9 @@ import audit_core.uc03_manual_verification as mv
 
 
 # ── unit ──────────────────────────────────────────────────────────────────────
-def test_rule_key_round_trips_document_id() -> None:
+def test_rule_key_format() -> None:
     doc = uuid4()
-    key = mv._rule_key("BOOKING", doc)
-    assert key == f"MANUAL_VERIFICATION:BOOKING:{doc}"
-    assert mv._document_from_rule(key) == doc
+    assert mv._rule_key("BOOKING", doc) == f"MANUAL_VERIFICATION:BOOKING:{doc}"
 
 
 def test_friendly_label() -> None:
@@ -119,7 +117,23 @@ def _add_field(conn, *, tenant_id, journey_id, document_id, field_key, value, co
     )
 
 
-def test_producer_raises_one_finding_per_document(journey) -> None:
+def _mark_reviewed(conn, *, tenant_id, field_key):
+    # Simulates what submit_field_correction's _apply_field_value /
+    # persist_reviewed_di_fields actually does in production -- that's the
+    # ONLY place reviewed_at_utc ever gets set; this module no longer has
+    # its own resolve endpoint (removed: nothing in the frontend ever
+    # called it, and a PC already resolves this entirely from the
+    # Documents page's own field-correction flow).
+    conn.execute(
+        text(
+            "UPDATE auditcore.journey_document_extracted_fields "
+            "SET reviewed_at_utc = now() WHERE tenant_id = :t AND field_key = :fk"
+        ),
+        {"t": tenant_id, "fk": field_key},
+    )
+
+
+def test_producer_raises_one_task_per_document(journey) -> None:
     tenant_id, journey_id = journey.tenant_id, journey.journey_id
     doc_a, doc_b = uuid4(), uuid4()
     _add_field(journey, tenant_id=tenant_id, journey_id=journey_id, document_id=doc_a,
@@ -127,7 +141,7 @@ def test_producer_raises_one_finding_per_document(journey) -> None:
     _add_field(journey, tenant_id=tenant_id, journey_id=journey_id, document_id=doc_a,
                field_key="name", value="J Doe", confidence=0.80)
     _add_field(journey, tenant_id=tenant_id, journey_id=journey_id, document_id=doc_b,
-               field_key="dob", value="1990-01-01", confidence=0.99)  # high conf -> no finding
+               field_key="dob", value="1990-01-01", confidence=0.99)  # high conf -> no task
 
     result = mv.sync_manual_verification_findings(
         journey, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING", correlation_id="",
@@ -135,15 +149,22 @@ def test_producer_raises_one_finding_per_document(journey) -> None:
     assert result["raised"] == 1  # only doc_a
 
     rows = journey.execute(
-        text("SELECT rule_key, finding_type_code, finding_class, owner_role_code "
-             "FROM auditcore.audit_findings WHERE tenant_id = :t AND journey_id = :j"),
+        text("SELECT task_type, process_area, assigned_role_code, task_payload "
+             "FROM auditcore.workflow_tasks WHERE tenant_id = :t AND journey_id = :j"),
         {"t": tenant_id, "j": journey_id},
     ).mappings().all()
     assert len(rows) == 1
-    assert rows[0]["finding_type_code"] == "MANUAL_VERIFICATION"
-    assert rows[0]["finding_class"] == "DATA_GAP"
-    assert rows[0]["owner_role_code"] == "PC"
-    assert rows[0]["rule_key"] == f"MANUAL_VERIFICATION:BOOKING:{doc_a}"
+    assert rows[0]["task_type"] == "MANUAL_VERIFICATION_REVIEW"
+    assert rows[0]["process_area"] == "BOOKING"
+    assert rows[0]["assigned_role_code"] == "PC"
+    assert rows[0]["task_payload"]["ruleKey"] == f"MANUAL_VERIFICATION:BOOKING:{doc_a}"
+    assert set(rows[0]["task_payload"]["fieldKeys"]) == {"pan_number", "name"}
+
+    # Not in Audit at all -- this is a Task Queue item, not a
+    # rule-classified finding.
+    assert journey.execute(
+        text("SELECT count(*) FROM auditcore.audit_findings WHERE tenant_id = :t"), {"t": tenant_id}
+    ).scalar_one() == 0
 
     # idempotent
     again = mv.sync_manual_verification_findings(
@@ -151,11 +172,11 @@ def test_producer_raises_one_finding_per_document(journey) -> None:
     )
     assert again["raised"] == 1
     assert journey.execute(
-        text("SELECT count(*) FROM auditcore.audit_findings WHERE tenant_id = :t"), {"t": tenant_id}
+        text("SELECT count(*) FROM auditcore.workflow_tasks WHERE tenant_id = :t"), {"t": tenant_id}
     ).scalar_one() == 1
 
 
-def test_resolving_confirms_and_corrects_then_closes_finding(journey) -> None:
+def test_task_self_heals_once_every_field_is_reviewed(journey) -> None:
     tenant_id, journey_id = journey.tenant_id, journey.journey_id
     doc = uuid4()
     _add_field(journey, tenant_id=tenant_id, journey_id=journey_id, document_id=doc,
@@ -165,83 +186,67 @@ def test_resolving_confirms_and_corrects_then_closes_finding(journey) -> None:
     mv.sync_manual_verification_findings(
         journey, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING", correlation_id="",
     )
-    finding_id = journey.execute(
-        text("SELECT audit_finding_id FROM auditcore.audit_findings WHERE tenant_id = :t"),
+    task_id = journey.execute(
+        text("SELECT workflow_task_id FROM auditcore.workflow_tasks WHERE tenant_id = :t"),
         {"t": tenant_id},
     ).scalar_one()
-    fields = journey.execute(
-        text("SELECT extracted_field_id, field_key FROM auditcore.journey_document_extracted_fields "
-             "WHERE tenant_id = :t ORDER BY field_key"),
-        {"t": tenant_id},
-    ).mappings().all()
-    by_key = {r["field_key"]: r["extracted_field_id"] for r in fields}
 
-    # resolve one field at a time — finding stays open until the last one
-    _resolve(journey, tenant_id, journey_id, finding_id,
-             [{"extractedFieldId": by_key["address"], "action": "CORRECT", "effectiveValue": "new addr"}])
+    # One field reviewed, one still outstanding -- the Task stays open.
+    _mark_reviewed(journey, tenant_id=tenant_id, field_key="address")
+    mv.sync_manual_verification_findings(
+        journey, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING", correlation_id="",
+    )
     still_open = journey.execute(
-        text("SELECT finding_status FROM auditcore.audit_findings WHERE audit_finding_id = :f AND tenant_id = :t"),
-        {"f": finding_id, "t": tenant_id},
+        text("SELECT task_status FROM auditcore.workflow_tasks WHERE tenant_id = :t AND workflow_task_id = :tid"),
+        {"t": tenant_id, "tid": task_id},
     ).scalar_one()
-    assert still_open == "OPEN"
+    assert still_open in ("PENDING", "READY")
 
-    _resolve(journey, tenant_id, journey_id, finding_id,
-             [{"extractedFieldId": by_key["pan_number"], "action": "CONFIRM"}])
+    # Last field reviewed -- the Task closes on its own, no separate
+    # "mark done" action.
+    _mark_reviewed(journey, tenant_id=tenant_id, field_key="pan_number")
+    result = mv.sync_manual_verification_findings(
+        journey, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING", correlation_id="",
+    )
+    assert result["resolved"] == 1
     closed = journey.execute(
-        text("SELECT finding_status, disposition FROM auditcore.audit_findings "
-             "WHERE audit_finding_id = :f AND tenant_id = :t"),
-        {"f": finding_id, "t": tenant_id},
-    ).mappings().one()
-    assert closed["finding_status"] == "RESOLVED"
-    assert closed["disposition"] == "FIXED"
+        text("SELECT task_status FROM auditcore.workflow_tasks WHERE tenant_id = :t AND workflow_task_id = :tid"),
+        {"t": tenant_id, "tid": task_id},
+    ).scalar_one()
+    assert closed == "COMPLETED"
 
-    stored = journey.execute(
-        text("SELECT field_key, effective_value, is_modified, reviewed_at_utc IS NOT NULL AS reviewed "
-             "FROM auditcore.journey_document_extracted_fields WHERE tenant_id = :t ORDER BY field_key"),
+
+def test_legacy_finding_still_resolves_after_the_task_queue_move(journey) -> None:
+    """A MANUAL_VERIFICATION finding raised before this producer moved onto
+    the Task Queue must still resolve once its fields are reviewed --
+    nothing else in the codebase ever closes it any more."""
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    doc = uuid4()
+    _add_field(journey, tenant_id=tenant_id, journey_id=journey_id, document_id=doc,
+               field_key="pan_number", value="ABCDE1234F", confidence=0.55)
+    journey.execute(
+        text(
+            """
+            INSERT INTO auditcore.audit_findings (
+                tenant_id, journey_id, finding_type_code, severity, finding_status,
+                title, stage_code, origin_kind, origin_role_snapshot, rule_key,
+                finding_class, owner_role_code
+            ) VALUES (
+                :t, :j, 'MANUAL_VERIFICATION', 'LOW', 'OPEN', 'legacy test',
+                'BOOKING', 'MACHINE', 'SYSTEM', :rule_key, 'DATA_GAP', 'PC'
+            )
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "rule_key": mv._rule_key("BOOKING", doc)},
+    )
+
+    _mark_reviewed(journey, tenant_id=tenant_id, field_key="pan_number")
+    result = mv.sync_manual_verification_findings(
+        journey, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING", correlation_id="",
+    )
+    assert result["resolved"] == 1
+    status = journey.execute(
+        text("SELECT finding_status FROM auditcore.audit_findings WHERE tenant_id = :t"),
         {"t": tenant_id},
-    ).mappings().all()
-    addr = next(r for r in stored if r["field_key"] == "address")
-    pan = next(r for r in stored if r["field_key"] == "pan_number")
-    assert addr["effective_value"] == "new addr"
-    assert addr["is_modified"] is True
-    assert addr["reviewed"] is True
-    assert pan["effective_value"] == "ABCDE1234F"
-    assert pan["is_modified"] is False
-    assert pan["reviewed"] is True
-
-
-def _resolve(conn, tenant_id, journey_id, finding_id, decisions):
-    """Call the resolve handler directly (bypassing FastAPI DI)."""
-    from audit_core.uc03_manual_verification import (
-        ResolveManualVerificationCommand,
-        resolve_manual_verification,
-    )
-
-    class _State:
-        correlation_id = "test-corr"
-
-    class _Req:
-        def __init__(self) -> None:
-            self.headers: dict = {}
-            self.state = _State()
-
-    class _Principal:
-        subject = "pc-mv-test"
-
-    class _Auth:
-        def check_user_permission(self, **_):
-            class _D:
-                allowed = True
-
-            return _D()
-
-    return resolve_manual_verification(
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        finding_id=finding_id,
-        command=ResolveManualVerificationCommand(decisions=decisions),
-        request=_Req(),
-        human_principal=_Principal(),
-        authorization_client=_Auth(),
-        connection=conn,
-    )
+    ).scalar_one()
+    assert status == "RESOLVED"
