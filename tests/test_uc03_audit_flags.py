@@ -488,11 +488,13 @@ def test_review_queue_summary_counts_manual_verification_separately_from_data_ga
                 INSERT INTO auditcore.audit_findings (
                     tenant_id, journey_id, finding_type_code, severity,
                     finding_status, title, stage_code, origin_kind,
-                    origin_role_snapshot, rule_key, blocking_completion
+                    origin_role_snapshot, rule_key, blocking_completion,
+                    finding_class, owner_role_code
                 ) VALUES (
                     :tenant_id, :journey_id, 'MANUAL_VERIFICATION', 'LOW',
                     'OPEN', 'Low-confidence extracted field', 'BOOKING', 'MACHINE',
-                    'SYSTEM', 'MANUAL_VERIFICATION:BOOKING:aadhaar_card', false
+                    'SYSTEM', 'MANUAL_VERIFICATION:BOOKING:aadhaar_card', false,
+                    'DATA_GAP', 'PC'
                 )
                 """
             ),
