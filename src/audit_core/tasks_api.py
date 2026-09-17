@@ -47,10 +47,14 @@ class TaskCancelInput(BaseModel):
 class TaskCompleteInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    # PC_VERIFY_UNRECOGNIZED_DOCUMENT only today: 'CORRECT' (DI just
-    # couldn't classify it, dismiss) or 'INCORRECT' (wrong document,
-    # soft-delete it). Every other task_type ignores this field entirely --
-    # optional so their existing no-body completion calls keep working.
+    # PC_VERIFY_UNRECOGNIZED_DOCUMENT: 'CORRECT' (DI just couldn't classify
+    # it, dismiss) or 'INCORRECT' (wrong document, soft-delete it).
+    # WRONG_DOCUMENT_REVIEW reuses the same vocabulary: 'CORRECT' (this
+    # check's fuzzy name match under-scored a legitimate variant, release
+    # the hold) or 'INCORRECT' (genuinely the wrong document, void it and
+    # ask for a reupload). Every other task_type ignores this field
+    # entirely -- optional so their existing no-body completion calls keep
+    # working.
     outcome: str | None = None
 
 
@@ -223,12 +227,16 @@ def complete_task(
         permission="audit.work.update",
     )
 
+    from audit_core.uc03_customer_identity_consistency import (
+        TASK_TYPE as _WRONG_DOCUMENT_TASK_TYPE,
+    )
     from audit_core.uc03_document_unrecognized import (
         TASK_TYPE as _DOCUMENT_VERIFICATION_TASK_TYPE,
     )
 
+    _outcome_required_task_types = {_DOCUMENT_VERIFICATION_TASK_TYPE, _WRONG_DOCUMENT_TASK_TYPE}
     outcome = (payload.outcome or "").strip().upper() if payload else ""
-    if task["task_type"] == _DOCUMENT_VERIFICATION_TASK_TYPE and outcome not in _DOCUMENT_VERIFICATION_OUTCOMES:
+    if task["task_type"] in _outcome_required_task_types and outcome not in _DOCUMENT_VERIFICATION_OUTCOMES:
         raise AuditCoreError(
             error_code="VAC-VAL-007",
             status_code=400,
@@ -247,6 +255,9 @@ def complete_task(
         # flags.py::act_on_flag's own special cases. Every other task_type
         # completes exactly as before. Cancelling needs no equivalent hook
         # in cancel_task below -- neither side effect has anything to undo.
+        from audit_core.uc03_customer_identity_consistency import (
+            apply_wrong_document_verification,
+        )
         from audit_core.uc03_document_field_corrections import (
             TASK_TYPE as _FIELD_CORRECTION_TASK_TYPE,
         )
@@ -288,6 +299,18 @@ def complete_task(
                 stage_code=task["process_area"],
                 di_document_id=UUID(str(document_payload["diDocumentId"])),
                 outcome=outcome,
+            )
+        elif task["task_type"] == _WRONG_DOCUMENT_TASK_TYPE:
+            document_payload = task["task_payload"] or {}
+            apply_wrong_document_verification(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=task["journey_id"],
+                stage_code=task["process_area"],
+                di_document_id=UUID(str(document_payload["diDocumentId"])),
+                outcome=outcome,
+                actor_id=principal.subject,
+                correlation_id=get_correlation_id(request),
             )
         response = _response(
             get_workflow_task(connection, tenant_id=tenant_id, workflow_task_id=task_id)

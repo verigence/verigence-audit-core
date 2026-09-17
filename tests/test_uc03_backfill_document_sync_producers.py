@@ -121,10 +121,12 @@ def test_backfill_raises_wrong_document_for_an_old_journey(seeded_tenant) -> Non
 
     with engine.begin() as c:
         c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        # WRONG_DOCUMENT moved off Audit onto a WRONG_DOCUMENT_REVIEW Task
+        # (audit-core#306) -- see uc03_customer_identity_consistency.py.
         count = c.execute(
-            text("SELECT count(*) FROM auditcore.audit_findings "
-                 "WHERE tenant_id=:t AND journey_id=:j AND finding_type_code='WRONG_DOCUMENT' "
-                 "AND finding_status IN ('OPEN','ACKNOWLEDGED')"),
+            text("SELECT count(*) FROM auditcore.workflow_tasks "
+                 "WHERE tenant_id=:t AND journey_id=:j AND task_type='WRONG_DOCUMENT_REVIEW' "
+                 "AND task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT')"),
             {"t": tenant_id, "j": journey_id},
         ).scalar_one()
     assert count == 1
@@ -166,18 +168,22 @@ def test_backfill_is_idempotent_on_rerun(seeded_tenant) -> None:
     second = backfill.backfill_document_sync_producers_for_tenant(engine, tenant_id=tenant_id)
     # "raised" reports the mismatch still being true on this run, same as
     # every other producer's own convention (see uc03_customer_identity_
-    # consistency.py) -- it is not "raised" in the sense of "newly inserted".
-    # The real idempotency guarantee is _machine_flag's own: re-running
-    # never creates a second row for the same still-open rule_key.
+    # consistency.py) -- it is not "raised" in the sense of "newly created".
+    # The real idempotency guarantee is the producer's own effect_key
+    # pre-check: re-running never creates a second Task for the same
+    # still-open rule_key.
     assert second["identityFindingsRaised"] == 1
     assert second["journeysFailed"] == []
 
     with engine.begin() as c:
         c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        # This is the receipt-vs-dealer check specifically (dealer_receipt's
+        # own dealer_name field) -- WRONG_DOCUMENT_DEALER_NOTICE, not the
+        # customer-name variant's WRONG_DOCUMENT_REVIEW.
         count = c.execute(
-            text("SELECT count(*) FROM auditcore.audit_findings "
-                 "WHERE tenant_id=:t AND journey_id=:j AND finding_type_code='WRONG_DOCUMENT' "
-                 "AND finding_status IN ('OPEN','ACKNOWLEDGED')"),
+            text("SELECT count(*) FROM auditcore.workflow_tasks "
+                 "WHERE tenant_id=:t AND journey_id=:j AND task_type='WRONG_DOCUMENT_DEALER_NOTICE' "
+                 "AND task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT')"),
             {"t": tenant_id, "j": journey_id},
         ).scalar_one()
     assert count == 1

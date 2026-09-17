@@ -654,6 +654,8 @@ _TASK_TITLE = {
     "FIELD_CORRECTION_REVIEW": "Review proposed field correction",
     "MANUAL_VERIFICATION_REVIEW": "Verify low-confidence fields",
     "DUPLICATE_RECEIPT_NOTICE": "Duplicate receipt -- won't be counted",
+    "WRONG_DOCUMENT_REVIEW": "Verify customer name mismatch",
+    "WRONG_DOCUMENT_DEALER_NOTICE": "Receipt dealer name mismatch",
 }
 
 # AUTO_SELF_SERVE's generic title tells a PC nothing about what to actually

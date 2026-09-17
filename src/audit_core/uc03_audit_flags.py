@@ -1591,6 +1591,14 @@ def act_on_flag(
         # hold to resolve; the sibling receipt-vs-dealer check (three
         # segments, "WRONG_DOCUMENT:DEALER:{document_id}") is a narrower
         # question with nothing to release or reject.
+        #
+        # LEGACY PATH as of 2026-09-17: the producer no longer raises new
+        # WRONG_DOCUMENT findings -- it raises a WRONG_DOCUMENT_REVIEW /
+        # WRONG_DOCUMENT_DEALER_NOTICE Task instead, completed with the
+        # same reject_wrong_document / release_wrong_document_hold calls
+        # from tasks_api.py::complete_task. This hook stays so a Team Lead
+        # can still act on a finding raised before that move. Safe to
+        # delete once no tenant has one of these findings open any longer.
         if row["finding_type_code"] == "WRONG_DOCUMENT":
             rule_parts = str(row["rule_key"] or "").split(":")
             if len(rule_parts) == 2:
