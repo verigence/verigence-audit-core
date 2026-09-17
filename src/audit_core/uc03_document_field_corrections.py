@@ -345,10 +345,13 @@ def submit_field_correction(
             title="Document not found",
             detail="This document is not on this journey's Booking/Delivery capture.",
         )
-    needs_review = requires_pc_review(payload.confidenceScore)
+    # requires_pc_review returns True for a LOW-confidence field (self-serve,
+    # apply immediately -- see module docstring); a >=90% field needs the
+    # opposite, TL-adjudicated treatment.
+    needs_adjudication = requires_pc_review(payload.confidenceScore) is False
 
     def execute() -> dict[str, Any]:
-        if needs_review:
+        if needs_adjudication:
             task_id = create_workflow_task(
                 connection,
                 tenant_id=tenant_id,

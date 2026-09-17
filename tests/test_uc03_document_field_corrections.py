@@ -9,9 +9,9 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-from audit_core.dependencies import get_human_principal
+from audit_core.dependencies import get_human_principal, get_principal
 from audit_core.main import app
-from audit_core.security import HumanPrincipal
+from audit_core.security import HumanPrincipal, Principal
 from audit_core.security_authorization import (
     SecurityAuthorizationDecision,
     get_security_authorization_client,
@@ -170,6 +170,15 @@ def correction_setup():
 
     active_actor = {"id": actors["PC"]}
     app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=active_actor["id"])
+    # tasks_api.py's complete/cancel actions depend on get_principal, not
+    # get_human_principal -- a separate dependency (see
+    # test_uc03_model_selection_corrections.py's own fixture for the same
+    # requirement on the exact same Complete/Cancel actions).
+    app.dependency_overrides[get_principal] = lambda: Principal(
+        subject=active_actor["id"],
+        tenant_id=tenant_id,
+        permissions=("audit.work.read", "audit.work.update", "audit.work.manage"),
+    )
     app.dependency_overrides[get_security_authorization_client] = lambda: AllowedAuthorization()
     try:
         yield {
@@ -182,6 +191,7 @@ def correction_setup():
         }
     finally:
         app.dependency_overrides.pop(get_human_principal, None)
+        app.dependency_overrides.pop(get_principal, None)
         app.dependency_overrides.pop(get_security_authorization_client, None)
         engine.dispose()
 
