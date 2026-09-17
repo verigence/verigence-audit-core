@@ -37,12 +37,19 @@ noise, not signal):
     matching, lower threshold -- addresses are long and OCR-noisy) without
     requiring an exact pincode                                -- Weak
 
-Given a matched pair, the one whose minimum-booking-amount is currently
-CONFIRMED (no open BK_MIN_BOOKING_AMOUNT_NOT_MET finding) is treated as the
-original; if both or neither qualify, the earlier-created journey is the
-original -- a real payment commitment is the strongest signal of intent,
-timing is the fallback. The finding is raised on the duplicate, not the
-original, naming which journey it is believed to duplicate.
+Given a matched pair, whichever journey actually reached its minimum
+booking amount EARLIER holds the booking -- not just "confirmed or not":
+``journey_stage_states.booking_confirm_date`` (set by
+``evaluate_minimum_booking_payment`` to the receipt date on which the
+running total first met the minimum, not the date it happened to be
+evaluated) is the real-world "who paid first" signal, compared directly
+between the two journeys. If only one side has reached its minimum at
+all, that one holds it outright. If neither has, the earlier-CREATED
+journey is the fallback -- timing of intent is weaker evidence than
+timing of an actual payment commitment, but it's what's left when neither
+side has paid anything toward the minimum yet. The finding is raised on
+the journey that does NOT hold the booking, naming which journey it is
+believed to duplicate.
 
 ``sync_duplicate_booking_detection`` is the producer: idempotent, self-heals
 (a pairing that no longer matches resolves the finding), never raises.
@@ -66,7 +73,6 @@ logger = logging.getLogger(__name__)
 _FINDING_TYPE = "DUPLICATE_BOOKING"
 _RULE_PREFIX = "DUPLICATE_BOOKING"
 _STAGE = "BOOKING"
-_MIN_BOOKING_AMOUNT_RULE = "BK_MIN_BOOKING_AMOUNT_NOT_MET"
 
 _KYC_DOCUMENT_TYPES: tuple[str, ...] = ("aadhaar", "pan_card", "customer_kyc")
 _NAME_FIELDS: dict[str, str] = {
@@ -103,6 +109,35 @@ _SEVERITY_BY_BASIS: dict[str, str] = {
     "MOBILE": "MEDIUM",
     "SURNAME_AND_PINCODE": "LOW",
     "SIMILAR_ADDRESS": "LOW",
+}
+
+# A reviewer's real question isn't just "which basis matched" but "how
+# likely is this to actually be the same person" -- a deterministic
+# confidence estimate per basis, not a model score (there's no training
+# data for this), reflecting how rarely each signal collides by chance:
+# PAN/Aadhaar are near-unique identifiers; a relative's name repeated as
+# another booking's own customer name is a very specific coincidence;
+# mobile/GST can legitimately be shared within a household or business;
+# surname+pincode or a merely-similar address are the weakest signals,
+# common enough to collide between unrelated people.
+_CONFIDENCE_PERCENT_BY_BASIS: dict[str, int] = {
+    "PAN": 99,
+    "AADHAAR": 99,
+    "CUSTOMER_MATCHES_RELATIVE": 90,
+    "NAME_AND_ADDRESS": 85,
+    "GST": 75,
+    "MOBILE": 70,
+    "SURNAME_AND_PINCODE": 40,
+    "SIMILAR_ADDRESS": 35,
+}
+# One-to-one with _SEVERITY_BY_BASIS's own tiers -- kept as an explicit,
+# separate mapping (not derived inline) so a reviewer-facing label never
+# silently drifts if the internal severity tiers used for SLA routing
+# ever change independently of this.
+_CONFIDENCE_LABEL_BY_SEVERITY: dict[str, str] = {
+    "CRITICAL": "HIGH",
+    "MEDIUM": "MEDIUM",
+    "LOW": "LOW",
 }
 
 _BASIS_LABEL: dict[str, str] = {
@@ -354,27 +389,21 @@ def _match_basis(signals: dict[str, Any], candidate: dict[str, Any]) -> str | No
     return None
 
 
-def _min_booking_amount_confirmed(
-    connection: Connection, *, tenant_id: str, journey_id: UUID
-) -> bool:
-    """True when this journey has no OPEN/ACKNOWLEDGED
-    BK_MIN_BOOKING_AMOUNT_NOT_MET finding -- the minimum booking payment
-    has been made (or the rule hasn't fired for some other reason, e.g. no
-    minimum configured; either way, not a currently-flagged shortfall)."""
-    return (
-        connection.execute(
-            text(
-                """
-                SELECT 1 FROM auditcore.audit_findings
-                WHERE tenant_id = :tenant_id AND journey_id = :journey_id
-                  AND rule_key = :rule_key AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
-                LIMIT 1
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id, "rule_key": _MIN_BOOKING_AMOUNT_RULE},
-        ).first()
-        is None
-    )
+def _booking_confirm_date(connection: Connection, *, tenant_id: str, journey_id: UUID) -> Any:
+    """The receipt date on which this journey's running Booking payments
+    first met the minimum booking amount -- set by
+    ``evaluate_minimum_booking_payment`` onto
+    ``journey_stage_states.booking_confirm_date``. None when the minimum
+    hasn't been reached yet (or no Booking stage row exists at all)."""
+    return connection.execute(
+        text(
+            """
+            SELECT booking_confirm_date FROM auditcore.journey_stage_states
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id AND stage_code = 'BOOKING'
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalar_one_or_none()
 
 
 def sync_duplicate_booking_detection(
@@ -402,26 +431,41 @@ def sync_duplicate_booking_detection(
             if basis is None:
                 continue
 
-            this_confirmed = _min_booking_amount_confirmed(
+            this_confirm_date = _booking_confirm_date(
                 connection, tenant_id=tenant_id, journey_id=journey_id
             )
-            other_confirmed = _min_booking_amount_confirmed(
+            other_confirm_date = _booking_confirm_date(
                 connection, tenant_id=tenant_id, journey_id=candidate["journey_id"]
             )
-            if this_confirmed and not other_confirmed:
+            if this_confirm_date and other_confirm_date:
+                if this_confirm_date != other_confirm_date:
+                    is_original = this_confirm_date < other_confirm_date
+                    originality_basis = "EARLIER_PAYMENT_DATE"
+                else:
+                    # Same receipt date on both sides -- fall through to the
+                    # created_at/journey_id tiebreak below, same as neither
+                    # having paid at all.
+                    is_original = (this_journey_created, str(journey_id)) <= (
+                        candidate["created_at_utc"], str(candidate["journey_id"])
+                    )
+                    originality_basis = "CREATED_AT_TIEBREAK"
+            elif this_confirm_date and not other_confirm_date:
                 is_original = True
-            elif other_confirmed and not this_confirmed:
+                originality_basis = "ONLY_THIS_SIDE_PAID"
+            elif other_confirm_date and not this_confirm_date:
                 is_original = False
+                originality_basis = "ONLY_OTHER_SIDE_PAID"
             else:
-                # created_at_utc alone can tie -- two journeys created in the
-                # same transaction (common in tests, possible in a real fast
-                # double-booking) share Postgres's transaction-start now().
-                # journey_id as a stable secondary key guarantees exactly one
-                # side of the pair is picked, consistently regardless of
+                # Neither side has reached its minimum booking amount yet --
+                # created_at_utc alone can tie (two journeys created in the
+                # same transaction share Postgres's transaction-start now()),
+                # so journey_id as a stable secondary key guarantees exactly
+                # one side of the pair is picked, consistently regardless of
                 # which journey's own sync triggered this check.
                 is_original = (this_journey_created, str(journey_id)) <= (
                     candidate["created_at_utc"], str(candidate["journey_id"])
                 )
+                originality_basis = "CREATED_AT_TIEBREAK"
 
             if is_original:
                 continue  # the finding belongs on the duplicate, not this journey
@@ -446,6 +490,11 @@ def sync_duplicate_booking_detection(
                 safe_payload={
                     "matchBasis": basis,
                     "believedOriginalJourneyId": str(candidate["journey_id"]),
+                    "originalityBasis": originality_basis,
+                    "thisBookingConfirmDate": this_confirm_date,
+                    "holderBookingConfirmDate": other_confirm_date,
+                    "matchConfidencePercent": _CONFIDENCE_PERCENT_BY_BASIS[basis],
+                    "matchConfidenceLabel": _CONFIDENCE_LABEL_BY_SEVERITY[_SEVERITY_BY_BASIS[basis]],
                 },
             )
             raised += 1
