@@ -154,24 +154,36 @@ def test_missing_document_finding_self_heals_once_the_document_lands(delivery_jo
     assert _finding_status(c, rule_key="DL_V2_REQUIRED_DOCUMENT_MISSING:accessory_invoice_dms") == "RESOLVED"
 
 
-def test_processing_failed_finding_self_heals_once_the_document_recovers(delivery_journey) -> None:
+def _processing_failure_task_status(c, *, document_id) -> str | None:
+    return c.execute(
+        text(
+            "SELECT task_status FROM auditcore.workflow_tasks "
+            "WHERE tenant_id=:t AND journey_id=:j AND task_type='PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE' "
+            "AND effect_key LIKE :pattern"
+        ),
+        {"t": c.tenant_id, "j": c.journey_id, "pattern": f"%{document_id}"},
+    ).scalar_one_or_none()
+
+
+def test_processing_failed_raises_a_task_not_a_finding_and_self_heals(delivery_journey) -> None:
+    """A document that failed processing isn't a rule breach -- no Audit
+    Finding at all, only a standalone task for PC to re-upload it."""
     c = delivery_journey
     document_id = uuid4()
     _capture_document(c, di_document_id=document_id, requirement_key="rto_challan", capture_status="FAILED")
 
-    raised, _resolved = schedule_delivery_document_checkpoint(
+    schedule_delivery_document_checkpoint(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="test",
     )
-    assert raised
-    assert _finding_status(c, rule_key=f"DL_V2_DOCUMENT_PROCESSING_FAILED:{document_id}") == "OPEN"
+    assert _finding_status(c, rule_key=f"DL_V2_DOCUMENT_PROCESSING_FAILED:{document_id}") is None
+    assert _processing_failure_task_status(c, document_id=document_id) == "READY"
 
     _set_capture_status(c, di_document_id=document_id, capture_status="CLASSIFIED")
 
-    _raised, resolved = schedule_delivery_document_checkpoint(
+    schedule_delivery_document_checkpoint(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="test",
     )
-    assert resolved
-    assert _finding_status(c, rule_key=f"DL_V2_DOCUMENT_PROCESSING_FAILED:{document_id}") == "RESOLVED"
+    assert _processing_failure_task_status(c, document_id=document_id) == "CANCELLED"
 
 
 def test_raise_new_false_never_raises_but_still_resolves(delivery_journey) -> None:
