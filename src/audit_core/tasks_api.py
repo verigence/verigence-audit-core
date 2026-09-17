@@ -247,6 +247,12 @@ def complete_task(
         # flags.py::act_on_flag's own special cases. Every other task_type
         # completes exactly as before. Cancelling needs no equivalent hook
         # in cancel_task below -- neither side effect has anything to undo.
+        from audit_core.uc03_document_field_corrections import (
+            TASK_TYPE as _FIELD_CORRECTION_TASK_TYPE,
+        )
+        from audit_core.uc03_document_field_corrections import (
+            apply_confirmed_field_correction,
+        )
         from audit_core.uc03_document_unrecognized import (
             apply_unrecognized_document_verification,
         )
@@ -264,6 +270,14 @@ def complete_task(
                 journey_id=task["journey_id"],
                 workflow_task_id=task_id,
                 correlation_id=get_correlation_id(request),
+            )
+        elif task["task_type"] == _FIELD_CORRECTION_TASK_TYPE:
+            apply_confirmed_field_correction(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=task["journey_id"],
+                workflow_task_id=task_id,
+                actor_id=principal.subject,
             )
         elif task["task_type"] == _DOCUMENT_VERIFICATION_TASK_TYPE:
             document_payload = task["task_payload"] or {}

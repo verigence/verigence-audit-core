@@ -1557,22 +1557,25 @@ def act_on_flag(
         next_status = verdict["next_status"]
         # Unified Documents review (2026-09-13): a Confirm-Breach verdict on a
         # DI_VALUE_CORRECTION_PROPOSED finding actually applies the proposed
-        # value -- the one place this generic handler has a finding-type-
-        # specific side effect, deliberately narrow (see
-        # uc03_document_field_corrections.py's module docstring for why it
-        # isn't a parallel approval system). Mark-False-Positive needs no
-        # extra step: the finding resolves and the original DI value stands.
-        # Local import to avoid a circular import (that module imports this
-        # one's _scope/_finding/_flag_view for its own propose endpoint).
+        # value. LEGACY PATH as of 2026-09-17
+        # (uc03_document_field_corrections.py moved this whole flow onto the
+        # Task Queue -- see that module's docstring and migration
+        # 0106_field_correction_as_task) -- a NEW field correction never
+        # raises this finding type any more; this hook only still fires for
+        # a finding raised before that change. Kept, not removed, purely so
+        # an already-open one keeps resolving the way it always did. Safe
+        # to delete once no tenant has one of these findings open any
+        # longer. Local import to avoid a circular import (that module
+        # imports this one's _scope for its own propose endpoint).
         if (
             payload.action == "CONFIRM_BREACH"
             and row["finding_type_code"] == "DI_VALUE_CORRECTION_PROPOSED"
         ):
             from audit_core.uc03_document_field_corrections import (
-                apply_confirmed_field_correction,
+                apply_confirmed_field_correction_legacy,
             )
 
-            apply_confirmed_field_correction(
+            apply_confirmed_field_correction_legacy(
                 connection,
                 tenant_id=tenant_id,
                 journey_id=journey_id,
