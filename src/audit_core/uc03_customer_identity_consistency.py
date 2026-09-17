@@ -419,7 +419,7 @@ def apply_wrong_document_verification(
             )
 
             materialize_machine_booking_values(
-                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                connection, tenant_id=tenant_id, journey_id=journey_id,
             )
 
 
