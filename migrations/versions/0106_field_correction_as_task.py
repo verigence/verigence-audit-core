@@ -50,6 +50,14 @@ _TABLE = "auditcore.journey_document_field_correction_proposals"
 
 def upgrade() -> None:
     conn = op.get_bind()
+    # The old PK's own constraint implies NOT NULL on audit_finding_id --
+    # that has to go first, or DROP NOT NULL below fails with "column
+    # audit_finding_id is in a primary key" (confirmed live in CI).
+    conn.execute(
+        text(
+            f"ALTER TABLE {_TABLE} DROP CONSTRAINT journey_document_field_correction_proposals_pkey"
+        )
+    )
     conn.execute(
         text(
             f"""
@@ -61,13 +69,7 @@ def upgrade() -> None:
         )
     )
     conn.execute(
-        text(
-            f"""
-            ALTER TABLE {_TABLE}
-                DROP CONSTRAINT journey_document_field_correction_proposals_pkey,
-                ADD PRIMARY KEY (tenant_id, correction_id)
-            """
-        )
+        text(f"ALTER TABLE {_TABLE} ADD PRIMARY KEY (tenant_id, correction_id)")
     )
     conn.execute(
         text(
@@ -114,14 +116,18 @@ def downgrade() -> None:
     # such row exists (matching this repo's own downgrade conventions,
     # which favor a clean schema revert over silent data loss).
     conn.execute(
+        text(f"ALTER TABLE {_TABLE} DROP CONSTRAINT journey_document_field_correction_proposals_pkey")
+    )
+    conn.execute(
         text(
             f"""
             ALTER TABLE {_TABLE}
-                DROP CONSTRAINT journey_document_field_correction_proposals_pkey,
-                ADD PRIMARY KEY (tenant_id, audit_finding_id),
                 ALTER COLUMN audit_finding_id SET NOT NULL,
                 DROP COLUMN workflow_task_id,
                 DROP COLUMN correction_id
             """
         )
+    )
+    conn.execute(
+        text(f"ALTER TABLE {_TABLE} ADD PRIMARY KEY (tenant_id, audit_finding_id)")
     )
