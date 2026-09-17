@@ -646,15 +646,13 @@ def _tasks_to_items(
     return out
 
 
-# Every self-serve auto-spawn (including manual verification, which is
-# itself just a DOCUMENT_GAP finding) shares task_type AUTO_SELF_SERVE --
-# there's no separate manual-verification task_type today.
 _TASK_TITLE = {
     "AUTO_SELF_SERVE": "Resolve data / document gap",
     "TL_TAKE_ACTION": "Take Action requested",
     "PC_VERIFY_UNRECOGNIZED_DOCUMENT": "Verify unrecognized document",
     "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE": "Re-upload a document that failed processing",
     "FIELD_CORRECTION_REVIEW": "Review proposed field correction",
+    "MANUAL_VERIFICATION_REVIEW": "Verify low-confidence fields",
 }
 
 # AUTO_SELF_SERVE's generic title tells a PC nothing about what to actually

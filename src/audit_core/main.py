@@ -121,9 +121,6 @@ from audit_core.uc03_journey_overview_projection import (
     router as uc03_journey_overview_projection_router,
 )
 from audit_core.uc03_journey_search import router as uc03_journey_search_router
-from audit_core.uc03_manual_verification import (
-    router as uc03_manual_verification_router,
-)
 from audit_core.uc03_model_resolution import router as uc03_model_resolution_router
 from audit_core.uc03_model_selection_corrections import (
     router as uc03_model_selection_corrections_router,
@@ -301,7 +298,6 @@ def create_app() -> FastAPI:
     application.include_router(uc03_rule_status_report_router)
     application.include_router(uc03_run_all_rules_router)
     application.include_router(uc03_declarative_rule_authoring_router)
-    application.include_router(uc03_manual_verification_router)
     application.include_router(readiness_router)
     application.include_router(project_activation_router)
     application.include_router(mahindra_upload_state_router)
