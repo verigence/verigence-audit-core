@@ -260,6 +260,21 @@ def _minimal_booking_journey(connection, *, tenant_id: str, suffix: str) -> str:
     """A journey with no document_requirement_profile trigger wiring --
     requirements are inserted directly, for a focused test of one
     requirement's applicability resolution rather than the whole seed."""
+    category_id = connection.execute(
+        text("INSERT INTO auditcore.product_categories (category_code, category_name) "
+             "VALUES (:c, 'V') RETURNING product_category_id"),
+        {"c": f"BKC-CAT-{suffix}"},
+    ).scalar_one()
+    oem_id = connection.execute(
+        text("INSERT INTO auditcore.oems (oem_code, oem_name) VALUES (:c, 'O') RETURNING oem_id"),
+        {"c": f"BKC-OEM-{suffix}"},
+    ).scalar_one()
+    connection.execute(
+        text("INSERT INTO auditcore.projects (tenant_id, project_code, project_name, oem_id, "
+             "product_category_id, effective_start_date) "
+             "VALUES (:t, :pc, 'BKC', :o, :cat, CURRENT_DATE)"),
+        {"t": tenant_id, "pc": f"BKC-{suffix}", "o": oem_id, "cat": category_id},
+    )
     dealer_id = connection.execute(
         text("INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
              "VALUES (:t, :c, 'D') RETURNING dealer_id"),
