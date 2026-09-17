@@ -468,10 +468,12 @@ def test_review_queue_never_duplicates_a_self_serve_gap_as_its_own_task(audit_se
     assert kinds_by_flag[doc_gap["flagId"]] == "FINDING"
     assert not [item for item in with_tasks if item["itemKind"] == "EXECUTION_TASK"]
 
-    summary_default = _client().get(f"{_queue(audit_setup)}/summary").json()
-    assert summary_default["byKind"] == {"FINDING": 1}
+    # The summary endpoint's byKind counts must reflect the same exclusion --
+    # previously this inflated the Task Queue KPI tiles by exactly the
+    # number of self-serve gaps present (each counted as both a FINDING and
+    # an EXECUTION_TASK).
     summary_with_tasks = _client().get(f"{_queue(audit_setup)}/summary?includeTasks=true").json()
-    assert summary_with_tasks["byKind"] == {"FINDING": 1, "EXECUTION_TASK": 1}
+    assert summary_with_tasks["byKind"] == {"FINDING": 1}
 
 
 def test_pc_cannot_raise_a_flag(audit_setup):
