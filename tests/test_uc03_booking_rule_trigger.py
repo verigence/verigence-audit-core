@@ -380,7 +380,12 @@ def test_corporate_conditional_requirement_still_flagged_when_discount_actually_
         assert "BK_CONDITIONAL_DOCS_ADDRESSED" in by_rule
         assert by_rule["BK_CONDITIONAL_DOCS_ADDRESSED"].requirement_keys == ("gst_certificate",)
         # The description now names the actual outstanding requirement
-        # instead of a generic "one or more" sentence.
-        assert "gst_certificate" in by_rule["BK_CONDITIONAL_DOCS_ADDRESSED"].description
+        # instead of a generic "one or more" sentence -- by its real
+        # display label (document_capture_v2_requirement_policy already
+        # has a seeded row for gst_certificate), not the raw key.
+        assert "Outstanding:" in by_rule["BK_CONDITIONAL_DOCS_ADDRESSED"].description
+        assert by_rule["BK_CONDITIONAL_DOCS_ADDRESSED"].description != (
+            "One or more applicable conditional Booking requirements are not fully satisfied."
+        )
 
     engine.dispose()
