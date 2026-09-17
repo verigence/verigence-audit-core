@@ -252,7 +252,18 @@ def _bulk_ensure_variants(
     connection: Connection, *, entries: list[tuple[UUID, str, str, dict[str, Any]]]
 ) -> dict[tuple[UUID, str], UUID]:
     """(model_id, variant_code) -> variant_id for every ``(model_id, code, display_name,
-    attrs)`` entry. One SELECT across every model involved, one batched INSERT."""
+    attrs)`` entry. One SELECT across every model involved, one batched INSERT for new
+    variants, and one batched UPDATE refreshing ``attributes`` on already-existing ones.
+
+    The UPDATE matters: re-uploading the same OEM masters file (a genuinely routine
+    admin action, not a one-off) must actually refresh a variant's attributes when the
+    parser starts extracting something it didn't before -- e.g. ``trim`` was parsed by
+    oem_master_parsers.py from day one but never included in this dict until now, so
+    every already-ingested variant needs that field backfilled, not just newly-added
+    ones. Without this, a re-upload silently keeps serving the stale attributes
+    forever, since variant_code already existed and the old insert-only path never
+    touched it again.
+    """
     model_ids = list({model_id for model_id, *_ in entries})
     if not model_ids:
         return {}
@@ -267,18 +278,22 @@ def _bulk_ensure_variants(
     id_by_key: dict[tuple[UUID, str], UUID] = {(row[0], row[1]): row[2] for row in existing}
 
     to_insert: dict[tuple[UUID, str], dict[str, Any]] = {}
+    to_update: dict[tuple[UUID, str], dict[str, Any]] = {}
     for model_id, code, display_name, attrs in entries:
         key = (model_id, code)
-        if key not in id_by_key and key not in to_insert:
-            to_insert[key] = {
-                "model_id": model_id,
-                "variant_code": code,
-                "variant_name": display_name,
-                "fuel_powertrain": attrs.get("fuel"),
-                "transmission": attrs.get("transmission"),
-                "body_type": attrs.get("bodyType"),
-                "attributes": json.dumps(attrs),
-            }
+        row = {
+            "model_id": model_id,
+            "variant_code": code,
+            "variant_name": display_name,
+            "fuel_powertrain": attrs.get("fuel"),
+            "transmission": attrs.get("transmission"),
+            "body_type": attrs.get("bodyType"),
+            "attributes": json.dumps(attrs),
+        }
+        if key in id_by_key:
+            to_update.setdefault(key, row)
+        elif key not in to_insert:
+            to_insert[key] = row
 
     inserted = _chunked_insert_returning(
         connection,
@@ -293,6 +308,21 @@ def _bulk_ensure_variants(
     )
     for row in inserted:
         id_by_key[(row["model_id"], row["variant_code"])] = row["variant_id"]
+
+    for key, row in to_update.items():
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.product_variants
+                SET fuel_powertrain = :fuel_powertrain,
+                    transmission = :transmission,
+                    body_type = :body_type,
+                    attributes = CAST(:attributes AS jsonb)
+                WHERE variant_id = :variant_id
+                """
+            ),
+            {**row, "variant_id": id_by_key[key]},
+        )
 
     return id_by_key
 
@@ -429,6 +459,7 @@ def ingest_price_list(
             _variant_code(row),
             _variant_display(row),
             {
+                "trim": row.trim,
                 "fuel": row.fuel,
                 "transmission": row.transmission,
                 "drive": row.drive,

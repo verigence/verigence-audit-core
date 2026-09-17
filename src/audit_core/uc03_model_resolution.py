@@ -241,10 +241,12 @@ def _sku_rows_for_version(
     excludes the corporate line, ``master_total_corporate`` excludes the individual
     line — the resolver matches against whichever the buyer's basis selects.
 
-    ``fuel_powertrain``/``transmission``/``drive``/``seater`` are the variant's own
-    already-clean structured attributes (populated verbatim from the OEM's price-list
-    columns at ingestion) — unused by ``_match``'s whole-string comparison, but read
-    here for ``uc03_model_attribute_matching``'s decomposition fallback.
+    ``fuel_powertrain``/``transmission``/``drive``/``seater``/``trim`` are the
+    variant's own already-clean structured attributes (populated verbatim from
+    the OEM's price-list columns at ingestion) — unused by ``_match``'s
+    whole-string comparison, but read here for
+    ``uc03_model_attribute_matching``'s decomposition fallback and for the
+    Modify Model picker's own Trim dropdown (uc03ModelResolution.ts).
     """
     rows = connection.execute(
         text(
@@ -258,6 +260,7 @@ def _sku_rows_for_version(
                    pv.transmission,
                    pv.attributes ->> 'drive'  AS drive,
                    pv.attributes ->> 'seater' AS seater,
+                   pv.attributes ->> 'trim'   AS trim,
                    SUM(pli.standard_amount) FILTER (WHERE pli.component_key <> 'REGISTRATION_CORPORATE')
                                                                                 AS master_total_individual,
                    SUM(pli.standard_amount) FILTER (WHERE pli.component_key <> 'REGISTRATION_INDIVIDUAL')
@@ -276,7 +279,7 @@ def _sku_rows_for_version(
               AND pv.is_active = true
             GROUP BY s.product_sku_id, s.sku_code, pm.model_name, pv.variant_name, c.colour_name,
                      pv.fuel_powertrain, pv.transmission,
-                     pv.attributes ->> 'drive', pv.attributes ->> 'seater'
+                     pv.attributes ->> 'drive', pv.attributes ->> 'seater', pv.attributes ->> 'trim'
             """
         ),
         {"tenant_id": tenant_id, "plv": price_list_version_id, "exkey": _EX_SHOWROOM_COMPONENT},
@@ -1234,6 +1237,7 @@ def get_model_catalog(connection: Connection, *, tenant_id: str, journey_id: UUI
                 "transmission": r.get("transmission"),
                 "drive": r.get("drive"),
                 "seater": r.get("seater"),
+                "trim": r.get("trim"),
                 "exShowroomPrice": _to_decimal(r.get("master_ex_showroom")),
                 "totalPrice": _master_total(r, basis),
             }
@@ -1363,6 +1367,7 @@ class ModelCatalogSkuOut(BaseModel):
     transmission: str | None = None
     drive: str | None = None
     seater: str | None = None
+    trim: str | None = None
     exShowroomPrice: Decimal | None = None
     totalPrice: Decimal | None = None
 

@@ -310,7 +310,15 @@ def _seed_price_list(c, skus: list[dict], *, effective_from: str = "CURRENT_DATE
                 "fuel": entry.get("fuel"),
                 "trans": entry.get("transmission"),
                 "attrs": json.dumps(
-                    {k: v for k, v in {"drive": entry.get("drive"), "seater": entry.get("seater")}.items() if v}
+                    {
+                        k: v
+                        for k, v in {
+                            "drive": entry.get("drive"),
+                            "seater": entry.get("seater"),
+                            "trim": entry.get("trim"),
+                        }.items()
+                        if v
+                    }
                 ),
             },
         ).scalar_one()
@@ -439,6 +447,33 @@ def test_integration_get_model_catalog_lists_every_sku_unconditionally(journey) 
     assert variants == {"Z8L", "Z8T"}
     fuels = {sku["fuel"] for sku in catalog["skus"]}
     assert fuels == {"PETROL", "DIESEL"}
+
+
+def test_integration_model_catalog_exposes_trim_distinct_from_variant(journey) -> None:
+    """The masters sheet carries Trim as its own column, separate from the
+    full Variant string -- several distinct trims (e.g. Z2/Z4/Z8 S/Z8T/Z8 L
+    on the same model) can share identical fuel/transmission/drive/seater,
+    so without trim as its own field there's no way to tell them apart
+    short of reading the whole variant string. Confirmed missing live
+    (oem_price_masters.py parsed trim but never persisted it) -- this
+    proves it's now on the catalog."""
+    c = journey
+    _seed_price_list(c, [
+        {"model": "SCORPIO N", "variant": "Z4 G MT 2WD 7 STR - E BS6.2 - New", "trim": "Z4",
+         "fuel": "PETROL", "transmission": "MT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "1400000"}},
+        {"model": "SCORPIO N", "variant": "Z8 S G MT 2WD 7 STR BS6.2 - Refresh", "trim": "Z8 S",
+         "fuel": "PETROL", "transmission": "MT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "1600000"}},
+    ])
+    _set_journey_product(c, "Scorpio N", "Z4 G MT 2WD 7 STR - E BS6.2 - New")
+    _set_commercial(c, "ex_showroom_price", "1400000")
+    mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    catalog = mr.get_model_catalog(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    trims_by_variant = {sku["variantName"]: sku["trim"] for sku in catalog["skus"]}
+    assert trims_by_variant["Z4 G MT 2WD 7 STR - E BS6.2 - New"] == "Z4"
+    assert trims_by_variant["Z8 S G MT 2WD 7 STR BS6.2 - Refresh"] == "Z8 S"
 
 
 def test_integration_resolves_via_ex_showroom_when_total_ambiguous(journey) -> None:

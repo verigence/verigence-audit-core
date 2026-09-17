@@ -122,6 +122,87 @@ def test_price_list_ingest_creates_catalogue_and_resolves_plan(connection) -> No
     assert plan["price_list_code"] == "OEM_NATIVE_PRICE_LIST"
 
 
+def test_price_list_ingest_persists_trim_on_the_variant(connection) -> None:
+    """oem_master_parsers.py has parsed Trim (a distinct masters column, not
+    part of the Variant string) from day one, but oem_price_masters.py never
+    included it in the attrs written to product_variants.attributes --
+    confirmed live: several distinct trims sharing identical fuel/
+    transmission/drive/seater made "Variant" the only disambiguator in the
+    Modify Model picker, with no way to narrow by trim first."""
+    tenant_id = connection.tenant_id
+    project = _project_oem(connection, tenant_id)
+    ingest_price_list(
+        connection, tenant_id=tenant_id, oem_id=project["oem_id"],
+        effective_from=date(2026, 9, 3),
+        parsed=parse_price_list(_price_bytes(("THAR ROXX", "MX1 PMT 2WD", 1_000_000))),
+        actor_id="admin",
+    )
+    trim = connection.execute(
+        text("""
+            SELECT pv.attributes ->> 'trim' FROM auditcore.product_variants pv
+            JOIN auditcore.product_models pm ON pm.model_id = pv.model_id
+            WHERE pm.oem_id = :o AND pv.variant_name = 'MX1 PMT 2WD'
+        """),
+        {"o": project["oem_id"]},
+    ).scalar_one()
+    assert trim == "MX1"
+
+
+def test_reupload_backfills_trim_onto_an_already_ingested_variant(connection) -> None:
+    """A re-upload of the same masters file is a routine admin action, not a
+    one-off -- when the parser starts extracting a field it didn't capture
+    before, an already-ingested variant must pick it up too, not keep
+    serving stale attributes forever just because its variant_code already
+    existed."""
+    tenant_id = connection.tenant_id
+    project = _project_oem(connection, tenant_id)
+    ingest_price_list(
+        connection, tenant_id=tenant_id, oem_id=project["oem_id"],
+        effective_from=date(2026, 9, 3),
+        parsed=parse_price_list(_price_bytes(("THAR ROXX", "MX1 PMT 2WD", 1_000_000))),
+        actor_id="admin",
+    )
+    # Simulate the pre-fix state: strip trim back out, as if this variant had
+    # been ingested before oem_price_masters.py carried it through.
+    connection.execute(
+        text("""
+            UPDATE auditcore.product_variants SET attributes = attributes - 'trim'
+            WHERE variant_id IN (
+                SELECT pv.variant_id FROM auditcore.product_variants pv
+                JOIN auditcore.product_models pm ON pm.model_id = pv.model_id
+                WHERE pm.oem_id = :o AND pv.variant_name = 'MX1 PMT 2WD'
+            )
+        """),
+        {"o": project["oem_id"]},
+    )
+    assert connection.execute(
+        text("""
+            SELECT pv.attributes ->> 'trim' FROM auditcore.product_variants pv
+            JOIN auditcore.product_models pm ON pm.model_id = pv.model_id
+            WHERE pm.oem_id = :o AND pv.variant_name = 'MX1 PMT 2WD'
+        """),
+        {"o": project["oem_id"]},
+    ).scalar_one_or_none() is None
+
+    # Re-upload the exact same file -- same variant_code, so the old
+    # insert-only path would have left it untouched forever.
+    ingest_price_list(
+        connection, tenant_id=tenant_id, oem_id=project["oem_id"],
+        effective_from=date(2026, 10, 1),
+        parsed=parse_price_list(_price_bytes(("THAR ROXX", "MX1 PMT 2WD", 1_100_000))),
+        actor_id="admin",
+    )
+    trim = connection.execute(
+        text("""
+            SELECT pv.attributes ->> 'trim' FROM auditcore.product_variants pv
+            JOIN auditcore.product_models pm ON pm.model_id = pv.model_id
+            WHERE pm.oem_id = :o AND pv.variant_name = 'MX1 PMT 2WD'
+        """),
+        {"o": project["oem_id"]},
+    ).scalar_one()
+    assert trim == "MX1"
+
+
 def test_reupload_supersedes_by_effective_date(connection) -> None:
     tenant_id = connection.tenant_id
     project = _project_oem(connection, tenant_id)
