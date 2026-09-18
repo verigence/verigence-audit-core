@@ -399,10 +399,27 @@ def _discover_requirement_for_callback(
 def _require_callback_applicable(requirement) -> tuple[str, str | None]:
     state, reason = _effective_applicability(requirement)
     if state != "APPLICABLE":
+        # TEMPORARY DIAGNOSTIC (2026-09-18): three specific documents kept
+        # hitting this 409 across dozens of DI retries even after the
+        # process_area gate fix. Surface exactly which requirement/condition
+        # is still stuck and why -- process_area, requirement_key, condition
+        # key/state -- directly in the log line (already wired to include
+        # `detail` as of the same fix) instead of guessing. Revert once found.
+        snapshot = requirement.get("condition_snapshot") or {}
+        detail = (
+            "The supplied requirementRef is not currently applicable to this Booking. "
+            f"process_area={requirement.get('process_area')} "
+            f"requirement_key={requirement.get('requirement_key')} "
+            f"requirement_level={requirement.get('requirement_level')} "
+            f"requirement_status={requirement.get('requirement_status')} "
+            f"applicability_state={state!r} "
+            f"condition_key={snapshot.get('conditionKey') if isinstance(snapshot, dict) else None!r} "
+            f"condition_snapshot={snapshot!r}"
+        )
         raise ConflictError(
             error_code="VAC-CONFLICT-004",
             title="Booking document requirement is not applicable",
-            detail="The supplied requirementRef is not currently applicable to this Booking.",
+            detail=detail,
         )
     return state, reason
 
@@ -497,10 +514,15 @@ def acknowledge_booking_document_link(
         customer_id=customer_id,
     )
     if subject_id is None:
+        # TEMPORARY DIAGNOSTIC (2026-09-18): see the matching note on
+        # _require_callback_applicable above. Revert once found.
         raise ConflictError(
             error_code="VAC-CONFLICT-004",
             title="DI Subject mapping is not ready",
-            detail="Prepare the Booking document upload context before linking a DI document.",
+            detail=(
+                "Prepare the Booking document upload context before linking a DI document. "
+                f"tenant_id={tenant_id} customer_id={customer_id} journey_id={journey_id}"
+            ),
         )
 
     existing_for_document = connection.execute(
