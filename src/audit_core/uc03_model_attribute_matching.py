@@ -184,6 +184,39 @@ def _master_trim_key(row: dict[str, Any], *, oem_code: str) -> str:
     return master.trim_key if master else ""
 
 
+def _master_attributes(row: dict[str, Any], *, oem_code: str) -> _Decomposed:
+    """A master variant row's own fuel/transmission/drive/seater, preferring the
+    masters sheet's own dedicated columns (``fuel_powertrain``/``transmission``/
+    ``drive``/``seater``, populated by ``oem_price_masters.py``) but falling back
+    -- independently, per attribute, same as ``_master_trim_key`` already does for
+    trim alone -- to decomposing the row's own ``variant_name`` for whichever the
+    master left blank.
+
+    Real Mahindra Consolidated Price List exports routinely leave these columns
+    blank per-row even though the header names them: the same information is
+    already carried in the free-text Variant column instead (e.g. "Z8 S G AT 2WD
+    7 STR BS6.2 - Refresh" encodes fuel=G, transmission=AT, drive=2WD, seater=7).
+    Without this fallback, ``match_by_attributes`` below silently skips every
+    blank attribute's check instead of deriving it, degrading matching to
+    trim-only and letting otherwise-distinct variants collide.
+    """
+    fallback = _decompose(str(row.get("variant_name") or ""), oem_code=oem_code)
+
+    def pick(raw_value: Any, fallback_value: str | None) -> str | None:
+        if raw_value:
+            return str(raw_value).upper()
+        return fallback_value
+
+    seater_raw = row.get("seater")
+    return _Decomposed(
+        fuel=pick(row.get("fuel_powertrain"), fallback.fuel if fallback else None),
+        transmission=pick(row.get("transmission"), fallback.transmission if fallback else None),
+        drive=pick(row.get("drive"), fallback.drive if fallback else None),
+        seater=str(seater_raw) if seater_raw else (fallback.seater if fallback else None),
+        trim_key=_master_trim_key(row, oem_code=oem_code),
+    )
+
+
 # ── model resolution via oem_model_aliases ──────────────────────────────────
 def resolve_model_via_aliases(
     *, model_name: str, oem_aliases: list[tuple[str, str]]
@@ -289,20 +322,17 @@ def match_by_attributes(
 
     matched: list[dict[str, Any]] = []
     for row in rows:
-        if booking.fuel and row.get("fuel_powertrain") and booking.fuel != str(row["fuel_powertrain"]).upper():
+        master = _master_attributes(row, oem_code=oem_code)
+        if booking.fuel and master.fuel and booking.fuel != master.fuel:
             continue
-        if (
-            booking.transmission
-            and row.get("transmission")
-            and booking.transmission != str(row["transmission"]).upper()
-        ):
+        if booking.transmission and master.transmission and booking.transmission != master.transmission:
             continue
-        if booking.drive and row.get("drive") and booking.drive != str(row["drive"]).upper():
+        if booking.drive and master.drive and booking.drive != master.drive:
             continue
-        if booking.seater and row.get("seater") and booking.seater != str(row["seater"]):
+        if booking.seater and master.seater and booking.seater != master.seater:
             continue
 
-        master_key = _master_trim_key(row, oem_code=oem_code)
+        master_key = master.trim_key
         if not master_key:
             continue
         if not (booking.trim_key.startswith(master_key) or master_key.startswith(booking.trim_key)):
