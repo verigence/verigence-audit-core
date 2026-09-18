@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
+from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -424,6 +425,47 @@ def _require_callback_applicable(requirement) -> tuple[str, str | None]:
     return state, reason
 
 
+def _force_conditional_applicable_for_arriving_document(
+    connection: Connection, *, tenant_id: str, requirement: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """A document-link callback arriving at all, for a CONDITIONAL
+    requirement, IS the qualifying fact: DI only reaches here because it
+    classified a real document and matched it against this exact
+    requirement's own candidate document type (see _candidate_type_keys/
+    requirement_refs_by_document_type_key upstream) -- direct, first-party
+    evidence the requirement applies, stronger than the indirect
+    commercial-line/registration lookup
+    resolve_requirement_applicability_if_conditional tries beforehand.
+
+    Hit live: an accessory invoice DI had already extracted was rejected
+    forever because accessoriesTaken resolved "No" from commercial_lines,
+    even though the invoice's own existence proves accessories were taken.
+    A document that exists and was correctly classified is never less
+    trustworthy than a separate derived signal saying it shouldn't.
+
+    No-op (returns None) when the requirement isn't CONDITIONAL, or already
+    resolved APPLICABLE.
+    """
+    if str(requirement.get("requirement_level") or "").upper() != "CONDITIONAL":
+        return None
+    if _effective_applicability(requirement)[0] == "APPLICABLE":
+        return None
+
+    from audit_core.uc03_delivery_documents import _apply_resolved_applicability
+
+    snapshot = requirement.get("condition_snapshot") or {}
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    condition_key = str(snapshot.get("conditionKey") or "").strip().lower()
+    return _apply_resolved_applicability(
+        connection,
+        tenant_id=tenant_id,
+        requirement_id=requirement["journey_document_requirement_id"],
+        condition_key=condition_key,
+        snapshot=snapshot,
+        resolved=True,
+    )
+
+
 # No @router decorator: uc03_confidence_review_policy.py's
 # acknowledge_booking_document_link_with_auto_sync is decorated directly on
 # this same router for this same path (POST /v1/internal/di/booking-
@@ -502,6 +544,12 @@ def acknowledge_booking_document_link(
     )
     if updated is not None:
         requirement = {**requirement, **updated}
+
+    forced = _force_conditional_applicable_for_arriving_document(
+        connection, tenant_id=tenant_id, requirement=requirement,
+    )
+    if forced is not None:
+        requirement = {**requirement, **forced}
 
     applicability_state, applicability_reason = _require_callback_applicable(requirement)
     customer_id: UUID = requirement["customer_id"]

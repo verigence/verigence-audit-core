@@ -263,6 +263,57 @@ def test_booking_conditional_requirement_also_resolves_via_the_shared_resolver(d
     assert updated["requirement_status"] == "NOT_APPLICABLE"
 
 
+def test_document_link_callback_forces_conditional_applicable_over_a_negative_indirect_signal(delivery_journey) -> None:
+    """Regression: a real accessory invoice DI had already extracted was
+    rejected forever because accessoriesTaken resolved "No" from
+    commercial_lines, even though the invoice's own existence proves
+    accessories were taken. The document-link callback arriving at all, for
+    a CONDITIONAL requirement, is stronger, first-party evidence than that
+    indirect derived signal -- confirmed live via the enriched VAC-CONFLICT-004
+    detail showing applicability_state='NOT_APPLICABLE' for a document DI
+    had genuinely classified and was trying to link."""
+    c = delivery_journey
+    requirement_id = _conditional_requirement(
+        c, requirement_key="accessory_invoice_dms", condition_key="accessoriesTaken",
+    )
+    # No accessories commercial line at all (or zero) -- the indirect signal
+    # alone would resolve this NOT_APPLICABLE, exactly like the live incident.
+    c.execute(
+        text("""INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, actual_amount)
+                VALUES (:t, :j, 'accessories_cost', 0)"""),
+        {"t": c.tenant_id, "j": c.journey_id},
+    )
+    requirement = c.execute(
+        text("SELECT journey_document_requirement_id, requirement_level, requirement_status, condition_snapshot "
+             "FROM auditcore.journey_document_requirements WHERE journey_document_requirement_id=:r"),
+        {"r": requirement_id},
+    ).mappings().one()
+
+    # Same order acknowledge_booking_document_link calls these in: the
+    # indirect resolver runs first (and would reject), then the arriving
+    # document's own existence forces it applicable regardless.
+    indirect = resolve_requirement_applicability_if_conditional(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, requirement=requirement,
+    )
+    assert indirect is not None
+    assert indirect["condition_snapshot"]["applicabilityState"] == "NOT_APPLICABLE"
+    requirement = {**requirement, **indirect}
+
+    forced = pc_documents._force_conditional_applicable_for_arriving_document(
+        c, tenant_id=c.tenant_id, requirement=requirement,
+    )
+
+    assert forced is not None
+    assert forced["condition_snapshot"]["applicabilityState"] == "APPLICABLE"
+    assert forced["requirement_status"] == "PENDING"
+
+    # A requirement already resolved APPLICABLE (nothing to override) is a
+    # clean no-op -- never re-writes a row that doesn't need it.
+    assert pc_documents._force_conditional_applicable_for_arriving_document(
+        c, tenant_id=c.tenant_id, requirement={**requirement, **forced},
+    ) is None
+
+
 def test_document_link_webhook_resolves_its_own_row_before_gating_for_either_process_area() -> None:
     # Source-inspected rather than exercised end-to-end through the full HTTP
     # webhook (service-principal auth, DI subject mapping, evidence creation
