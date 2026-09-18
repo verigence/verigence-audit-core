@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from uuid import uuid4
 
 import pytest
@@ -240,6 +241,63 @@ def test_low_confidence_does_not_remove_machine_effective_value() -> None:
 def test_unit_interval_confidence_is_normalized_for_identity_gate() -> None:
     row = {"confidenceScore": 0.97, "confidenceScale": "UNIT_INTERVAL"}
     assert post_extract._confidence_percent(row) == 97.0
+
+
+def test_sync_booking_document_raises_lock_busy_without_blocking() -> None:
+    """Regression: pg_advisory_xact_lock blocked here, subject to this same
+    transaction's own statement_timeout -- a second caller queued behind a
+    legitimately slow first one had its own wait cancelled
+    (QueryCanceled: canceling statement due to statement timeout), confirmed
+    live and repeatedly on a journey with several documents syncing close
+    together. pg_try_advisory_xact_lock must return immediately instead:
+    proven here against a real Postgres by holding the identical lock key
+    open on a separate connection and asserting the call under test comes
+    back in well under a second with DocumentSyncLockBusyError, not a
+    multi-second block."""
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for this integration test")
+
+    engine = create_engine(database_url)
+    suffix = uuid4().hex
+    tenant_id = f"tenant-pem-lockbusy-{suffix}"
+    journey_id, document_id = _seed_booking_evidence(engine, tenant_id=tenant_id, suffix=suffix)
+
+    holder = engine.connect()
+    holder_txn = holder.begin()
+    holder.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+        {"lock_key": f"uc03-document-sync:{tenant_id}:{journey_id}"},
+    )
+    try:
+        document = DiDocument(
+            document_id=str(document_id),
+            upload_status="COMPLETE",
+            processing_status="COMPLETED",
+            confirmation_status="CONFIRMED",
+            document_type_key="booking_form",
+            verification_state="NOT_VERIFIED",
+        )
+        started = time.monotonic()
+        with engine.begin() as connection:
+            with pytest.raises(confidence_policy.DocumentSyncLockBusyError):
+                confidence_policy._sync_booking_document(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    document_id=document_id,
+                    service_id="di-service",
+                    security_client=_FakeSecurityClient(),
+                    di_client=_FakeDiClient(document, []),
+                    bump_version=True,
+                )
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0
+    finally:
+        holder_txn.rollback()
+        holder.close()
+
+    engine.dispose()
 
 
 def test_close_booking_ready_queues_document_sync_instead_of_running_it_inline() -> None:

@@ -80,15 +80,25 @@ def test_document_link_webhook_defers_sync_to_a_background_task() -> None:
     assert "_sync_booking_document(" not in source
 
 
-def test_sync_booking_document_serializes_per_journey_with_an_advisory_lock() -> None:
+def test_sync_booking_document_serializes_per_journey_with_a_non_blocking_advisory_lock() -> None:
     # Multiple documents for the same journey can now confirm close together
     # -- an upload batch, or several background syncs firing in quick
     # succession once the webhook responds immediately (see
     # _run_sync_booking_document_task) -- all writing the same
-    # journey_stage_states/evidence rows. Racing them was observed live as a
-    # Postgres statement-timeout under row-lock contention; this lock must
-    # be the very first thing the pipeline does, before it touches any of
-    # those rows, so concurrent callers queue instead of colliding.
+    # journey_stage_states/evidence rows. This lock must be the very first
+    # thing the pipeline does, before it touches any of those rows.
+    #
+    # Regression: a BLOCKING pg_advisory_xact_lock was tried here first and
+    # made concurrent callers queue instead of collide, but the lock WAIT is
+    # itself a statement bound by this same transaction's statement_timeout
+    # (45s), while whichever caller holds the lock is allowed up to
+    # idle_in_transaction_session_timeout (90s) to finish -- so anyone queued
+    # behind a legitimately-slow-but-permitted holder was guaranteed to have
+    # its own wait cancelled (QueryCanceled: canceling statement due to
+    # statement timeout), confirmed live and repeatedly. pg_try_advisory_
+    # xact_lock must be used instead: it returns immediately rather than
+    # blocking inside Postgres, and a busy lock is signalled to the caller
+    # (DocumentSyncLockBusyError) to retry in Python instead.
     #
     # Read straight from the source file rather than inspect.getsource() on
     # the live name: install_uc03_post_extraction_materialization() (a
@@ -105,10 +115,34 @@ def test_sync_booking_document_serializes_per_journey_with_an_advisory_lock() ->
     start = module_source.index("\ndef _sync_booking_document(")
     end = module_source.index("\ndef ", start + 1)
     function_source = module_source[start:end]
-    assert "pg_advisory_xact_lock" in function_source
+    assert "pg_try_advisory_xact_lock" in function_source
+    assert "DocumentSyncLockBusyError" in function_source
     assert (
-        function_source.index("pg_advisory_xact_lock")
+        function_source.index("pg_try_advisory_xact_lock")
         < function_source.index("FROM auditcore.evidence")
+    )
+
+
+def test_background_sync_task_retries_in_python_instead_of_blocking_in_postgres() -> None:
+    # Regression: a lock-busy sync used to have no way back to try again --
+    # DI acknowledges the document-link webhook the instant it responds and
+    # never retries it itself, so one failed attempt here left the document
+    # silently unsynced until a human clicked Resync. This loop must catch
+    # DocumentSyncLockBusyError specifically (not swallow it as a generic
+    # failure) and retry a bounded number of times with a real gap between
+    # attempts, still inside the one function nothing upstream re-drives.
+    source_file = inspect.getsourcefile(confidence_policy)
+    assert source_file is not None
+    with open(source_file) as f:
+        module_source = f.read()
+    start = module_source.index("\ndef _run_sync_booking_document_task(")
+    end = module_source.index("\ndef ", start + 1)
+    function_source = module_source[start:end]
+    assert "except DocumentSyncLockBusyError" in function_source
+    assert "time.sleep(" in function_source
+    assert (
+        function_source.index("_sync_booking_document(")
+        < function_source.index("except DocumentSyncLockBusyError")
     )
 
 
