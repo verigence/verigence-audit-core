@@ -53,6 +53,7 @@ from audit_core.uc03_delivery_commands import _machine_flag
 from audit_core.uc03_manual_verification import _resolve_finding
 from audit_core.uc03_masters_alignment import registration_basis
 from audit_core.uc03_model_attribute_matching import (
+    _master_attributes,
     has_qualifying_signal,
     match_by_attributes,
     normalized_model_key,
@@ -1226,25 +1227,46 @@ def get_model_catalog(connection: Connection, *, tenant_id: str, journey_id: UUI
     )
     inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id)
     basis = inputs["registration_basis"] if inputs is not None else "INDIVIDUAL"
+    oem_code = _oem_code_for_tenant(connection, tenant_id=tenant_id)
+
+    def _catalog_entry(r: dict[str, Any]) -> dict[str, Any]:
+        # Real Mahindra Consolidated Price List exports routinely leave
+        # fuel_powertrain/transmission/drive/seater blank per-row even
+        # though the master has dedicated columns for them -- the same
+        # signal already lives in the free-text Variant column instead.
+        # match_by_attributes/get_model_resolution_candidates already
+        # decompose it that way (_master_attributes, which itself prefers
+        # the raw column when present); reading these raw columns directly
+        # here left this catalogue's own dropdowns empty for every row the
+        # master itself left blank -- the exact "Modify Model" symptom
+        # reported live, repeatedly. No oem_code (tenant has no OEM
+        # mapping yet) falls back to the previous raw-column-only reads.
+        attrs = _master_attributes(r, oem_code=oem_code) if oem_code else None
+        return {
+            "productSkuId": r["product_sku_id"],
+            "skuCode": r["sku_code"],
+            "modelName": r["model_name"],
+            "variantName": r["variant_name"],
+            "colourName": r["colour_name"],
+            "fuel": attrs.fuel if attrs else r.get("fuel_powertrain"),
+            "transmission": attrs.transmission if attrs else r.get("transmission"),
+            "drive": attrs.drive if attrs else r.get("drive"),
+            "seater": attrs.seater if attrs else r.get("seater"),
+            # Unlike fuel/transmission/drive/seater above, attrs.trim_key is
+            # a glued/normalized matching key (_master_trim_key), not a
+            # display string -- it turns "Z8 S" into "Z8S". The master's own
+            # raw trim column already carries the exact display form when
+            # present (test_integration_model_catalog_exposes_trim_distinct_
+            # from_variant); attrs.trim_key is only a fallback for a variant
+            # ingested before that column existed.
+            "trim": r.get("trim") or (attrs.trim_key if attrs else None),
+            "exShowroomPrice": _to_decimal(r.get("master_ex_showroom")),
+            "totalPrice": _master_total(r, basis),
+        }
+
     return {
         "journeyId": journey_id,
-        "skus": [
-            {
-                "productSkuId": r["product_sku_id"],
-                "skuCode": r["sku_code"],
-                "modelName": r["model_name"],
-                "variantName": r["variant_name"],
-                "colourName": r["colour_name"],
-                "fuel": r.get("fuel_powertrain"),
-                "transmission": r.get("transmission"),
-                "drive": r.get("drive"),
-                "seater": r.get("seater"),
-                "trim": r.get("trim"),
-                "exShowroomPrice": _to_decimal(r.get("master_ex_showroom")),
-                "totalPrice": _master_total(r, basis),
-            }
-            for r in rows
-        ],
+        "skus": [_catalog_entry(r) for r in rows],
     }
 
 
