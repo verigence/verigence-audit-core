@@ -34,6 +34,7 @@ BASE = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
         ("RE_DUPLICATE_CHASSIS_ACROSS_INVOICES", "CROSS_CASE_DUPLICATE", "VIOLATION"),
         ("DI_VALUE_CORRECTION_PROPOSED:vin_number", "DI_VALUE_CORRECTION_PROPOSED", "VIOLATION"),
         ("DI_VALUE_CORRECTED:vin_number", "DI_VALUE_CORRECTED", "DATA_GAP"),
+        ("DELIVERY_DATE_BEFORE_BOOKING_DATE", "DELIVERY_DATE_BEFORE_BOOKING_DATE", "DATA_GAP"),
         (None, "DOCUMENT_EXCEPTION", "DOCUMENT_GAP"),
         (None, "PAYMENT_EXCEPTION", "DATA_GAP"),
         (None, "COMMERCIAL_EXCEPTION", "VIOLATION"),
@@ -73,6 +74,14 @@ def test_classify_by_rule_key_matches_duplicate_receipt_explicitly() -> None:
     # ever does. Real rule_key shape: "DUPLICATE_RECEIPT:dealer_receipt:<no>:<amount>".
     assert classify_by_rule_key("DUPLICATE_RECEIPT:dealer_receipt:AMC-B/20186/26-27:21000.00") == "VIOLATION"
     assert classify_by_rule_key("DUPLICATE_RECEIPT") == "VIOLATION"
+
+
+def test_classify_by_rule_key_matches_delivery_date_before_booking_explicitly() -> None:
+    # Same reasoning as the DI-correction/duplicate-receipt cases above:
+    # DATA_GAP here means the PC re-verifies the Gate Pass -- there's no
+    # second document for a TL to adjudicate between, so this must not fall
+    # through to VIOLATION (DEFAULT_CLASS) if the default ever changes.
+    assert classify_by_rule_key("DELIVERY_DATE_BEFORE_BOOKING_DATE") == "DATA_GAP"
 
 
 def test_classify_by_type_returns_none_for_unknown_types() -> None:
