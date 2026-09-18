@@ -634,6 +634,41 @@ def test_integration_resolves_scorpio_n_z8s_from_folded_booking_form_text(mahind
     assert _open_model_flags(c) == 0
 
 
+def test_integration_resolves_when_master_model_name_casing_differs_from_alias(mahindra_journey) -> None:
+    """Reproduces a live production finding verbatim: Booking model
+    'SCORPIO CLASSIC' / 'S MT 7S' raised 'could not be matched to the price
+    masters' despite the master carrying exactly that vehicle. Root cause:
+    resolve_model_via_aliases normalizes text to match 'SCORPIO CLASSIC'
+    against the real, globally-seeded oem_model_aliases row, but the
+    canonical name it returns (verbatim from that table) was then compared
+    with a raw `==` against the master's own product_models.model_name
+    (verbatim from OEM price-list ingestion) -- two independently authored
+    strings with no guaranteed casing/spacing match. Seeded here with
+    different casing ('Scorpio Classic') than the alias table's spelling to
+    prove the fix normalizes both sides before comparing."""
+    c = mahindra_journey
+    sku_id, = _seed_price_list(c, [
+        {"model": "Scorpio Classic", "variant": "S MT 7 STR",
+         "fuel": "DIESEL", "transmission": "MT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "1200000"}},
+    ])
+    _set_journey_product(c, "SCORPIO CLASSIC", "S MT 7S")
+
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("resolved") is True
+
+    row = c.execute(
+        text("SELECT product_sku_id, selection_status FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one()
+    assert row["product_sku_id"] == sku_id
+    assert row["selection_status"] == "CONFIRMED"
+    assert _open_model_flags(c) == 0
+
+
 def test_integration_resolves_xuv_7xo_ax7l_from_folded_booking_form_text(mahindra_journey) -> None:
     """Second real sample: 'XUV-7XO' / 'AX-7L(D) AT 2WD 7STR'. Also proves
     the AWD sibling (same trim residue, different drivetrain) is correctly
