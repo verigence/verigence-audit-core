@@ -22,8 +22,7 @@ from audit_core import uc03_booking_capture as booking_capture
 from audit_core import uc03_journey_reviewed_details as reviewed_details
 from audit_core import uc03_v2_review_materialization as materialization
 from audit_core.dependencies import get_connection, get_engine, get_human_principal
-from audit_core.errors import AuditCoreError, DependencyUnavailableError
-from audit_core.evidence import get_di_client, get_security_oauth_client
+from audit_core.errors import AuditCoreError
 from audit_core.observability import get_correlation_id
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
@@ -404,10 +403,22 @@ def close_booking_ready_with_lazy_v2_sync(
 ):
     """Submit Booking without making DI availability a business-process dependency.
 
-    Only current V2-capture documents participate in the pre-submit race check. DI
-    clients are acquired lazily, so legacy evidence and an unavailable DI service do
-    not turn an otherwise ready Booking into a 500. The durable callback remains the
-    source of eventual post-submit synchronization.
+    Only current V2-capture documents participate in the pre-submit race check.
+    Each one's sync is queued as its own background task (the same
+    _run_sync_booking_document_task the DI webhook uses), not run inline here --
+    confirmed live: this loop ran every document's full sync (a Security token
+    fetch, DI network round trips, durable fact copy, materialization) inside
+    this one request-scoped connection with no headroom, so a Booking with
+    several documents could sit long enough for Postgres's own
+    idle_in_transaction_session_timeout to kill the connection mid-loop
+    (``psycopg.errors.IdleInTransactionSessionTimeout`` at commit), discarding
+    whatever had already synced. _run_sync_booking_document_task's own
+    transaction already carries the deliberate statement_timeout/idle_in_
+    transaction_session_timeout headroom this needs (see its own docstring) --
+    reused here rather than duplicated. The durable callback remains the
+    source of eventual post-submit synchronization; this is a best-effort
+    head start, same as it always was, just no longer able to fail the
+    request or lose work to a killed connection.
     """
 
     from audit_core import uc03_confidence_review_policy as confidence_policy
@@ -424,49 +435,16 @@ def close_booking_ready_with_lazy_v2_sync(
         tenant_id=tenant_id,
         journey_id=journey_id,
     )
-    if document_ids:
-        security_provider = None
-        di_provider = None
-        try:
-            security_provider = get_security_oauth_client()
-            security_client = next(security_provider)
-            di_provider = get_di_client()
-            di_client = next(di_provider)
-            for document_id in document_ids:
-                try:
-                    confidence_policy._sync_booking_document(
-                        connection,
-                        tenant_id=tenant_id,
-                        journey_id=journey_id,
-                        document_id=document_id,
-                        service_id="audit-core",
-                        security_client=security_client,
-                        di_client=di_client,
-                        bump_version=False,
-                    )
-                except DependencyUnavailableError:
-                    logger.warning(
-                        "uc03_booking_pre_submit_di_sync_unavailable",
-                        extra={
-                            "tenant_id": tenant_id,
-                            "journey_id": str(journey_id),
-                            "document_id": str(document_id),
-                        },
-                    )
-        except RuntimeError as exc:
-            logger.warning(
-                "uc03_booking_pre_submit_di_clients_unavailable",
-                extra={
-                    "tenant_id": tenant_id,
-                    "journey_id": str(journey_id),
-                    "reason": str(exc),
-                },
-            )
-        finally:
-            if di_provider is not None:
-                di_provider.close()
-            if security_provider is not None:
-                security_provider.close()
+    for document_id in document_ids:
+        background_tasks.add_task(
+            confidence_policy._run_sync_booking_document_task,
+            get_engine(),
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            document_id=document_id,
+            service_id="audit-core",
+            stage_code="BOOKING",
+        )
 
     # Same safety net as PC Review Confirm (see confirm_booking_review_v2_
     # confidence_policy): Submit is where the pre-submit loop above may have

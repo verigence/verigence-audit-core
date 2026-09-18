@@ -240,3 +240,25 @@ def test_low_confidence_does_not_remove_machine_effective_value() -> None:
 def test_unit_interval_confidence_is_normalized_for_identity_gate() -> None:
     row = {"confidenceScore": 0.97, "confidenceScale": "UNIT_INTERVAL"}
     assert post_extract._confidence_percent(row) == 97.0
+
+
+def test_close_booking_ready_queues_document_sync_instead_of_running_it_inline() -> None:
+    """Regression: this endpoint's pre-submit loop used to run every V2
+    document's full _sync_booking_document (Security token fetch, DI network
+    round trips, durable fact copy, materialization) inline, inside this one
+    request-scoped connection, with no timeout headroom. A Booking with
+    several documents could sit in that loop long enough for Postgres's own
+    idle_in_transaction_session_timeout to kill the connection mid-loop
+    (psycopg.errors.IdleInTransactionSessionTimeout at commit -- confirmed
+    live), discarding whatever had already synced. _run_sync_booking_
+    document_task's own transaction already carries the deliberate
+    statement_timeout/idle_in_transaction_session_timeout headroom this
+    needs (fixed once already for the DI webhook's own background task) --
+    queuing through it here instead of duplicating that fix, or calling
+    _sync_booking_document directly, closes the gap."""
+    import inspect
+
+    source = inspect.getsource(post_extract.close_booking_ready_with_lazy_v2_sync)
+    assert "background_tasks.add_task(" in source
+    assert "confidence_policy._run_sync_booking_document_task" in source
+    assert "confidence_policy._sync_booking_document(" not in source
