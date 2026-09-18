@@ -84,6 +84,7 @@ def _problem(
         correlation_id=correlation_id,
         error_code=error_code,
         status_code=status_code,
+        detail=detail,
     )
     return JSONResponse(
         status_code=status_code,
