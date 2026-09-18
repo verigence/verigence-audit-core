@@ -461,26 +461,30 @@ def acknowledge_booking_document_link(
         },
     ).mappings().one()
 
-    if requirement["process_area"] == "DELIVERY":
-        # A conditional Delivery requirement's applicability only ever gets
-        # recomputed today when a human happens to load the Delivery
-        # documents list first -- if DI's callback for that exact document
-        # arrives before anyone has, _require_callback_applicable below sees
-        # it stuck UNRESOLVED and rejects with 409 forever, even once the
-        # authoritative fact has been there the whole time. Resolve it here
-        # too, scoped to only the one row already locked above (see
-        # resolve_requirement_applicability_if_conditional's own docstring
-        # for why NOT the journey-wide recompute: that one caused a live
-        # lock-contention incident when called from every callback).
-        from audit_core.uc03_delivery_documents import (
-            resolve_requirement_applicability_if_conditional,
-        )
+    # A conditional requirement's applicability only ever gets recomputed
+    # today when a human happens to load the Booking/Delivery documents list
+    # first -- if DI's callback for that exact document arrives before
+    # anyone has, _require_callback_applicable below sees it stuck UNRESOLVED
+    # and rejects with 409 forever, even once the authoritative fact has been
+    # there the whole time. Resolve it here too, scoped to only the one row
+    # already locked above (see resolve_requirement_applicability_if_
+    # conditional's own docstring for why NOT the journey-wide recompute:
+    # that one caused a live lock-contention incident when called from every
+    # callback). Despite living in uc03_delivery_documents.py, this resolver
+    # is process-area-agnostic -- it already explicitly documents resolving
+    # Booking's own gst_certificate/corporate_id requirements via the
+    # "corporatecustomer" condition key -- it was only ever gated to
+    # DELIVERY here, so a conditional BOOKING requirement hit this exact
+    # same 409-forever failure the DELIVERY side was already fixed for.
+    from audit_core.uc03_delivery_documents import (
+        resolve_requirement_applicability_if_conditional,
+    )
 
-        updated = resolve_requirement_applicability_if_conditional(
-            connection, tenant_id=tenant_id, journey_id=journey_id, requirement=requirement,
-        )
-        if updated is not None:
-            requirement = {**requirement, **updated}
+    updated = resolve_requirement_applicability_if_conditional(
+        connection, tenant_id=tenant_id, journey_id=journey_id, requirement=requirement,
+    )
+    if updated is not None:
+        requirement = {**requirement, **updated}
 
     applicability_state, applicability_reason = _require_callback_applicable(requirement)
     customer_id: UUID = requirement["customer_id"]

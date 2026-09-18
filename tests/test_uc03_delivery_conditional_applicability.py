@@ -78,20 +78,21 @@ def delivery_journey():
     engine.dispose()
 
 
-def _conditional_requirement(c, *, requirement_key, condition_key, document_type_key=None):
+def _conditional_requirement(c, *, requirement_key, condition_key, document_type_key=None, process_area="DELIVERY"):
     return c.execute(
         text("""
             INSERT INTO auditcore.journey_document_requirements (
                 tenant_id, journey_id, requirement_key, document_type_key,
                 process_area, requirement_level, condition_snapshot
             ) VALUES (
-                :t, :j, :key, :doc_type, 'DELIVERY', 'CONDITIONAL',
+                :t, :j, :key, :doc_type, :process_area, 'CONDITIONAL',
                 CAST(:snapshot AS jsonb)
             ) RETURNING journey_document_requirement_id
         """),
         {
             "t": c.tenant_id, "j": c.journey_id, "key": requirement_key,
             "doc_type": document_type_key or requirement_key,
+            "process_area": process_area,
             "snapshot": f'{{"conditionKey":"{condition_key}"}}',
         },
     ).scalar_one()
@@ -227,18 +228,54 @@ def test_single_row_resolver_only_touches_its_own_requirement(delivery_journey) 
     ) is None
 
 
-def test_document_link_webhook_resolves_only_its_own_row_before_gating() -> None:
+def test_booking_conditional_requirement_also_resolves_via_the_shared_resolver(delivery_journey) -> None:
+    """Regression: resolve_requirement_applicability_if_conditional is fully
+    process-area-agnostic (it already explicitly resolves Booking's own
+    gst_certificate/corporate_id requirements via the "corporatecustomer"
+    condition key), but the webhook only ever called it for process_area ==
+    'DELIVERY' -- a conditional BOOKING requirement hit the exact same
+    409-forever failure (VAC-CONFLICT-004) the DELIVERY side was already
+    fixed for. Confirmed live: DI's worker retried a Booking document-link
+    callback repeatedly, always failing, exactly like the pre-fix Delivery
+    incident this file's other tests document."""
+    c = delivery_journey
+    requirement_id = _conditional_requirement(
+        c, requirement_key="gst_certificate", condition_key="corporateCustomer",
+        process_area="BOOKING",
+    )
+    c.execute(
+        text("""INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, actual_amount)
+                VALUES (:t, :j, 'corporate_discount_amount', 0)"""),
+        {"t": c.tenant_id, "j": c.journey_id},
+    )
+    requirement = c.execute(
+        text("SELECT journey_document_requirement_id, requirement_level, condition_snapshot "
+             "FROM auditcore.journey_document_requirements WHERE journey_document_requirement_id=:r"),
+        {"r": requirement_id},
+    ).mappings().one()
+
+    updated = resolve_requirement_applicability_if_conditional(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, requirement=requirement,
+    )
+
+    assert updated is not None
+    assert updated["condition_snapshot"]["applicabilityState"] == "NOT_APPLICABLE"
+    assert updated["requirement_status"] == "NOT_APPLICABLE"
+
+
+def test_document_link_webhook_resolves_its_own_row_before_gating_for_either_process_area() -> None:
     # Source-inspected rather than exercised end-to-end through the full HTTP
     # webhook (service-principal auth, DI subject mapping, evidence creation
     # are a large fixture that adds nothing to this specific assertion): the
-    # webhook must self-heal a stuck-UNRESOLVED Delivery requirement before
-    # _require_callback_applicable can 409 it, but ONLY via the single-row
-    # resolver -- NOT _resolve_known_applicability, whose journey-wide
+    # webhook must self-heal a stuck-UNRESOLVED requirement -- Booking or
+    # Delivery alike -- before _require_callback_applicable can 409 it, via
+    # the single-row resolver, unconditionally (not gated to one process
+    # area), and never via _resolve_known_applicability, whose journey-wide
     # ``FOR UPDATE`` caused a live lock-contention incident when called from
     # every callback (see resolve_requirement_applicability_if_conditional's
-    # docstring). Asserting the safe function is used, and the unsafe one
-    # is not, keeps that regression from silently coming back.
+    # docstring).
     source = inspect.getsource(pc_documents.acknowledge_booking_document_link)
-    assert "DELIVERY" in source
     assert "resolve_requirement_applicability_if_conditional(" in source
     assert "_resolve_known_applicability(" not in source
+    assert 'if requirement["process_area"] == "DELIVERY"' not in source
+    assert "if requirement['process_area'] == 'DELIVERY'" not in source
