@@ -449,6 +449,34 @@ def test_integration_get_model_catalog_lists_every_sku_unconditionally(journey) 
     assert fuels == {"PETROL", "DIESEL"}
 
 
+def test_integration_get_model_catalog_falls_back_to_variant_text_when_master_columns_are_blank(
+    mahindra_journey,
+) -> None:
+    """Reproduces the live 'Modify Model' symptom reported repeatedly: real
+    Mahindra Consolidated Price List exports routinely leave fuel_powertrain/
+    transmission/drive/seater blank per-row even though the same information
+    is already encoded in the free-text Variant column (e.g. 'Z8 S G AT 2WD
+    7 STR BS6.2 - Refresh' encodes fuel=G, transmission=AT, drive=2WD,
+    seater=7). Before this fix, get_model_catalog read those raw master
+    columns directly with no fallback -- match_by_attributes already had
+    one (_master_attributes), but this endpoint, used only by the picker a
+    PC opens to manually correct a SKU, did not -- leaving its own dropdowns
+    empty for every row shaped like this."""
+    c = mahindra_journey
+    _seed_price_list(c, [
+        {"model": "SCORPIO N", "variant": "Z8 S G AT 2WD 7 STR BS6.2 - Refresh",
+         "components": {"EX_SHOWROOM": "1600000"}},
+    ])
+
+    catalog = mr.get_model_catalog(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    assert len(catalog["skus"]) == 1
+    sku = catalog["skus"][0]
+    assert sku["fuel"] == "PETROL"
+    assert sku["transmission"] == "AT"
+    assert sku["drive"] == "2WD"
+    assert sku["seater"] == "7"
+
+
 def test_integration_model_catalog_exposes_trim_distinct_from_variant(journey) -> None:
     """The masters sheet carries Trim as its own column, separate from the
     full Variant string -- several distinct trims (e.g. Z2/Z4/Z8 S/Z8T/Z8 L
