@@ -279,18 +279,17 @@ def test_sync_booking_document_raises_lock_busy_without_blocking() -> None:
             verification_state="NOT_VERIFIED",
         )
         started = time.monotonic()
-        with engine.begin() as connection:
-            with pytest.raises(confidence_policy.DocumentSyncLockBusyError):
-                confidence_policy._sync_booking_document(
-                    connection,
-                    tenant_id=tenant_id,
-                    journey_id=journey_id,
-                    document_id=document_id,
-                    service_id="di-service",
-                    security_client=_FakeSecurityClient(),
-                    di_client=_FakeDiClient(document, []),
-                    bump_version=True,
-                )
+        with engine.begin() as connection, pytest.raises(confidence_policy.DocumentSyncLockBusyError):
+            confidence_policy._sync_booking_document(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                document_id=document_id,
+                service_id="di-service",
+                security_client=_FakeSecurityClient(),
+                di_client=_FakeDiClient(document, []),
+                bump_version=True,
+            )
         elapsed = time.monotonic() - started
         assert elapsed < 2.0
     finally:
