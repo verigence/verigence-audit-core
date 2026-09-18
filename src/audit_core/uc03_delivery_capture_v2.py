@@ -881,16 +881,19 @@ def schedule_delivery_document_checkpoint(
     Booking's schedule_booking_checkpoint_rules uses -- Delivery routinely
     confirms 10-15 documents in a tight burst (real dealership upload
     behaviour, already the cause of one live lock-contention incident this
-    session), so this uses pg_try_advisory_xact_lock (non-blocking) rather
-    than the blocking pg_advisory_xact_lock _sync_booking_document itself
-    uses: several documents from the same burst each open their own
-    connection to call this (see _run_sync_booking_document_task), and this
-    service's connection pool is small (SQLAlchemy defaults, pool_timeout=5s).
-    A BLOCKING lock would have each of those connections sit idle-in-wait for
+    session), so this uses pg_try_advisory_xact_lock (non-blocking): several
+    documents from the same burst each open their own connection to call
+    this (see _run_sync_booking_document_task), and this service's
+    connection pool is small (SQLAlchemy defaults, pool_timeout=5s). A
+    BLOCKING lock would have each of those connections sit idle-in-wait for
     the whole burst instead of being returned to the pool, which is exactly
     what starves an unrelated request (e.g. opening a Booking) waiting for a
-    free connection. Skipping when contended costs nothing -- the document
-    that's already running this reads the same current state, and the very
+    free connection. _sync_booking_document's own per-journey lock uses the
+    identical non-blocking primitive now, for the same reason, but retries
+    instead of skipping -- see its docstring for why a document's own sync
+    can't just be skipped the way a checkpoint re-evaluation can. Skipping
+    when contended costs nothing here -- the document that's already
+    running this reads the same current state, and the very
     next confirmed document re-triggers it anyway.
 
     raise_new=False (the per-document DI-webhook trigger, see

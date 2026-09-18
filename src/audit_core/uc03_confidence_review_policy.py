@@ -12,6 +12,7 @@ Business contract:
 from __future__ import annotations
 
 import json
+import time
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -67,6 +68,14 @@ from audit_core.uc03_v2_review_materialization import (
 )
 
 logger = structlog.get_logger(__name__)
+
+
+class DocumentSyncLockBusyError(Exception):
+    """Raised by _sync_booking_document when another sync currently holds
+    this journey's advisory lock. Internal signal only -- never crosses into
+    an HTTP response, since _sync_booking_document only ever runs off the
+    request path (see _run_sync_booking_document_task, its only caller in
+    production code). The caller decides whether/how to retry."""
 
 _DI_AUDIENCE = "di"
 _REVIEW_FLAG_RULE = "UC03_DI_LOW_CONFIDENCE_POST_SUBMIT"
@@ -735,22 +744,41 @@ def _sync_booking_document(
     doesn't apply to (a Delivery document has no vehicle model to resolve a
     SKU against).
 
-    Serialized per journey via an advisory transaction lock: multiple
-    documents for the same journey can confirm close together (a normal
-    upload batch, or several async callbacks landing at once now that the
-    document-link webhook responds immediately -- see
+    Serialized per journey via a non-blocking advisory transaction lock:
+    multiple documents for the same journey can confirm close together (a
+    normal upload batch, or several async callbacks landing at once now that
+    the document-link webhook responds immediately -- see
     _run_sync_booking_document_task), each writing the same
-    journey_stage_states / evidence rows. Racing them was observed live as
-    ``QueryCanceled: canceling statement due to statement timeout`` under
-    row-lock contention; the lock makes them queue instead of collide. Safe
-    to acquire repeatedly within the same transaction (Postgres advisory
-    locks are re-entrant per session), so the pre-submit gate's per-document
-    loop -- all inside one connection/transaction -- pays for it once.
+    journey_stage_states / evidence rows. A blocking pg_advisory_xact_lock
+    was tried here first and did stop them colliding, but traded one live
+    failure for another: the lock WAIT is itself a statement, bound by this
+    same transaction's statement_timeout (45s, set in
+    _run_sync_booking_document_task), while whichever document currently
+    holds the lock is allowed up to idle_in_transaction_session_timeout
+    (90s) to finish its own work. Any document queued behind one that
+    legitimately takes 45-90s -- well within what's allowed -- was therefore
+    guaranteed to have its own lock wait cancelled
+    (``QueryCanceled: canceling statement due to statement timeout``),
+    confirmed live and repeatedly on a journey with several documents
+    syncing close together: exactly the failure this lock exists to
+    prevent, just moved one step later. pg_try_advisory_xact_lock returns
+    immediately instead of waiting on Postgres for an answer; a caller that
+    doesn't get it raises DocumentSyncLockBusyError so
+    _run_sync_booking_document_task can back off in Python and retry
+    shortly -- the same non-blocking-plus-caller-owns-the-retry shape
+    schedule_delivery_document_checkpoint already uses for the identical
+    kind of contention, just with a retry instead of a skip, since unlike a
+    checkpoint re-evaluation, no later document's sync re-covers this one's
+    own facts.
     """
-    connection.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+    acquired = connection.execute(
+        text("SELECT pg_try_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
         {"lock_key": f"uc03-document-sync:{tenant_id}:{journey_id}"},
-    )
+    ).scalar_one()
+    if not acquired:
+        raise DocumentSyncLockBusyError(
+            f"uc03-document-sync lock busy for tenant={tenant_id} journey={journey_id}"
+        )
     link = connection.execute(
         text(
             """
@@ -1256,55 +1284,77 @@ def _run_sync_booking_document_task(
     concurrent background tasks, all writing the same journey_stage_states /
     evidence rows -- exactly the kind of row-lock contention that shows up
     live as ``QueryCanceled: canceling statement due to statement timeout``.
-    An advisory transaction lock keyed per journey serializes them instead of
-    letting them race: at most one document's sync runs for a given journey
-    at a time, everything else waits its turn rather than lock-contending.
+    _sync_booking_document's own non-blocking per-journey advisory lock keeps
+    them from writing those rows at the same time; when it's busy, the loop
+    below waits it out with a short sleep between attempts in this thread
+    (see DocumentSyncLockBusyError -- a blocking wait inside Postgres was
+    tried first and made the same failure worse, not better).
+
+    This is also the only place a given document's sync ever runs: DI marks
+    the document-link acknowledged the instant the webhook responds, win or
+    lose, and never retries it -- the webhook's fast response is what let DI
+    move on in the first place. Nothing upstream will try again if this
+    fails, so lock contention and other transient failures get a bounded
+    retry here rather than one attempt and a silently incomplete sync until
+    a human happens to click Resync.
     """
     security_provider = get_security_oauth_client()
     di_provider = get_di_client()
+    max_attempts = 6
+    retry_delay_seconds = (2.0, 4.0, 8.0, 15.0, 30.0)
     try:
         security_client = next(security_provider)
         di_client = next(di_provider)
-        with engine.begin() as connection:
-            set_tenant_context(connection, tenant_id)
-            # _sync_booking_document's own per-journey advisory lock (see its
-            # docstring) makes concurrent documents for one journey queue
-            # instead of racing on the same evidence/journey_stage_states
-            # rows -- correct, but each document's turn now includes a DI
-            # network round trip, so a real upload batch (confirmed live at
-            # 15 Delivery documents) can genuinely take longer, queued, than
-            # the connection pool's 10s statement_timeout (dependencies.py,
-            # tuned for interactive HTTP requests). The result was the exact
-            # failure this lock was built to prevent in the first place:
-            # QueryCanceled: canceling statement due to statement timeout,
-            # this time on a document late in the queue's own evidence
-            # UPDATE. This background task has no HTTP client waiting on
-            # it, so give this one transaction (not the request-serving
-            # pool generally) real headroom instead of tightening the lock
-            # further.
-            connection.execute(text("SET LOCAL statement_timeout = '45s'"))
-            # statement_timeout alone only bounds a single SQL statement --
-            # it does nothing while the connection sits idle waiting on a DI/
-            # Security HTTP call between statements (a Security token fetch,
-            # then two DI calls, each up to 15s, all made while this same
-            # transaction is open). Confirmed live: the server's own default
-            # idle_in_transaction_session_timeout killed one of these mid-
-            # sync (psycopg.errors.IdleInTransactionSessionTimeout at commit
-            # time), discarding whatever this document's sync had already
-            # done. Give this one background transaction the same deliberate
-            # headroom as statement_timeout above, for the same reason.
-            connection.execute(text("SET LOCAL idle_in_transaction_session_timeout = '90s'"))
-            _sync_booking_document(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                document_id=document_id,
-                service_id=service_id,
-                security_client=security_client,
-                di_client=di_client,
-                bump_version=True,
-                stage_code=stage_code,
-            )
+        for attempt in range(max_attempts):
+            try:
+                with engine.begin() as connection:
+                    set_tenant_context(connection, tenant_id)
+                    # This transaction's own work (a DI facts fetch, durable
+                    # copy, SKU resolution, reconciliation, materialization)
+                    # has no HTTP client waiting on it, so give it real
+                    # headroom instead of the connection pool's 10s
+                    # interactive default (dependencies.py). Confirmed live:
+                    # that default previously cut a sync off mid-flight
+                    # (QueryCanceled: canceling statement due to statement
+                    # timeout on an evidence UPDATE).
+                    connection.execute(text("SET LOCAL statement_timeout = '45s'"))
+                    # statement_timeout alone only bounds a single SQL
+                    # statement -- it does nothing while the connection sits
+                    # idle waiting on a DI/Security HTTP call between
+                    # statements (a Security token fetch, then two DI calls,
+                    # each up to 15s, all made while this same transaction is
+                    # open). Confirmed live: the server's own default
+                    # idle_in_transaction_session_timeout killed one of these
+                    # mid-sync (psycopg.errors.IdleInTransactionSessionTimeout
+                    # at commit time), discarding whatever this document's
+                    # sync had already done.
+                    connection.execute(
+                        text("SET LOCAL idle_in_transaction_session_timeout = '90s'")
+                    )
+                    _sync_booking_document(
+                        connection,
+                        tenant_id=tenant_id,
+                        journey_id=journey_id,
+                        document_id=document_id,
+                        service_id=service_id,
+                        security_client=security_client,
+                        di_client=di_client,
+                        bump_version=True,
+                        stage_code=stage_code,
+                    )
+                break
+            except DocumentSyncLockBusyError:
+                if attempt == max_attempts - 1:
+                    logger.warning(
+                        "uc03_document_link_background_sync_deferred",
+                        tenant_id=tenant_id,
+                        journey_id=str(journey_id),
+                        document_id=str(document_id),
+                        stage_code=stage_code,
+                        attempts=max_attempts,
+                    )
+                    return
+                time.sleep(retry_delay_seconds[attempt])
     except Exception:
         logger.warning(
             "uc03_document_link_background_sync_failed",
