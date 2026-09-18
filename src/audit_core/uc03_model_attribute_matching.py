@@ -51,6 +51,23 @@ def _words(text: str) -> list[str]:
     return [w for w in _NON_ALNUM.sub(" ", text.upper()).split() if w]
 
 
+def normalized_model_key(text: str | None) -> str:
+    """Glued, uppercase, punctuation/whitespace-insensitive form of a model
+    name, e.g. ``'Scorpio Classic'`` / ``'SCORPIO-CLASSIC'`` / ``'SCORPIO
+    CLASSIC'`` all -> ``'SCORPIOCLASSIC'``.
+
+    ``resolve_model_via_aliases`` already compares text this way to find the
+    matching alias, but the canonical name it returns (verbatim from
+    ``oem_model_aliases``, a manually seeded reference table) was then being
+    compared with a raw ``==`` against a price-master row's own ``model_name``
+    (verbatim from the OEM's price-list ingestion) -- two independently
+    authored strings with no guarantee of matching casing/spacing. Both
+    sides must be normalized the same way before comparing, or a real
+    alias-resolved model can still fail to find any of its own master rows.
+    """
+    return "".join(_words(text or ""))
+
+
 # ── per-OEM vocabulary ──────────────────────────────────────────────────────
 # Only tokens actually observed in Mahindra's ingested price-master
 # variant_name text and on real Booking Forms (verified directly against the

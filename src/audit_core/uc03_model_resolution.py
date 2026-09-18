@@ -55,6 +55,7 @@ from audit_core.uc03_masters_alignment import registration_basis
 from audit_core.uc03_model_attribute_matching import (
     has_qualifying_signal,
     match_by_attributes,
+    normalized_model_key,
     resolve_model_via_aliases,
 )
 from audit_core.uc03_sku_candidates import (
@@ -687,7 +688,8 @@ def _attribute_decomposition_fallback(
         return [], "NONE", False
 
     canonical_model, remainder = resolved
-    model_rows = [r for r in rows if r["model_name"] == canonical_model]
+    canonical_key = normalized_model_key(canonical_model)
+    model_rows = [r for r in rows if normalized_model_key(r["model_name"]) == canonical_key]
     if not model_rows:
         return [], "NONE", False
 
