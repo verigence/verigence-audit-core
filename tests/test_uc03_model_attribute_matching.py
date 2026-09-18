@@ -141,6 +141,27 @@ def test_falls_back_to_variant_name_residue_when_no_trim_field_stored() -> None:
     assert [r["sku_code"] for r in matched] == ["Z8S"]
 
 
+def test_master_row_derives_fuel_transmission_drive_seater_from_variant_name_when_columns_blank() -> None:
+    """Real Mahindra Consolidated Price List exports routinely leave
+    fuel_powertrain/transmission/drive/seater blank per-row even though the
+    header names them -- the same information is already carried in the
+    free-text Variant column instead (e.g. "Z8 L G MT 2WD 7 STR" already
+    states fuel=G, transmission=MT, drive=2WD, seater=7). Without deriving
+    these from variant_name the same way trim already falls back to it, an
+    MT and an AT candidate for the same trim would both silently pass
+    (blank master column skips the check instead of failing it) and the
+    Booking Form's own transmission would never disambiguate them.
+    """
+    rows = [
+        _row("NEW SCORPIO N", "Z8 L G MT 2WD 7 STR", sku="Z8L_MT"),
+        _row("NEW SCORPIO N", "Z8 L G AT 2WD 7 STR", sku="Z8L_AT"),
+    ]
+    matched = m.match_by_attributes(
+        rows, oem_code="MAHINDRA", model_remainder="Z8 L", variant_text="G AT 2WD 7STR"
+    )
+    assert [r["sku_code"] for r in matched] == ["Z8L_AT"]
+
+
 def test_unknown_oem_is_a_no_op() -> None:
     rows = [_row("SCORPIO N", "Z8 S D AT 2WD 7 STR BS6.2 - N", fuel="DIESEL", transmission="AT", drive="2WD", seater="7")]
     matched = m.match_by_attributes(
