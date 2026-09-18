@@ -826,6 +826,27 @@ def _sync_booking_document(
     )
 
     if str(document.confirmation_status or "").upper() != "CONFIRMED":
+        # TEMPORARY DIAGNOSTIC (2026-09-18): an accessory invoice DI's
+        # schema fully supports extracting stayed "no extracted values
+        # retained" through multiple Resync attempts, with no visible
+        # reason why -- everything downstream of this early return
+        # (durable fact copy, materialization) never runs, silently, no
+        # matter how many times Resync re-queues _sync_booking_document.
+        # Surface DI's own reported status directly so the next Resync
+        # shows whether this is a genuine not-yet-confirmed state (correct,
+        # not a bug) or DI is stuck on something else entirely. Revert once
+        # found.
+        logger.warning(
+            "uc03_document_sync_skipped_not_confirmed",
+            tenant_id=tenant_id,
+            journey_id=str(journey_id),
+            document_id=str(document_id),
+            document_type_key=document.document_type_key or link["document_type_key"],
+            confirmation_status=document.confirmation_status,
+            processing_status=getattr(document, "processing_status", None),
+            human_verification_status=getattr(document, "human_verification_status", None),
+            verification_state=getattr(document, "verification_state", None),
+        )
         return 0
 
     try:
