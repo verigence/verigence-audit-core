@@ -103,12 +103,25 @@ def _problem(
 def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # TEMPORARY DIAGNOSTIC (2026-09-18): a real, reproducible 400 on
+        # POST .../uc03/documents/upload-intents has no server-log record of
+        # which field actually failed -- this handler discarded `exc` entirely.
+        # Surface loc/msg/type (never the submitted value itself) directly in
+        # the response body so the next reproduction shows the real cause
+        # without needing Railway log access. Revert once the real cause is found.
+        field_errors = "; ".join(
+            f"{'.'.join(str(part) for part in error.get('loc', ()))}: {error.get('msg')} ({error.get('type')})"
+            for error in exc.errors()
+        )
+        detail = "One or more request fields are invalid."
+        if field_errors:
+            detail = f"{detail} {field_errors}"
         return _problem(
             request,
             error_code="VAC-VAL-001",
             status_code=400,
             title="Validation failed",
-            detail="One or more request fields are invalid.",
+            detail=detail,
         )
 
     @app.exception_handler(SecurityTokenError)
