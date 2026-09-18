@@ -526,6 +526,79 @@ def test_materialize_delivery_date_is_idempotent_on_rerun(journey) -> None:
     assert version_after_second == version_after_first
 
 
+def test_materialize_delivery_date_raises_high_finding_when_before_booking_date(journey) -> None:
+    # Regression: materialize_delivery_date trusts the Gate Pass's own
+    # extracted delivery_date verbatim, with no independent evidence to weigh
+    # it against. A vehicle cannot be delivered before it was booked -- a
+    # wrong extraction landing there (confirmed live, 5 years in the past)
+    # must not sail through silently.
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    journey.execute(
+        text("INSERT INTO auditcore.bookings (tenant_id, journey_id, booking_date) "
+             "VALUES (:t, :j, :d)"),
+        {"t": tenant_id, "j": journey_id, "d": "2026-09-01"},
+    )
+    gate_pass = _document("gate_pass", [_field("delivery_date", "2021-09-11")])
+
+    materialization.materialize_delivery_date(
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[gate_pass],
+    )
+
+    row = journey.execute(
+        text("SELECT finding_type_code, finding_class, owner_role_code, severity, finding_status "
+             "FROM auditcore.audit_findings WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one()
+    assert row["finding_type_code"] == "DELIVERY_DATE_BEFORE_BOOKING_DATE"
+    # DATA_GAP/PC: the PC re-verifies the Gate Pass or gets it re-extracted --
+    # there is no second document here for a TL to adjudicate between.
+    assert row["finding_class"] == "DATA_GAP"
+    assert row["owner_role_code"] == "PC"
+    assert row["severity"] == "HIGH"
+    assert row["finding_status"] == "OPEN"
+
+    # idempotent -- no duplicate finding on a repeat call with the same facts
+    materialization.materialize_delivery_date(
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[gate_pass],
+    )
+    count = journey.execute(
+        text("SELECT count(*) FROM auditcore.audit_findings WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one()
+    assert count == 1
+
+    # self-heals once the date is corrected (re-review or a re-extraction)
+    corrected = _document("gate_pass", [_field("delivery_date", "2026-09-05")])
+    materialization.materialize_delivery_date(
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[corrected],
+    )
+    status = journey.execute(
+        text("SELECT finding_status FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND finding_type_code='DELIVERY_DATE_BEFORE_BOOKING_DATE'"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one()
+    assert status == "RESOLVED"
+
+
+def test_materialize_delivery_date_no_finding_when_on_or_after_booking_date(journey) -> None:
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    journey.execute(
+        text("INSERT INTO auditcore.bookings (tenant_id, journey_id, booking_date) "
+             "VALUES (:t, :j, :d)"),
+        {"t": tenant_id, "j": journey_id, "d": "2026-09-01"},
+    )
+    gate_pass = _document("gate_pass", [_field("delivery_date", "2026-09-05")])
+
+    materialization.materialize_delivery_date(
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[gate_pass],
+    )
+    count = journey.execute(
+        text("SELECT count(*) FROM auditcore.audit_findings WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one()
+    assert count == 0
+
+
 def test_materialize_delivery_date_ignores_unparseable_or_missing_value(journey) -> None:
     tenant_id, journey_id = journey.tenant_id, journey.journey_id
     gate_pass = _document("gate_pass", [_field("delivery_date", "not a date")])

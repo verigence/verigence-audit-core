@@ -180,12 +180,107 @@ def _to_delivery_date(value: Any) -> date | None:
         return None
 
 
+_DELIVERY_DATE_SANITY_FINDING_TYPE = "DELIVERY_DATE_BEFORE_BOOKING_DATE"
+_DELIVERY_DATE_SANITY_RULE_KEY = "DELIVERY_DATE_BEFORE_BOOKING_DATE"
+
+
+def _sync_delivery_date_sanity_finding(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    actual_delivered_at: datetime,
+    correlation_id: str = "",
+) -> dict[str, int]:
+    """Raise a HIGH finding when the Gate Pass's own delivery date lands
+    before this journey's booking date -- a vehicle cannot be delivered
+    before it was booked, so this is never a legitimate value. Confirmed
+    live: materialize_delivery_date trusts the Gate Pass's extracted date
+    verbatim, with no independent evidence to weigh it against, and a wrong
+    extraction landed 5 years in the past with nothing catching it. Resolves
+    itself once the date is corrected (re-review or a re-extraction) or the
+    booking date turns out to have been wrong instead. Routed DATA_GAP (see
+    uc03_finding_routing.py) -- the PC who owns this journey re-verifies the
+    Gate Pass, there is no second document here for a TL to adjudicate
+    between. Best-effort and idempotent, safe to call after every Delivery
+    review sync; never raises.
+    """
+    try:
+        booking_date = connection.execute(
+            text(
+                """
+                SELECT booking_date FROM auditcore.bookings
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one_or_none()
+    except Exception:  # noqa: BLE001 - producer must never break the caller
+        return {"raised": 0, "resolved": 0, "error": 1}
+
+    if booking_date is None:
+        return {"raised": 0, "resolved": 0}
+
+    is_before_booking = actual_delivered_at.date() < booking_date
+
+    if is_before_booking:
+        _machine_flag(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code="DELIVERY",
+            rule_key=_DELIVERY_DATE_SANITY_RULE_KEY,
+            finding_type=_DELIVERY_DATE_SANITY_FINDING_TYPE,
+            severity="HIGH",
+            title="Delivery date is before the booking date",
+            description=(
+                f"The Gate Pass reports a delivery date of {actual_delivered_at.date().isoformat()}, "
+                f"which is before this journey's booking date of {booking_date.isoformat()}. "
+                "Re-verify the Gate Pass or get it re-extracted."
+            ),
+            correlation_id=correlation_id,
+            safe_payload={
+                "actualDeliveredAt": actual_delivered_at.date().isoformat(),
+                "bookingDate": booking_date.isoformat(),
+            },
+        )
+        _set_stage_flag_status(connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY")
+        return {"raised": 1, "resolved": 0}
+
+    updated = connection.execute(
+        text(
+            """
+            UPDATE auditcore.audit_findings
+            SET finding_status = 'RESOLVED',
+                disposition = 'FIXED',
+                resolved_at_utc = now(),
+                updated_at_utc = now()
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+              AND stage_code = 'DELIVERY'
+              AND finding_type_code = :finding_type
+              AND rule_key = :rule_key
+              AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "finding_type": _DELIVERY_DATE_SANITY_FINDING_TYPE,
+            "rule_key": _DELIVERY_DATE_SANITY_RULE_KEY,
+        },
+    )
+    if updated.rowcount:
+        _set_stage_flag_status(connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY")
+    return {"raised": 0, "resolved": updated.rowcount}
+
+
 def materialize_delivery_date(
     connection: Connection,
     *,
     tenant_id: str,
     journey_id: UUID,
     documents: list[Any],
+    correlation_id: str = "",
 ) -> int:
     """Set the canonical delivery date from the Gate Pass.
 
@@ -209,6 +304,14 @@ def materialize_delivery_date(
         return 0
     actual_delivered_at = datetime.combine(parsed, time.min, tzinfo=UTC)
     source_evidence_id = _source_evidence(pair[0])
+
+    _sync_delivery_date_sanity_finding(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        actual_delivered_at=actual_delivered_at,
+        correlation_id=correlation_id,
+    )
 
     existing = connection.execute(
         text(

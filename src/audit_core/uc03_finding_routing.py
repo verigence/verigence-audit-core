@@ -85,6 +85,13 @@ _DATA_GAP_RULE_PREFIXES: frozenset[str] = frozenset({
     # verdict. Compare DI_VALUE_CORRECTION_PROPOSED below, its >=90%
     # sibling, which IS adjudicated because nothing was applied yet.
     "DI_VALUE_CORRECTED",
+    # 2026-09-18: the Gate Pass's own extracted delivery_date is trusted
+    # verbatim (materialize_delivery_date) with no independent evidence to
+    # adjudicate against -- confirmed live, a wrong extraction landed 5 years
+    # off with nothing else on file to weigh it against. The PC who owns this
+    # journey re-verifies the Gate Pass or gets it re-extracted; there is
+    # nothing here for a TL to judge between two conflicting sources.
+    "DELIVERY_DATE_BEFORE_BOOKING_DATE",
 })
 _VIOLATION_RULE_PREFIXES: frozenset[str] = frozenset({
     "DL_VIN_RECONCILIATION",
