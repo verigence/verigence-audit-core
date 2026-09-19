@@ -477,6 +477,29 @@ def test_integration_get_model_catalog_falls_back_to_variant_text_when_master_co
     assert sku["seater"] == "7"
 
 
+def test_integration_get_model_catalog_leaves_trim_blank_rather_than_showing_the_matching_key(
+    mahindra_journey,
+) -> None:
+    """Regression: a first version of the blank-column fallback above also
+    fell back to _master_trim_key for trim -- a glued, uppercased MATCHING
+    key built from residue text, e.g. 'Classic S11 BS6.2 - E' residues to
+    'CLASSICS11E' (it still includes the model-name fragment 'CLASSIC').
+    Confirmed live: that string was shown as a pickable trim option in the
+    Modify Model dropdown, actively misleading a PC rather than merely
+    blank. Unlike fuel/transmission/drive/seater, there is no trustworthy
+    fallback for trim -- when the master's own raw trim column is blank,
+    the catalog must leave it blank too."""
+    c = mahindra_journey
+    _seed_price_list(c, [
+        {"model": "SCORPIO CLASSIC", "variant": "Classic S11 BS6.2 - E",
+         "components": {"EX_SHOWROOM": "1400000"}},
+    ])
+
+    catalog = mr.get_model_catalog(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    assert len(catalog["skus"]) == 1
+    assert catalog["skus"][0]["trim"] is None
+
+
 def test_integration_model_catalog_exposes_trim_distinct_from_variant(journey) -> None:
     """The masters sheet carries Trim as its own column, separate from the
     full Variant string -- several distinct trims (e.g. Z2/Z4/Z8 S/Z8T/Z8 L

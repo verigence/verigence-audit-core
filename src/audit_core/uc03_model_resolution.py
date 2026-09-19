@@ -1253,13 +1253,17 @@ def get_model_catalog(connection: Connection, *, tenant_id: str, journey_id: UUI
             "drive": attrs.drive if attrs else r.get("drive"),
             "seater": attrs.seater if attrs else r.get("seater"),
             # Unlike fuel/transmission/drive/seater above, attrs.trim_key is
-            # a glued/normalized matching key (_master_trim_key), not a
-            # display string -- it turns "Z8 S" into "Z8S". The master's own
-            # raw trim column already carries the exact display form when
-            # present (test_integration_model_catalog_exposes_trim_distinct_
-            # from_variant); attrs.trim_key is only a fallback for a variant
-            # ingested before that column existed.
-            "trim": r.get("trim") or (attrs.trim_key if attrs else None),
+            # a glued/normalized MATCHING key (_master_trim_key), built from
+            # whatever residue is left in variant_name after every
+            # recognized fuel/transmission/drive/seater token is stripped --
+            # e.g. "Classic S11 BS6.2 - E" residues to "CLASSICS11E", which
+            # includes the model name fragment and is never a real trim
+            # value. Confirmed live: using it as this dropdown's fallback
+            # showed exactly that string as a pickable "trim", actively
+            # misleading rather than merely blank. The master's own raw trim
+            # column is the ONLY trustworthy source for a human-facing trim
+            # value; when it's blank, this must stay blank too, not guess.
+            "trim": r.get("trim"),
             "exShowroomPrice": _to_decimal(r.get("master_ex_showroom")),
             "totalPrice": _master_total(r, basis),
         }
