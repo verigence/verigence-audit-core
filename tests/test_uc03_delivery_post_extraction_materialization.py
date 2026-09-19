@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from audit_core.uc03_delivery_post_extraction_materialization import (
+    materialize_booking_insurance_from_durable_store,
     materialize_delivery_documents_from_durable_store,
 )
 
@@ -86,7 +87,8 @@ def journey():
 
 
 def _seed_field(
-    conn, *, tenant_id, journey_id, document_id, document_type_key, field_key, value, fact_version=1
+    conn, *, tenant_id, journey_id, document_id, document_type_key, field_key, value,
+    fact_version=1, stage_code="DELIVERY",
 ):
     conn.execute(
         text(
@@ -98,7 +100,7 @@ def _seed_field(
                 extracted_value, effective_value, is_modified
             ) VALUES (
                 :tenant_id, :journey_id, NULL, :document_id,
-                NULL, :fact_version, 'DELIVERY',
+                NULL, :fact_version, :stage_code,
                 :document_type_key, NULL, :field_key,
                 CAST(:value AS jsonb), CAST(:value AS jsonb), false
             )
@@ -109,6 +111,7 @@ def _seed_field(
             "journey_id": journey_id,
             "document_id": document_id,
             "fact_version": fact_version,
+            "stage_code": stage_code,
             "document_type_key": document_type_key,
             "field_key": field_key,
             "value": json.dumps(value),
@@ -159,6 +162,59 @@ def test_delivery_receipt_registered_as_payment_receipt_materializes_a_payment(j
 def test_no_durable_documents_is_a_clean_skip(journey) -> None:
     tenant_id, journey_id = journey.tenant_id, journey.journey_id
     result = materialize_delivery_documents_from_durable_store(
+        journey, tenant_id=tenant_id, journey_id=journey_id
+    )
+    assert result == {"skipped": True, "reason": "no_documents"}
+
+
+def test_booking_insurance_cover_materializes_into_insurance_records(journey) -> None:
+    # Regression, confirmed live: an Insurance Cover document uploaded and
+    # reviewed during Booking showed its extracted fields (insurer name,
+    # chassis number, ...) in the raw reviewed-fields viewer, but never
+    # reached auditcore.insurance_records no matter how many times Resync
+    # ran. Root cause: materialize_delivery_insurance is genuinely stage-
+    # agnostic (filters by document type, auditcore.insurance_records has
+    # no stage column), but its only caller was Delivery-only
+    # (materialize_reviewed_delivery_business_values, stage_code ==
+    # "DELIVERY" gate in uc03_confidence_review_policy.py). Not a
+    # confirmation-status gate, not a stale row -- a genuinely missing call
+    # for Booking-stage insurance documents.
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    document_id = uuid4()
+    _seed_field(
+        journey, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+        document_type_key="insurance_cover", field_key="insurer_name",
+        value="Zurich Kotak General Insurance Company (Ind.) Ltd.", stage_code="BOOKING",
+    )
+    _seed_field(
+        journey, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+        document_type_key="insurance_cover", field_key="agent_intermediary_name",
+        value="Aditya Motors", stage_code="BOOKING",
+    )
+
+    result = materialize_booking_insurance_from_durable_store(
+        journey, tenant_id=tenant_id, journey_id=journey_id
+    )
+    assert not result.get("error"), result
+    assert result.get("insuranceFieldsWritten", 0) > 0
+
+    row = journey.execute(
+        text(
+            """
+            SELECT insurer_name, agent_intermediary_name
+            FROM auditcore.insurance_records
+            WHERE tenant_id=:t AND journey_id=:j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one()
+    assert row["insurer_name"] == "Zurich Kotak General Insurance Company (Ind.) Ltd."
+    assert row["agent_intermediary_name"] == "Aditya Motors"
+
+
+def test_booking_insurance_no_durable_documents_is_a_clean_skip(journey) -> None:
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    result = materialize_booking_insurance_from_durable_store(
         journey, tenant_id=tenant_id, journey_id=journey_id
     )
     assert result == {"skipped": True, "reason": "no_documents"}
