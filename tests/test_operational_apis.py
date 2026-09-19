@@ -7,9 +7,13 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-from audit_core.dependencies import get_connection, get_principal
+from audit_core.dependencies import get_connection, get_human_principal, get_principal
 from audit_core.main import app
-from audit_core.security import Principal
+from audit_core.security import HumanPrincipal, Principal
+from audit_core.security_authorization import (
+    SecurityAuthorizationDecision,
+    get_security_authorization_client,
+)
 
 
 def test_daily_crm_and_escalation_routes_persist_operational_work() -> None:
@@ -127,13 +131,40 @@ def test_daily_crm_and_escalation_routes_persist_operational_work() -> None:
         with engine.begin() as connection:
             yield connection
 
+    class AllowingDailyOpsAuthorization:
+        def __init__(self) -> None:
+            self.permission_checks: list[str] = []
+
+        def check_user_permission(
+            self,
+            *,
+            user_id: str,
+            tenant_id: str,
+            permission_key: str,
+        ) -> SecurityAuthorizationDecision:
+            self.permission_checks.append(permission_key)
+            return SecurityAuthorizationDecision(
+                allowed=True,
+                reason_code="TEST_ALLOW",
+                user_id=user_id,
+                tenant_id=tenant_id,
+                permission_key=permission_key,
+                role_key="PM",
+            )
+
+    daily_ops_authorization = AllowingDailyOpsAuthorization()
+
     app.dependency_overrides[get_connection] = connection_override
+    app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=actor_id)
+    app.dependency_overrides[get_security_authorization_client] = lambda: daily_ops_authorization
+
+    # CRM and Escalation intentionally remain on their existing legacy Principal
+    # dependency in this test. Keeping this override proves the Daily Ops auth repair
+    # does not migrate or alter those neighboring operational flows.
     app.dependency_overrides[get_principal] = lambda: Principal(
         subject=actor_id,
         tenant_id=tenant_id,
         permissions=(
-            "audit.daily_ops.read",
-            "audit.daily_ops.execute",
             "audit.crm.read",
             "audit.crm.manage",
             "audit.escalation.read",
@@ -160,6 +191,7 @@ def test_daily_crm_and_escalation_routes_persist_operational_work() -> None:
         )
         assert replayed_daily.status_code == 200, replayed_daily.text
         assert replayed_daily.json() == completed_daily.json()
+        assert set(daily_ops_authorization.permission_checks) == {"audit.daily_ops.execute"}
 
         journey_base = f"/v1/tenants/{tenant_id}/journeys/{journey_id}"
         crm_key = f"crm-create-{suffix}"
