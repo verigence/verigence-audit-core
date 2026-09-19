@@ -38,6 +38,7 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from audit_core.uc03_delivery_review_materialization import (
+    materialize_delivery_insurance,
     materialize_reviewed_delivery_business_values,
 )
 
@@ -46,8 +47,8 @@ logger = logging.getLogger(__name__)
 _MACHINE_ACTOR = "SYSTEM:DI_AUTO"
 
 
-def _delivery_documents_from_durable_store(
-    connection: Connection, *, tenant_id: str, journey_id: UUID
+def _documents_from_durable_store(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, stage_code: str
 ) -> list[Any]:
     rows = connection.execute(
         text(
@@ -56,11 +57,11 @@ def _delivery_documents_from_durable_store(
                    field_key, effective_value, confidence_score
             FROM auditcore.journey_document_extracted_fields
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code='DELIVERY'
+              AND stage_code=:stage_code
             ORDER BY di_document_id
             """
         ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
+        {"tenant_id": tenant_id, "journey_id": journey_id, "stage_code": stage_code},
     ).mappings().all()
 
     grouped: dict[UUID, dict[str, Any]] = {}
@@ -107,8 +108,8 @@ def materialize_delivery_documents_from_durable_store(
     typed writer underneath upserts); never raises.
     """
     try:
-        documents = _delivery_documents_from_durable_store(
-            connection, tenant_id=tenant_id, journey_id=journey_id
+        documents = _documents_from_durable_store(
+            connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY"
         )
         if not documents:
             return {"skipped": True, "reason": "no_documents"}
@@ -136,4 +137,60 @@ def materialize_delivery_documents_from_durable_store(
         return {"error": True}
 
 
-__all__ = ["materialize_delivery_documents_from_durable_store"]
+def materialize_booking_insurance_from_durable_store(
+    connection: Connection, *, tenant_id: str, journey_id: UUID
+) -> dict[str, Any]:
+    """Fill canonical insurance facts from every currently-confirmed Booking
+    document carrying an insurance_cover (or alias) type.
+
+    materialize_delivery_insurance is misleadingly named but genuinely
+    stage-agnostic: it filters candidate documents by document TYPE, and
+    auditcore.insurance_records is keyed (tenant_id, journey_id) with no
+    stage column at all. It was, however, only ever called from Delivery's
+    own materialize_reviewed_delivery_business_values -- confirmed live,
+    an Insurance Cover document uploaded and confirmed during Booking
+    showed its extracted fields (insurer name, chassis number, ...) in the
+    raw reviewed-fields viewer, but never reached auditcore.insurance_
+    records no matter how many times Resync ran, because the one code path
+    that calls materialize_delivery_insurance never fires for stage_code
+    == "BOOKING" at all -- not a confirmation-status gate, not a stale row,
+    a genuinely missing call. This mirrors materialize_delivery_documents_
+    from_durable_store's own shape but deliberately calls only the one
+    document-type-scoped materializer that actually applies pre-Delivery,
+    not the full Delivery bundle (vehicle/registration/finance/scrappage
+    genuinely don't apply yet at Booking time).
+    """
+    try:
+        documents = _documents_from_durable_store(
+            connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING"
+        )
+        if not documents:
+            return {"skipped": True, "reason": "no_documents"}
+        written = materialize_delivery_insurance(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            documents=documents,
+        )
+        result = {"insuranceFieldsWritten": written}
+        logger.info(
+            "uc03_booking_insurance_materialized",
+            extra={
+                "tenant_id": tenant_id,
+                "journey_id": str(journey_id),
+                "document_count": len(documents),
+                **result,
+            },
+        )
+        return result
+    except Exception:
+        logger.warning(
+            "materialize_booking_insurance_from_durable_store failed", exc_info=True
+        )
+        return {"error": True}
+
+
+__all__ = [
+    "materialize_booking_insurance_from_durable_store",
+    "materialize_delivery_documents_from_durable_store",
+]
