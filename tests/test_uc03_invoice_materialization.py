@@ -259,6 +259,61 @@ def test_tax_invoice_persisted_and_projected(journey) -> None:
     assert disc["details"]["origin"] == "INVOICE_MATERIALIZATION"
 
 
+def test_accessory_invoice_line_items_persist_and_round_trip(journey) -> None:
+    """Regression check: reported live as accessory line items visible in the
+    document's own raw extracted fields (confirmed non-empty, real
+    ACCESSORY_GENUINE rows) but missing from the Journey 360 Accessories
+    panel, which reads invoice_review_values.line_items via _invoices() in
+    uc03_journey_overview_projection.py. derive_commercials/the ACCESSORY-
+    purpose total path (test_accessory_invoice_projects_accessories_cost)
+    doesn't touch this column at all -- it derives the total independently
+    from grand_total_amount -- so a correct total there proves nothing about
+    whether line_items itself survives the DB round trip. This asserts the
+    actual persisted column directly, with the real shape from the live
+    report (6 ACCESSORY_GENUINE rows: seat cover, wheel covers, roof rail,
+    rear guard, chrome kit, spoiler)."""
+    c = journey
+    line_items = [
+        {"item_code": "AC00819", "description_raw": "Dark theme- Seat cover with Armrest-7SF",
+         "hsn_sac": "87089900", "quantity": 1, "unit_rate": 7885.59, "gross_amount": 7885.59,
+         "discount_amount": 0.0, "taxable_amount": 7885.59, "tax_rate": 18.0, "tax_amount": 1419.42,
+         "net_amount": 9305.0, "line_category": "ACCESSORY_GENUINE"},
+        {"item_code": "AZ00111", "description_raw": "OE Wheel Cover - Z101",
+         "hsn_sac": "87089900", "quantity": 4, "unit_rate": 807.63, "gross_amount": 3230.52,
+         "discount_amount": 0.0, "taxable_amount": 3230.52, "tax_rate": 18.0, "tax_amount": 581.5,
+         "net_amount": 3812.01, "line_category": "ACCESSORY_GENUINE"},
+        {"item_code": "AC00625", "description_raw": "Roof Rail Set - Scorpio",
+         "hsn_sac": "87089900", "quantity": 1, "unit_rate": 4166.95, "gross_amount": 4166.95,
+         "discount_amount": 0.0, "taxable_amount": 4166.95, "tax_rate": 18.0, "tax_amount": 750.06,
+         "net_amount": 4917.0, "line_category": "ACCESSORY_GENUINE"},
+    ]
+    im.materialize_reviewed_invoices(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[_doc("accessory_invoice_dms", {
+            "invoice_purpose": "ACCESSORY",
+            "grand_total_amount": "17870",
+            "line_items": line_items,
+        })],
+    )
+
+    row = c.execute(
+        text("SELECT line_items FROM auditcore.invoice_review_values "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one()
+    persisted = row["line_items"]
+    assert persisted is not None
+    assert len(persisted) == 3
+    assert {item["item_code"] for item in persisted} == {"AC00819", "AZ00111", "AC00625"}
+    assert all(item["line_category"] == "ACCESSORY_GENUINE" for item in persisted)
+
+    from audit_core import uc03_journey_overview_projection as projection
+    projected = projection._invoices(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    assert len(projected) == 1
+    assert len(projected[0]["lineItems"]) == 3
+    assert {item["item_code"] for item in projected[0]["lineItems"]} == {"AC00819", "AZ00111", "AC00625"}
+
+
 def test_accessory_invoice_projects_accessories_cost(journey) -> None:
     c = journey
     im.materialize_reviewed_invoices(
