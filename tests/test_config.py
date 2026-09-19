@@ -19,6 +19,32 @@ def test_load_settings_accepts_explicit_environment() -> None:
     assert settings.service_name == "verigence-audit-core"
 
 
+def test_observability_signals_are_independently_configurable() -> None:
+    settings = load_settings(
+        {
+            "APP_ENV": "dev",
+            "OBSERVABILITY_LOGS_ENABLED": "true",
+            "OBSERVABILITY_ERRORS_ENABLED": "false",
+            "OBSERVABILITY_METRICS_ENABLED": "true",
+            "OBSERVABILITY_TRACES_ENABLED": "false",
+        }
+    )
+
+    assert settings.observability_logs_enabled is True
+    assert settings.observability_errors_enabled is False
+    assert settings.observability_metrics_enabled is True
+    assert settings.observability_traces_enabled is False
+
+
+def test_legacy_master_does_not_enable_distributed_tracing() -> None:
+    settings = load_settings({"APP_ENV": "dev", "OBSERVABILITY_ENABLED": "true"})
+
+    assert settings.observability_logs_enabled is True
+    assert settings.observability_errors_enabled is True
+    assert settings.observability_metrics_enabled is True
+    assert settings.observability_traces_enabled is False
+
+
 def test_service_startup_fails_fast_without_required_setting() -> None:
     env = os.environ.copy()
     env.pop("APP_ENV", None)
