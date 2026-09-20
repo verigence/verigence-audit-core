@@ -1,4 +1,8 @@
+import os
 from uuid import uuid4
+
+import pytest
+from sqlalchemy import create_engine, text
 
 from audit_core.uc03_booking_review_decisions import _raw_review_items
 from audit_core.uc03_document_review_v2 import (
@@ -14,6 +18,7 @@ from audit_core.uc03_v2_review_materialization import (
     _RECEIPT_FIELDS,
     _payment_values,
     _reviewed_receipt_values,
+    materialize_reviewed_di_business_values,
     receipt_document_ordinals,
     receipt_review_key,
 )
@@ -289,3 +294,126 @@ def test_reviewed_receipt_fields_are_collected_once_in_memory() -> None:
     assert str(values["receipt_date"]) == "2026-08-30"
     assert values["payment_mode"] == "UPI"
     assert values["payment_reference_no"] == "UTR-123"
+
+
+# ── integration: Confirm-time materialization covers insurance/finance too ──
+
+@pytest.fixture
+def journey():
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for materialization integration tests")
+    engine = create_engine(database_url)
+    suffix = uuid4().hex[:10]
+    tenant_id = f"tenant-v2rm-{suffix}"
+    with engine.begin() as c:
+        category_id = c.execute(
+            text("INSERT INTO auditcore.product_categories (category_code, category_name) "
+                 "VALUES (:c, 'V') RETURNING product_category_id"),
+            {"c": f"V2RM-CAT-{suffix}"},
+        ).scalar_one()
+        oem_id = c.execute(
+            text("INSERT INTO auditcore.oems (oem_code, oem_name) VALUES (:c, 'O') RETURNING oem_id"),
+            {"c": f"V2RM-OEM-{suffix}"},
+        ).scalar_one()
+        c.execute(
+            text("""INSERT INTO auditcore.projects
+                (tenant_id, project_code, project_name, oem_id, product_category_id,
+                 effective_start_date, timezone_name, project_status)
+                VALUES (:t, :pc, 'V2RM', :o, :cat, CURRENT_DATE - 1, 'Asia/Kolkata', 'ACTIVE')"""),
+            {"t": tenant_id, "pc": f"V2RM-{suffix}", "o": oem_id, "cat": category_id},
+        )
+        dealer_id = c.execute(
+            text("INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
+                 "VALUES (:t, :c, 'D') RETURNING dealer_id"),
+            {"t": tenant_id, "c": f"V2RM-D-{suffix}"},
+        ).scalar_one()
+        outlet_id = c.execute(
+            text("INSERT INTO auditcore.dealer_outlets (tenant_id, dealer_id, outlet_code, outlet_name) "
+                 "VALUES (:t, :d, :c, 'O') RETURNING outlet_id"),
+            {"t": tenant_id, "d": dealer_id, "c": f"V2RM-O-{suffix}"},
+        ).scalar_one()
+        customer_id = c.execute(
+            text("""INSERT INTO auditcore.customers
+                (tenant_id, dealer_id, outlet_id, customer_type_code, display_name)
+                VALUES (:t, :d, :o, 'INDIVIDUAL', 'C') RETURNING customer_id"""),
+            {"t": tenant_id, "d": dealer_id, "o": outlet_id},
+        ).scalar_one()
+        journey_id = c.execute(
+            text("""INSERT INTO auditcore.journeys
+                (tenant_id, dealer_id, outlet_id, customer_id, journey_reference)
+                VALUES (:t, :d, :o, :cu, :r) RETURNING journey_id"""),
+            {"t": tenant_id, "d": dealer_id, "o": outlet_id, "cu": customer_id, "r": f"V2RM-J-{suffix}"},
+        ).scalar_one()
+    engine.dispose()
+    engine = create_engine(database_url)
+    with engine.begin() as c:
+        c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        c.tenant_id = tenant_id  # type: ignore[attr-defined]
+        c.journey_id = journey_id  # type: ignore[attr-defined]
+        yield c
+    engine.dispose()
+
+
+def test_confirm_time_materialization_covers_insurance_and_finance(journey) -> None:
+    # Regression: materialize_reviewed_di_business_values (the materializer
+    # POST /booking/review/confirm runs the instant a PC confirms, including
+    # any field corrections made via the review screen's date picker) never
+    # called materialize_delivery_insurance/materialize_delivery_finance at
+    # all -- both are genuinely stage-agnostic (they filter by document
+    # TYPE, and auditcore.insurance_records/finance_records have no stage
+    # column), but were only ever wired into Delivery's own confirm flow and
+    # the async document-link webhook's Booking-side background sync. A PC
+    # correcting an insurance or finance field here and clicking Confirm
+    # needs that correction in the canonical table immediately, not only
+    # once some later, unrelated document's background sync happens to run
+    # this same materializer again.
+    c = journey
+    tenant_id, journey_id = c.tenant_id, c.journey_id
+    insurance_doc = ReviewV2Document(
+        documentId=uuid4(),
+        label="Insurance Cover",
+        documentTypeKey="insurance_cover",
+        originalFilename="insurance.pdf",
+        processingStatus="PROCESSED",
+        extractionState="READY",
+        fields=[
+            _field("insurer_name", "Zurich Kotak General Insurance Company (Ind.) Ltd."),
+            _field("agent_intermediary_name", "Aditya Motors"),
+        ],
+    )
+    finance_doc = ReviewV2Document(
+        documentId=uuid4(),
+        label="Bank Approval Letter",
+        documentTypeKey="bank_approval_letter",
+        originalFilename="approval.pdf",
+        processingStatus="PROCESSED",
+        extractionState="READY",
+        fields=[_field("financed_by", "UCO Bank")],
+    )
+
+    result = materialize_reviewed_di_business_values(
+        c,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        documents=[insurance_doc, finance_doc],
+        rejected_review_keys=set(),
+        actor_id="tester",
+    )
+    assert result["insuranceFieldsWritten"] > 0
+    assert result["financeFieldsWritten"] > 0
+
+    insurance_row = c.execute(
+        text("SELECT insurer_name, agent_intermediary_name FROM auditcore.insurance_records "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one()
+    assert insurance_row["insurer_name"] == "Zurich Kotak General Insurance Company (Ind.) Ltd."
+    assert insurance_row["agent_intermediary_name"] == "Aditya Motors"
+
+    finance_row = c.execute(
+        text("SELECT provider_name FROM auditcore.finance_records "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one()
+    assert finance_row["provider_name"] == "UCO Bank"
