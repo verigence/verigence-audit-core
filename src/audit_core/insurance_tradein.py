@@ -47,6 +47,10 @@ class InsurancePut(BaseModel):
     actualPremiumAmount: Decimal | None = None
     selfInsuranceFlag: bool | None = None
     actualStatusCode: str | None = Field(default=None, max_length=100)
+    agentIntermediaryName: str | None = Field(default=None, max_length=200)
+    agentIntermediaryCode: str | None = Field(default=None, max_length=80)
+    mispCode: str | None = Field(default=None, max_length=80)
+    insuranceAddOns: list[str] | None = None
     sourceKind: SourceKind | None = None
     sourceEvidenceId: UUID | None = None
     addons: list[AddonInput] = Field(default_factory=list)
@@ -62,6 +66,10 @@ class InsuranceResponse(BaseModel):
     actualPremiumAmount: Decimal | None
     selfInsuranceFlag: bool | None
     actualStatusCode: str | None
+    agentIntermediaryName: str | None
+    agentIntermediaryCode: str | None
+    mispCode: str | None
+    insuranceAddOns: list[str] | None
     sourceKind: str | None
     sourceEvidenceId: UUID | None
     addons: list[AddonResponse]
@@ -162,7 +170,8 @@ def _insurance(connection: Connection, tenant_id: str, journey_id: UUID):
             SELECT insurance_record_id, journey_id, insurer_name, policy_reference,
                    cover_note_reference, standard_premium_amount,
                    actual_premium_amount, self_insurance_flag, actual_status_code,
-                   source_kind, source_evidence_id
+                   agent_intermediary_name, agent_intermediary_code, misp_code,
+                   add_ons, source_kind, source_evidence_id
             FROM auditcore.insurance_records
             WHERE tenant_id = :tenant_id AND journey_id = :journey_id
             """
@@ -185,6 +194,10 @@ def _insurance(connection: Connection, tenant_id: str, journey_id: UUID):
         actualPremiumAmount=row["actual_premium_amount"],
         selfInsuranceFlag=row["self_insurance_flag"],
         actualStatusCode=row["actual_status_code"],
+        agentIntermediaryName=row["agent_intermediary_name"],
+        agentIntermediaryCode=row["agent_intermediary_code"],
+        mispCode=row["misp_code"],
+        insuranceAddOns=row["add_ons"],
         sourceKind=row["source_kind"],
         sourceEvidenceId=row["source_evidence_id"],
         addons=_addons(connection, tenant_id, journey_id),
@@ -222,12 +235,14 @@ def put_insurance(
                 tenant_id, journey_id, insurer_name, policy_reference,
                 cover_note_reference, standard_premium_amount,
                 actual_premium_amount, self_insurance_flag, actual_status_code,
-                source_kind, source_evidence_id
+                agent_intermediary_name, agent_intermediary_code, misp_code,
+                add_ons, source_kind, source_evidence_id
             ) VALUES (
                 :tenant_id, :journey_id, :insurer_name, :policy_reference,
                 :cover_note_reference, :standard_premium_amount,
                 :actual_premium_amount, :self_insurance_flag, :actual_status_code,
-                :source_kind, :source_evidence_id
+                :agent_intermediary_name, :agent_intermediary_code, :misp_code,
+                CAST(:add_ons AS jsonb), :source_kind, :source_evidence_id
             )
             ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
                 insurer_name = EXCLUDED.insurer_name,
@@ -237,6 +252,10 @@ def put_insurance(
                 actual_premium_amount = EXCLUDED.actual_premium_amount,
                 self_insurance_flag = EXCLUDED.self_insurance_flag,
                 actual_status_code = EXCLUDED.actual_status_code,
+                agent_intermediary_name = EXCLUDED.agent_intermediary_name,
+                agent_intermediary_code = EXCLUDED.agent_intermediary_code,
+                misp_code = EXCLUDED.misp_code,
+                add_ons = EXCLUDED.add_ons,
                 source_kind = EXCLUDED.source_kind,
                 source_evidence_id = EXCLUDED.source_evidence_id,
                 updated_at_utc = now(),
@@ -253,6 +272,10 @@ def put_insurance(
             "actual_premium_amount": payload.actualPremiumAmount,
             "self_insurance_flag": payload.selfInsuranceFlag,
             "actual_status_code": payload.actualStatusCode,
+            "agent_intermediary_name": payload.agentIntermediaryName,
+            "agent_intermediary_code": payload.agentIntermediaryCode,
+            "misp_code": payload.mispCode,
+            "add_ons": json.dumps(payload.insuranceAddOns) if payload.insuranceAddOns is not None else None,
             "source_kind": payload.sourceKind,
             "source_evidence_id": payload.sourceEvidenceId,
         },
