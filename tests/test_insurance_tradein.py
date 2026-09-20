@@ -149,6 +149,10 @@ def test_insurance_addons_and_trade_in_persist_independently() -> None:
                 "policyReference": "POL-1",
                 "standardPremiumAmount": "50000.00",
                 "actualPremiumAmount": "50456.00",
+                "agentIntermediaryName": "Example Broking Agency",
+                "agentIntermediaryCode": "AGT-9001",
+                "mispCode": "MISP-42",
+                "insuranceAddOns": ["Zero Depreciation", "RSA", "Engine Protect"],
                 "sourceKind": "OPERATIONAL_INPUT",
                 "addons": [
                     {
@@ -165,6 +169,16 @@ def test_insurance_addons_and_trade_in_persist_independently() -> None:
         body = insurance.json()
         assert Decimal(str(body["actualPremiumAmount"])) == Decimal("50456.00")
         assert body["addons"][0]["addonTypeCode"] == "EXTENDED_WARRANTY"
+        # Agent/intermediary, MISP code, and DI-extracted insurance add-ons
+        # (auditcore.insurance_records.agent_intermediary_name/_code/misp_code/
+        # add_ons, added by migration 0076 but never wired into this
+        # endpoint's read/write path until now) must round-trip -- confirmed
+        # live gap: materialize_delivery_insurance already writes all four,
+        # this API never read or wrote any of them.
+        assert body["agentIntermediaryName"] == "Example Broking Agency"
+        assert body["agentIntermediaryCode"] == "AGT-9001"
+        assert body["mispCode"] == "MISP-42"
+        assert body["insuranceAddOns"] == ["Zero Depreciation", "RSA", "Engine Protect"]
         assert client.get(insurance_url).json() == body
 
         trade_url = f"/v1/tenants/{tenant_id}/journeys/{journey_id}/trade-in"
