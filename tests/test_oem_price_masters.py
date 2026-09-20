@@ -27,6 +27,7 @@ from audit_core.oem_price_masters import (
     ingest_price_list,
 )
 from audit_core.price_lists import find_effective_price_plan
+from audit_core.uc03_model_resolution import _sku_rows_for_version
 
 _HEADER = [
     "Sl. No.", "Category", "Model", "Variant", "Trim", "Fuel", "Transmission",
@@ -48,6 +49,31 @@ def _price_bytes(*price_rows: tuple[str, str, int]) -> bytes:
         onroad = ex + tcs + ins + ew4 + ew45 + acc + rsa + fastag + reg
         ws.append([
             sl, "PV", model, variant, variant.split()[0], "PETROL", "MT", "2WD", "5",
+            ex, tcs, ins, ew4, ew45, acc, rsa, fastag, reg, onroad, reg, onroad, "S",
+        ])
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _price_bytes_full(*rows: dict) -> bytes:
+    """Same header/layout as _price_bytes, but every structured attribute is
+    explicit per row instead of derived from the variant string -- needed to
+    reproduce a real master sheet where several variants of the same model
+    share some attributes (fuel/transmission/drive, even the same trim) but
+    differ in others (seater), which _price_bytes' one-row-per-call helper
+    can never exercise."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Price List"
+    ws.append(_HEADER)
+    for sl, row in enumerate(rows, start=1):
+        tcs, ins, ew4, ew45, acc, rsa, fastag, reg = 100, 200, 300, 400, 500, 60, 40, 5000
+        ex = row["ex"]
+        onroad = ex + tcs + ins + ew4 + ew45 + acc + rsa + fastag + reg
+        ws.append([
+            sl, "PV", row["model"], row["variant"], row["trim"], row["fuel"],
+            row["transmission"], row["drive"], row["seater"],
             ex, tcs, ins, ew4, ew45, acc, rsa, fastag, reg, onroad, reg, onroad, "S",
         ])
     buf = BytesIO()
@@ -201,6 +227,45 @@ def test_reupload_backfills_trim_onto_an_already_ingested_variant(connection) ->
         {"o": project["oem_id"]},
     ).scalar_one()
     assert trim == "MX1"
+
+
+def test_price_list_ingest_persists_trim_across_sibling_variants_of_one_model(connection) -> None:
+    """Reproduces the live master sheet verbatim: SCORPIO CLASSIC carries
+    three variants that share fuel/transmission/drive (DIESEL/MT/2WD) and,
+    for two of them, the identical trim "S" -- differing only in seater (7
+    vs 9) for those two, and in trim ("S11") for the third. The single-row
+    tests above (test_price_list_ingest_persists_trim_on_the_variant,
+    test_reupload_backfills_trim_onto_an_already_ingested_variant) only
+    ever ingest one variant per model per call, so they cannot catch a bug
+    that only shows up when several sibling variants of the same model are
+    ingested together in one upload -- which is the real-world shape being
+    reported live as "trim is missing" for exactly these three rows."""
+    tenant_id = connection.tenant_id
+    project = _project_oem(connection, tenant_id)
+    parsed = parse_price_list(_price_bytes_full(
+        {"model": "SCORPIO CLASSIC", "variant": "Classic S BS6.2 - E", "trim": "S",
+         "fuel": "DIESEL", "transmission": "MT", "drive": "2WD", "seater": "7", "ex": 1_336_701},
+        {"model": "SCORPIO CLASSIC", "variant": "Classic S - 9 STR BS6.2 - E", "trim": "S",
+         "fuel": "DIESEL", "transmission": "MT", "drive": "2WD", "seater": "9", "ex": 1_383_901},
+        {"model": "SCORPIO CLASSIC", "variant": "Classic S11 BS6.2 - E", "trim": "S11",
+         "fuel": "DIESEL", "transmission": "MT", "drive": "2WD", "seater": "7", "ex": 1_739_901},
+    ))
+    assert not parsed.errors, parsed.errors
+    version_id, sku_id_by_code = ingest_price_list(
+        connection, tenant_id=tenant_id, oem_id=project["oem_id"],
+        effective_from=date(2026, 9, 3), parsed=parsed, actor_id="admin",
+    )
+    assert len(sku_id_by_code) == 3
+
+    rows = _sku_rows_for_version(connection, tenant_id=tenant_id, price_list_version_id=version_id)
+    by_variant = {r["variant_name"]: r for r in rows}
+    assert by_variant["Classic S BS6.2 - E"]["trim"] == "S"
+    assert by_variant["Classic S - 9 STR BS6.2 - E"]["trim"] == "S"
+    assert by_variant["Classic S11 BS6.2 - E"]["trim"] == "S11"
+    for variant_name in by_variant:
+        assert by_variant[variant_name]["fuel_powertrain"] == "DIESEL"
+        assert by_variant[variant_name]["transmission"] == "MT"
+        assert by_variant[variant_name]["drive"] == "2WD"
 
 
 def test_reupload_supersedes_by_effective_date(connection) -> None:
