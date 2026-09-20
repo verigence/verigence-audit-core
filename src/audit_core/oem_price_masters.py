@@ -1003,6 +1003,11 @@ def _build_preview(parsed: ParseResult, kind: str) -> dict[str, Any]:
             {
                 "model": r.model_name,
                 "variant": r.variant_name,
+                "trim": r.trim,
+                "fuel": r.fuel,
+                "transmission": r.transmission,
+                "drive": r.drive,
+                "seater": r.seater,
                 "category": r.category,
                 "registrationBasis": r.registration_basis,
                 **{

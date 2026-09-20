@@ -21,6 +21,7 @@ from audit_core.oem_master_parsers import (
     parse_master,
     parse_price_list,
 )
+from audit_core.oem_price_masters import _build_preview
 
 _PRICE_HEADER = [
     "Sl. No.", "Category", "Model", "Variant", "Trim", "Fuel", "Transmission",
@@ -132,6 +133,28 @@ def test_price_list_tolerates_a_currency_glyph_stuck_to_a_header_label() -> None
     assert not result.errors
     assert len(result.price_rows) == 1
     assert result.price_rows[0].model_name == "THAR ROXX"
+
+
+def test_price_list_preview_exposes_the_structured_attributes() -> None:
+    # Confirmed live: an admin reviewing the Publish preview for a fresh
+    # upload had no way to see Trim/Fuel/Transmission/Drive/Seater at all --
+    # not because parsing dropped them (it doesn't), but because the preview
+    # sample dict never included them in the first place, only model/
+    # variant/category/registrationBasis/prices. The preview table itself
+    # renders whatever keys the sample rows carry (AdminOemMastersPage.tsx's
+    # SampleTable derives its columns from Object.keys(sample[0])), so
+    # backfilling these keys here is the whole fix, no frontend change
+    # needed.
+    result = parse_price_list(
+        _price_workbook([_price_row(1, "THAR ROXX", "MX1 PMT 2WD", 1_000_000, 90_000, 91_500)])
+    )
+    preview = _build_preview(result, "PRICE_LIST")
+    row = preview["sample"][0]
+    assert row["trim"] == "MX1"
+    assert row["fuel"] == "PETROL"
+    assert row["transmission"] == "MT"
+    assert row["drive"] == "2WD"
+    assert row["seater"] == "5"
 
 
 def _corporate_workbook() -> bytes:
