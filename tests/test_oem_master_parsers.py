@@ -105,6 +105,35 @@ def test_price_list_rejects_foreign_workbook() -> None:
         parse_price_list(buf.getvalue())
 
 
+def test_price_list_tolerates_a_currency_glyph_stuck_to_a_header_label() -> None:
+    # Confirmed against a real uploaded master (Mahindra Consolidated List,
+    # 03-Sep-2026): the Model column's header cell literally reads "Model₹"
+    # -- the Rupee symbol stuck directly onto the label, every other header
+    # cell unaffected. The strict header-layout check rejected the entire
+    # file outright, silently discarding real Trim data (this exact
+    # scenario is what left SCORPIO CLASSIC's trim missing from the Modify
+    # Model picker for about a week -- see
+    # test_price_list_ingest_persists_trim_across_sibling_variants_of_one_
+    # model in test_oem_price_masters.py, which proved ingestion itself was
+    # fine once a file actually got past this gate). A header cell is a
+    # label, never itself a currency value, so tolerating a trailing
+    # currency glyph here can't mask a genuine layout mismatch.
+    header = list(_PRICE_HEADER)
+    header[2] = "Model₹"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Price List"
+    ws.append(header)
+    ws.append(_price_row(1, "THAR ROXX", "MX1 PMT 2WD", 1_000_000, 90_000, 91_500))
+    buf = BytesIO()
+    wb.save(buf)
+
+    result = parse_price_list(buf.getvalue())
+    assert not result.errors
+    assert len(result.price_rows) == 1
+    assert result.price_rows[0].model_name == "THAR ROXX"
+
+
 def _corporate_workbook() -> bytes:
     wb = Workbook()
     policy = wb.active

@@ -169,6 +169,25 @@ def _text(value: Any) -> str | None:
     return text or None
 
 
+_HEADER_NOISE_RE = re.compile(r"[₹$€£]+$")
+
+
+def _header_text(value: Any) -> str:
+    """Header-cell text, with trailing currency-symbol noise stripped.
+
+    Confirmed live against a real uploaded master: a header cell literally
+    reads "Model₹" (the Rupee symbol stuck to the label, not a stray column
+    -- Sl. No./Category/Variant/Trim/... on either side are all otherwise
+    unaffected), which fails parse_price_list's strict header-layout check
+    outright and rejects the whole file -- with a real Trim column the
+    picker needs, but nothing downstream ever saw it. A header cell is a
+    label, never itself a currency value (the monetary *columns* are
+    validated separately via _money on the data rows), so stripping a
+    trailing currency glyph here can never mask a genuine layout mismatch.
+    """
+    return _HEADER_NOISE_RE.sub("", _text(value) or "")
+
+
 def _slug_model(name: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "_", name.strip().upper()).strip("_")
 
@@ -276,7 +295,7 @@ def parse_price_list(content: bytes) -> ParseResult:
     rows = list(sheet.iter_rows(values_only=True))
     if not rows:
         raise MasterParseError("Price list sheet is empty.")
-    header = [(_text(c) or "") for c in rows[0][: len(_PRICE_HEADER)]]
+    header = [_header_text(c) for c in rows[0][: len(_PRICE_HEADER)]]
     if header != list(_PRICE_HEADER):
         raise MasterParseError(
             "Price list header does not match the expected consolidated layout: "
