@@ -394,15 +394,15 @@ def _seed_extracted_field(
         text(
             """
             INSERT INTO auditcore.evidence (
-                tenant_id, journey_id, customer_id, di_document_id,
+                tenant_id, journey_id, customer_id, di_subject_id, di_document_id,
                 document_type_key, evidence_purpose, linked_by_actor_id
             ) VALUES (
-                :t, :j, :cu, :doc, :dtype, 'DELIVERY_AUDIT', :actor
+                :t, :j, :cu, :subject, :doc, :dtype, 'DELIVERY_AUDIT', :actor
             ) RETURNING evidence_id
             """
         ),
         {
-            "t": tenant_id, "j": journey_id, "cu": customer_id, "doc": di_document_id,
+            "t": tenant_id, "j": journey_id, "cu": customer_id, "subject": uuid4(), "doc": di_document_id,
             "dtype": document_type_key, "actor": actor_id,
         },
     ).scalar_one()
