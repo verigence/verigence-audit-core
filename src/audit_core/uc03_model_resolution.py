@@ -54,6 +54,7 @@ from audit_core.uc03_manual_verification import _resolve_finding
 from audit_core.uc03_masters_alignment import registration_basis
 from audit_core.uc03_model_attribute_matching import (
     _master_attributes,
+    fuzzy_match_by_attributes,
     has_qualifying_signal,
     match_by_attributes,
     normalized_model_key,
@@ -709,6 +710,51 @@ def _attribute_decomposition_fallback(
     return matched, "ATTRIBUTE_DECOMPOSITION", trustworthy
 
 
+# A confident auto-resolve needs both a reasonable absolute combined score
+# AND a real gap over the next-best candidate -- the margin does most of
+# the real safety work here, not the absolute floor. Tuned empirically
+# against SequenceMatcher's own ratio() behavior on short (2-4 character)
+# trim codes, which is what a real Mahindra Trim column actually looks
+# like: a single mid-string character misread (fuzzy_match_by_attributes's
+# own tests) lands the correct candidate's combined score (0.7*trim_sim +
+# 0.3*attribute-confirmation) around 0.75-0.80 with a >=0.2 gap over the
+# next-best candidate, while two genuinely different short trims typically
+# land within 0.1-0.15 of each other -- an absolute floor as high as 0.85
+# (plausible-sounding but unverified) would silently never fire for the
+# single-character-typo case this whole fallback exists for.
+_FUZZY_CONFIDENT_SCORE = 0.70
+_FUZZY_CONFIDENT_MARGIN = 0.15
+
+
+def _fuzzy_decomposition_fallback(
+    connection: Connection, *, tenant_id: str, rows: list[dict[str, Any]], inputs: dict[str, Any]
+) -> list[Any]:
+    """Controlled fuzzy fallback -- tried only once exact attribute
+    decomposition (``match_by_attributes`` above) already failed to
+    produce a unique SKU. Model resolution itself stays exact (see
+    ``fuzzy_match_by_attributes``'s own docstring for why fuzzy-matching
+    the model name is a separate, harder problem, deliberately out of
+    scope here) -- only the trim comparison within that already-resolved
+    model is fuzzy. Returns ``[]`` when the model itself doesn't resolve
+    via the exact alias table at all.
+    """
+    oem_code = _oem_code_for_tenant(connection, tenant_id=tenant_id)
+    if not oem_code:
+        return []
+    aliases = _oem_model_aliases(connection, oem_code=oem_code)
+    resolved = resolve_model_via_aliases(model_name=inputs["model_name"], oem_aliases=aliases)
+    if resolved is None:
+        return []
+    canonical_model, remainder = resolved
+    canonical_key = normalized_model_key(canonical_model)
+    model_rows = [r for r in rows if normalized_model_key(r["model_name"]) == canonical_key]
+    if not model_rows:
+        return []
+    return fuzzy_match_by_attributes(
+        model_rows, oem_code=oem_code, model_remainder=remainder, variant_text=inputs["variant_name"],
+    )
+
+
 def _latest_invoice_field(
     connection: Connection, *, tenant_id: str, journey_id: UUID, field_keys: tuple[str, ...]
 ) -> str | None:
@@ -1056,6 +1102,25 @@ def _current_match(
     matched, stage = _match(rows, inputs)
     if len(matched) == 1:
         return {"matched": matched, "matchStage": stage}
+
+    # Both exact passes failed to converge -- a controlled fuzzy trim match
+    # within the already-identified model, tried before giving up to a
+    # human. Auto-resolves only when the best-scoring candidate clears both
+    # an absolute confidence floor and a real margin over the next best;
+    # otherwise every candidate this narrowed to is reported (never a wider
+    # set than the exact pass already had) so the PC picker shows exactly
+    # what was actually close, not one silent guess.
+    fuzzy_candidates = _fuzzy_decomposition_fallback(
+        connection, tenant_id=tenant_id, rows=rows, inputs=inputs
+    )
+    if fuzzy_candidates:
+        top = fuzzy_candidates[0]
+        runner_up_score = fuzzy_candidates[1].score if len(fuzzy_candidates) > 1 else 0.0
+        if top.score >= _FUZZY_CONFIDENT_SCORE and (top.score - runner_up_score) >= _FUZZY_CONFIDENT_MARGIN:
+            return {"matched": [top.row], "matchStage": "FUZZY_ATTRIBUTE_DECOMPOSITION"}
+        fuzzy_rows = [c.row for c in fuzzy_candidates]
+        if not matched or len(fuzzy_rows) < len(matched):
+            matched, stage = fuzzy_rows, "FUZZY_ATTRIBUTE_DECOMPOSITION"
 
     # Neither pass reached exactly one on its own -- report whichever
     # leaves the smaller, more defensible shortlist.

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Any
 
 _NON_ALNUM = re.compile(r"[^A-Z0-9]+")
@@ -356,3 +357,102 @@ def match_by_attributes(
             continue
         matched.append(row)
     return matched
+
+
+# ── controlled fuzzy fallback (trim text only; attributes stay exact) ──────
+# ``match_by_attributes`` above is exact-only by design and stays that way —
+# it's the first, and still preferred, pass. This is tried only once that
+# pass produces zero or more-than-one candidate: a real Booking Form's trim
+# text and the master's own Trim column are independently transcribed
+# (handwriting -> OCR/LLM extraction on one side, an OEM's own spreadsheet
+# on the other), so a genuine trim match can differ by a dropped/extra
+# character, a missing space, or an abbreviation ("CLASSIC" vs "CLASSICS",
+# "Z8L" vs "Z8 (L)") without the vehicle actually being a different one.
+#
+# Fuel/Transmission/Drive/Seater are NOT fuzzy-scored -- they are closed-
+# vocabulary categorical facts (Diesel is never "close to" Petrol), so they
+# stay exactly what ``match_by_attributes`` already enforces: a stated
+# mismatch disqualifies a candidate outright, never merely lowers a score.
+# What fuzzy scoring adds for them is a *confirmation bonus* -- a candidate
+# whose master row also states an attribute that agrees with the Booking
+# Form counts as more corroborated than one where the master left that
+# column blank (no contradiction, but no confirmation either).
+#
+# Price is deliberately not part of this score at all -- exactly as the
+# exact path already treats it (see ``_current_match`` in
+# uc03_model_resolution.py), it is only ever a downstream tie-breaker
+# applied to whatever this narrows to, never a primary signal here.
+_FUZZY_TRIM_WEIGHT = 0.7
+_FUZZY_ATTR_WEIGHT = 0.3
+_FUZZY_ATTR_KEYS = ("fuel", "transmission", "drive", "seater")
+
+
+def _trim_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+@dataclass(frozen=True)
+class FuzzyCandidate:
+    row: dict[str, Any]
+    score: float
+    trim_similarity: float
+    confirmed_attributes: tuple[str, ...]
+
+
+def fuzzy_match_by_attributes(
+    rows: list[dict[str, Any]],
+    *,
+    oem_code: str,
+    model_remainder: str,
+    variant_text: str | None,
+) -> list[FuzzyCandidate]:
+    """Like ``match_by_attributes``, but trim is fuzzy-scored instead of
+    required to be an exact prefix/suffix match. ``rows`` must already be
+    narrowed to one resolved model (this never fuzzy-matches the model
+    name itself -- see this module's own docstring for why that's a
+    separate, harder problem, deliberately out of scope here).
+
+    Returns every row that survives the same hard fuel/transmission/drive/
+    seater equality filter ``match_by_attributes`` uses, each with a
+    combined score in [0, 1], sorted highest first. A stated attribute
+    mismatch still disqualifies a row outright -- this only softens the
+    trim comparison, never the categorical ones.
+    """
+    combined = " ".join(w for w in (model_remainder, variant_text) if w)
+    booking = _decompose(combined, oem_code=oem_code)
+    if booking is None or not booking.trim_key:
+        return []
+
+    candidates: list[FuzzyCandidate] = []
+    for row in rows:
+        master = _master_attributes(row, oem_code=oem_code)
+        if booking.fuel and master.fuel and booking.fuel != master.fuel:
+            continue
+        if booking.transmission and master.transmission and booking.transmission != master.transmission:
+            continue
+        if booking.drive and master.drive and booking.drive != master.drive:
+            continue
+        if booking.seater and master.seater and booking.seater != master.seater:
+            continue
+        if not master.trim_key:
+            continue
+
+        trim_sim = _trim_similarity(booking.trim_key, master.trim_key)
+        booking_attrs = {"fuel": booking.fuel, "transmission": booking.transmission,
+                          "drive": booking.drive, "seater": booking.seater}
+        master_attrs = {"fuel": master.fuel, "transmission": master.transmission,
+                         "drive": master.drive, "seater": master.seater}
+        confirmed = tuple(
+            key for key in _FUZZY_ATTR_KEYS
+            if booking_attrs[key] and master_attrs[key] and booking_attrs[key] == master_attrs[key]
+        )
+        attr_component = len(confirmed) / len(_FUZZY_ATTR_KEYS)
+        score = (_FUZZY_TRIM_WEIGHT * trim_sim) + (_FUZZY_ATTR_WEIGHT * attr_component)
+        candidates.append(FuzzyCandidate(
+            row=row, score=score, trim_similarity=trim_sim, confirmed_attributes=confirmed,
+        ))
+
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    return candidates
