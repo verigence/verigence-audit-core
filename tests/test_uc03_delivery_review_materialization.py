@@ -264,6 +264,11 @@ def test_delivery_business_materializer_calls_all_canonical_projections(monkeypa
     )
     monkeypatch.setattr(
         materialization,
+        "resolve_finance_disbursement",
+        lambda *args, **kwargs: calls.append("finance_disbursement") or {"resolved": False, "reason": "no_financer"},
+    )
+    monkeypatch.setattr(
+        materialization,
         "materialize_delivery_insurance",
         lambda *args, **kwargs: calls.append("insurance") or 3,
     )
@@ -299,7 +304,7 @@ def test_delivery_business_materializer_calls_all_canonical_projections(monkeypa
     )
 
     assert calls == [
-        "vehicle", "registration", "finance", "finance_hypothecation",
+        "vehicle", "registration", "finance", "finance_hypothecation", "finance_disbursement",
         "insurance", "delivery_date", "commercials", "receipts",
     ]
     assert result["vehicleFields"] == 2

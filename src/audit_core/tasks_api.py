@@ -56,6 +56,11 @@ class TaskCompleteInput(BaseModel):
     # entirely -- optional so their existing no-body completion calls keep
     # working.
     outcome: str | None = None
+    # FINANCE_DISBURSEMENT_REVIEW: the payment_id a PC picked from the
+    # eligible-candidates list (uc03_finance_disbursement_resolution.
+    # eligible_loan_disbursement_candidates) as the actual loan
+    # disbursement. Every other task_type ignores this field.
+    paymentId: UUID | None = None
 
 
 class TaskHistoryEventResponse(BaseModel):
@@ -233,6 +238,9 @@ def complete_task(
     from audit_core.uc03_document_unrecognized import (
         TASK_TYPE as _DOCUMENT_VERIFICATION_TASK_TYPE,
     )
+    from audit_core.uc03_finance_disbursement_resolution import (
+        TASK_TYPE as _FINANCE_DISBURSEMENT_TASK_TYPE,
+    )
 
     _outcome_required_task_types = {_DOCUMENT_VERIFICATION_TASK_TYPE, _WRONG_DOCUMENT_TASK_TYPE}
     outcome = (payload.outcome or "").strip().upper() if payload else ""
@@ -242,6 +250,14 @@ def complete_task(
             status_code=400,
             title="Validation failed",
             detail="outcome must be 'CORRECT' or 'INCORRECT' to complete this task.",
+        )
+    payment_id = payload.paymentId if payload else None
+    if task["task_type"] == _FINANCE_DISBURSEMENT_TASK_TYPE and payment_id is None:
+        raise AuditCoreError(
+            error_code="VAC-VAL-008",
+            status_code=400,
+            title="Validation failed",
+            detail="paymentId is required to complete this task.",
         )
 
     def execute() -> dict:
@@ -267,6 +283,9 @@ def complete_task(
         from audit_core.uc03_document_unrecognized import (
             apply_unrecognized_document_verification,
         )
+        from audit_core.uc03_finance_disbursement_resolution import (
+            confirm_loan_disbursement,
+        )
         from audit_core.uc03_model_selection_corrections import (
             TASK_TYPE as _MODEL_SELECTION_CORRECTION_TASK_TYPE,
         )
@@ -274,7 +293,16 @@ def complete_task(
             apply_confirmed_model_selection_correction,
         )
 
-        if task["task_type"] == _MODEL_SELECTION_CORRECTION_TASK_TYPE:
+        if task["task_type"] == _FINANCE_DISBURSEMENT_TASK_TYPE:
+            confirm_loan_disbursement(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=task["journey_id"],
+                payment_id=payment_id,
+                actor_id=principal.subject,
+                correlation_id=get_correlation_id(request),
+            )
+        elif task["task_type"] == _MODEL_SELECTION_CORRECTION_TASK_TYPE:
             apply_confirmed_model_selection_correction(
                 connection,
                 tenant_id=tenant_id,
@@ -322,7 +350,7 @@ def complete_task(
         tenant_id=tenant_id,
         operation_key=f"task.complete:{task_id}",
         idempotency_key=idempotency_key,
-        request_payload={"taskId": str(task_id), "outcome": outcome or None},
+        request_payload={"taskId": str(task_id), "outcome": outcome or None, "paymentId": str(payment_id) if payment_id else None},
         execute=execute,
         logical_result_id=str(task_id),
     )
