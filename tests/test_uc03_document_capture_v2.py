@@ -16,6 +16,7 @@ from audit_core.uc03_document_capture_v2 import (
     _ensure_evidence_link_for_resync,
     _human_actor_id,
     _requirement_refs_by_document_type_key,
+    _upload_intent_failures,
     resync_booking_capture_v2,
 )
 
@@ -549,3 +550,30 @@ def test_backfill_evidence_links_for_resync_skips_document_with_no_resolvable_re
         )
 
     assert _evidence_row(setup["engine"], tenant_id=setup["tenant_id"], document_id=setup["document_id"]) is None
+
+
+def test_upload_intent_failures_maps_dis_per_file_failures() -> None:
+    # DI (verigence-di#81) isolates each file in an upload-intents batch on
+    # its own SAVEPOINT and reports a failure per file instead of failing
+    # the whole batch -- shared by Booking's/Delivery's own upload-intents
+    # routes and the unified path so a PC sees the same shape everywhere.
+    payload = {
+        "uploads": [{"clientUploadId": "ok-file"}],
+        "failures": [
+            {
+                "clientUploadId": "bad-file",
+                "errorCode": "CONFLICT",
+                "detail": "The existing V2 upload intent was created with a different Audit Core requirement mapping.",
+            }
+        ],
+    }
+    failures = _upload_intent_failures(payload)
+    assert len(failures) == 1
+    assert failures[0].clientUploadId == "bad-file"
+    assert failures[0].errorCode == "CONFLICT"
+
+
+def test_upload_intent_failures_is_empty_when_di_omits_the_field() -> None:
+    # Defensive: a DI deploy older than #81 (or any payload that simply
+    # doesn't carry the field) must not crash this mapping.
+    assert _upload_intent_failures({"uploads": []}) == []

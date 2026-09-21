@@ -33,6 +33,7 @@ from audit_core.uc03_document_capture_v2 import (
     _human_actor_id,
     _log_di_capture_v2_failure,
     _requirement_refs_by_document_type_key,
+    _upload_intent_failures,
     get_di_capture_v2_client,
     get_di_client,
     get_security_oauth_client,
@@ -546,7 +547,9 @@ def create_delivery_upload_intents_v2(
                 expiresAtUtc=str(item["expiresAtUtc"]),
             )
         )
-    return UploadIntentResponse(externalContextRef=context_ref, uploads=results)
+    return UploadIntentResponse(
+        externalContextRef=context_ref, uploads=results, failures=_upload_intent_failures(payload)
+    )
 
 
 @router.post("/documents/{document_id}/finalize", response_model=FinalizeResponse)
