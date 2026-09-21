@@ -755,6 +755,41 @@ def _fuzzy_decomposition_fallback(
     )
 
 
+# Stand-in for "no existing exact candidate set to beat" (an empty list
+# means unconstrained, not "beat zero") when comparing sizes below --
+# large enough that any real, non-empty fuzzy result always counts as an
+# improvement over nothing.
+_NO_EXISTING_CANDIDATES = 10**9
+
+
+def _fuzzy_or_none(
+    connection: Connection, *, tenant_id: str, rows: list[dict[str, Any]], inputs: dict[str, Any],
+    best_len: int,
+) -> dict[str, Any] | None:
+    """Try the controlled fuzzy trim fallback; return a result only if
+    it's a genuine improvement over whatever the exact passes already
+    found -- either a confident single resolve (clears both the score
+    floor and the margin over the runner-up), or a shortlist strictly
+    smaller than ``best_len``. Returns ``None`` otherwise, so a caller
+    whose exact pass already found an equally-good-or-better result never
+    gets it silently relabeled "fuzzy" just because fuzzy scoring
+    happened to reproduce the same rows.
+    """
+    fuzzy_candidates = _fuzzy_decomposition_fallback(
+        connection, tenant_id=tenant_id, rows=rows, inputs=inputs
+    )
+    if not fuzzy_candidates:
+        return None
+    top = fuzzy_candidates[0]
+    runner_up_score = fuzzy_candidates[1].score if len(fuzzy_candidates) > 1 else 0.0
+    if top.score >= _FUZZY_CONFIDENT_SCORE and (top.score - runner_up_score) >= _FUZZY_CONFIDENT_MARGIN:
+        return {"matched": [top.row], "matchStage": "FUZZY_ATTRIBUTE_DECOMPOSITION"}
+    fuzzy_rows = [c.row for c in fuzzy_candidates]
+    if len(fuzzy_rows) < best_len:
+        return {"matched": fuzzy_rows, "matchStage": "FUZZY_ATTRIBUTE_DECOMPOSITION"}
+    return None
+
+
 def _latest_invoice_field(
     connection: Connection, *, tenant_id: str, journey_id: UUID, field_keys: tuple[str, ...]
 ) -> str | None:
@@ -1092,6 +1127,19 @@ def _current_match(
             return {"matched": price_matched, "matchStage": price_stage}
         if len(price_matched) < len(attr_matched):
             return {"matched": price_matched, "matchStage": price_stage}
+        # Neither the exact prefix/suffix check nor price narrowed this --
+        # including the case where attr_matched is itself empty (a
+        # qualifying signal was stated, but nothing survived the exact
+        # trim comparison at all). A confident fuzzy trim match, or a
+        # fuzzy shortlist strictly smaller than what's known so far, is
+        # still worth trying before giving up -- an empty attr_matched
+        # means there's nothing to lose by trying.
+        fuzzy_result = _fuzzy_or_none(
+            connection, tenant_id=tenant_id, rows=rows, inputs=inputs,
+            best_len=len(attr_matched) or _NO_EXISTING_CANDIDATES,
+        )
+        if fuzzy_result is not None:
+            return fuzzy_result
         return {"matched": attr_matched, "matchStage": attr_stage}
 
     # No trustworthy attribute signal at all (no OEM vocabulary, no
@@ -1105,22 +1153,20 @@ def _current_match(
 
     # Both exact passes failed to converge -- a controlled fuzzy trim match
     # within the already-identified model, tried before giving up to a
-    # human. Auto-resolves only when the best-scoring candidate clears both
-    # an absolute confidence floor and a real margin over the next best;
-    # otherwise every candidate this narrowed to is reported (never a wider
-    # set than the exact pass already had) so the PC picker shows exactly
-    # what was actually close, not one silent guess.
-    fuzzy_candidates = _fuzzy_decomposition_fallback(
-        connection, tenant_id=tenant_id, rows=rows, inputs=inputs
+    # human. Only actually used if it's a genuine improvement over
+    # whichever exact pass already did best here (see _fuzzy_or_none) --
+    # never relabels an already-exact-matched ambiguous set as "fuzzy"
+    # merely because fuzzy scoring reproduced the same rows at the same
+    # size.
+    best_len = min(
+        len(matched) or _NO_EXISTING_CANDIDATES,
+        len(attr_matched) or _NO_EXISTING_CANDIDATES,
     )
-    if fuzzy_candidates:
-        top = fuzzy_candidates[0]
-        runner_up_score = fuzzy_candidates[1].score if len(fuzzy_candidates) > 1 else 0.0
-        if top.score >= _FUZZY_CONFIDENT_SCORE and (top.score - runner_up_score) >= _FUZZY_CONFIDENT_MARGIN:
-            return {"matched": [top.row], "matchStage": "FUZZY_ATTRIBUTE_DECOMPOSITION"}
-        fuzzy_rows = [c.row for c in fuzzy_candidates]
-        if not matched or len(fuzzy_rows) < len(matched):
-            matched, stage = fuzzy_rows, "FUZZY_ATTRIBUTE_DECOMPOSITION"
+    fuzzy_result = _fuzzy_or_none(
+        connection, tenant_id=tenant_id, rows=rows, inputs=inputs, best_len=best_len,
+    )
+    if fuzzy_result is not None:
+        return fuzzy_result
 
     # Neither pass reached exactly one on its own -- report whichever
     # leaves the smaller, more defensible shortlist.
