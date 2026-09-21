@@ -761,7 +761,8 @@ def get_journey_overview(
                 receipt_number AS "receiptNumber",
                 actual_status_code AS "actualStatusCode",
                 status_source AS "sourceKind",
-                source_evidence_id AS "sourceEvidenceId"
+                source_evidence_id AS "sourceEvidenceId",
+                source_di_document_id AS "sourceDiDocumentId"
             FROM auditcore.payments
             WHERE tenant_id = :tenant_id AND journey_id = :journey_id
             ORDER BY payment_at_utc NULLS LAST, created_at_utc, payment_id
