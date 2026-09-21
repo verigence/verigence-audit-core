@@ -783,7 +783,10 @@ def get_journey_overview(
                 actual_status_code AS "actualStatusCode",
                 source_kind AS "sourceKind",
                 source_evidence_id AS "sourceEvidenceId",
-                details AS "details"
+                details AS "details",
+                loan_disbursement_amount AS "loanDisbursementAmount",
+                loan_disbursement_confidence AS "loanDisbursementConfidence",
+                loan_disbursement_match_basis AS "loanDisbursementMatchBasis"
             FROM auditcore.finance_records
             WHERE tenant_id = :tenant_id AND journey_id = :journey_id
             ORDER BY created_at_utc DESC, finance_record_id DESC
