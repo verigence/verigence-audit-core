@@ -237,3 +237,75 @@ def test_has_qualifying_signal_false_when_every_candidate_shares_the_same_trim()
     assert not m.has_qualifying_signal(
         oem_code="MAHINDRA", model_remainder="Z8T", variant_text=None, candidate_rows=rows
     )
+
+
+# ── fuzzy_match_by_attributes (controlled fuzzy fallback) ───────────────────
+def test_fuzzy_resolves_a_single_mid_string_ocr_misread_in_trim() -> None:
+    # Booking Form's trim text was OCR'd as "Z9S" ("8" misread as "9") --
+    # exact match_by_attributes finds nothing (neither "Z9S" nor "Z8S"/
+    # "Z8T" is a prefix/suffix of the other), but "Z9S" is genuinely,
+    # unambiguously closer to "Z8S" than to "Z8T" (SequenceMatcher: 0.67
+    # vs 0.33 -- both differ by one character, but Z8S's differing
+    # character is adjacent to two matching ones, Z8T's isn't). Z8L6 is
+    # excluded outright regardless, on a hard seater mismatch (6 vs the
+    # Booking Form's stated 7STR). Master rows carry their own real Trim
+    # column, as a properly-ingested master does -- the variant-name-
+    # residue fallback is noisier (picks up "- N"/"- Refresh" generation
+    # suffixes) and is exercised separately below.
+    rows = [
+        _row("SCORPIO N", "Z8 S D AT 2WD 7 STR BS6.2 - N", fuel="DIESEL", transmission="AT", drive="2WD", seater="7", trim="Z8 S", sku="Z8S"),
+        _row("SCORPIO N", "Z8T D AT 2WD 7 STR BS6.2 - N", fuel="DIESEL", transmission="AT", drive="2WD", seater="7", trim="Z8T", sku="Z8T"),
+        _row("SCORPIO N", "Z8 L D AT 2WD 6 STR BS6.2 - N - ADAS", fuel="DIESEL", transmission="AT", drive="2WD", seater="6", trim="Z8 L", sku="Z8L6"),
+    ]
+    assert m.match_by_attributes(
+        rows, oem_code="MAHINDRA", model_remainder="Z9S", variant_text="DAT 2WD 7STR"
+    ) == []
+
+    candidates = m.fuzzy_match_by_attributes(
+        rows, oem_code="MAHINDRA", model_remainder="Z9S", variant_text="DAT 2WD 7STR"
+    )
+    assert [c.row["sku_code"] for c in candidates] == ["Z8S", "Z8T"]
+    assert candidates[0].score >= 0.70
+    assert candidates[0].score - candidates[1].score >= 0.15
+
+
+def test_fuzzy_does_not_guess_between_two_genuinely_close_trims() -> None:
+    # "Z8" alone, with nothing else stated, is genuinely equidistant
+    # between Z8S and Z8T -- must not silently pick one.
+    rows = [
+        _row("SCORPIO N", "Z8 S D AT 2WD 7 STR BS6.2 - N", fuel="DIESEL", transmission="AT", drive="2WD", seater="7", sku="Z8S"),
+        _row("SCORPIO N", "Z8 T D AT 2WD 7 STR BS6.2 - N", fuel="DIESEL", transmission="AT", drive="2WD", seater="7", sku="Z8T"),
+    ]
+    candidates = m.fuzzy_match_by_attributes(
+        rows, oem_code="MAHINDRA", model_remainder="Z8", variant_text="DAT 2WD 7STR"
+    )
+    assert len(candidates) == 2
+    assert abs(candidates[0].score - candidates[1].score) < 0.15
+
+
+def test_fuzzy_still_disqualifies_a_stated_attribute_mismatch() -> None:
+    # Perfect trim text match, but the Booking Form states Diesel and this
+    # row is Petrol -- attributes stay a hard, exact filter under fuzzy
+    # matching too, never merely a lower score.
+    rows = [
+        _row("SCORPIO N", "Z8 S G AT 2WD 7 STR BS6.2 - N", fuel="PETROL", transmission="AT", drive="2WD", seater="7", sku="Z8SPETROL"),
+    ]
+    candidates = m.fuzzy_match_by_attributes(
+        rows, oem_code="MAHINDRA", model_remainder="Z8S", variant_text="D AT 2WD 7STR"
+    )
+    assert candidates == []
+
+
+def test_fuzzy_confirmed_attributes_break_a_tie_between_equal_trim_similarity() -> None:
+    # Both rows have an identical trim residue once decomposed ("Z8S"), but
+    # only one of them also has its own transmission column populated and
+    # agreeing with the Booking Form -- that row is more corroborated.
+    rows = [
+        _row("SCORPIO N", "Z8 S D 2WD 7 STR BS6.2 - N", fuel="DIESEL", transmission=None, drive="2WD", seater="7", sku="NO_TRANS_COL"),
+        _row("SCORPIO N", "Z8 S D AT 2WD 7 STR BS6.2 - N", fuel="DIESEL", transmission="AT", drive="2WD", seater="7", sku="HAS_TRANS_COL"),
+    ]
+    candidates = m.fuzzy_match_by_attributes(
+        rows, oem_code="MAHINDRA", model_remainder="Z8S", variant_text="D AT 2WD 7STR"
+    )
+    assert candidates[0].row["sku_code"] == "HAS_TRANS_COL"
+    assert candidates[0].score > candidates[1].score

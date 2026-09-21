@@ -753,6 +753,40 @@ def test_integration_resolves_xuv_7xo_ax7l_from_folded_booking_form_text(mahindr
     assert _open_model_flags(c) == 0
 
 
+def test_integration_fuzzy_resolves_a_mid_string_ocr_misread_trim(mahindra_journey) -> None:
+    """Exact attribute decomposition finds nothing at all: the Booking
+    Form's trim was OCR'd as "Z9S" (an "8" misread as "9"), which is
+    neither a prefix nor a suffix of either real master trim. The
+    controlled fuzzy fallback (uc03_model_attribute_matching.
+    fuzzy_match_by_attributes) still resolves it unambiguously -- Z9S is
+    genuinely, measurably closer to Z8S than to Z8T, and every other
+    stated fact (Diesel, AT, 2WD, 7-seater) corroborates it."""
+    c = mahindra_journey
+    z8s, *_ = _seed_price_list(c, [
+        {"model": "SCORPIO N", "variant": "Z8 S D AT 2WD 7 STR BS6.2 - N",
+         "fuel": "DIESEL", "transmission": "AT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "1750000"}},
+        {"model": "SCORPIO N", "variant": "Z8T D AT 2WD 7 STR BS6.2 - N",
+         "fuel": "DIESEL", "transmission": "AT", "drive": "2WD", "seater": "7",
+         "components": {"EX_SHOWROOM": "1780000"}},
+    ])
+    _set_journey_product(c, "SCORPIO N Z9S", "DAT 2WD 7STR")
+
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("resolved") is True
+    assert result.get("matchStage") == "FUZZY_ATTRIBUTE_DECOMPOSITION"
+
+    pinned = c.execute(
+        text("SELECT product_sku_id FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert pinned == z8s
+    assert _open_model_flags(c) == 0
+
+
 def test_integration_still_raises_when_decomposition_also_ambiguous(mahindra_journey) -> None:
     """Dealer wrote only the model and bare trim, no fuel/transmission/drive/
     seater at all -- both diesel-AT and diesel-MT SKUs remain plausible, so
