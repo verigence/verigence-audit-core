@@ -196,6 +196,32 @@ def test_background_sync_task_gives_itself_headroom_past_the_pool_default_timeou
     )
 
 
+def test_sync_booking_document_fetches_both_di_calls_before_any_database_write() -> None:
+    # Regression test for a live incident: _sync_booking_document used to
+    # write auditcore.evidence's cache columns (get_audit_document already
+    # fetched), then run sync_document_confirmation_status, then -- only
+    # afterward -- make a *second* slow external call to
+    # get_audit_document_facts. That evidence write takes an implicit
+    # foreign-key lock on this document's journey_document_requirements row,
+    # and holding it open across the second unbounded network call meant a
+    # concurrent DI document-link callback for that same requirement could
+    # queue behind this connection and get cancelled on statement_timeout --
+    # confirmed live: the blocking connection's last statement was this
+    # exact evidence UPDATE, sitting idle-in-transaction. Both DI calls must
+    # now happen before the first database write in this function.
+    source_file = inspect.getsourcefile(confidence_policy)
+    assert source_file is not None
+    with open(source_file) as f:
+        module_source = f.read()
+    start = module_source.index("\ndef _sync_booking_document(")
+    end = module_source.index("\ndef ", start + 1)
+    function_source = module_source[start:end]
+
+    evidence_cache_write = function_source.index("UPDATE auditcore.evidence")
+    assert function_source.index("get_audit_document(") < evidence_cache_write
+    assert function_source.index("get_audit_document_facts(") < evidence_cache_write
+
+
 def test_confirm_calls_attribute_resolution_directly_not_via_review_v2() -> None:
     # Regression test for a live production AttributeError: confirm_booking_
     # review_v2_confidence_policy used to call review_v2.apply_supported_
