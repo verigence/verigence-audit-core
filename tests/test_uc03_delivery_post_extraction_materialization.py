@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from audit_core.uc03_delivery_post_extraction_materialization import (
-    materialize_booking_insurance_from_durable_store,
+    materialize_booking_documents_from_durable_store,
     materialize_delivery_documents_from_durable_store,
 )
 
@@ -192,7 +192,7 @@ def test_booking_insurance_cover_materializes_into_insurance_records(journey) ->
         value="Aditya Motors", stage_code="BOOKING",
     )
 
-    result = materialize_booking_insurance_from_durable_store(
+    result = materialize_booking_documents_from_durable_store(
         journey, tenant_id=tenant_id, journey_id=journey_id
     )
     assert not result.get("error"), result
@@ -212,9 +212,47 @@ def test_booking_insurance_cover_materializes_into_insurance_records(journey) ->
     assert row["agent_intermediary_name"] == "Aditya Motors"
 
 
+def test_booking_rto_challan_materializes_into_registration_records(journey) -> None:
+    # Same bug class as the insurance regression above, for the other
+    # stage-agnostic materializer with the identical shape: an RTO Challan
+    # uploaded and reviewed during Booking must reach auditcore.
+    # registration_records without waiting for a Delivery-stage sync.
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    document_id = uuid4()
+    _seed_field(
+        journey, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+        document_type_key="rto_challan", field_key="registration_number",
+        value="MH12AB1234", stage_code="BOOKING",
+    )
+    _seed_field(
+        journey, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+        document_type_key="rto_challan", field_key="registration_state",
+        value="Maharashtra", stage_code="BOOKING",
+    )
+
+    result = materialize_booking_documents_from_durable_store(
+        journey, tenant_id=tenant_id, journey_id=journey_id
+    )
+    assert not result.get("error"), result
+    assert result.get("registrationFieldsWritten", 0) > 0
+
+    row = journey.execute(
+        text(
+            """
+            SELECT registration_number, registration_state
+            FROM auditcore.registration_records
+            WHERE tenant_id=:t AND journey_id=:j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one()
+    assert row["registration_number"] == "MH12AB1234"
+    assert row["registration_state"] == "Maharashtra"
+
+
 def test_booking_insurance_no_durable_documents_is_a_clean_skip(journey) -> None:
     tenant_id, journey_id = journey.tenant_id, journey.journey_id
-    result = materialize_booking_insurance_from_durable_store(
+    result = materialize_booking_documents_from_durable_store(
         journey, tenant_id=tenant_id, journey_id=journey_id
     )
     assert result == {"skipped": True, "reason": "no_documents"}

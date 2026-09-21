@@ -468,7 +468,7 @@ def reconcile_unified_documents(
     # fields.stage_code is the column the actual materializers key their
     # durable-store reads on (_documents_from_durable_store,
     # materialize_delivery_documents_from_durable_store /
-    # materialize_booking_insurance_from_durable_store), and correcting one
+    # materialize_booking_documents_from_durable_store), and correcting one
     # table never used to correct the other. A document whose checklist
     # entry correctly says "Delivery" could still leave insurance/
     # registration/finance/commercial-lines permanently empty -- no amount
@@ -487,10 +487,10 @@ def reconcile_unified_documents(
         )
     if corrected_to_booking:
         from audit_core.uc03_delivery_post_extraction_materialization import (
-            materialize_booking_insurance_from_durable_store,
+            materialize_booking_documents_from_durable_store,
         )
 
-        materialize_booking_insurance_from_durable_store(
+        materialize_booking_documents_from_durable_store(
             connection, tenant_id=tenant_id, journey_id=journey_id,
         )
 
