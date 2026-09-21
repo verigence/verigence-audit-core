@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import os
 import time
 from uuid import uuid4
@@ -297,6 +298,106 @@ def test_sync_booking_document_raises_lock_busy_without_blocking() -> None:
         holder.close()
 
     engine.dispose()
+
+
+def test_background_task_releases_its_worker_thread_while_waiting_out_a_busy_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: _run_sync_booking_document_task used to retry a busy lock
+    with a plain time.sleep() between attempts. Since a sync BackgroundTasks
+    callable is dispatched through the same process-wide anyio worker-thread
+    pool every synchronous route depends on (main.py's lifespan widens it
+    past the DB pool's ceiling, #280), that sleep held one of those threads
+    hostage for the full delay on every retry -- confirmed live 2026-09-21
+    on a journey with 22 documents in flight, where a burst of these
+    background syncs left an unrelated Journey Overview request queued for a
+    thread for ~20s, invisible to any in-handler timing log, the same
+    signature #280 already diagnosed once from a different cause (the DB
+    pool, not this).
+
+    Proven directly against anyio's own thread-limiter accounting rather
+    than by reading the source: while this task is asleep between retry
+    attempts, it must be borrowing zero threads from that limiter.
+    """
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for this integration test")
+
+    import anyio
+    import anyio.to_thread
+
+    engine = create_engine(database_url)
+    suffix = uuid4().hex
+    tenant_id = f"tenant-pem-threadfree-{suffix}"
+    journey_id, document_id = _seed_booking_evidence(engine, tenant_id=tenant_id, suffix=suffix)
+
+    holder = engine.connect()
+    holder_txn = holder.begin()
+    holder.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+        {"lock_key": f"uc03-document-sync:{tenant_id}:{journey_id}"},
+    )
+
+    document = DiDocument(
+        document_id=str(document_id),
+        upload_status="COMPLETE",
+        processing_status="COMPLETED",
+        confirmation_status="CONFIRMED",
+        document_type_key="booking_form",
+        verification_state="NOT_VERIFIED",
+    )
+    def _fake_security_provider():
+        yield _FakeSecurityClient()
+
+    def _fake_di_provider():
+        yield _FakeDiClient(document, [])
+
+    # Real _run_sync_booking_document_task calls provider.close() in a
+    # finally block (these are Iterator[...] generator-based FastAPI
+    # dependency providers reused directly, not FastAPI's own Depends());
+    # a plain iter([...]) has no .close(), so the fakes must be actual
+    # generator functions to behave the same way as get_security_oauth_
+    # client/get_di_client do.
+    monkeypatch.setattr(confidence_policy, "get_security_oauth_client", _fake_security_provider)
+    monkeypatch.setattr(confidence_policy, "get_di_client", _fake_di_provider)
+
+    sampled_borrowed_tokens: list[int] = []
+
+    async def _observe_mid_sleep() -> None:
+        # Attempt 1 fails busy almost immediately (pg_try_advisory_xact_lock
+        # never blocks); this lands comfortably inside its first retry
+        # delay (2.0s) without ever reaching the second (4.0s).
+        await anyio.sleep(1.0)
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        sampled_borrowed_tokens.append(limiter.borrowed_tokens)
+        # Free the lock so the task's next attempt can succeed and the task
+        # group can exit promptly instead of running out its full 6-attempt
+        # budget (2+4+8+15+30s -- far too slow for a test).
+        holder_txn.rollback()
+        holder.close()
+
+    async def _run() -> None:
+        with anyio.fail_after(10):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(
+                    functools.partial(
+                        confidence_policy._run_sync_booking_document_task,
+                        engine,
+                        tenant_id=tenant_id,
+                        journey_id=journey_id,
+                        document_id=document_id,
+                        service_id="di-service",
+                        stage_code="BOOKING",
+                    )
+                )
+                tg.start_soon(_observe_mid_sleep)
+
+    try:
+        anyio.run(_run)
+    finally:
+        engine.dispose()
+
+    assert sampled_borrowed_tokens == [0]
 
 
 def test_close_booking_ready_queues_document_sync_instead_of_running_it_inline() -> None:
