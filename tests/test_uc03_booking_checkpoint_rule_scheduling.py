@@ -298,7 +298,10 @@ def test_async_document_sync_schedules_checkpoint_rules_for_booking() -> None:
     # findings to surface.
     source = inspect.getsource(confidence_policy._run_sync_booking_document_task)
     assert 'stage_code == "BOOKING"' in source
-    assert "schedule_booking_checkpoint_rules(" in source
+    # Dispatched via functools.partial(schedule_booking_checkpoint_rules, ...)
+    # through anyio.to_thread.run_sync rather than called directly -- see
+    # this function's own docstring for why (thread-pool contention, #280).
+    assert "schedule_booking_checkpoint_rules" in source
     # raise_new=False: never raise off a partial Booking -- the genuine gap
     # check runs at Review Confirm instead. See
     # test_async_and_confirm_get_independent_tasks_for_the_same_version for

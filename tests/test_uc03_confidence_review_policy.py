@@ -135,13 +135,21 @@ def test_background_sync_task_retries_in_python_instead_of_blocking_in_postgres(
     assert source_file is not None
     with open(source_file) as f:
         module_source = f.read()
-    start = module_source.index("\ndef _run_sync_booking_document_task(")
+    start = module_source.index("\nasync def _run_sync_booking_document_task(")
     end = module_source.index("\ndef ", start + 1)
     function_source = module_source[start:end]
     assert "except DocumentSyncLockBusyError" in function_source
-    assert "time.sleep(" in function_source
+    # Regression: this used to be a blocking time.sleep() between attempts,
+    # which -- since a sync BackgroundTasks callable runs on the same
+    # process-wide anyio worker-thread pool every synchronous route depends
+    # on (main.py's lifespan, #280) -- could tie up a thread for up to ~59s
+    # doing nothing but wait, starving unrelated requests (Journey Overview
+    # among them) of a thread to even start on. An async sleep costs no
+    # thread at all.
+    assert "anyio.sleep(" in function_source
+    assert "time.sleep(" not in function_source
     assert (
-        function_source.index("_sync_booking_document(")
+        function_source.index("_sync_booking_document_once")
         < function_source.index("except DocumentSyncLockBusyError")
     )
 
@@ -157,11 +165,15 @@ def test_background_sync_task_gives_itself_headroom_past_the_pool_default_timeou
     # queue. This background task has no HTTP client waiting on it, so it
     # must give its own transaction real headroom instead of inheriting the
     # tight default.
+    #
+    # This transaction lives in _sync_booking_document_once, the sync helper
+    # _run_sync_booking_document_task dispatches onto a worker thread via
+    # anyio.to_thread.run_sync -- not in that async orchestrator itself.
     source_file = inspect.getsourcefile(confidence_policy)
     assert source_file is not None
     with open(source_file) as f:
         module_source = f.read()
-    start = module_source.index("\ndef _run_sync_booking_document_task(")
+    start = module_source.index("\ndef _sync_booking_document_once(")
     end = module_source.index("\ndef ", start + 1)
     function_source = module_source[start:end]
     assert "SET LOCAL statement_timeout" in function_source

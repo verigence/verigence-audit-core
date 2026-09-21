@@ -11,11 +11,12 @@ Business contract:
 """
 from __future__ import annotations
 
+import functools
 import json
-import time
 from typing import Annotated, Any
 from uuid import UUID
 
+import anyio.to_thread
 import structlog
 from fastapi import BackgroundTasks, Depends, Header, Request, Response
 from sqlalchemy import Connection, Engine, text
@@ -1276,7 +1277,76 @@ def _sync_booking_document(
     return len(facts)
 
 
-def _run_sync_booking_document_task(
+def _sync_booking_document_once(
+    engine: Engine,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    document_id: UUID,
+    service_id: str,
+    stage_code: str,
+    security_client: SecurityOAuthClient,
+    di_client: DiClient,
+) -> None:
+    """One attempt of the actual sync transaction. Kept as a plain sync
+    function so _run_sync_booking_document_task can dispatch it onto a
+    worker thread with anyio.to_thread.run_sync only for the duration of its
+    own blocking DB/HTTP work -- never for that function's between-attempts
+    sleep, which must not hold a thread (see its docstring)."""
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        # This transaction's own work (a DI facts fetch, durable
+        # copy, SKU resolution, reconciliation, materialization)
+        # has no HTTP client waiting on it, so give it real
+        # headroom instead of the connection pool's 10s
+        # interactive default (dependencies.py). Confirmed live:
+        # that default previously cut a sync off mid-flight
+        # (QueryCanceled: canceling statement due to statement
+        # timeout on an evidence UPDATE).
+        connection.execute(text("SET LOCAL statement_timeout = '45s'"))
+        # statement_timeout alone only bounds a single SQL
+        # statement -- it does nothing while the connection sits
+        # idle waiting on a DI/Security HTTP call between
+        # statements (a Security token fetch, then two DI calls,
+        # each up to 15s, all made while this same transaction is
+        # open). Confirmed live: the server's own default
+        # idle_in_transaction_session_timeout killed one of these
+        # mid-sync (psycopg.errors.IdleInTransactionSessionTimeout
+        # at commit time), discarding whatever this document's
+        # sync had already done.
+        connection.execute(
+            text("SET LOCAL idle_in_transaction_session_timeout = '90s'")
+        )
+        _sync_booking_document(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            document_id=document_id,
+            service_id=service_id,
+            security_client=security_client,
+            di_client=di_client,
+            bump_version=True,
+            stage_code=stage_code,
+        )
+
+
+def _run_delivery_checkpoint_once(engine: Engine, *, tenant_id: str, journey_id: UUID) -> None:
+    from audit_core.uc03_delivery_capture_v2 import (
+        schedule_delivery_document_checkpoint,
+    )
+
+    with engine.begin() as checkpoint_connection:
+        set_tenant_context(checkpoint_connection, tenant_id)
+        schedule_delivery_document_checkpoint(
+            checkpoint_connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            correlation_id="",
+            raise_new=False,
+        )
+
+
+async def _run_sync_booking_document_task(
     engine: Engine,
     *,
     tenant_id: str,
@@ -1306,17 +1376,26 @@ def _run_sync_booking_document_task(
     live as ``QueryCanceled: canceling statement due to statement timeout``.
     _sync_booking_document's own non-blocking per-journey advisory lock keeps
     them from writing those rows at the same time; when it's busy, the loop
-    below waits it out with a short sleep between attempts in this thread
-    (see DocumentSyncLockBusyError -- a blocking wait inside Postgres was
-    tried first and made the same failure worse, not better).
+    below waits it out with a short sleep between attempts.
 
-    This is also the only place a given document's sync ever runs: DI marks
-    the document-link acknowledged the instant the webhook responds, win or
-    lose, and never retries it -- the webhook's fast response is what let DI
-    move on in the first place. Nothing upstream will try again if this
-    fails, so lock contention and other transient failures get a bounded
-    retry here rather than one attempt and a silently incomplete sync until
-    a human happens to click Resync.
+    Confirmed live (2026-09-21): every synchronous route AND every
+    BackgroundTasks callable in this app share one process-wide anyio
+    worker-thread pool (see main.py's lifespan widening it past the DB
+    pool's ceiling -- #280). This function used to be a plain sync def with
+    a blocking Python-level sleep between attempts, holding whatever OS
+    thread it runs on for the full delay; since a sync BackgroundTasks
+    callable is itself dispatched through that same pool, a burst of documents
+    confirming close together (a batch upload, a Resync click, DI catching
+    up on a backlog -- this journey alone had 22 documents in flight) could
+    tie up several of those threads in nothing but sleep for up to ~59s
+    each, starving unrelated synchronous requests (Journey Overview among
+    them) of a thread to even start on -- invisible to any in-handler
+    timing log, the exact signature #280 already diagnosed once from a
+    different cause. Making this function itself async and awaiting
+    anyio.sleep() between attempts means the wait costs no thread at all;
+    only the actual synchronous DB/HTTP work (dispatched below through
+    anyio.to_thread.run_sync) ever occupies one, and only for as long as
+    that work actually takes.
     """
     security_provider = get_security_oauth_client()
     di_provider = get_di_client()
@@ -1327,41 +1406,19 @@ def _run_sync_booking_document_task(
         di_client = next(di_provider)
         for attempt in range(max_attempts):
             try:
-                with engine.begin() as connection:
-                    set_tenant_context(connection, tenant_id)
-                    # This transaction's own work (a DI facts fetch, durable
-                    # copy, SKU resolution, reconciliation, materialization)
-                    # has no HTTP client waiting on it, so give it real
-                    # headroom instead of the connection pool's 10s
-                    # interactive default (dependencies.py). Confirmed live:
-                    # that default previously cut a sync off mid-flight
-                    # (QueryCanceled: canceling statement due to statement
-                    # timeout on an evidence UPDATE).
-                    connection.execute(text("SET LOCAL statement_timeout = '45s'"))
-                    # statement_timeout alone only bounds a single SQL
-                    # statement -- it does nothing while the connection sits
-                    # idle waiting on a DI/Security HTTP call between
-                    # statements (a Security token fetch, then two DI calls,
-                    # each up to 15s, all made while this same transaction is
-                    # open). Confirmed live: the server's own default
-                    # idle_in_transaction_session_timeout killed one of these
-                    # mid-sync (psycopg.errors.IdleInTransactionSessionTimeout
-                    # at commit time), discarding whatever this document's
-                    # sync had already done.
-                    connection.execute(
-                        text("SET LOCAL idle_in_transaction_session_timeout = '90s'")
-                    )
-                    _sync_booking_document(
-                        connection,
+                await anyio.to_thread.run_sync(
+                    functools.partial(
+                        _sync_booking_document_once,
+                        engine,
                         tenant_id=tenant_id,
                         journey_id=journey_id,
                         document_id=document_id,
                         service_id=service_id,
+                        stage_code=stage_code,
                         security_client=security_client,
                         di_client=di_client,
-                        bump_version=True,
-                        stage_code=stage_code,
                     )
+                )
                 break
             except DocumentSyncLockBusyError:
                 if attempt == max_attempts - 1:
@@ -1374,7 +1431,7 @@ def _run_sync_booking_document_task(
                         attempts=max_attempts,
                     )
                     return
-                time.sleep(retry_delay_seconds[attempt])
+                await anyio.sleep(retry_delay_seconds[attempt])
     except Exception:
         logger.warning(
             "uc03_document_link_background_sync_failed",
@@ -1402,13 +1459,16 @@ def _run_sync_booking_document_task(
     # matching Delivery's own Submit-time equivalent.
     if stage_code == "BOOKING":
         try:
-            schedule_booking_checkpoint_rules(
-                engine,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                correlation_id="",
-                trigger="ASYNC_DOCUMENT_SYNC",
-                raise_new=False,
+            await anyio.to_thread.run_sync(
+                functools.partial(
+                    schedule_booking_checkpoint_rules,
+                    engine,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    correlation_id="",
+                    trigger="ASYNC_DOCUMENT_SYNC",
+                    raise_new=False,
+                )
             )
         except Exception:
             logger.warning(
@@ -1432,19 +1492,14 @@ def _run_sync_booking_document_task(
         # not once Delivery is actually being closed. Submit still raises
         # for whatever is genuinely missing once the PC is done.
         try:
-            from audit_core.uc03_delivery_capture_v2 import (
-                schedule_delivery_document_checkpoint,
-            )
-
-            with engine.begin() as checkpoint_connection:
-                set_tenant_context(checkpoint_connection, tenant_id)
-                schedule_delivery_document_checkpoint(
-                    checkpoint_connection,
+            await anyio.to_thread.run_sync(
+                functools.partial(
+                    _run_delivery_checkpoint_once,
+                    engine,
                     tenant_id=tenant_id,
                     journey_id=journey_id,
-                    correlation_id="",
-                    raise_new=False,
                 )
+            )
         except Exception:
             logger.warning(
                 "uc03_delivery_checkpoint_schedule_failed",
