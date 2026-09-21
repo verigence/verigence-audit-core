@@ -346,12 +346,20 @@ def test_background_task_releases_its_worker_thread_while_waiting_out_a_busy_loc
         document_type_key="booking_form",
         verification_state="NOT_VERIFIED",
     )
-    monkeypatch.setattr(
-        confidence_policy, "get_security_oauth_client", lambda: iter([_FakeSecurityClient()])
-    )
-    monkeypatch.setattr(
-        confidence_policy, "get_di_client", lambda: iter([_FakeDiClient(document, [])])
-    )
+    def _fake_security_provider():
+        yield _FakeSecurityClient()
+
+    def _fake_di_provider():
+        yield _FakeDiClient(document, [])
+
+    # Real _run_sync_booking_document_task calls provider.close() in a
+    # finally block (these are Iterator[...] generator-based FastAPI
+    # dependency providers reused directly, not FastAPI's own Depends());
+    # a plain iter([...]) has no .close(), so the fakes must be actual
+    # generator functions to behave the same way as get_security_oauth_
+    # client/get_di_client do.
+    monkeypatch.setattr(confidence_policy, "get_security_oauth_client", _fake_security_provider)
+    monkeypatch.setattr(confidence_policy, "get_di_client", _fake_di_provider)
 
     sampled_borrowed_tokens: list[int] = []
 
