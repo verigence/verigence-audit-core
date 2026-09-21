@@ -1095,20 +1095,23 @@ def _sync_booking_document(
         # Booking's generic attribute mapping above (materialize_machine_
         # booking_values) only projects fields with a registered
         # uc03_attribute_mapping.py spec -- insurer_name/policy_reference/
-        # chassis_number/etc. from an insurance_cover document have none,
-        # by design (they're document-type-scoped, not generic attributes).
-        # Confirmed live: an Insurance Cover document uploaded at Booking
-        # showed its extracted fields in the raw reviewed-fields viewer but
-        # never reached auditcore.insurance_records regardless of Resync
-        # count, because the only caller of materialize_delivery_insurance
-        # (itself genuinely stage-agnostic) was gated to stage_code ==
-        # "DELIVERY". See materialize_booking_insurance_from_durable_store's
-        # own docstring for the full trace.
+        # chassis_number/registration_number/etc. from an insurance_cover or
+        # rto_challan document have none, by design (they're document-type-
+        # scoped, not generic attributes). Confirmed live: an Insurance
+        # Cover document uploaded at Booking showed its extracted fields in
+        # the raw reviewed-fields viewer but never reached auditcore.
+        # insurance_records regardless of Resync count, because the only
+        # caller of materialize_delivery_insurance (itself genuinely
+        # stage-agnostic) was gated to stage_code == "DELIVERY" -- the exact
+        # same gap applies to every other stage-agnostic materializer (e.g.
+        # materialize_delivery_registration for an RTO Challan). See
+        # materialize_booking_documents_from_durable_store's own docstring
+        # for the full trace.
         from audit_core.uc03_delivery_post_extraction_materialization import (
-            materialize_booking_insurance_from_durable_store,
+            materialize_booking_documents_from_durable_store,
         )
 
-        materialize_booking_insurance_from_durable_store(
+        materialize_booking_documents_from_durable_store(
             connection, tenant_id=tenant_id, journey_id=journey_id,
         )
 

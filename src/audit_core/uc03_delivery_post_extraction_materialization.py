@@ -39,6 +39,7 @@ from sqlalchemy import Connection, text
 
 from audit_core.uc03_delivery_review_materialization import (
     materialize_delivery_insurance,
+    materialize_delivery_registration,
     materialize_reviewed_delivery_business_values,
 )
 
@@ -137,28 +138,34 @@ def materialize_delivery_documents_from_durable_store(
         return {"error": True}
 
 
-def materialize_booking_insurance_from_durable_store(
+def materialize_booking_documents_from_durable_store(
     connection: Connection, *, tenant_id: str, journey_id: UUID
 ) -> dict[str, Any]:
-    """Fill canonical insurance facts from every currently-confirmed Booking
-    document carrying an insurance_cover (or alias) type.
+    """Fill canonical facts from every currently-confirmed Booking document,
+    for every document-type-scoped materializer that is genuinely stage-
+    agnostic (filters candidates by document TYPE, writes a table keyed
+    (tenant_id, journey_id) with no stage column at all).
 
-    materialize_delivery_insurance is misleadingly named but genuinely
-    stage-agnostic: it filters candidate documents by document TYPE, and
-    auditcore.insurance_records is keyed (tenant_id, journey_id) with no
-    stage column at all. It was, however, only ever called from Delivery's
-    own materialize_reviewed_delivery_business_values -- confirmed live,
-    an Insurance Cover document uploaded and confirmed during Booking
-    showed its extracted fields (insurer name, chassis number, ...) in the
-    raw reviewed-fields viewer, but never reached auditcore.insurance_
-    records no matter how many times Resync ran, because the one code path
-    that calls materialize_delivery_insurance never fires for stage_code
-    == "BOOKING" at all -- not a confirmation-status gate, not a stale row,
-    a genuinely missing call. This mirrors materialize_delivery_documents_
-    from_durable_store's own shape but deliberately calls only the one
-    document-type-scoped materializer that actually applies pre-Delivery,
-    not the full Delivery bundle (vehicle/registration/finance/scrappage
-    genuinely don't apply yet at Booking time).
+    Originally written narrowly for insurance only (materialize_delivery_
+    insurance): confirmed live, an Insurance Cover document uploaded and
+    confirmed during Booking showed its extracted fields (insurer name,
+    chassis number, ...) in the raw reviewed-fields viewer, but never
+    reached auditcore.insurance_records no matter how many times Resync
+    ran, because the one code path that calls materialize_delivery_
+    insurance never fired for stage_code == "BOOKING" at all -- not a
+    confirmation-status gate, not a stale row, a genuinely missing call.
+    That fix was never generalized to the other document-type-scoped
+    materializers with the exact same shape (e.g. materialize_delivery_
+    registration for an RTO Challan uploaded at Booking) -- leaving the
+    identical bug open for every one of them except insurance. Fixed here
+    by calling every stage-agnostic materializer, not just one.
+
+    Deliberately still not the full Delivery bundle (materialize_reviewed_
+    delivery_business_values) -- vehicle/finance/scrappage/invoices/
+    receipts/bank-statement reconciliation carry real Delivery-only side
+    effects (disbursement resolution, payment reconciliation) that
+    genuinely don't apply pre-Delivery, unlike a plain per-document-type
+    field fill.
     """
     try:
         documents = _documents_from_durable_store(
@@ -166,15 +173,24 @@ def materialize_booking_insurance_from_durable_store(
         )
         if not documents:
             return {"skipped": True, "reason": "no_documents"}
-        written = materialize_delivery_insurance(
+        insurance_written = materialize_delivery_insurance(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
             documents=documents,
         )
-        result = {"insuranceFieldsWritten": written}
+        registration_written = materialize_delivery_registration(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            documents=documents,
+        )
+        result = {
+            "insuranceFieldsWritten": insurance_written,
+            "registrationFieldsWritten": registration_written,
+        }
         logger.info(
-            "uc03_booking_insurance_materialized",
+            "uc03_booking_documents_materialized",
             extra={
                 "tenant_id": tenant_id,
                 "journey_id": str(journey_id),
@@ -185,12 +201,12 @@ def materialize_booking_insurance_from_durable_store(
         return result
     except Exception:
         logger.warning(
-            "materialize_booking_insurance_from_durable_store failed", exc_info=True
+            "materialize_booking_documents_from_durable_store failed", exc_info=True
         )
         return {"error": True}
 
 
 __all__ = [
-    "materialize_booking_insurance_from_durable_store",
+    "materialize_booking_documents_from_durable_store",
     "materialize_delivery_documents_from_durable_store",
 ]

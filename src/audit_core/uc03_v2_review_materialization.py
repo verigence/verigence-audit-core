@@ -1216,22 +1216,25 @@ def materialize_reviewed_di_business_values(
     )
     # A retail / proforma invoice can be captured at Booking; project it with the
     # same invoice-first precedence used at Delivery.
-    # Insurance and financier/hypothecation facts can equally be captured at
-    # Booking (an Insurance Cover or a financier's approval letter routinely
-    # arrives before Delivery) -- both materializers are genuinely stage-
-    # agnostic (they filter candidate documents by document TYPE, and their
-    # target tables have no stage column at all), but until now they were
-    # only ever wired into Delivery's own confirm flow and the async
-    # document-link webhook's Booking-side background sync
-    # (materialize_booking_insurance_from_durable_store, added alongside
-    # the async path's own fix for the identical gap). Confirmed live: a
-    # PC correcting an insurance/finance field here and clicking Confirm
-    # needs that correction in auditcore.insurance_records/finance_records
-    # immediately, not only once some later, unrelated document's
-    # background sync happens to run this same materializer again.
+    # Insurance, registration and financier/hypothecation facts can equally
+    # be captured at Booking (an Insurance Cover, an RTO Challan, or a
+    # financier's approval letter routinely arrives before Delivery) -- all
+    # three materializers are genuinely stage-agnostic (they filter
+    # candidate documents by document TYPE, and their target tables have no
+    # stage column at all), but until now they were only ever wired into
+    # Delivery's own confirm flow and the async document-link webhook's
+    # Booking-side background sync (materialize_booking_documents_from_
+    # durable_store, added alongside the async path's own fix for the
+    # identical gap -- originally insurance-only, since generalized to
+    # registration too). Confirmed live: a PC correcting an insurance/
+    # finance field here and clicking Confirm needs that correction in
+    # auditcore.insurance_records/finance_records immediately, not only
+    # once some later, unrelated document's background sync happens to run
+    # this same materializer again -- registration has the identical need.
     from audit_core.uc03_delivery_review_materialization import (
         materialize_delivery_finance,
         materialize_delivery_insurance,
+        materialize_delivery_registration,
     )
     from audit_core.uc03_invoice_materialization import materialize_reviewed_invoices
     from audit_core.uc03_payment_reconciliation import (
@@ -1263,6 +1266,12 @@ def materialize_reviewed_di_business_values(
         journey_id=journey_id,
         documents=documents,
     )
+    registration_fields = materialize_delivery_registration(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        documents=documents,
+    )
     finance_fields = materialize_delivery_finance(
         connection,
         tenant_id=tenant_id,
@@ -1287,6 +1296,7 @@ def materialize_reviewed_di_business_values(
         "invoiceDiscountApplications": invoices["discountApplications"],
         "scrappageCertificatesMaterialized": scrappage_certificates,
         "insuranceFieldsWritten": insurance_fields,
+        "registrationFieldsWritten": registration_fields,
         "financeFieldsWritten": finance_fields,
         "bankStatementLines": bank_lines,
         "paymentReconciliation": reconciliation,
