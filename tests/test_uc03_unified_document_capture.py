@@ -386,6 +386,10 @@ def _seed_extracted_field(
     field_key: str = "ndc_reference",
     value: str = "NDC-12345",
 ) -> None:
+    customer_id = connection.execute(
+        text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one()
     evidence_id = connection.execute(
         text(
             """
@@ -393,13 +397,14 @@ def _seed_extracted_field(
                 tenant_id, journey_id, customer_id, di_document_id,
                 document_type_key, evidence_purpose, linked_by_actor_id
             ) VALUES (
-                :t, :j,
-                (SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j),
-                :doc, :dtype, 'DELIVERY_AUDIT', :actor
+                :t, :j, :cu, :doc, :dtype, 'DELIVERY_AUDIT', :actor
             ) RETURNING evidence_id
             """
         ),
-        {"t": tenant_id, "j": journey_id, "doc": di_document_id, "dtype": document_type_key, "actor": actor_id},
+        {
+            "t": tenant_id, "j": journey_id, "cu": customer_id, "doc": di_document_id,
+            "dtype": document_type_key, "actor": actor_id,
+        },
     ).scalar_one()
     connection.execute(
         text(
