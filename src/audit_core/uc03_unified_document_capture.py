@@ -290,6 +290,74 @@ def resolve_document_stage(
     return "BOOKING", None
 
 
+def _correct_durable_store_stage(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    document_id: UUID,
+    stage_code: str,
+) -> bool:
+    """Re-tag this document's durably-stored extracted fields to the
+    now-known-correct stage, if they were ever written under a different
+    one. Returns True when a correction was actually made.
+
+    journey_document_extracted_fields.stage_code is written once, at
+    whatever moment a document's facts were first durably copied in (the DI
+    document-link webhook, uc03_confidence_review_policy._sync_booking_
+    document) -- unlike document_capture_v2_documents.stage_code (this
+    module's own checklist column, corrected above on every reconcile),
+    nothing ever revisited this one. The Delivery/Booking materializers
+    that read canonical insurance/registration/finance/commercial-lines
+    facts key their durable-store read entirely on this column
+    (_documents_from_durable_store, WHERE stage_code=:stage_code) -- so a
+    document whose fact-write ever landed under the wrong stage stayed
+    permanently invisible to materialization, with its checklist entry
+    showing the correct stage the whole time, and Resync never fixing it
+    since Resync's own re-sync reads this exact same never-corrected
+    column.
+
+    The guard against re-tagging into a row that already exists under the
+    target stage (rather than blindly UPDATEing) matters because stage_code
+    is part of journey_document_extracted_fields' own partial unique index
+    (tenant_id, journey_id, stage_code, di_document_id,
+    source_canonical_field_id, source_fact_version WHERE
+    source_canonical_field_id IS NOT NULL, uc03_di_core_persistence.py's
+    _V2_UPSERT) -- a later, correctly-tagged webhook redelivery could have
+    already written the right row independently, and blindly retagging the
+    stale one into the same identity would violate that index.
+    """
+    result = connection.execute(
+        text(
+            """
+            UPDATE auditcore.journey_document_extracted_fields AS target
+            SET stage_code = :stage_code, updated_at_utc = now()
+            WHERE target.tenant_id = :tenant_id
+              AND target.journey_id = :journey_id
+              AND target.di_document_id = :document_id
+              AND target.stage_code <> :stage_code
+              AND NOT EXISTS (
+                  SELECT 1 FROM auditcore.journey_document_extracted_fields other
+                  WHERE other.tenant_id = target.tenant_id
+                    AND other.journey_id = target.journey_id
+                    AND other.di_document_id = target.di_document_id
+                    AND other.stage_code = :stage_code
+                    AND other.source_canonical_field_id
+                        IS NOT DISTINCT FROM target.source_canonical_field_id
+                    AND other.source_fact_version = target.source_fact_version
+              )
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "document_id": document_id,
+            "stage_code": stage_code,
+        },
+    )
+    return result.rowcount > 0
+
+
 def reconcile_unified_documents(
     connection: Connection,
     *,
@@ -336,6 +404,8 @@ def reconcile_unified_documents(
             di_documents.append(item)
 
     delivery_started = False
+    corrected_to_delivery = False
+    corrected_to_booking = False
     for item in di_documents:
         document_id = UUID(str(item["documentId"]))
         classified_type = item.get("classifiedDocumentTypeKey")
@@ -377,6 +447,48 @@ def reconcile_unified_documents(
                 "requirement_key": requirement_key,
                 "stage_code": stage_code,
             },
+        )
+        if _correct_durable_store_stage(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            document_id=document_id,
+            stage_code=stage_code,
+        ):
+            if stage_code == "DELIVERY":
+                corrected_to_delivery = True
+            else:
+                corrected_to_booking = True
+
+    # document_capture_v2_documents.stage_code (just corrected above) is
+    # local checklist bookkeeping only -- journey_document_extracted_
+    # fields.stage_code is the column the actual materializers key their
+    # durable-store reads on (_documents_from_durable_store,
+    # materialize_delivery_documents_from_durable_store /
+    # materialize_booking_insurance_from_durable_store), and correcting one
+    # table never used to correct the other. A document whose checklist
+    # entry correctly says "Delivery" could still leave insurance/
+    # registration/finance/commercial-lines permanently empty -- no amount
+    # of clicking Resync would ever fix it, since Resync's own re-sync path
+    # reads the exact same never-corrected column. Re-run the affected
+    # stage's durable-store materializer now, immediately, rather than
+    # waiting for some other document's future sync to incidentally re-hit
+    # the fixed rows.
+    if corrected_to_delivery:
+        from audit_core.uc03_delivery_post_extraction_materialization import (
+            materialize_delivery_documents_from_durable_store,
+        )
+
+        materialize_delivery_documents_from_durable_store(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+        )
+    if corrected_to_booking:
+        from audit_core.uc03_delivery_post_extraction_materialization import (
+            materialize_booking_insurance_from_durable_store,
+        )
+
+        materialize_booking_insurance_from_durable_store(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
         )
 
 

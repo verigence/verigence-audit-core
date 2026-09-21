@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from uuid import uuid4
@@ -10,6 +11,7 @@ from sqlalchemy import create_engine, text
 from audit_core.db import set_tenant_context
 from audit_core.uc03_delivery_capture_v2 import _delivery_requirements
 from audit_core.uc03_unified_document_capture import (
+    _correct_durable_store_stage,
     reconcile_unified_documents,
     resolve_document_stage,
 )
@@ -369,3 +371,206 @@ def test_delivery_checklist_read_seeds_requirements_before_any_upload(unified_ca
         )
         again = _delivery_requirements(connection, setup["tenant_id"], setup["journey_id"])
         assert len(again) == len(after)
+
+
+def _seed_extracted_field(
+    connection,
+    *,
+    tenant_id: str,
+    journey_id,
+    di_document_id,
+    actor_id: str,
+    stage_code: str,
+    source_canonical_field_id: str,
+    document_type_key: str = "no_dues_certificate",
+    field_key: str = "ndc_reference",
+    value: str = "NDC-12345",
+) -> None:
+    customer_id = connection.execute(
+        text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one()
+    # evidence has its own UNIQUE (tenant_id, di_document_id) -- seeding two
+    # extracted-field rows for the SAME di_document_id under two different
+    # stages (this module's own collision-guard test does exactly that)
+    # can't share one evidence row's di_document_id either, so each
+    # evidence row here gets its own synthetic one. Nothing enforces
+    # evidence.di_document_id == journey_document_extracted_fields.
+    # di_document_id at the DB level; only the latter is what
+    # _documents_from_durable_store/_correct_durable_store_stage key on.
+    evidence_id = connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.evidence (
+                tenant_id, journey_id, customer_id, di_subject_id, di_document_id,
+                document_type_key, evidence_purpose, linked_by_actor_id
+            ) VALUES (
+                :t, :j, :cu, :subject, :evidence_doc, :dtype, 'DELIVERY_AUDIT', :actor
+            ) RETURNING evidence_id
+            """
+        ),
+        {
+            "t": tenant_id, "j": journey_id, "cu": customer_id, "subject": uuid4(), "evidence_doc": uuid4(),
+            "dtype": document_type_key, "actor": actor_id,
+        },
+    ).scalar_one()
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.journey_document_extracted_fields (
+                tenant_id, journey_id, evidence_id, di_document_id,
+                stage_code, source_document_type_key, source_canonical_field_id,
+                field_key, effective_value, source_fact_version
+            ) VALUES (
+                :t, :j, :ev, :doc,
+                :stage, :dtype, :canonical_field_id,
+                :field_key, CAST(:val AS jsonb), 1
+            )
+            """
+        ),
+        {
+            "t": tenant_id, "j": journey_id, "ev": evidence_id, "doc": di_document_id,
+            "stage": stage_code, "dtype": document_type_key, "canonical_field_id": source_canonical_field_id,
+            "field_key": field_key, "val": json.dumps(value),
+        },
+    )
+
+
+def test_reconcile_unified_documents_corrects_a_stale_durable_store_stage_and_rematerializes(
+    unified_capture_setup, monkeypatch,
+) -> None:
+    """Regression: document_capture_v2_documents.stage_code (the checklist's
+    own column) already self-heals on every reconcile, but journey_document_
+    extracted_fields.stage_code -- the column the actual Delivery/Booking
+    materializers key their durable-store read on -- never did. A document
+    whose facts were durably written under a stale stage guess (BOOKING,
+    resolve_document_stage's own default) stayed permanently invisible to
+    insurance/registration/finance/commercial-lines materialization even
+    once correctly classified, no matter how many times Resync ran, since
+    Resync's own re-sync reads this exact same never-corrected column.
+    Confirmed live: a document whose checklist entry correctly said
+    "Delivery" left every one of those canonical tables empty."""
+    setup = unified_capture_setup
+    di_document_id = setup["document_id"]
+
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        _seed_extracted_field(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=setup["journey_id"],
+            di_document_id=di_document_id,
+            actor_id=setup["actor_id"],
+            stage_code="BOOKING",
+            source_canonical_field_id="ndc-field-1",
+        )
+
+    rematerialize_calls: list[tuple[str, object]] = []
+
+    def _spy(connection, *, tenant_id, journey_id):
+        rematerialize_calls.append((tenant_id, journey_id))
+        return {"spied": True}
+
+    monkeypatch.setattr(
+        "audit_core.uc03_delivery_post_extraction_materialization.materialize_delivery_documents_from_durable_store",
+        _spy,
+    )
+
+    v2_client = _FakeV2Client(documents_by_phase={
+        "BOOKING": [
+            {
+                "documentId": str(di_document_id),
+                "state": "CLASSIFIED",
+                "classifiedDocumentTypeKey": "NO_DUES_CERTIFICATE",
+            }
+        ],
+    })
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        reconcile_unified_documents(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=setup["journey_id"],
+            actor_id=setup["actor_id"],
+            actor_role="PC",
+            correlation_id="test-reconcile-stage-fix",
+            v2_client=v2_client,
+            context_ref="ctx",
+            token="tok",
+        )
+
+        stage_after = connection.execute(
+            text(
+                """
+                SELECT stage_code FROM auditcore.journey_document_extracted_fields
+                WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:doc
+                  AND source_canonical_field_id='ndc-field-1'
+                """
+            ),
+            {"t": setup["tenant_id"], "j": setup["journey_id"], "doc": di_document_id},
+        ).scalar_one()
+        assert stage_after == "DELIVERY"
+
+    assert rematerialize_calls == [(setup["tenant_id"], setup["journey_id"])]
+
+
+def test_correct_durable_store_stage_never_collides_with_an_already_correct_row(
+    unified_capture_setup,
+) -> None:
+    """A later, correctly-tagged webhook redelivery can independently have
+    already written the right (stage_code=DELIVERY) row for the very same
+    document/field/version identity before reconcile ever runs. Blindly
+    UPDATEing the stale BOOKING row into that same identity would violate
+    journey_document_extracted_fields' own partial unique index
+    (tenant_id, journey_id, stage_code, di_document_id,
+    source_canonical_field_id, source_fact_version) -- the fix must detect
+    that and leave the stale row alone instead of raising."""
+    setup = unified_capture_setup
+    di_document_id = setup["document_id"]
+
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        _seed_extracted_field(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=setup["journey_id"],
+            di_document_id=di_document_id,
+            actor_id=setup["actor_id"],
+            stage_code="BOOKING",
+            source_canonical_field_id="ndc-field-2",
+            value="stale-booking-copy",
+        )
+        _seed_extracted_field(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=setup["journey_id"],
+            di_document_id=di_document_id,
+            actor_id=setup["actor_id"],
+            stage_code="DELIVERY",
+            source_canonical_field_id="ndc-field-2",
+            value="already-correct-copy",
+        )
+
+        corrected = _correct_durable_store_stage(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=setup["journey_id"],
+            document_id=di_document_id,
+            stage_code="DELIVERY",
+        )
+        assert corrected is False
+
+        rows = connection.execute(
+            text(
+                """
+                SELECT stage_code, effective_value FROM auditcore.journey_document_extracted_fields
+                WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:doc
+                  AND source_canonical_field_id='ndc-field-2'
+                ORDER BY stage_code
+                """
+            ),
+            {"t": setup["tenant_id"], "j": setup["journey_id"], "doc": di_document_id},
+        ).mappings().all()
+        assert [r["stage_code"] for r in rows] == ["BOOKING", "DELIVERY"]
+        assert rows[0]["effective_value"] == "stale-booking-copy"
+        assert rows[1]["effective_value"] == "already-correct-copy"
