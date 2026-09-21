@@ -64,6 +64,7 @@ from audit_core.uc03_booking_receipt_capture import (
 )
 from audit_core.uc03_document_assessments import _effective_applicability
 from audit_core.uc03_document_registry import is_receipt_document_type
+from audit_core.workflow import create_workflow_task
 
 logger = structlog.get_logger(__name__)
 
@@ -71,6 +72,8 @@ router = APIRouter(tags=["uc03-pc-booking-documents"])
 
 _DI_AUDIENCE = "di"
 _AUDIT_SERVICE_AUDIENCE = "audit"
+_DUPLICATE_DOCUMENT_WORKFLOW_TYPE = "UC03_DUPLICATE_DOCUMENT"
+_DUPLICATE_DOCUMENT_TASK_TYPE = "DUPLICATE_DOCUMENT_NOTICE"
 # Requirement keys that accept more than one active evidence row (partial
 # payments, multiple receipts, multi-page/multi-period bank statements)
 # rather than the newest superseding the last. Delivery's payment-receipt
@@ -641,15 +644,74 @@ def acknowledge_booking_document_link(
                 },
             ).scalar_one_or_none()
             if prior_evidence_id is not None:
-                connection.execute(
+                # Standing rule for every document type, not just receipts:
+                # a second upload against a single-slot requirement is
+                # rejected outright, never silently superseded -- even when
+                # it's a genuinely different (corrected/re-scanned) file.
+                # The prior evidence stays ACTIVE and untouched; this new
+                # document is voided as a duplicate and a PC task is raised
+                # so it's visible, not silently dropped.
+                rejected_evidence_id = connection.execute(
                     text(
                         """
-                        UPDATE auditcore.evidence
-                        SET association_status='SUPERSEDED'
-                        WHERE tenant_id=:tenant_id AND evidence_id=:evidence_id
+                        INSERT INTO auditcore.evidence (
+                            tenant_id, journey_id, customer_id,
+                            journey_document_requirement_id,
+                            di_subject_id, di_document_id,
+                            document_type_key, evidence_purpose, process_area,
+                            association_status, void_reason,
+                            voided_by_actor_id, voided_at_utc,
+                            linked_by_actor_id, correlation_id
+                        ) VALUES (
+                            :tenant_id, :journey_id, :customer_id,
+                            :requirement_ref,
+                            :subject_id, :document_id,
+                            :document_type_key, :evidence_purpose, :process_area,
+                            'VOIDED', 'DUPLICATE_UPLOAD',
+                            :service_id, now(),
+                            :service_id, NULL
+                        )
+                        RETURNING evidence_id
                         """
                     ),
-                    {"tenant_id": tenant_id, "evidence_id": prior_evidence_id},
+                    {
+                        "tenant_id": tenant_id,
+                        "journey_id": journey_id,
+                        "customer_id": customer_id,
+                        "requirement_ref": payload.requirementRef,
+                        "subject_id": subject_id,
+                        "document_id": payload.documentId,
+                        "document_type_key": requirement["document_type_key"],
+                        "evidence_purpose": f"{process_area}_DOCUMENT",
+                        "process_area": process_area,
+                        "service_id": service_principal.subject,
+                    },
+                ).scalar_one()
+                create_workflow_task(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    workflow_type=_DUPLICATE_DOCUMENT_WORKFLOW_TYPE,
+                    process_area=process_area,
+                    task_type=_DUPLICATE_DOCUMENT_TASK_TYPE,
+                    assigned_role_code="PC",
+                    task_payload={
+                        "requirementKey": requirement["requirement_key"],
+                        "documentTypeKey": requirement["document_type_key"],
+                        "priorEvidenceId": str(prior_evidence_id),
+                        "rejectedDiDocumentId": str(payload.documentId),
+                        "comment": (
+                            f"A duplicate {requirement['document_type_key']} was uploaded. "
+                            "The earlier document already on file was kept; this newer "
+                            "upload was not used."
+                        ),
+                    },
+                    correlation_id=None,
+                )
+                return BookingDocumentLinkResponse(
+                    requirementRef=payload.requirementRef,
+                    documentId=payload.documentId,
+                    evidenceId=rejected_evidence_id,
                 )
 
         evidence_id = connection.execute(
