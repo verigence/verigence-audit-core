@@ -818,6 +818,34 @@ def _sync_booking_document(
             detail="Document extraction synchronization is temporarily unavailable."
         ) from exc
 
+    # Both slow, external DI calls happen here, before any database write --
+    # a write to auditcore.evidence (even though it looks unrelated) takes an
+    # implicit foreign-key lock on this document's journey_document_
+    # requirements row, and holding that lock across a *second* unbounded
+    # network call afterward is exactly what caused a live incident:
+    # concurrent DI document-link callbacks for that same requirement queued
+    # behind this connection and were cancelled on statement_timeout once it
+    # ran long (confirmed live: the blocking connection's last statement was
+    # this evidence UPDATE, sitting idle-in-transaction while a later step
+    # in this same function was still waiting on DI). Fetching facts here,
+    # ahead of the write, means every database statement in this function
+    # from this point on is DB-only -- nothing left to hold a row lock open
+    # across.
+    confirmed = str(document.confirmation_status or "").upper() == "CONFIRMED"
+    facts: list[Any] = []
+    if confirmed:
+        try:
+            facts = di_client.get_audit_document_facts(
+                token=token,
+                tenant_id=tenant_id,
+                external_context_ref=context_ref,
+                document_id=str(document_id),
+            )
+        except DiClientError as exc:
+            raise DependencyUnavailableError(
+                detail="Document extraction facts are temporarily unavailable."
+            ) from exc
+
     connection.execute(
         text(
             """
@@ -854,7 +882,7 @@ def _sync_booking_document(
         correlation_id="",
     )
 
-    if str(document.confirmation_status or "").upper() != "CONFIRMED":
+    if not confirmed:
         # TEMPORARY DIAGNOSTIC (2026-09-18): an accessory invoice DI's
         # schema fully supports extracting stayed "no extracted values
         # retained" through multiple Resync attempts, with no visible
@@ -877,18 +905,6 @@ def _sync_booking_document(
             verification_state=getattr(document, "verification_state", None),
         )
         return 0
-
-    try:
-        facts = di_client.get_audit_document_facts(
-            token=token,
-            tenant_id=tenant_id,
-            external_context_ref=context_ref,
-            document_id=str(document_id),
-        )
-    except DiClientError as exc:
-        raise DependencyUnavailableError(
-            detail="Document extraction facts are temporarily unavailable."
-        ) from exc
 
     document_type_key = (
         str(document.document_type_key).strip().lower()
