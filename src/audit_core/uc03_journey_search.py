@@ -758,6 +758,7 @@ def get_journey_overview(
                 currency_code AS "currencyCode",
                 payment_method_code AS "paymentMethodCode",
                 payment_reference AS "paymentReference",
+                receipt_number AS "receiptNumber",
                 actual_status_code AS "actualStatusCode",
                 status_source AS "sourceKind",
                 source_evidence_id AS "sourceEvidenceId"

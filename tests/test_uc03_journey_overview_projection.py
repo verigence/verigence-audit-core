@@ -386,6 +386,10 @@ def test_receipts_keep_every_reviewed_receipt_and_pending_capture_distinct() -> 
                 "documentTypeKey": "dealer_receipt",
             },
         ],
+        # No canonical auditcore.payments row yet for pending_id either --
+        # a genuinely still-processing receipt, unlike the "materialized but
+        # never reviewed" case covered separately below.
+        [],
     )
 
     receipts = _receipts(
@@ -400,3 +404,56 @@ def test_receipts_keep_every_reviewed_receipt_and_pending_capture_distinct() -> 
     assert receipts[0]["reviewStatus"] == "VERIFIED"
     assert str(receipts[1]["documentId"]) == str(pending_id)
     assert receipts[1]["reviewStatus"] == "PENDING"
+
+
+def test_receipts_shows_real_data_for_a_document_materialized_without_ever_being_reviewed() -> None:
+    """Regression, confirmed live: dealer_receipt_review_values is the OLD
+    per-stage capture screens' own review table -- a receipt confirmed
+    through the newer unified capture flow is fully materialized straight
+    into the canonical auditcore.payments row without ever writing one.
+    Before this fix, this loop's only signal for "already handled" was a
+    dealer_receipt_review_values row, so a fully PROCESSED/CONFIRMED
+    receipt -- with a real receipt_number/amount already sitting in
+    auditcore.payments -- rendered as "Pending -- DI extraction in
+    progress" forever, no matter how many times Resync ran."""
+    materialized_id = uuid4()
+    connection = _ScriptedConnection(
+        [],  # dealer_receipt_review_values: nothing reviewed at all
+        [
+            {
+                "documentId": materialized_id,
+                "originalFilename": "receipt-3.pdf",
+                "stageCode": "BOOKING",
+                "captureStatus": "CLASSIFIED",
+                "documentTypeKey": "dealer_receipt",
+            },
+        ],
+        [
+            {
+                "documentId": materialized_id,
+                "receiptNumber": "AMP-B/04733/26-27",
+                "receiptDate": None,
+                "amount": 1170000,
+                "paymentMethodCode": "RTGS",
+                "paymentReference": None,
+                "bankMatchStatus": None,
+                "bankMatchMethod": None,
+                "bankMatchLineId": None,
+                "bankMatchLineReference": None,
+                "bankMatchLineDate": None,
+            },
+        ],
+    )
+
+    receipts = _receipts(
+        connection,
+        tenant_id="tenant-1",
+        journey_id=uuid4(),
+        review_statuses={"BOOKING": "PENDING"},
+    )
+    assert len(receipts) == 1
+    assert receipts[0]["reviewStatus"] == "VERIFIED"
+    assert receipts[0]["receiptNumber"] == "AMP-B/04733/26-27"
+    assert receipts[0]["amount"] == 1170000
+    assert receipts[0]["paymentMethodCode"] == "RTGS"
+    assert receipts[0]["bankMatch"] is None
