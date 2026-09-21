@@ -128,9 +128,36 @@ class UploadIntentResult(BaseModel):
     expiresAtUtc: str
 
 
+class UploadIntentFailure(BaseModel):
+    clientUploadId: str
+    errorCode: str
+    detail: str
+
+
 class UploadIntentResponse(BaseModel):
     externalContextRef: str
     uploads: list[UploadIntentResult]
+    # DI isolates each file in a batch on its own SAVEPOINT -- a problem with
+    # one file no longer fails every other file in the same request. Always
+    # present; empty when every file in the batch succeeded.
+    failures: list[UploadIntentFailure] = Field(default_factory=list)
+
+
+def _upload_intent_failures(payload: dict[str, Any]) -> list[UploadIntentFailure]:
+    """Map DI's per-file failures (create_upload_intents) to our own model.
+
+    Shared by all three upload-intents routes (Booking's own, Delivery's own,
+    the unified path) so a PC always sees the same shape regardless of which
+    screen they uploaded from.
+    """
+    return [
+        UploadIntentFailure(
+            clientUploadId=str(failure["clientUploadId"]),
+            errorCode=str(failure.get("errorCode") or "UPLOAD_INTENT_FAILED"),
+            detail=str(failure.get("detail") or "This file could not be uploaded."),
+        )
+        for failure in payload.get("failures") or []
+    ]
 
 
 class ConditionalDeclarationCommand(BaseModel):
@@ -1136,7 +1163,9 @@ def create_booking_upload_intents_v2(
                 expiresAtUtc=str(item["expiresAtUtc"]),
             )
         )
-    return UploadIntentResponse(externalContextRef=context_ref, uploads=results)
+    return UploadIntentResponse(
+        externalContextRef=context_ref, uploads=results, failures=_upload_intent_failures(payload)
+    )
 
 
 @router.post("/booking/documents/{document_id}/finalize", response_model=FinalizeResponse)
