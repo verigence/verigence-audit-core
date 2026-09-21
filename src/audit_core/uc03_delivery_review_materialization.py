@@ -29,6 +29,7 @@ from audit_core import uc03_v2_review_materialization as booking_materialization
 from audit_core.uc03_attribute_mapping import spec_for_field
 from audit_core.uc03_delivery_commands import _machine_flag, _set_stage_flag_status
 from audit_core.uc03_document_registry import is_receipt_document_type
+from audit_core.uc03_finance_disbursement_resolution import resolve_finance_disbursement
 from audit_core.uc03_invoice_materialization import materialize_reviewed_invoices
 from audit_core.uc03_payment_reconciliation import (
     materialize_reviewed_bank_statements,
@@ -1222,6 +1223,12 @@ def materialize_reviewed_delivery_business_values(
         tenant_id=tenant_id,
         journey_id=journey_id,
     )
+    finance_disbursement = resolve_finance_disbursement(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        correlation_id="",
+    )
     insurance_fields = materialize_delivery_insurance(
         connection,
         tenant_id=tenant_id,
@@ -1278,6 +1285,7 @@ def materialize_reviewed_delivery_business_values(
         "financeFields": finance_fields,
         "financeHypothecationRaised": finance_hypothecation["raised"],
         "financeHypothecationResolved": finance_hypothecation["resolved"],
+        "financeDisbursement": finance_disbursement,
         "insuranceFields": insurance_fields,
         "deliveryDateSet": delivery_date_set,
         "invoicesMaterialized": invoices["invoices"],

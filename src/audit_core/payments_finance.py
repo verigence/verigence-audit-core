@@ -119,6 +119,34 @@ class FinancePut(BaseModel):
 class FinanceResponse(FinancePut):
     financeRecordId: UUID
     journeyId: UUID
+    # The actual loan amount a bank/NBFC disbursed to the dealer -- distinct
+    # from financedAmount above (the RTO Challan's own hypothecation
+    # charges). No document states this directly; it's resolved from the
+    # journey's own payment receipts (uc03_finance_disbursement_
+    # resolution.py). loanDisbursementConfidence is one of HIGH/MEDIUM
+    # (automatic), PC_CONFIRMED (a human picked it), AMBIGUOUS/UNVERIFIED
+    # (couldn't resolve -- see the FINANCE_DISBURSEMENT_REVIEW Task Queue
+    # item), or null (no financer named at all, nothing to resolve).
+    loanDisbursementAmount: Decimal | None = None
+    loanDisbursementPaymentId: UUID | None = None
+    loanDisbursementConfidence: str | None = None
+    loanDisbursementMatchBasis: str | None = None
+
+
+class LoanDisbursementCandidate(BaseModel):
+    paymentId: UUID
+    amount: Decimal
+    paymentAtUtc: datetime | None
+    paymentMethodCode: str | None
+    bankName: str | None
+    remarks: str | None
+    paymentReference: str | None
+
+
+class LoanDisbursementConfirm(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    paymentId: UUID
 
 
 def _journey_scope(connection: Connection, tenant_id: str, journey_id: UUID):
@@ -411,7 +439,9 @@ def _finance_response(connection: Connection, tenant_id: str, journey_id: UUID):
             """
             SELECT finance_record_id, journey_id, finance_type_code, provider_name,
                    do_reference, po_reference, financed_amount, actual_status_code,
-                   source_kind, source_evidence_id, details
+                   source_kind, source_evidence_id, details,
+                   loan_disbursement_amount, loan_disbursement_payment_id,
+                   loan_disbursement_confidence, loan_disbursement_match_basis
             FROM auditcore.finance_records
             WHERE tenant_id = :tenant_id AND journey_id = :journey_id
             ORDER BY created_at_utc DESC, finance_record_id DESC
@@ -438,6 +468,10 @@ def _finance_response(connection: Connection, tenant_id: str, journey_id: UUID):
         sourceKind=row["source_kind"],
         sourceEvidenceId=row["source_evidence_id"],
         details=row["details"],
+        loanDisbursementAmount=row["loan_disbursement_amount"],
+        loanDisbursementPaymentId=row["loan_disbursement_payment_id"],
+        loanDisbursementConfidence=row["loan_disbursement_confidence"],
+        loanDisbursementMatchBasis=row["loan_disbursement_match_basis"],
     )
 
 
@@ -455,6 +489,75 @@ def get_finance(
         principal,
         tenant_id=tenant_id,
         journey_id=journey_id,
+    )
+    return _finance_response(connection, tenant_id, journey_id)
+
+
+@router.get(
+    "/journeys/{journey_id}/finance/loan-disbursement-candidates",
+    response_model=list[LoanDisbursementCandidate],
+)
+def get_loan_disbursement_candidates(
+    tenant_id: str,
+    journey_id: UUID,
+    principal: Annotated[Principal, Depends(get_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> list[LoanDisbursementCandidate]:
+    """Every payment after the minimum booking amount, in an eligible
+    (never Cash/UPI/Card/QR) mode -- the exact same list the automatic
+    resolver considers, so a PC's pick (Task Queue or the standalone
+    Journey Documents correction) always matches what the system itself
+    already tried."""
+    from audit_core.uc03_finance_disbursement_resolution import (
+        eligible_loan_disbursement_candidates,
+    )
+
+    authorize(principal, tenant_id=tenant_id, permission="audit.payment.read")
+    set_tenant_context(connection, tenant_id)
+    _authorize_scope(connection, principal, tenant_id=tenant_id, journey_id=journey_id)
+    candidates = eligible_loan_disbursement_candidates(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+    )
+    return [
+        LoanDisbursementCandidate(
+            paymentId=row["payment_id"],
+            amount=row["amount"],
+            paymentAtUtc=row["payment_at_utc"],
+            paymentMethodCode=row["payment_method_code"],
+            bankName=row["receipt_bank_name"],
+            remarks=row["receipt_remarks"],
+            paymentReference=row["payment_reference"],
+        )
+        for row in candidates
+    ]
+
+
+@router.put("/journeys/{journey_id}/finance/loan-disbursement", response_model=FinanceResponse)
+def put_loan_disbursement(
+    tenant_id: str,
+    journey_id: UUID,
+    payload: LoanDisbursementConfirm,
+    principal: Annotated[Principal, Depends(get_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> FinanceResponse:
+    """Standalone correction path (Journey Documents' own "Update Loan
+    Amount" action) -- same write, same TL notice, and the exact same
+    candidate validation as confirming a FINANCE_DISBURSEMENT_REVIEW Task
+    Queue item (tasks_api.py), just without a task to complete."""
+    from audit_core.uc03_finance_disbursement_resolution import (
+        confirm_loan_disbursement,
+    )
+
+    authorize(principal, tenant_id=tenant_id, permission="audit.payment.write")
+    set_tenant_context(connection, tenant_id)
+    _authorize_scope(connection, principal, tenant_id=tenant_id, journey_id=journey_id)
+    confirm_loan_disbursement(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        payment_id=payload.paymentId,
+        actor_id=principal.subject,
+        correlation_id="",
     )
     return _finance_response(connection, tenant_id, journey_id)
 
