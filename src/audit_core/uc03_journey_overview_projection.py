@@ -444,12 +444,94 @@ def _receipts(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
+
+    # dealer_receipt_review_values is the OLD per-stage capture screens' own
+    # review table -- a receipt uploaded through the newer unified capture
+    # flow (uc03_unified_document_capture.py) is confirmed and fully
+    # materialized straight into the canonical auditcore.payments row
+    # (materialize_delivery_receipts et al.) without ever writing one.
+    # Confirmed live: a dealer_receipt document showing PROCESSED/CONFIRMED
+    # in evidence, with a real receipt_number/amount already in
+    # auditcore.payments, still rendered as "Pending -- DI extraction in
+    # progress" forever, because this loop's only signal for "already
+    # handled" was reviewed_ids (dealer_receipt_review_values), and nothing
+    # here ever checked the canonical table those receipts actually landed
+    # in. Look any such document up there before falling back to a genuine
+    # still-pending placeholder.
+    unreviewed_ids = [
+        str(row["documentId"]) for row in pending_rows if str(row["documentId"]) not in reviewed_ids
+    ]
+    materialized_by_document: dict[str, dict[str, Any]] = {}
+    if unreviewed_ids:
+        materialized_rows = connection.execute(
+            text(
+                """
+                SELECT
+                    p.source_di_document_id AS "documentId",
+                    p.receipt_number AS "receiptNumber",
+                    p.payment_at_utc AS "receiptDate",
+                    p.amount AS "amount",
+                    p.payment_method_code AS "paymentMethodCode",
+                    p.payment_reference AS "paymentReference",
+                    m.match_status AS "bankMatchStatus",
+                    m.match_method AS "bankMatchMethod",
+                    m.bank_statement_line_id AS "bankMatchLineId",
+                    bl.reference_no AS "bankMatchLineReference",
+                    bl.transaction_date AS "bankMatchLineDate"
+                FROM auditcore.payments p
+                LEFT JOIN auditcore.payment_bank_matches m
+                  ON m.tenant_id=p.tenant_id AND m.payment_id=p.payment_id
+                LEFT JOIN auditcore.bank_statement_lines bl
+                  ON bl.tenant_id=m.tenant_id
+                 AND bl.bank_statement_line_id=m.bank_statement_line_id
+                WHERE p.tenant_id=:tenant_id AND p.journey_id=:journey_id
+                  AND p.source_di_document_id = ANY(CAST(:document_ids AS uuid[]))
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "document_ids": unreviewed_ids,
+            },
+        ).mappings().all()
+        for row in materialized_rows:
+            materialized_by_document[str(row["documentId"])] = dict(row)
+
     for row in pending_rows:
         item = dict(row)
-        if str(item["documentId"]) in reviewed_ids:
+        document_id = str(item["documentId"])
+        if document_id in reviewed_ids:
             continue
-        item["reviewStatus"] = review_statuses.get(str(item.get("stageCode")), "PENDING")
-        item["bankMatch"] = None
+        materialized = materialized_by_document.get(document_id)
+        if materialized is None:
+            item["reviewStatus"] = review_statuses.get(str(item.get("stageCode")), "PENDING")
+            item["bankMatch"] = None
+            result.append(item)
+            continue
+        item["receiptNumber"] = materialized["receiptNumber"]
+        item["receiptDate"] = materialized["receiptDate"]
+        item["amount"] = materialized["amount"]
+        item["paymentMethodCode"] = materialized["paymentMethodCode"]
+        item["paymentReference"] = materialized["paymentReference"]
+        item["reviewStatus"] = "VERIFIED"
+        status = materialized.get("bankMatchStatus")
+        item["bankMatch"] = (
+            {
+                "status": status,
+                "method": materialized.get("bankMatchMethod"),
+                "lineId": (
+                    str(materialized["bankMatchLineId"])
+                    if materialized.get("bankMatchLineId") is not None
+                    else None
+                ),
+                "lineReference": materialized.get("bankMatchLineReference"),
+                "lineDate": materialized.get("bankMatchLineDate"),
+            }
+            if status is not None
+            else None
+        )
+        item["isDuplicate"] = False
+        item["duplicateBasis"] = None
         result.append(item)
     return result
 
