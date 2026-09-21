@@ -13,13 +13,33 @@ against a stage where the type has no requirement is left with
 ``requirement_key=NULL``, permanently unable to link to evidence.
 
 Per explicit product correction: customer_kyc is a Booking-stage
-requirement, not Delivery. Both ``initialize_uc03_booking_requirements()``
-and ``initialize_uc03_delivery_requirements()`` (0017/0073) read
-``document_requirement_items.process_area`` live at journey-stage-start
-time via a generic ``WHERE upper(process_area)=...`` join -- customer_kyc
-was never one of the types hardcoded directly into either trigger body, so
-moving the source row's process_area is sufficient to fix both triggers for
-every future Booking/Delivery start, with no trigger-body edit needed.
+requirement, not Delivery.
+
+``document_requirement_items`` cannot simply be UPDATEd once its parent
+``document_requirement_profile_version`` is PUBLISHED -- confirmed live,
+``auditcore.protect_version_child_mutation()`` (0007/0014) raises
+"child rows may only be changed while master version is DRAFT" -- and every
+tenant provisioned to date already has a PUBLISHED version. So this
+migration fixes the two things it safely can:
+
+1. Every already-instantiated journey's own ``journey_document_requirements``
+   row -- ordinary mutable operational state, not a versioned catalog row --
+   moved in place (same requirement_key, same
+   journey_document_requirement_id, so any evidence already bound to it
+   stays bound and simply now shows under Booking). This is the fix for the
+   concrete, currently-open problem: every journey that exists today.
+
+2. ``ensure_uc03_default_document_profile`` (0022), so a brand new tenant
+   provisioned from today gets the correction from day one.
+
+Known, deliberately out of scope here: an EXISTING tenant's own catalog
+(``document_requirement_items``) still says customer_kyc is Delivery-only,
+so a brand new journey for an existing tenant would still seed it there
+(via ``initialize_uc03_delivery_requirements()``'s live join) until that
+tenant's profile gets a new PUBLISHED version with the correction -- a
+separate, larger piece of work (bumping the profile version_no and copying
+every item across, immutability-respecting) that a future migration should
+do if this gap needs closing for other tenants too.
 """
 from __future__ import annotations
 
@@ -32,24 +52,11 @@ depends_on = None
 
 
 def upgrade() -> None:
-    bind = op.get_bind()
-
-    # 1. The master catalog every future Booking-stage-start reads from, for
-    # every tenant that already has a published profile version.
-    bind.execute(
-        """
-        UPDATE auditcore.document_requirement_items
-        SET process_area = 'BOOKING'
-        WHERE requirement_key = 'customer_kyc'
-          AND upper(process_area) = 'DELIVERY'
-        """
-    )
-
-    # 2. Every already-instantiated journey's own requirement row -- moved
+    # 1. Every already-instantiated journey's own requirement row -- moved
     # in place (same requirement_key, same journey_document_requirement_id,
     # so any evidence already bound to it stays bound and simply now shows
-    # under Booking).
-    bind.execute(
+    # under Booking). Fixes every journey that exists today.
+    op.execute(
         """
         UPDATE auditcore.journey_document_requirements
         SET process_area = 'BOOKING'
@@ -58,8 +65,8 @@ def upgrade() -> None:
         """
     )
 
-    # 3. ensure_uc03_default_document_profile (0022) only ever creates a new
-    # profile version once per tenant -- steps 1-2 above are what fixes
+    # 2. ensure_uc03_default_document_profile (0022) only ever creates a new
+    # profile version once per tenant -- step 1 above is what fixes
     # every tenant that already has one. This step is purely so a brand new
     # tenant provisioned from today gets the correction from day one;
     # otherwise byte-identical to 0022's own function body.
@@ -187,16 +194,13 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    bind = op.get_bind()
-    bind.execute(
-        """
-        UPDATE auditcore.document_requirement_items
-        SET process_area = 'DELIVERY'
-        WHERE requirement_key = 'customer_kyc'
-          AND upper(process_area) = 'BOOKING'
-        """
-    )
-    bind.execute(
+    # document_requirement_items is intentionally not reverted here -- see
+    # this module's own docstring: upgrade() never mutated an existing,
+    # PUBLISHED item row (the immutability trigger forbids it), so the only
+    # 'BOOKING' customer_kyc item rows that can exist are on a brand new
+    # tenant's own PUBLISHED version, itself equally protected from a
+    # downgrade-time UPDATE.
+    op.execute(
         """
         UPDATE auditcore.journey_document_requirements
         SET process_area = 'DELIVERY'
