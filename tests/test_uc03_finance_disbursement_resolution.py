@@ -154,7 +154,12 @@ def _seed_payment(
         {
             "t": tenant_id, "j": journey_id, "days": days_after_booking, "amount": amount,
             "method": method, "mode": _classify(method), "bank": bank_name, "remarks": remarks,
-            "receipt_number": f"R-{uuid4().hex[:8]}", "stage": "BOOKING" if days_after_booking <= 0 else "DELIVERY",
+            # payment_stage='DELIVERY' requires an actual linked delivery
+            # row (auditcore.prepare_payment_stage_link's own trigger) --
+            # irrelevant to this resolver, which never filters on stage at
+            # all, so every seeded payment here stays 'BOOKING' rather than
+            # standing up a full Delivery fixture this module doesn't need.
+            "receipt_number": f"R-{uuid4().hex[:8]}", "stage": "BOOKING",
         },
     )
 
