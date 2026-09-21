@@ -1476,9 +1476,12 @@ def resync_booking_capture_v2(
         service_id=f"manual-resync:{human_principal.subject}",
     )
 
-    from audit_core.uc03_confidence_review_policy import _run_sync_booking_document_task
+    from audit_core.uc03_confidence_review_policy import (
+        _run_sync_booking_document_task,
+        sync_stagger_seconds,
+    )
 
-    for document_id in document_ids:
+    for index, document_id in enumerate(document_ids):
         background_tasks.add_task(
             _run_sync_booking_document_task,
             engine,
@@ -1487,6 +1490,7 @@ def resync_booking_capture_v2(
             document_id=document_id,
             service_id=f"manual-resync:{human_principal.subject}",
             stage_code="BOOKING",
+            initial_delay_seconds=sync_stagger_seconds(index),
         )
     return BookingCaptureV2ResyncResponse(
         documentsFound=len(documents),

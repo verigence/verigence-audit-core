@@ -245,6 +245,49 @@ def test_confirm_calls_attribute_resolution_directly_not_via_review_v2() -> None
     assert "record_attribute_resolution(" in source
 
 
+def test_sync_stagger_seconds_spreads_a_batch_and_caps_it() -> None:
+    # Regression test for a live incident: a 35-document journey's Resync
+    # dispatched 30 background tasks at once, all competing for the same
+    # per-journey advisory lock; the unlucky tail exhausted the ~59s bounded
+    # retry budget and silently never synced (no persisted error anywhere).
+    # A per-document stagger must increase with index (to actually spread
+    # contention out) but stay bounded (a very large batch must not delay
+    # its last document indefinitely).
+    assert confidence_policy.sync_stagger_seconds(0) == 0.0
+    assert confidence_policy.sync_stagger_seconds(1) > confidence_policy.sync_stagger_seconds(0)
+    assert confidence_policy.sync_stagger_seconds(2) > confidence_policy.sync_stagger_seconds(1)
+    assert confidence_policy.sync_stagger_seconds(1000) <= 20.0
+
+
+def test_run_sync_booking_document_task_awaits_its_stagger_before_the_retry_loop() -> None:
+    source = inspect.getsource(confidence_policy._run_sync_booking_document_task)
+    assert "initial_delay_seconds" in source
+    assert source.index("anyio.sleep(initial_delay_seconds)") < source.index("max_attempts = 6")
+
+
+def test_resync_endpoints_stagger_their_batch_dispatch() -> None:
+    # Both Booking's and Delivery's resync endpoints, plus Submit's own
+    # document_ids loop, dispatch _run_sync_booking_document_task once per
+    # document for the same journey -- every one of those call sites must
+    # pass a per-index stagger, not just the shared helper existing in
+    # isolation, or the regression comes right back for whichever call site
+    # was missed.
+    from audit_core import uc03_delivery_capture_v2, uc03_document_capture_v2
+    from audit_core import uc03_post_extraction_materialization as booking_submit
+
+    for module, function_name in (
+        (uc03_document_capture_v2, "resync_booking_capture_v2"),
+        (uc03_delivery_capture_v2, "resync_delivery_capture_v2"),
+    ):
+        source = inspect.getsource(getattr(module, function_name))
+        assert "sync_stagger_seconds(index)" in source, function_name
+        assert "enumerate(document_ids)" in source, function_name
+
+    submit_source = inspect.getsource(booking_submit)
+    assert "confidence_policy.sync_stagger_seconds(index)" in submit_source
+    assert "enumerate(document_ids)" in submit_source
+
+
 def test_confirm_no_longer_blocks_on_unresolved_low_confidence_decisions() -> None:
     # Document completeness is the sole criterion for Booking/Delivery to
     # finish (2026-09-13 design change) -- confidence review is a separate,
