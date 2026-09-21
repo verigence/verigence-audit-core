@@ -122,13 +122,26 @@ class DiCaptureV2Client:
         params: dict[str, Any] | None = None,
         expect_body: bool = True,
     ) -> dict[str, Any]:
-        response = self._client.request(
-            method,
-            path,
-            headers={"Authorization": f"Bearer {token}"},
-            json=json,
-            params=params,
-        )
+        try:
+            response = self._client.request(
+                method,
+                path,
+                headers={"Authorization": f"Bearer {token}"},
+                json=json,
+                params=params,
+            )
+        except httpx.HTTPError as exc:
+            # A slow/unreachable DI (e.g. a large multi-file upload-intents
+            # batch that runs long) raises this as a raw httpx exception, not
+            # a DiCaptureV2Error -- every caller only catches the latter, so
+            # this used to skip their handling (and the generic-but-present
+            # DependencyUnavailableError message) entirely and surface as a
+            # bare unhandled 500 with no detail at all. Route it through the
+            # same DiCaptureV2Error path every caller already handles.
+            raise DiCaptureV2Error(
+                status_code=504,
+                detail=f"DI V2 request failed: {exc.__class__.__name__}",
+            ) from exc
         if not 200 <= response.status_code < 300:
             detail = response.text[:1000] or f"HTTP {response.status_code}"
             raise DiCaptureV2Error(status_code=response.status_code, detail=detail)
