@@ -390,6 +390,14 @@ def _seed_extracted_field(
         text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
         {"t": tenant_id, "j": journey_id},
     ).scalar_one()
+    # evidence has its own UNIQUE (tenant_id, di_document_id) -- seeding two
+    # extracted-field rows for the SAME di_document_id under two different
+    # stages (this module's own collision-guard test does exactly that)
+    # can't share one evidence row's di_document_id either, so each
+    # evidence row here gets its own synthetic one. Nothing enforces
+    # evidence.di_document_id == journey_document_extracted_fields.
+    # di_document_id at the DB level; only the latter is what
+    # _documents_from_durable_store/_correct_durable_store_stage key on.
     evidence_id = connection.execute(
         text(
             """
@@ -397,12 +405,12 @@ def _seed_extracted_field(
                 tenant_id, journey_id, customer_id, di_subject_id, di_document_id,
                 document_type_key, evidence_purpose, linked_by_actor_id
             ) VALUES (
-                :t, :j, :cu, :subject, :doc, :dtype, 'DELIVERY_AUDIT', :actor
+                :t, :j, :cu, :subject, :evidence_doc, :dtype, 'DELIVERY_AUDIT', :actor
             ) RETURNING evidence_id
             """
         ),
         {
-            "t": tenant_id, "j": journey_id, "cu": customer_id, "subject": uuid4(), "doc": di_document_id,
+            "t": tenant_id, "j": journey_id, "cu": customer_id, "subject": uuid4(), "evidence_doc": uuid4(),
             "dtype": document_type_key, "actor": actor_id,
         },
     ).scalar_one()
