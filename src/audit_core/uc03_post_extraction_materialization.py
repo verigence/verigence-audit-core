@@ -435,7 +435,7 @@ def close_booking_ready_with_lazy_v2_sync(
         tenant_id=tenant_id,
         journey_id=journey_id,
     )
-    for document_id in document_ids:
+    for index, document_id in enumerate(document_ids):
         background_tasks.add_task(
             confidence_policy._run_sync_booking_document_task,
             get_engine(),
@@ -444,6 +444,7 @@ def close_booking_ready_with_lazy_v2_sync(
             document_id=document_id,
             service_id="audit-core",
             stage_code="BOOKING",
+            initial_delay_seconds=confidence_policy.sync_stagger_seconds(index),
         )
 
     # Same safety net as PC Review Confirm (see confirm_booking_review_v2_

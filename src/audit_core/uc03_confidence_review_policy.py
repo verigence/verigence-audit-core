@@ -1365,6 +1365,20 @@ def _run_delivery_checkpoint_once(engine: Engine, *, tenant_id: str, journey_id:
         )
 
 
+_SYNC_STAGGER_STEP_SECONDS = 0.75
+_SYNC_STAGGER_MAX_SECONDS = 20.0
+
+
+def sync_stagger_seconds(index: int) -> float:
+    """Per-document dispatch delay for a batch of _run_sync_booking_document_
+    task background tasks against the same journey (index 0-based, in
+    dispatch order) -- see that function's own docstring for why a batch
+    needs this at all. Capped so a very large batch still starts its last
+    document within a bounded, short window rather than growing unbounded.
+    """
+    return min(index * _SYNC_STAGGER_STEP_SECONDS, _SYNC_STAGGER_MAX_SECONDS)
+
+
 async def _run_sync_booking_document_task(
     engine: Engine,
     *,
@@ -1373,6 +1387,7 @@ async def _run_sync_booking_document_task(
     document_id: UUID,
     service_id: str,
     stage_code: str,
+    initial_delay_seconds: float = 0.0,
 ) -> None:
     """Background execution of _sync_booking_document for the DI document-link
     webhook. DI's own client enforces a hard 5s timeout on that call (a
@@ -1384,6 +1399,22 @@ async def _run_sync_booking_document_task(
     only grows as more steps accumulate. Running it here, after the webhook
     has already responded, means a slow moment costs a beat of eventual
     consistency, never DI's retry budget.
+
+    ``initial_delay_seconds`` (a caller-supplied per-document stagger, 0 for
+    the single-document DI webhook path): confirmed live, a batch of many
+    documents for the same journey (a large Resync, or Submit's own
+    document_ids loop) dispatches one of these as a background task per
+    document, all at once. Every one of them competes for the same
+    per-journey advisory lock below with a bounded retry budget (max_attempts
+    * the sum of retry_delay_seconds, ~59s) -- with enough simultaneous
+    contenders, the unlucky tail can lose the lock race on all 6 attempts and
+    give up silently (a warning log, no persisted error anywhere), leaving
+    that document's evidence row's processing_status_cache untouched forever
+    unless a human clicks Resync again and gets lucky with less contention.
+    A caller dispatching many of these for one journey should spread their
+    start times out (see resync_booking_capture_v2/resync_delivery_capture_v2)
+    so the retry budget is spent on genuine lock contention, not entirely
+    consumed by everyone starting in the same instant.
 
     Deferring to the background also means DI can now fire this webhook far
     faster than before (each call used to be held open by all the work this
@@ -1416,6 +1447,9 @@ async def _run_sync_booking_document_task(
     anyio.to_thread.run_sync) ever occupies one, and only for as long as
     that work actually takes.
     """
+    if initial_delay_seconds > 0:
+        await anyio.sleep(initial_delay_seconds)
+
     security_provider = get_security_oauth_client()
     di_provider = get_di_client()
     max_attempts = 6
