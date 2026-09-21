@@ -23,9 +23,15 @@ own documents), which the older ``uc03_sku_candidates`` resolver does not see
   4. zero SKU -> MODEL_NOT_IDENTIFIED "no matching model"
   5. >1  SKU  -> MODEL_NOT_IDENTIFIED "matched multiple models" (+ candidates)
 
-No fuzzy matching, no price tolerance (``_label_similarity`` is normalised
-equality only; the attribute fallback is exact-per-attribute, never a fuzzy
-score). Idempotent, self-heals on read, never raises.
+No fuzzy matching (``_label_similarity`` is normalised equality only; the
+attribute fallback is exact-per-attribute, never a fuzzy score). Price
+matching is exact everywhere except one narrow, deliberate exception: once a
+real stated attribute fact (fuel/transmission/drive/seater) has already
+narrowed the field to a small candidate set, ``_price_disambiguate`` allows a
+tight 0.5% tolerance to arbitrate within it -- covering real-world rounding
+between the Booking Form's stated total and the master's, without ever doing
+a fuzzy price search across the whole price list (see ``_PRICE_APPROX_
+TOLERANCE``). Idempotent, self-heals on read, never raises.
 """
 from __future__ import annotations
 
@@ -77,6 +83,39 @@ _RULE_KEY = "MODEL_NOT_IDENTIFIED:BOOKING"
 _STAGE = "BOOKING"
 _SELECTION_METHOD = "MODEL_RESOLUTION_SYNC_V1"
 _EX_SHOWROOM_COMPONENT = "EX_SHOWROOM"
+
+# Confirmed against a real live case: "Scorpio Classic" / "S MT 7S" already
+# had a trustworthy attribute signal (transmission=MT, seater=7) narrowing to
+# two rows differing only by colour, with the Booking Form's offered total
+# a mere 0.01% off the correct row's master total -- real-world rounding
+# (paise-level tax rounding at different calculation stages), not a genuine
+# price disagreement. An exact `==` match sees that as no signal at all and
+# leaves both rows tied. This tolerance is intentionally only used here, in
+# _price_disambiguate -- never in _match's broad, un-narrowed price search --
+# because it only ever arbitrates within a candidate set _attribute_
+# decomposition_fallback has already confirmed via a real stated fact
+# (fuel/transmission/drive/seater), where a coincidental price collision
+# between two actually-different vehicles cannot happen by construction.
+_PRICE_APPROX_TOLERANCE = Decimal("0.005")  # 0.5%, well clear of real rounding noise
+
+
+def _closest_within_tolerance(
+    rows: list[dict[str, Any]], *, offered: Decimal, field_value: Any
+) -> list[dict[str, Any]]:
+    """Rows whose price (already extracted per-row via ``field_value``) is
+    within ``_PRICE_APPROX_TOLERANCE`` of ``offered``. Ties (more than one row
+    equally within tolerance) are returned as-is -- still genuinely ambiguous,
+    not resolved by guessing which is closer."""
+    if offered == 0:
+        return []
+    candidates = []
+    for row in rows:
+        price = field_value(row)
+        if price is None:
+            continue
+        if abs(price - offered) / abs(offered) <= _PRICE_APPROX_TOLERANCE:
+            candidates.append(row)
+    return candidates
 
 # Delivery-side fallback (see sync_model_resolution_from_invoice below): DI's
 # generalized invoice schema (verigence-di schemas/invoice.py) never maps
@@ -448,6 +487,25 @@ def _price_disambiguate(
         by_ex = _narrow(by_ex, variant=inputs["variant_name"], colour=inputs["colour_name"])
         if by_ex:
             return by_ex, "EX_SHOWROOM"
+
+    # Exact equality found no usable signal (0 or still >1) on either field --
+    # a real stated attribute fact already narrowed `rows` to this specific
+    # small set, so a tight, symmetric tolerance here is arbitrating within an
+    # already-confirmed vehicle identity, not doing a fresh price search. See
+    # _PRICE_APPROX_TOLERANCE's own comment for the live case this covers.
+    if total is not None:
+        by_total_approx = _closest_within_tolerance(
+            rows, offered=total, field_value=lambda r: _master_total(r, basis)
+        )
+        if len(by_total_approx) == 1:
+            return by_total_approx, "TOTAL_APPROX"
+
+    if ex is not None:
+        by_ex_approx = _closest_within_tolerance(
+            rows, offered=ex, field_value=lambda r: _to_decimal(r["master_ex_showroom"])
+        )
+        if len(by_ex_approx) == 1:
+            return by_ex_approx, "EX_SHOWROOM_APPROX"
 
     return rows, "TOTAL" if total is not None else "NONE"
 

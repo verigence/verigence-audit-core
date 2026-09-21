@@ -100,6 +100,54 @@ def test_no_price_data_returns_empty() -> None:
     assert matched == [rows[0]] or matched == []  # model matched but nothing to disambiguate
 
 
+# ── unit: _price_disambiguate's tolerance (real live case) ──────────────────
+def test_price_disambiguate_resolves_a_hairline_rounding_gap() -> None:
+    """Reproduces a live case verbatim: 'Scorpio Classic' / 'S MT 7S' already
+    had a trustworthy attribute signal (transmission=MT, seater=7) narrowing
+    to two rows differing only by colour -- and the Booking Form's offered
+    total was 0.01% off the correct row's master total, real-world rounding,
+    not a genuine price disagreement. Exact `==` sees that as no signal at
+    all and leaves both tied; the 0.5% tolerance must resolve it."""
+    rows = [
+        _row("A", "SCORPIO CLASSIC", variant="S MT 7 STR", colour="RED", total="1200120"),
+        _row("B", "SCORPIO CLASSIC", variant="S MT 7 STR", colour="WHITE", total="1250000"),
+    ]
+    matched, stage = mr._price_disambiguate(
+        rows, _inputs(model="SCORPIO CLASSIC", total="1200000")
+    )
+    assert stage == "TOTAL_APPROX"
+    assert [r["sku_code"] for r in matched] == ["A"]
+
+
+def test_price_disambiguate_does_not_resolve_a_real_price_gap() -> None:
+    """A gap far outside real rounding noise (5% on both sides, not 0.01%)
+    must stay ambiguous -- the tolerance exists for rounding, not to paper
+    over a genuine price disagreement between two different colour SKUs."""
+    rows = [
+        _row("A", "SCORPIO CLASSIC", variant="S MT 7 STR", colour="RED", total="1260000"),
+        _row("B", "SCORPIO CLASSIC", variant="S MT 7 STR", colour="WHITE", total="1140000"),
+    ]
+    matched, stage = mr._price_disambiguate(
+        rows, _inputs(model="SCORPIO CLASSIC", total="1200000")
+    )
+    assert stage != "TOTAL_APPROX"
+    assert {r["sku_code"] for r in matched} == {"A", "B"}
+
+
+def test_price_disambiguate_tolerance_still_ambiguous_when_both_rows_qualify() -> None:
+    """Two rows both within tolerance of the offered total must not be
+    arbitrarily narrowed to one -- that's still a genuine tie."""
+    rows = [
+        _row("A", "SCORPIO CLASSIC", variant="S MT 7 STR", colour="RED", total="1200100"),
+        _row("B", "SCORPIO CLASSIC", variant="S MT 7 STR", colour="WHITE", total="1199900"),
+    ]
+    matched, stage = mr._price_disambiguate(
+        rows, _inputs(model="SCORPIO CLASSIC", total="1200000")
+    )
+    assert stage != "TOTAL_APPROX"
+    assert {r["sku_code"] for r in matched} == {"A", "B"}
+
+
 # ── unit: generation-refresh bridge ──────────────────────────────────────────
 # Real, confirmed live data: a Mahindra price list can carry an old-generation
 # "SCORPIO N" (still on sale) alongside a "NEW SCORPIO N" refresh in the exact
