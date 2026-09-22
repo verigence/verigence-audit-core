@@ -875,6 +875,24 @@ def _sync_booking_document(
         result=manual_verification_result,
         skipped_reason=f"no extracted fields for {stage_code} yet",
     )
+    # A leftover UC03_DI_LOW_CONFIDENCE_POST_SUBMIT finding (the pre-#346
+    # mechanism, no longer created -- see _ensure_post_submit_review_flag's
+    # removal) closes on exactly the same event sync_manual_verification_
+    # findings above just used to close the modern Task: this document's
+    # fields getting reviewed. Confirmed live: a document's Task closed via
+    # the Documents page's own correction flow while its old finding sat
+    # open forever, because _resolve_review_flags -- the intended self-heal
+    # -- was only ever wired to a different, unrelated PC-review endpoint
+    # nothing in that flow actually calls. Harmless once every legacy
+    # finding is gone; safe to delete then.
+    _resolve_review_flags(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        evidence_ids={link["evidence_id"]},
+        actor_id=service_id,
+        actor_role="SYSTEM",
+    )
 
     # Every document on this Journey must belong to the same customer.
     # Reacts to any document of either stage (a KYC document confirming
