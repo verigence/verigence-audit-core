@@ -48,7 +48,12 @@ from audit_core.workflow import create_workflow_task
 
 logger = structlog.get_logger(__name__)
 
-DEFAULT_SWEEP_INTERVAL_SECONDS = 60.0
+# Matches workflow_stale_task_recovery.py's own default -- no real reason
+# for this sweep to run any more often than the existing, already-proven
+# one in this same service. TL's SLA clock starting a few minutes later
+# than the instant readiness is reached costs nothing; ticking 5x more
+# often for that was unjustified extra load with no correctness benefit.
+DEFAULT_SWEEP_INTERVAL_SECONDS = 300.0
 
 
 def _active_tenant_ids(engine: Engine) -> list[str]:
