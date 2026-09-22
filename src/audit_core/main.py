@@ -95,6 +95,12 @@ from audit_core.uc03_delivery_capture_v2 import (
 )
 from audit_core.uc03_delivery_commands import router as uc03_delivery_router
 from audit_core.uc03_delivery_documents import router as uc03_delivery_documents_router
+from audit_core.uc03_delivery_review_readiness_sweep import (
+    DEFAULT_SWEEP_INTERVAL_SECONDS as DELIVERY_REVIEW_SWEEP_INTERVAL_SECONDS,
+)
+from audit_core.uc03_delivery_review_readiness_sweep import (
+    run_delivery_review_readiness_sweep_loop,
+)
 from audit_core.uc03_document_assessments import (
     router as uc03_document_assessments_router,
 )
@@ -212,12 +218,28 @@ async def _lifespan(_: FastAPI):
     sweep_task = asyncio.create_task(
         run_stale_worker_task_recovery_loop(get_engine(), interval_seconds=sweep_interval)
     )
+    delivery_review_sweep_interval = float(
+        os.environ.get(
+            "DELIVERY_REVIEW_READINESS_SWEEP_INTERVAL_SECONDS",
+            str(DELIVERY_REVIEW_SWEEP_INTERVAL_SECONDS),
+        )
+    )
+    delivery_review_sweep_task = asyncio.create_task(
+        run_delivery_review_readiness_sweep_loop(
+            get_engine(), interval_seconds=delivery_review_sweep_interval,
+        )
+    )
     try:
         yield
     finally:
         sweep_task.cancel()
+        delivery_review_sweep_task.cancel()
         try:
             await sweep_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await delivery_review_sweep_task
         except asyncio.CancelledError:
             pass
 

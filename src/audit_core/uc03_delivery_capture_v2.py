@@ -38,7 +38,11 @@ from audit_core.uc03_document_capture_v2 import (
     get_di_client,
     get_security_oauth_client,
 )
-from audit_core.workflow import cancel_workflow_task, create_workflow_task
+from audit_core.workflow import (
+    cancel_workflow_task,
+    complete_workflow_task,
+    create_workflow_task,
+)
 
 router = APIRouter(
     prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}/delivery",
@@ -53,6 +57,37 @@ _TERMINAL_FAILURE_STATES = {"FAILED", "ERROR", "REJECTED"}
 # as uc03_document_unrecognized.py's PC_VERIFY_UNRECOGNIZED_DOCUMENT.
 _PROCESSING_FAILED_TASK_TYPE = "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE"
 _PROCESSING_FAILED_WORKFLOW_TYPE = "UC03_DOCUMENT_VERIFICATION"
+
+# One workflow_tasks row per journey+stage for each side of the handoff --
+# not a new column on journey_stage_states. PC's own task records when PC
+# actually finished (created and completed together, right here, the same
+# instant Submit succeeds -- Submit itself stays unconditional). TL's task
+# (see uc03_delivery_review_readiness_sweep.py) is raised separately, only
+# once the system confirms document/data review is genuinely done -- its own
+# created_at_utc is TL's real SLA/KPI clock, deliberately decoupled from
+# PC's click, which workflow_tasks already tracks correctly without needing
+# any new state anywhere else.
+PC_DELIVERY_CAPTURE_TASK_TYPE = "PC_DELIVERY_CAPTURE"
+_PC_DELIVERY_CAPTURE_WORKFLOW_TYPE = "UC03_DELIVERY_CAPTURE"
+TL_DELIVERY_REVIEW_TASK_TYPE = "TL_DELIVERY_REVIEW"
+TL_DELIVERY_REVIEW_WORKFLOW_TYPE = "UC03_DELIVERY_REVIEW"
+
+
+def _pc_delivery_capture_effect_key(tenant_id: str, journey_id: UUID) -> str:
+    return f"task:delivery-pc-capture:{tenant_id}:{journey_id}"
+
+
+def tl_delivery_review_effect_key_prefix(tenant_id: str) -> str:
+    # Split out from tl_delivery_review_effect_key so
+    # uc03_delivery_review_readiness_sweep.py's own "does a TL task already
+    # exist for this journey" SQL can build its WHERE-clause prefix from the
+    # exact same source instead of a second, hand-copied literal that could
+    # silently drift out of sync with this one.
+    return f"task:delivery-tl-review:{tenant_id}:"
+
+
+def tl_delivery_review_effect_key(tenant_id: str, journey_id: UUID) -> str:
+    return f"{tl_delivery_review_effect_key_prefix(tenant_id)}{journey_id}"
 
 
 def _processing_failed_effect_key(tenant_id: str, journey_id: UUID, document_id: str) -> str:
@@ -943,6 +978,128 @@ def schedule_delivery_document_checkpoint(
     return raised, resolved
 
 
+_OPEN_TASK_STATUSES = ("PENDING", "READY", "CLAIMED", "IN_PROGRESS", "RETRY_WAIT")
+
+
+def delivery_review_readiness_blockers(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    documents: list[dict[str, Any]],
+) -> list[str]:
+    """What must be resolved before this Delivery's document/data review is
+    genuinely finished -- read by uc03_delivery_review_readiness_sweep.py to
+    decide when to raise the TL_DELIVERY_REVIEW task, NOT by Submit itself
+    (Submit stays unconditional, exactly as it always has -- PC's own action
+    and the system's own confirmation of readiness are two different events
+    on two different clocks, not one gated button).
+
+    Scoped to exactly the three self-serviceable-by-PC categories: a
+    document genuinely missing, a document that failed processing or was
+    rejected as wrong/duplicate, and an unreviewed low-confidence field.
+    Deliberately excludes VIOLATION-class findings (those need a TL
+    decision, not PC action -- would be circular to gate TL's own task on
+    something only TL can resolve).
+    """
+    blockers: list[str] = []
+
+    if any(
+        str(row.get("capture_status") or "").upper() in {"RECEIVING", "STORED", "CLASSIFYING"}
+        for row in documents
+    ):
+        blockers.append("One or more uploaded documents are still being processed.")
+
+    # Distinct from the check above -- a document can be past classification
+    # (capture_status='CLASSIFIED') while DI is still extracting/confirming
+    # its fields. confirmation_status_cache is auditcore's own local mirror
+    # of DI's confirmation_status, kept current by the same per-document
+    # webhook sync as everything else here (uc03_confidence_review_policy.py
+    # _sync_booking_document) -- 'CONFIRMED' is the exact value that sync
+    # gates a durable fact copy on, so anything else means this document's
+    # classification finished but its extraction has not.
+    unextracted_documents = connection.execute(
+        text(
+            """
+            SELECT count(*) FROM auditcore.evidence
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND process_area='DELIVERY' AND association_status='ACTIVE'
+              AND confirmation_status_cache IS DISTINCT FROM 'CONFIRMED'
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalar_one()
+    if unextracted_documents:
+        blockers.append(
+            f"{unextracted_documents} classified document(s) have not finished extraction yet."
+        )
+
+    missing_documents = connection.execute(
+        text(
+            """
+            SELECT count(*) FROM auditcore.audit_findings
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND stage_code='DELIVERY'
+              AND finding_status IN ('OPEN','ACKNOWLEDGED')
+              AND rule_key LIKE 'DL_V2_REQUIRED_DOCUMENT_MISSING:%'
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalar_one()
+    if missing_documents:
+        blockers.append(f"{missing_documents} required document(s) are still missing.")
+
+    # Local imports, same reasoning as this pipeline's other cross-module
+    # TASK_TYPE references (e.g. uc03_confidence_review_policy.py) -- avoids
+    # any chance of a load-order/circular-import issue at app startup.
+    from audit_core.uc03_customer_identity_consistency import (
+        DEALER_TASK_TYPE as _wrong_document_dealer_task_type,
+    )
+    from audit_core.uc03_customer_identity_consistency import (
+        TASK_TYPE as _wrong_document_task_type,
+    )
+    from audit_core.uc03_document_field_corrections import (
+        TASK_TYPE as _field_correction_task_type,
+    )
+    from audit_core.uc03_duplicate_receipt_detection import (
+        TASK_TYPE as _duplicate_receipt_task_type,
+    )
+    from audit_core.uc03_manual_verification import (
+        TASK_TYPE as _manual_verification_task_type,
+    )
+
+    open_tasks = connection.execute(
+        text(
+            """
+            SELECT count(*) FROM auditcore.workflow_tasks
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND process_area='DELIVERY'
+              AND task_type = ANY(:task_types)
+              AND task_status = ANY(:statuses)
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "task_types": [
+                _PROCESSING_FAILED_TASK_TYPE,
+                _duplicate_receipt_task_type,
+                _wrong_document_task_type,
+                _wrong_document_dealer_task_type,
+                _manual_verification_task_type,
+                _field_correction_task_type,
+            ],
+            "statuses": list(_OPEN_TASK_STATUSES),
+        },
+    ).scalar_one()
+    if open_tasks:
+        blockers.append(
+            f"{open_tasks} open Task Queue item(s) (document or data review) still require PC action."
+        )
+
+    return blockers
+
+
 @router.post("/submit", response_model=DeliveryCaptureV2SubmissionResponse)
 def submit_delivery_capture_v2(
     tenant_id: str,
@@ -977,6 +1134,7 @@ def submit_delivery_capture_v2(
             correlation_id=correlation_id,
         )
         documents = _linked_delivery_documents(connection, tenant_id, journey_id)
+        first_submission = refreshed.get("capture_completed_at_utc") is None
         connection.execute(
             text(
                 """
@@ -990,6 +1148,24 @@ def submit_delivery_capture_v2(
             ),
             {"tenant_id": tenant_id, "journey_id": journey_id},
         )
+        if first_submission:
+            pc_task_id = create_workflow_task(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                workflow_type=_PC_DELIVERY_CAPTURE_WORKFLOW_TYPE,
+                process_area="DELIVERY",
+                task_type=PC_DELIVERY_CAPTURE_TASK_TYPE,
+                assigned_role_code="PC",
+                assigned_actor_id=human_principal.subject,
+                task_payload={"documentCount": len(documents)},
+                effect_key=_pc_delivery_capture_effect_key(tenant_id, journey_id),
+                correlation_id=correlation_id,
+            )
+            complete_workflow_task(
+                connection, tenant_id=tenant_id, workflow_task_id=pc_task_id,
+                actor_id=human_principal.subject,
+            )
         _append_delivery_event(
             connection,
             tenant_id=tenant_id,
