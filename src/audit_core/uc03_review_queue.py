@@ -738,18 +738,46 @@ _TASK_TITLE_BY_RULE_KEY_STEM = {
 # those tabs regardless of which was clicked. AUTO_SELF_SERVE isn't listed:
 # it's excluded from this query entirely (see _TASK_QUEUE_SQL), already
 # classified correctly via the DATA_GAP/DOCUMENT_GAP finding it was spawned
-# from. TL_TAKE_ACTION is deliberately left unmapped -- its underlying
-# trigger varies too widely to classify from task_type alone.
+# from.
+#
+# Confirmed live the first pass at this list was incomplete (grep across the
+# whole codebase for every task_type actually used, not just the ones
+# touched most recently) -- DUPLICATE_DOCUMENT_NOTICE and PC_DOCUMENT_
+# REUPLOAD were both real, already-firing task types this dict never
+# mentioned, so the exact same "All" vs. tab-sum mismatch this dict was
+# built to fix was still showing up for them. Every task_type found by that
+# audit is accounted for below, either mapped or explicitly left out with a
+# reason -- not just the ones a screenshot happened to catch this time.
+#
+# Deliberately left unmapped: task types that are a call-to-action ("go
+# review/call/claim") rather than a document-or-data gap, where forcing one
+# of the two labels would misrepresent what the item actually is --
+# TL_TAKE_ACTION, TL_REVIEW, TL_DELIVERY_REVIEW, CRM_CALL, ESCALATION_
+# FOLLOW_UP, PC_CORRECTION (a TL/PM send-back with too free-form a reason to
+# classify from task_type alone). PC_DELIVERY_CAPTURE is created already-
+# completed (see submit_delivery_capture_v2) so it never appears as an open
+# item to classify. BOOKING_RULE_EVALUATION is a machine-worker task (the
+# one real caller of the claim/lease lifecycle, see workflow_stale_task_
+# recovery.py's own docstring) never assigned to a human role.
 _TASK_TYPE_FINDING_CLASS: dict[str, str] = {
     "PC_VERIFY_UNRECOGNIZED_DOCUMENT": "DOCUMENT_GAP",
     "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE": "DOCUMENT_GAP",
     "DUPLICATE_RECEIPT_NOTICE": "DOCUMENT_GAP",
+    "DUPLICATE_DOCUMENT_NOTICE": "DOCUMENT_GAP",
+    "PC_DOCUMENT_REUPLOAD": "DOCUMENT_GAP",
     "WRONG_DOCUMENT_REVIEW": "DOCUMENT_GAP",
     "WRONG_DOCUMENT_DEALER_NOTICE": "DOCUMENT_GAP",
     "FIELD_CORRECTION_REVIEW": "DATA_GAP",
     "MANUAL_VERIFICATION_REVIEW": "DATA_GAP",
     "FINANCE_DISBURSEMENT_REVIEW": "DATA_GAP",
     "FINANCE_DISBURSEMENT_CONFIRMED_NOTICE": "DATA_GAP",
+    "PAYMENT_RECONCILIATION": "DATA_GAP",
+    "SKU_RESOLUTION": "DATA_GAP",
+    "SKU_RESOLUTION_INVOICE": "DATA_GAP",
+    "DEAL_TOTAL_VARIANCE_REVIEW": "DATA_GAP",
+    "INVOICE_DISCREPANCY_REVIEW": "DATA_GAP",
+    "MODEL_SELECTION_CORRECTION_REVIEW": "DATA_GAP",
+    "INVOICE_SKU_MISMATCH_REASON": "DATA_GAP",
 }
 
 

@@ -122,3 +122,47 @@ def test_finding_class_filter_excludes_tasks_of_a_different_derived_class() -> N
         rows, roles=["PC"], now=datetime.now(UTC), subject_kind="JOURNEY", finding_class="DATA_GAP"
     )
     assert [item.category for item, _ in data_only] == ["MANUAL_VERIFICATION_REVIEW"]
+
+
+# ── completeness: every real task_type is a conscious decision ─────────────────
+def test_every_task_type_used_in_the_codebase_is_a_conscious_mapping_decision() -> None:
+    # The exact bug this whole module exists to prevent recurred once
+    # already: DUPLICATE_RECEIPT_NOTICE and PC_DOCUMENT_REUPLOAD were both
+    # real, already-firing task types _TASK_TYPE_FINDING_CLASS never
+    # mentioned, so the same "All" vs. tab-sum mismatch this dict was built
+    # to fix was still showing up for them, confirmed live. This test greps
+    # every literal task_type string and every module-level *TASK_TYPE
+    # constant across src/audit_core -- the same audit that found the two
+    # gaps -- and fails if a new one shows up unmentioned here, instead of
+    # only being caught the next time it happens to appear on someone's
+    # screen. AUTO_SELF_SERVE and BOOKING_RULE_EVALUATION are the two real
+    # exceptions (excluded from the Task Queue query entirely / a
+    # machine-only lease task, see _TASK_TYPE_FINDING_CLASS's own comment).
+    import re
+    from pathlib import Path
+
+    src_dir = Path(rq.__file__).parent
+    found: set[str] = set()
+    for path in src_dir.glob("*.py"):
+        text = path.read_text()
+        found.update(re.findall(r'task_type\s*=\s*"([A-Z_]+)"', text))
+        found.update(re.findall(r'^_?[A-Z_]*TASK_TYPE\s*=\s*"([A-Z_]+)"', text, re.MULTILINE))
+
+    deliberately_unmapped = {
+        "AUTO_SELF_SERVE",
+        "BOOKING_RULE_EVALUATION",
+        "PC_DELIVERY_CAPTURE",
+        "TL_DELIVERY_REVIEW",
+        "TL_TAKE_ACTION",
+        "TL_REVIEW",
+        "CRM_CALL",
+        "ESCALATION_FOLLOW_UP",
+        "PC_CORRECTION",
+    }
+    accounted_for = set(rq._TASK_TYPE_FINDING_CLASS) | deliberately_unmapped
+    unaccounted = found - accounted_for
+    assert not unaccounted, (
+        f"{unaccounted} task_type(s) exist in the codebase but aren't in "
+        "_TASK_TYPE_FINDING_CLASS or this test's deliberately_unmapped set -- "
+        "classify them or add them to deliberately_unmapped with a reason."
+    )
