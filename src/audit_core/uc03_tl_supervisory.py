@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from datetime import date, datetime
 from typing import Annotated, Any
 from uuid import UUID
@@ -28,7 +27,6 @@ from audit_core.uc03_booking_commands import (
     _append_workflow_event,
     _stage_state,
 )
-from audit_core.uc03_finding_classification import resolve_classification
 from audit_core.uc03_pc_generic_review import (
     DirectExtractedField,
     _project_known_field,
@@ -119,7 +117,6 @@ class TlReuploadRequestResponse(BaseModel):
     requirementRef: UUID
     documentId: UUID
     taskId: UUID
-    findingId: UUID
     assignedPcActorId: str
     status: str = "REQUESTED"
 
@@ -795,75 +792,6 @@ def _existing_reupload_task(
     ).mappings().one_or_none()
 
 
-def _create_reupload_finding(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-    actor_id: str,
-    reason: str,
-    correlation_id: str,
-) -> UUID:
-    finding_id = connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.audit_findings (
-                tenant_id, journey_id, finding_type_code, severity,
-                finding_status, title, description, created_by_actor_id,
-                correlation_id, stage_code, origin_kind, origin_actor_id,
-                origin_role_snapshot, rule_key, blocking_completion,
-                finding_class, owner_role_code, sla_due_at_utc
-            ) VALUES (
-                :tenant_id, :journey_id, 'DOCUMENT_EXCEPTION', 'MEDIUM',
-                'OPEN', 'Team Lead requested document re-upload', :description,
-                :actor_id, :correlation_id, 'BOOKING', 'HUMAN', :actor_id,
-                'TL', 'TL_DOCUMENT_REUPLOAD_REQUEST', false,
-                :finding_class, :owner_role_code, :sla_due_at_utc
-            ) RETURNING audit_finding_id
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "description": reason.strip(),
-            "actor_id": actor_id,
-            "correlation_id": correlation_id,
-            **resolve_classification(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                rule_key="TL_DOCUMENT_REUPLOAD_REQUEST",
-                finding_type_code="DOCUMENT_EXCEPTION",
-                severity="MEDIUM",
-            ),
-        },
-    ).scalar_one()
-    connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.audit_finding_events (
-                tenant_id, audit_finding_id, journey_id, stage_code,
-                event_type, actor_id, actor_role_snapshot, safe_payload,
-                correlation_id
-            ) VALUES (
-                :tenant_id, :finding_id, :journey_id, 'BOOKING',
-                'RAISED', :actor_id, 'TL', CAST(:safe_payload AS jsonb),
-                :correlation_id
-            )
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "finding_id": finding_id,
-            "journey_id": journey_id,
-            "actor_id": actor_id,
-            "safe_payload": json.dumps({"reasonCategory": "DOCUMENT_REUPLOAD_REQUEST"}),
-            "correlation_id": correlation_id,
-        },
-    )
-    return finding_id
-
-
 @router.post("/cases/{journey_id}/reupload-request", response_model=TlReuploadRequestResponse)
 def request_pc_document_reupload(
     tenant_id: str,
@@ -899,7 +827,7 @@ def request_pc_document_reupload(
 
     def execute() -> dict[str, Any]:
         _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
-        _linked_document(
+        document = _linked_document(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
@@ -917,25 +845,29 @@ def request_pc_document_reupload(
             journey_id=journey_id,
             document_id=payload.documentId,
         )
-        if existing is not None and existing["finding_id"] is not None:
+        if existing is not None:
             return {
                 "journeyId": str(journey_id),
                 "requirementRef": str(payload.requirementRef),
                 "documentId": str(payload.documentId),
                 "taskId": str(existing["workflow_task_id"]),
-                "findingId": str(existing["finding_id"]),
                 "assignedPcActorId": str(existing["assigned_actor_id"] or pc_actor_id),
                 "status": "REQUESTED",
             }
 
-        finding_id = _create_reupload_finding(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            actor_id=human_principal.subject,
-            reason=payload.reason,
-            correlation_id=correlation_id,
-        )
+        # Task Queue only -- no audit_findings row. A TL requesting a
+        # reupload is a process instruction for PC, the same shape as
+        # DUPLICATE_DOCUMENT_NOTICE/WRONG_DOCUMENT_DEALER_NOTICE (Task-Queue-
+        # only by design, see uc03_pc_booking_documents.py /
+        # uc03_customer_identity_consistency.py), not a rule-classified
+        # finding. Confirmed live: raising both meant the exact same request
+        # showed up twice in the Task Queue ("Documents" tab counted it
+        # twice), and neither representation carried the document's own name
+        # -- documentTypeKey/documentLabel below are what
+        # _task_specific_suffix (uc03_review_queue.py) already knows how to
+        # turn into a real title instead of a bare document_id.
+        document_type_key = str(document["document_type_key"])
+        document_label = document_type_key.replace("_", " ").title()
         task_id = create_workflow_task(
             connection,
             tenant_id=tenant_id,
@@ -950,9 +882,14 @@ def request_pc_document_reupload(
             task_payload={
                 "documentId": str(payload.documentId),
                 "requirementRef": str(payload.requirementRef),
-                "findingId": str(finding_id),
+                "documentTypeKey": document_type_key,
+                "documentLabel": document_label,
                 "requestedByRole": "TL",
                 "reason": payload.reason.strip(),
+                "comment": (
+                    f"Team Lead requested a re-upload of {document_label}: "
+                    f"{payload.reason.strip()}"
+                ),
             },
             effect_key=f"tl-document-reupload:{journey_id}:{payload.documentId}",
             correlation_id=correlation_id,
@@ -973,7 +910,6 @@ def request_pc_document_reupload(
                 "requirementRef": str(payload.requirementRef),
                 "documentId": str(payload.documentId),
                 "taskId": str(task_id),
-                "findingId": str(finding_id),
                 "assignedPcActorId": pc_actor_id,
                 "optionalTlReview": True,
             },
@@ -995,7 +931,6 @@ def request_pc_document_reupload(
             "requirementRef": str(payload.requirementRef),
             "documentId": str(payload.documentId),
             "taskId": str(task_id),
-            "findingId": str(finding_id),
             "assignedPcActorId": pc_actor_id,
             "status": "REQUESTED",
         }
