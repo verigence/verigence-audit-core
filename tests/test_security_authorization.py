@@ -3,10 +3,19 @@ import json
 import httpx
 import pytest
 
+from audit_core import security_authorization
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     SecurityAuthorizationError,
 )
+
+
+def test_allow_reuse_window_is_300_seconds() -> None:
+    # Widened from 60s: confirmed live, 60s is shorter than a real person's
+    # typical navigate-away-and-come-back gap, so it behaved as no cache at
+    # all for normal Journey 360 usage (3-4 independent permission_key
+    # checks per load, each paying up to 5s on a cold cache).
+    assert security_authorization._AUTHORIZATION_ALLOW_REUSE_SECONDS == 300.0
 
 
 def test_security_authorization_client_uses_service_identity_and_exact_decision() -> None:

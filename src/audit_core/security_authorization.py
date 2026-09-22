@@ -24,7 +24,17 @@ _SERVICE_TOKEN_FALLBACK_REUSE_SECONDS = 60.0
 # Reuse only a successful identical ALLOW for a short process-local window. DENY
 # and errors are deliberately never cached. Human JWT validation still happens on
 # every request.
-_AUTHORIZATION_ALLOW_REUSE_SECONDS = 60.0
+#
+# Widened from 60s -> 300s (2026-09-22): confirmed live, 60s is shorter than a
+# real person's typical navigate-away-and-come-back gap, so in practice this
+# behaved as no cache at all for normal usage -- every Journey 360 load (which
+# alone fires 3-4 independent permission_key checks: overview's two, plus
+# Insurance and Finance) paid the full cold-cache cost (up to 5s per check)
+# on nearly every visit. DENY/error responses are still never cached, so a
+# revoked permission still can't be used to get in; this only widens how long
+# a stale ALLOW can persist after a permission is revoked, from up to 1
+# minute to up to 5.
+_AUTHORIZATION_ALLOW_REUSE_SECONDS = 300.0
 
 
 def _service_token_reuse_seconds(token: str) -> float:
