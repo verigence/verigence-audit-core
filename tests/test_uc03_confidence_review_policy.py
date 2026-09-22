@@ -301,3 +301,20 @@ def test_confirm_no_longer_blocks_on_unresolved_low_confidence_decisions() -> No
     # Confirm must still actually apply whatever was given, unconditionally.
     assert "rejected_keys" in source
     assert "materialize_reviewed_di_business_values(" in source
+
+
+def test_sync_closes_leftover_legacy_findings_on_the_same_event_that_closes_the_modern_task() -> None:
+    # Bug fix, confirmed live: a document's MANUAL_VERIFICATION_REVIEW Task
+    # closed correctly via the Documents page's own correction flow, but its
+    # older, pre-#346 UC03_DI_LOW_CONFIDENCE_POST_SUBMIT finding for the
+    # exact same evidence stayed open forever -- _resolve_review_flags (the
+    # intended self-heal) was only ever wired to a different, unrelated
+    # PC-review endpoint nothing in that flow actually calls. Fix: call it
+    # from the same event sync_manual_verification_findings already reacts
+    # to (a document syncing), right next to it, using the same evidence_id
+    # already in scope there -- no new trigger, no new endpoint.
+    source = inspect.getsource(confidence_policy._sync_booking_document)
+    manual_idx = source.index("sync_manual_verification_findings(")
+    resolve_idx = source.index("_resolve_review_flags(")
+    assert resolve_idx > manual_idx
+    assert 'evidence_ids={link["evidence_id"]}' in source
