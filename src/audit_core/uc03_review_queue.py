@@ -463,13 +463,16 @@ def _load_daily_ops_task_queue(
     actor_id: str,
     roles: list[str],
     now: datetime,
+    finding_class: str | None = None,
     include_closed: bool = False,
 ) -> list[tuple[QueueItem, bool]]:
     rows = connection.execute(
         text(_DAILY_OPS_TASK_QUEUE_SQL),
         {"tenant_id": tenant_id, "actor_id": actor_id, "include_closed": include_closed},
     ).mappings().all()
-    return _tasks_to_items(rows, roles=roles, now=now, subject_kind="DAILY_OPS")
+    return _tasks_to_items(
+        rows, roles=roles, now=now, subject_kind="DAILY_OPS", finding_class=finding_class
+    )
 
 
 def _load_queue(
@@ -560,6 +563,7 @@ def _load_task_queue(
     roles: list[str],
     now: datetime,
     stage: str | None,
+    finding_class: str | None = None,
     include_closed: bool = False,
 ) -> list[tuple[QueueItem, bool]]:
     rows = connection.execute(
@@ -568,11 +572,50 @@ def _load_task_queue(
     ).mappings().all()
     if stage:
         rows = [r for r in rows if r["process_area"] == stage]
-    return _tasks_to_items(rows, roles=roles, now=now, subject_kind="JOURNEY")
+    return _tasks_to_items(
+        rows, roles=roles, now=now, subject_kind="JOURNEY", finding_class=finding_class
+    )
+
+
+def _task_specific_suffix(payload: dict[str, Any], *, derived_class: str | None) -> str | None:
+    """A short, specific label to append to a Task's generic title -- the
+    document name for a DOCUMENT_GAP-class task, the field name (falling
+    back to the document name if no field is present) for a DATA_GAP-class
+    one. Tries every payload key shape the current producers actually use
+    (they don't share one convention); returns None when a producer's
+    payload genuinely carries nothing specific to show, in which case the
+    title falls back to today's plain category label, unchanged."""
+
+    def fmt(raw: Any) -> str | None:
+        text_value = str(raw).strip() if raw else ""
+        return text_value.replace("_", " ").title() if text_value else None
+
+    doc_label = (
+        fmt(payload.get("documentLabel"))
+        or fmt(payload.get("originalFilename"))
+        or fmt(payload.get("documentTypeKey"))
+        or fmt(payload.get("provider_name"))
+    )
+    field_keys = payload.get("fieldKeys")
+    if isinstance(field_keys, list) and field_keys:
+        field_label = fmt(field_keys[0])
+        if field_label and len(field_keys) > 1:
+            field_label = f"{field_label} +{len(field_keys) - 1} more"
+    else:
+        field_label = fmt(payload.get("fieldKey"))
+
+    if derived_class == "DATA_GAP" and field_label:
+        return f"{doc_label}: {field_label}" if doc_label else field_label
+    return doc_label
 
 
 def _tasks_to_items(
-    rows: list[Any], *, roles: list[str], now: datetime, subject_kind: QueueSubjectKind
+    rows: list[Any],
+    *,
+    roles: list[str],
+    now: datetime,
+    subject_kind: QueueSubjectKind,
+    finding_class: str | None = None,
 ) -> list[tuple[QueueItem, bool]]:
     """Shared Task→QueueItem mapping for both subjects.
 
@@ -586,9 +629,25 @@ def _tasks_to_items(
     permittedActions is deliberately empty -- the Task-completion action
     (PC upload + comment) doesn't exist yet; this queue only lists Tasks
     today, it doesn't yet let anyone act on one from here.
+
+    findingClass is derived from task_type via _TASK_TYPE_FINDING_CLASS,
+    not read off any column -- a Task genuinely has none. Bug fix: before
+    this, every Task left findingClass null, so it was invisible to every
+    Documents/Data/Violations class filter (findingClass=X only ever
+    matched Finding rows) while _load_task_queue applied no class filter
+    of its own -- meaning every open Task showed up under every class tab
+    regardless of which was clicked, and none of them counted toward any
+    tab's own badge, which only ever summed Finding rows. Filtering here
+    (skip a Task whose derived class doesn't match the requested one) is
+    what actually fixes the segregation; get_review_queue_summary's byClass
+    count is then correct for free, since it already sums item.findingClass
+    across everything _load_all returns.
     """
     out: list[tuple[QueueItem, bool]] = []
     for row in rows:
+        derived_class = _TASK_TYPE_FINDING_CLASS.get(row["task_type"])
+        if finding_class and derived_class != finding_class:
+            continue
         assigned_role = (row["assigned_role_code"] or "PC").upper()
         # A Task has no SLA-driven escalation to gate on (visible_to_role's
         # own job) -- oversight here is simply "the assigned role, or
@@ -602,8 +661,14 @@ def _tasks_to_items(
         is_open = row["task_status"] in _OPEN_TASK_STATUSES
         due_at = row["due_at_utc"]
         payload = row["task_payload"] or {}
-        rule_key = payload.get("ruleKey") if isinstance(payload, dict) else None
+        payload = payload if isinstance(payload, dict) else {}
+        rule_key = payload.get("ruleKey")
         rule_key_stem = rule_key.split(":")[0] if rule_key else None
+        base_title = (
+            _TASK_TITLE_BY_RULE_KEY_STEM.get(rule_key_stem)
+            or _TASK_TITLE.get(row["task_type"], row["task_type"].replace("_", " ").title())
+        )
+        specific = _task_specific_suffix(payload, derived_class=derived_class)
 
         item = QueueItem(
             flagId=row["workflow_task_id"],
@@ -617,15 +682,13 @@ def _tasks_to_items(
             businessDate=row.get("business_date"),
             relatedFindingId=row["related_finding_id"],
             category=row["task_type"],
+            findingClass=derived_class,
             severity=row["severity"] or "MEDIUM",
             status=row["task_status"],
             isOpen=is_open,
             version=int(row["version_no"]),
-            title=(
-                _TASK_TITLE_BY_RULE_KEY_STEM.get(rule_key_stem)
-                or _TASK_TITLE.get(row["task_type"], row["task_type"].replace("_", " ").title())
-            ),
-            description=payload.get("comment") if isinstance(payload, dict) else None,
+            title=f"{base_title} — {specific}" if specific else base_title,
+            description=payload.get("comment"),
             ownerRoleCode=assigned_role,
             disposition=None,
             originKind="SYSTEM",
@@ -663,6 +726,30 @@ _TASK_TITLE = {
 # exists, so the Task Queue reads as an instruction, not a category label.
 _TASK_TITLE_BY_RULE_KEY_STEM = {
     "MODEL_NOT_IDENTIFIED": "Select the vehicle SKU",
+}
+
+# A Task has no finding_class column of its own (that's a Finding concept),
+# but every task_type below is unambiguously "about a document" or "about a
+# data value" -- bug fix: without this, every Task row left item.findingClass
+# null, so it was invisible to the Documents/Data/Violations class filters
+# (findingClass=X only ever matched Finding rows) while still counted in the
+# unfiltered "All" total, AND -- since _load_task_queue applied no class
+# filter of its own either -- every open Task showed up under every one of
+# those tabs regardless of which was clicked. AUTO_SELF_SERVE isn't listed:
+# it's excluded from this query entirely (see _TASK_QUEUE_SQL), already
+# classified correctly via the DATA_GAP/DOCUMENT_GAP finding it was spawned
+# from. TL_TAKE_ACTION is deliberately left unmapped -- its underlying
+# trigger varies too widely to classify from task_type alone.
+_TASK_TYPE_FINDING_CLASS: dict[str, str] = {
+    "PC_VERIFY_UNRECOGNIZED_DOCUMENT": "DOCUMENT_GAP",
+    "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE": "DOCUMENT_GAP",
+    "DUPLICATE_RECEIPT_NOTICE": "DOCUMENT_GAP",
+    "WRONG_DOCUMENT_REVIEW": "DOCUMENT_GAP",
+    "WRONG_DOCUMENT_DEALER_NOTICE": "DOCUMENT_GAP",
+    "FIELD_CORRECTION_REVIEW": "DATA_GAP",
+    "MANUAL_VERIFICATION_REVIEW": "DATA_GAP",
+    "FINANCE_DISBURSEMENT_REVIEW": "DATA_GAP",
+    "FINANCE_DISBURSEMENT_CONFIRMED_NOTICE": "DATA_GAP",
 }
 
 
@@ -749,7 +836,7 @@ def _load_all(
         if include_tasks:
             loaded = loaded + _load_daily_ops_task_queue(
                 connection, tenant_id=tenant_id, actor_id=actor_id, roles=roles, now=now,
-                include_closed=include_closed,
+                finding_class=finding_class, include_closed=include_closed,
             )
         return loaded
     loaded = _load_queue(
@@ -759,7 +846,7 @@ def _load_all(
     if include_tasks:
         loaded = loaded + _load_task_queue(
             connection, tenant_id=tenant_id, actor_id=actor_id, roles=roles, now=now,
-            stage=stage, include_closed=include_closed,
+            stage=stage, finding_class=finding_class, include_closed=include_closed,
         )
     return loaded
 
