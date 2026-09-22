@@ -403,116 +403,6 @@ def _find_review_flag(
     ).scalar_one_or_none()
 
 
-def _ensure_post_submit_review_flag(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-    evidence_id: UUID,
-    document_id: UUID,
-    service_id: str,
-    low_confidence_count: int,
-) -> bool:
-    submitted, _, _ = _booking_review_state(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-    )
-    if not submitted or low_confidence_count <= 0:
-        return False
-    if _find_review_flag(connection, tenant_id=tenant_id, evidence_id=evidence_id):
-        return False
-
-    routing = resolve_classification(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        rule_key=_REVIEW_FLAG_RULE,
-        finding_type_code="DOCUMENT_EXCEPTION",
-        severity="INFO",
-    )
-    finding_id = connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.audit_findings (
-                tenant_id, journey_id, finding_type_code, severity,
-                finding_status, title, description,
-                created_by_actor_id, stage_code, origin_kind,
-                origin_actor_id, origin_role_snapshot, rule_key,
-                blocking_completion, finding_class, owner_role_code, sla_due_at_utc
-            ) VALUES (
-                :tenant_id, :journey_id, 'DOCUMENT_EXCEPTION', 'INFO',
-                'OPEN', 'DI extraction requires PC review', :description,
-                -- origin_kind='RULE' was never a valid value here --
-                -- ck_audit_findings_uc03_origin (migration 0011) only ever
-                -- allowed 'MACHINE' or 'HUMAN', and the frontend's own type
-                -- (uc03Audit.ts) only ever declared 'MACHINE' | 'HUMAN' | null.
-                -- This insert has been failing every time it runs since the
-                -- day this function was added -- confirmed live (2026-09-15)
-                -- via a real CheckViolation against the actual schema.
-                :service_id, 'BOOKING', 'MACHINE',
-                :service_id, 'SYSTEM', :rule_key, false,
-                :finding_class, :owner_role_code, :sla_due_at_utc
-            )
-            RETURNING audit_finding_id
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "description": (
-                f"{low_confidence_count} populated DI field"
-                f"{'s' if low_confidence_count != 1 else ''} from document {document_id} "
-                "are below the 90% confidence threshold and require PC review."
-            ),
-            "service_id": service_id,
-            "rule_key": _REVIEW_FLAG_RULE,
-            **routing,
-        },
-    ).scalar_one()
-    connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.finding_evidence (
-                tenant_id, audit_finding_id, evidence_id, linkage_purpose
-            ) VALUES (:tenant_id, :finding_id, :evidence_id, 'LOW_CONFIDENCE_DI')
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "finding_id": finding_id,
-            "evidence_id": evidence_id,
-        },
-    )
-    connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.audit_finding_events (
-                tenant_id, audit_finding_id, journey_id, stage_code,
-                event_type, actor_id, actor_role_snapshot, safe_payload
-            ) VALUES (
-                :tenant_id, :finding_id, :journey_id, 'BOOKING',
-                'RAISED', :service_id, 'SYSTEM', CAST(:payload AS jsonb)
-            )
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "finding_id": finding_id,
-            "journey_id": journey_id,
-            "service_id": service_id,
-            "payload": json.dumps(
-                {
-                    "documentId": str(document_id),
-                    "lowConfidenceFieldCount": low_confidence_count,
-                    "thresholdPercent": REVIEW_THRESHOLD_PERCENT,
-                }
-            ),
-        },
-    )
-    return True
-
-
 def _resolve_review_flags(
     connection: Connection,
     *,
@@ -931,24 +821,13 @@ def _sync_booking_document(
         document_id=document_id,
         stage_code=stage_code,
     )
-    # The post-submit "DI extraction requires PC review" INFO flag is a
-    # Booking-only mechanism today (_ensure_post_submit_review_flag reads
-    # Booking's own review-state table); Delivery's equivalent doesn't exist
-    # yet, so this stays gated rather than silently mis-checking Booking's
-    # submission state against a Delivery document.
-    finding_created = False
-    if stage_code == "BOOKING":
-        finding_created = _ensure_post_submit_review_flag(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            evidence_id=link["evidence_id"],
-            document_id=document_id,
-            service_id=service_id,
-            low_confidence_count=low_count,
-        )
-
-    if changed or finding_created:
+    # low_count > 0 stands in for the old finding_created signal this gate
+    # used to key on (removed -- superseded by sync_manual_verification_
+    # findings below, which raises a proper Task Queue item instead of an
+    # audit_findings row the frontend has no way to render correctly). The
+    # CASE branches below already key off :low_count directly, so this is
+    # the same condition, not a new one.
+    if changed or low_count > 0:
         status = "PENDING" if low_count else None
         connection.execute(
             text(

@@ -164,6 +164,19 @@ def _friendly_label(raw: Any, document_id: UUID) -> str:
     return text_value.replace("_", " ").title()
 
 
+_MAX_FIELD_NAMES_IN_COMMENT = 6
+
+
+def _field_names_summary(field_keys: list[str]) -> str:
+    """Human-readable field list for the Task's comment -- capped so a
+    document with many low-confidence fields still gets a short message."""
+    names = [str(key).replace("_", " ").title() for key in field_keys]
+    if len(names) <= _MAX_FIELD_NAMES_IN_COMMENT:
+        return ", ".join(names)
+    shown = names[:_MAX_FIELD_NAMES_IN_COMMENT]
+    return f"{', '.join(shown)}, +{len(names) - _MAX_FIELD_NAMES_IN_COMMENT} more"
+
+
 # ── producer ──────────────────────────────────────────────────────────────────
 def sync_manual_verification_findings(
     connection: Connection,
@@ -228,8 +241,10 @@ def sync_manual_verification_findings(
                 "fieldKeys": [row["field_key"] for row in fields],
                 "comment": (
                     f"{len(fields)} machine-read value"
-                    f"{'s' if len(fields) != 1 else ''} on {label} are below the 90% "
-                    "confidence threshold — confirm or correct each against the document."
+                    f"{'s' if len(fields) != 1 else ''} on {label} "
+                    f"({_field_names_summary([row['field_key'] for row in fields])}) "
+                    "are below the 90% confidence threshold — confirm or correct each "
+                    "against the document."
                 ),
             },
             effect_key=effect_key,
