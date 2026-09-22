@@ -29,8 +29,6 @@ from audit_core.uc03_masters_alignment import (
     commercial_key_for_price_component,
     registration_basis,
 )
-from audit_core.uc03_model_resolution import sync_model_resolution
-from audit_core.uc03_payment_reconciliation import reconcile_payments
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/uc03",
@@ -987,24 +985,15 @@ def get_journey_overview_projection(
 ) -> JourneyOverviewProjectionResponse:
     """Project Journey 360 from Audit Core, including every reviewed DI field."""
 
-    # Self-heal on read: resolve the SKU against the OEM price masters (or raise
-    # MODEL_NOT_IDENTIFIED) so the Deal panel and findings below reflect it.
+    # Pure read: SKU resolution and payment reconciliation are not triggered
+    # from here. Both already run on the real event that can actually change
+    # their outcome -- SKU resolution on Booking document sync
+    # (uc03_confidence_review_policy.py, stage_code == "BOOKING"), payment
+    # reconciliation on a receipt/bank-statement document sync
+    # (is_reconciliation_trigger_document_type) -- so re-running either on
+    # every page view added no freshness, only repeated, unconditional cost
+    # on every single read.
     set_tenant_context(connection, tenant_id)
-    # raise_findings=False: this runs on every page view of this endpoint --
-    # still pin/resolve the SKU itself so the Deal panel reflects it, but
-    # skip deal reconciliation's evidence/total-variance checks (each a
-    # handful of sequential DB round-trips per discount row). Real
-    # document-sync events (uc03_confidence_review_policy.py,
-    # uc03_run_all_rules.py) already run those with the full checks, so
-    # they stay current without paying their cost on every single read --
-    # this specific unconditional-per-request cost was confirmed as a real
-    # latency regression (a live 23s overview load), not a hypothetical one.
-    sync_model_resolution(
-        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id="", raise_findings=False,
-    )
-    reconcile_payments(
-        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=""
-    )
 
     base = legacy.get_journey_overview(
         tenant_id=tenant_id,
