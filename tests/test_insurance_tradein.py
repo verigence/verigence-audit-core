@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass, field
 from decimal import Decimal
 from uuid import uuid4
 
@@ -8,9 +9,33 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-from audit_core.dependencies import get_connection, get_principal
+from audit_core.dependencies import get_connection, get_human_principal, get_principal
 from audit_core.main import app
-from audit_core.security import Principal
+from audit_core.security import HumanPrincipal, Principal
+from audit_core.security_authorization import (
+    SecurityAuthorizationDecision,
+    get_security_authorization_client,
+)
+
+
+@dataclass
+class _AllowAllAuthorization:
+    """get_insurance is on get_human_principal now (see its own fix) -- this
+    test's PUT calls still go through get_principal/require_business_scope
+    (untouched), but the GET (client.get(insurance_url) below) needs the
+    newer dependency's own mock too."""
+
+    calls: list[tuple[str, str, str]] = field(default_factory=list)
+
+    def check_user_permission(
+        self, *, user_id: str, tenant_id: str, permission_key: str,
+    ) -> SecurityAuthorizationDecision:
+        self.calls.append((user_id, tenant_id, permission_key))
+        return SecurityAuthorizationDecision(
+            allowed=True, reason_code="AUTHORIZED",
+            user_id=user_id, tenant_id=tenant_id, permission_key=permission_key,
+            role_key="PC",
+        )
 
 
 def test_insurance_addons_and_trade_in_persist_independently() -> None:
@@ -139,6 +164,8 @@ def test_insurance_addons_and_trade_in_persist_independently() -> None:
             "audit.trade_in.write",
         ),
     )
+    app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=actor_id)
+    app.dependency_overrides[get_security_authorization_client] = lambda: _AllowAllAuthorization()
     try:
         client = TestClient(app, raise_server_exceptions=False)
         insurance_url = f"/v1/tenants/{tenant_id}/journeys/{journey_id}/insurance"

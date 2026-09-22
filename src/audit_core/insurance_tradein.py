@@ -8,12 +8,17 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Connection, text
 
-from audit_core.authorization import authorize
+from audit_core.authorization import AuthorizationError, authorize
 from audit_core.business_assignments import require_business_scope
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import get_connection, get_principal
-from audit_core.errors import NotFoundError
-from audit_core.security import Principal
+from audit_core.dependencies import get_connection, get_human_principal, get_principal
+from audit_core.errors import DependencyUnavailableError, NotFoundError
+from audit_core.security import HumanPrincipal, Principal
+from audit_core.security_authorization import (
+    SecurityAuthorizationClient,
+    SecurityAuthorizationError,
+    get_security_authorization_client,
+)
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["insurance-trade-in"])
 SourceKind = Literal["EVIDENCE", "OPERATIONAL_INPUT", "SOURCE_SYSTEM"]
@@ -133,6 +138,83 @@ def _scope(
     )
 
 
+def _authorize_read_human(
+    authorization_client: SecurityAuthorizationClient,
+    *,
+    human_principal: HumanPrincipal,
+    tenant_id: str,
+    permission: str,
+) -> None:
+    """Same permission check as authorize()/get_principal, for a caller on
+    the newer thin HumanPrincipal (get_human_principal) instead -- see
+    get_insurance's own fix for why this endpoint needed it."""
+    try:
+        decision = authorization_client.check_user_permission(
+            user_id=human_principal.subject,
+            tenant_id=tenant_id,
+            permission_key=permission,
+        )
+    except SecurityAuthorizationError as exc:
+        raise DependencyUnavailableError(
+            detail="This is temporarily unavailable. Please try again."
+        ) from exc
+    if not decision.allowed:
+        raise AuthorizationError(
+            error_code="VAC-AUTH-002",
+            status_code=403,
+            title="Permission denied",
+        )
+
+
+def _scope_human(
+    connection: Connection,
+    *,
+    human_principal: HumanPrincipal,
+    tenant_id: str,
+    journey_id: UUID,
+) -> None:
+    """Same business-scope check as _scope()/require_business_scope, for a
+    caller on the newer thin HumanPrincipal instead -- require_business_
+    scope needs a full Principal (.tenant_id, .subject), which HumanPrincipal
+    deliberately doesn't carry. Kept local rather than widening require_
+    business_scope's own signature, which other still-on-get_principal
+    callers depend on."""
+    journey = _journey_scope(connection, tenant_id, journey_id)
+    assigned = connection.execute(
+        text(
+            """
+            SELECT 1
+            FROM auditcore.business_assignments
+            WHERE tenant_id = :tenant_id
+              AND security_actor_id = :actor_id
+              AND assignment_status = 'ACTIVE'
+              AND effective_from <= now()
+              AND (effective_to IS NULL OR effective_to >= now())
+              AND (
+                    dealer_id IS NULL
+                    OR (
+                        dealer_id = :dealer_id
+                        AND (outlet_id IS NULL OR outlet_id = :outlet_id)
+                    )
+              )
+            LIMIT 1
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "actor_id": human_principal.subject,
+            "dealer_id": journey["dealer_id"],
+            "outlet_id": journey["outlet_id"],
+        },
+    ).scalar_one_or_none()
+    if assigned is None:
+        raise AuthorizationError(
+            error_code="VAC-AUTH-004",
+            status_code=403,
+            title="Business scope denied",
+        )
+
+
 def _addons(connection: Connection, tenant_id: str, journey_id: UUID):
     rows = connection.execute(
         text(
@@ -208,12 +290,25 @@ def _insurance(connection: Connection, tenant_id: str, journey_id: UUID):
 def get_insurance(
     tenant_id: str,
     journey_id: UUID,
-    principal: Annotated[Principal, Depends(get_principal)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> InsuranceResponse:
-    authorize(principal, tenant_id=tenant_id, permission="audit.journey.read")
+    # Confirmed live: this endpoint was on get_principal, which requires a
+    # JWT carrying tenant_id/permissions claims directly -- the human token
+    # format actually issued today deliberately carries neither (permissions
+    # are checked live against the Security service instead), so every real
+    # PC/TL request here has been a guaranteed 401, never a transient one.
+    _authorize_read_human(
+        authorization_client,
+        human_principal=human_principal,
+        tenant_id=tenant_id,
+        permission="audit.journey.read",
+    )
     set_tenant_context(connection, tenant_id)
-    _scope(connection, principal, tenant_id=tenant_id, journey_id=journey_id)
+    _scope_human(connection, human_principal=human_principal, tenant_id=tenant_id, journey_id=journey_id)
     return _insurance(connection, tenant_id, journey_id)
 
 
