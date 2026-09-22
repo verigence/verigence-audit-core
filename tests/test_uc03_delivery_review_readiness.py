@@ -19,6 +19,9 @@ from audit_core.uc03_delivery_capture_v2 import (
     tl_delivery_review_effect_key,
     tl_delivery_review_effect_key_prefix,
 )
+from audit_core.uc03_delivery_review_readiness_sweep import (
+    DEFAULT_SWEEP_INTERVAL_SECONDS,
+)
 
 
 def test_task_types_are_distinct_and_named_for_their_own_role() -> None:
@@ -53,3 +56,12 @@ def test_tl_effect_key_prefix_is_tenant_scoped() -> None:
     assert tl_delivery_review_effect_key_prefix("tenant-1") != tl_delivery_review_effect_key_prefix(
         "tenant-2"
     )
+
+
+def test_sweep_interval_matches_the_existing_stale_task_sweep_cadence() -> None:
+    # No correctness reason for this sweep to run any more often than the
+    # already-proven workflow_stale_task_recovery.py sweep in this same
+    # service -- pinned so a future "let's make it more responsive" edit
+    # has to consciously change this, not drift back to an unjustified
+    # tighter interval by accident.
+    assert DEFAULT_SWEEP_INTERVAL_SECONDS == 300.0
