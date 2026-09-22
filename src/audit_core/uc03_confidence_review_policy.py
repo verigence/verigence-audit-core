@@ -1230,6 +1230,7 @@ def _sync_booking_document_once(
 
 def _run_delivery_checkpoint_once(engine: Engine, *, tenant_id: str, journey_id: UUID) -> None:
     from audit_core.uc03_delivery_capture_v2 import (
+        raise_tl_delivery_review_if_ready,
         schedule_delivery_document_checkpoint,
     )
 
@@ -1241,6 +1242,14 @@ def _run_delivery_checkpoint_once(engine: Engine, *, tenant_id: str, journey_id:
             journey_id=journey_id,
             correlation_id="",
             raise_new=False,
+        )
+        # Same event, same connection: this document syncing is the only
+        # thing that can ever make delivery_review_readiness_blockers turn
+        # up clean, so checking here -- instead of on a separate timer --
+        # means TL_DELIVERY_REVIEW is raised the moment it's actually true,
+        # not up to a poll interval late.
+        raise_tl_delivery_review_if_ready(
+            checkpoint_connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id="",
         )
 
 

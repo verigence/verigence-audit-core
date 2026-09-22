@@ -1,12 +1,18 @@
 """Pure-function coverage for the Delivery review-readiness handoff:
 submit_delivery_capture_v2 stays unconditional (PC's own click always
-succeeds and records its own PC_DELIVERY_CAPTURE task), while
-TL_DELIVERY_REVIEW is raised separately by uc03_delivery_review_readiness_
-sweep.py once delivery_review_readiness_blockers actually comes back
-clean. What's tested here at the direct-function-call level, no DB needed:
-the effect-key helpers stay consistent with each other (the sweep's SQL
-prefix match depends on it), and the mid-processing check inside
-delivery_review_readiness_blockers is pure Python.
+succeeds and records its own completed PC_DELIVERY_CAPTURE task).
+TL_DELIVERY_REVIEW is raised by raise_tl_delivery_review_if_ready, called
+from the exact same per-document sync chain every other Delivery self-heal
+check already runs from (_run_delivery_checkpoint_once, off the DI
+document-link webhook) -- not a separate poll -- plus once directly from
+Submit itself, since submitting is the event that first makes readiness
+meaningful (capture_completed_at_utc goes from null to set right then).
+
+raise_tl_delivery_review_if_ready and delivery_review_readiness_blockers
+both need a live connection (they query journey_stage_states,
+audit_findings, workflow_tasks, evidence), so they aren't covered here --
+what's tested at the direct-function-call level, no DB needed, is that the
+task-type/effect-key building blocks stay consistent with each other.
 """
 from __future__ import annotations
 
@@ -17,10 +23,6 @@ from audit_core.uc03_delivery_capture_v2 import (
     TL_DELIVERY_REVIEW_TASK_TYPE,
     _pc_delivery_capture_effect_key,
     tl_delivery_review_effect_key,
-    tl_delivery_review_effect_key_prefix,
-)
-from audit_core.uc03_delivery_review_readiness_sweep import (
-    DEFAULT_SWEEP_INTERVAL_SECONDS,
 )
 
 
@@ -38,30 +40,11 @@ def test_pc_and_tl_effect_keys_are_distinct_per_journey() -> None:
     )
 
 
-def test_tl_effect_key_prefix_matches_the_full_key() -> None:
-    # This is exactly what uc03_delivery_review_readiness_sweep.py's own SQL
-    # depends on: effect_key = prefix || journey_id::text must match what
-    # tl_delivery_review_effect_key itself produces, or the sweep's "does a
-    # TL task already exist" check silently stops matching and it starts
-    # trying to create a duplicate every tick.
-    tenant_id = "tenant-1"
+def test_tl_effect_key_is_tenant_and_journey_scoped() -> None:
     journey_id = uuid4()
-    prefix = tl_delivery_review_effect_key_prefix(tenant_id)
-    full_key = tl_delivery_review_effect_key(tenant_id, journey_id)
-    assert full_key == f"{prefix}{journey_id}"
-    assert full_key.startswith(prefix)
-
-
-def test_tl_effect_key_prefix_is_tenant_scoped() -> None:
-    assert tl_delivery_review_effect_key_prefix("tenant-1") != tl_delivery_review_effect_key_prefix(
-        "tenant-2"
+    assert tl_delivery_review_effect_key("tenant-1", journey_id) != tl_delivery_review_effect_key(
+        "tenant-2", journey_id
     )
-
-
-def test_sweep_interval_matches_the_existing_stale_task_sweep_cadence() -> None:
-    # No correctness reason for this sweep to run any more often than the
-    # already-proven workflow_stale_task_recovery.py sweep in this same
-    # service -- pinned so a future "let's make it more responsive" edit
-    # has to consciously change this, not drift back to an unjustified
-    # tighter interval by accident.
-    assert DEFAULT_SWEEP_INTERVAL_SECONDS == 300.0
+    assert tl_delivery_review_effect_key("tenant-1", journey_id) != tl_delivery_review_effect_key(
+        "tenant-1", uuid4()
+    )

@@ -77,17 +77,8 @@ def _pc_delivery_capture_effect_key(tenant_id: str, journey_id: UUID) -> str:
     return f"task:delivery-pc-capture:{tenant_id}:{journey_id}"
 
 
-def tl_delivery_review_effect_key_prefix(tenant_id: str) -> str:
-    # Split out from tl_delivery_review_effect_key so
-    # uc03_delivery_review_readiness_sweep.py's own "does a TL task already
-    # exist for this journey" SQL can build its WHERE-clause prefix from the
-    # exact same source instead of a second, hand-copied literal that could
-    # silently drift out of sync with this one.
-    return f"task:delivery-tl-review:{tenant_id}:"
-
-
 def tl_delivery_review_effect_key(tenant_id: str, journey_id: UUID) -> str:
-    return f"{tl_delivery_review_effect_key_prefix(tenant_id)}{journey_id}"
+    return f"task:delivery-tl-review:{tenant_id}:{journey_id}"
 
 
 def _processing_failed_effect_key(tenant_id: str, journey_id: UUID, document_id: str) -> str:
@@ -1100,6 +1091,67 @@ def delivery_review_readiness_blockers(
     return blockers
 
 
+def raise_tl_delivery_review_if_ready(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str,
+) -> bool:
+    """Called from the same per-document sync chain every other Delivery
+    self-heal check already runs from (_run_delivery_checkpoint_once, off
+    the DI document-link webhook) -- not a separate poll. Fires on every
+    document sync for this journey, but only actually does anything once
+    two things are both true: PC has already submitted (nothing to hand off
+    otherwise), and delivery_review_readiness_blockers comes back clean for
+    *every* document on the journey, not just the one that just synced --
+    that function's own queries read current journey-wide state regardless
+    of which document triggered this call. Idempotent via the same
+    effect_key TL_DELIVERY_REVIEW always uses; a no-op once already raised.
+    Returns True only when it actually raised the task (for tests/logging).
+    """
+    state = connection.execute(
+        text(
+            """
+            SELECT capture_completed_at_utc FROM auditcore.journey_stage_states
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND stage_code='DELIVERY'
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
+    if state is None or state["capture_completed_at_utc"] is None:
+        return False
+
+    effect_key = tl_delivery_review_effect_key(tenant_id, journey_id)
+    already_raised = connection.execute(
+        text(
+            """
+            SELECT 1 FROM auditcore.workflow_tasks
+            WHERE tenant_id=:tenant_id AND task_type=:task_type AND effect_key=:effect_key
+            """
+        ),
+        {"tenant_id": tenant_id, "task_type": TL_DELIVERY_REVIEW_TASK_TYPE, "effect_key": effect_key},
+    ).scalar_one_or_none()
+    if already_raised is not None:
+        return False
+
+    documents = _linked_delivery_documents(connection, tenant_id, journey_id)
+    if delivery_review_readiness_blockers(
+        connection, tenant_id=tenant_id, journey_id=journey_id, documents=documents,
+    ):
+        return False
+
+    create_workflow_task(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        workflow_type=TL_DELIVERY_REVIEW_WORKFLOW_TYPE,
+        process_area="DELIVERY",
+        task_type=TL_DELIVERY_REVIEW_TASK_TYPE,
+        assigned_role_code="TL",
+        task_payload={"documentCount": len(documents)},
+        effect_key=effect_key,
+        correlation_id=correlation_id,
+    )
+    return True
+
+
 @router.post("/submit", response_model=DeliveryCaptureV2SubmissionResponse)
 def submit_delivery_capture_v2(
     tenant_id: str,
@@ -1166,6 +1218,15 @@ def submit_delivery_capture_v2(
                 connection, tenant_id=tenant_id, workflow_task_id=pc_task_id,
                 actor_id=human_principal.subject,
             )
+        # Submitting is itself the event that first makes readiness
+        # meaningful (capture_completed_at_utc just went from null to set)
+        # -- the per-document sync hook alone would miss the common case
+        # where every document already finished processing *before* PC
+        # clicked Submit, since nothing would sync again afterward to
+        # trigger it. Same idempotent check either way.
+        raise_tl_delivery_review_if_ready(
+            connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+        )
         _append_delivery_event(
             connection,
             tenant_id=tenant_id,
