@@ -13,6 +13,7 @@ from audit_core.uc03_delivery_capture_v2 import _delivery_requirements
 from audit_core.uc03_unified_document_capture import (
     _correct_durable_store_stage,
     _receipt_defaults_to_delivery,
+    _requirements_owned_by_stage,
     reconcile_unified_documents,
     resolve_document_stage,
 )
@@ -95,6 +96,56 @@ def test_resolve_document_stage_handles_missing_classification() -> None:
     )
     assert stage == "BOOKING"
     assert requirement_key is None
+
+
+def test_requirements_owned_by_stage_drops_a_row_the_catalog_mislabels() -> None:
+    """Direct bug this closes (2026-09-23): create_unified_upload_intents
+    used to bind a requirement_ref from whichever stage's catalog happened
+    to register a type first -- the same per-catalog dependency
+    resolve_document_stage was fixed to not use. A Booking-catalog row for
+    a type that isn't in the fixed Booking list (see
+    test_resolve_document_stage_unlisted_type_defaults_to_delivery_even_
+    with_a_booking_row) must never be returned as BOOKING-owned."""
+    mislabeled = [_requirement("some_booking_gate_pass_row", "gate_pass")]
+    # A tenant's requirement catalog registered this gate_pass row under
+    # BOOKING -- but gate_pass isn't in the fixed Booking list, so filtering
+    # the BOOKING-sourced list against "BOOKING" drops it: it must never
+    # supply a Booking requirement_ref regardless of which catalog it's in.
+    assert _requirements_owned_by_stage(
+        mislabeled, "BOOKING", receipt_defaults_to_delivery=False,
+    ) == []
+    # The same row filtered against its type's real, correct stage is kept
+    # -- proving it would bind correctly if it existed in Delivery's own
+    # catalog list instead (the function filters by type, not by which
+    # list it's called with).
+    assert _requirements_owned_by_stage(
+        mislabeled, "DELIVERY", receipt_defaults_to_delivery=False,
+    ) == mislabeled
+
+
+def test_requirements_owned_by_stage_keeps_a_correctly_labeled_row() -> None:
+    assert _requirements_owned_by_stage(
+        BOOKING_REQS, "BOOKING", receipt_defaults_to_delivery=False,
+    ) == BOOKING_REQS
+    assert _requirements_owned_by_stage(
+        DELIVERY_REQS, "DELIVERY", receipt_defaults_to_delivery=False,
+    ) == DELIVERY_REQS
+
+
+def test_requirements_owned_by_stage_follows_the_receipt_running_total() -> None:
+    receipt_row = [_requirement("booking_payment_receipt", "dealer_receipt")]
+    assert _requirements_owned_by_stage(
+        receipt_row, "BOOKING", receipt_defaults_to_delivery=False,
+    ) == receipt_row
+    assert _requirements_owned_by_stage(
+        receipt_row, "DELIVERY", receipt_defaults_to_delivery=False,
+    ) == []
+    assert _requirements_owned_by_stage(
+        receipt_row, "DELIVERY", receipt_defaults_to_delivery=True,
+    ) == receipt_row
+    assert _requirements_owned_by_stage(
+        receipt_row, "BOOKING", receipt_defaults_to_delivery=True,
+    ) == []
 
 
 @dataclass
