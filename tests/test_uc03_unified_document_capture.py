@@ -12,6 +12,7 @@ from audit_core.db import set_tenant_context
 from audit_core.uc03_delivery_capture_v2 import _delivery_requirements
 from audit_core.uc03_unified_document_capture import (
     _correct_durable_store_stage,
+    _receipt_defaults_to_delivery,
     reconcile_unified_documents,
     resolve_document_stage,
 )
@@ -24,13 +25,26 @@ def _requirement(key: str, document_type: str, requirement_key: str | None = Non
     }
 
 
-BOOKING_REQS = [_requirement("booking_docket", "booking_form"), _requirement("pan_card", "pan")]
+BOOKING_REQS = [_requirement("booking_docket", "booking_form"), _requirement("pan_card", "pan_card")]
 DELIVERY_REQS = [_requirement("delivery_ndc", "NO_DUES_CERTIFICATE"), _requirement("delivery_car_pictures", "CAR_PICTURES")]
 
 
+# Stage is now a static property of the type itself (_BOOKING_ONLY_
+# DOCUMENT_TYPES in uc03_unified_document_capture.py), not resolved by
+# matching against whichever requirement rows a journey happens to have --
+# these calls never touch the database for a non-receipt type, so a
+# placeholder connection/tenant/journey is fine.
+_UNUSED_CONNECTION = None
+_UNUSED_TENANT = "unused-tenant"
+_UNUSED_JOURNEY = uuid4()
+
+
 def test_resolve_document_stage_matches_delivery_type() -> None:
+    # NO_DUES_CERTIFICATE isn't in the fixed Booking list, so it defaults
+    # to Delivery regardless of what either requirement list contains.
     stage, requirement_key = resolve_document_stage(
-        "NO_DUES_CERTIFICATE", booking_requirements=BOOKING_REQS, delivery_requirements=DELIVERY_REQS,
+        _UNUSED_CONNECTION, "NO_DUES_CERTIFICATE", tenant_id=_UNUSED_TENANT, journey_id=_UNUSED_JOURNEY,
+        booking_requirements=BOOKING_REQS, delivery_requirements=DELIVERY_REQS,
     )
     assert stage == "DELIVERY"
     assert requirement_key == "delivery_ndc"
@@ -38,65 +52,46 @@ def test_resolve_document_stage_matches_delivery_type() -> None:
 
 def test_resolve_document_stage_matches_booking_type() -> None:
     stage, requirement_key = resolve_document_stage(
-        "pan", booking_requirements=BOOKING_REQS, delivery_requirements=DELIVERY_REQS,
+        _UNUSED_CONNECTION, "pan_card", tenant_id=_UNUSED_TENANT, journey_id=_UNUSED_JOURNEY,
+        booking_requirements=BOOKING_REQS, delivery_requirements=DELIVERY_REQS,
     )
     assert stage == "BOOKING"
     assert requirement_key == "pan_card"
 
 
-RECEIPT_BOOKING_REQS = [_requirement("booking_docket", "booking_form"), _requirement("booking_receipt", "dealer_receipt")]
-RECEIPT_DELIVERY_REQS = [_requirement("delivery_ndc", "NO_DUES_CERTIFICATE"), _requirement("delivery_receipt", "payment_receipt")]
-
-
-def test_resolve_document_stage_receipt_goes_to_booking_before_delivery_starts() -> None:
-    """dealer_receipt/payment_receipt canonicalize to one type (_DOCUMENT_
-    TYPE_ALIASES) and are a candidate under both stages at once -- the one
-    genuinely ambiguous case today. delivery_active (the caller's real,
-    persisted journey state) breaks the tie, not content: before Delivery
-    has started, a classified receipt binds to Booking's own slot."""
-    stage, requirement_key = resolve_document_stage(
-        "dealer_receipt", booking_requirements=RECEIPT_BOOKING_REQS,
-        delivery_requirements=RECEIPT_DELIVERY_REQS, delivery_active=False,
-    )
-    assert stage == "BOOKING"
-    assert requirement_key == "booking_receipt"
-
-
-def test_resolve_document_stage_receipt_goes_to_delivery_once_it_has_started() -> None:
-    # Same classified type, same requirement sets -- only delivery_active
-    # changed, and that alone must flip which stage it binds to.
-    stage, requirement_key = resolve_document_stage(
-        "payment_receipt", booking_requirements=RECEIPT_BOOKING_REQS,
-        delivery_requirements=RECEIPT_DELIVERY_REQS, delivery_active=True,
+def test_resolve_document_stage_unlisted_type_defaults_to_delivery_even_with_a_booking_row() -> None:
+    """Direct user correction (2026-09-23): stage is decided by the fixed
+    Booking list alone, never by which journey_document_requirements rows
+    happen to exist -- a type that isn't in that list defaults to Delivery
+    even if some tenant's requirement catalog happens to register it under
+    BOOKING (the exact per-journey-data-dependent ambiguity this replaces)."""
+    stage, _ = resolve_document_stage(
+        _UNUSED_CONNECTION, "gate_pass", tenant_id=_UNUSED_TENANT, journey_id=_UNUSED_JOURNEY,
+        booking_requirements=[_requirement("some_booking_gate_pass_row", "gate_pass")],
+        delivery_requirements=[],
     )
     assert stage == "DELIVERY"
-    assert requirement_key == "delivery_receipt"
 
 
-def test_resolve_document_stage_non_ambiguous_type_is_unaffected_by_delivery_active() -> None:
-    # A type that's only a candidate under one stage must resolve exactly
-    # the same regardless of delivery_active -- the tiebreak only matters
-    # when there's actually something to break a tie between.
-    for delivery_active in (False, True):
-        stage, requirement_key = resolve_document_stage(
-            "NO_DUES_CERTIFICATE", booking_requirements=RECEIPT_BOOKING_REQS,
-            delivery_requirements=RECEIPT_DELIVERY_REQS, delivery_active=delivery_active,
-        )
-        assert stage == "DELIVERY"
-        assert requirement_key == "delivery_ndc"
-
-
-def test_resolve_document_stage_defaults_unrecognized_to_booking() -> None:
+def test_resolve_document_stage_defaults_a_classified_but_unlisted_type_to_delivery() -> None:
+    # "all other docs are under delivery" -- a real, classified type that
+    # isn't in the fixed Booking list defaults to Delivery, not Booking.
     stage, requirement_key = resolve_document_stage(
-        "totally_unknown_type", booking_requirements=BOOKING_REQS, delivery_requirements=DELIVERY_REQS,
+        _UNUSED_CONNECTION, "totally_unknown_type", tenant_id=_UNUSED_TENANT, journey_id=_UNUSED_JOURNEY,
+        booking_requirements=BOOKING_REQS, delivery_requirements=DELIVERY_REQS,
     )
-    assert stage == "BOOKING"
+    assert stage == "DELIVERY"
     assert requirement_key is None
 
 
 def test_resolve_document_stage_handles_missing_classification() -> None:
+    # No classification at all yet (still mid-classification) is a
+    # genuinely different case from "classified as something we don't list"
+    # -- defaults to BOOKING as a safe placeholder, the stage that always
+    # exists, until real classification arrives.
     stage, requirement_key = resolve_document_stage(
-        None, booking_requirements=BOOKING_REQS, delivery_requirements=DELIVERY_REQS,
+        _UNUSED_CONNECTION, None, tenant_id=_UNUSED_TENANT, journey_id=_UNUSED_JOURNEY,
+        booking_requirements=BOOKING_REQS, delivery_requirements=DELIVERY_REQS,
     )
     assert stage == "BOOKING"
     assert requirement_key is None
@@ -678,3 +673,120 @@ def test_correct_durable_store_stage_never_collides_with_an_already_correct_row(
         assert [r["stage_code"] for r in rows] == ["BOOKING", "DELIVERY"]
         assert rows[0]["effective_value"] == "stale-booking-copy"
         assert rows[1]["effective_value"] == "already-correct-copy"
+
+
+def test_receipt_defaults_to_booking_below_minimum_amount(unified_capture_setup) -> None:
+    """No tenant_rule_config row in this fixture -> the ₹11,000 default
+    (_DEFAULT_MINIMUM_BOOKING_AMOUNT) applies. A single already-extracted
+    receipt for ₹5,000 hasn't reached it yet, so the NEXT receipt still
+    defaults to Booking."""
+    setup = unified_capture_setup
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        _seed_extracted_field(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=setup["journey_id"],
+            di_document_id=uuid4(),
+            actor_id=setup["actor_id"],
+            stage_code="BOOKING",
+            source_canonical_field_id="receipt-amount-1",
+            document_type_key="dealer_receipt",
+            field_key="amount_paid",
+            value="5000",
+        )
+
+        assert _receipt_defaults_to_delivery(
+            connection, tenant_id=setup["tenant_id"], journey_id=setup["journey_id"],
+        ) is False
+
+        stage, _ = resolve_document_stage(
+            connection, "dealer_receipt", tenant_id=setup["tenant_id"], journey_id=setup["journey_id"],
+            booking_requirements=[], delivery_requirements=[],
+        )
+        assert stage == "BOOKING"
+
+
+def test_receipt_defaults_to_delivery_once_running_total_reaches_minimum(unified_capture_setup) -> None:
+    """Two already-extracted receipts (₹6,000 + ₹6,000 = ₹12,000) push the
+    running total at/above the ₹11,000 default minimum -- a NEW receipt now
+    defaults to Delivery. Direct user directive (2026-09-23): 'once minimum
+    booking amount is received, all other payment receipts can be
+    considered for delivery.'"""
+    setup = unified_capture_setup
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        _seed_extracted_field(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=setup["journey_id"],
+            di_document_id=uuid4(),
+            actor_id=setup["actor_id"],
+            stage_code="BOOKING",
+            source_canonical_field_id="receipt-amount-1",
+            document_type_key="dealer_receipt",
+            field_key="amount_paid",
+            value="6000",
+        )
+        _seed_extracted_field(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=setup["journey_id"],
+            di_document_id=uuid4(),
+            actor_id=setup["actor_id"],
+            stage_code="BOOKING",
+            source_canonical_field_id="receipt-amount-2",
+            document_type_key="dealer_receipt",
+            field_key="amount_paid",
+            value="6000",
+        )
+
+        assert _receipt_defaults_to_delivery(
+            connection, tenant_id=setup["tenant_id"], journey_id=setup["journey_id"],
+        ) is True
+
+        stage, _ = resolve_document_stage(
+            connection, "dealer_receipt", tenant_id=setup["tenant_id"], journey_id=setup["journey_id"],
+            booking_requirements=[], delivery_requirements=[],
+        )
+        assert stage == "DELIVERY"
+
+
+def test_receipt_running_total_canonicalizes_payment_receipt_with_dealer_receipt(
+    unified_capture_setup,
+) -> None:
+    """The running total must count a payment_receipt-typed row (Delivery's
+    own historical type name for the same physical document) toward the
+    same total as dealer_receipt -- they're one canonical identity
+    (uc03_document_capture_v2._DOCUMENT_TYPE_ALIASES), not two."""
+    setup = unified_capture_setup
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        _seed_extracted_field(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=setup["journey_id"],
+            di_document_id=uuid4(),
+            actor_id=setup["actor_id"],
+            stage_code="BOOKING",
+            source_canonical_field_id="receipt-amount-1",
+            document_type_key="dealer_receipt",
+            field_key="amount_paid",
+            value="6000",
+        )
+        _seed_extracted_field(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=setup["journey_id"],
+            di_document_id=uuid4(),
+            actor_id=setup["actor_id"],
+            stage_code="DELIVERY",
+            source_canonical_field_id="receipt-amount-2",
+            document_type_key="payment_receipt",
+            field_key="amount_paid",
+            value="6000",
+        )
+
+        assert _receipt_defaults_to_delivery(
+            connection, tenant_id=setup["tenant_id"], journey_id=setup["journey_id"],
+        ) is True
