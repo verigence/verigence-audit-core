@@ -126,7 +126,12 @@ def test_resync_endpoint_queues_one_background_task_per_resyncable_document() ->
     source = inspect.getsource(resync_delivery_capture_v2)
     assert "_authorize_delivery(" in source
     assert "_ensure_di_context(" in source
-    assert "_reconcile_delivery_documents(" in source
+    # reconcile_unified_documents, not the narrower Delivery-only
+    # _reconcile_delivery_documents -- mirror-image fix of the Booking
+    # resync one: a Booking-only-typed document defaulted to the wrong
+    # stage at upload time is otherwise permanently unlinkable.
+    assert "reconcile_unified_documents(" in source
+    assert "_reconcile_delivery_documents(" not in source
     assert "_resyncable_document_ids(" in source
     assert "background_tasks.add_task(" in source
     assert "_run_sync_booking_document_task" in source

@@ -82,6 +82,7 @@ from audit_core.uc03_document_capture_v2 import (
     _human_actor_id,
     _log_di_capture_v2_failure,
     _requirement_refs_by_document_type_key,
+    _requirements_with_open_slot,
     _upload_intent_failures,
     get_di_capture_v2_client,
     get_di_client,
@@ -142,6 +143,9 @@ def create_unified_upload_intents(
         connection, tenant_id=tenant_id, journey_id=journey_id
     )
     merged_requirements = booking_requirements + delivery_requirements
+    open_requirements = _requirements_with_open_slot(
+        connection, tenant_id=tenant_id, journey_id=journey_id, requirements=merged_requirements,
+    )
     context_ref, token = _ensure_di_context(
         connection=connection,
         engine=engine,
@@ -156,9 +160,14 @@ def create_unified_upload_intents(
             tenant_id=tenant_id,
             external_context_ref=context_ref,
             phase="BOOKING",
+            # Full (unfiltered) list here -- classification must still
+            # recognize a duplicate copy for what it actually is.
             candidate_document_type_keys=_candidate_type_keys(merged_requirements),
+            # Filtered list here -- only an open requirement gets a
+            # requirement_ref, which is what gates DI's own extraction
+            # (see _requirements_with_open_slot's own docstring).
             requirement_refs_by_document_type_key=(
-                _requirement_refs_by_document_type_key(merged_requirements)
+                _requirement_refs_by_document_type_key(open_requirements)
             ),
             files=[item.model_dump() for item in command.files],
         )

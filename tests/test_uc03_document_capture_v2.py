@@ -312,7 +312,13 @@ def test_booking_resync_endpoint_authorizes_and_queues_the_shared_sync_task() ->
     assert "_authorize_booking_for_resync(" in source
     assert "_authorize_booking(" not in source
     assert "_ensure_di_context(" in source
-    assert "_reconcile_documents(" in source
+    # reconcile_unified_documents, not the narrower Booking-only
+    # _reconcile_documents -- see the function's own comment: a
+    # Delivery-only-typed document defaulted to stage_code='BOOKING' at
+    # upload time is otherwise permanently unlinkable, since
+    # _reconcile_documents can never resolve its requirement_key.
+    assert "reconcile_unified_documents(" in source
+    assert "_reconcile_documents(" not in source
     assert "_linked_documents(" in source
     assert '"CLASSIFIED"' in source
     assert "_backfill_evidence_links_for_resync(" in source

@@ -1358,8 +1358,20 @@ async def _run_sync_booking_document_task(
 
     security_provider = get_security_oauth_client()
     di_provider = get_di_client()
-    max_attempts = 6
-    retry_delay_seconds = (2.0, 4.0, 8.0, 15.0, 30.0)
+    # Confirmed live (2026-09-23): a 23-document journey (a nightly-reprocess
+    # backlog draining, or a large Resync) serializes every one of those
+    # documents' syncs through this same per-journey lock, each holding it
+    # for real DI/Security HTTP call time. The previous ~59s total budget
+    # (6 attempts, capped backoff to 30s) was sized for ordinary lock
+    # contention between a couple of documents, not a whole journey's worth
+    # queuing behind each other -- a document dispatched even a few
+    # positions back in a large batch reliably exhausted its own budget
+    # waiting on documents ahead of it, and gave up silently
+    # (uc03_document_link_background_sync_deferred), permanently, since
+    # nothing else ever retries it. Widened so the total wait comfortably
+    # outlasts a large batch's realistic worst-case serialized time.
+    max_attempts = 13
+    retry_delay_seconds = (2.0, 4.0, 8.0, 15.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0)
     try:
         security_client = next(security_provider)
         di_client = next(di_provider)

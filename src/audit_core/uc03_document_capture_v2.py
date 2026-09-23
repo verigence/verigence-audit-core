@@ -37,6 +37,7 @@ from audit_core.uc03_booking_commands import (
     _append_workflow_event,
     _parse_if_match,
 )
+from audit_core.uc03_pc_booking_documents import _is_repeatable_requirement
 
 router = APIRouter(prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}", tags=["uc03-document-capture-v2"])
 _DI_AUDIENCE = "di"
@@ -517,6 +518,47 @@ def _requirement_refs_by_document_type_key(
         if document_type_key and requirement_ref:
             result.setdefault(_canonical_document_type(str(document_type_key)), str(requirement_ref))
     return result
+
+
+def _requirements_with_open_slot(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, requirements: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Requirements DI should still be told to extract a NEW document
+    against. A repeatable requirement (multiple payment receipts, bank
+    statements, scrappage certificates -- see _is_repeatable_requirement)
+    always has an open slot; a single-document requirement that already has
+    an ACTIVE evidence link does not -- a further upload of that same type
+    is an extra copy, not a new fact, and extracting it wastes DI's own
+    processing for data that will never be used.
+
+    Deliberately NOT used to build candidate_document_type_keys (what DI is
+    allowed to classify the file as) -- that stays on the full, unfiltered
+    requirements list, so a duplicate copy still gets correctly classified
+    as whatever it actually is. Only requirement_refs_by_document_type_key
+    reads this filtered list, so a duplicate simply gets no requirement_ref
+    -- DI's own extraction gate (create_initial_job's requirement_ref
+    check) skips queuing extraction for it on that basis alone.
+    """
+    fulfilled_refs = {
+        str(row[0])
+        for row in connection.execute(
+            text(
+                """
+                SELECT DISTINCT journey_document_requirement_id
+                FROM auditcore.evidence
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND association_status='ACTIVE'
+                  AND journey_document_requirement_id IS NOT NULL
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        )
+    }
+    return [
+        row for row in requirements
+        if _is_repeatable_requirement(row.get("requirement_key"))
+        or str(row.get("requirement_ref")) not in fulfilled_refs
+    ]
 
 
 def _reconcile_documents(
@@ -1094,6 +1136,9 @@ def create_booking_upload_intents_v2(
         connection, tenant_id=tenant_id, journey_id=journey_id
     )
     requirements = _base_requirements(connection, tenant_id, journey_id)
+    open_requirements = _requirements_with_open_slot(
+        connection, tenant_id=tenant_id, journey_id=journey_id, requirements=requirements,
+    )
     context_ref, token = _ensure_di_context(
         connection=connection,
         engine=engine,
@@ -1110,7 +1155,7 @@ def create_booking_upload_intents_v2(
             phase="BOOKING",
             candidate_document_type_keys=_candidate_type_keys(requirements),
             requirement_refs_by_document_type_key=(
-                _requirement_refs_by_document_type_key(requirements)
+                _requirement_refs_by_document_type_key(open_requirements)
             ),
             files=[item.model_dump() for item in command.files],
         )
@@ -1429,27 +1474,40 @@ def resync_booking_capture_v2(
             security_client=security_client,
             di_client=di_client,
         )
-        try:
-            payload = v2_client.list_documents(
-                token=token,
-                tenant_id=tenant_id,
-                external_context_ref=context_ref,
-                phase="BOOKING",
-            )
-        except DiCaptureV2Error as exc:
-            _log_di_capture_v2_failure(
-                operation="list_documents", exc=exc, tenant_id=tenant_id,
-                journey_id=journey_id, context_ref=context_ref,
-            )
-            raise DependencyUnavailableError(
-                detail="Document status is temporarily unavailable -- try resync again shortly."
-            ) from exc
-        _reconcile_documents(
+        # reconcile_unified_documents, not the narrower Booking-only
+        # _reconcile_documents this used to call -- confirmed live: a
+        # document whose only real requirement is Delivery-side (e.g.
+        # gate_pass, accessory_invoice_dms) gets defaulted to
+        # stage_code='BOOKING' at upload time (before DI has classified it
+        # yet), and nothing ever revisited that guess once classification
+        # actually completed. _reconcile_documents' own type_to_requirement
+        # map is built from Booking-only requirements, so it can never
+        # resolve such a document's requirement_key -- leaving it
+        # permanently unlinkable (_ensure_evidence_link_for_resync skips
+        # any document with no requirement_key), no matter how many times
+        # Resync runs. reconcile_unified_documents checks both stages'
+        # requirements and corrects stage_code/requirement_key from DI's
+        # current (now-complete) classification -- already idempotent, and
+        # its own docstring already anticipated being called from a future
+        # resync. Unlike the old call, DI listing failures are handled
+        # per-phase inside reconcile_unified_documents itself (logged, that
+        # phase skipped) rather than aborting the whole resync -- a genuine
+        # improvement, since a Delivery-listing hiccup no longer has to take
+        # down a Booking-only resync.
+        from audit_core.uc03_unified_document_capture import (
+            reconcile_unified_documents,
+        )
+
+        reconcile_unified_documents(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
-            requirements=requirements,
-            di_documents=list(payload.get("documents") or []),
+            actor_id=f"manual-resync:{human_principal.subject}",
+            actor_role="PC",
+            correlation_id="",
+            v2_client=v2_client,
+            context_ref=context_ref,
+            token=token,
         )
 
     documents = _linked_documents(connection, tenant_id, journey_id)
