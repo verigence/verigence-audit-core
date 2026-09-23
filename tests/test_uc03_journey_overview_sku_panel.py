@@ -5,9 +5,8 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, text
-
 from conftest import delete_tenant_data
+from sqlalchemy import create_engine, text
 
 import audit_core.uc03_invoice_materialization as im
 from audit_core.uc03_journey_overview_projection import _sku_pricing_panel
