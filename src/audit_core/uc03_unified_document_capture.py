@@ -50,6 +50,7 @@ Why a new path rather than teaching the old ones to merge:
 """
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -145,15 +146,16 @@ def create_unified_upload_intents(
     # Order decides which stage's row wins for a canonicalized type that's
     # a candidate under both (today, only a receipt -- see
     # _DOCUMENT_TYPE_ALIASES): _requirement_refs_by_document_type_key keeps
-    # the first row it sees for a given canonical key. Delivery first once
-    # it has actually started, Booking first beforehand -- the same
-    # journey-state tiebreak resolve_document_stage uses, so a new receipt
-    # upload and this journey's own later reconciliation of it never
-    # disagree about which stage it belongs to.
-    delivery_active = _delivery_state(connection, tenant_id=tenant_id, journey_id=journey_id) is not None
+    # the first row it sees for a given canonical key. Same running-total
+    # decision resolve_document_stage uses (see _receipt_defaults_to_
+    # delivery), so a new receipt upload and this journey's own later
+    # reconciliation of it never disagree about which stage it belongs to.
+    receipt_defaults_to_delivery = _receipt_defaults_to_delivery(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+    )
     merged_requirements = (
         delivery_requirements + booking_requirements
-        if delivery_active
+        if receipt_defaults_to_delivery
         else booking_requirements + delivery_requirements
     )
     open_requirements = _requirements_with_open_slot(
@@ -287,51 +289,91 @@ def finalize_unified_document(
     return FinalizeResponse(documentId=document_id, state=str(payload["state"]))
 
 
+# Direct user correction (2026-09-23): "tagging document to stage won't
+# work for us" -- matching a classified type against whichever journey_
+# document_requirements rows happen to exist made stage depend on
+# requirement-catalog setup and DI's own classification timing (the actual
+# cause of every stage-misrouting bug found this session: gate_pass,
+# accessory_invoice_dms, dealer_receipt/payment_receipt). Booking's own
+# document set is small and fixed; everything else defaults to Delivery.
+# No per-journey matching needed to decide this any more.
+_BOOKING_ONLY_DOCUMENT_TYPES = frozenset({
+    "aadhaar",
+    "pan_card",
+    "booking_form",  # booking_docket canonicalizes to this
+    "minimum_booking_payment_proof",
+    "customer_kyc",  # one per journey, Booking-side -- never duplicated to Delivery
+})
+# The one genuine exception: a receipt legitimately happens at both stages
+# (installments toward the minimum booking amount, then further payments at
+# Delivery) -- resolved by running total, not type membership, in
+# _receipt_defaults_to_delivery below.
+_RECEIPT_CANONICAL_TYPE = "dealer_receipt"
+
+
+def _receipt_defaults_to_delivery(
+    connection: Connection, *, tenant_id: str, journey_id: UUID,
+) -> bool:
+    """True once this journey's already-extracted receipts (any stage,
+    canonicalized -- see uc03_duplicate_receipt_detection._receipt_documents)
+    sum to at least the tenant's minimum booking amount: a receipt beyond
+    that point is no longer proving the booking payment, so it defaults to
+    Delivery. A receipt's own amount is only known after extraction, and
+    extraction cannot run before its stage is resolved -- so this can only
+    ever total already-extracted receipts, never the one currently being
+    resolved. Self-corrects on the next reconciliation pass as more receipts
+    get processed, same as every other resolution in this module.
+    """
+    from audit_core.uc03_booking_confirmation_rules import _minimum_booking_amount
+    from audit_core.uc03_duplicate_receipt_detection import _receipt_documents
+
+    records = _receipt_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
+    total = sum((r.amount for r in records if r.amount is not None), Decimal(0))
+    return total >= _minimum_booking_amount(connection, tenant_id=tenant_id)
+
+
 def resolve_document_stage(
+    connection: Connection,
     classified_type: str | None,
     *,
+    tenant_id: str,
+    journey_id: UUID,
     booking_requirements: list[dict[str, Any]],
     delivery_requirements: list[dict[str, Any]],
-    delivery_active: bool = False,
 ) -> tuple[str, str | None]:
     """(stage_code, requirement_key) for a classified document type.
 
-    Exact match against each stage's own requirement set decides it for
-    every type except one: since migration 0091 retired the one type
-    (bank_statement_extract) that used to be a candidate under both, and
-    payment_receipt canonicalizes to dealer_receipt (see
-    _DOCUMENT_TYPE_ALIASES -- direct user correction, 2026-09-23: DI cannot
-    reliably tell an advance receipt from a balance receipt apart by
-    content, so that choice is removed from classification entirely), a
-    canonicalized receipt is now a genuine candidate under both stages at
-    once. ``delivery_active`` (the caller's own already-persisted state,
-    not anything content-derived) breaks that tie by checking whichever
-    stage is currently the real one first -- Delivery once it has actually
-    started, Booking beforehand. Every other type still matches exactly one
-    list, so this ordering never changes anything for it.
+    Stage is a static property of the type itself (_BOOKING_ONLY_DOCUMENT_
+    TYPES, else Delivery), not resolved by matching against whichever
+    journey_document_requirements rows happen to exist -- see that
+    constant's own comment. The one exception (a canonicalized receipt) is
+    resolved by running total instead, see _receipt_defaults_to_delivery.
 
-    An unrecognized type (matches neither -- should not happen for
-    anything DI was actually offered as a candidate) defaults to BOOKING,
+    Once stage is decided, the matching row in that stage's own requirement
+    list (if any -- a tenant need not require every type) supplies the
+    specific requirement_key.
+
+    An unrecognized type (no classification at all) defaults to BOOKING,
     the stage that always exists.
     """
-    if classified_type:
-        canonical = _canonical_document_type(str(classified_type))
-        first, second = (
-            (delivery_requirements, booking_requirements)
-            if delivery_active
-            else (booking_requirements, delivery_requirements)
-        )
-        first_stage = "DELIVERY" if delivery_active else "BOOKING"
-        second_stage = "BOOKING" if delivery_active else "DELIVERY"
-        for requirement in first:
-            document_type_key = requirement.get("document_type_key")
-            if document_type_key and _canonical_document_type(str(document_type_key)) == canonical:
-                return first_stage, str(requirement["requirement_key"])
-        for requirement in second:
-            document_type_key = requirement.get("document_type_key")
-            if document_type_key and _canonical_document_type(str(document_type_key)) == canonical:
-                return second_stage, str(requirement["requirement_key"])
-    return "BOOKING", None
+    if not classified_type:
+        return "BOOKING", None
+    canonical = _canonical_document_type(str(classified_type))
+    if canonical == _RECEIPT_CANONICAL_TYPE:
+        stage = "DELIVERY" if _receipt_defaults_to_delivery(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+        ) else "BOOKING"
+    elif canonical in _BOOKING_ONLY_DOCUMENT_TYPES:
+        stage = "BOOKING"
+    else:
+        stage = "DELIVERY"
+
+    requirements = booking_requirements if stage == "BOOKING" else delivery_requirements
+    for requirement in requirements:
+        document_type_key = requirement.get("document_type_key")
+        if document_type_key and _canonical_document_type(str(document_type_key)) == canonical:
+            return stage, str(requirement["requirement_key"])
+    return stage, None
 
 
 def _correct_durable_store_stage(
@@ -426,11 +468,6 @@ def reconcile_unified_documents(
     _seed_delivery_requirements(connection, tenant_id=tenant_id, journey_id=journey_id)
     booking_requirements = _base_requirements(connection, tenant_id, journey_id)
     delivery_requirements = _delivery_requirements(connection, tenant_id, journey_id)
-    # Checked once, up front, from persisted state -- not the loop-local
-    # delivery_started flag below, which only flips true partway through
-    # this same call and would make a receipt's stage depend on dict/list
-    # iteration order relative to whatever else is in this batch.
-    delivery_active = _delivery_state(connection, tenant_id=tenant_id, journey_id=journey_id) is not None
 
     di_documents: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -459,10 +496,12 @@ def reconcile_unified_documents(
         document_id = UUID(str(item["documentId"]))
         classified_type = item.get("classifiedDocumentTypeKey")
         stage_code, requirement_key = resolve_document_stage(
+            connection,
             classified_type,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
             booking_requirements=booking_requirements,
             delivery_requirements=delivery_requirements,
-            delivery_active=delivery_active,
         )
         if stage_code == "DELIVERY" and not delivery_started:
             if _delivery_state(connection, tenant_id=tenant_id, journey_id=journey_id) is None:
