@@ -393,37 +393,6 @@ def _receipts(
         )
         result.append(item)
 
-    # Flag duplicates (same physical receipt uploaded more than once) so the
-    # UI never counts the same money twice toward "Total collected" -- same
-    # grouping the DUPLICATE_RECEIPT_NOTICE task uses (compute_duplicate_groups),
-    # so a document flagged here is exactly the one that task is about.
-    # `result` is already in reviewed_at_utc order, so the first document in
-    # each group is the earliest reviewed one -- that one counts; the rest
-    # stay marked excluded automatically, no PC/TL decision required
-    # (correcting the receipt number/amount/date breaks the match and
-    # un-marks it here on the next read).
-    receipt_records = [
-        ReceiptRecord(
-            document_id=item["documentId"],
-            stage_code=str(item.get("stageCode") or "BOOKING"),
-            document_type_key="dealer_receipt",
-            receipt_number=normalize_receipt_number(item.get("receiptNumber")),
-            amount=_to_decimal(item.get("amount")),
-            receipt_date=normalize_receipt_date(item.get("receiptDate")),
-        )
-        for item in result
-    ]
-    for item in result:
-        item["isDuplicate"] = False
-        item["duplicateBasis"] = None
-    for group in compute_duplicate_groups(receipt_records):
-        for document in group.documents[1:]:
-            for item in result:
-                if item["documentId"] == document.document_id:
-                    item["isDuplicate"] = True
-                    item["duplicateBasis"] = group.match_basis
-                    break
-
     pending_rows = connection.execute(
         text(
             """
@@ -528,9 +497,45 @@ def _receipts(
             if status is not None
             else None
         )
+        result.append(item)
+
+    # Flag duplicates (same physical receipt uploaded more than once) so the
+    # UI never counts the same money twice toward "Total collected" -- same
+    # grouping the DUPLICATE_RECEIPT_NOTICE task uses (compute_duplicate_groups),
+    # so a document flagged here is exactly the one that task is about.
+    #
+    # Direct bug found live (2026-09-23): this used to run right after the
+    # reviewed_rows loop above, before pending_rows (receipts materialized
+    # straight into auditcore.payments via the newer unified capture flow --
+    # see that loop's own comment) were appended to `result` -- so two
+    # identical receipts uploaded through THAT flow never got compared
+    # against each other, or against a dealer_receipt_review_values receipt,
+    # at all: both showed isDuplicate=False unconditionally, hardcoded in
+    # the loop above, and the same amount got double-counted into "Total
+    # collected". Must run once, here, over the fully assembled `result`
+    # from both sources.
+    receipt_records = [
+        ReceiptRecord(
+            document_id=item["documentId"],
+            stage_code=str(item.get("stageCode") or "BOOKING"),
+            document_type_key="dealer_receipt",
+            receipt_number=normalize_receipt_number(item.get("receiptNumber")),
+            amount=_to_decimal(item.get("amount")),
+            receipt_date=normalize_receipt_date(item.get("receiptDate")),
+        )
+        for item in result
+    ]
+    for item in result:
         item["isDuplicate"] = False
         item["duplicateBasis"] = None
-        result.append(item)
+    for group in compute_duplicate_groups(receipt_records):
+        for document in group.documents[1:]:
+            for item in result:
+                if item["documentId"] == document.document_id:
+                    item["isDuplicate"] = True
+                    item["duplicateBasis"] = group.match_basis
+                    break
+
     return result
 
 
