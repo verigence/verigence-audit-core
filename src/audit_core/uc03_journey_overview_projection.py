@@ -904,28 +904,74 @@ def _sku_pricing_panel(
     booking_total_price = _to_decimal(reviewed_booking.get("total_price"))
     booking_net_amount  = _to_decimal(reviewed_booking.get("net_amount"))
 
-    # Enrich master_components with the matching booking-side amount.
-    # The OEM price list keys components as EX_SHOWROOM / INSURANCE /
+    # Enrich master_components with the matching actual amount. The OEM
+    # price list keys components as EX_SHOWROOM / INSURANCE /
     # REGISTRATION_INDIVIDUAL / ... ; the reviewed booking uses ex_showroom_price
     # / insurance_amount / registration_charges / ... — bridged by
     # uc03_masters_alignment (deterministic, explicit).
-    _BOOKING_COMPONENT_MAP: dict[str, Decimal | None] = {
-        "ex_showroom_price": booking_ex_showroom,
-        "insurance_amount":  booking_insurance,
-        "registration_charges": booking_registration,
-        "road_tax_amount":   booking_road_tax,
-        "tcs_amount":        booking_tcs,
-        "rsa_amount":        booking_rsa,
-        "additional_warranty_amount": booking_warranty,
-        "accessories_cost":  booking_accessories,
-        "other_charges":     booking_other,
-        "fastag_amount":     _to_decimal(reviewed_booking.get("fastag_amount")),
+    #
+    # Direct user correction (2026-09-23): read commercial_lines.actual_amount
+    # first, wherever a row exists there -- it's already invoice-prioritized
+    # (_upsert_commercial_line's own source_priority, invoice > deal sheet >
+    # booking form; "invoice holds significance over booking... whatever is
+    # in invoice is truth"). This used to read the raw booking-form value
+    # unconditionally, which could disagree with an invoice that had already
+    # won. Falls back to the raw booking value only when no commercial_lines
+    # row exists for that key yet.
+    commercial_actuals_rows = connection.execute(
+        text(
+            "SELECT component_key, actual_amount FROM auditcore.commercial_lines "
+            "WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND actual_amount IS NOT NULL"
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    commercial_actuals = {
+        row["component_key"]: _to_decimal(row["actual_amount"]) for row in commercial_actuals_rows
     }
+    _BOOKING_COMPONENT_MAP: dict[str, Decimal | None] = {
+        "ex_showroom_price": commercial_actuals.get("ex_showroom_price", booking_ex_showroom),
+        "insurance_amount":  commercial_actuals.get("insurance_amount", booking_insurance),
+        "registration_charges": commercial_actuals.get("registration_charges", booking_registration),
+        "road_tax_amount":   commercial_actuals.get("road_tax_amount", booking_road_tax),
+        "tcs_amount":        commercial_actuals.get("tcs_amount", booking_tcs),
+        "rsa_amount":        commercial_actuals.get("rsa_amount", booking_rsa),
+        "additional_warranty_amount": commercial_actuals.get("additional_warranty_amount", booking_warranty),
+        "accessories_cost":  commercial_actuals.get("accessories_cost", booking_accessories),
+        "other_charges":     commercial_actuals.get("other_charges", booking_other),
+        "fastag_amount":     commercial_actuals.get(
+            "fastag_amount", _to_decimal(reviewed_booking.get("fastag_amount"))
+        ),
+    }
+
+    # Direct user correction (2026-09-23): "match it to nearest 1%... there
+    # should be [a marker] to show what is selected." When several OEM rows
+    # share one commercial_key (today, only the two extended-warranty
+    # tiers), only the row NEAREST the actual is a real standard-vs-actual
+    # comparison; the other tier is a genuine, still-relevant alternative
+    # the price list offers -- not a deviation/exception. Grouping first
+    # (rather than comparing every row independently against the same
+    # actual) is what stops the tier that wasn't taken from showing up as a
+    # scary red "exception" alongside the one that was.
+    by_commercial_key: dict[str, list[dict[str, Any]]] = {}
     for component in master_components:
-        oem_key = component["componentKey"]
-        commercial_key = commercial_key_for_price_component(oem_key, basis=_basis)
-        booking_val = _BOOKING_COMPONENT_MAP.get(commercial_key) if commercial_key else None
-        if booking_val is not None:
+        commercial_key = commercial_key_for_price_component(component["componentKey"], basis=_basis)
+        by_commercial_key.setdefault(commercial_key or component["componentKey"], []).append(component)
+
+    for commercial_key, group in by_commercial_key.items():
+        booking_val = _BOOKING_COMPONENT_MAP.get(commercial_key)
+        selected = (
+            min(group, key=lambda c: abs(Decimal(str(c["masterAmount"])) - booking_val))
+            if booking_val is not None and len(group) > 1
+            else None
+        )
+        for component in group:
+            is_alternative = selected is not None and component is not selected
+            component["isAlternative"] = is_alternative
+            if booking_val is None or is_alternative:
+                component["bookingAmount"] = None
+                component["deviationAmount"] = None
+                component["deviationPercent"] = None
+                continue
             component["bookingAmount"] = float(booking_val)
             master_val = Decimal(str(component["masterAmount"]))
             dev = booking_val - master_val
@@ -935,10 +981,6 @@ def _sku_pricing_panel(
                 if master_val != 0
                 else None
             )
-        else:
-            component["bookingAmount"] = None
-            component["deviationAmount"] = None
-            component["deviationPercent"] = None
 
     # Top-level total deviation (master_total vs booking total_price)
     total_deviation: float | None = None

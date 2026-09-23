@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
+from conftest import delete_tenant_data
 from sqlalchemy import create_engine, text
 
+import audit_core.uc03_invoice_materialization as im
 from audit_core.uc03_journey_overview_projection import _sku_pricing_panel
 
 
@@ -69,13 +72,16 @@ def journey():
         )
     engine.dispose()
     engine = create_engine(database_url)
-    with engine.begin() as c:
-        c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
-        c.tenant_id = tenant_id  # type: ignore[attr-defined]
-        c.journey_id = journey_id  # type: ignore[attr-defined]
-        c.oem_id = oem_id  # type: ignore[attr-defined]
-        yield c
-    engine.dispose()
+    try:
+        with engine.begin() as c:
+            c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+            c.tenant_id = tenant_id  # type: ignore[attr-defined]
+            c.journey_id = journey_id  # type: ignore[attr-defined]
+            c.oem_id = oem_id  # type: ignore[attr-defined]
+            yield c
+    finally:
+        delete_tenant_data(engine, tenant_id)
+        engine.dispose()
 
 
 def _seed_price_list(c, skus: list[dict]) -> list:
@@ -204,3 +210,57 @@ def test_sku_pricing_panel_scopes_to_booking_price_list_id_when_set(journey) -> 
 
     assert panel is not None
     assert panel["modelName"] == "THAR"
+
+
+def test_sku_pricing_panel_groups_warranty_tiers_and_flags_the_untaken_one_as_alternative(journey) -> None:
+    """Direct user correction (2026-09-23): a price list can carry two extended-
+    warranty tiers (4th year only vs. 4th+5th year) for the same SKU, both
+    mapping to the single commercial_lines key ``additional_warranty_amount``.
+    A customer takes at most one. The panel must select whichever tier's
+    master price is nearest the actual amount as the real comparison, and mark
+    the other tier ``isAlternative`` (with no deviation/exception noise) rather
+    than showing both as independent rows -- one of which would otherwise look
+    like a scary, unrelated price deviation.
+    """
+    c = journey
+    (sku_id,) = _seed_price_list(c, [{
+        "model": "SCORPIO N", "variant": "Z8L",
+        "components": {
+            "EX_SHOWROOM": "1600000",
+            "EXT_WARRANTY_4TH_YR": "12000",
+            "EXT_WARRANTY_4TH_5TH_YR": "18000.62",
+        },
+    }])
+    c.execute(
+        text(
+            "INSERT INTO auditcore.journey_products "
+            "(tenant_id, journey_id, product_sku_id, model_name_snapshot, "
+            " variant_name_snapshot, selection_status, selection_source) "
+            "VALUES (:t, :j, :sku, 'SCORPIO N', 'Z8L', 'CONFIRMED', 'EVIDENCE')"
+        ),
+        {"t": c.tenant_id, "j": c.journey_id, "sku": sku_id},
+    )
+    im._upsert_commercial_line(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id,
+        component_key="additional_warranty_amount", amount=Decimal(18001),
+        document_type="retail_invoice", document_id=uuid4(), evidence_id=None,
+    )
+
+    panel = _sku_pricing_panel(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, reviewed_booking={},
+    )
+
+    assert panel is not None
+    by_key = {row["componentKey"]: row for row in panel["masterComponents"]}
+    four_yr = by_key["EXT_WARRANTY_4TH_YR"]
+    four_five_yr = by_key["EXT_WARRANTY_4TH_5TH_YR"]
+
+    assert four_five_yr["isAlternative"] is False
+    assert four_five_yr["bookingAmount"] == 18001.0
+    assert four_five_yr["deviationAmount"] is not None
+    assert abs(four_five_yr["deviationAmount"] - 0.38) < 0.01
+
+    assert four_yr["isAlternative"] is True
+    assert four_yr["bookingAmount"] is None
+    assert four_yr["deviationAmount"] is None
+    assert four_yr["deviationPercent"] is None

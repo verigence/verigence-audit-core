@@ -206,12 +206,25 @@ def _materialize_price_standards(
 
     grouped: dict[str, dict[str, Any]] = {}
     for commercial_key, rows in candidates.items():
-        chosen = rows[-1]
         actual = actual_amounts.get(commercial_key)
-        if actual is not None:
-            matching = [row for row in rows if abs(row["amount"] - actual) <= 1]
-            if matching:
-                chosen = matching[0]
+        if actual is None or actual == 0:
+            # No actual known yet (or a genuinely zero one, which a percentage
+            # tolerance can't meaningfully apply to) -- deterministic pick by
+            # the ORDER BY above, self-corrects once an actual exists.
+            chosen = rows[-1]
+        else:
+            # Direct user correction (2026-09-23): always select the tier
+            # whose price is NEAREST the actual amount -- never leave it on
+            # an arbitrary deterministic pick just because nothing matched
+            # exactly (the previous version required an exact ±₹1 match,
+            # far stricter than the OCR/rounding noise between an invoice's
+            # printed total and the master's own paisa-precise price
+            # actually warrants, and silently fell back to an unrelated
+            # candidate whenever that failed). With only two tiers today,
+            # "nearest" always resolves unambiguously with no threshold
+            # needed; it self-corrects on the next pass if a better actual
+            # amount becomes known.
+            chosen = min(rows, key=lambda row: abs(row["amount"] - actual))
         grouped[commercial_key] = chosen
 
     written = 0

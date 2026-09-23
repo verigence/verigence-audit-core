@@ -299,6 +299,39 @@ def test_price_standards_match_warranty_tier_to_the_known_actual_amount(journey)
     assert _commercial(c, "additional_warranty_amount") == Decimal(18000)
 
 
+def test_price_standards_pick_the_nearest_warranty_tier_when_not_an_exact_match(journey) -> None:
+    """Direct user correction (2026-09-23): the actual amount an invoice/
+    booking form reports will not always land exactly on the master's own
+    paisa-precise price (OCR rounding, a whole-rupee printed total vs a
+    fractional master price) -- an exact-match-or-arbitrary-fallback rule
+    is too strict and silently picks the wrong tier the moment the actual
+    is even ₹1 off. Must always select whichever tier's price is nearest
+    the actual, not fall back to something unrelated."""
+    c = journey
+    _seed_pinned_sku(c, model="SCORPIO N", variant="Z8L", components={
+        "EX_SHOWROOM": "1600000",
+        "EXT_WARRANTY_4TH_YR": "12000",
+        "EXT_WARRANTY_4TH_5TH_YR": "18000.62",
+    })
+    im._upsert_commercial_line(
+        c,
+        tenant_id=c.tenant_id,
+        journey_id=c.journey_id,
+        component_key="additional_warranty_amount",
+        amount=Decimal(18001),  # 38 paise off the 4TH_5TH_YR master price, nowhere near 4TH_YR's 12000
+        document_type="retail_invoice",
+        document_id=uuid4(),
+        evidence_id=None,
+    )
+
+    result = dr.sync_deal_reconciliation(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("priceLines", 0) >= 2
+
+    assert _commercial(c, "additional_warranty_amount") == Decimal("18000.62")
+
+
 def test_registration_basis_corporate_picks_corporate_rate(journey) -> None:
     c = journey
     c.execute(
