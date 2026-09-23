@@ -2,11 +2,21 @@
 Delivery alike (2026-09-13).
 
 Deliberately additive: neither of the existing Booking/Delivery capture
-screens, their own upload-intent endpoints, nor their own reconciliation
-functions (``_reconcile_documents`` / ``_reconcile_delivery_documents``)
+screens, their own upload-intent endpoints, nor their own document tables
 are touched. This module is a new, parallel path the unified Journey
 Documents page uses instead -- "keep existing functionality intact" per
 explicit instruction.
+
+Direct user directive (2026-09-23): "we should allow PC to upload
+documents without giving him pain to select the stage." One exception to
+"deliberately additive" above, made for exactly this reason: Booking's and
+Delivery's own reconciliation functions (``_reconcile_documents`` /
+``_reconcile_delivery_documents``, uc03_document_capture_v2.py /
+uc03_delivery_capture_v2.py) now delegate to ``apply_di_classification``
+below instead of each only managing their own stage's rows -- see that
+function's own docstring for why. Their upload-intent endpoints, requirement
+catalogs, and UI stay untouched; only how a misclassified document gets
+noticed and relocated changed.
 
 Why a new path rather than teaching the old ones to merge:
 
@@ -486,50 +496,49 @@ def _correct_durable_store_stage(
     return result.rowcount > 0
 
 
-def reconcile_unified_documents(
+_MACHINE_ACTOR = "SYSTEM:DI_AUTO"
+
+
+def apply_di_classification(
     connection: Connection,
     *,
     tenant_id: str,
     journey_id: UUID,
+    di_documents: list[dict[str, Any]],
     actor_id: str,
     actor_role: str,
     correlation_id: str,
-    v2_client: DiCaptureV2Client,
-    context_ref: str,
-    token: str,
 ) -> None:
-    """Poll DI for every document on this journey, in EITHER phase, and
-    write the correctly-dispatched stage_code/requirement_key back to
-    document_capture_v2_documents -- so Booking's and Delivery's own,
-    completely untouched GET endpoints each show the right documents
-    afterward, purely by reading that column as they already do.
+    """Apply DI's classification result to document_capture_v2_documents for
+    every item in di_documents, relocating stage_code/requirement_key to
+    wherever resolve_document_stage says the type actually belongs --
+    regardless of which single phase's listing di_documents came from. A
+    document's classified type alone decides its stage; nothing here needs
+    a listing from DI's other phase.
+
+    Direct user directive (2026-09-23): "we should allow PC to upload
+    documents without giving him pain to select the stage" -- this is the
+    piece that actually makes that seamless. Before this, only
+    reconcile_unified_documents itself (a full, both-phase DI listing,
+    effectively only run right after upload or via an explicit Resync)
+    ever relocated a misplaced document. Booking's own and Delivery's own
+    everyday polling (_reconcile_documents / _reconcile_delivery_documents,
+    uc03_document_capture_v2.py / uc03_delivery_capture_v2.py) each already
+    fetch a live classification result on every read, but used to only
+    refresh requirement_key within their OWN stage's rows -- silently
+    nulling it forever, never relocating, whenever the type actually
+    belonged to the other stage. Both now call this same function with
+    their own single-phase di_documents, so a misplaced document self-
+    heals within one poll cycle, from whichever screen a PC happens to
+    have open, with no dependency on the full two-phase reconcile ever
+    running again.
     """
-    # Idempotent and cheap -- called here too (not just from
+    # Idempotent and cheap -- called from every caller below (not just
     # create_unified_upload_intents) so this function gives correct
-    # results even if it's ever invoked on its own (e.g. a future resync).
+    # results regardless of which entry point reaches it first.
     _seed_delivery_requirements(connection, tenant_id=tenant_id, journey_id=journey_id)
     booking_requirements = _base_requirements(connection, tenant_id, journey_id)
     delivery_requirements = _delivery_requirements(connection, tenant_id, journey_id)
-
-    di_documents: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    for phase in ("BOOKING", "DELIVERY"):
-        try:
-            payload = v2_client.list_documents(
-                token=token, tenant_id=tenant_id, external_context_ref=context_ref, phase=phase,
-            )
-        except DiCaptureV2Error as exc:
-            _log_di_capture_v2_failure(
-                operation="list_documents", exc=exc, tenant_id=tenant_id,
-                journey_id=journey_id, context_ref=context_ref,
-            )
-            continue
-        for item in payload.get("documents") or []:
-            document_id = str(item.get("documentId"))
-            if document_id in seen_ids:
-                continue
-            seen_ids.add(document_id)
-            di_documents.append(item)
 
     delivery_started = False
     corrected_to_delivery = False
@@ -621,6 +630,55 @@ def reconcile_unified_documents(
         materialize_booking_documents_from_durable_store(
             connection, tenant_id=tenant_id, journey_id=journey_id,
         )
+
+
+def reconcile_unified_documents(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    actor_id: str,
+    actor_role: str,
+    correlation_id: str,
+    v2_client: DiCaptureV2Client,
+    context_ref: str,
+    token: str,
+) -> None:
+    """Poll DI for every document on this journey, in EITHER phase, and
+    apply the combined result via apply_di_classification -- so Booking's
+    and Delivery's own, completely untouched GET endpoints each show the
+    right documents afterward, purely by reading that column as they
+    already do.
+    """
+    di_documents: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for phase in ("BOOKING", "DELIVERY"):
+        try:
+            payload = v2_client.list_documents(
+                token=token, tenant_id=tenant_id, external_context_ref=context_ref, phase=phase,
+            )
+        except DiCaptureV2Error as exc:
+            _log_di_capture_v2_failure(
+                operation="list_documents", exc=exc, tenant_id=tenant_id,
+                journey_id=journey_id, context_ref=context_ref,
+            )
+            continue
+        for item in payload.get("documents") or []:
+            document_id = str(item.get("documentId"))
+            if document_id in seen_ids:
+                continue
+            seen_ids.add(document_id)
+            di_documents.append(item)
+
+    apply_di_classification(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        di_documents=di_documents,
+        actor_id=actor_id,
+        actor_role=actor_role,
+        correlation_id=correlation_id,
+    )
 
 
 class ReconcileResponse(BaseModel):

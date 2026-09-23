@@ -59,3 +59,22 @@ def test_repeatable_requirements_are_unaffected_by_the_reject_path() -> None:
     reject_insert = source.index("'VOIDED', 'DUPLICATE_UPLOAD'")
     unconditional_insert = source.index("'ACTIVE', :supersedes_evidence_id,")
     assert not_repeatable_guard < reject_insert < unconditional_insert
+
+
+def test_discover_requirement_for_callback_never_reads_document_capture_v2_documents() -> None:
+    """Direct claim made to the user (2026-09-23), verified here so it stays
+    true rather than just being true today: which rules/materializers fire
+    for a classified document is resolved entirely from the requirement row
+    itself (journey_document_requirements.process_area, fixed correctly at
+    upload time -- see uc03_unified_document_capture.py's upload-intent
+    endpoint) -- never from document_capture_v2_documents.stage_code, which
+    is a separate, UI-display-only cache that can lag behind. This function
+    is where that resolution happens (its own comment: "Stage is data, not
+    routing... DI has no notion of Booking vs Delivery, and neither should
+    this handler"); a plain string check that the table name never appears
+    in its source is a stronger guarantee than any test of specific
+    behavior, since it proves the dependency cannot exist for ANY input,
+    not just the cases a test happens to cover."""
+    source = inspect.getsource(pc_booking_documents._discover_requirement_for_callback)
+    assert "document_capture_v2_documents" not in source
+    assert "process_area" in source

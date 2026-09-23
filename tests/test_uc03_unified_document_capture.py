@@ -335,16 +335,17 @@ def test_reconcile_unified_documents_dispatches_delivery_type_and_autostarts(uni
         ).scalar_one()
         assert delivery_started == "DELIVERY_STARTED"
 
-        # Reported live: the Booking screen's own "live" read (unrelated to
-        # this module) re-runs its own reconciliation against every
-        # DI document it sees, using a Booking-only requirement lookup --
-        # before it was scoped to stage_code='BOOKING' (matching
-        # uc03_delivery_capture_v2._reconcile_delivery_documents' own,
-        # already-correct scoping), it would find this Delivery-routed
-        # document (still visible in DI's BOOKING-phase list -- this module
-        # always uses that one phase, see the module docstring), fail to
-        # match NO_DUES_CERTIFICATE against Booking's own requirements, and
-        # null the requirement_key this reconcile just correctly set.
+        # The Booking screen's own "live" read (unrelated to this module)
+        # re-runs its own reconciliation against every DI document it sees
+        # -- this document is still visible there (this module always
+        # files with DI under phase="BOOKING", see the module docstring).
+        # _reconcile_documents now delegates to apply_di_classification
+        # (2026-09-23), so it re-resolves and idempotently re-confirms
+        # DELIVERY/NDC rather than either corrupting it (the original bug)
+        # or merely leaving it alone untouched (the first fix, PR #353) --
+        # see test_reconcile_documents_relocates_a_freshly_classified_
+        # delivery_type_document below for the case that actually starts
+        # from stage_code='BOOKING' and proves the relocation itself.
         from audit_core.uc03_document_capture_v2 import (
             _base_requirements,
             _reconcile_documents,
@@ -372,6 +373,103 @@ def test_reconcile_unified_documents_dispatches_delivery_type_and_autostarts(uni
         ).mappings().one()
         assert row_after_booking_poll["stage_code"] == "DELIVERY"
         assert row_after_booking_poll["requirement_key"] == "NDC"
+
+
+def test_reconcile_documents_relocates_a_freshly_classified_delivery_type_document(
+    unified_capture_setup,
+) -> None:
+    """Direct user directive (2026-09-23): "we should allow PC to upload
+    documents without giving him pain to select the stage." Starts from
+    exactly the state a fresh upload is in before anyone has ever run the
+    full two-phase reconcile_unified_documents -- stage_code='BOOKING'
+    (the hardcoded value every unified-capture upload gets, DI classification
+    not yet known), requirement_key=NULL. Calls ONLY _reconcile_documents
+    (Booking's own poll, the only one that ever sees this document in DI's
+    response at all -- see that function's own docstring for why) and
+    proves it relocates the document to DELIVERY and auto-starts Delivery,
+    with no separate reconcile_unified_documents call ever needed."""
+    setup = unified_capture_setup
+    from audit_core.uc03_document_capture_v2 import _reconcile_documents
+
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        before = connection.execute(
+            text("SELECT stage_code, requirement_key FROM auditcore.document_capture_v2_documents "
+                 "WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:doc"),
+            {"t": setup["tenant_id"], "j": setup["journey_id"], "doc": setup["document_id"]},
+        ).mappings().one()
+        assert before["stage_code"] == "BOOKING"
+        assert before["requirement_key"] is None
+
+        _reconcile_documents(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=setup["journey_id"],
+            requirements=[],
+            di_documents=[{
+                "documentId": str(setup["document_id"]),
+                "state": "CLASSIFIED",
+                "classifiedDocumentTypeKey": "NO_DUES_CERTIFICATE",
+            }],
+        )
+
+        after = connection.execute(
+            text("SELECT stage_code, requirement_key, capture_status "
+                 "FROM auditcore.document_capture_v2_documents "
+                 "WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:doc"),
+            {"t": setup["tenant_id"], "j": setup["journey_id"], "doc": setup["document_id"]},
+        ).mappings().one()
+        assert after["stage_code"] == "DELIVERY"
+        assert after["requirement_key"] == "NDC"
+        assert after["capture_status"] == "CLASSIFIED"
+
+        delivery_started = connection.execute(
+            text("SELECT business_status FROM auditcore.journey_stage_states "
+                 "WHERE tenant_id=:t AND journey_id=:j AND stage_code='DELIVERY'"),
+            {"t": setup["tenant_id"], "j": setup["journey_id"]},
+        ).scalar_one()
+        assert delivery_started == "DELIVERY_STARTED"
+
+
+def test_reconcile_documents_leaves_a_genuine_booking_type_document_alone(
+    unified_capture_setup,
+) -> None:
+    """Same starting state as above, but the classified type genuinely
+    belongs to Booking -- _reconcile_documents must keep matching it
+    against Booking's own requirements exactly as before, no relocation."""
+    setup = unified_capture_setup
+    from audit_core.uc03_document_capture_v2 import _reconcile_documents
+
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        _reconcile_documents(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=setup["journey_id"],
+            requirements=[],
+            di_documents=[{
+                "documentId": str(setup["document_id"]),
+                "state": "CLASSIFIED",
+                "classifiedDocumentTypeKey": "booking_docket",
+            }],
+        )
+
+        after = connection.execute(
+            text("SELECT stage_code, requirement_key, capture_status "
+                 "FROM auditcore.document_capture_v2_documents "
+                 "WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:doc"),
+            {"t": setup["tenant_id"], "j": setup["journey_id"], "doc": setup["document_id"]},
+        ).mappings().one()
+        assert after["stage_code"] == "BOOKING"
+        assert after["requirement_key"] == "BOOKING_DOCKET"
+        assert after["capture_status"] == "CLASSIFIED"
+
+        delivery_state = connection.execute(
+            text("SELECT business_status FROM auditcore.journey_stage_states "
+                 "WHERE tenant_id=:t AND journey_id=:j AND stage_code='DELIVERY'"),
+            {"t": setup["tenant_id"], "j": setup["journey_id"]},
+        ).scalar_one_or_none()
+        assert delivery_state is None
 
 
 def test_reconcile_unified_documents_leaves_booking_type_alone(unified_capture_setup) -> None:
