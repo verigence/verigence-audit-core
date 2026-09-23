@@ -251,10 +251,48 @@ def test_price_standards_materialized_with_registration_basis(journey) -> None:
 
     assert _commercial(c, "ex_showroom_price") == Decimal(1600000)
     assert _commercial(c, "insurance_amount") == Decimal(60000)
-    # the two extended-warranty tiers sum onto one line
-    assert _commercial(c, "additional_warranty_amount") == Decimal(30000)
+    # Direct user correction (2026-09-23): a customer takes at most one
+    # warranty tier, never both -- the two tiers must never be summed
+    # (30000 would be the old, wrong, inflated behavior). Both map onto
+    # the same commercial line; the later one wins deterministically by
+    # component_key order (EXT_WARRANTY_4TH_YR sorts after
+    # EXT_WARRANTY_4TH_5TH_YR), not the sum of both.
+    assert _commercial(c, "additional_warranty_amount") == Decimal(12000)
     # individual buyer -> individual registration rate, corporate variant not double counted
     assert _commercial(c, "registration_charges") == Decimal(170000)
+
+
+def test_price_standards_match_warranty_tier_to_the_known_actual_amount(journey) -> None:
+    """Direct user instruction (2026-09-23): once an actual warranty amount
+    is already known for this journey (invoice already wins over booking
+    form there -- see _upsert_commercial_line's own source_priority), the
+    standard must be whichever tier's master price matches it, not a
+    deterministic guess. Reuses the real invoice-materialization upsert
+    (im._upsert_commercial_line) rather than a raw INSERT, so this proves
+    the same code path a real invoice sync uses actually feeds this."""
+    c = journey
+    _seed_pinned_sku(c, model="SCORPIO N", variant="Z8L", components={
+        "EX_SHOWROOM": "1600000",
+        "EXT_WARRANTY_4TH_YR": "12000",
+        "EXT_WARRANTY_4TH_5TH_YR": "18000",
+    })
+    im._upsert_commercial_line(
+        c,
+        tenant_id=c.tenant_id,
+        journey_id=c.journey_id,
+        component_key="additional_warranty_amount",
+        amount=Decimal(18000),
+        document_type="retail_invoice",
+        document_id=uuid4(),
+        evidence_id=None,
+    )
+
+    result = dr.sync_deal_reconciliation(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("priceLines", 0) >= 2
+
+    assert _commercial(c, "additional_warranty_amount") == Decimal(18000)
 
 
 def test_registration_basis_corporate_picks_corporate_rate(journey) -> None:

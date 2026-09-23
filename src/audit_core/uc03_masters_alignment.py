@@ -101,9 +101,19 @@ def commercial_key_for_price_component(
 
 
 def commercial_amounts_are_additive(commercial_key: str) -> bool:
-    """True when several OEM components legitimately sum onto one Audit Core line
-    (only the two extended-warranty tiers today)."""
-    return commercial_key == "additional_warranty_amount"
+    """True when several OEM components legitimately sum onto one Audit Core line.
+
+    Direct user correction (2026-09-23): the two extended-warranty tiers
+    (EXT_WARRANTY_4TH_YR, EXT_WARRANTY_4TH_5TH_YR) used to be treated as
+    additive here -- summing both tiers' master prices into one inflated
+    "additional_warranty_amount" standard (e.g. 32,999 + 17,999 = 50,998)
+    whenever a SKU's price list had both rows. That is wrong: a customer
+    takes at most one tier, never both ("customer can avail any one or
+    not but both wont be there"), so summing them never reflects a real
+    standard price. Always False now -- no current OEM component pair is
+    genuinely additive.
+    """
+    return False
 
 
 # ── discount benefits ────────────────────────────────────────────────────────

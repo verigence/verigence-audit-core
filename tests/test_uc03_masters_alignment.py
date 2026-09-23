@@ -12,13 +12,17 @@ def test_price_component_maps_to_booking_field() -> None:
     assert align.commercial_key_for_price_component("FASTAG") == "fastag_amount"
 
 
-def test_both_warranty_tiers_fold_onto_one_line() -> None:
+def test_both_warranty_tiers_map_to_one_line_but_are_not_additive() -> None:
+    """Direct user correction (2026-09-23): both OEM warranty tiers still
+    map onto the same Audit Core commercial line (there's no other line
+    for either to go on), but a customer takes at most one tier, never
+    both -- so their master prices must never be summed together."""
     assert align.commercial_key_for_price_component("EXT_WARRANTY_4TH_YR") == "additional_warranty_amount"
     assert (
         align.commercial_key_for_price_component("EXT_WARRANTY_4TH_5TH_YR")
         == "additional_warranty_amount"
     )
-    assert align.commercial_amounts_are_additive("additional_warranty_amount") is True
+    assert align.commercial_amounts_are_additive("additional_warranty_amount") is False
     assert align.commercial_amounts_are_additive("ex_showroom_price") is False
 
 

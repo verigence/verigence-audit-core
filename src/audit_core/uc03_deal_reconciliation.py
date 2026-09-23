@@ -8,7 +8,11 @@ the OEM native masters, deterministically:
       = the SKU's ``price_list_items`` for the effective published version,
         mapped OEM component_key -> booking component_key via
         ``uc03_masters_alignment`` (registration variant chosen by the buyer's
-        basis; the two extended-warranty tiers sum).
+        basis; the two extended-warranty tiers both map to one line but are
+        never summed -- a customer takes at most one tier, so whichever
+        tier's price matches the already-invoice-prioritized actual amount
+        on that line wins, falling back to a deterministic pick until an
+        actual is known).
 
   discount_applications  (one row per applicable scheme benefit, keyed by the
                           canonical discount key, actual_source_kind CALCULATED)
@@ -42,7 +46,6 @@ from audit_core.uc03_masters_alignment import (
     CONDITIONAL_DISCOUNT_LABEL,
     DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY,
     canonical_discount_key,
-    commercial_amounts_are_additive,
     commercial_key_for_price_component,
     registration_basis,
 )
@@ -148,13 +151,30 @@ def _materialize_price_standards(
             WHERE pli.tenant_id = :tenant_id
               AND pli.price_list_version_id = :plv
               AND pli.product_sku_id = :sku
+            ORDER BY pli.component_key
             """
         ),
         {"tenant_id": tenant_id, "plv": price_list_version_id, "sku": product_sku_id},
     ).mappings().all()
 
-    # OEM component -> Audit Core commercial key; sum where several fold onto one.
-    grouped: dict[str, dict[str, Any]] = {}
+    # OEM component -> Audit Core commercial key. commercial_amounts_are_
+    # additive is always False today (see its own docstring: the two
+    # extended-warranty tiers used to be summed here, which the user
+    # corrected -- a customer takes at most one tier, never both).
+    #
+    # Direct user instruction (2026-09-23): when several OEM rows map to
+    # the same commercial_key (today, only the two warranty tiers), pick
+    # whichever tier's master price matches the amount already recorded
+    # as this journey's actual for that commercial_key -- invoice already
+    # wins over booking form there (commercial_lines.actual_amount is
+    # populated by _upsert_commercial_line's own source_priority ranking,
+    # _COMMERCIAL_SOURCES = invoice > deal sheet > booking form; nothing
+    # new needed here, just read what it already resolved). Falls back to
+    # the last candidate (by the deterministic ORDER BY above) only when
+    # no actual is known yet -- self-corrects on the next reconciliation
+    # pass once one is. Never a PC-editable choice: purely a match against
+    # already-extracted evidence.
+    candidates: dict[str, list[dict[str, Any]]] = {}
     for item in items:
         commercial_key = commercial_key_for_price_component(item["component_key"], basis=basis)
         if commercial_key is None:
@@ -162,16 +182,37 @@ def _materialize_price_standards(
         amount = _to_decimal(item["standard_amount"])
         if amount is None:
             continue
-        entry = grouped.setdefault(
-            commercial_key,
-            {"amount": Decimal(0), "price_list_item_id": item["price_list_item_id"],
+        candidates.setdefault(commercial_key, []).append(
+            {"amount": amount, "price_list_item_id": item["price_list_item_id"],
              "currency": str(item["currency_code"] or "INR")},
         )
-        if commercial_amounts_are_additive(commercial_key) or entry["amount"] == 0:
-            entry["amount"] += amount
-        else:
-            entry["amount"] = amount
-        entry["price_list_item_id"] = item["price_list_item_id"]
+
+    actual_amounts: dict[str, Decimal] = {}
+    if any(len(rows) > 1 for rows in candidates.values()):
+        actual_rows = connection.execute(
+            text(
+                """
+                SELECT component_key, actual_amount FROM auditcore.commercial_lines
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND component_key = ANY(:keys) AND actual_amount IS NOT NULL
+                """
+            ),
+            {
+                "tenant_id": tenant_id, "journey_id": journey_id,
+                "keys": [key for key, rows in candidates.items() if len(rows) > 1],
+            },
+        ).mappings().all()
+        actual_amounts = {row["component_key"]: _to_decimal(row["actual_amount"]) for row in actual_rows}
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for commercial_key, rows in candidates.items():
+        chosen = rows[-1]
+        actual = actual_amounts.get(commercial_key)
+        if actual is not None:
+            matching = [row for row in rows if abs(row["amount"] - actual) <= 1]
+            if matching:
+                chosen = matching[0]
+        grouped[commercial_key] = chosen
 
     written = 0
     for commercial_key, entry in grouped.items():
