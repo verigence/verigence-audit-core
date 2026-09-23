@@ -3,6 +3,7 @@ import os
 from uuid import UUID, uuid4
 
 import pytest
+from conftest import delete_tenant_data
 from sqlalchemy import create_engine, text
 
 from audit_core.main import app
@@ -425,15 +426,18 @@ def evidence_backfill_setup():
             )"""),
             {"t": tenant_id, "j": journey_id, "doc": document_id, "upload": uuid4()},
         )
-    yield {
-        "engine": engine,
-        "tenant_id": tenant_id,
-        "journey_id": journey_id,
-        "requirement_ref": requirement_ref,
-        "requirement_key": "booking_docket",
-        "document_id": document_id,
-    }
-    engine.dispose()
+    try:
+        yield {
+            "engine": engine,
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "requirement_ref": requirement_ref,
+            "requirement_key": "booking_docket",
+            "document_id": document_id,
+        }
+    finally:
+        delete_tenant_data(engine, tenant_id)
+        engine.dispose()
 
 
 def _evidence_row(engine, *, tenant_id, document_id):
