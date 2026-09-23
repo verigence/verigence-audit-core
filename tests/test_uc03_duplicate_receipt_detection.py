@@ -6,6 +6,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
+from conftest import delete_tenant_data
 from sqlalchemy import create_engine, text
 
 from audit_core import uc03_duplicate_receipt_detection as drd
@@ -108,12 +109,15 @@ def journey():
         ).scalar_one()
     engine.dispose()
     engine = create_engine(database_url)
-    with engine.begin() as c:
-        c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
-        c.tenant_id = tenant_id  # type: ignore[attr-defined]
-        c.journey_id = journey_id  # type: ignore[attr-defined]
-        yield c
-    engine.dispose()
+    try:
+        with engine.begin() as c:
+            c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+            c.tenant_id = tenant_id  # type: ignore[attr-defined]
+            c.journey_id = journey_id  # type: ignore[attr-defined]
+            yield c
+    finally:
+        delete_tenant_data(engine, tenant_id)
+        engine.dispose()
 
 
 def _set_receipt_field(c, *, stage_code, document_type_key, field_key, value, document_id):

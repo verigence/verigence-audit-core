@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from conftest import delete_tenant_data
 from sqlalchemy import create_engine, text
 
 import audit_core.uc03_deal_reconciliation as dr
@@ -106,14 +107,17 @@ def journey():
         )
     engine.dispose()
     engine = create_engine(database_url)
-    with engine.begin() as c:
-        c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
-        c.tenant_id = tenant_id  # type: ignore[attr-defined]
-        c.journey_id = journey_id  # type: ignore[attr-defined]
-        c.oem_id = oem_id  # type: ignore[attr-defined]
-        c.customer_id = customer_id  # type: ignore[attr-defined]
-        yield c
-    engine.dispose()
+    try:
+        with engine.begin() as c:
+            c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+            c.tenant_id = tenant_id  # type: ignore[attr-defined]
+            c.journey_id = journey_id  # type: ignore[attr-defined]
+            c.oem_id = oem_id  # type: ignore[attr-defined]
+            c.customer_id = customer_id  # type: ignore[attr-defined]
+            yield c
+    finally:
+        delete_tenant_data(engine, tenant_id)
+        engine.dispose()
 
 
 def _seed_pinned_sku(c, *, model: str, variant: str, components: dict[str, str], pin: bool = True):

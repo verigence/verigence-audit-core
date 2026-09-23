@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 
 import pytest
+from conftest import delete_tenant_data
 from sqlalchemy import create_engine, text
 
 from audit_core.db import set_tenant_context
@@ -281,14 +282,17 @@ def unified_capture_setup():
             {"t": tenant_id, "j": journey_id, "doc": document_id, "upload": f"upload-{suffix}", "actor": actor_id},
         )
 
-    yield {
-        "engine": engine,
-        "tenant_id": tenant_id,
-        "journey_id": journey_id,
-        "document_id": document_id,
-        "actor_id": actor_id,
-    }
-    engine.dispose()
+    try:
+        yield {
+            "engine": engine,
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "document_id": document_id,
+            "actor_id": actor_id,
+        }
+    finally:
+        delete_tenant_data(engine, tenant_id)
+        engine.dispose()
 
 
 def test_reconcile_unified_documents_dispatches_delivery_type_and_autostarts(unified_capture_setup) -> None:
