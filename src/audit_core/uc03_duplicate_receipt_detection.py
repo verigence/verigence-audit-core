@@ -1,12 +1,20 @@
 """uc03_duplicate_receipt_detection.py — the same physical receipt uploaded
 more than once must not be counted as more money paid.
 
-Scoped to receipts of the *same* document type only: dealer_receipt (Booking)
-compared against dealer_receipt, payment_receipt (Delivery) against
-payment_receipt -- never mixed. A Booking advance receipt and a Delivery
-balance receipt legitimately coexist for the same amount; that is not a
-duplicate, it is two different real payments, and reconciliation (a separate
-concern, see uc03_payment_reconciliation.py) sums each type on its own.
+Direct user correction (2026-09-23): this used to scope matching to same
+document_type_key only (dealer_receipt vs dealer_receipt, payment_receipt vs
+payment_receipt, never mixed), reasoning that a Booking advance receipt and a
+Delivery balance receipt legitimately coexist for the same amount. That
+reasoning does not hold: duplication has no relationship with stage --
+whichever stage a receipt is for, the same receipt number and amount on two
+documents is the same physical receipt uploaded twice, full stop. It is
+matched on identity here regardless of stage, using dealer_receipt/
+payment_receipt's own canonicalization (_canonical_document_type,
+uc03_document_capture_v2.py -- these two document_type_keys were themselves
+merged into one for the same reason: DI cannot reliably tell an advance
+receipt from a balance receipt apart by content). Two receipts for
+different, legitimately separate payments simply will not share a receipt
+number -- dealers do not reuse them.
 
 Both receipt schemas (verigence-di schemas/dealer_receipt.py,
 schemas/payment_receipt.py) require DI to read a ``receipt_number`` off every
@@ -44,6 +52,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_document_capture_v2 import _canonical_document_type
 from audit_core.workflow import cancel_workflow_task, create_workflow_task
 
 logger = logging.getLogger(__name__)
@@ -54,8 +63,10 @@ TASK_TYPE = "DUPLICATE_RECEIPT_NOTICE"
 _WORKFLOW_TYPE = "UC03_DUPLICATE_RECEIPT"
 _OPEN_TASK_STATUSES = {"PENDING", "READY", "CLAIMED", "IN_PROGRESS", "RETRY_WAIT"}
 
-# Same-type only, by design (see module docstring) -- these are compared
-# within each type separately, never against each other.
+# Both raw document_type_keys are selected from storage (a document's stored
+# facts still carry whichever one it was actually classified/synced under,
+# historical rows included), then canonicalized to one identity before
+# grouping -- see _receipt_documents and the module docstring.
 _RECEIPT_DOCUMENT_TYPES = ("dealer_receipt", "payment_receipt")
 _RECEIPT_NUMBER_FIELD = "receipt_number"
 _AMOUNT_FIELD = "amount_paid"
@@ -106,6 +117,13 @@ class ReceiptRecord:
 @dataclass(frozen=True)
 class DuplicateGroup:
     rule_key: str
+    # Which Task Queue process-area bucket the notice appears under -- since
+    # matching is now cross-stage (see module docstring), a group can mix
+    # Booking and Delivery documents; this is simply the first member found,
+    # not a claim that the whole group belongs to one stage. Money-total
+    # exclusion (evaluate_minimum_booking_payment, uc03_journey_overview_
+    # projection.py) reads every document in the group directly, never
+    # gated by this field.
     stage_code: str
     document_type_key: str
     match_basis: str
@@ -162,7 +180,17 @@ def _receipt_documents(
     for row in rows:
         entry = by_document.setdefault(
             row["di_document_id"],
-            {"stage_code": row["stage_code"], "document_type_key": row["document_type_key"]},
+            {
+                "stage_code": row["stage_code"],
+                # Canonicalized here, not left as whichever raw key this
+                # document happened to be classified/synced under -- see
+                # module docstring. compute_duplicate_groups' own by_type
+                # grouping needs no change: two receipts now land in the
+                # same group regardless of stage purely because this is
+                # the one place their identity gets normalized before
+                # grouping ever sees it.
+                "document_type_key": _canonical_document_type(str(row["document_type_key"])),
+            },
         )
         entry[row["field_key"]] = row["effective_value"]
 

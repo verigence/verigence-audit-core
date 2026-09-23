@@ -213,14 +213,40 @@ def test_different_receipt_numbers_same_amount_are_not_flagged(journey) -> None:
     assert _open_duplicate_tasks(c) == []
 
 
-def test_dealer_receipt_and_payment_receipt_same_amount_are_not_cross_flagged(journey) -> None:
-    # A Booking advance (dealer_receipt) and a Delivery balance (payment_receipt)
-    # for the same amount are two different real payments -- same type only.
+def test_dealer_receipt_and_payment_receipt_same_receipt_are_cross_flagged(journey) -> None:
+    """Direct user correction (2026-09-23): duplication has no relationship
+    with stage. dealer_receipt and payment_receipt are the same real-world
+    document under two different document_type_keys (see
+    _DOCUMENT_TYPE_ALIASES) -- the same receipt number and amount on one of
+    each is the same physical receipt uploaded twice, regardless of which
+    stage each copy landed in, and must be flagged exactly like two
+    same-type copies would be."""
+    c = journey
+    doc_a = _seed_receipt(c, stage_code="BOOKING", document_type_key="dealer_receipt",
+                          receipt_number="RC-3001", amount="100000", receipt_date="2026-08-01")
+    doc_b = _seed_receipt(c, stage_code="DELIVERY", document_type_key="payment_receipt",
+                          receipt_number="RC-3001", amount="100000", receipt_date="2026-08-01")
+
+    result = drd.sync_duplicate_receipt_detection(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+
+    assert result["groupCount"] == 1
+    tasks = _open_duplicate_tasks(c)
+    assert len(tasks) == 1
+    assert set(tasks[0]["task_payload"]["diDocumentIds"]) == {str(doc_a), str(doc_b)}
+
+
+def test_two_genuinely_separate_payments_at_different_stages_are_not_flagged(journey) -> None:
+    # Two different real payments (different receipt numbers) at different
+    # stages must not be flagged just because they're both receipts now --
+    # cross-stage matching only fires on a real receipt-number+amount match,
+    # same as it always has within one stage.
     c = journey
     _seed_receipt(c, stage_code="BOOKING", document_type_key="dealer_receipt",
-                  receipt_number="RC-3001", amount="100000", receipt_date="2026-08-01")
+                  receipt_number="RC-4001", amount="100000", receipt_date="2026-08-01")
     _seed_receipt(c, stage_code="DELIVERY", document_type_key="payment_receipt",
-                  receipt_number="RC-3001", amount="100000", receipt_date="2026-08-01")
+                  receipt_number="RC-4002", amount="100000", receipt_date="2026-09-15")
 
     result = drd.sync_duplicate_receipt_detection(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",

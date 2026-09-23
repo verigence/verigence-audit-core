@@ -472,7 +472,24 @@ def _ensure_di_context(
 # Core's own reviewed-value materialisation (``_BOOKING_FORM_DOCUMENT_TYPE``) all use
 # ``booking_form``.  Send/accept the canonical key so the sales contract is extracted
 # against the real Booking Form field set instead of the generic fallback schema.
-_DOCUMENT_TYPE_ALIASES: dict[str, str] = {"booking_docket": "booking_form"}
+#
+# payment_receipt -> dealer_receipt: the same real-world document (a
+# dealership money receipt) registered under two different document_type_
+# keys purely because Booking's and Delivery's default requirement
+# profiles were authored independently (dealer_receipt.py and payment_
+# receipt.py are near-identical DI schemas -- see payment_receipt.py's own
+# docstring). Direct user correction (2026-09-23): asking DI to visually
+# tell these apart is unreliable by construction -- nothing distinguishes
+# an advance receipt from a balance receipt except which stage it's
+# for, which is exactly the fact classification can't see. Canonicalizing
+# removes the ambiguous choice from DI's classifier entirely; which
+# stage's requirement a canonicalized receipt actually binds to is decided
+# separately, by journey state (see resolve_document_stage and
+# _requirement_ref_for_open_requirements below), not by content.
+_DOCUMENT_TYPE_ALIASES: dict[str, str] = {
+    "booking_docket": "booking_form",
+    "payment_receipt": "dealer_receipt",
+}
 
 
 def _canonical_document_type(key: str) -> str:
