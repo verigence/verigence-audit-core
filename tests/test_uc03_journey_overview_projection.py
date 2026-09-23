@@ -457,3 +457,77 @@ def test_receipts_shows_real_data_for_a_document_materialized_without_ever_being
     assert receipts[0]["amount"] == 1170000
     assert receipts[0]["paymentMethodCode"] == "RTGS"
     assert receipts[0]["bankMatch"] is None
+
+
+def test_receipts_flags_a_duplicate_between_two_documents_materialized_without_review() -> None:
+    """Direct bug found live (2026-09-23): two dealer_receipt documents both
+    confirmed through the newer unified capture flow (materialized straight
+    into auditcore.payments, no dealer_receipt_review_values row -- see the
+    test above) with the same receipt_number/amount were never compared
+    against each other at all. Duplicate detection used to run only over
+    the dealer_receipt_review_values-sourced half of `result`, before the
+    materialized-without-review half was even appended -- both showed
+    isDuplicate=False unconditionally, hardcoded, and the amount was
+    double-counted into "Total collected". Confirmed against real data:
+    tenant 5fbe26ab-6ed7-444a-8488-5bfb81208588, journey
+    96336c0e-62b4-4f10-bd59-96327960f42e, receipt AMP-B/04824/26-27,
+    ₹84,308.00, two distinct DI document ids."""
+    first_id, second_id = uuid4(), uuid4()
+    connection = _ScriptedConnection(
+        [],  # dealer_receipt_review_values: nothing reviewed at all
+        [
+            {
+                "documentId": first_id,
+                "originalFilename": "receipt-a.pdf",
+                "stageCode": "BOOKING",
+                "captureStatus": "CLASSIFIED",
+                "documentTypeKey": "dealer_receipt",
+            },
+            {
+                "documentId": second_id,
+                "originalFilename": "receipt-b.pdf",
+                "stageCode": "BOOKING",
+                "captureStatus": "CLASSIFIED",
+                "documentTypeKey": "dealer_receipt",
+            },
+        ],
+        [
+            {
+                "documentId": first_id,
+                "receiptNumber": "AMP-B/04824/26-27",
+                "receiptDate": "2026-09-11",
+                "amount": 84308,
+                "paymentMethodCode": "CARD",
+                "paymentReference": None,
+                "bankMatchStatus": None,
+                "bankMatchMethod": None,
+                "bankMatchLineId": None,
+                "bankMatchLineReference": None,
+                "bankMatchLineDate": None,
+            },
+            {
+                "documentId": second_id,
+                "receiptNumber": "AMP-B/04824/26-27",
+                "receiptDate": "2026-09-11",
+                "amount": 84308,
+                "paymentMethodCode": "CARD",
+                "paymentReference": None,
+                "bankMatchStatus": None,
+                "bankMatchMethod": None,
+                "bankMatchLineId": None,
+                "bankMatchLineReference": None,
+                "bankMatchLineDate": None,
+            },
+        ],
+    )
+
+    receipts = _receipts(
+        connection,
+        tenant_id="tenant-1",
+        journey_id=uuid4(),
+        review_statuses={"BOOKING": "PENDING"},
+    )
+    assert len(receipts) == 2
+    assert receipts[0]["isDuplicate"] is False
+    assert receipts[1]["isDuplicate"] is True
+    assert receipts[1]["duplicateBasis"] == "RECEIPT_NUMBER_AND_AMOUNT"
