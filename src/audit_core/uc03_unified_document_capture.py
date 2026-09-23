@@ -143,23 +143,32 @@ def create_unified_upload_intents(
     booking_requirements, delivery_requirements = _merged_candidate_requirements(
         connection, tenant_id=tenant_id, journey_id=journey_id
     )
-    # Order decides which stage's row wins for a canonicalized type that's
-    # a candidate under both (today, only a receipt -- see
-    # _DOCUMENT_TYPE_ALIASES): _requirement_refs_by_document_type_key keeps
-    # the first row it sees for a given canonical key. Same running-total
-    # decision resolve_document_stage uses (see _receipt_defaults_to_
-    # delivery), so a new receipt upload and this journey's own later
-    # reconciliation of it never disagree about which stage it belongs to.
+    # Full (unfiltered) union here -- classification must still recognize a
+    # duplicate copy for what it actually is, and a type is a legitimate
+    # candidate at all if EITHER stage's catalog registers it, even if the
+    # requirement_ref binding below (correctly) won't come from that row.
+    full_type_universe = booking_requirements + delivery_requirements
+    # requirement_ref is what DI reports back on classification, and the
+    # document-link webhook (uc03_pc_booking_documents._discover_requirement_
+    # for_callback) resolves BOOKING/DELIVERY from that row's own process_area
+    # -- straight off the DB, at upload time, before this module's own
+    # reconciliation ever runs. So which row wins here IS the live,
+    # automatic-sync stage decision, not a cosmetic ordering choice: a
+    # requirement row can only supply a ref for the stage _stage_for_type
+    # actually assigns its canonical type to (see that function's own
+    # comment) -- never "whichever stage's catalog happened to register it
+    # first", which is the exact per-catalog dependency this module's
+    # reconciliation was fixed to not use.
     receipt_defaults_to_delivery = _receipt_defaults_to_delivery(
         connection, tenant_id=tenant_id, journey_id=journey_id,
     )
-    merged_requirements = (
-        delivery_requirements + booking_requirements
-        if receipt_defaults_to_delivery
-        else booking_requirements + delivery_requirements
+    stage_owned_requirements = _requirements_owned_by_stage(
+        booking_requirements, "BOOKING", receipt_defaults_to_delivery=receipt_defaults_to_delivery,
+    ) + _requirements_owned_by_stage(
+        delivery_requirements, "DELIVERY", receipt_defaults_to_delivery=receipt_defaults_to_delivery,
     )
     open_requirements = _requirements_with_open_slot(
-        connection, tenant_id=tenant_id, journey_id=journey_id, requirements=merged_requirements,
+        connection, tenant_id=tenant_id, journey_id=journey_id, requirements=stage_owned_requirements,
     )
     context_ref, token = _ensure_di_context(
         connection=connection,
@@ -175,12 +184,10 @@ def create_unified_upload_intents(
             tenant_id=tenant_id,
             external_context_ref=context_ref,
             phase="BOOKING",
-            # Full (unfiltered) list here -- classification must still
-            # recognize a duplicate copy for what it actually is.
-            candidate_document_type_keys=_candidate_type_keys(merged_requirements),
-            # Filtered list here -- only an open requirement gets a
-            # requirement_ref, which is what gates DI's own extraction
-            # (see _requirements_with_open_slot's own docstring).
+            candidate_document_type_keys=_candidate_type_keys(full_type_universe),
+            # Filtered to each type's static-list-correct stage AND to an
+            # open requirement slot -- only that ref gates DI's own
+            # extraction (see _requirements_with_open_slot's own docstring).
             requirement_refs_by_document_type_key=(
                 _requirement_refs_by_document_type_key(open_requirements)
             ),
@@ -311,6 +318,43 @@ _BOOKING_ONLY_DOCUMENT_TYPES = frozenset({
 _RECEIPT_CANONICAL_TYPE = "dealer_receipt"
 
 
+def _stage_for_type(canonical: str, *, receipt_defaults_to_delivery: bool) -> str:
+    """Pure type->stage decision, shared by resolve_document_stage (below,
+    at classification/reconciliation time) and create_unified_upload_intents
+    (at upload time, before classification exists) -- one definition, so a
+    document's upload-time requirement_ref binding and its later
+    reconciliation never disagree about which stage it belongs to."""
+    if canonical == _RECEIPT_CANONICAL_TYPE:
+        return "DELIVERY" if receipt_defaults_to_delivery else "BOOKING"
+    if canonical in _BOOKING_ONLY_DOCUMENT_TYPES:
+        return "BOOKING"
+    return "DELIVERY"
+
+
+def _requirements_owned_by_stage(
+    requirements: list[dict[str, Any]], stage: str, *, receipt_defaults_to_delivery: bool,
+) -> list[dict[str, Any]]:
+    """Keep only the rows whose canonical type _stage_for_type actually
+    assigns to ``stage`` -- never "this row exists in the catalog under
+    this process_area", which is the exact per-catalog dependency
+    resolve_document_stage was fixed to not use (see _BOOKING_ONLY_
+    DOCUMENT_TYPES' own comment). Used at upload time
+    (create_unified_upload_intents) to decide which row supplies a
+    requirement_ref -- the live, automatic-sync stage decision (see that
+    function's own comment) -- so a row a tenant's requirement profile
+    mistakenly registers under the wrong process_area is never used to
+    bind one."""
+    return [
+        requirement
+        for requirement in requirements
+        if requirement.get("document_type_key")
+        and _stage_for_type(
+            _canonical_document_type(str(requirement["document_type_key"])),
+            receipt_defaults_to_delivery=receipt_defaults_to_delivery,
+        ) == stage
+    ]
+
+
 def _receipt_defaults_to_delivery(
     connection: Connection, *, tenant_id: str, journey_id: UUID,
 ) -> bool:
@@ -359,14 +403,12 @@ def resolve_document_stage(
     if not classified_type:
         return "BOOKING", None
     canonical = _canonical_document_type(str(classified_type))
-    if canonical == _RECEIPT_CANONICAL_TYPE:
-        stage = "DELIVERY" if _receipt_defaults_to_delivery(
-            connection, tenant_id=tenant_id, journey_id=journey_id,
-        ) else "BOOKING"
-    elif canonical in _BOOKING_ONLY_DOCUMENT_TYPES:
-        stage = "BOOKING"
-    else:
-        stage = "DELIVERY"
+    receipt_defaults_to_delivery = (
+        _receipt_defaults_to_delivery(connection, tenant_id=tenant_id, journey_id=journey_id)
+        if canonical == _RECEIPT_CANONICAL_TYPE
+        else False
+    )
+    stage = _stage_for_type(canonical, receipt_defaults_to_delivery=receipt_defaults_to_delivery)
 
     requirements = booking_requirements if stage == "BOOKING" else delivery_requirements
     for requirement in requirements:
