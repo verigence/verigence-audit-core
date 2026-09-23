@@ -583,53 +583,44 @@ def _reconcile_documents(
     *,
     tenant_id: str,
     journey_id: UUID,
-    requirements: list[dict[str, Any]],
+    requirements: list[dict[str, Any]],  # kept for signature stability; see below -- unused now
     di_documents: list[dict[str, Any]],
 ) -> None:
-    # The UPDATE below is scoped to stage_code='BOOKING' (matching
-    # uc03_delivery_capture_v2._reconcile_delivery_documents' own, already-
-    # correct scoping -- this function was missing it). Without that scope,
-    # every read of this Booking screen re-runs this reconciliation against
-    # every di_document_id it sees at DI regardless of which stage it now
-    # belongs to, and requirements here is BOOKING-only -- so a document the
-    # unified upload screen (uc03_unified_document_capture.py) had already
-    # correctly routed to DELIVERY, with a real Delivery requirement_key,
-    # got that requirement_key silently nulled back out on the very next
-    # Booking-screen poll, every time, because its classified type matches
-    # nothing in this function's Booking-only lookup table.
-    type_to_requirement: dict[str, str] = {}
-    for requirement in requirements:
-        raw_key = str(requirement["document_type_key"])
-        requirement_key = str(requirement["requirement_key"])
-        # bind a classification of either the legacy or the canonical type
-        type_to_requirement.setdefault(raw_key, requirement_key)
-        type_to_requirement.setdefault(_canonical_document_type(raw_key), requirement_key)
+    """Direct user directive (2026-09-23): "we should allow PC to upload
+    documents without giving him pain to select the stage" -- a document
+    the unified capture screen (uc03_unified_document_capture.py) always
+    files with DI under phase="BOOKING", permanently (DI never re-files a
+    document into another phase), so this Booking screen's own poll is the
+    ONLY place that ever sees a unified-flow document in DI's response at
+    all, regardless of which stage it actually belongs to. It used to only
+    match a classified type against Booking's own requirements (the
+    ``requirements`` param, now unused -- kept in the signature so its two
+    callers need no change) and silently null the link forever whenever a
+    type actually belonged to Delivery. Delegates to
+    apply_di_classification instead, which resolves the correct stage
+    itself (booking_requirements AND delivery_requirements, freshly read)
+    and relocates the row -- so a document classifies once, from wherever
+    a PC happens to have the page open, no stage picker, ever.
 
-    for item in di_documents:
-        document_id = UUID(str(item["documentId"]))
-        classified_type = item.get("classifiedDocumentTypeKey")
-        requirement_key = type_to_requirement.get(str(classified_type)) if classified_type else None
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.document_capture_v2_documents
-                SET capture_status=:capture_status,
-                    classified_document_type_key=:classified_type,
-                    requirement_key=:requirement_key,
-                    updated_at_utc=now()
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND stage_code='BOOKING' AND di_document_id=:document_id
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "document_id": document_id,
-                "capture_status": str(item["state"]),
-                "classified_type": classified_type,
-                "requirement_key": requirement_key,
-            },
-        )
+    Delivery's own poll (_reconcile_delivery_documents) does NOT need this
+    same change: it queries DI with phase="DELIVERY", which never returns
+    a unified-flow document in the first place (they're always filed under
+    "BOOKING"), so it could never be the one to notice a misplacement here.
+    """
+    from audit_core.uc03_unified_document_capture import (
+        _MACHINE_ACTOR,
+        apply_di_classification,
+    )
+
+    apply_di_classification(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        di_documents=di_documents,
+        actor_id=_MACHINE_ACTOR,
+        actor_role="SYSTEM",
+        correlation_id="",
+    )
 
 
 def _ensure_evidence_link_for_resync(
