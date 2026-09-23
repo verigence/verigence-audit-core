@@ -329,6 +329,68 @@ def test_reconcile_unified_documents_leaves_booking_type_alone(unified_capture_s
         assert delivery_state is None
 
 
+def test_requirements_with_open_slot_excludes_a_fulfilled_single_document_requirement(
+    unified_capture_setup,
+) -> None:
+    """Confirmed live (2026-09-23): a second upload of a single-document
+    requirement type (e.g. a duplicate booking_form) still got handed the
+    same requirement_ref DI already had for the first one, so it extracted
+    -- and then permanently failed to link (a requirement can only have one
+    active evidence link), wasting DI compute on data nothing would ever
+    read. _requirements_with_open_slot is what lets Audit Core simply not
+    hand out a ref for an already-fulfilled single-document requirement in
+    the first place -- DI still classifies the duplicate (candidate_
+    document_type_keys is built from the full, unfiltered list separately),
+    it just never gets queued for extraction.
+    """
+    from audit_core.uc03_document_capture_v2 import (
+        _base_requirements,
+        _requirements_with_open_slot,
+    )
+
+    setup = unified_capture_setup
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        requirements = _base_requirements(connection, setup["tenant_id"], setup["journey_id"])
+        booking_docket = next(r for r in requirements if r["requirement_key"] == "BOOKING_DOCKET")
+
+        # No evidence yet -- BOOKING_DOCKET has an open slot.
+        open_before = _requirements_with_open_slot(
+            connection, tenant_id=setup["tenant_id"], journey_id=setup["journey_id"],
+            requirements=requirements,
+        )
+        assert "BOOKING_DOCKET" in {r["requirement_key"] for r in open_before}
+
+        connection.execute(
+            text("""
+                INSERT INTO auditcore.evidence (
+                    tenant_id, journey_id, customer_id, journey_document_requirement_id,
+                    di_subject_id, di_document_id, evidence_purpose
+                ) VALUES (
+                    :t, :j, :cu, :req, :subj, :doc, 'DOCUMENT_CAPTURE'
+                )
+                """),
+            {
+                "t": setup["tenant_id"], "j": setup["journey_id"],
+                "cu": connection.execute(
+                    text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+                    {"t": setup["tenant_id"], "j": setup["journey_id"]},
+                ).scalar_one(),
+                "req": booking_docket["requirement_ref"],
+                "subj": uuid4(), "doc": uuid4(),
+            },
+        )
+
+        open_after = _requirements_with_open_slot(
+            connection, tenant_id=setup["tenant_id"], journey_id=setup["journey_id"],
+            requirements=requirements,
+        )
+        assert "BOOKING_DOCKET" not in {r["requirement_key"] for r in open_after}
+        # Nothing else in the requirement set was touched by this one
+        # requirement becoming fulfilled.
+        assert len(open_after) == len(open_before) - 1
+
+
 def test_delivery_checklist_read_seeds_requirements_before_any_upload(unified_capture_setup) -> None:
     """Reported live: the combined Booking+Delivery checklist on Capture New
     Booking showed a Delivery section only after a document had been

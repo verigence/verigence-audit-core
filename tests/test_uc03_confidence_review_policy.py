@@ -262,7 +262,7 @@ def test_sync_stagger_seconds_spreads_a_batch_and_caps_it() -> None:
 def test_run_sync_booking_document_task_awaits_its_stagger_before_the_retry_loop() -> None:
     source = inspect.getsource(confidence_policy._run_sync_booking_document_task)
     assert "initial_delay_seconds" in source
-    assert source.index("anyio.sleep(initial_delay_seconds)") < source.index("max_attempts = 6")
+    assert source.index("anyio.sleep(initial_delay_seconds)") < source.index("max_attempts = 13")
 
 
 def test_resync_endpoints_stagger_their_batch_dispatch() -> None:

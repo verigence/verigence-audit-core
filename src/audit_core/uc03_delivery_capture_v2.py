@@ -502,6 +502,11 @@ def create_delivery_upload_intents_v2(
         authorization_client=authorization_client,
     )
     requirements = _delivery_requirements(connection, tenant_id, journey_id)
+    from audit_core.uc03_document_capture_v2 import _requirements_with_open_slot
+
+    open_requirements = _requirements_with_open_slot(
+        connection, tenant_id=tenant_id, journey_id=journey_id, requirements=requirements,
+    )
     context_ref, token = _ensure_di_context(
         connection=connection,
         engine=engine,
@@ -518,7 +523,7 @@ def create_delivery_upload_intents_v2(
             phase="DELIVERY",
             candidate_document_type_keys=_candidate_type_keys(requirements),
             requirement_refs_by_document_type_key=(
-                _requirement_refs_by_document_type_key(requirements)
+                _requirement_refs_by_document_type_key(open_requirements)
             ),
             files=[item.model_dump() for item in command.files],
         )
@@ -1331,27 +1336,28 @@ def resync_delivery_capture_v2(
             security_client=security_client,
             di_client=di_client,
         )
-        try:
-            payload = v2_client.list_documents(
-                token=token,
-                tenant_id=tenant_id,
-                external_context_ref=context_ref,
-                phase="DELIVERY",
-            )
-        except DiCaptureV2Error as exc:
-            _log_di_capture_v2_failure(
-                operation="list_documents", exc=exc, tenant_id=tenant_id,
-                journey_id=journey_id, context_ref=context_ref,
-            )
-            raise DependencyUnavailableError(
-                detail="Document status is temporarily unavailable -- try resync again shortly."
-            ) from exc
-        _reconcile_delivery_documents(
+        # reconcile_unified_documents, not the narrower Delivery-only
+        # _reconcile_delivery_documents this used to call -- same fix as
+        # uc03_document_capture_v2.resync_booking_capture_v2 for the
+        # mirror-image gap: a document whose real requirement is
+        # Booking-side but got defaulted to the wrong stage at upload time
+        # is just as unlinkable via this Delivery-only reconciliation as
+        # the Booking-only one was for a Delivery-typed document. See that
+        # function's own comment for the full explanation.
+        from audit_core.uc03_unified_document_capture import (
+            reconcile_unified_documents,
+        )
+
+        reconcile_unified_documents(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
-            requirements=requirements,
-            di_documents=list(payload.get("documents") or []),
+            actor_id=f"manual-resync:{human_principal.subject}",
+            actor_role="PC",
+            correlation_id="",
+            v2_client=v2_client,
+            context_ref=context_ref,
+            token=token,
         )
 
     documents = _linked_delivery_documents(connection, tenant_id, journey_id)
