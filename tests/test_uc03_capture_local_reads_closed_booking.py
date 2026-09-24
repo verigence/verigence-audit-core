@@ -1,5 +1,6 @@
 from uuid import UUID
 
+from audit_core import uc03_document_capture_v2
 from audit_core.security import HumanPrincipal
 from audit_core.uc03_capture_local_reads import (
     get_booking_capture_local_v2,
@@ -33,6 +34,7 @@ def test_booking_capture_local_read_allows_closed_booking(monkeypatch) -> None:
     monkeypatch.setitem(globals_, "_base_requirements", lambda *args: [])
     monkeypatch.setitem(globals_, "_declarations", lambda *args: {})
     monkeypatch.setitem(globals_, "_linked_documents", lambda *args: [])
+    monkeypatch.setattr(uc03_document_capture_v2, "_extracted_document_ids", lambda *args: set())
 
     result = get_booking_capture_local_v2(
         tenant_id="tenant-1",
