@@ -174,6 +174,74 @@ def test_documents_include_v2_capture_and_dedupe_legacy_evidence() -> None:
     assert str(documents[1]["documentId"]) == str(legacy_only_document_id)
 
 
+def test_documents_nulls_requirement_key_on_extra_copies_of_a_single_document_type() -> None:
+    """Reported live (2026-09-24): Journey 360 said Uploaded 5 / Classified 5 /
+    Duplicates 0 while the Documents checklist -- correctly -- only counted 3
+    of 29 requirements received. document_capture_v2_documents.requirement_key
+    is set unconditionally by type match alone, so a 2nd/3rd copy of the same
+    non-repeatable document (e.g. Booking Form) keeps the SAME requirement_key
+    as the original, and documentExtractionCounts' own duplicate check
+    (`!doc.requirementKey`) could never see it. Only the first copy (by
+    created_at_utc, which the query already orders by) should keep its key;
+    later copies of the same non-repeatable type must come back with
+    requirementKey=None so this endpoint agrees with the checklist."""
+    first_id, second_id, receipt_a, receipt_b = uuid4(), uuid4(), uuid4(), uuid4()
+    connection = _ScriptedConnection(
+        [
+            {
+                "documentId": first_id,
+                "requirementKey": "booking_form",
+                "documentTypeKey": "booking_form",
+                "processArea": "BOOKING",
+                "processingStatus": "CLASSIFIED",
+                "originalFilename": "booking-form-1.pdf",
+                "linkedAtUtc": None,
+            },
+            {
+                "documentId": second_id,
+                "requirementKey": "booking_form",
+                "documentTypeKey": "booking_form",
+                "processArea": "BOOKING",
+                "processingStatus": "CLASSIFIED",
+                "originalFilename": "booking-form-2.pdf",
+                "linkedAtUtc": None,
+            },
+            # Repeatable requirement -- both copies must keep their key.
+            {
+                "documentId": receipt_a,
+                "requirementKey": "booking_payment_receipt",
+                "documentTypeKey": "dealer_receipt",
+                "processArea": "BOOKING",
+                "processingStatus": "CLASSIFIED",
+                "originalFilename": "receipt-a.pdf",
+                "linkedAtUtc": None,
+            },
+            {
+                "documentId": receipt_b,
+                "requirementKey": "booking_payment_receipt",
+                "documentTypeKey": "dealer_receipt",
+                "processArea": "BOOKING",
+                "processingStatus": "CLASSIFIED",
+                "originalFilename": "receipt-b.pdf",
+                "linkedAtUtc": None,
+            },
+        ],
+        [],
+    )
+
+    documents = _documents(
+        connection,
+        tenant_id="tenant-1",
+        journey_id=uuid4(),
+        review_statuses={"BOOKING": "PENDING"},
+    )
+    by_id = {str(d["documentId"]): d for d in documents}
+    assert by_id[str(first_id)]["requirementKey"] == "booking_form"
+    assert by_id[str(second_id)]["requirementKey"] is None
+    assert by_id[str(receipt_a)]["requirementKey"] == "booking_payment_receipt"
+    assert by_id[str(receipt_b)]["requirementKey"] == "booking_payment_receipt"
+
+
 def test_invoices_projects_every_reviewed_invoice_with_stringified_ids() -> None:
     # Feeds the Invoice tab: one row per reviewed invoice-family document
     # (invoice_review_values stores multiple invoices on one journey
