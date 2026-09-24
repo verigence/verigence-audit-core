@@ -30,6 +30,7 @@ from audit_core.uc03_document_capture_v2 import (
     UploadIntentResult,
     _candidate_type_keys,
     _ensure_di_context,
+    _extracted_document_ids,
     _human_actor_id,
     _log_di_capture_v2_failure,
     _requirement_refs_by_document_type_key,
@@ -343,11 +344,14 @@ def _build_delivery_capture_response(
 
 def _build_local_delivery_capture_response(
     *,
+    connection: Connection,
+    tenant_id: str,
     journey_id: UUID,
     requirements: list[dict[str, Any]],
     audit_documents: list[dict[str, Any]],
     submitted: bool,
 ) -> DeliveryCaptureV2Response:
+    extracted_ids = _extracted_document_ids(connection, tenant_id, journey_id)
     di_documents = [
         {
             "documentId": str(row["di_document_id"]),
@@ -356,7 +360,7 @@ def _build_local_delivery_capture_response(
             "classifiedDocumentTypeKey": row.get("classified_document_type_key"),
             "originalFilename": str(row["original_filename"]),
             "contentUrl": None,
-            "processingStatus": None,
+            "processingStatus": "PROCESSED" if str(row["di_document_id"]) in extracted_ids else None,
         }
         for row in audit_documents
     ]
@@ -386,6 +390,8 @@ def _read_delivery_capture(
     submitted = state.get("capture_completed_at_utc") is not None
     if not audit_documents:
         return _build_local_delivery_capture_response(
+            connection=connection,
+            tenant_id=tenant_id,
             journey_id=journey_id,
             requirements=requirements,
             audit_documents=audit_documents,

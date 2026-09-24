@@ -13,6 +13,12 @@ class _FakeMappingResult:
     def one_or_none(self):
         return None
 
+    def __iter__(self):
+        # _extracted_document_ids iterates the raw execute() result directly
+        # (no .mappings() call) -- no rows means no document on this journey
+        # has ever produced an extracted field, which is exactly true here.
+        return iter(())
+
 
 class _FakeConnection:
     def __init__(self) -> None:
