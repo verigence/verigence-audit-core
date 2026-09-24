@@ -114,6 +114,7 @@ def _run_audit_core_rules_for_stage(
     from audit_core.uc03_customer_identity_consistency import (
         sync_customer_identity_consistency,
     )
+    from audit_core.uc03_deal_reconciliation import sync_deal_reconciliation
     from audit_core.uc03_duplicate_booking_detection import (
         sync_duplicate_booking_detection,
     )
@@ -170,6 +171,37 @@ def _run_audit_core_rules_for_stage(
             rule_code="MODEL_NOT_IDENTIFIED", triggering_event=_TRIGGERING_EVENT, result=model_result,
         )
         _record("MODEL_NOT_IDENTIFIED", "ERROR" if model_result.get("error") else ("SKIPPED" if model_result.get("skipped") else ("FAIL" if model_result.get("raised") else "PASS")))
+
+        # Direct user correction (2026-09-24): price/discount standards
+        # (uc03_deal_reconciliation.sync_deal_reconciliation) previously had
+        # exactly one trigger -- the moment SKU resolution itself completes
+        # (uc03_model_resolution.py) -- with no way to re-run it afterward.
+        # A journey resolved before a discount scheme covering its own
+        # booking date was uploaded (confirmed live: booking date predates
+        # the OEM master's own effective_from) stayed permanently stuck
+        # showing zero eligible discounts, even after the correct master
+        # data existed, because nothing ever asked the question again. This
+        # button already re-evaluates everything else "against data already
+        # durably stored" -- deal reconciliation belongs in that same set.
+        deal_result = sync_deal_reconciliation(
+            connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
+        )
+        record_execution(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            rule_code="DEAL_RECONCILIATION_REFRESH", triggering_event=_TRIGGERING_EVENT,
+            outcome=(
+                "ERROR" if deal_result.get("error")
+                else "SKIPPED" if deal_result.get("skipped")
+                else "PASS"
+            ),
+            reason=str(deal_result.get("reason")) if deal_result.get("skipped") else None,
+        )
+        _record(
+            "DEAL_RECONCILIATION_REFRESH",
+            "ERROR" if deal_result.get("error")
+            else "SKIPPED" if deal_result.get("skipped")
+            else "PASS",
+        )
     else:
         invoice_model_result = sync_model_resolution_from_invoice_with_escalation(
             connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
