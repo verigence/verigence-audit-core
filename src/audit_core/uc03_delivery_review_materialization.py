@@ -19,6 +19,7 @@ see ``materialize_delivery_date``.
 import json
 import logging
 from datetime import UTC, date, datetime, time
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -30,7 +31,11 @@ from audit_core.uc03_attribute_mapping import spec_for_field
 from audit_core.uc03_delivery_commands import _machine_flag, _set_stage_flag_status
 from audit_core.uc03_document_registry import is_receipt_document_type
 from audit_core.uc03_finance_disbursement_resolution import resolve_finance_disbursement
-from audit_core.uc03_invoice_materialization import materialize_reviewed_invoices
+from audit_core.uc03_invoice_materialization import (
+    _to_decimal,
+    _upsert_commercial_line,
+    materialize_reviewed_invoices,
+)
 from audit_core.uc03_payment_reconciliation import (
     materialize_reviewed_bank_statements,
     reconcile_payments,
@@ -70,6 +75,19 @@ _RTO_CHALLAN_FIELDS = {
 # registration_state/district/territory/type fields above.
 _FINANCED_BY_FIELD_KEYS = ("financed_by",)
 _HP_CHARGES_FIELD_KEYS = ("hp_charges_amount",)
+
+# Direct user correction (2026-09-24): "MV Tax is Road Tax and Registration
+# Charges can be Hypothecation Charges" -- a real RTO Challan's own money
+# breakdown varies too much by state/dealer to have named fields per charge
+# (see rto_challan.py's own line_items schema), so it's captured as a free-
+# form list instead. registration_charges/road_tax_amount already exist as
+# commercial-line components with rto_challan as their TOP source_priority
+# (uc03_attribute_mapping.py's _RTO) -- that priority was configured with
+# nothing ever feeding it, since no derivation from line_items existed
+# until now. Matched by substring on description_raw (case-insensitive):
+# whichever line is MV Tax is road_tax_amount, everything else on the
+# Challan sums into registration_charges.
+_ROAD_TAX_LINE_ITEM_MATCH = "mv tax"
 
 _INSURANCE_FIELDS = {
     "insurer_name": "insurer_name",
@@ -500,8 +518,12 @@ def materialize_delivery_registration(
             values[destination] = text_value
             document_for_field[destination] = document
 
+    commercial_lines_written = _materialize_rto_challan_commercial_lines(
+        connection, tenant_id=tenant_id, journey_id=journey_id, documents=documents,
+    )
+
     if not values:
-        return 0
+        return commercial_lines_written
 
     existing = connection.execute(
         text(
@@ -536,7 +558,7 @@ def materialize_delivery_registration(
                     break
 
     if existing is not None and all(existing[column] == merged[column] for column in columns):
-        return 0
+        return commercial_lines_written
 
     connection.execute(
         text(
@@ -575,10 +597,83 @@ def materialize_delivery_registration(
             "source_evidence_id": source_evidence_id,
         },
     )
-    return sum(
+    return commercial_lines_written + sum(
         1 for column in columns
         if values.get(column) is not None and (existing is None or existing[column] is None)
     )
+
+
+def _materialize_rto_challan_commercial_lines(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    documents: list[Any],
+) -> int:
+    """Derive registration_charges/road_tax_amount commercial-line actuals
+    from an RTO Challan's own line_items -- see _ROAD_TAX_LINE_ITEM_MATCH's
+    own comment for why these two components have no dedicated schema
+    fields on rto_challan.py, and why source_priority already ranks
+    rto_challan above every other document type for them despite nothing
+    having ever fed it until now.
+    """
+    selected = _best_field(documents, ("line_items",), document_types={_RTO_CHALLAN_DOCUMENT_TYPE})
+    if selected is None:
+        return 0
+    document, field = selected
+    line_items = getattr(field, "value", None)
+    if not isinstance(line_items, list):
+        return 0
+
+    def _net(item: dict[str, Any]) -> Decimal:
+        total = _to_decimal(item.get("total"))
+        if total is not None:
+            return total
+        amount = _to_decimal(item.get("amount")) or Decimal(0)
+        rebate = _to_decimal(item.get("rebate_waiver_amount")) or Decimal(0)
+        penalty = _to_decimal(item.get("fine_penalty_amount")) or Decimal(0)
+        return amount - rebate + penalty
+
+    road_tax_total = Decimal(0)
+    registration_charges_total = Decimal(0)
+    seen_any = False
+    for item in line_items:
+        if not isinstance(item, dict):
+            continue
+        description = str(item.get("description_raw") or "").strip().casefold()
+        if not description:
+            continue
+        seen_any = True
+        if _ROAD_TAX_LINE_ITEM_MATCH in description:
+            road_tax_total += _net(item)
+        else:
+            registration_charges_total += _net(item)
+
+    if not seen_any:
+        return 0
+
+    document_id = getattr(document, "documentId", None)
+    if document_id is None:
+        return 0
+    evidence_id = _source_evidence(document)
+
+    written = 0
+    for component_key, amount in (
+        ("road_tax_amount", road_tax_total),
+        ("registration_charges", registration_charges_total),
+    ):
+        if _upsert_commercial_line(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            component_key=component_key,
+            amount=amount,
+            document_type=_RTO_CHALLAN_DOCUMENT_TYPE,
+            document_id=document_id,
+            evidence_id=evidence_id,
+        ):
+            written += 1
+    return written
 
 
 def materialize_delivery_finance(
