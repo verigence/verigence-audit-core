@@ -4,6 +4,7 @@ import os
 from uuid import uuid4
 
 import pytest
+from conftest import delete_tenant_data
 from sqlalchemy import create_engine, text
 
 from audit_core.uc03_run_all_rules import _run_audit_core_rules_for_stage
@@ -58,10 +59,13 @@ def run_all_rules_setup():
         ).scalar_one()
     engine.dispose()
     engine = create_engine(database_url)
-    with engine.begin() as c:
-        c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
-        yield c, tenant_id, journey_id
-    engine.dispose()
+    try:
+        with engine.begin() as c:
+            c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+            yield c, tenant_id, journey_id
+    finally:
+        delete_tenant_data(engine, tenant_id)
+        engine.dispose()
 
 
 def test_run_all_rules_for_a_fresh_booking_journey_returns_all_expected_rule_codes(
@@ -76,7 +80,8 @@ def test_run_all_rules_for_a_fresh_booking_journey_returns_all_expected_rule_cod
     rule_codes = {r.ruleCode for r in results}
     assert rule_codes == {
         "WRONG_DOCUMENT", "DUPLICATE_RECEIPT", "DUPLICATE_BOOKING", "MODEL_NOT_IDENTIFIED",
-        "MANUAL_VERIFICATION", "PAYMENT_BANK_UNMATCHED", "AUTOMATED_SYNC_FAILURE",
+        "DEAL_RECONCILIATION_REFRESH", "MANUAL_VERIFICATION", "PAYMENT_BANK_UNMATCHED",
+        "AUTOMATED_SYNC_FAILURE",
     }
     # Nothing has been extracted yet -- every one of these is a clean SKIPPED,
     # except AUTOMATED_SYNC_FAILURE, which has no SKIPPED state of its own
@@ -102,7 +107,7 @@ def test_run_all_rules_writes_execution_log_rows(run_all_rules_setup) -> None:
         ),
         {"t": tenant_id, "j": journey_id},
     ).mappings().all()
-    assert len(rows) == 7
+    assert len(rows) == 8
     assert all(row["triggering_event"] == "MANUAL_RUN_ALL_RULES" for row in rows)
 
 
