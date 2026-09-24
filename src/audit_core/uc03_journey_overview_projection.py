@@ -29,6 +29,7 @@ from audit_core.uc03_masters_alignment import (
     commercial_key_for_price_component,
     registration_basis,
 )
+from audit_core.uc03_pc_booking_documents import _is_repeatable_requirement
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/uc03",
@@ -264,12 +265,31 @@ def _documents(
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
 
+    # A non-repeatable requirement (Booking Form, PAN, Aadhaar, ...) only
+    # ever has ONE document actually occupying its slot -- the earliest
+    # classified copy (rows are already ordered by created_at_utc above).
+    # document_capture_v2_documents.requirement_key is set unconditionally
+    # by type match alone (see uc03_delivery_capture_v2._link_document),
+    # so a 2nd/3rd upload of the same type keeps the SAME requirement_key
+    # as the original, and this overview's own duplicate check
+    # (Journey360Page.documentExtractionCounts: "no requirementKey" =
+    # duplicate) can never catch it. Null the key on every copy after the
+    # first here so this endpoint agrees with the Documents checklist
+    # ("N of M received" + its own "Extra copies" list), which already
+    # binds only the first copy to the requirement's slot.
+    first_seen_for_requirement: set[str] = set()
     documents: list[dict[str, Any]] = []
     seen_document_ids: set[str] = set()
     for row in v2_rows:
         item = dict(row)
         document_id = str(item["documentId"])
         seen_document_ids.add(document_id)
+        requirement_key = item.get("requirementKey")
+        if requirement_key and not _is_repeatable_requirement(requirement_key):
+            if requirement_key in first_seen_for_requirement:
+                item["requirementKey"] = None
+            else:
+                first_seen_for_requirement.add(requirement_key)
         item.update(
             {
                 "evidenceId": None,
