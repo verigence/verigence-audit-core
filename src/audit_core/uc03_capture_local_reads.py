@@ -62,6 +62,8 @@ def get_booking_capture_local_v2(
         for_update=False,
     )
     return _build_local_capture_response(
+        connection=connection,
+        tenant_id=tenant_id,
         journey_id=journey_id,
         requirements=_base_requirements(connection, tenant_id, journey_id),
         declaration_rows=_declarations(connection, tenant_id, journey_id),
@@ -119,6 +121,8 @@ def get_delivery_capture_local_v2(
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().one_or_none()
     return _build_local_delivery_capture_response(
+        connection=connection,
+        tenant_id=tenant_id,
         journey_id=journey_id,
         requirements=_delivery_requirements(connection, tenant_id, journey_id),
         audit_documents=_linked_delivery_documents(connection, tenant_id, journey_id),

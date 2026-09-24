@@ -376,6 +376,32 @@ def _declarations(connection: Connection, tenant_id: str, journey_id: UUID) -> d
     return {str(row["condition_key"]): dict(row) for row in rows}
 
 
+def _extracted_document_ids(connection: Connection, tenant_id: str, journey_id: UUID) -> set[str]:
+    """Documents that have actually produced at least one extracted field --
+    the read-only local capture responses (_build_local_capture_response /
+    _build_local_delivery_capture_response) never call DI live for
+    performance, so they can't ask DI's own processing status. This is the
+    DB-only equivalent: a row here only ever exists once DI extraction has
+    genuinely completed for that document (see uc03_journey_reviewed_details,
+    which reads the same table). Used to tell the checklist card apart from
+    "Classified" (DI knows what it is, nothing extracted from it yet) --
+    direct user correction (2026-09-24): the checklist previously hardcoded
+    processingStatus=None for every document, so a fully reviewed document
+    could never show anything but "Classified", forever.
+    """
+    rows = connection.execute(
+        text(
+            """
+            SELECT DISTINCT di_document_id
+            FROM auditcore.journey_document_extracted_fields
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    )
+    return {str(row[0]) for row in rows}
+
+
 def _linked_documents(connection: Connection, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
     rows = connection.execute(
         text(
@@ -885,11 +911,14 @@ def _build_capture_response(
 
 def _build_local_capture_response(
     *,
+    connection: Connection,
+    tenant_id: str,
     journey_id: UUID,
     requirements: list[dict[str, Any]],
     declaration_rows: dict[str, dict[str, Any]],
     audit_documents: list[dict[str, Any]],
 ) -> BookingCaptureV2Response:
+    extracted_ids = _extracted_document_ids(connection, tenant_id, journey_id)
     di_documents = [
         {
             "documentId": str(row["di_document_id"]),
@@ -898,7 +927,7 @@ def _build_local_capture_response(
             "classifiedDocumentTypeKey": row.get("classified_document_type_key"),
             "originalFilename": str(row["original_filename"]),
             "contentUrl": None,
-            "processingStatus": None,
+            "processingStatus": "PROCESSED" if str(row["di_document_id"]) in extracted_ids else None,
         }
         for row in audit_documents
     ]
@@ -928,6 +957,8 @@ def _read_capture(
 
     if not audit_documents:
         return _build_local_capture_response(
+            connection=connection,
+            tenant_id=tenant_id,
             journey_id=journey_id,
             requirements=requirements,
             declaration_rows=declaration_rows,
@@ -1059,6 +1090,8 @@ def complete_booking_capture_v2(
             )
 
         local_capture = _build_local_capture_response(
+            connection=connection,
+            tenant_id=tenant_id,
             journey_id=journey_id,
             requirements=_base_requirements(connection, tenant_id, journey_id),
             declaration_rows=_declarations(connection, tenant_id, journey_id),
@@ -1406,6 +1439,8 @@ def set_booking_declaration_v2(
         },
     )
     return _build_local_capture_response(
+        connection=connection,
+        tenant_id=tenant_id,
         journey_id=journey_id,
         requirements=requirements,
         declaration_rows=_declarations(connection, tenant_id, journey_id),

@@ -250,6 +250,14 @@ def test_requirement_ref_map_uses_only_the_canonical_key() -> None:
     assert set(refs) <= set(_candidate_type_keys(requirements))
 
 
+class _NoExtractionsConnection:
+    """Stands in for _extracted_document_ids' own query -- no rows, i.e. no
+    document on this journey has ever produced an extracted field yet."""
+
+    def execute(self, *_args, **_kwargs):
+        return []
+
+
 def test_local_completion_check_uses_reconciled_classified_links() -> None:
     requirements = [_requirement()]
     audit_documents = [{
@@ -262,6 +270,8 @@ def test_local_completion_check_uses_reconciled_classified_links() -> None:
     }]
 
     result = _build_local_capture_response(
+        connection=_NoExtractionsConnection(),
+        tenant_id="tenant-1",
         journey_id=JOURNEY_ID,
         requirements=requirements,
         declaration_rows={},
@@ -270,6 +280,46 @@ def test_local_completion_check_uses_reconciled_classified_links() -> None:
 
     assert result.canContinue is True
     assert result.requirements[0].state == "UPLOADED"
+
+
+class _OneExtractedDocumentConnection:
+    """Stands in for _extracted_document_ids' own query -- exactly one
+    document on this journey has produced an extracted field."""
+
+    def __init__(self, document_id: UUID) -> None:
+        self._document_id = document_id
+
+    def execute(self, *_args, **_kwargs):
+        return [(self._document_id,)]
+
+
+def test_local_completion_check_reports_processed_once_fields_are_extracted() -> None:
+    """Direct user correction (2026-09-24): the Documents checklist card
+    showed "Classified" forever, even for a fully reviewed document, because
+    this read-only response hardcoded processingStatus=None regardless of
+    actual extraction state. Once journey_document_extracted_fields has a
+    row for this document, the response must say PROCESSED so the frontend's
+    cardStatus() can show "Extracted" instead."""
+    requirements = [_requirement()]
+    audit_documents = [{
+        "di_document_id": DOCUMENT_ID,
+        "client_upload_id": "client-upload-1",
+        "capture_status": "CLASSIFIED",
+        "classified_document_type_key": "booking_docket",
+        "requirement_key": "booking_docket",
+        "original_filename": "booking.pdf",
+    }]
+
+    result = _build_local_capture_response(
+        connection=_OneExtractedDocumentConnection(DOCUMENT_ID),
+        tenant_id="tenant-1",
+        journey_id=JOURNEY_ID,
+        requirements=requirements,
+        declaration_rows={},
+        audit_documents=audit_documents,
+    )
+
+    assert result.requirements[0].document.processingStatus == "PROCESSED"
 
 
 def test_booking_resync_only_includes_classified_documents() -> None:

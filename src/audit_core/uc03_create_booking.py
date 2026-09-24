@@ -509,6 +509,8 @@ def create_booking(
 
     journey_id = UUID(str(body["journeyId"]))
     capture = _build_local_capture_response(
+        connection=connection,
+        tenant_id=tenant_id,
         journey_id=journey_id,
         requirements=_base_requirements(connection, tenant_id, journey_id),
         declaration_rows=_declarations(connection, tenant_id, journey_id),
