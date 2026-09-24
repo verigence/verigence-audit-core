@@ -366,24 +366,58 @@ def _requirements_owned_by_stage(
 
 
 def _receipt_defaults_to_delivery(
-    connection: Connection, *, tenant_id: str, journey_id: UUID,
+    connection: Connection, *, tenant_id: str, journey_id: UUID, document_id: UUID | None = None,
 ) -> bool:
     """True once this journey's already-extracted receipts (any stage,
     canonicalized -- see uc03_duplicate_receipt_detection._receipt_documents)
     sum to at least the tenant's minimum booking amount: a receipt beyond
     that point is no longer proving the booking payment, so it defaults to
-    Delivery. A receipt's own amount is only known after extraction, and
-    extraction cannot run before its stage is resolved -- so this can only
-    ever total already-extracted receipts, never the one currently being
-    resolved. Self-corrects on the next reconciliation pass as more receipts
-    get processed, same as every other resolution in this module.
+    Delivery.
+
+    Reported live (2026-09-24): a single receipt whose OWN amount alone
+    met the minimum showed as "Missing" on Booking's own checklist forever
+    after. A receipt's own amount is only known after extraction, so at
+    the moment it is FIRST classified it can never appear in "already-
+    extracted receipts" -- but apply_di_classification re-resolves every
+    already-classified document's stage on every subsequent poll too
+    (self-correcting a receipt that arrives out of order), and by then
+    that receipt's own extracted amount IS in the total, so it could tip
+    itself over the threshold and relocate itself to Delivery, orphaning
+    the Booking requirement it had already correctly fulfilled.
+
+    document_id (when given -- re-resolving an ALREADY-extracted receipt,
+    not a brand-new upload) excludes that receipt from its own check by
+    only summing the receipts that come BEFORE it in receipt-date order
+    (ties broken by document_id for a stable order) -- mirroring
+    evaluate_minimum_booking_payment's own date-ordering, for the same
+    "a backdated receipt can shift the boundary" reason. The receipt that
+    itself completes the minimum still belongs to Booking; only ones whose
+    position falls after that point are further payments. Without
+    document_id (upload time, before this document has any row at all),
+    every already-extracted receipt unconditionally precedes it, so this
+    collapses to a plain unconditional sum.
     """
     from audit_core.uc03_booking_confirmation_rules import _minimum_booking_amount
     from audit_core.uc03_duplicate_receipt_detection import _receipt_documents
 
-    records = _receipt_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
-    total = sum((r.amount for r in records if r.amount is not None), Decimal(0))
-    return total >= _minimum_booking_amount(connection, tenant_id=tenant_id)
+    minimum = _minimum_booking_amount(connection, tenant_id=tenant_id)
+    records = [
+        r for r in _receipt_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
+        if r.amount is not None
+    ]
+    if document_id is None:
+        return sum((r.amount for r in records), Decimal(0)) >= minimum
+
+    records.sort(key=lambda r: (r.receipt_date or "9999-99-99", str(r.document_id)))
+    running = Decimal(0)
+    for record in records:
+        if record.document_id == document_id:
+            return running >= minimum
+        running += record.amount
+    # This document's own extracted amount isn't in the durable set at all
+    # (shouldn't happen once document_id is passed, but stay conservative
+    # rather than raise) -- treat it like a brand-new, not-yet-extracted one.
+    return sum((r.amount for r in records), Decimal(0)) >= minimum
 
 
 def resolve_document_stage(
@@ -394,6 +428,7 @@ def resolve_document_stage(
     journey_id: UUID,
     booking_requirements: list[dict[str, Any]],
     delivery_requirements: list[dict[str, Any]],
+    document_id: UUID | None = None,
 ) -> tuple[str, str | None]:
     """(stage_code, requirement_key) for a classified document type.
 
@@ -409,12 +444,19 @@ def resolve_document_stage(
 
     An unrecognized type (no classification at all) defaults to BOOKING,
     the stage that always exists.
+
+    document_id identifies the specific document being (re-)resolved --
+    passed through to _receipt_defaults_to_delivery so an already-extracted
+    receipt is never checked against a running total that includes its own
+    amount (see that function's own docstring for the live bug this fixes).
     """
     if not classified_type:
         return "BOOKING", None
     canonical = _canonical_document_type(str(classified_type))
     receipt_defaults_to_delivery = (
-        _receipt_defaults_to_delivery(connection, tenant_id=tenant_id, journey_id=journey_id)
+        _receipt_defaults_to_delivery(
+            connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+        )
         if canonical == _RECEIPT_CANONICAL_TYPE
         else False
     )
@@ -553,6 +595,7 @@ def apply_di_classification(
             journey_id=journey_id,
             booking_requirements=booking_requirements,
             delivery_requirements=delivery_requirements,
+            document_id=document_id,
         )
         if stage_code == "DELIVERY" and not delivery_started:
             if _delivery_state(connection, tenant_id=tenant_id, journey_id=journey_id) is None:

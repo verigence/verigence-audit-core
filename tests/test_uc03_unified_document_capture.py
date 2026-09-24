@@ -912,6 +912,105 @@ def test_receipt_defaults_to_delivery_once_running_total_reaches_minimum(unified
         assert stage == "DELIVERY"
 
 
+def test_receipt_does_not_relocate_itself_once_its_own_amount_meets_minimum(
+    unified_capture_setup,
+) -> None:
+    """Live bug (2026-09-24): a single receipt whose own extracted amount
+    alone already meets the minimum showed as "Missing" on Booking's own
+    checklist forever after. apply_di_classification re-resolves every
+    already-classified document's stage on every subsequent poll, not just
+    brand-new ones -- by the time this receipt's own amount is durably
+    extracted, resolving ITS OWN stage counted itself in the running total,
+    tipping it over the threshold and relocating it to Delivery. Passing
+    its own document_id must exclude it from its own check."""
+    setup = unified_capture_setup
+    receipt_id = uuid4()
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        _seed_extracted_field(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=setup["journey_id"],
+            di_document_id=receipt_id,
+            actor_id=setup["actor_id"],
+            stage_code="BOOKING",
+            source_canonical_field_id="receipt-amount-1",
+            document_type_key="dealer_receipt",
+            field_key="amount_paid",
+            value="15000",
+        )
+
+        # The old, buggy call shape (no document_id): this receipt's own
+        # amount alone already crosses the ₹11,000 default minimum.
+        assert _receipt_defaults_to_delivery(
+            connection, tenant_id=setup["tenant_id"], journey_id=setup["journey_id"],
+        ) is True
+
+        # With its own document_id passed: excluded from its own check --
+        # no OTHER receipt exists yet, so it must stay Booking.
+        assert _receipt_defaults_to_delivery(
+            connection, tenant_id=setup["tenant_id"], journey_id=setup["journey_id"],
+            document_id=receipt_id,
+        ) is False
+
+        stage, _ = resolve_document_stage(
+            connection, "dealer_receipt", tenant_id=setup["tenant_id"], journey_id=setup["journey_id"],
+            booking_requirements=[], delivery_requirements=[], document_id=receipt_id,
+        )
+        assert stage == "BOOKING"
+
+
+def test_receipts_that_together_complete_the_minimum_all_stay_booking(
+    unified_capture_setup,
+) -> None:
+    """Two ₹6,000 receipts (₹12,000 total) against the ₹11,000 default
+    minimum: naively excluding only "myself" from the total would flip
+    BOTH simultaneously (each one's total-of-the-other alone already
+    clears the bar). Ordering by receipt_date instead means the first one
+    (the one that actually completes the minimum) stays Booking, and so
+    does the second, since nothing comes after it yet -- only a THIRD, new
+    receipt (test_receipt_defaults_to_delivery_once_running_total_reaches_
+    minimum above) defaults to Delivery."""
+    setup = unified_capture_setup
+    first_id, second_id = uuid4(), uuid4()
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        for doc_id, receipt_date, field_suffix in (
+            (first_id, "2026-09-01", "1"),
+            (second_id, "2026-09-05", "2"),
+        ):
+            _seed_extracted_field(
+                connection,
+                tenant_id=setup["tenant_id"],
+                journey_id=setup["journey_id"],
+                di_document_id=doc_id,
+                actor_id=setup["actor_id"],
+                stage_code="BOOKING",
+                source_canonical_field_id=f"receipt-amount-{field_suffix}",
+                document_type_key="dealer_receipt",
+                field_key="amount_paid",
+                value="6000",
+            )
+            _seed_extracted_field(
+                connection,
+                tenant_id=setup["tenant_id"],
+                journey_id=setup["journey_id"],
+                di_document_id=doc_id,
+                actor_id=setup["actor_id"],
+                stage_code="BOOKING",
+                source_canonical_field_id=f"receipt-date-{field_suffix}",
+                document_type_key="dealer_receipt",
+                field_key="receipt_date",
+                value=receipt_date,
+            )
+
+        for doc_id in (first_id, second_id):
+            assert _receipt_defaults_to_delivery(
+                connection, tenant_id=setup["tenant_id"], journey_id=setup["journey_id"],
+                document_id=doc_id,
+            ) is False
+
+
 def test_receipt_running_total_canonicalizes_payment_receipt_with_dealer_receipt(
     unified_capture_setup,
 ) -> None:
