@@ -32,6 +32,7 @@ from audit_core.uc03_delivery_commands import _machine_flag, _set_stage_flag_sta
 from audit_core.uc03_document_registry import is_receipt_document_type
 from audit_core.uc03_finance_disbursement_resolution import resolve_finance_disbursement
 from audit_core.uc03_invoice_materialization import (
+    _line_item_rows,
     _to_decimal,
     _upsert_commercial_line,
     materialize_reviewed_invoices,
@@ -621,8 +622,11 @@ def _materialize_rto_challan_commercial_lines(
     if selected is None:
         return 0
     document, field = selected
-    line_items = getattr(field, "value", None)
-    if not isinstance(line_items, list):
+    # _line_item_rows also salvages the legacy Gemini-adapter serialization
+    # bug (str() instead of json.dumps on an array value) -- confirmed live
+    # against this exact document's own line_items.
+    line_items = _line_item_rows(getattr(field, "value", None))
+    if not line_items:
         return 0
 
     def _net(item: dict[str, Any]) -> Decimal:

@@ -128,6 +128,28 @@ def test_line_item_rows_parses_json_string() -> None:
     assert rows == [{"line_category": "RSA", "net_amount": 2000}]
 
 
+def test_line_item_rows_salvages_legacy_python_repr_string() -> None:
+    # Confirmed live (2026-09-24): a since-fixed Gemini adapter bug
+    # serialized array field values via str() instead of json.dumps,
+    # landing exactly this single-quoted, non-JSON text in
+    # journey_document_extracted_fields for every array field extracted
+    # before the fix. ast.literal_eval salvages it without a DI reprocess.
+    legacy_value = (
+        "[{'description_raw': 'MV Tax(One Time)', 'amount': 100252}, "
+        "{'description_raw': 'Hypothecation Addition', 'amount': 1500}]"
+    )
+    rows = im._line_item_rows(legacy_value)
+    assert rows == [
+        {"description_raw": "MV Tax(One Time)", "amount": 100252},
+        {"description_raw": "Hypothecation Addition", "amount": 1500},
+    ]
+
+
+def test_line_item_rows_rejects_unparseable_garbage() -> None:
+    assert im._line_item_rows("not a list at all") == []
+    assert im._line_item_rows("{'not': 'a list'}") == []
+
+
 def test_to_decimal_tolerant() -> None:
     assert im._to_decimal("N/A") is None
     assert im._to_decimal("") is None
