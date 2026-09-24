@@ -392,18 +392,15 @@ def test_booking_start_snapshots_profile_requirements(booking_document_setup) ->
     listed = client.get(_documents_url(setup))
     assert listed.status_code == 200, listed.text
     by_key = {item["requirementKey"]: item for item in listed.json()}
-    # booking_credit_note, booking_gst_declaration (0073), and
-    # booking_scrappage_certificate (0078) are unconditionally added by the
-    # Booking snapshot trigger to every Booking regardless of profile --
-    # none are checklist items (no document_requirement_item_id), so they
-    # don't affect the applicability/answer assertions below or audit
-    # completion. booking_bank_statement (0070) was retired by 0091 -- a
-    # bank statement is a Delivery-only document now (unified capture
-    # dispatch needs every document type to resolve to exactly one stage).
-    assert set(by_key) == {
-        "BOOKING_DOCKET", "TRADE_IN_RC",
-        "booking_credit_note", "booking_gst_declaration", "booking_scrappage_certificate",
-    }
+    # booking_bank_statement (0070) was retired by 0091 -- a bank statement
+    # is a Delivery-only document now (unified capture dispatch needs every
+    # document type to resolve to exactly one stage). booking_credit_note,
+    # booking_gst_declaration (0073), and booking_scrappage_certificate
+    # (0078) were the same kind of unconditional Booking-side addition;
+    # migration 0110 retired all three the same way -- each already had a
+    # real Delivery-side counterpart, so the Booking-side one was always a
+    # redundant duplicate checklist card, not a distinct requirement.
+    assert set(by_key) == {"BOOKING_DOCKET", "TRADE_IN_RC"}
     assert by_key["BOOKING_DOCKET"]["applicabilityState"] == "APPLICABLE"
     assert by_key["BOOKING_DOCKET"]["answer"] == "UNANSWERED"
     assert by_key["TRADE_IN_RC"]["applicabilityState"] == "UNRESOLVED"
