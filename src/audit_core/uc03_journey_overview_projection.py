@@ -41,6 +41,7 @@ class JourneyOverviewProjectionResponse(legacy.JourneyOverviewResponse):
     reviewedFields: list[dict[str, Any]] = Field(default_factory=list)
     resolvedReviewedValues: dict[str, dict[str, Any]] = Field(default_factory=dict)
     skuPricing: dict[str, Any] | None = Field(default=None)
+    dealPricePointOptions: dict[str, Any] | None = Field(default=None)
     bankStatementLines: list[dict[str, Any]] = Field(default_factory=list)
     invoices: list[dict[str, Any]] = Field(default_factory=list)
     scrappageCertificates: list[dict[str, Any]] = Field(default_factory=list)
@@ -1016,6 +1017,136 @@ def _sku_pricing_panel(
     }
 
 
+# The real vehicle-sale invoice types, in the same priority order
+# uc03_attribute_mapping._INVOICE uses for commercial-value precedence --
+# excludes the single-purpose invoices in that tuple's tail (accessory/EW/
+# RSA/credit note), which are unrelated side documents, not the vehicle
+# sale itself.
+_VEHICLE_SALE_INVOICE_TYPES = (
+    "tax_invoice_tally",
+    "customer_invoice_dms",
+    "wholesale_invoice",
+    "invoice_generic",
+    "customer_invoice_dms_v2",
+    "tax_invoice",
+    "tax_invoice_dms",
+)
+
+
+def _primary_invoice_date(connection: Connection, *, tenant_id: str, journey_id: UUID):
+    """The primary vehicle-sale invoice's own date, if one has been
+    reviewed -- None if no such invoice exists yet, or none carries a date."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT document_type_key, invoice_date
+            FROM auditcore.invoice_review_values
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND invoice_date IS NOT NULL
+              AND document_type_key = ANY(:types)
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "types": list(_VEHICLE_SALE_INVOICE_TYPES)},
+    ).mappings().all()
+    by_type = {str(row["document_type_key"]): row["invoice_date"] for row in rows}
+    for document_type in _VEHICLE_SALE_INVOICE_TYPES:
+        if document_type in by_type:
+            return by_type[document_type]
+    return None
+
+
+def _deal_price_point_options(
+    connection: Connection, *, tenant_id: str, journey_id: UUID
+) -> dict[str, Any] | None:
+    """Direct user request (2026-09-24): standard pricing/discounts are
+    resolved against whichever master version was effective on the
+    Booking's own date (the default) -- but if the primary vehicle-sale
+    invoice carries a *different* date, and a different price-list or
+    discount-scheme version was published in between, the deal may
+    actually belong under that later master instead. Purely a read-time
+    check against the same wef-date lookups booking-date resolution
+    already uses (_price_plan_for_journey, _applicable_benefits) -- no new
+    master-data logic, no persisted state, no write. Returns None unless
+    an invoice date exists, differs from the booking date, AND resolves to
+    an actually different price-list or discount-scheme version.
+    """
+    from audit_core.errors import AuditCoreError
+    from audit_core.uc03_deal_reconciliation import _applicable_benefits
+    from audit_core.uc03_sku_candidates import _price_plan_for_journey
+
+    row = connection.execute(
+        text(
+            """
+            SELECT s.model_id, s.variant_id, b.booking_date, cu.customer_type_code,
+                   rr.registration_type_code
+            FROM auditcore.journey_products jp
+            JOIN auditcore.product_skus s ON s.product_sku_id = jp.product_sku_id
+            JOIN auditcore.journeys j ON j.tenant_id=jp.tenant_id AND j.journey_id=jp.journey_id
+            LEFT JOIN auditcore.bookings b ON b.tenant_id=j.tenant_id AND b.journey_id=j.journey_id
+            LEFT JOIN auditcore.customers cu ON cu.tenant_id=j.tenant_id AND cu.customer_id=j.customer_id
+            LEFT JOIN auditcore.registration_records rr ON rr.tenant_id=j.tenant_id AND rr.journey_id=j.journey_id
+            WHERE jp.tenant_id=:tenant_id AND jp.journey_id=:journey_id
+              AND jp.product_sku_id IS NOT NULL
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
+    if row is None or row["booking_date"] is None:
+        return None
+
+    invoice_date = _primary_invoice_date(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if invoice_date is None or invoice_date == row["booking_date"]:
+        return None
+
+    basis = registration_basis(
+        customer_type_code=row["customer_type_code"],
+        registration_type_code=row["registration_type_code"],
+    )
+
+    try:
+        booking_plan = _price_plan_for_journey(
+            connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=row["booking_date"],
+        )
+    except AuditCoreError:
+        booking_plan = None
+    try:
+        invoice_plan = _price_plan_for_journey(
+            connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=invoice_date,
+        )
+    except AuditCoreError:
+        invoice_plan = None
+    price_list_differs = (
+        booking_plan is not None and invoice_plan is not None
+        and booking_plan["price_list_version_id"] != invoice_plan["price_list_version_id"]
+    )
+
+    booking_benefit_versions = {
+        b["discount_scheme_version_id"]
+        for b in _applicable_benefits(
+            connection, tenant_id=tenant_id, model_id=row["model_id"], variant_id=row["variant_id"],
+            effective_on=row["booking_date"], basis=basis,
+        )
+    }
+    invoice_benefit_versions = {
+        b["discount_scheme_version_id"]
+        for b in _applicable_benefits(
+            connection, tenant_id=tenant_id, model_id=row["model_id"], variant_id=row["variant_id"],
+            effective_on=invoice_date, basis=basis,
+        )
+    }
+    discounts_differ = booking_benefit_versions != invoice_benefit_versions
+
+    if not price_list_differs and not discounts_differ:
+        return None
+
+    return {
+        "bookingDate": row["booking_date"].isoformat(),
+        "invoiceDate": invoice_date.isoformat(),
+        "priceListDiffers": price_list_differs,
+        "discountsDiffer": discounts_differ,
+    }
+
+
 @router.get(
     "/journeys/{journey_id}/overview",
     response_model=JourneyOverviewProjectionResponse,
@@ -1187,6 +1318,11 @@ def get_journey_overview_projection(
         tenant_id=tenant_id,
         journey_id=journey_id,
         reviewed_booking=reviewed_booking,
+    )
+    data["dealPricePointOptions"] = _deal_price_point_options(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
     )
     data["bankStatementLines"] = _bank_statement_lines(
         connection,
