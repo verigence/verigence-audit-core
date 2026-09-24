@@ -29,7 +29,7 @@ from audit_core.uc03_booking_commands import (
     _set_etag,
 )
 from audit_core.uc03_finding_classification import resolve_classification
-from audit_core.workflow import create_workflow_task
+from audit_core.workflow import complete_workflow_task, create_workflow_task
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/journeys/{journey_id}/delivery",
@@ -297,6 +297,121 @@ def _ensure_self_serve_task(
         effect_key=f"task:{finding_id}:round:{round_no}",
         correlation_id=correlation_id,
     )
+
+
+_VEHICLE_PHOTOS_TASK_TYPE = "DELIVERY_VEHICLE_PHOTOS_MISSING"
+
+
+def _ensure_vehicle_photos_task(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    requirements: list[dict[str, Any]],
+    audit_documents: list[dict[str, Any]],
+    correlation_id: str,
+) -> None:
+    """Direct product ask (2026-09-24): once every REQUIRED Delivery document
+    is in hand, a PC still needs proof of the vehicle itself -- a photo, or
+    failing that a manually-entered VIN (record_delivery_vehicle_observation).
+    Deliberately independent of _delivery_audit_gaps: that function's own
+    document-completeness check reads the legacy journey_document_assessments
+    declaration table, which the Unified Capture v2 flow this checks against
+    never writes to -- a separate, pre-existing gap left untouched here.
+    Reuses the exact same document_capture_v2_documents/
+    journey_document_requirements data the Delivery capture screen's own
+    checklist already computes (requirements/audit_documents passed in by the
+    caller), not a new parallel source of truth. Self-healing like
+    _ensure_self_serve_task above: converges to exactly one open task.
+    """
+    required_keys = {
+        str(r["requirement_key"])
+        for r in requirements
+        if str(r.get("requirement_level")) == "REQUIRED"
+        and str(r.get("requirement_status") or "").upper() != "NOT_APPLICABLE"
+    }
+    if not required_keys:
+        return
+    satisfied_keys = {
+        str(doc["requirement_key"])
+        for doc in audit_documents
+        if doc.get("requirement_key")
+        and str(doc.get("capture_status", "")).upper() == "CLASSIFIED"
+    }
+    if not required_keys.issubset(satisfied_keys):
+        return
+
+    from audit_core.uc03_delivery_vehicle_photos import vehicle_photos_uploaded
+
+    if vehicle_photos_uploaded(connection, tenant_id=tenant_id, journey_id=journey_id):
+        return
+
+    existing_tasks = connection.execute(
+        text(
+            """
+            SELECT
+                count(*) FILTER (
+                    WHERE task_status NOT IN ('COMPLETED', 'CANCELLED', 'FAILED', 'DEAD_LETTER')
+                ) AS open_count,
+                count(*) AS total_count
+            FROM auditcore.workflow_tasks
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND task_type=:task_type
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "task_type": _VEHICLE_PHOTOS_TASK_TYPE},
+    ).mappings().one()
+    if existing_tasks["open_count"] > 0:
+        return
+
+    create_workflow_task(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        workflow_type="UC03_DELIVERY_VEHICLE_PHOTOS",
+        process_area="DELIVERY",
+        task_type=_VEHICLE_PHOTOS_TASK_TYPE,
+        assigned_role_code="PC",
+        severity="HIGH",
+        task_payload={
+            "instruction": (
+                "All required Delivery documents are captured, but no vehicle "
+                "photos have been uploaded. Confirm delivery intimation first: "
+                "if the delivery was intimated, upload vehicle photos; if not, "
+                "record the vehicle's VIN manually under Vehicle details."
+            ),
+        },
+        effect_key=f"vehicle-photos-task:{journey_id}:round:{existing_tasks['total_count']}",
+        correlation_id=correlation_id,
+    )
+
+
+def _complete_open_vehicle_photos_task(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    actor_id: str,
+) -> None:
+    """Called from both resolution paths (vehicle-photo upload and manual
+    VIN observation) so the PC never has to separately click Complete on a
+    task whose underlying condition they've already resolved.
+    """
+    task_id = connection.execute(
+        text(
+            """
+            SELECT workflow_task_id FROM auditcore.workflow_tasks
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND task_type=:task_type
+              AND task_status NOT IN ('COMPLETED', 'CANCELLED', 'FAILED', 'DEAD_LETTER')
+            ORDER BY created_at_utc DESC
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "task_type": _VEHICLE_PHOTOS_TASK_TYPE},
+    ).scalar_one_or_none()
+    if task_id is not None:
+        complete_workflow_task(
+            connection, tenant_id=tenant_id, workflow_task_id=task_id, actor_id=actor_id,
+        )
 
 
 def _machine_flag(
@@ -1305,6 +1420,17 @@ def record_delivery_vehicle_observation(
                 description="Comparable full vehicle identifiers conflict. Physical Delivery progression remains recordable.",
                 correlation_id=correlation_id,
                 safe_payload={"evaluatorKey": _VIN_EVALUATOR},
+            )
+        if (payload.vin or "").strip():
+            # A manually-recorded VIN is the documented fallback for a
+            # journey with no vehicle photos -- resolves the vehicle-photos
+            # task the same way uploading a photo does (see
+            # uc03_delivery_vehicle_photos.upload_vehicle_photos).
+            _complete_open_vehicle_photos_task(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                actor_id=human_principal.subject,
             )
         event_id = _append_delivery_event(
             connection,
