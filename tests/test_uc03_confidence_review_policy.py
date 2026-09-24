@@ -288,6 +288,33 @@ def test_resync_endpoints_stagger_their_batch_dispatch() -> None:
     assert "enumerate(document_ids)" in submit_source
 
 
+def test_document_link_webhook_staggers_its_own_dispatch_too() -> None:
+    # Root-caused live (2026-09-24): a 10-document real upload batch has DI
+    # call this webhook once per document, independently, all within
+    # milliseconds of each other -- unlike the batch endpoints above, this
+    # call site has no explicit loop/index to pass sync_stagger_seconds. Every
+    # one of those independent calls used to dispatch with the default
+    # initial_delay_seconds=0, so they raced for the same per-journey lock at
+    # once -- the exact pile-up the other three call sites were already fixed
+    # for, just never applied here, where every normal (non-Resync) upload
+    # actually goes through. Confirmed live: 9 of 10 documents in one such
+    # batch had DI-side processing_status=PROCESSED and audit_link_status=
+    # ACKNOWLEDGED, yet zero rows in journey_document_extracted_fields.
+    source = inspect.getsource(acknowledge_booking_document_link_with_auto_sync)
+    assert "sync_stagger_seconds(" in source
+    assert "initial_delay_seconds=sync_stagger_seconds(stagger_index) + stagger_jitter_seconds" in source
+    # The stagger index must come from counting recent concurrent arrivals
+    # (this call site has no batch loop to index into), not a hardcoded 0 --
+    # a hardcoded 0 would silently reintroduce the exact bug this fixes.
+    assert "linked_at_utc >= now() - interval" in source
+    # A count-only index isn't sufficient: under READ COMMITTED, several
+    # truly-concurrent callers can each run that COUNT before any of the
+    # others have committed, land on the same stagger_index, and collide
+    # again anyway. Random jitter on top must be present so same-index
+    # collisions still land at different times.
+    assert "random.uniform(" in source
+
+
 def test_confirm_no_longer_blocks_on_unresolved_low_confidence_decisions() -> None:
     # Document completeness is the sole criterion for Booking/Delivery to
     # finish (2026-09-13 design change) -- confidence review is a separate,

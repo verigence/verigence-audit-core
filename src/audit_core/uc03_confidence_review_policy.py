@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import json
+import random
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -1505,6 +1506,53 @@ def acknowledge_booking_document_link_with_auto_sync(
         service_id=service_principal.subject,
         requirement_ref=payload.requirementRef,
     )
+    # Root-caused live (2026-09-24) via direct DB inspection on a 10-document
+    # batch upload: DI calls this webhook once per document, independently,
+    # as each one finishes classifying -- a normal multi-file upload lands
+    # all of them within milliseconds of each other. Each call used to
+    # dispatch its background sync with initial_delay_seconds=0 (the
+    # default), so all of them raced for _sync_booking_document's same
+    # per-journey advisory lock at once -- exactly the pile-up
+    # sync_stagger_seconds/_run_sync_booking_document_task's own docstring
+    # already describes and that Resync already staggers for
+    # (uc03_document_capture_v2.py / uc03_delivery_capture_v2.py /
+    # uc03_post_extraction_materialization.py all pass it an explicit loop
+    # index) -- this webhook path, the one EVERY normal upload goes through,
+    # never got the same fix, because a single independent webhook call has
+    # no natural "index" the way a batch loop does. Confirmed live: 9 of 10
+    # documents in one such batch had DI-side processing_status=PROCESSED
+    # and audit_link_status=ACKNOWLEDGED, yet zero rows in
+    # journey_document_extracted_fields -- DI delivered everything; the
+    # losers of this lock race exhausted their retry budget and gave up
+    # silently (uc03_document_link_background_sync_deferred), permanently.
+    #
+    # Approximates the same "position in the batch" index a loop would have
+    # by counting how many OTHER evidence rows for this journey linked in
+    # the last 30 seconds -- documents arriving in the same real upload
+    # batch land within that window; older, unrelated documents don't.
+    #
+    # This count alone is not enough: under READ COMMITTED, a webhook call
+    # only sees an evidence row from another truly-concurrent call once that
+    # call's own transaction has committed -- when several land within true
+    # milliseconds of each other (the exact failure case), more than one can
+    # run this COUNT before any of the others have committed, see the same
+    # count, and land on the same stagger_index -- shifting the pile-up in
+    # time rather than actually spreading it. A small random jitter on top
+    # (bounded by one stagger step) keeps same-index collisions from lining
+    # back up at the same instant.
+    concurrent_recent_links = connection.execute(
+        text(
+            """
+            SELECT COUNT(*) FROM auditcore.evidence
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND association_status='ACTIVE'
+              AND linked_at_utc >= now() - interval '30 seconds'
+            """
+        ),
+        {"tenant_id": str(discovered["tenant_id"]), "journey_id": discovered["journey_id"]},
+    ).scalar_one()
+    stagger_index = max(0, int(concurrent_recent_links) - 1)
+    stagger_jitter_seconds = random.uniform(0.0, _SYNC_STAGGER_STEP_SECONDS)
     # One pipeline, stage as data: this callback accepts Booking and Delivery
     # requirements alike (the requirement row says which -- see migration
     # 0068), and _sync_booking_document runs the identical sync for either --
@@ -1522,6 +1570,7 @@ def acknowledge_booking_document_link_with_auto_sync(
         document_id=payload.documentId,
         service_id=service_principal.subject,
         stage_code=str(discovered["process_area"]).upper(),
+        initial_delay_seconds=sync_stagger_seconds(stagger_index) + stagger_jitter_seconds,
     )
     return response
 
