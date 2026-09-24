@@ -1,7 +1,7 @@
 """Booking's document set is KYC + Booking Form + Payment Receipt only;
 everything else defaults to Delivery.
 
-Revision ID: 0110_booking_documents_minimal_set
+Revision ID: 0110_booking_minimal_doc_set
 Revises: 0109_customer_kyc_booking_stage
 Create Date: 2026-09-24
 
@@ -71,7 +71,7 @@ from __future__ import annotations
 from alembic import op
 from sqlalchemy import text
 
-revision = "0110_booking_documents_minimal_set"
+revision = "0110_booking_minimal_doc_set"
 down_revision = "0109_customer_kyc_booking_stage"
 branch_labels = None
 depends_on = None
