@@ -28,6 +28,7 @@ both at once.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 from uuid import UUID
@@ -143,6 +144,41 @@ def linked_documents_for_journey(
         {"tenant_id": tenant_id, "journey_id": journey_id, "stage_code": stage_code},
     ).mappings().all()
     return [dict(row) for row in rows]
+
+
+def first_linked_document_ids(
+    documents: list[dict[str, Any]],
+    *,
+    is_repeatable: Callable[[str], bool],
+) -> dict[str, UUID]:
+    """Which document (by upload order, i.e. created_at_utc -- callers
+    already sort their query this way) currently occupies each
+    non-repeatable requirement's slot, regardless of classification status.
+
+    Deliberately distinct from resolve_requirement_satisfaction's own
+    "active document" concept: satisfaction requires the document to be
+    CLASSIFIED, but this is a plain occupancy rule -- a single not-yet-
+    classified upload still owns its slot, it just isn't satisfied yet.
+    This is exactly the "first physical upload wins" rule
+    uc03_journey_overview_projection.py's own dedup nulling already
+    implements; extracted here so it isn't re-derived a second way.
+
+    is_repeatable is injected rather than imported directly so this module
+    stays free of uc03_pc_booking_documents.py's much heavier dependency
+    chain -- every current caller already imports it for its own use.
+    """
+    first_seen: dict[str, UUID] = {}
+    for doc in documents:
+        key = doc.get("requirement_key") or doc.get("requirementKey")
+        if not key or is_repeatable(str(key)):
+            continue
+        key = str(key)
+        if key in first_seen:
+            continue
+        doc_id = doc.get("di_document_id") or doc.get("documentId")
+        if doc_id is not None:
+            first_seen[key] = UUID(str(doc_id))
+    return first_seen
 
 
 def resolve_requirement_satisfaction(
