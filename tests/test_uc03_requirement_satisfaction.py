@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from uuid import uuid4
 
-from audit_core.uc03_requirement_satisfaction import resolve_requirement_satisfaction
+from audit_core.uc03_requirement_satisfaction import (
+    first_linked_document_ids,
+    resolve_requirement_satisfaction,
+)
 
 
 def _requirement(
@@ -112,6 +115,35 @@ def test_first_classified_document_by_created_at_wins_the_slot() -> None:
         ],
     )
     assert result["booking_form"].active_document_id == first_id
+
+
+def test_first_linked_document_wins_the_slot_even_if_still_unclassified() -> None:
+    # Distinct from satisfaction's own "active document" rule: a single
+    # not-yet-classified upload still owns its slot, it just isn't
+    # satisfied yet -- must not be nulled just because it's not CLASSIFIED.
+    doc_id = uuid4()
+    result = first_linked_document_ids(
+        [_document("booking_form", di_document_id=doc_id, capture_status="RECEIVING")],
+        is_repeatable=lambda key: False,
+    )
+    assert result == {"booking_form": doc_id}
+
+
+def test_first_linked_document_ids_ignores_repeatable_requirements() -> None:
+    result = first_linked_document_ids(
+        [_document("minimum_booking_payment_proof"), _document("minimum_booking_payment_proof")],
+        is_repeatable=lambda key: True,
+    )
+    assert result == {}
+
+
+def test_first_linked_document_ids_keeps_the_earliest_by_iteration_order() -> None:
+    first_id, second_id = uuid4(), uuid4()
+    result = first_linked_document_ids(
+        [_document("booking_form", di_document_id=first_id), _document("booking_form", di_document_id=second_id)],
+        is_repeatable=lambda key: False,
+    )
+    assert result == {"booking_form": first_id}
 
 
 def test_requirement_with_a_document_present_but_wrong_slot_does_not_satisfy_it() -> None:
