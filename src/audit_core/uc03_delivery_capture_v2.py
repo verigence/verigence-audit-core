@@ -413,6 +413,18 @@ def _read_delivery_capture(
     requirements = _delivery_requirements(connection, tenant_id, journey_id)
     audit_documents = _linked_delivery_documents(connection, tenant_id, journey_id)
     submitted = state.get("capture_completed_at_utc") is not None
+
+    from audit_core.uc03_delivery_commands import _ensure_vehicle_photos_task
+
+    _ensure_vehicle_photos_task(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        requirements=requirements,
+        audit_documents=audit_documents,
+        correlation_id="",
+    )
+
     if not audit_documents:
         return _build_local_delivery_capture_response(
             connection=connection,
