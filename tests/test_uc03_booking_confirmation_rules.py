@@ -4,6 +4,7 @@ import os
 from uuid import uuid4
 
 import pytest
+from conftest import delete_tenant_data
 from sqlalchemy import create_engine, text
 
 from audit_core import uc03_confidence_review_policy as confidence_policy
@@ -98,6 +99,20 @@ def _seed_journey(engine, *, tenant_id: str, suffix: str):
     return journey_id
 
 
+def _start_delivery(engine, *, tenant_id: str, journey_id) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """INSERT INTO auditcore.journey_stage_states
+                (tenant_id, journey_id, stage_code, business_status, audit_state, audit_status,
+                 first_started_at_utc, latest_activity_at_utc, version_no)
+                VALUES (:t, :j, 'DELIVERY', 'DELIVERY_IN_PROGRESS', 'IN_PROGRESS', 'NOT_EVALUATED',
+                        now(), now(), 1)"""
+            ),
+            {"t": tenant_id, "j": journey_id},
+        )
+
+
 def _link_evidence(engine, *, tenant_id: str, journey_id, customer_id, document_type_key: str):
     document_id = uuid4()
     with engine.begin() as connection:
@@ -155,7 +170,7 @@ def _confirmed_document(document_id, document_type_key):
     )
 
 
-def test_booking_form_discount_evidence_and_intimation_date() -> None:
+def test_booking_form_discount_evidence_and_intimation_date(request: pytest.FixtureRequest) -> None:
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         pytest.skip("DATABASE_URL is required for this integration test")
@@ -163,8 +178,16 @@ def test_booking_form_discount_evidence_and_intimation_date() -> None:
     engine = create_engine(database_url)
     suffix = uuid4().hex
     tenant_id = f"tenant-bcr-{suffix}"
+    request.addfinalizer(lambda: (delete_tenant_data(engine, tenant_id), engine.dispose()))
     journey_id = _seed_journey(engine, tenant_id=tenant_id, suffix=suffix)
     customer_id = _customer_id(engine, tenant_id=tenant_id, journey_id=journey_id)
+    # Migration 0110 moved corporate_id/vehicle_rc to Delivery-stage
+    # requirements and gated their own discount-evidence RAISE on Delivery
+    # having actually started (see test_corporate_and_exchange_discount_
+    # evidence_not_raised_before_delivery_starts below for that gate itself)
+    # -- this test's own scope is the underlying self-healing mechanism, so
+    # it starts Delivery up front to keep asserting that unchanged.
+    _start_delivery(engine, tenant_id=tenant_id, journey_id=journey_id)
 
     booking_form_id = _link_evidence(
         engine, tenant_id=tenant_id, journey_id=journey_id, customer_id=customer_id,
@@ -265,6 +288,98 @@ def test_booking_form_discount_evidence_and_intimation_date() -> None:
     assert status_by_key["BK_DISCOUNT_EVIDENCE_MISSING:corporate_discount"] == "RESOLVED"
     assert status_by_key["BK_DISCOUNT_EVIDENCE_MISSING:exchange_bonus"] == "OPEN"
     assert status_by_key["BK_DISCOUNT_EVIDENCE_MISSING:scrappage_discount"] == "RESOLVED"
+
+    engine.dispose()
+
+
+def test_corporate_and_exchange_discount_evidence_not_raised_before_delivery_starts(
+    request: pytest.FixtureRequest,
+) -> None:
+    """Direct user correction (2026-09-24, migration 0110): corporate_id and
+    trade_in_vehicle_rc are now Delivery-stage requirements, so a customer
+    is not expected to produce either at Booking time. A corporate/exchange
+    discount claimed on the Booking Form must not raise a standing HIGH
+    finding the instant the Booking Form confirms -- only once Delivery has
+    actually started. Scrappage's own discount-evidence check is untouched
+    by 0110 and keeps raising unconditionally, same as before.
+    """
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for this integration test")
+
+    engine = create_engine(database_url)
+    suffix = uuid4().hex
+    tenant_id = f"tenant-bcrgate-{suffix}"
+    request.addfinalizer(lambda: (delete_tenant_data(engine, tenant_id), engine.dispose()))
+    journey_id = _seed_journey(engine, tenant_id=tenant_id, suffix=suffix)
+    customer_id = _customer_id(engine, tenant_id=tenant_id, journey_id=journey_id)
+
+    booking_form_id = _link_evidence(
+        engine, tenant_id=tenant_id, journey_id=journey_id, customer_id=customer_id,
+        document_type_key="booking_form",
+    )
+    di_client = _FakeDiClient()
+    di_client.add(
+        _confirmed_document(booking_form_id, "booking_form"),
+        [
+            _fact(f"corporate_discount-{suffix}", "corporate_discount_amount", "5000"),
+            _fact(f"exchange_discount-{suffix}", "exchange_discount_amount", "8000"),
+            _fact(f"scrappage_discount-{suffix}", "scrappage_discount_amount", "3000"),
+        ],
+    )
+
+    with engine.begin() as connection:
+        confidence_policy._sync_booking_document(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            document_id=booking_form_id,
+            service_id="di-service",
+            security_client=_FakeSecurityClient(),
+            di_client=di_client,
+            bump_version=True,
+        )
+
+    with engine.begin() as connection:
+        findings = connection.execute(
+            text(
+                "SELECT rule_key FROM auditcore.audit_findings "
+                "WHERE tenant_id=:t AND journey_id=:j"
+            ),
+            {"t": tenant_id, "j": journey_id},
+        ).mappings().all()
+    rule_keys = {row["rule_key"] for row in findings}
+    assert "BK_DISCOUNT_EVIDENCE_MISSING:corporate_discount" not in rule_keys
+    assert "BK_DISCOUNT_EVIDENCE_MISSING:exchange_bonus" not in rule_keys
+    assert "BK_DISCOUNT_EVIDENCE_MISSING:scrappage_discount" in rule_keys
+
+    # Delivery starts; re-confirming the same Booking Form now raises the
+    # two previously-gated findings (scrappage's stays open, unaffected).
+    _start_delivery(engine, tenant_id=tenant_id, journey_id=journey_id)
+    with engine.begin() as connection:
+        from audit_core.uc03_booking_confirmation_rules import (
+            record_booking_form_intimation_and_discount_evidence,
+        )
+
+        record_booking_form_intimation_and_discount_evidence(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            document_id=booking_form_id,
+            correlation_id="test",
+        )
+
+    with engine.begin() as connection:
+        findings = connection.execute(
+            text(
+                "SELECT rule_key FROM auditcore.audit_findings "
+                "WHERE tenant_id=:t AND journey_id=:j"
+            ),
+            {"t": tenant_id, "j": journey_id},
+        ).mappings().all()
+    rule_keys = {row["rule_key"] for row in findings}
+    assert "BK_DISCOUNT_EVIDENCE_MISSING:corporate_discount" in rule_keys
+    assert "BK_DISCOUNT_EVIDENCE_MISSING:exchange_bonus" in rule_keys
 
     engine.dispose()
 

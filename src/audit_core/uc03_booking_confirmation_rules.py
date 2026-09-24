@@ -72,6 +72,35 @@ _DISCOUNT_EVIDENCE: dict[str, tuple[str, str]] = {
 # finding once its Booking Form is re-confirmed for any reason.
 _RETIRED_SCRAPPAGE_UNCLASSIFIED_RULE_KEY = "BK_SCRAPPAGE_DOCUMENT_UNCLASSIFIED"
 
+# Direct user correction (2026-09-24, migration 0110): corporate_id and
+# trade_in_vehicle_rc (document_type_key=vehicle_rc) moved from Booking-stage
+# to Delivery-stage requirements -- a customer is no longer expected to
+# produce either at Booking time. The presence check below is deliberately
+# stage-independent (a document uploaded early still satisfies it early),
+# but the RAISE side used to fire unconditionally the moment the Booking
+# Form itself confirmed, which would now put a guaranteed, standing
+# HIGH-severity finding on every corporate/exchange booking from day one --
+# the document isn't even expected to exist yet. Gated so the finding only
+# starts once Delivery has actually begun; resolving an already-open finding
+# the instant evidence appears is untouched and still fires regardless of
+# stage. scrappage_discount_amount is deliberately excluded here -- its
+# document type wasn't reassigned by 0110, only its redundant duplicate
+# Booking-side checklist card was retired.
+_RAISE_GATED_UNTIL_DELIVERY_STARTS = frozenset({"corporate_discount_amount", "exchange_discount_amount"})
+
+
+def _delivery_started(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    return (
+        connection.execute(
+            text(
+                "SELECT 1 FROM auditcore.journey_stage_states "
+                "WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND stage_code='DELIVERY'"
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one_or_none()
+        is not None
+    )
+
 
 def _confidence_percent(row: dict[str, Any]) -> float | None:
     score = row.get("confidence_score")
@@ -222,6 +251,10 @@ def record_booking_form_intimation_and_discount_evidence(
                 rule_key=rule_key,
                 correlation_id=correlation_id,
             )
+            continue
+        if field_key in _RAISE_GATED_UNTIL_DELIVERY_STARTS and not _delivery_started(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+        ):
             continue
         _machine_flag(
             connection,

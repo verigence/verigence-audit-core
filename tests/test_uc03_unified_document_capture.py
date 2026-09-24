@@ -595,8 +595,15 @@ def test_delivery_checklist_read_seeds_requirements_before_any_upload(unified_ca
 
         # Before anything is seeded: no DELIVERY journey_document_requirements
         # rows exist yet (nothing has ever uploaded a document or started
-        # Delivery on this fresh Journey).
-        before = _delivery_requirements(connection, setup["tenant_id"], setup["journey_id"])
+        # Delivery on this fresh Journey). Migration 0110 moved corporate_id
+        # to a live Delivery-side policy "extension" (requirement_ref=None,
+        # synthesized on every read, same as it always was under Booking
+        # before the move) -- filtered out here since it's not a per-journey
+        # materialized row and was never something seeding needed to create.
+        before = [
+            item for item in _delivery_requirements(connection, setup["tenant_id"], setup["journey_id"])
+            if item["requirement_ref"] is not None
+        ]
         assert before == []
 
         # The exact call get_delivery_capture_local_v2 now makes before
