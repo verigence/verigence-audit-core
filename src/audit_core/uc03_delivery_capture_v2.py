@@ -274,6 +274,7 @@ def _build_delivery_capture_response(
     audit_documents: list[dict[str, Any]],
     di_documents: list[dict[str, Any]],
     submitted: bool,
+    fallback_extracted_ids: frozenset[str] = frozenset(),
 ) -> DeliveryCaptureV2Response:
     di_by_id = {str(item["documentId"]): item for item in di_documents}
     active_by_requirement: dict[str, dict[str, Any]] = {}
@@ -282,7 +283,32 @@ def _build_delivery_capture_response(
     for link in audit_documents:
         di = di_by_id.get(str(link["di_document_id"]))
         if di is None:
-            continue
+            # The unified capture screen has no stage picker -- every upload
+            # is recorded against DI's phase at upload time and audit-core's
+            # own reconciliation (apply_di_classification) later relocates a
+            # misclassified document's stage_code/requirement_key here, but
+            # never updates DI's own upload-time phase column. DI's live
+            # list_documents(phase="DELIVERY") then never returns a document
+            # DI still has filed under phase="BOOKING", even though this
+            # journey's own document_capture_v2_documents row correctly
+            # says DELIVERY. Confirmed live: every one of this journey's
+            # reclassified Delivery documents was still phase="BOOKING" in
+            # docintel.document_capture_v2_uploads, so di_by_id never
+            # matched any of them and every requirement showed "Missing".
+            # Fall back to this journey's own row instead of dropping it.
+            di = {
+                "documentId": str(link["di_document_id"]),
+                "clientUploadId": str(link["client_upload_id"]),
+                "state": str(link["capture_status"]),
+                "classifiedDocumentTypeKey": link.get("classified_document_type_key"),
+                "originalFilename": str(link["original_filename"]),
+                "contentUrl": None,
+                "processingStatus": (
+                    "PROCESSED"
+                    if str(link["di_document_id"]) in fallback_extracted_ids
+                    else None
+                ),
+            }
         public = CaptureV2Document(
             documentId=UUID(str(di["documentId"])),
             clientUploadId=str(di["clientUploadId"]),
@@ -447,6 +473,9 @@ def _read_delivery_capture(
         audit_documents=_linked_delivery_documents(connection, tenant_id, journey_id),
         di_documents=di_documents,
         submitted=submitted,
+        fallback_extracted_ids=frozenset(
+            _extracted_document_ids(connection, tenant_id, journey_id)
+        ),
     )
 
 

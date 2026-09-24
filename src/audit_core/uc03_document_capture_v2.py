@@ -775,6 +775,7 @@ def _build_capture_response(
     declaration_rows: dict[str, dict[str, Any]],
     audit_documents: list[dict[str, Any]],
     di_documents: list[dict[str, Any]],
+    fallback_extracted_ids: frozenset[str] = frozenset(),
 ) -> BookingCaptureV2Response:
     di_by_id = {str(item["documentId"]): item for item in di_documents}
     active_by_requirement: dict[str, dict[str, Any]] = {}
@@ -783,7 +784,25 @@ def _build_capture_response(
     for link in audit_documents:
         di = di_by_id.get(str(link["di_document_id"]))
         if di is None:
-            continue
+            # See uc03_delivery_capture_v2._build_delivery_capture_response's
+            # matching comment -- the unified capture screen has no stage
+            # picker, so a document can be reclassified by audit-core's own
+            # reconciliation into a stage_code DI never updates its own
+            # upload-time phase for. Fall back to this journey's own row
+            # instead of silently dropping it from the checklist.
+            di = {
+                "documentId": str(link["di_document_id"]),
+                "clientUploadId": str(link["client_upload_id"]),
+                "state": str(link["capture_status"]),
+                "classifiedDocumentTypeKey": link.get("classified_document_type_key"),
+                "originalFilename": str(link["original_filename"]),
+                "contentUrl": None,
+                "processingStatus": (
+                    "PROCESSED"
+                    if str(link["di_document_id"]) in fallback_extracted_ids
+                    else None
+                ),
+            }
         public = CaptureV2Document(
             documentId=UUID(str(di["documentId"])),
             clientUploadId=str(di["clientUploadId"]),
@@ -1015,6 +1034,9 @@ def _read_capture(
         declaration_rows=declaration_rows,
         audit_documents=audit_documents,
         di_documents=di_documents,
+        fallback_extracted_ids=frozenset(
+            _extracted_document_ids(connection, tenant_id, journey_id)
+        ),
     )
 
 
