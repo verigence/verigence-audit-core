@@ -239,6 +239,61 @@ def test_insurance_addons_are_selected_from_the_di_add_ons_array_field() -> None
     assert selected[1].value == ["zero_depreciation", "engine_protection"]
 
 
+def test_rto_challan_line_items_derive_road_tax_and_registration_charges(monkeypatch) -> None:
+    # Direct user correction (2026-09-24): "MV Tax is Road Tax and
+    # Registration Charges can be Hypothecation Charges." Real-world example
+    # from the reported journey's RTO Challan.
+    challan = _document(
+        "rto_challan",
+        [
+            _field(
+                "line_items",
+                [
+                    {"description_raw": "New Registration (RTO Side)", "amount": "0"},
+                    {"description_raw": "Hypothecation Addition", "amount": "1500"},
+                    {"description_raw": "Automation and Technology Fee", "amount": "140"},
+                    {"description_raw": "MV Tax(One Time)", "amount": "100252"},
+                ],
+            )
+        ],
+    )
+
+    written: list[dict] = []
+    monkeypatch.setattr(
+        materialization,
+        "_upsert_commercial_line",
+        lambda connection, **kwargs: written.append(kwargs) or True,
+    )
+
+    count = materialization._materialize_rto_challan_commercial_lines(
+        object(), tenant_id="tenant-a", journey_id=uuid4(), documents=[challan],
+    )
+
+    assert count == 2
+    by_component = {call["component_key"]: call["amount"] for call in written}
+    assert by_component["road_tax_amount"] == 100252
+    assert by_component["registration_charges"] == 0 + 1500 + 140
+    assert all(call["document_type"] == "rto_challan" for call in written)
+
+
+def test_rto_challan_line_items_ignore_non_challan_documents(monkeypatch) -> None:
+    invoice = _document(
+        "customer_invoice_dms",
+        [_field("line_items", [{"description_raw": "MV Tax", "amount": "999"}])],
+    )
+
+    monkeypatch.setattr(
+        materialization,
+        "_upsert_commercial_line",
+        lambda connection, **kwargs: pytest.fail("should not write from a non-challan document"),
+    )
+
+    count = materialization._materialize_rto_challan_commercial_lines(
+        object(), tenant_id="tenant-a", journey_id=uuid4(), documents=[invoice],
+    )
+    assert count == 0
+
+
 def test_delivery_business_materializer_calls_all_canonical_projections(monkeypatch) -> None:
     calls: list[str] = []
 
