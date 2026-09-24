@@ -20,6 +20,7 @@ Deterministic, idempotent, and safe to run inside the Review-Confirm transaction
 """
 from __future__ import annotations
 
+import ast
 import json
 import logging
 from datetime import date
@@ -178,13 +179,29 @@ def _upper(value: Any) -> str:
 
 
 def _line_item_rows(value: Any) -> list[dict[str, Any]]:
-    """Normalise a DI array field into a list of dict rows."""
+    """Normalise a DI array field into a list of dict rows.
+
+    Confirmed live (2026-09-24): a Gemini adapter bug (fixed in verigence-di,
+    see gemini_adapter.py's _parse_response) serialized array-valued fields
+    via plain str() instead of json.dumps -- for a list of dicts that
+    produces Python's single-quoted repr, e.g.
+    "[{'description_raw': 'MV Tax', 'amount': 100252}]", which is not valid
+    JSON. Every RTO Challan/invoice line_items value extracted before that
+    fix is stuck in exactly this form in journey_document_extracted_fields
+    and will stay that way until reprocessed. ast.literal_eval parses only
+    Python literals (no code execution) and salvages this legacy data back
+    into real rows the next time materialization runs, without needing a
+    DI reprocess.
+    """
     raw = value
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
         except (ValueError, TypeError):
-            return []
+            try:
+                raw = ast.literal_eval(raw)
+            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                return []
     if not isinstance(raw, list):
         return []
     return [row for row in raw if isinstance(row, dict)]

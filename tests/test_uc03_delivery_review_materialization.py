@@ -276,6 +276,34 @@ def test_rto_challan_line_items_derive_road_tax_and_registration_charges(monkeyp
     assert all(call["document_type"] == "rto_challan" for call in written)
 
 
+def test_rto_challan_line_items_salvages_legacy_python_repr_string(monkeypatch) -> None:
+    # Confirmed live (2026-09-24): the exact reported journey's RTO Challan
+    # had this legacy single-quoted repr text as its stored line_items value
+    # (a since-fixed Gemini adapter bug) -- without the ast.literal_eval
+    # salvage in _line_item_rows, this would silently return 0 forever.
+    legacy_value = (
+        "[{'description_raw': 'New Registration (RTO Side)', 'amount': 0}, "
+        "{'description_raw': 'MV Tax(One Time)', 'amount': 100252}]"
+    )
+    challan = _document("rto_challan", [_field("line_items", legacy_value)])
+
+    written: list[dict] = []
+    monkeypatch.setattr(
+        materialization,
+        "_upsert_commercial_line",
+        lambda connection, **kwargs: written.append(kwargs) or True,
+    )
+
+    count = materialization._materialize_rto_challan_commercial_lines(
+        object(), tenant_id="tenant-a", journey_id=uuid4(), documents=[challan],
+    )
+
+    assert count == 2
+    by_component = {call["component_key"]: call["amount"] for call in written}
+    assert by_component["road_tax_amount"] == 100252
+    assert by_component["registration_charges"] == 0
+
+
 def test_rto_challan_line_items_ignore_non_challan_documents(monkeypatch) -> None:
     invoice = _document(
         "customer_invoice_dms",
