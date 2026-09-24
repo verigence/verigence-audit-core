@@ -15,7 +15,6 @@ from audit_core.security_authorization import (
 from audit_core.uc03_booking_capture import _scope
 from audit_core.uc03_delivery_capture_v2 import (
     DeliveryCaptureV2Response,
-    _authorize_delivery,
     _build_local_delivery_capture_response,
     _delivery_requirements,
     _linked_delivery_documents,
@@ -81,7 +80,21 @@ def get_delivery_capture_local_v2(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> DeliveryCaptureV2Response:
-    state = _authorize_delivery(
+    # Direct user correction (2026-09-24): _authorize_delivery (via
+    # _delivery_state) used to gate this endpoint, and raises VAC-NF-005
+    # ("Start Delivery before capturing Delivery documents") whenever
+    # journey_stage_states has no DELIVERY row yet -- i.e. for every journey
+    # still in Booking, which is the normal, common case for a PC opening
+    # the combined checklist. That 404 propagated to the frontend as a
+    # silently-swallowed query error (retry: false, no error banner wired
+    # to this specific query), so the unified Documents checklist rendered
+    # with the Delivery half simply empty and every visible card -- even
+    # "Missing" placeholders -- defaulting to a "BOOKING" label with no
+    # indication anything had failed. This is a read-only preview endpoint,
+    # like booking/capture-local next to it: the active-Delivery-stage guard
+    # belongs on capture/extraction mutations, not here, so the PC can see
+    # what Delivery will expect before Delivery has actually started.
+    _scope(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
@@ -98,9 +111,16 @@ def get_delivery_capture_local_v2(
         text("SELECT auditcore.seed_delivery_document_requirements(:tenant_id, :journey_id)"),
         {"tenant_id": tenant_id, "journey_id": str(journey_id)},
     )
+    delivery_state = connection.execute(
+        text(
+            "SELECT capture_completed_at_utc FROM auditcore.journey_stage_states "
+            "WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND stage_code='DELIVERY'"
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
     return _build_local_delivery_capture_response(
         journey_id=journey_id,
         requirements=_delivery_requirements(connection, tenant_id, journey_id),
         audit_documents=_linked_delivery_documents(connection, tenant_id, journey_id),
-        submitted=state.get("capture_completed_at_utc") is not None,
+        submitted=bool(delivery_state and delivery_state["capture_completed_at_utc"] is not None),
     )
