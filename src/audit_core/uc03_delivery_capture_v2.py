@@ -228,43 +228,42 @@ def _reconcile_delivery_documents(
     *,
     tenant_id: str,
     journey_id: UUID,
-    requirements: list[dict[str, Any]],
+    requirements: list[dict[str, Any]],  # kept for signature stability; see below -- unused now
     di_documents: list[dict[str, Any]],
 ) -> None:
-    type_to_requirement: dict[str, str] = {}
-    for requirement in requirements:
-        document_type_key = requirement.get("document_type_key")
-        if document_type_key:
-            type_to_requirement.setdefault(
-                str(document_type_key),
-                str(requirement["requirement_key"]),
-            )
+    """Root-caused live (2026-09-24): this used to only match a classified
+    type against Delivery's OWN requirements and refresh requirement_key
+    for rows already stage_code='DELIVERY' -- harmless to an
+    already-relocated document (di_documents comes from DI's phase=
+    'DELIVERY' listing, which never includes a unified-capture document at
+    all, since DI always files those under phase='BOOKING'), but it also
+    meant Delivery's own live poll could never be the one to RELOCATE a
+    misplaced document -- only Booking's own poll (_reconcile_documents)
+    could, via its live /booking/capture endpoint. That endpoint 409s
+    permanently once a journey's Booking has closed (VAC-CONFLICT-004),
+    which is true for every journey that's progressed to Delivery -- so a
+    newly uploaded Delivery-bound document could only ever self-heal
+    through the one-time explicit /reconcile call right after upload, not
+    through this screen's own everyday polling, unlike Booking's side.
+    Delegates to apply_di_classification the same way _reconcile_documents
+    already does, so either screen's own poll can relocate a document,
+    with no dependency on Booking's own (potentially permanently-blocked)
+    live endpoint ever succeeding again.
+    """
+    from audit_core.uc03_unified_document_capture import (
+        _MACHINE_ACTOR,
+        apply_di_classification,
+    )
 
-    for item in di_documents:
-        document_id = UUID(str(item["documentId"]))
-        classified_type = item.get("classifiedDocumentTypeKey")
-        requirement_key = type_to_requirement.get(str(classified_type)) if classified_type else None
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.document_capture_v2_documents
-                SET capture_status=:capture_status,
-                    classified_document_type_key=:classified_type,
-                    requirement_key=:requirement_key,
-                    updated_at_utc=now()
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND stage_code='DELIVERY' AND di_document_id=:document_id
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "document_id": document_id,
-                "capture_status": str(item["state"]),
-                "classified_type": classified_type,
-                "requirement_key": requirement_key,
-            },
-        )
+    apply_di_classification(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        di_documents=di_documents,
+        actor_id=_MACHINE_ACTOR,
+        actor_role="SYSTEM",
+        correlation_id="",
+    )
 
 
 def _build_delivery_capture_response(
