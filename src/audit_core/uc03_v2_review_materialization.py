@@ -405,6 +405,19 @@ def _upsert_review_value_row(
     return str(row_id)
 
 
+# Direct user correction (2026-09-24): DI's booking_form schema has two
+# overlapping fields for the same real-world Extended/Additional Warranty
+# line -- additional_warranty_amount and a later, near-identically-aliased
+# extended_warranty_amount -- so which one a given extraction lands on is
+# model-dependent, not deterministic. uc03_invoice_materialization.py
+# already folds both onto additional_warranty_amount on the invoice side;
+# this does the same for the Booking Form, which previously wrote them as
+# two independent commercial_lines rows -- one populated from the price
+# master, the other always empty, both shown on the Deal page as if they
+# were different products.
+_COMMERCIAL_LINE_FIELD_ALIAS = {"extended_warranty_amount": "additional_warranty_amount"}
+
+
 def _materialize_commercial_lines(
     connection: Connection,
     *,
@@ -415,8 +428,13 @@ def _materialize_commercial_lines(
     values: dict[str, Any],
 ) -> int:
     written = 0
-    for component_key in sorted(_COMMERCIAL_LINE_FIELDS):
-        amount = values.get(component_key)
+    for raw_key in sorted(_COMMERCIAL_LINE_FIELDS):
+        component_key = _COMMERCIAL_LINE_FIELD_ALIAS.get(raw_key, raw_key)
+        if component_key != raw_key and values.get(component_key) is not None:
+            # The canonical field already has its own value this pass --
+            # never let the aliased duplicate field overwrite it.
+            continue
+        amount = values.get(raw_key)
         if amount is None:
             continue
         record_source_value(

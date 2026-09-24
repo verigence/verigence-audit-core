@@ -1,7 +1,9 @@
 import os
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
+from conftest import delete_tenant_data
 from sqlalchemy import create_engine, text
 
 from audit_core.uc03_booking_review_decisions import _raw_review_items
@@ -347,12 +349,15 @@ def journey():
         ).scalar_one()
     engine.dispose()
     engine = create_engine(database_url)
-    with engine.begin() as c:
-        c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
-        c.tenant_id = tenant_id  # type: ignore[attr-defined]
-        c.journey_id = journey_id  # type: ignore[attr-defined]
-        yield c
-    engine.dispose()
+    try:
+        with engine.begin() as c:
+            c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+            c.tenant_id = tenant_id  # type: ignore[attr-defined]
+            c.journey_id = journey_id  # type: ignore[attr-defined]
+            yield c
+    finally:
+        delete_tenant_data(engine, tenant_id)
+        engine.dispose()
 
 
 def test_confirm_time_materialization_covers_insurance_and_finance(journey) -> None:
@@ -417,3 +422,59 @@ def test_confirm_time_materialization_covers_insurance_and_finance(journey) -> N
         {"t": tenant_id, "j": journey_id},
     ).mappings().one()
     assert finance_row["provider_name"] == "UCO Bank"
+
+
+def test_extended_warranty_amount_aliases_onto_additional_warranty_amount(journey) -> None:
+    """Direct user correction (2026-09-24): DI's booking_form schema has two
+    overlapping fields for the same real-world Extended/Additional Warranty
+    line -- additional_warranty_amount and a later, near-identically-aliased
+    extended_warranty_amount -- so which one a given extraction lands on is
+    model-dependent, not deterministic. Previously these wrote two
+    independent commercial_lines rows: the price master only ever resolves
+    a Standard amount for additional_warranty_amount, so whenever the real
+    value landed under extended_warranty_amount instead, the Deal page
+    showed one row with a real Standard/Actual pair and a second, always-
+    empty "Extended Warranty Amount" row right next to it, as if they were
+    different products. Both must now land on the single canonical
+    additional_warranty_amount commercial line.
+    """
+    from audit_core.uc03_booking_commercial_components import (
+        install_uc03_booking_commercial_components,
+    )
+
+    # extended_warranty_amount only exists as a recognized commercial-line
+    # field once this installer has run (production runs it once at app
+    # startup via uc03_document_capture_v2_rules's own import) -- without
+    # it, the field is silently ignored rather than exercising the alias
+    # this test is actually about.
+    install_uc03_booking_commercial_components()
+
+    c = journey
+    tenant_id, journey_id = c.tenant_id, c.journey_id
+    booking_form = ReviewV2Document(
+        documentId=uuid4(),
+        label="Booking Form",
+        documentTypeKey="booking_form",
+        originalFilename="booking.pdf",
+        processingStatus="PROCESSED",
+        extractionState="READY",
+        fields=[_field("extended_warranty_amount", "17999")],
+    )
+
+    materialize_reviewed_di_business_values(
+        c,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        documents=[booking_form],
+        rejected_review_keys=set(),
+        actor_id="tester",
+    )
+
+    rows = c.execute(
+        text("SELECT component_key, actual_amount FROM auditcore.commercial_lines "
+             "WHERE tenant_id=:t AND journey_id=:j "
+             "AND component_key IN ('additional_warranty_amount', 'extended_warranty_amount')"),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()
+    by_key = {row["component_key"]: row["actual_amount"] for row in rows}
+    assert by_key == {"additional_warranty_amount": Decimal(17999)}
