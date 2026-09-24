@@ -80,6 +80,56 @@ def test_delivery_capture_links_classified_document_without_creating_gate() -> N
     assert response.requirements[0].blocksContinue is False
 
 
+def test_delivery_capture_falls_back_to_own_row_when_di_never_returns_it() -> None:
+    # Confirmed live (2026-09-24), journey B-13084433: the unified capture
+    # screen has no stage picker, so every document is recorded against DI's
+    # phase at upload time; audit-core's own reconciliation
+    # (apply_di_classification) later relocates a misclassified document's
+    # stage_code/requirement_key, but never updates DI's own upload-time
+    # phase column in docintel.document_capture_v2_uploads. DI's live
+    # list_documents(phase="DELIVERY") then never returns a document DI
+    # still has filed under phase="BOOKING" -- di_by_id never matched any of
+    # this journey's 9 reclassified Delivery documents, and the checklist
+    # showed "0 of 25" / every requirement "Missing" despite them being
+    # genuinely uploaded, classified and extracted.
+    document_id = uuid4()
+    response = _build_delivery_capture_response(
+        journey_id=uuid4(),
+        context_ref="test",
+        requirements=[
+            {
+                "requirement_key": "rto_challan",
+                "document_type_key": "rto_challan",
+                "requirement_level": "CONDITIONAL",
+                "requirement_status": "PENDING",
+                "display_label": "RTO Challan",
+                "condition_key": None,
+            }
+        ],
+        audit_documents=[
+            {
+                "di_document_id": document_id,
+                "client_upload_id": "client-1",
+                "requirement_key": "rto_challan",
+                "classified_document_type_key": "rto_challan",
+                "capture_status": "CLASSIFIED",
+                "original_filename": "challan.jpeg",
+                "content_type": "image/jpeg",
+            }
+        ],
+        # DI's own phase-filtered live list is empty -- exactly what DI
+        # returns when it still has this document filed under phase=BOOKING.
+        di_documents=[],
+        submitted=False,
+        fallback_extracted_ids=frozenset({str(document_id)}),
+    )
+
+    assert response.requirements[0].state == "UPLOADED"
+    assert response.requirements[0].document is not None
+    assert response.requirements[0].document.processingStatus == "PROCESSED"
+    assert len(response.uploads) == 1
+
+
 def test_resyncable_document_ids_only_includes_classified_documents() -> None:
     # Regression: live Delivery journey with 15 documents where DI had
     # already classified 11 and extracted 6 of them, but audit-core's own

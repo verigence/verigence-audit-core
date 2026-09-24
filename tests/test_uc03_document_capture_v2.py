@@ -62,6 +62,7 @@ def _response(
     declarations: dict[str, dict[str, object]] | None = None,
     audit_documents: list[dict[str, object]] | None = None,
     di_documents: list[dict[str, object]] | None = None,
+    fallback_extracted_ids: frozenset[str] = frozenset(),
 ):
     return _build_capture_response(
         journey_id=JOURNEY_ID,
@@ -70,6 +71,7 @@ def _response(
         declaration_rows=declarations or {},
         audit_documents=audit_documents or [],
         di_documents=di_documents or [],
+        fallback_extracted_ids=fallback_extracted_ids,
     )
 
 
@@ -97,6 +99,34 @@ def test_required_classified_document_allows_screen_two() -> None:
     assert result.requirements[0].state == "UPLOADED"
     assert result.requirements[0].canView is True
     assert result.requirements[0].canDelete is True
+
+
+def test_capture_falls_back_to_own_row_when_di_never_returns_it() -> None:
+    # Same DI phase-drift gap as delivery's mirror of this function (see
+    # test_uc03_delivery_capture_v2.py) -- a document reclassified by
+    # audit-core's own reconciliation into a stage_code DI never updates its
+    # own upload-time phase column for must not silently vanish from the
+    # checklist just because di_by_id has nothing for it.
+    result = _response(
+        requirements=[_requirement()],
+        audit_documents=[
+            {
+                "di_document_id": DOCUMENT_ID,
+                "client_upload_id": "client-upload-1",
+                "requirement_key": "booking_docket",
+                "classified_document_type_key": "booking_docket",
+                "capture_status": "CLASSIFIED",
+                "original_filename": "booking.pdf",
+                "content_type": "application/pdf",
+            }
+        ],
+        di_documents=[],
+        fallback_extracted_ids=frozenset({str(DOCUMENT_ID)}),
+    )
+
+    assert result.requirements[0].state == "UPLOADED"
+    assert result.requirements[0].document is not None
+    assert result.requirements[0].document.processingStatus == "PROCESSED"
 
 
 def test_unknown_upload_does_not_satisfy_requirement_but_does_not_block() -> None:
