@@ -47,6 +47,7 @@ class JourneyOverviewProjectionResponse(legacy.JourneyOverviewResponse):
     bankStatementLines: list[dict[str, Any]] = Field(default_factory=list)
     invoices: list[dict[str, Any]] = Field(default_factory=list)
     scrappageCertificates: list[dict[str, Any]] = Field(default_factory=list)
+    documentCounts: dict[str, int] = Field(default_factory=lambda: {"uploaded": 0, "classified": 0, "extracted": 0, "duplicates": 0})
 
 
 _BOOKING_REVIEW_FIELDS = (
@@ -1333,12 +1334,25 @@ def get_journey_overview_projection(
         journey_id=journey_id,
         review_statuses=review_statuses,
     )
-    data["evidence"] = _documents(
+    evidence_list = _documents(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
         review_statuses=review_statuses,
     )
+    data["evidence"] = evidence_list
+    # Compute document counts: frontend was independently deriving these from
+    # evidence + reviewedFields, now computed once here instead.
+    extracted_ids = {field.get("documentId") for field in reviewed_fields if field.get("documentId")}
+    classified_count = sum(1 for doc in evidence_list if doc.get("documentTypeKey"))
+    extracted_count = sum(1 for doc in evidence_list if doc.get("documentId") in extracted_ids)
+    duplicates_count = sum(1 for doc in evidence_list if doc.get("documentTypeKey") and not doc.get("requirementKey"))
+    data["documentCounts"] = {
+        "uploaded": len(evidence_list),
+        "classified": classified_count,
+        "extracted": extracted_count,
+        "duplicates": duplicates_count,
+    }
     data["skuPricing"] = _sku_pricing_panel(
         connection,
         tenant_id=tenant_id,
