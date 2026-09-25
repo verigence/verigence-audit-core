@@ -246,12 +246,20 @@ def _capture_phase_state(
 
 
 def _require_capture_phase_open(connection: Connection, *, tenant_id: str, journey_id: UUID) -> None:
+    """Delete-only lock: a document may be deleted until its own stage is
+    marked complete, then it's locked -- the one genuinely stage-based rule
+    that survives (protecting already-audited evidence from removal after a
+    decision was made on it), matching uc03_delivery_capture_v2's identical
+    check on delete_delivery_document_v2. Upload/finalize/classify are never
+    gated by this -- those actions are accepted at any time regardless of
+    completion state (see _authorize_booking's own docstring).
+    """
     state = _capture_phase_state(connection, tenant_id=tenant_id, journey_id=journey_id)
     if state["capture_completed_at_utc"] is not None:
         raise ConflictError(
             error_code="VAC-CONFLICT-004",
             title="Booking document capture is complete",
-            detail="Booking V2 document capture is locked after Booking submission.",
+            detail="Documents cannot be deleted after Booking has been submitted.",
         )
 
 
@@ -263,42 +271,17 @@ def _authorize_booking(
     human_principal: HumanPrincipal,
     authorization_client: SecurityAuthorizationClient,
 ) -> dict[str, Any]:
-    _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    state = _capture_phase_state(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        for_update=False,
-    )
-    _require_active_booking(state)
-    return dict(state)
-
-
-def _authorize_booking_for_resync(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-    human_principal: HumanPrincipal,
-    authorization_client: SecurityAuthorizationClient,
-) -> dict[str, Any]:
-    """Same permission scoping as _authorize_booking, but deliberately does
-    NOT call _require_active_booking. That gate exists to stop ordinary
-    capture/declaration writes from mutating a Booking that has already
-    closed -- exactly right for those endpoints. Resync is a repair action,
-    not a capture edit: on any journey that has progressed to Delivery (the
-    overwhelmingly common case for a journey old enough to need a resync),
-    Booking is CLOSED by design, and that must not block re-running the sync
-    pipeline against documents that were already accepted while it was
-    open. Still requires the Booking stage to exist at all (via
-    _capture_phase_state's own NotFoundError) -- only the active-status
-    requirement is dropped.
+    """Deliberately does NOT call _require_active_booking. Every upload/
+    finalize/classify/read action on Booking documents is accepted at any
+    time, regardless of Booking's own business_status -- the same
+    unconditional treatment uc03_delivery_capture_v2._authorize_delivery
+    already gives Delivery. This used to be a separate carve-out
+    (_authorize_booking_for_resync) needed only because a resync on a
+    Journey that had progressed to Delivery would otherwise be rejected by
+    this same check; once no action is stage-gated, resync needs no
+    carve-out of its own and calls this directly. Still requires the
+    Booking stage to exist at all (via _capture_phase_state's own
+    NotFoundError).
     """
     _scope(
         connection,
@@ -1154,9 +1137,6 @@ def create_booking_upload_intents_v2(
         human_principal=human_principal,
         authorization_client=authorization_client,
     )
-    _require_capture_phase_open(
-        connection, tenant_id=tenant_id, journey_id=journey_id
-    )
     requirements = _base_requirements(connection, tenant_id, journey_id)
     open_requirements = _requirements_with_open_slot(
         connection, tenant_id=tenant_id, journey_id=journey_id, requirements=requirements,
@@ -1254,9 +1234,6 @@ def finalize_booking_document_v2(
         journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
-    )
-    _require_capture_phase_open(
-        connection, tenant_id=tenant_id, journey_id=journey_id
     )
     context_ref, token = _ensure_di_context(
         connection=connection,
@@ -1451,11 +1428,12 @@ def resync_booking_capture_v2(
 ) -> BookingCaptureV2ResyncResponse:
     """The Booking counterpart of uc03_delivery_capture_v2.resync_delivery_
     capture_v2 -- open to any role with legitimate access to this Journey
-    (per _authorize_booking_for_resync's own scoping, not restricted further
-    here). Deliberately does NOT require the Booking to still be active --
-    see _authorize_booking_for_resync's own docstring for why: this is the
-    repair path for a Booking that has long since closed and moved on to
-    Delivery, which is the normal case for anything old enough to need one.
+    (per _authorize_booking's own scoping, not restricted further here).
+    Booking's own business_status is never checked for any capture-v2
+    action (see _authorize_booking's own docstring), so this repair path
+    needs no special carve-out of its own for a Journey that has long since
+    moved on to Delivery, which is the normal case for anything old enough
+    to need a resync.
 
     1. Refreshes document classification status from DI's own live state
        first (_reconcile_documents), the same call the capture screen's own
@@ -1481,7 +1459,7 @@ def resync_booking_capture_v2(
        for the same document, only ever creates-or-updates -- it cannot
        double-insert.
     """
-    _authorize_booking_for_resync(
+    _authorize_booking(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,

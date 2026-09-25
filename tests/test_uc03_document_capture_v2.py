@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, text
 from audit_core.main import app
 from audit_core.security import HumanPrincipal
 from audit_core.uc03_document_capture_v2 import (
-    _authorize_booking_for_resync,
+    _authorize_booking,
     _backfill_evidence_links_for_resync,
     _build_capture_response,
     _build_local_capture_response,
@@ -390,8 +390,7 @@ def test_booking_resync_endpoint_authorizes_and_queues_the_shared_sync_task() ->
     # identity/dealer checks, duplicate-receipt detection) rather than a
     # parallel one.
     source = inspect.getsource(resync_booking_capture_v2)
-    assert "_authorize_booking_for_resync(" in source
-    assert "_authorize_booking(" not in source
+    assert "_authorize_booking(" in source
     assert "_ensure_di_context(" in source
     # reconcile_unified_documents, not the narrower Booking-only
     # _reconcile_documents -- see the function's own comment: a
@@ -408,13 +407,15 @@ def test_booking_resync_endpoint_authorizes_and_queues_the_shared_sync_task() ->
     assert 'stage_code="BOOKING"' in source
 
 
-def test_authorize_booking_for_resync_does_not_require_active_booking() -> None:
-    # The regression itself: _authorize_booking (used by ordinary capture
-    # writes) calls _require_active_booking and rejects a CLOSED Booking --
-    # correct for a capture edit, wrong for a resync/repair action on a
-    # Journey that has since progressed to Delivery. The resync-specific
-    # authorizer must scope-check and load state without that gate.
-    source = inspect.getsource(_authorize_booking_for_resync)
+def test_authorize_booking_does_not_require_active_booking() -> None:
+    # Every capture-v2 action on Booking (upload, finalize, delete, read,
+    # resync) is accepted regardless of Booking's own business_status --
+    # no stage-based gate on document actions, matching
+    # uc03_delivery_capture_v2._authorize_delivery's identical shape. This
+    # used to be a resync-only carve-out (_authorize_booking_for_resync);
+    # once no action is stage-gated, resync needed no carve-out of its own
+    # and now shares this same function.
+    source = inspect.getsource(_authorize_booking)
     assert "_scope(" in source
     assert "_capture_phase_state(" in source
     assert "_require_active_booking(" not in source
