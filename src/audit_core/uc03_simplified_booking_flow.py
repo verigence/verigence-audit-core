@@ -42,6 +42,10 @@ from audit_core.uc03_document_capture_v2 import (
     _declarations,
     _linked_documents,
 )
+from audit_core.uc03_requirement_satisfaction import (
+    resolve_requirement_satisfaction,
+    unresolved_completion_blockers,
+)
 from audit_core.uc03_simplified_create_atomic import (
     execute_simplified_create_booking_atomic,
 )
@@ -192,10 +196,31 @@ def submit_booking_from_review(
         # are uploaded and classified, exactly like Delivery already does.
         requirements = _base_requirements(connection, tenant_id, journey_id)
         documents = _linked_documents(connection, tenant_id, journey_id)
-        mandatory_documents_complete = booking_v2._mandatory_booking_documents_complete(
-            requirements,
-            documents,
+        # Was booking_v2._mandatory_booking_documents_complete(requirements,
+        # documents) -- a sixth independent computation of the same fact
+        # resolve_requirement_satisfaction now answers everywhere else (this
+        # endpoint is the REAL, live "Submit Booking" action; complete_
+        # booking_capture_v2 has no frontend caller). Its own PAN-or-Aadhaar
+        # "identity requirement" special case is a no-op against today's
+        # catalog (pan_card/aadhaar are OPTIONAL since migration 0109/0110,
+        # so _is_identity_requirement's REQUIRED-only filter always finds
+        # customer_kyc instead) -- behaviorally equivalent to the shared
+        # function's own REQUIRED-satisfaction check, just via one canonical
+        # path instead of a second one to keep in sync. Booking has no
+        # CONDITIONAL requirements today either, so the shared function's
+        # extra CONDITIONAL check is a no-op here too, not a behavior
+        # change. Soft-downgrade-on-incomplete (business_status stays
+        # BOOKING_IN_PROGRESS rather than a hard 409) is this endpoint's own
+        # deliberate, already-documented design -- not touched.
+        satisfaction = resolve_requirement_satisfaction(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code="BOOKING",
+            requirements=requirements,
+            documents=documents,
         )
+        mandatory_documents_complete = not unresolved_completion_blockers(satisfaction)
         current_pc_status = connection.execute(
             text(
                 """
