@@ -1,3 +1,21 @@
+"""uc03_booking_rule_trigger.py — booking audit rule engine entry point.
+
+When a Booking is submitted for review (submitSimplifiedBookingV2), this module
+fires all configured BK_* audit rules against the booking's captured documents,
+extracted values, and commercial outcomes (SKU resolution, price discrepancies,
+etc.). Rules can flag issues that don't block submission but do require PC
+acknowledgement or correction before the booking moves to Delivery.
+
+This is the primary rule-engine checkpoint in the UC03 Booking/Delivery audit
+workflow. It uses the shared resolve_requirement_satisfaction() function to
+determine document presence, feeds results through run_rule_engine_phase() for
+unified rule execution and finding storage, and records outcomes in
+journey_stage_states as audit_state transitions (OPEN → FINDING_REQUIRED, etc.).
+
+The rule definitions themselves live in document_capture_v2_requirement_policy
+and uc03_booking_confirmation_rules (specific business rules like
+BK_DISCOUNT_EVIDENCE_MISSING); this module is the orchestrator that runs them.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -50,6 +68,9 @@ def _requirement_snapshot(
     tenant_id: str,
     journey_id: UUID,
 ) -> list[dict[str, Any]]:
+    """Snapshot of all Booking requirements and their evidence status.
+    Returns requirement_key, level, whether evidence exists, condition answers.
+    Used by rule engine to evaluate rules that depend on specific documents."""
     rows = connection.execute(
         text(
             """
