@@ -783,6 +783,31 @@ def _vin_reconciliation(
     return "MATCH"
 
 
+def vin_reconciliation_review_required(
+    connection: Connection, *, tenant_id: str, journey_id: UUID,
+) -> bool:
+    """Whether journey_delivery_audit_facts.vin_reconciliation_status is
+    still REVIEW_REQUIRED (never resolved to MATCH/MISMATCH) -- the one
+    real "rule/materializer outcome" example from the approved unification
+    plan that already has an exact signal (see _vin_reconciliation, whose
+    output is written to that column). Used by
+    uc03_delivery_capture_v2.submit_delivery_capture_v2's completion gate;
+    _delivery_audit_gaps reads the same column inline for its own,
+    separate physical-delivery-completion gap list.
+    """
+    status = connection.execute(
+        text(
+            """
+            SELECT vin_reconciliation_status
+            FROM auditcore.journey_delivery_audit_facts
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalar_one_or_none()
+    return status == "REVIEW_REQUIRED"
+
+
 def _delivery_audit_gaps(
     connection: Connection,
     *,
