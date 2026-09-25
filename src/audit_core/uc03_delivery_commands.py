@@ -29,7 +29,6 @@ from audit_core.uc03_booking_commands import (
     _set_etag,
 )
 from audit_core.uc03_finding_classification import resolve_classification
-from audit_core.uc03_requirement_satisfaction import resolve_requirement_satisfaction
 from audit_core.workflow import complete_workflow_task, create_workflow_task
 
 router = APIRouter(
@@ -41,6 +40,7 @@ _BOOKING_INCOMPLETE_RULE = "WF_BOOKING_INCOMPLETE_AT_DELIVERY_START"
 _DELIVERY_AUDIT_INCOMPLETE_RULE = "WF_DELIVERY_COMPLETED_WITH_AUDIT_INCOMPLETE"
 _NOT_INTIMATED_RULE = "DL_NOT_INTIMATED"
 _VIN_RULE = "DL_VIN_RECONCILIATION"
+_DOCUMENT_NO_RULE = "DOC_REQUIRED_ANSWER_NO"
 _VIN_EVALUATOR = "EXACT_COMPARABLE_IDENTIFIER_V1"
 # PAY_UNVERIFIED_RECEIPT was retired as a standalone rule_code -- the
 # unverified-payment check below now raises under PAYMENT_BANK_UNMATCHED's
@@ -783,31 +783,6 @@ def _vin_reconciliation(
     return "MATCH"
 
 
-def vin_reconciliation_review_required(
-    connection: Connection, *, tenant_id: str, journey_id: UUID,
-) -> bool:
-    """Whether journey_delivery_audit_facts.vin_reconciliation_status is
-    still REVIEW_REQUIRED (never resolved to MATCH/MISMATCH) -- the one
-    real "rule/materializer outcome" example from the approved unification
-    plan that already has an exact signal (see _vin_reconciliation, whose
-    output is written to that column). Used by
-    uc03_delivery_capture_v2.submit_delivery_capture_v2's completion gate;
-    _delivery_audit_gaps reads the same column inline for its own,
-    separate physical-delivery-completion gap list.
-    """
-    status = connection.execute(
-        text(
-            """
-            SELECT vin_reconciliation_status
-            FROM auditcore.journey_delivery_audit_facts
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).scalar_one_or_none()
-    return status == "REVIEW_REQUIRED"
-
-
 def _delivery_audit_gaps(
     connection: Connection,
     *,
@@ -850,23 +825,46 @@ def _delivery_audit_gaps(
     if facts is not None and facts["vin_reconciliation_status"] == "REVIEW_REQUIRED":
         gaps.append("VIN_RECONCILIATION_REVIEW_REQUIRED")
 
-    # Confirmed live (2026-09-24): this used to LEFT JOIN
-    # journey_document_assessments for a PC-declared Yes/No/Unanswered
-    # "answer" per requirement -- a table the current Unified Capture v2
-    # flow never writes to (no PC has ever actually answered one in
-    # practice), so every REQUIRED requirement always came back
-    # UNANSWERED regardless of whether the document was genuinely
-    # uploaded. Replaced with the one canonical, live-computed
-    # satisfaction fact every other consumer now reads too -- see
-    # uc03_requirement_satisfaction.py's own module docstring for the
-    # full list of what this was duplicating.
-    satisfaction = resolve_requirement_satisfaction(
-        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
-    )
-    for requirement_key, result in satisfaction.items():
-        if result.requirement_level != "REQUIRED" or result.satisfied:
-            continue
-        gaps.append(f"DOCUMENT_MISSING:{requirement_key}")
+    documents = connection.execute(
+        text(
+            """
+            SELECT jdr.requirement_key, jdr.requirement_level,
+                   jdr.requirement_status,
+                   COALESCE(jda.answer, 'UNANSWERED') AS answer
+            FROM auditcore.journey_document_requirements jdr
+            LEFT JOIN auditcore.journey_document_assessments jda
+              ON jda.tenant_id=jdr.tenant_id
+             AND jda.journey_id=jdr.journey_id
+             AND jda.stage_code='DELIVERY'
+             AND jda.requirement_key=jdr.requirement_key
+            WHERE jdr.tenant_id=:tenant_id AND jdr.journey_id=:journey_id
+              AND upper(jdr.process_area)='DELIVERY'
+              AND jdr.requirement_status <> 'NOT_APPLICABLE'
+            ORDER BY jdr.requirement_key
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    for document in documents:
+        answer = document["answer"]
+        if answer == "UNANSWERED":
+            gaps.append(f"DOCUMENT_UNANSWERED:{document['requirement_key']}")
+        elif answer == "NO":
+            flags.append(
+                _machine_flag(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    stage_code="DELIVERY",
+                    rule_key=f"{_DOCUMENT_NO_RULE}:{document['requirement_key']}",
+                    finding_type="REQUIRED_DOCUMENT_ANSWER_NO",
+                    severity="HIGH" if document["requirement_level"] == "REQUIRED" else "MEDIUM",
+                    title="Delivery document answered No",
+                    description=f"Requirement {document['requirement_key']} was explicitly answered No.",
+                    correlation_id=correlation_id,
+                    safe_payload={"requirementKey": document["requirement_key"]},
+                )
+            )
 
     unverified_payments = connection.execute(
         text(

@@ -111,12 +111,6 @@ from audit_core.uc03_document_field_corrections import (
     router as uc03_document_field_corrections_router,
 )
 from audit_core.uc03_document_review_v2 import router as uc03_document_review_v2_router
-from audit_core.uc03_document_sync_recovery import (
-    DEFAULT_SWEEP_INTERVAL_SECONDS as DOCUMENT_SYNC_SWEEP_INTERVAL_SECONDS,
-)
-from audit_core.uc03_document_sync_recovery import (
-    run_document_sync_recovery_loop,
-)
 from audit_core.uc03_duplicate_bookings_report import (
     router as uc03_duplicate_bookings_report_router,
 )
@@ -221,28 +215,12 @@ async def _lifespan(_: FastAPI):
     sweep_task = asyncio.create_task(
         run_stale_worker_task_recovery_loop(get_engine(), interval_seconds=sweep_interval)
     )
-    document_sync_sweep_interval = float(
-        os.environ.get(
-            "DOCUMENT_SYNC_RECOVERY_SWEEP_INTERVAL_SECONDS",
-            str(DOCUMENT_SYNC_SWEEP_INTERVAL_SECONDS),
-        )
-    )
-    document_sync_sweep_task = asyncio.create_task(
-        run_document_sync_recovery_loop(
-            get_engine(), interval_seconds=document_sync_sweep_interval,
-        )
-    )
     try:
         yield
     finally:
         sweep_task.cancel()
-        document_sync_sweep_task.cancel()
         try:
             await sweep_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await document_sync_sweep_task
         except asyncio.CancelledError:
             pass
 
