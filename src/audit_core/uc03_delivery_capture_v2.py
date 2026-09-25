@@ -39,6 +39,10 @@ from audit_core.uc03_document_capture_v2 import (
     get_di_client,
     get_security_oauth_client,
 )
+from audit_core.uc03_requirement_satisfaction import (
+    linked_documents_for_journey,
+    requirements_for_journey,
+)
 from audit_core.workflow import (
     cancel_workflow_task,
     complete_workflow_task,
@@ -153,52 +157,14 @@ def _delivery_requirements(
     tenant_id: str,
     journey_id: UUID,
 ) -> list[dict[str, Any]]:
-    rows = connection.execute(
-        text(
-            """
-            SELECT jdr.journey_document_requirement_id AS requirement_ref,
-                   jdr.requirement_key, jdr.document_type_key,
-                   jdr.requirement_level, jdr.requirement_status,
-                   COALESCE(p.display_label, jdr.requirement_key) AS display_label,
-                   COALESCE(p.condition_key, jdr.condition_snapshot->>'conditionKey') AS condition_key,
-                   COALESCE(p.sort_order, dri.sort_order, 999999) AS sort_order
-            FROM auditcore.journey_document_requirements jdr
-            LEFT JOIN auditcore.document_requirement_items dri
-              ON dri.tenant_id=jdr.tenant_id
-             AND dri.document_requirement_item_id=jdr.document_requirement_item_id
-            LEFT JOIN auditcore.document_capture_v2_requirement_policy p
-              ON p.requirement_key=jdr.requirement_key
-             AND p.process_area='DELIVERY'
-             AND p.is_active=true
-            WHERE jdr.tenant_id=:tenant_id
-              AND jdr.journey_id=:journey_id
-              AND upper(jdr.process_area)='DELIVERY'
-            ORDER BY COALESCE(p.sort_order, dri.sort_order, 999999), jdr.requirement_key
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().all()
-    requirements = [dict(row) for row in rows]
-
-    extensions = connection.execute(
-        text(
-            """
-            SELECT NULL::uuid AS requirement_ref,
-                   requirement_key,
-                   extension_document_type_key AS document_type_key,
-                   extension_requirement_level AS requirement_level,
-                   'PENDING' AS requirement_status,
-                   display_label, condition_key, sort_order
-            FROM auditcore.document_capture_v2_requirement_policy
-            WHERE process_area='DELIVERY' AND is_active=true AND is_extension=true
-            ORDER BY sort_order, requirement_key
-            """
-        )
-    ).mappings().all()
-    existing = {row["requirement_key"] for row in requirements}
-    requirements.extend(dict(row) for row in extensions if row["requirement_key"] not in existing)
-    requirements.sort(key=lambda row: (int(row.get("sort_order") or 999999), row["requirement_key"]))
-    return requirements
+    """Thin delegation to the one shared, stage-parametrized query -- was a
+    full copy of uc03_document_capture_v2._base_requirements with only the
+    'BOOKING'/'DELIVERY' literal differing. See
+    uc03_requirement_satisfaction.requirements_for_journey.
+    """
+    return requirements_for_journey(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
+    )
 
 
 def _linked_delivery_documents(
@@ -206,21 +172,14 @@ def _linked_delivery_documents(
     tenant_id: str,
     journey_id: UUID,
 ) -> list[dict[str, Any]]:
-    rows = connection.execute(
-        text(
-            """
-            SELECT di_document_id, client_upload_id, requirement_key,
-                   classified_document_type_key, capture_status,
-                   original_filename, content_type
-            FROM auditcore.document_capture_v2_documents
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code='DELIVERY' AND capture_status <> 'SUPERSEDED'
-            ORDER BY created_at_utc, di_document_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().all()
-    return [dict(row) for row in rows]
+    """Thin delegation to the one shared, stage-parametrized query -- was a
+    full copy of uc03_document_capture_v2._linked_documents with only the
+    'BOOKING'/'DELIVERY' literal differing. See
+    uc03_requirement_satisfaction.linked_documents_for_journey.
+    """
+    return linked_documents_for_journey(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
+    )
 
 
 def _reconcile_delivery_documents(
