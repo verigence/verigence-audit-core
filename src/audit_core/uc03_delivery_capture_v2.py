@@ -20,7 +20,12 @@ from audit_core.security_authorization import (
 )
 from audit_core.security_integration import SecurityOAuthClient
 from audit_core.uc03_booking_capture import _scope
-from audit_core.uc03_delivery_commands import _append_delivery_event, _machine_flag
+from audit_core.uc03_delivery_commands import (
+    _append_delivery_event,
+    _machine_flag,
+    vin_reconciliation_review_required,
+)
+from audit_core.uc03_delivery_documents import _resolve_known_applicability
 from audit_core.uc03_document_capture_v2 import (
     CaptureV2Document,
     CaptureV2Requirement,
@@ -42,6 +47,8 @@ from audit_core.uc03_document_capture_v2 import (
 from audit_core.uc03_requirement_satisfaction import (
     linked_documents_for_journey,
     requirements_for_journey,
+    resolve_requirement_satisfaction,
+    unresolved_completion_blockers,
 )
 from audit_core.workflow import (
     cancel_workflow_task,
@@ -1197,6 +1204,41 @@ def submit_delivery_capture_v2(
         )
         documents = _linked_delivery_documents(connection, tenant_id, journey_id)
         first_submission = refreshed.get("capture_completed_at_utc") is None
+        if first_submission:
+            # Only gates the FIRST submission -- Delivery previously had no
+            # completeness gate at all (this UPDATE always succeeded via
+            # COALESCE), so re-submitting an already-completed Delivery
+            # must stay exactly as unconditional as before; re-running this
+            # check on every idempotent re-submit could newly block a
+            # Delivery that was already legitimately completed.
+            _resolve_known_applicability(
+                connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
+            )
+            requirements = _delivery_requirements(connection, tenant_id, journey_id)
+            satisfaction = resolve_requirement_satisfaction(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                stage_code="DELIVERY",
+                requirements=requirements,
+                documents=documents,
+            )
+            blockers = unresolved_completion_blockers(satisfaction)
+            if blockers:
+                raise ConflictError(
+                    error_code="VAC-CONFLICT-004",
+                    title="Delivery document capture is incomplete",
+                    detail=(
+                        "Required documents are still missing or unclassified: "
+                        + ", ".join(sorted(b.requirement_key for b in blockers))
+                    ),
+                )
+            if vin_reconciliation_review_required(connection, tenant_id=tenant_id, journey_id=journey_id):
+                raise ConflictError(
+                    error_code="VAC-CONFLICT-004",
+                    title="Delivery document capture is incomplete",
+                    detail="VIN/chassis reconciliation between the RC and the invoice still needs review.",
+                )
         connection.execute(
             text(
                 """

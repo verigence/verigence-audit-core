@@ -3,8 +3,10 @@ from __future__ import annotations
 from uuid import uuid4
 
 from audit_core.uc03_requirement_satisfaction import (
+    RequirementSatisfaction,
     first_linked_document_ids,
     resolve_requirement_satisfaction,
+    unresolved_completion_blockers,
 )
 
 
@@ -14,8 +16,11 @@ def _requirement(
     level: str = "REQUIRED",
     status: str = "PENDING",
     doc_type: str | None = None,
+    requirement_ref=None,
+    is_extension: bool = False,
 ) -> dict:
     return {
+        "requirement_ref": None if is_extension else (requirement_ref or uuid4()),
         "requirement_key": key,
         "requirement_level": level,
         "requirement_status": status,
@@ -158,3 +163,91 @@ def test_requirement_with_a_document_present_but_wrong_slot_does_not_satisfy_it(
     assert result["booking_form"].satisfied is True
     assert result["customer_kyc"].satisfied is False
     assert result["customer_kyc"].reason == "NO_DOCUMENT"
+
+
+def test_extension_requirement_is_marked_is_extension() -> None:
+    # requirement_ref is NULL for a document_capture_v2_requirement_policy
+    # "extension" row (corporate_id today) -- never materialized into
+    # journey_document_requirements, so applicability can never resolve
+    # for it the way a catalog-backed CONDITIONAL requirement's does.
+    result = resolve_requirement_satisfaction(
+        object(),
+        tenant_id="tenant-a",
+        journey_id=uuid4(),
+        stage_code="DELIVERY",
+        requirements=[_requirement("corporate_id", level="CONDITIONAL", is_extension=True)],
+        documents=[],
+    )
+    assert result["corporate_id"].is_extension is True
+    assert result["corporate_id"].satisfied is False
+
+
+def test_catalog_backed_requirement_is_not_marked_is_extension() -> None:
+    result = resolve_requirement_satisfaction(
+        object(),
+        tenant_id="tenant-a",
+        journey_id=uuid4(),
+        stage_code="BOOKING",
+        requirements=[_requirement("booking_form")],
+        documents=[_document("booking_form")],
+    )
+    assert result["booking_form"].is_extension is False
+
+
+def _satisfaction(**overrides) -> RequirementSatisfaction:
+    defaults = {
+        "requirement_key": "booking_form",
+        "stage_code": "BOOKING",
+        "requirement_level": "REQUIRED",
+        "display_label": "Booking Form",
+        "document_type_key": "booking_form",
+        "condition_key": None,
+        "satisfied": False,
+        "reason": "NO_DOCUMENT",
+        "active_document_id": None,
+        "active_document": None,
+        "is_extension": False,
+    }
+    defaults.update(overrides)
+    return RequirementSatisfaction(**defaults)
+
+
+def test_unresolved_completion_blockers_includes_unsatisfied_required() -> None:
+    blockers = unresolved_completion_blockers({"booking_form": _satisfaction()})
+    assert [b.requirement_key for b in blockers] == ["booking_form"]
+
+
+def test_unresolved_completion_blockers_includes_unsatisfied_conditional() -> None:
+    blockers = unresolved_completion_blockers(
+        {"gst_certificate": _satisfaction(requirement_key="gst_certificate", requirement_level="CONDITIONAL")}
+    )
+    assert [b.requirement_key for b in blockers] == ["gst_certificate"]
+
+
+def test_unresolved_completion_blockers_excludes_optional() -> None:
+    blockers = unresolved_completion_blockers(
+        {"pan_card": _satisfaction(requirement_key="pan_card", requirement_level="OPTIONAL")}
+    )
+    assert blockers == []
+
+
+def test_unresolved_completion_blockers_excludes_satisfied() -> None:
+    blockers = unresolved_completion_blockers(
+        {"booking_form": _satisfaction(satisfied=True, reason="SATISFIED")}
+    )
+    assert blockers == []
+
+
+def test_unresolved_completion_blockers_excludes_extension_even_if_conditional_and_unsatisfied() -> None:
+    # The exact landmine this exists to avoid: corporate_id is CONDITIONAL
+    # and, for the overwhelming majority of non-corporate journeys, will
+    # never have a document -- without this exclusion it would block every
+    # such Delivery's completion forever.
+    blockers = unresolved_completion_blockers(
+        {
+            "corporate_id": _satisfaction(
+                requirement_key="corporate_id", requirement_level="CONDITIONAL", is_extension=True,
+            )
+        }
+    )
+    assert blockers == []

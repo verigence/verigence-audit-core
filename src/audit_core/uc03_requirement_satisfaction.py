@@ -55,6 +55,7 @@ class RequirementSatisfaction:
     reason: SatisfactionReason
     active_document_id: UUID | None
     active_document: dict[str, Any] | None
+    is_extension: bool = False
 
 
 def requirements_for_journey(
@@ -254,6 +255,18 @@ def resolve_requirement_satisfaction(
                     UUID(str(active["di_document_id"])) if active is not None else None
                 ),
                 active_document=active,
+                # requirement_ref is NULL for a document_capture_v2_requirement_
+                # policy "extension" row (requirements_for_journey's own
+                # second query) -- never materialized into
+                # journey_document_requirements, so it has no row for
+                # _resolve_known_applicability/_apply_resolved_applicability
+                # to ever write NOT_APPLICABLE onto. A CONDITIONAL extension
+                # (corporate_id is the one example today) would otherwise
+                # sit at satisfied=False forever for any journey no matching
+                # document ever arrives for -- see unresolved_completion_
+                # blockers, which excludes these from hard-blocking
+                # completion for exactly this reason.
+                is_extension=requirement.get("requirement_ref") is None,
             )
         return result
     except Exception:
@@ -273,3 +286,30 @@ def resolve_requirement_satisfaction(
             kind="histogram",
             labels={"stage_code": stage_code},
         )
+
+
+def unresolved_completion_blockers(
+    satisfaction: dict[str, RequirementSatisfaction],
+) -> list[RequirementSatisfaction]:
+    """Which requirements must not be unresolved for a stage to be marked
+    complete: REQUIRED and CONDITIONAL only, matching capture-v2's own
+    pre-unification blocksContinue rule (OPTIONAL never blocked; NOT_
+    APPLICABLE is a satisfied=True outcome, so it never appears here).
+    is_extension rows are excluded regardless of level -- they have no
+    journey_document_requirements row for applicability to ever resolve
+    against (see RequirementSatisfaction.is_extension's own docstring), so
+    hard-blocking completion on one would mean a CONDITIONAL extension
+    (corporate_id today) blocks every journey forever unless a document
+    happens to arrive for it.
+
+    Shared by complete_booking_capture_v2 and submit_delivery_capture_v2 so
+    both stages gate on the identical rule instead of two hand-written
+    copies.
+    """
+    return [
+        result
+        for result in satisfaction.values()
+        if result.requirement_level in ("REQUIRED", "CONDITIONAL")
+        and not result.satisfied
+        and not result.is_extension
+    ]

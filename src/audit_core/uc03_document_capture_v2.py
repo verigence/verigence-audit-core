@@ -37,10 +37,13 @@ from audit_core.uc03_booking_commands import (
     _append_workflow_event,
     _parse_if_match,
 )
+from audit_core.uc03_delivery_documents import _resolve_known_applicability
 from audit_core.uc03_pc_booking_documents import _is_repeatable_requirement
 from audit_core.uc03_requirement_satisfaction import (
     linked_documents_for_journey,
     requirements_for_journey,
+    resolve_requirement_satisfaction,
+    unresolved_completion_blockers,
 )
 
 router = APIRouter(prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}", tags=["uc03-document-capture-v2"])
@@ -1053,19 +1056,52 @@ def complete_booking_capture_v2(
                 detail="Booking V2 document capture has already been submitted.",
             )
 
-        local_capture = _build_local_capture_response(
-            connection=connection,
+        # Fresh-resolve CONDITIONAL applicability before gating: a
+        # requirement whose deciding document never arrives (so the DI
+        # webhook's own resolve_requirement_applicability_if_conditional
+        # never fires for it) would otherwise sit at requirement_status=
+        # PENDING forever even though the answer is already knowable from
+        # commercial-line/trade-in facts (_resolve_condition). Booking's
+        # checklist read never triggered this recompute the way Delivery's
+        # legacy list_delivery_documents does -- doing it here, once, right
+        # before the one-shot completion decision, closes that gap without
+        # adding a recompute to every checklist read.
+        _resolve_known_applicability(
+            connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
+        )
+        satisfaction = resolve_requirement_satisfaction(
+            connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
+            stage_code="BOOKING",
             requirements=_base_requirements(connection, tenant_id, journey_id),
-            declaration_rows=_declarations(connection, tenant_id, journey_id),
-            audit_documents=_linked_documents(connection, tenant_id, journey_id),
+            documents=_linked_documents(connection, tenant_id, journey_id),
         )
-        if not local_capture.canContinue:
+        blockers = unresolved_completion_blockers(satisfaction)
+        if blockers:
             raise ConflictError(
                 error_code="VAC-CONFLICT-004",
                 title="Booking document capture is incomplete",
-                detail="Required classifications or applicability decisions are still pending.",
+                detail=(
+                    "Required documents are still missing or unclassified: "
+                    + ", ".join(sorted(b.requirement_key for b in blockers))
+                ),
+            )
+        tentative_sku = connection.execute(
+            text(
+                """
+                SELECT 1 FROM auditcore.journey_products
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND selection_status='TENTATIVE'
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one_or_none()
+        if tentative_sku is not None:
+            raise ConflictError(
+                error_code="VAC-CONFLICT-004",
+                title="Booking document capture is incomplete",
+                detail="Vehicle model/SKU selection is still ambiguous and needs Team Lead confirmation.",
             )
 
         next_version = expected_version + 1
