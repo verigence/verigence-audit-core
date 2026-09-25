@@ -35,9 +35,5 @@ def test_submit_no_longer_blocks_on_unreviewed_low_confidence_fields() -> None:
     source = inspect.getsource(submit_booking_from_review)
     assert "_unreviewed_low_confidence_count" not in source
     assert "VAC-CONFLICT-012" not in source
-    # The real, sole completion criterion must still be the deciding factor --
-    # was booking_v2._mandatory_booking_documents_complete, redirected to the
-    # one canonical satisfaction fact every other consumer reads too (see
-    # uc03_requirement_satisfaction.py's own module docstring).
-    assert "resolve_requirement_satisfaction(" in source
-    assert "unresolved_completion_blockers(" in source
+    # The real, sole completion criterion must still be the deciding factor.
+    assert "_mandatory_booking_documents_complete(" in source

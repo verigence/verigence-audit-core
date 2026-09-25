@@ -416,30 +416,14 @@ def _resolve_known_applicability(
     *,
     tenant_id: str,
     journey_id: UUID,
-    stage_code: str = "DELIVERY",
 ) -> list[dict[str, str]]:
-    """Resolve every conditional document requirement for one stage of this
-    journey whose authoritative fact already exists. stage_code was
-    hardcoded to 'DELIVERY' (the only caller was list_delivery_documents,
-    the legacy V1 read endpoint) -- now a plain parameter so the Booking/
-    Delivery completion checks (uc03_document_capture_v2.
-    complete_booking_capture_v2 / uc03_delivery_capture_v2.
-    submit_delivery_capture_v2) can force the same fresh resolution right
-    before gating on it, closing the gap where a Booking CONDITIONAL
-    requirement with no document ever arriving (so
-    resolve_requirement_applicability_if_conditional's webhook-triggered
-    path never fires for it) would otherwise sit at requirement_status=
-    PENDING forever, even though _resolve_condition already knows the
-    answer from commercial-line/trade-in facts. _resolve_condition itself
-    is already stage-agnostic (keyed by condition_key, not process_area) --
-    this was the only stage-specific piece.
-
-    Used by the read/verification endpoints (called once per page view);
-    the DI document-link webhook uses
-    resolve_requirement_applicability_if_conditional instead, scoped to the
-    single row it already holds -- see that function's docstring for why
-    calling this one from the webhook caused a live lock-contention
-    incident.
+    """Resolve every conditional Delivery document requirement for this
+    journey whose authoritative fact already exists. Used by the read/
+    verification endpoints (called once per page view); the DI document-link
+    webhook uses resolve_requirement_applicability_if_conditional instead,
+    scoped to the single row it already holds -- see that function's
+    docstring for why calling this one from the webhook caused a live
+    lock-contention incident.
     """
     rows = connection.execute(
         text(
@@ -448,12 +432,12 @@ def _resolve_known_applicability(
                    requirement_status, condition_snapshot
             FROM auditcore.journey_document_requirements
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND upper(process_area)=:stage_code
+              AND upper(process_area)='DELIVERY'
               AND requirement_level='CONDITIONAL'
             FOR UPDATE
             """
         ),
-        {"tenant_id": tenant_id, "journey_id": journey_id, "stage_code": stage_code},
+        {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
     changes: list[dict[str, str]] = []
     for row in rows:

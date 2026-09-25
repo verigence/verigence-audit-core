@@ -37,14 +37,7 @@ from audit_core.uc03_booking_commands import (
     _append_workflow_event,
     _parse_if_match,
 )
-from audit_core.uc03_delivery_documents import _resolve_known_applicability
 from audit_core.uc03_pc_booking_documents import _is_repeatable_requirement
-from audit_core.uc03_requirement_satisfaction import (
-    linked_documents_for_journey,
-    requirements_for_journey,
-    resolve_requirement_satisfaction,
-    unresolved_completion_blockers,
-)
 
 router = APIRouter(prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}", tags=["uc03-document-capture-v2"])
 _DI_AUDIENCE = "di"
@@ -249,20 +242,12 @@ def _capture_phase_state(
 
 
 def _require_capture_phase_open(connection: Connection, *, tenant_id: str, journey_id: UUID) -> None:
-    """Delete-only lock: a document may be deleted until its own stage is
-    marked complete, then it's locked -- the one genuinely stage-based rule
-    that survives (protecting already-audited evidence from removal after a
-    decision was made on it), matching uc03_delivery_capture_v2's identical
-    check on delete_delivery_document_v2. Upload/finalize/classify are never
-    gated by this -- those actions are accepted at any time regardless of
-    completion state (see _authorize_booking's own docstring).
-    """
     state = _capture_phase_state(connection, tenant_id=tenant_id, journey_id=journey_id)
     if state["capture_completed_at_utc"] is not None:
         raise ConflictError(
             error_code="VAC-CONFLICT-004",
             title="Booking document capture is complete",
-            detail="Documents cannot be deleted after Booking has been submitted.",
+            detail="Booking V2 document capture is locked after Booking submission.",
         )
 
 
@@ -274,17 +259,42 @@ def _authorize_booking(
     human_principal: HumanPrincipal,
     authorization_client: SecurityAuthorizationClient,
 ) -> dict[str, Any]:
-    """Deliberately does NOT call _require_active_booking. Every upload/
-    finalize/classify/read action on Booking documents is accepted at any
-    time, regardless of Booking's own business_status -- the same
-    unconditional treatment uc03_delivery_capture_v2._authorize_delivery
-    already gives Delivery. This used to be a separate carve-out
-    (_authorize_booking_for_resync) needed only because a resync on a
-    Journey that had progressed to Delivery would otherwise be rejected by
-    this same check; once no action is stage-gated, resync needs no
-    carve-out of its own and calls this directly. Still requires the
-    Booking stage to exist at all (via _capture_phase_state's own
-    NotFoundError).
+    _scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    state = _capture_phase_state(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        for_update=False,
+    )
+    _require_active_booking(state)
+    return dict(state)
+
+
+def _authorize_booking_for_resync(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: HumanPrincipal,
+    authorization_client: SecurityAuthorizationClient,
+) -> dict[str, Any]:
+    """Same permission scoping as _authorize_booking, but deliberately does
+    NOT call _require_active_booking. That gate exists to stop ordinary
+    capture/declaration writes from mutating a Booking that has already
+    closed -- exactly right for those endpoints. Resync is a repair action,
+    not a capture edit: on any journey that has progressed to Delivery (the
+    overwhelmingly common case for a journey old enough to need a resync),
+    Booking is CLOSED by design, and that must not block re-running the sync
+    pipeline against documents that were already accepted while it was
+    open. Still requires the Booking stage to exist at all (via
+    _capture_phase_state's own NotFoundError) -- only the active-status
+    requirement is dropped.
     """
     _scope(
         connection,
@@ -304,14 +314,52 @@ def _authorize_booking(
 
 
 def _base_requirements(connection: Connection, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
-    """Thin delegation to the one shared, stage-parametrized query -- was a
-    full copy of uc03_delivery_capture_v2._delivery_requirements with only
-    the 'BOOKING'/'DELIVERY' literal differing. See
-    uc03_requirement_satisfaction.requirements_for_journey.
-    """
-    return requirements_for_journey(
-        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
-    )
+    rows = connection.execute(
+        text(
+            """
+            SELECT jdr.journey_document_requirement_id AS requirement_ref,
+                   jdr.requirement_key, jdr.document_type_key,
+                   jdr.requirement_level, jdr.requirement_status,
+                   COALESCE(p.display_label, jdr.requirement_key) AS display_label,
+                   COALESCE(p.condition_key, jdr.condition_snapshot->>'conditionKey') AS condition_key,
+                   COALESCE(p.sort_order, dri.sort_order, 999999) AS sort_order
+            FROM auditcore.journey_document_requirements jdr
+            LEFT JOIN auditcore.document_requirement_items dri
+              ON dri.tenant_id=jdr.tenant_id
+             AND dri.document_requirement_item_id=jdr.document_requirement_item_id
+            LEFT JOIN auditcore.document_capture_v2_requirement_policy p
+              ON p.requirement_key=jdr.requirement_key
+             AND p.process_area='BOOKING'
+             AND p.is_active=true
+            WHERE jdr.tenant_id=:tenant_id
+              AND jdr.journey_id=:journey_id
+              AND upper(jdr.process_area)='BOOKING'
+            ORDER BY COALESCE(p.sort_order, dri.sort_order, 999999), jdr.requirement_key
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    requirements = [dict(row) for row in rows]
+
+    extensions = connection.execute(
+        text(
+            """
+            SELECT NULL::uuid AS requirement_ref,
+                   requirement_key,
+                   extension_document_type_key AS document_type_key,
+                   extension_requirement_level AS requirement_level,
+                   'PENDING' AS requirement_status,
+                   display_label, condition_key, sort_order
+            FROM auditcore.document_capture_v2_requirement_policy
+            WHERE process_area='BOOKING' AND is_active=true AND is_extension=true
+            ORDER BY sort_order, requirement_key
+            """
+        )
+    ).mappings().all()
+    existing_keys = {row["requirement_key"] for row in requirements}
+    requirements.extend(dict(row) for row in extensions if row["requirement_key"] not in existing_keys)
+    requirements.sort(key=lambda row: (int(row.get("sort_order") or 999999), row["requirement_key"]))
+    return requirements
 
 
 def _declarations(connection: Connection, tenant_id: str, journey_id: UUID) -> dict[str, dict[str, Any]]:
@@ -355,14 +403,21 @@ def _extracted_document_ids(connection: Connection, tenant_id: str, journey_id: 
 
 
 def _linked_documents(connection: Connection, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
-    """Thin delegation to the one shared, stage-parametrized query -- was a
-    full copy of uc03_delivery_capture_v2._linked_delivery_documents with
-    only the 'BOOKING'/'DELIVERY' literal differing. See
-    uc03_requirement_satisfaction.linked_documents_for_journey.
-    """
-    return linked_documents_for_journey(
-        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
-    )
+    rows = connection.execute(
+        text(
+            """
+            SELECT di_document_id, client_upload_id, requirement_key,
+                   classified_document_type_key, capture_status,
+                   original_filename, content_type
+            FROM auditcore.document_capture_v2_documents
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND stage_code='BOOKING' AND capture_status <> 'SUPERSEDED'
+            ORDER BY created_at_utc, di_document_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    return [dict(row) for row in rows]
 
 
 # _ensure_di_context is called on every Booking/Delivery capture read (once
@@ -1056,52 +1111,19 @@ def complete_booking_capture_v2(
                 detail="Booking V2 document capture has already been submitted.",
             )
 
-        # Fresh-resolve CONDITIONAL applicability before gating: a
-        # requirement whose deciding document never arrives (so the DI
-        # webhook's own resolve_requirement_applicability_if_conditional
-        # never fires for it) would otherwise sit at requirement_status=
-        # PENDING forever even though the answer is already knowable from
-        # commercial-line/trade-in facts (_resolve_condition). Booking's
-        # checklist read never triggered this recompute the way Delivery's
-        # legacy list_delivery_documents does -- doing it here, once, right
-        # before the one-shot completion decision, closes that gap without
-        # adding a recompute to every checklist read.
-        _resolve_known_applicability(
-            connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
-        )
-        satisfaction = resolve_requirement_satisfaction(
-            connection,
+        local_capture = _build_local_capture_response(
+            connection=connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
-            stage_code="BOOKING",
             requirements=_base_requirements(connection, tenant_id, journey_id),
-            documents=_linked_documents(connection, tenant_id, journey_id),
+            declaration_rows=_declarations(connection, tenant_id, journey_id),
+            audit_documents=_linked_documents(connection, tenant_id, journey_id),
         )
-        blockers = unresolved_completion_blockers(satisfaction)
-        if blockers:
+        if not local_capture.canContinue:
             raise ConflictError(
                 error_code="VAC-CONFLICT-004",
                 title="Booking document capture is incomplete",
-                detail=(
-                    "Required documents are still missing or unclassified: "
-                    + ", ".join(sorted(b.requirement_key for b in blockers))
-                ),
-            )
-        tentative_sku = connection.execute(
-            text(
-                """
-                SELECT 1 FROM auditcore.journey_products
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND selection_status='TENTATIVE'
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).scalar_one_or_none()
-        if tentative_sku is not None:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-004",
-                title="Booking document capture is incomplete",
-                detail="Vehicle model/SKU selection is still ambiguous and needs Team Lead confirmation.",
+                detail="Required classifications or applicability decisions are still pending.",
             )
 
         next_version = expected_version + 1
@@ -1172,6 +1194,9 @@ def create_booking_upload_intents_v2(
         journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
+    )
+    _require_capture_phase_open(
+        connection, tenant_id=tenant_id, journey_id=journey_id
     )
     requirements = _base_requirements(connection, tenant_id, journey_id)
     open_requirements = _requirements_with_open_slot(
@@ -1270,6 +1295,9 @@ def finalize_booking_document_v2(
         journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
+    )
+    _require_capture_phase_open(
+        connection, tenant_id=tenant_id, journey_id=journey_id
     )
     context_ref, token = _ensure_di_context(
         connection=connection,
@@ -1464,12 +1492,11 @@ def resync_booking_capture_v2(
 ) -> BookingCaptureV2ResyncResponse:
     """The Booking counterpart of uc03_delivery_capture_v2.resync_delivery_
     capture_v2 -- open to any role with legitimate access to this Journey
-    (per _authorize_booking's own scoping, not restricted further here).
-    Booking's own business_status is never checked for any capture-v2
-    action (see _authorize_booking's own docstring), so this repair path
-    needs no special carve-out of its own for a Journey that has long since
-    moved on to Delivery, which is the normal case for anything old enough
-    to need a resync.
+    (per _authorize_booking_for_resync's own scoping, not restricted further
+    here). Deliberately does NOT require the Booking to still be active --
+    see _authorize_booking_for_resync's own docstring for why: this is the
+    repair path for a Booking that has long since closed and moved on to
+    Delivery, which is the normal case for anything old enough to need one.
 
     1. Refreshes document classification status from DI's own live state
        first (_reconcile_documents), the same call the capture screen's own
@@ -1495,7 +1522,7 @@ def resync_booking_capture_v2(
        for the same document, only ever creates-or-updates -- it cannot
        double-insert.
     """
-    _authorize_booking(
+    _authorize_booking_for_resync(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
