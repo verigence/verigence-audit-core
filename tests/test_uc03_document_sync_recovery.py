@@ -66,6 +66,7 @@ def journey():
         c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
         c.tenant_id = tenant_id  # type: ignore[attr-defined]
         c.journey_id = journey_id  # type: ignore[attr-defined]
+        c.customer_id = customer_id  # type: ignore[attr-defined]
         yield c
     engine.dispose()
 
@@ -75,6 +76,7 @@ def _insert_evidence(
     *,
     tenant_id: str,
     journey_id,
+    customer_id,
     processing_status_cache: str | None,
     linked_minutes_ago: int,
     process_area: str = "DELIVERY",
@@ -83,18 +85,20 @@ def _insert_evidence(
         text(
             """
             INSERT INTO auditcore.evidence (
-                tenant_id, journey_id, di_document_id, document_type_key,
-                process_area, association_status, processing_status_cache,
-                linked_at_utc
+                tenant_id, journey_id, customer_id, di_subject_id, di_document_id,
+                document_type_key, evidence_purpose, process_area, association_status,
+                processing_status_cache, linked_at_utc
             ) VALUES (
-                :t, :j, :doc, 'dealer_receipt', :area, 'ACTIVE', :cache,
-                now() - (:minutes || ' minutes')::interval
+                :t, :j, :cu, :subj, :doc, 'dealer_receipt', 'DELIVERY_CAPTURE', :area,
+                'ACTIVE', :cache, now() - (:minutes || ' minutes')::interval
             )
             """
         ),
         {
             "t": tenant_id,
             "j": journey_id,
+            "cu": customer_id,
+            "subj": uuid4(),
             "doc": uuid4(),
             "area": process_area,
             "cache": processing_status_cache,
@@ -105,7 +109,7 @@ def _insert_evidence(
 
 def test_finds_stale_unsynced_evidence_older_than_the_threshold(journey) -> None:
     _insert_evidence(
-        journey, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+        journey, tenant_id=journey.tenant_id, journey_id=journey.journey_id, customer_id=journey.customer_id,
         processing_status_cache=None, linked_minutes_ago=15,
     )
     rows = _find_stale_document_syncs(journey, tenant_id=journey.tenant_id)
@@ -116,7 +120,7 @@ def test_finds_stale_unsynced_evidence_older_than_the_threshold(journey) -> None
 
 def test_ignores_evidence_still_within_the_retry_budget_window(journey) -> None:
     _insert_evidence(
-        journey, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+        journey, tenant_id=journey.tenant_id, journey_id=journey.journey_id, customer_id=journey.customer_id,
         processing_status_cache=None, linked_minutes_ago=2,
     )
     rows = _find_stale_document_syncs(journey, tenant_id=journey.tenant_id)
@@ -125,7 +129,7 @@ def test_ignores_evidence_still_within_the_retry_budget_window(journey) -> None:
 
 def test_ignores_evidence_that_already_has_a_processing_status(journey) -> None:
     _insert_evidence(
-        journey, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+        journey, tenant_id=journey.tenant_id, journey_id=journey.journey_id, customer_id=journey.customer_id,
         processing_status_cache="PROCESSED", linked_minutes_ago=30,
     )
     rows = _find_stale_document_syncs(journey, tenant_id=journey.tenant_id)
