@@ -704,7 +704,59 @@ def _sync_booking_document(
             external_context_ref=context_ref,
             document_id=str(document_id),
         )
-    except (SecurityTokenError, DiClientError) as exc:
+    except DiClientError as exc:
+        # DI has authoritatively said this exact document does not exist --
+        # narrowly scoped to that specific code, not the broader
+        # `not exc.retryable` (which could also cover a different,
+        # genuinely audit-core-side bug, e.g. a malformed request, that
+        # shouldn't be silently voided). Every other DiClientError still
+        # falls through to the existing DependencyUnavailableError below,
+        # unchanged. Root-caused live (2026-09-26): this except block used
+        # to wrap EVERY DiClientError identically as "temporarily
+        # unavailable", discarding DI's own retryable/code classification
+        # -- so a document that will never exist got retried forever, once
+        # per sweep cycle (uc03_document_sync_recovery.py), indefinitely.
+        # Voiding it here uses the exact same convention
+        # delete_unified_document already uses for a document that's gone
+        # for a different reason (uc03_unified_document_capture.py) --
+        # _sync_booking_document's own early-return guard above
+        # (association_status != 'ACTIVE') and _find_stale_document_syncs's
+        # own WHERE clause both already exclude a voided row, so this alone
+        # stops it being picked up again, for every caller of this sync
+        # path (the DI webhook, resync, and the sweep), not just the sweep.
+        if exc.code == "DOCUMENT_NOT_FOUND":
+            logger.warning(
+                "uc03_document_sync_permanently_failed_voided",
+                tenant_id=tenant_id,
+                journey_id=str(journey_id),
+                document_id=str(document_id),
+                di_error_code=exc.code,
+                di_status_code=exc.status_code,
+            )
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.evidence
+                    SET association_status='VOIDED',
+                        void_reason='DI_DOCUMENT_NOT_FOUND',
+                        voided_by_actor_id=:actor_id,
+                        voided_at_utc=now()
+                    WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                      AND di_document_id=:document_id AND association_status='ACTIVE'
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "journey_id": journey_id,
+                    "document_id": document_id,
+                    "actor_id": service_id,
+                },
+            )
+            return 0
+        raise DependencyUnavailableError(
+            detail="Document extraction synchronization is temporarily unavailable."
+        ) from exc
+    except SecurityTokenError as exc:
         raise DependencyUnavailableError(
             detail="Document extraction synchronization is temporarily unavailable."
         ) from exc
