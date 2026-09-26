@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, Header, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Connection, Engine, text
 
+from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_engine, get_human_principal
 from audit_core.di_capture_v2_client import DiCaptureV2Client, DiCaptureV2Error
 from audit_core.di_client import DiClient
@@ -400,19 +401,38 @@ def _ensure_di_context(
     token = security_client.get_service_token(audience=_DI_AUDIENCE)
     subject_id = _subject_mapping(connection, tenant_id=tenant_id, customer_id=customer_id)
     if subject_id is None:
-        subject = di_client.create_subject(
-            token=token,
-            tenant_id=tenant_id,
-            subject_type="OTHER",
-            display_name=journey["customer_name"],
-        )
-        subject_id = UUID(subject.subject_id)
-        _persist_subject_mapping(
-            engine,
-            tenant_id=tenant_id,
-            customer_id=customer_id,
-            subject_id=subject_id,
-        )
+        # Root-caused live (2026-09-26): reviewQuery and captureQuery both
+        # call this function on a Journey Documents page's first mount, both
+        # seeing subject_id is None (guaranteed on a brand-new customer) and
+        # both firing their own real, uncoordinated create_subject POST --
+        # create_subject has no idempotency-key support at all (di_client.py),
+        # so nothing at DI's own end collapses the duplicate either. Blocking
+        # on a short-lived advisory lock (own transaction, not the caller's
+        # long-lived one -- see uc03_confidence_review_policy._sync_booking_
+        # document for the same pattern) makes the second caller wait for
+        # the first, then re-check: it reuses what the first already
+        # created instead of paying for a second real external call.
+        with engine.begin() as lock_connection:
+            set_tenant_context(lock_connection, tenant_id)
+            lock_connection.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": f"uc03-di-subject:{tenant_id}:{customer_id}"},
+            )
+            subject_id = _subject_mapping(lock_connection, tenant_id=tenant_id, customer_id=customer_id)
+            if subject_id is None:
+                subject = di_client.create_subject(
+                    token=token,
+                    tenant_id=tenant_id,
+                    subject_type="OTHER",
+                    display_name=journey["customer_name"],
+                )
+                subject_id = UUID(subject.subject_id)
+                _persist_subject_mapping(
+                    engine,
+                    tenant_id=tenant_id,
+                    customer_id=customer_id,
+                    subject_id=subject_id,
+                )
 
     cache_key = (tenant_id, context_ref)
     now = time.monotonic()

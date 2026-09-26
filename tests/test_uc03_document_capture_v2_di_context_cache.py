@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, text
 
+from audit_core.db import set_tenant_context
 from audit_core.di_client import DiSubject
 from audit_core.uc03_document_capture_v2 import _ensure_di_context
 
@@ -24,6 +27,24 @@ class _FakeDiClient:
 
     def ensure_audit_storage_context(self, **kwargs: object) -> dict[str, str]:
         self.context_calls += 1
+        return {}
+
+
+class _SlowCreateSubjectDiClient:
+    """Records every create_subject call and holds each one open briefly,
+    widening the race window a real concurrent DI round trip would have."""
+
+    def __init__(self) -> None:
+        self.create_subject_calls = 0
+        self._lock = threading.Lock()
+
+    def create_subject(self, **kwargs: object) -> DiSubject:
+        with self._lock:
+            self.create_subject_calls += 1
+        time.sleep(0.2)
+        return DiSubject(subject_id=str(uuid4()), status="ACTIVE")
+
+    def ensure_audit_storage_context(self, **kwargs: object) -> dict[str, str]:
         return {}
 
 
@@ -104,3 +125,49 @@ def test_ensure_di_context_skips_the_redundant_ensure_call_on_repeat(di_context_
     )
 
     assert di_client.context_calls == 1
+
+
+def test_ensure_di_context_serializes_concurrent_subject_creation(di_context_journey) -> None:
+    """Root-caused live (2026-09-26): reviewQuery and captureQuery both call
+    _ensure_di_context the moment a Journey Documents page mounts. On a
+    brand-new customer, subject_id is guaranteed None for both -- without
+    serialization, both fire their own real create_subject POST (di_client.
+    create_subject has no idempotency-key support at all, unlike
+    ensure_audit_storage_context right next to it), racing to create two DI
+    subjects for the one customer. Two concurrent callers for the same
+    (tenant_id, customer_id) must result in exactly one create_subject call
+    and exactly one di_subject_mappings row."""
+    tenant_id, journey_id, _connection, engine = di_context_journey
+    di_client = _SlowCreateSubjectDiClient()
+    security_client = _FakeSecurityClient()
+    errors: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            with engine.connect() as connection:
+                set_tenant_context(connection, tenant_id)
+                _ensure_di_context(
+                    connection=connection, engine=engine, tenant_id=tenant_id, journey_id=journey_id,
+                    security_client=security_client, di_client=di_client,
+                )
+        except BaseException as exc:  # noqa: BLE001 -- surfaced via errors, not swallowed
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    assert di_client.create_subject_calls == 1
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        mapping_count = connection.execute(
+            text(
+                "SELECT count(*) FROM auditcore.di_subject_mappings "
+                "WHERE tenant_id = :tenant_id"
+            ),
+            {"tenant_id": tenant_id},
+        ).scalar_one()
+    assert mapping_count == 1
