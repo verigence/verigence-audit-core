@@ -355,20 +355,19 @@ def complete_task(
                 actor_id=principal.subject,
                 correlation_id=get_correlation_id(request),
             )
-        elif task["task_type"] == _DELIVERY_VIN_REVIEW_TASK_TYPE:
-            # INCORRECT (TL doesn't approve the manually-typed VIN/Chassis)
-            # needs no hook: nothing was ever written, and the self-heal
-            # sweep (_ensure_vehicle_photos_task) opens a fresh PC task on
-            # its own once it notices the gap is still unresolved.
-            if outcome == "CORRECT":
-                apply_confirmed_delivery_vin_observation(
-                    connection,
-                    tenant_id=tenant_id,
-                    journey_id=task["journey_id"],
-                    workflow_task_id=task_id,
-                    actor_id=principal.subject,
-                    correlation_id=get_correlation_id(request),
-                )
+        # INCORRECT (TL doesn't approve the manually-typed VIN/Chassis) needs
+        # no hook: nothing was ever written, and the self-heal sweep
+        # (_ensure_vehicle_photos_task) opens a fresh PC task on its own once
+        # it notices the gap is still unresolved.
+        elif task["task_type"] == _DELIVERY_VIN_REVIEW_TASK_TYPE and outcome == "CORRECT":
+            apply_confirmed_delivery_vin_observation(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=task["journey_id"],
+                workflow_task_id=task_id,
+                actor_id=principal.subject,
+                correlation_id=get_correlation_id(request),
+            )
         response = _response(
             get_workflow_task(connection, tenant_id=tenant_id, workflow_task_id=task_id)
         )
