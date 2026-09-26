@@ -36,6 +36,7 @@ from audit_core.uc03_document_capture_v2 import (
     get_di_capture_v2_client,
 )
 from audit_core.uc03_document_registry import is_receipt_document_type
+from audit_core.uc03_requirement_satisfaction import linked_documents_for_journey
 from audit_core.uc03_review_confidence import (
     field_review_state as _field_review_state,
 )
@@ -515,21 +516,34 @@ def _v2_documents_for_stage(
     stage: str,
     requirements: list[dict[str, Any]] | None = None,
 ) -> list[ReviewV2Document]:
-    try:
-        di_payload = v2_client.list_documents(
-            token=token,
-            tenant_id=tenant_id,
-            external_context_ref=context_ref,
-            phase=stage,
-        )
-    except DiCaptureV2Error as exc:
-        if stage == "DELIVERY" and exc.status_code in {404, 405}:
-            return []
-        raise DependencyUnavailableError(
-            detail="Document review status is temporarily unavailable."
-        ) from exc
-
-    di_documents = list(di_payload.get("documents") or [])
+    # document_capture_v2_documents is the sole local record of anything ever
+    # uploaded for a journey/stage -- uc03_unified_document_capture.py writes
+    # a row there right after registering the upload with DI. So zero local
+    # rows means DI is guaranteed to have nothing classified here either, and
+    # calling list_documents (a real, ~15s-budget DI round trip) is pure
+    # waste on a journey's first-ever visit. Root-caused live (2026-09-26):
+    # this call, run unconditionally and sequentially for both BOOKING and
+    # DELIVERY, was a direct, sufficient explanation for a 12.8s
+    # /uc03/documents/review response on a brand-new, zero-document journey.
+    if linked_documents_for_journey(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage,
+    ):
+        try:
+            di_payload = v2_client.list_documents(
+                token=token,
+                tenant_id=tenant_id,
+                external_context_ref=context_ref,
+                phase=stage,
+            )
+        except DiCaptureV2Error as exc:
+            if stage == "DELIVERY" and exc.status_code in {404, 405}:
+                return []
+            raise DependencyUnavailableError(
+                detail="Document review status is temporarily unavailable."
+            ) from exc
+        di_documents = list(di_payload.get("documents") or [])
+    else:
+        di_documents = []
     if stage == "BOOKING" and requirements is not None:
         _reconcile_documents(
             connection,
