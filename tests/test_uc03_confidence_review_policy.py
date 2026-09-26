@@ -217,7 +217,13 @@ def test_sync_booking_document_fetches_both_di_calls_before_any_database_write()
     end = module_source.index("\ndef ", start + 1)
     function_source = module_source[start:end]
 
-    evidence_cache_write = function_source.index("UPDATE auditcore.evidence")
+    # Searches for the cache-write specifically (processing_status_cache is
+    # unique to it), not a bare "UPDATE auditcore.evidence" substring --
+    # since 2026-09-26 the function also has an earlier, different evidence
+    # UPDATE (voiding on a confirmed DI 404), which returns immediately
+    # after the first DI call and never reaches the second at all, so it's
+    # not the write this regression test is protecting against.
+    evidence_cache_write = function_source.index("processing_status_cache=:processing")
     assert function_source.index("get_audit_document(") < evidence_cache_write
     assert function_source.index("get_audit_document_facts(") < evidence_cache_write
 
