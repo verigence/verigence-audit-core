@@ -51,15 +51,43 @@ _MACHINE_ACTOR = "SYSTEM:DI_AUTO"
 def _documents_from_durable_store(
     connection: Connection, *, tenant_id: str, journey_id: UUID, stage_code: str
 ) -> list[Any]:
+    # Joined to evidence and filtered to association_status='ACTIVE' (added
+    # 2026-09-26): _sync_booking_document -- the ONLY writer of this table --
+    # already refuses to write a single row here unless the document's own
+    # evidence is ACTIVE at that moment (`if link is None or association_
+    # status != "ACTIVE": return 0`), so every row already in this table
+    # today was written while its document's evidence was ACTIVE -- this
+    # join drops nothing that isn't voided. What it does fix: once a
+    # document is deleted (delete_unified_document voids its evidence row
+    # rather than deleting these facts outright -- deletion is revoked for
+    # this table at the database level), that document's already-durable
+    # facts must stop feeding canonical materialization on every later
+    # re-run, without ever touching (or being able to touch) the permanent
+    # facts themselves.
+    #
+    # Joined on di_document_id, NOT this table's own evidence_id column:
+    # migration 0051 explicitly dropped evidence_id's NOT NULL ("current V2
+    # rows may instead use DI document + canonical field + fact version
+    # identity, so the two legacy identifiers become nullable") -- a plain
+    # V2 row's own evidence_id is commonly NULL. di_document_id, on both
+    # this table and evidence, has been NOT NULL since its original
+    # migration (0031) and was never altered; evidence also has a UNIQUE
+    # (tenant_id, di_document_id) -- the exact same pair _sync_booking_
+    # document's own evidence lookup already keys on. Joining on evidence_id
+    # instead would have silently dropped every current V2 document's facts
+    # from materialization, not just voided ones -- caught before shipping.
     rows = connection.execute(
         text(
             """
-            SELECT di_document_id, evidence_id, source_document_type_key,
-                   field_key, effective_value, confidence_score
-            FROM auditcore.journey_document_extracted_fields
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code=:stage_code
-            ORDER BY di_document_id
+            SELECT f.di_document_id, f.evidence_id, f.source_document_type_key,
+                   f.field_key, f.effective_value, f.confidence_score
+            FROM auditcore.journey_document_extracted_fields f
+            JOIN auditcore.evidence e
+              ON e.tenant_id=f.tenant_id AND e.di_document_id=f.di_document_id
+            WHERE f.tenant_id=:tenant_id AND f.journey_id=:journey_id
+              AND f.stage_code=:stage_code
+              AND e.association_status='ACTIVE'
+            ORDER BY f.di_document_id
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id, "stage_code": stage_code},

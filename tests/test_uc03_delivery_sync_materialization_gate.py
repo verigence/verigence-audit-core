@@ -8,7 +8,7 @@ uc03_confidence_review_policy._sync_booking_document's DELIVERY branch.
 CURRENT materializer code has ever actually run against it. A document
 confirmed once, whose facts have not moved since, shows changed=False on
 every later sync -- a duplicate DI webhook redelivery, or the PC's own
-`/resync` (uc03_delivery_capture_v2.resync_delivery_capture_v2) -- even
+`/resync` (uc03_unified_document_capture.resync_unified_documents) -- even
 after a materializer fix ships or a whole new canonical table is added.
 Symptom actually reported live: documents show Classified/Extracted, but
 Journey 360's Invoices/Registration/Payments panels stay empty, and

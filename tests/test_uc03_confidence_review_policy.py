@@ -266,22 +266,25 @@ def test_run_sync_booking_document_task_awaits_its_stagger_before_the_retry_loop
 
 
 def test_resync_endpoints_stagger_their_batch_dispatch() -> None:
-    # Both Booking's and Delivery's resync endpoints, plus Submit's own
+    # The unified resync endpoint (Phase 4 -- replaces the former separate
+    # Booking/Delivery resync_*_capture_v2 functions), plus Submit's own
     # document_ids loop, dispatch _run_sync_booking_document_task once per
     # document for the same journey -- every one of those call sites must
     # pass a per-index stagger, not just the shared helper existing in
     # isolation, or the regression comes right back for whichever call site
     # was missed.
-    from audit_core import uc03_delivery_capture_v2, uc03_document_capture_v2
     from audit_core import uc03_post_extraction_materialization as booking_submit
+    from audit_core import uc03_unified_document_capture
 
-    for module, function_name in (
-        (uc03_document_capture_v2, "resync_booking_capture_v2"),
-        (uc03_delivery_capture_v2, "resync_delivery_capture_v2"),
-    ):
-        source = inspect.getsource(getattr(module, function_name))
-        assert "sync_stagger_seconds(index)" in source, function_name
-        assert "enumerate(document_ids)" in source, function_name
+    source = inspect.getsource(uc03_unified_document_capture.resync_unified_documents)
+    assert "sync_stagger_seconds(index)" in source
+    # A single running index shared across BOTH stages' dispatch loops, not
+    # two independent enumerate(document_ids) sequences -- the latter would
+    # give each loop's first document initial_delay_seconds=0, recreating
+    # the exact same-instant lock-contention pile-up this feature exists to
+    # prevent, for any journey with documents pending in both stages.
+    assert source.count("index = 0") == 1
+    assert "index += 1" in source
 
     submit_source = inspect.getsource(booking_submit)
     assert "confidence_policy.sync_stagger_seconds(index)" in submit_source

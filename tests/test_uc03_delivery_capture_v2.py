@@ -4,10 +4,12 @@ from uuid import uuid4
 from audit_core.uc03_delivery_capture_v2 import (
     _build_delivery_capture_response,
     _resyncable_document_ids,
-    create_delivery_upload_intents_v2,
-    delete_delivery_document_v2,
-    finalize_delivery_document_v2,
-    resync_delivery_capture_v2,
+)
+from audit_core.uc03_unified_document_capture import (
+    create_unified_upload_intents,
+    delete_unified_document,
+    finalize_unified_document,
+    resync_unified_documents,
 )
 
 
@@ -161,27 +163,27 @@ def test_resyncable_document_ids_is_case_insensitive_and_handles_missing_status(
 
 
 def test_resync_endpoint_queues_one_background_task_per_resyncable_document() -> None:
-    # Source-inspected: exercising the full route (auth, a real BackgroundTasks
+    # Phase 4 unification: this endpoint replaces both
+    # uc03_delivery_capture_v2.resync_delivery_capture_v2 and
+    # uc03_document_capture_v2.resync_booking_capture_v2 -- one call now
+    # covers both stages. Source-inspected for the same reason those two
+    # were: exercising the full route (auth, a real BackgroundTasks
     # dispatch, DI/Security client construction) needs infrastructure this
     # file's other tests don't set up. What matters for the regression this
     # endpoint exists to fix is that it (a) re-authorizes against the
     # journey, (b) refreshes classification status from DI's own live state
-    # before filtering -- otherwise a Journey whose Delivery capture screen
-    # has not been reopened since classification finished silently resyncs 0
-    # documents against a stale local cache, (c) filters to resyncable
-    # documents through the function above (not some inline duplicate of the
-    # filter), and (d) queues the same _run_sync_booking_document_task the DI
-    # webhook itself uses, so a manually-triggered resync goes through the
-    # identical, already-tested pipeline rather than a parallel one.
-    source = inspect.getsource(resync_delivery_capture_v2)
-    assert "_authorize_delivery(" in source
+    # before filtering -- otherwise a Journey whose checklist has not been
+    # reopened since classification finished silently resyncs 0 documents
+    # against a stale local cache, (c) filters to resyncable documents
+    # through the function above for the Delivery half (not some inline
+    # duplicate of the filter), and (d) queues the same
+    # _run_sync_booking_document_task the DI webhook itself uses, so a
+    # manually-triggered resync goes through the identical, already-tested
+    # pipeline rather than a parallel one.
+    source = inspect.getsource(resync_unified_documents)
+    assert "_scope(" in source
     assert "_ensure_di_context(" in source
-    # reconcile_unified_documents, not the narrower Delivery-only
-    # _reconcile_delivery_documents -- mirror-image fix of the Booking
-    # resync one: a Booking-only-typed document defaulted to the wrong
-    # stage at upload time is otherwise permanently unlinkable.
     assert "reconcile_unified_documents(" in source
-    assert "_reconcile_delivery_documents(" not in source
     assert "_resyncable_document_ids(" in source
     assert "background_tasks.add_task(" in source
     assert "_run_sync_booking_document_task" in source
@@ -191,15 +193,18 @@ def test_uploading_and_finalizing_after_submission_is_allowed_but_delete_stays_l
     # Documents legitimately keep arriving after the PC has moved on to
     # Delivery Details (a late invoice, a corrected receipt) -- confirmed
     # live need. Only deleting already-submitted evidence should stay
-    # locked. Source-inspected for the same reason as the resync endpoint
-    # above: exercising the full routes needs infrastructure this file's
-    # other tests don't set up; what matters is that the submission-complete
-    # conflict check is gone from the two write paths that add evidence, and
-    # still present on the one that removes it.
-    upload_source = inspect.getsource(create_delivery_upload_intents_v2)
-    finalize_source = inspect.getsource(finalize_delivery_document_v2)
-    delete_source = inspect.getsource(delete_delivery_document_v2)
+    # locked. Phase 4 unification: create_unified_upload_intents/
+    # finalize_unified_document replace the old per-stage upload/finalize
+    # endpoints (never gated on completion, for either stage); delete_
+    # unified_document replaces both per-stage deletes and calls the shared
+    # _stage_completed lock check -- a separate function now (one rule,
+    # shared by both stages, not a literal duplicated per-stage inline
+    # check), so the lock is asserted by presence of that call rather than
+    # the literal column name appearing inline.
+    upload_source = inspect.getsource(create_unified_upload_intents)
+    finalize_source = inspect.getsource(finalize_unified_document)
+    delete_source = inspect.getsource(delete_unified_document)
 
-    assert "capture_completed_at_utc" not in upload_source
-    assert "capture_completed_at_utc" not in finalize_source
-    assert "capture_completed_at_utc" in delete_source
+    assert "_stage_completed(" not in upload_source
+    assert "_stage_completed(" not in finalize_source
+    assert "_stage_completed(" in delete_source

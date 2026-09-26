@@ -18,7 +18,6 @@ from audit_core.uc03_document_capture_v2 import (
     _human_actor_id,
     _requirement_refs_by_document_type_key,
     _upload_intent_failures,
-    resync_booking_capture_v2,
 )
 
 JOURNEY_ID = UUID("11111111-1111-1111-1111-111111111111")
@@ -371,40 +370,16 @@ def test_booking_resync_only_includes_classified_documents() -> None:
     assert resyncable == [classified_id]
 
 
-def test_booking_resync_endpoint_authorizes_and_queues_the_shared_sync_task() -> None:
-    # Source-inspected: exercising the full route (auth, a real
-    # BackgroundTasks dispatch) needs infrastructure this file's other
-    # tests don't set up. What matters for the regression this endpoint
-    # exists to fix (available to any role, opens the same door Delivery's
-    # own /resync already has) is that it (a) re-authorizes against the
-    # journey WITHOUT requiring an active Booking (a resync on a Journey
-    # that has moved on to Delivery, where Booking is CLOSED, must still
-    # work -- this is the exact bug a closed Booking triggered live), (b)
-    # refreshes classification status from DI's own live state before
-    # filtering, so a stale local cache can't silently resync 0 documents,
-    # (c) lists documents the same way the capture screen itself does, (d)
-    # filters to classified documents, and (e) queues the same
-    # _run_sync_booking_document_task the DI webhook itself uses -- a
-    # manually-triggered resync goes through the identical, already-tested
-    # pipeline (including every producer wired into it: SKU resolution,
-    # identity/dealer checks, duplicate-receipt detection) rather than a
-    # parallel one.
-    source = inspect.getsource(resync_booking_capture_v2)
-    assert "_authorize_booking(" in source
-    assert "_ensure_di_context(" in source
-    # reconcile_unified_documents, not the narrower Booking-only
-    # _reconcile_documents -- see the function's own comment: a
-    # Delivery-only-typed document defaulted to stage_code='BOOKING' at
-    # upload time is otherwise permanently unlinkable, since
-    # _reconcile_documents can never resolve its requirement_key.
-    assert "reconcile_unified_documents(" in source
-    assert "_reconcile_documents(" not in source
-    assert "_linked_documents(" in source
-    assert '"CLASSIFIED"' in source
-    assert "_backfill_evidence_links_for_resync(" in source
-    assert "background_tasks.add_task(" in source
-    assert "_run_sync_booking_document_task" in source
-    assert 'stage_code="BOOKING"' in source
+# Booking's own resync_booking_capture_v2 was removed (Phase 4 unification)
+# -- replaced by uc03_unified_document_capture.resync_unified_documents,
+# which covers both Booking and Delivery in one call. The equivalent
+# source-inspection coverage (re-authorizes without requiring an active
+# Booking, refreshes from DI's live state via reconcile_unified_documents
+# rather than the narrower per-stage reconcile, filters to classified
+# documents, backfills evidence links, queues the shared sync task) now
+# lives once, in tests/test_uc03_delivery_capture_v2.py's
+# test_resync_endpoint_queues_one_background_task_per_resyncable_document --
+# not duplicated here for a function that no longer exists per-stage.
 
 
 def test_authorize_booking_does_not_require_active_booking() -> None:

@@ -82,14 +82,55 @@ def journey():
         c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
         c.tenant_id = tenant_id  # type: ignore[attr-defined]
         c.journey_id = journey_id  # type: ignore[attr-defined]
+        c.customer_id = customer_id  # type: ignore[attr-defined]
         yield c
     engine.dispose()
+
+
+def _seed_evidence(conn, *, tenant_id, journey_id, document_id, document_type_key):
+    """A real ACTIVE evidence row for this document, matching the precondition
+    _sync_booking_document itself already enforces before it ever writes a
+    journey_document_extracted_fields row (see that function's own `if link
+    is None or association_status != "ACTIVE": return 0` gate) --
+    _documents_from_durable_store now joins on this same (tenant_id,
+    di_document_id) pair, so a seeded field with no matching evidence row
+    would be silently excluded, unlike real V2 sync output. ON CONFLICT DO
+    NOTHING: several _seed_field calls for the same document_id (multiple
+    fields on one document) must share one evidence row, not collide on
+    evidence's own UNIQUE (tenant_id, di_document_id).
+    """
+    conn.execute(
+        text(
+            """
+            INSERT INTO auditcore.evidence (
+                tenant_id, journey_id, customer_id, di_subject_id, di_document_id,
+                document_type_key, evidence_purpose, association_status
+            ) VALUES (
+                :tenant_id, :journey_id, :customer_id, :subject_id, :document_id,
+                :document_type_key, 'DOCUMENT_REVIEW', 'ACTIVE'
+            )
+            ON CONFLICT (tenant_id, di_document_id) DO NOTHING
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "customer_id": conn.customer_id,
+            "subject_id": uuid4(),
+            "document_id": document_id,
+            "document_type_key": document_type_key,
+        },
+    )
 
 
 def _seed_field(
     conn, *, tenant_id, journey_id, document_id, document_type_key, field_key, value,
     fact_version=1, stage_code="DELIVERY",
 ):
+    _seed_evidence(
+        conn, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+        document_type_key=document_type_key,
+    )
     conn.execute(
         text(
             """
@@ -165,6 +206,53 @@ def test_no_durable_documents_is_a_clean_skip(journey) -> None:
         journey, tenant_id=tenant_id, journey_id=journey_id
     )
     assert result == {"skipped": True, "reason": "no_documents"}
+
+
+def test_voided_evidence_document_is_excluded_from_materialization(journey) -> None:
+    # delete_unified_document (uc03_unified_document_capture.py) cannot
+    # delete evidence/journey_document_extracted_fields rows outright --
+    # DELETE is revoked on both at the database level -- so it voids the
+    # document's evidence row instead (association_status='VOIDED'). This is
+    # the one place that must actually honor that: a voided document's
+    # already-durable facts must stop reaching auditcore.payments (or any
+    # other canonical table) on every later materialization re-run, exactly
+    # as if the document had never been confirmed.
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    document_id = uuid4()
+    _seed_field(
+        journey, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+        document_type_key="payment_receipt", field_key="amount_paid", value="50000",
+    )
+    _seed_field(
+        journey, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+        document_type_key="payment_receipt", field_key="receipt_number", value="RCPT-VOID-001",
+    )
+    journey.execute(
+        text(
+            """
+            UPDATE auditcore.evidence
+            SET association_status='VOIDED', void_reason='DOCUMENT_DELETED', voided_at_utc=now()
+            WHERE tenant_id=:t AND di_document_id=:d
+            """
+        ),
+        {"t": tenant_id, "d": document_id},
+    )
+
+    result = materialize_delivery_documents_from_durable_store(
+        journey, tenant_id=tenant_id, journey_id=journey_id
+    )
+    assert result == {"skipped": True, "reason": "no_documents"}
+
+    payment = journey.execute(
+        text(
+            """
+            SELECT 1 FROM auditcore.payments
+            WHERE tenant_id=:t AND journey_id=:j AND source_di_document_id=:d
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "d": document_id},
+    ).scalar_one_or_none()
+    assert payment is None
 
 
 def test_booking_insurance_cover_materializes_into_insurance_records(journey) -> None:

@@ -80,9 +80,6 @@ from audit_core.uc03_booking_integrations import (
 )
 from audit_core.uc03_booking_part1 import router as uc03_booking_part1_router
 from audit_core.uc03_booking_v2 import router as uc03_booking_v2_router
-from audit_core.uc03_capture_local_reads import (
-    router as uc03_capture_local_reads_router,
-)
 from audit_core.uc03_compliance_report import router as uc03_compliance_report_router
 from audit_core.uc03_create_booking import router as uc03_create_booking_router
 from audit_core.uc03_customer_mobile_pii import install_uc03_customer_mobile_pii
@@ -296,7 +293,6 @@ def create_app() -> FastAPI:
     application.include_router(uc03_model_selection_corrections_router)
     application.include_router(uc03_document_capture_v2_router)
     application.include_router(uc03_unified_document_capture_router)
-    application.include_router(uc03_capture_local_reads_router)
     application.include_router(uc03_document_review_v2_router)
     application.include_router(uc03_final_source_router)
     application.include_router(uc03_pc_booking_documents_router)

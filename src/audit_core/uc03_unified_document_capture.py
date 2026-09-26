@@ -61,17 +61,17 @@ Why a new path rather than teaching the old ones to merge:
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from pydantic import BaseModel
 from sqlalchemy import Connection, Engine, text
 
 from audit_core.dependencies import get_connection, get_engine, get_human_principal
 from audit_core.di_capture_v2_client import DiCaptureV2Client, DiCaptureV2Error
 from audit_core.di_client import DiClient
-from audit_core.errors import DependencyUnavailableError
+from audit_core.errors import ConflictError, DependencyUnavailableError
 from audit_core.observability import get_correlation_id
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
@@ -83,6 +83,7 @@ from audit_core.uc03_booking_capture import _scope
 from audit_core.uc03_delivery_capture_v2 import _delivery_requirements
 from audit_core.uc03_delivery_commands import _delivery_state, ensure_delivery_started
 from audit_core.uc03_document_capture_v2 import (
+    CaptureV2Document,
     UploadIntentCommand,
     UploadIntentResponse,
     UploadIntentResult,
@@ -99,6 +100,7 @@ from audit_core.uc03_document_capture_v2 import (
     get_di_client,
     get_security_oauth_client,
 )
+from audit_core.uc03_requirement_satisfaction import linked_documents_for_journey
 
 router = APIRouter(
     prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}/uc03/documents",
@@ -769,3 +771,701 @@ def reconcile_unified_documents_endpoint(
         token=token,
     )
     return ReconcileResponse(journeyId=journey_id)
+
+
+# --- Unified GET/DELETE/resync (Phase 4) -----------------------------------
+#
+# Phase 3 (#251) deliberately left the existing Booking/Delivery GET, DELETE
+# and resync endpoints untouched, on the stated assumption that reconcile_
+# unified_documents correcting document_capture_v2_documents.stage_code was
+# enough for "Booking's and Delivery's own, completely untouched GET
+# endpoints [to] show the right documents purely by reading that column."
+# That assumption broke: both GET builders also cross-reference DI's own
+# phase-scoped list_documents() call for live fields (contentUrl, live
+# state), and DI's upload-time phase label is never updated by reconcile
+# (see PR #375's own root-cause note) -- a relocated document's DI record is
+# never found under its now-correct stage's phase, forcing a local-row
+# fallback with contentUrl hardcoded to None. Separately, both DELETE
+# endpoints tried DI before audit-core, so a document DI never durably
+# received could never be removed at all, and Booking's own canDelete never
+# matched the lock its DELETE endpoint actually enforces.
+#
+# This section finishes Phase 4: one GET (local + live), one DELETE, one
+# resync, each covering both stages from a single call -- fixing the phase-
+# lookup bug at the root (query DI under BOTH phases, merge by documentId,
+# feed the SAME merged list to both stages' existing, unmodified response
+# builders) instead of the local-fallback band-aid, and fixing delete's
+# ordering and canDelete's lock check in the same pass. The Booking/Delivery
+# routers' own capture-response builders (_build_capture_response et al.)
+# are reused verbatim, unmodified -- they are also called directly by
+# uc03_capture_local_reads.py... [see below], uc03_simplified_booking_flow.py,
+# uc03_create_booking.py, uc03_booking_v2.py and uc03_document_review_v2.py,
+# so changing their behavior here would ripple into flows this change never
+# discussed.
+
+
+class UnifiedCaptureV2Requirement(BaseModel):
+    requirementKey: str
+    stageCode: Literal["BOOKING", "DELIVERY"]
+    label: str
+    documentTypeKey: str
+    requirementLevel: str
+    conditionKey: str | None = None
+    applicabilityState: Literal["APPLICABLE", "NOT_APPLICABLE", "UNRESOLVED"]
+    state: str
+    document: CaptureV2Document | None = None
+    canView: bool = False
+    canDelete: bool = False
+
+
+class UnifiedCaptureV2Upload(CaptureV2Document):
+    stageCode: Literal["BOOKING", "DELIVERY"]
+
+
+class UnifiedCaptureV2Response(BaseModel):
+    journeyId: UUID
+    externalContextRef: str
+    requirements: list[UnifiedCaptureV2Requirement]
+    uploads: list[UnifiedCaptureV2Upload]
+    bookingSubmitted: bool
+    deliverySubmitted: bool
+
+
+def _stage_completed(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, stage_code: str,
+) -> bool:
+    """True once the given stage has been marked complete (Booking's
+    complete_booking_capture_v2 / Delivery's submit_delivery_capture_v2).
+    A missing journey_stage_states row (the stage hasn't started/been
+    seeded yet -- see module docstring on Delivery's requirements being
+    seeded eagerly before Delivery 'starts') is correctly 'not completed',
+    not an error -- unlike _capture_phase_state/_delivery_state, which raise
+    NotFoundError for exactly that case and would incorrectly 404 a unified
+    read for the (very common) journey still entirely in Booking.
+    """
+    row = connection.execute(
+        text(
+            """
+            SELECT capture_completed_at_utc FROM auditcore.journey_stage_states
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND stage_code=:stage_code
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "stage_code": stage_code},
+    ).mappings().one_or_none()
+    return bool(row is not None and row["capture_completed_at_utc"] is not None)
+
+
+def _merge_requirement(
+    requirement: Any, *, stage_code: str, completed: bool,
+) -> UnifiedCaptureV2Requirement:
+    document = requirement.document
+    return UnifiedCaptureV2Requirement(
+        requirementKey=requirement.requirementKey,
+        stageCode=stage_code,  # type: ignore[arg-type]
+        label=requirement.label,
+        documentTypeKey=requirement.documentTypeKey,
+        requirementLevel=requirement.requirementLevel,
+        conditionKey=requirement.conditionKey,
+        applicabilityState=requirement.applicabilityState,
+        state=requirement.state,
+        document=document,
+        canView=requirement.canView,
+        # The one real bug fix here: Booking's own _build_capture_response
+        # never checked the completion lock its DELETE endpoint enforces
+        # (canDelete=public_doc is not None, unconditionally); Delivery's
+        # own builder already did (and not submitted). Recomputed once,
+        # identically, for both stages here instead of trusting either
+        # builder's own (one correct, one wrong) value.
+        canDelete=document is not None and not completed,
+    )
+
+
+def _build_unified_response(
+    *,
+    journey_id: UUID,
+    context_ref: str,
+    booking_response: Any,
+    delivery_response: Any,
+    booking_completed: bool,
+    delivery_completed: bool,
+) -> UnifiedCaptureV2Response:
+    requirements = [
+        _merge_requirement(item, stage_code="BOOKING", completed=booking_completed)
+        for item in booking_response.requirements
+    ] + [
+        _merge_requirement(item, stage_code="DELIVERY", completed=delivery_completed)
+        for item in delivery_response.requirements
+    ]
+    uploads = [
+        UnifiedCaptureV2Upload(stageCode="BOOKING", **item.model_dump())
+        for item in booking_response.uploads
+    ] + [
+        UnifiedCaptureV2Upload(stageCode="DELIVERY", **item.model_dump())
+        for item in delivery_response.uploads
+    ]
+    return UnifiedCaptureV2Response(
+        journeyId=journey_id,
+        externalContextRef=context_ref,
+        requirements=requirements,
+        uploads=uploads,
+        bookingSubmitted=booking_completed,
+        deliverySubmitted=delivery_completed,
+    )
+
+
+def _build_local_unified_response(
+    *, connection: Connection, tenant_id: str, journey_id: UUID,
+) -> UnifiedCaptureV2Response:
+    from audit_core.uc03_delivery_capture_v2 import (
+        _build_local_delivery_capture_response,
+    )
+    from audit_core.uc03_document_capture_v2 import (
+        _build_local_capture_response,
+        _declarations,
+    )
+
+    booking_requirements, delivery_requirements = _merged_candidate_requirements(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+    )
+    booking_documents = linked_documents_for_journey(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
+    )
+    delivery_documents = linked_documents_for_journey(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
+    )
+    booking_response = _build_local_capture_response(
+        connection=connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        requirements=booking_requirements,
+        declaration_rows=_declarations(connection, tenant_id, journey_id),
+        audit_documents=booking_documents,
+    )
+    delivery_response = _build_local_delivery_capture_response(
+        connection=connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        requirements=delivery_requirements,
+        audit_documents=delivery_documents,
+        submitted=_stage_completed(
+            connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
+        ),
+    )
+    return _build_unified_response(
+        journey_id=journey_id,
+        context_ref="local-v2-unified-capture",
+        booking_response=booking_response,
+        delivery_response=delivery_response,
+        booking_completed=_stage_completed(
+            connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
+        ),
+        delivery_completed=_stage_completed(
+            connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
+        ),
+    )
+
+
+def _read_unified_capture(
+    *,
+    connection: Connection,
+    engine: Engine,
+    tenant_id: str,
+    journey_id: UUID,
+    security_client: SecurityOAuthClient,
+    di_client: DiClient,
+    v2_client: DiCaptureV2Client,
+) -> UnifiedCaptureV2Response:
+    from audit_core.uc03_delivery_capture_v2 import _build_delivery_capture_response
+    from audit_core.uc03_document_capture_v2 import (
+        _build_capture_response,
+        _declarations,
+        _extracted_document_ids,
+    )
+    from audit_core.uc03_document_unrecognized import (
+        sync_document_unrecognized_findings,
+    )
+
+    booking_requirements, delivery_requirements = _merged_candidate_requirements(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+    )
+    booking_documents = linked_documents_for_journey(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
+    )
+    delivery_documents = linked_documents_for_journey(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
+    )
+
+    # Matches _read_delivery_capture's own unconditional call (runs even
+    # when delivery_documents is empty) -- fires the vehicle-photos task
+    # once Delivery's own requirements are satisfied. Must stay before the
+    # local-fallback early return below, not just in the live-DI branch.
+    from audit_core.uc03_delivery_commands import _ensure_vehicle_photos_task
+
+    _ensure_vehicle_photos_task(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        requirements=delivery_requirements,
+        audit_documents=delivery_documents,
+        correlation_id="",
+    )
+
+    if not booking_documents and not delivery_documents:
+        return _build_local_unified_response(
+            connection=connection, tenant_id=tenant_id, journey_id=journey_id,
+        )
+
+    context_ref, token = _ensure_di_context(
+        connection=connection,
+        engine=engine,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        security_client=security_client,
+        di_client=di_client,
+    )
+    # Merge BOTH of DI's phases into one list -- the actual fix for the
+    # "Missing"/lost-contentUrl bug (PR #375's own band-aid): a document
+    # relocated to the other stage by reconcile is now found by documentId
+    # regardless of which phase DI still has it filed under, so neither
+    # builder below needs its own-row fallback for a merely-relocated
+    # document. A single phase failing degrades to the other, matching
+    # reconcile_unified_documents' own per-phase resilience; only a total
+    # DI outage (both phases fail) surfaces as unavailable, same as today.
+    di_documents: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    di_failures = 0
+    for phase in ("BOOKING", "DELIVERY"):
+        try:
+            payload = v2_client.list_documents(
+                token=token, tenant_id=tenant_id, external_context_ref=context_ref, phase=phase,
+            )
+        except DiCaptureV2Error as exc:
+            di_failures += 1
+            _log_di_capture_v2_failure(
+                operation="list_documents", exc=exc, tenant_id=tenant_id,
+                journey_id=journey_id, context_ref=context_ref,
+            )
+            continue
+        for item in payload.get("documents") or []:
+            document_id = str(item.get("documentId"))
+            if document_id in seen_ids:
+                continue
+            seen_ids.add(document_id)
+            di_documents.append(item)
+    if di_failures == 2:
+        raise DependencyUnavailableError(
+            detail="Document capture status is temporarily unavailable."
+        )
+
+    apply_di_classification(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        di_documents=di_documents,
+        actor_id=_MACHINE_ACTOR,
+        actor_role="SYSTEM",
+        correlation_id="",
+    )
+    # Called once, not once per stage: an unrecognized document (DI could
+    # not classify it at all) always resolves to stage_code="BOOKING" by
+    # resolve_document_stage's own default, so calling this a second time
+    # with stage_code="DELIVERY" against the same merged list would only
+    # ever create a second, differently-keyed workflow task for the same
+    # document -- never a legitimate Delivery-side unrecognized finding.
+    sync_document_unrecognized_findings(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+        stage_code="BOOKING", di_documents=di_documents, correlation_id="",
+    )
+
+    booking_documents = linked_documents_for_journey(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
+    )
+    delivery_documents = linked_documents_for_journey(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
+    )
+    extracted_ids = frozenset(_extracted_document_ids(connection, tenant_id, journey_id))
+
+    booking_response = _build_capture_response(
+        journey_id=journey_id,
+        context_ref=context_ref,
+        requirements=booking_requirements,
+        declaration_rows=_declarations(connection, tenant_id, journey_id),
+        audit_documents=booking_documents,
+        di_documents=di_documents,
+        fallback_extracted_ids=extracted_ids,
+    )
+    delivery_response = _build_delivery_capture_response(
+        journey_id=journey_id,
+        context_ref=context_ref,
+        requirements=delivery_requirements,
+        audit_documents=delivery_documents,
+        di_documents=di_documents,
+        submitted=_stage_completed(
+            connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
+        ),
+        fallback_extracted_ids=extracted_ids,
+    )
+    return _build_unified_response(
+        journey_id=journey_id,
+        context_ref=context_ref,
+        booking_response=booking_response,
+        delivery_response=delivery_response,
+        booking_completed=_stage_completed(
+            connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
+        ),
+        delivery_completed=_stage_completed(
+            connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
+        ),
+    )
+
+
+@router.get("/capture-local", response_model=UnifiedCaptureV2Response)
+def get_unified_capture_local(
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> UnifiedCaptureV2Response:
+    """Replaces uc03_capture_local_reads.get_booking_capture_local_v2 and
+    get_delivery_capture_local_v2 -- DB-only, no DI round trip, used for the
+    screen's own first paint."""
+    _scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    return _build_local_unified_response(
+        connection=connection, tenant_id=tenant_id, journey_id=journey_id,
+    )
+
+
+@router.get("/capture", response_model=UnifiedCaptureV2Response)
+def get_unified_capture(
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    engine: Annotated[Engine, Depends(get_engine)],
+    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
+    di_client: Annotated[DiClient, Depends(get_di_client)],
+    v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
+) -> UnifiedCaptureV2Response:
+    """Replaces uc03_document_capture_v2.get_booking_capture_v2 and
+    uc03_delivery_capture_v2.get_delivery_capture_v2. Never gates on either
+    stage's own business_status (matching _authorize_booking's/_authorize_
+    delivery's own unconditional-read docstrings) -- a journey still
+    entirely in Booking, or one whose Booking has long since closed, both
+    read correctly here.
+    """
+    _scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    return _read_unified_capture(
+        connection=connection,
+        engine=engine,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        security_client=security_client,
+        di_client=di_client,
+        v2_client=v2_client,
+    )
+
+
+def _document_stage(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, document_id: UUID,
+) -> str | None:
+    row = connection.execute(
+        text(
+            """
+            SELECT stage_code FROM auditcore.document_capture_v2_documents
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND di_document_id=:document_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "document_id": document_id},
+    ).scalar_one_or_none()
+    return str(row) if row is not None else None
+
+
+@router.delete("/{document_id}", status_code=204)
+def delete_unified_document(
+    tenant_id: str,
+    journey_id: UUID,
+    document_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    engine: Annotated[Engine, Depends(get_engine)],
+    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
+    di_client: Annotated[DiClient, Depends(get_di_client)],
+    v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
+) -> None:
+    """Replaces uc03_document_capture_v2.delete_booking_document_v2 and
+    uc03_delivery_capture_v2.delete_delivery_document_v2 -- both were
+    byte-identical except the stage_code literal, and shared the same two
+    bugs (see module-section docstring above): canDelete never matching the
+    lock actually enforced here, and DI-before-audit-core ordering meaning a
+    document DI never durably received could never be removed. Which stage
+    owns the document (and so which stage's completion lock applies) is
+    resolved from audit-core's own row, not from a caller-supplied stage.
+    """
+    _scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    stage_code = _document_stage(
+        connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+    )
+    if stage_code is None:
+        return
+    if _stage_completed(connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage_code):
+        raise ConflictError(
+            error_code="VAC-CONFLICT-004",
+            title="Document capture is complete",
+            detail=f"Documents cannot be deleted after {stage_code.title()} has been submitted.",
+        )
+    # Audit-core first: this is the row the UI's own "Uploaded" status reads
+    # from, and the one the PC actually needs gone. DI's own copy is deleted
+    # best-effort, second -- a document DI never durably received (sync
+    # never completed) has nothing to delete there anyway, and that must
+    # never block removing the audit-core row the PC is looking at.
+    connection.execute(
+        text(
+            """
+            DELETE FROM auditcore.document_capture_v2_documents
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND di_document_id=:document_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "document_id": document_id},
+    )
+    # evidence and journey_document_extracted_fields are permanent audit
+    # records -- DELETE is revoked on both at the database level (schema-
+    # wide in 0002_runtime_role_rls.py, restated per-table in each table's
+    # own migration), with document_capture_v2_documents above as the one
+    # deliberate exception. Voiding evidence (an UPDATE, fully permitted) is
+    # the correct and only way to make a deleted document's data stop
+    # counting, and is the same convention uc03_customer_identity_
+    # consistency.py already uses for a wrong-customer document.
+    # _sync_booking_document itself already refuses to act on non-ACTIVE
+    # evidence (`if link is None or association_status != "ACTIVE": return
+    # 0`), and _documents_from_durable_store now excludes it from canonical
+    # materialization the same way (uc03_delivery_post_extraction_
+    # materialization.py). If this UPDATE fails, the whole delete --
+    # including the document row above -- rolls back with it: this
+    # connection is one transaction for the entire request
+    # (dependencies.get_connection wraps every request in engine.begin()).
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.evidence
+            SET association_status='VOIDED',
+                void_reason='DOCUMENT_DELETED',
+                voided_by_actor_id=:actor_id,
+                voided_at_utc=now()
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND di_document_id=:document_id
+              AND association_status='ACTIVE'
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "document_id": document_id,
+            "actor_id": _human_actor_id(human_principal),
+        },
+    )
+    # Re-run this stage's materializer now, immediately -- a canonical fact
+    # already written from this document before it was deleted must not sit
+    # stale until some unrelated document's future sync happens to
+    # recompute it (same reasoning as apply_di_classification's own
+    # corrected_to_delivery/corrected_to_booking re-materialization call).
+    # Never raises -- both functions wrap their own body in try/except and
+    # return {"error": True} rather than propagate.
+    #
+    # Deliberately not extended to materialize_machine_booking_values
+    # (Booking's generic-attribute projection, uc03_post_extraction_
+    # materialization.py): it resolves its own "current winner" through a
+    # different path (_preferred_rows/_winner_by_id), not _documents_from_
+    # durable_store, and has not been audited for the same evidence-status
+    # awareness -- a real, separate gap, left alone rather than guessed at.
+    if stage_code == "DELIVERY":
+        from audit_core.uc03_delivery_post_extraction_materialization import (
+            materialize_delivery_documents_from_durable_store,
+        )
+
+        materialize_delivery_documents_from_durable_store(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+        )
+    else:
+        from audit_core.uc03_delivery_post_extraction_materialization import (
+            materialize_booking_documents_from_durable_store,
+        )
+
+        materialize_booking_documents_from_durable_store(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+        )
+    context_ref, token = _ensure_di_context(
+        connection=connection,
+        engine=engine,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        security_client=security_client,
+        di_client=di_client,
+    )
+    try:
+        v2_client.delete_document(
+            token=token,
+            tenant_id=tenant_id,
+            external_context_ref=context_ref,
+            document_id=str(document_id),
+        )
+    except DiCaptureV2Error as exc:
+        _log_di_capture_v2_failure(
+            operation="delete_document", exc=exc, tenant_id=tenant_id,
+            journey_id=journey_id, context_ref=context_ref,
+        )
+
+
+class UnifiedResyncResponse(BaseModel):
+    documentsFound: int
+    documentsResynced: int
+    documentsNotYetExtracted: int
+    queuedDocumentCount: int
+
+
+@router.post("/resync", response_model=UnifiedResyncResponse)
+def resync_unified_documents(
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    engine: Annotated[Engine, Depends(get_engine)],
+    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
+    di_client: Annotated[DiClient, Depends(get_di_client)],
+    v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
+    background_tasks: BackgroundTasks,
+) -> UnifiedResyncResponse:
+    """Replaces uc03_document_capture_v2.resync_booking_capture_v2 and
+    uc03_delivery_capture_v2.resync_delivery_capture_v2 -- both already
+    delegated reclassification to reconcile_unified_documents and were
+    otherwise byte-identical except the stage_code literal and which
+    linked-documents getter they called. One call now covers both stages.
+    """
+    from audit_core.uc03_confidence_review_policy import (
+        _run_sync_booking_document_task,
+        sync_stagger_seconds,
+    )
+    from audit_core.uc03_delivery_capture_v2 import (
+        _linked_delivery_documents,
+        _resyncable_document_ids,
+    )
+    from audit_core.uc03_document_capture_v2 import (
+        _backfill_evidence_links_for_resync,
+        _linked_documents,
+    )
+
+    _scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    booking_requirements, delivery_requirements = _merged_candidate_requirements(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+    )
+    any_documents = bool(_linked_documents(connection, tenant_id, journey_id)) or bool(
+        _linked_delivery_documents(connection, tenant_id, journey_id)
+    )
+    if any_documents:
+        context_ref, token = _ensure_di_context(
+            connection=connection,
+            engine=engine,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            security_client=security_client,
+            di_client=di_client,
+        )
+        reconcile_unified_documents(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            actor_id=f"manual-resync:{human_principal.subject}",
+            actor_role="PC",
+            correlation_id="",
+            v2_client=v2_client,
+            context_ref=context_ref,
+            token=token,
+        )
+
+    booking_documents = _linked_documents(connection, tenant_id, journey_id)
+    delivery_documents = _linked_delivery_documents(connection, tenant_id, journey_id)
+    booking_ids = [
+        row["di_document_id"] for row in booking_documents
+        if str(row.get("capture_status") or "").upper() == "CLASSIFIED"
+    ]
+    delivery_ids = _resyncable_document_ids(delivery_documents)
+
+    _backfill_evidence_links_for_resync(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        documents=booking_documents,
+        document_ids=booking_ids,
+        requirements=booking_requirements,
+        service_id=f"manual-resync:{human_principal.subject}",
+    )
+    _backfill_evidence_links_for_resync(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        documents=delivery_documents,
+        document_ids=delivery_ids,
+        requirements=delivery_requirements,
+        service_id=f"manual-resync:{human_principal.subject}",
+    )
+
+    index = 0
+    for document_id in booking_ids:
+        background_tasks.add_task(
+            _run_sync_booking_document_task,
+            engine,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            document_id=document_id,
+            service_id=f"manual-resync:{human_principal.subject}",
+            stage_code="BOOKING",
+            initial_delay_seconds=sync_stagger_seconds(index),
+        )
+        index += 1
+    for document_id in delivery_ids:
+        background_tasks.add_task(
+            _run_sync_booking_document_task,
+            engine,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            document_id=document_id,
+            service_id=f"manual-resync:{human_principal.subject}",
+            stage_code="DELIVERY",
+            initial_delay_seconds=sync_stagger_seconds(index),
+        )
+        index += 1
+
+    total_documents = len(booking_documents) + len(delivery_documents)
+    total_resynced = len(booking_ids) + len(delivery_ids)
+    return UnifiedResyncResponse(
+        documentsFound=total_documents,
+        documentsResynced=total_resynced,
+        documentsNotYetExtracted=total_documents - total_resynced,
+        queuedDocumentCount=total_resynced,
+    )

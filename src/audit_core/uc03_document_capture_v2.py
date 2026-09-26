@@ -9,14 +9,14 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, Request, Response
+from fastapi import APIRouter, Depends, Header, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Connection, Engine, text
 
 from audit_core.dependencies import get_connection, get_engine, get_human_principal
 from audit_core.di_capture_v2_client import DiCaptureV2Client, DiCaptureV2Error
 from audit_core.di_client import DiClient
-from audit_core.errors import ConflictError, DependencyUnavailableError, NotFoundError
+from audit_core.errors import ConflictError, NotFoundError
 from audit_core.evidence import (
     _external_context_ref,
     _journey_context,
@@ -905,114 +905,12 @@ def _build_local_capture_response(
     )
 
 
-def _read_capture(
-    *,
-    connection: Connection,
-    engine: Engine,
-    tenant_id: str,
-    journey_id: UUID,
-    security_client: SecurityOAuthClient,
-    di_client: DiClient,
-    v2_client: DiCaptureV2Client,
-) -> BookingCaptureV2Response:
-    requirements = _base_requirements(connection, tenant_id, journey_id)
-    declaration_rows = _declarations(connection, tenant_id, journey_id)
-    audit_documents = _linked_documents(connection, tenant_id, journey_id)
-
-    if not audit_documents:
-        return _build_local_capture_response(
-            connection=connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            requirements=requirements,
-            declaration_rows=declaration_rows,
-            audit_documents=audit_documents,
-        )
-
-    context_ref, token = _ensure_di_context(
-        connection=connection,
-        engine=engine,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        security_client=security_client,
-        di_client=di_client,
-    )
-    try:
-        di_payload = v2_client.list_documents(
-            token=token,
-            tenant_id=tenant_id,
-            external_context_ref=context_ref,
-            phase="BOOKING",
-        )
-    except DiCaptureV2Error as exc:
-        _log_di_capture_v2_failure(
-            operation="list_documents", exc=exc, tenant_id=tenant_id,
-            journey_id=journey_id, context_ref=context_ref,
-        )
-        raise DependencyUnavailableError(
-            detail="Document capture status is temporarily unavailable."
-        ) from exc
-    di_documents = list(di_payload.get("documents") or [])
-    _reconcile_documents(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        requirements=requirements,
-        di_documents=di_documents,
-    )
-    from audit_core.uc03_document_unrecognized import (
-        sync_document_unrecognized_findings,
-    )
-
-    sync_document_unrecognized_findings(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        stage_code="BOOKING",
-        di_documents=di_documents,
-        correlation_id="",
-    )
-    return _build_capture_response(
-        journey_id=journey_id,
-        context_ref=context_ref,
-        requirements=requirements,
-        declaration_rows=declaration_rows,
-        audit_documents=audit_documents,
-        di_documents=di_documents,
-        fallback_extracted_ids=frozenset(
-            _extracted_document_ids(connection, tenant_id, journey_id)
-        ),
-    )
-
-
-@router.get("/booking/capture", response_model=BookingCaptureV2Response)
-def get_booking_capture_v2(
-    tenant_id: str,
-    journey_id: UUID,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
-    connection: Annotated[Connection, Depends(get_connection)],
-    engine: Annotated[Engine, Depends(get_engine)],
-    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
-    di_client: Annotated[DiClient, Depends(get_di_client)],
-    v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
-) -> BookingCaptureV2Response:
-    _authorize_booking(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    return _read_capture(
-        connection=connection,
-        engine=engine,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        security_client=security_client,
-        di_client=di_client,
-        v2_client=v2_client,
-    )
+# GET /booking/capture was removed (Phase 4 unification) -- replaced by
+# uc03_unified_document_capture.get_unified_capture, which merges DI's two
+# phases into one call instead of this endpoint's single-phase list_documents
+# (see that module's own section docstring for why the single-phase version
+# was the root cause of a relocated document showing "Missing"/losing its
+# contentUrl). _read_capture is gone with it -- nothing else called it.
 
 
 @router.post("/booking/complete", response_model=BookingCaptureV2CompletionResponse)
@@ -1153,214 +1051,17 @@ def complete_booking_capture_v2(
     return BookingCaptureV2CompletionResponse.model_validate(body)
 
 
-@router.post("/booking/upload-intents", response_model=UploadIntentResponse)
-def create_booking_upload_intents_v2(
-    tenant_id: str,
-    journey_id: UUID,
-    command: UploadIntentCommand,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
-    connection: Annotated[Connection, Depends(get_connection)],
-    engine: Annotated[Engine, Depends(get_engine)],
-    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
-    di_client: Annotated[DiClient, Depends(get_di_client)],
-    v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
-) -> UploadIntentResponse:
-    _authorize_booking(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    requirements = _base_requirements(connection, tenant_id, journey_id)
-    open_requirements = _requirements_with_open_slot(
-        connection, tenant_id=tenant_id, journey_id=journey_id, requirements=requirements,
-    )
-    context_ref, token = _ensure_di_context(
-        connection=connection,
-        engine=engine,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        security_client=security_client,
-        di_client=di_client,
-    )
-    try:
-        payload = v2_client.create_upload_intents(
-            token=token,
-            tenant_id=tenant_id,
-            external_context_ref=context_ref,
-            phase="BOOKING",
-            candidate_document_type_keys=_candidate_type_keys(requirements),
-            requirement_refs_by_document_type_key=(
-                _requirement_refs_by_document_type_key(open_requirements)
-            ),
-            files=[item.model_dump() for item in command.files],
-        )
-    except DiCaptureV2Error as exc:
-        _log_di_capture_v2_failure(
-            operation="create_upload_intents", exc=exc, tenant_id=tenant_id,
-            journey_id=journey_id, context_ref=context_ref,
-        )
-        raise DependencyUnavailableError(detail="Document upload could not be prepared.") from exc
-
-    results: list[UploadIntentResult] = []
-    for item in payload.get("uploads") or []:
-        document_id = UUID(str(item["documentId"]))
-        input_item = next(file for file in command.files if file.clientUploadId == item["clientUploadId"])
-        connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.document_capture_v2_documents (
-                    tenant_id, journey_id, stage_code, di_document_id,
-                    client_upload_id, capture_status, original_filename,
-                    content_type, created_by_actor_id
-                ) VALUES (
-                    :tenant_id, :journey_id, 'BOOKING', :document_id,
-                    :client_upload_id, 'RECEIVING', :filename,
-                    :content_type, :actor_id
-                )
-                ON CONFLICT (tenant_id, journey_id, client_upload_id)
-                DO UPDATE SET di_document_id=EXCLUDED.di_document_id,
-                              original_filename=EXCLUDED.original_filename,
-                              content_type=EXCLUDED.content_type,
-                              updated_at_utc=now()
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "document_id": document_id,
-                "client_upload_id": item["clientUploadId"],
-                "filename": input_item.filename,
-                "content_type": input_item.contentType,
-                "actor_id": _human_actor_id(human_principal),
-            },
-        )
-        results.append(
-            UploadIntentResult(
-                clientUploadId=item["clientUploadId"],
-                documentId=document_id,
-                uploadUrl=item["uploadUrl"],
-                uploadHeaders=dict(item.get("uploadHeaders") or {}),
-                expiresAtUtc=str(item["expiresAtUtc"]),
-            )
-        )
-    return UploadIntentResponse(
-        externalContextRef=context_ref, uploads=results, failures=_upload_intent_failures(payload)
-    )
-
-
-@router.post("/booking/documents/{document_id}/finalize", response_model=FinalizeResponse)
-def finalize_booking_document_v2(
-    tenant_id: str,
-    journey_id: UUID,
-    document_id: UUID,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
-    connection: Annotated[Connection, Depends(get_connection)],
-    engine: Annotated[Engine, Depends(get_engine)],
-    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
-    di_client: Annotated[DiClient, Depends(get_di_client)],
-    v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
-) -> FinalizeResponse:
-    _authorize_booking(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    context_ref, token = _ensure_di_context(
-        connection=connection,
-        engine=engine,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        security_client=security_client,
-        di_client=di_client,
-    )
-    try:
-        payload = v2_client.finalize_document(
-            token=token,
-            tenant_id=tenant_id,
-            external_context_ref=context_ref,
-            document_id=str(document_id),
-        )
-    except DiCaptureV2Error as exc:
-        _log_di_capture_v2_failure(
-            operation="finalize_document", exc=exc, tenant_id=tenant_id,
-            journey_id=journey_id, context_ref=context_ref,
-        )
-        raise DependencyUnavailableError(detail="Uploaded document could not be finalized.") from exc
-    return FinalizeResponse(documentId=document_id, state=str(payload["state"]))
-
-
-@router.delete("/booking/documents/{document_id}", status_code=204)
-def delete_booking_document_v2(
-    tenant_id: str,
-    journey_id: UUID,
-    document_id: UUID,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
-    connection: Annotated[Connection, Depends(get_connection)],
-    engine: Annotated[Engine, Depends(get_engine)],
-    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
-    di_client: Annotated[DiClient, Depends(get_di_client)],
-    v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
-) -> None:
-    _authorize_booking(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    _require_capture_phase_open(
-        connection, tenant_id=tenant_id, journey_id=journey_id
-    )
-    exists = connection.execute(
-        text(
-            """
-            SELECT 1 FROM auditcore.document_capture_v2_documents
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code='BOOKING' AND di_document_id=:document_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id, "document_id": document_id},
-    ).scalar_one_or_none()
-    if exists is None:
-        return
-    context_ref, token = _ensure_di_context(
-        connection=connection,
-        engine=engine,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        security_client=security_client,
-        di_client=di_client,
-    )
-    try:
-        v2_client.delete_document(
-            token=token,
-            tenant_id=tenant_id,
-            external_context_ref=context_ref,
-            document_id=str(document_id),
-        )
-    except DiCaptureV2Error as exc:
-        _log_di_capture_v2_failure(
-            operation="delete_document", exc=exc, tenant_id=tenant_id,
-            journey_id=journey_id, context_ref=context_ref,
-        )
-        raise DependencyUnavailableError(detail="Document could not be deleted safely.") from exc
-    connection.execute(
-        text(
-            """
-            DELETE FROM auditcore.document_capture_v2_documents
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code='BOOKING' AND di_document_id=:document_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id, "document_id": document_id},
-    )
+# POST /booking/upload-intents, POST /booking/documents/{id}/finalize and
+# DELETE /booking/documents/{id} were removed (Phase 4 unification). The
+# first two had zero live callers already (the frontend's own
+# uploadBookingCaptureV2Files/uc03DocumentCaptureV2.ts was dead code -- every
+# real upload already went through the unified create_unified_upload_intents/
+# finalize_unified_document above them in this same codebase). DELETE is
+# replaced by uc03_unified_document_capture.delete_unified_document, which
+# fixes the two bugs this copy shared with uc03_delivery_capture_v2's own
+# (canDelete never matching this endpoint's own completion lock; DI attempted
+# before audit-core, so a document DI never durably received could never be
+# removed) -- see that module's own section docstring.
 
 
 @router.put("/booking/declarations/{condition_key}", response_model=BookingCaptureV2Response)
@@ -1442,155 +1143,9 @@ def set_booking_declaration_v2(
     )
 
 
-class BookingCaptureV2ResyncResponse(BaseModel):
-    documentsFound: int
-    documentsResynced: int
-    documentsNotYetExtracted: int
-    queuedDocumentCount: int
-
-
-@router.post("/booking/resync", response_model=BookingCaptureV2ResyncResponse)
-def resync_booking_capture_v2(
-    tenant_id: str,
-    journey_id: UUID,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
-    connection: Annotated[Connection, Depends(get_connection)],
-    engine: Annotated[Engine, Depends(get_engine)],
-    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
-    di_client: Annotated[DiClient, Depends(get_di_client)],
-    v2_client: Annotated[DiCaptureV2Client, Depends(get_di_capture_v2_client)],
-    background_tasks: BackgroundTasks,
-) -> BookingCaptureV2ResyncResponse:
-    """The Booking counterpart of uc03_delivery_capture_v2.resync_delivery_
-    capture_v2 -- open to any role with legitimate access to this Journey
-    (per _authorize_booking's own scoping, not restricted further here).
-    Booking's own business_status is never checked for any capture-v2
-    action (see _authorize_booking's own docstring), so this repair path
-    needs no special carve-out of its own for a Journey that has long since
-    moved on to Delivery, which is the normal case for anything old enough
-    to need a resync.
-
-    1. Refreshes document classification status from DI's own live state
-       first (_reconcile_documents), the same call the capture screen's own
-       read makes -- without this, a Journey whose capture screen has not
-       been reopened since classification actually finished would still be
-       filtered against a stale local cache and resync 0 documents with no
-       error, which is exactly what this endpoint must not do silently.
-    2. Lists every document uploaded for this Journey (via _linked_documents,
-       the same durable listing the capture screen itself reads).
-    3. Only a document DI has actually classified is worth re-syncing -- one
-       still mid-classification has nothing durable to copy yet, and
-       _sync_booking_document's own DOCUMENT_MISSING/manual-verification
-       logic already covers a document that never got this far. The
-       response reports both counts so a stuck upload is visible, not silent.
-    4. Forces every classified document through the full per-document sync
-       pipeline again (durable fact copy, MANUAL_VERIFICATION, SKU
-       resolution, payment reconciliation, canonical materialization, the
-       newer identity/duplicate-receipt checks -- everything wired into
-       _run_sync_booking_document_task). Every writer underneath is an
-       idempotent upsert (INSERT ... ON CONFLICT DO UPDATE, or an explicit
-       existing-row check before insert) specifically so calling this
-       redundantly, including concurrently with the async webhook trigger
-       for the same document, only ever creates-or-updates -- it cannot
-       double-insert.
-    """
-    _authorize_booking(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    requirements = _base_requirements(connection, tenant_id, journey_id)
-    if _linked_documents(connection, tenant_id, journey_id):
-        context_ref, token = _ensure_di_context(
-            connection=connection,
-            engine=engine,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            security_client=security_client,
-            di_client=di_client,
-        )
-        # reconcile_unified_documents, not the narrower Booking-only
-        # _reconcile_documents this used to call -- confirmed live: a
-        # document whose only real requirement is Delivery-side (e.g.
-        # gate_pass, accessory_invoice_dms) gets defaulted to
-        # stage_code='BOOKING' at upload time (before DI has classified it
-        # yet), and nothing ever revisited that guess once classification
-        # actually completed. _reconcile_documents' own type_to_requirement
-        # map is built from Booking-only requirements, so it can never
-        # resolve such a document's requirement_key -- leaving it
-        # permanently unlinkable (_ensure_evidence_link_for_resync skips
-        # any document with no requirement_key), no matter how many times
-        # Resync runs. reconcile_unified_documents checks both stages'
-        # requirements and corrects stage_code/requirement_key from DI's
-        # current (now-complete) classification -- already idempotent, and
-        # its own docstring already anticipated being called from a future
-        # resync. Unlike the old call, DI listing failures are handled
-        # per-phase inside reconcile_unified_documents itself (logged, that
-        # phase skipped) rather than aborting the whole resync -- a genuine
-        # improvement, since a Delivery-listing hiccup no longer has to take
-        # down a Booking-only resync.
-        from audit_core.uc03_unified_document_capture import (
-            reconcile_unified_documents,
-        )
-
-        reconcile_unified_documents(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            actor_id=f"manual-resync:{human_principal.subject}",
-            actor_role="PC",
-            correlation_id="",
-            v2_client=v2_client,
-            context_ref=context_ref,
-            token=token,
-        )
-
-    documents = _linked_documents(connection, tenant_id, journey_id)
-    # Only a document DI has actually classified is worth re-syncing -- see
-    # uc03_delivery_capture_v2._resyncable_document_ids, the same filter,
-    # duplicated rather than imported to avoid a circular import (that
-    # module already imports from this one).
-    document_ids = [
-        row["di_document_id"] for row in documents
-        if str(row.get("capture_status") or "").upper() == "CLASSIFIED"
-    ]
-
-    # Backfill any missing/inactive evidence link BEFORE queuing the sync
-    # task -- see _ensure_evidence_link_for_resync's own docstring. Without
-    # this, a document whose one-time DI "link" callback never landed would
-    # report as resynced while _sync_booking_document silently does nothing.
-    _backfill_evidence_links_for_resync(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        documents=documents,
-        document_ids=document_ids,
-        requirements=requirements,
-        service_id=f"manual-resync:{human_principal.subject}",
-    )
-
-    from audit_core.uc03_confidence_review_policy import (
-        _run_sync_booking_document_task,
-        sync_stagger_seconds,
-    )
-
-    for index, document_id in enumerate(document_ids):
-        background_tasks.add_task(
-            _run_sync_booking_document_task,
-            engine,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            document_id=document_id,
-            service_id=f"manual-resync:{human_principal.subject}",
-            stage_code="BOOKING",
-            initial_delay_seconds=sync_stagger_seconds(index),
-        )
-    return BookingCaptureV2ResyncResponse(
-        documentsFound=len(documents),
-        documentsResynced=len(document_ids),
-        documentsNotYetExtracted=len(documents) - len(document_ids),
-        queuedDocumentCount=len(document_ids),
-    )
+# POST /booking/resync was removed (Phase 4 unification) -- replaced by
+# uc03_unified_document_capture.resync_unified_documents, which covers both
+# stages in one call. This copy and uc03_delivery_capture_v2.resync_delivery_
+# capture_v2 were already both delegating reclassification to
+# reconcile_unified_documents and were otherwise byte-identical except the
+# stage_code literal and which linked-documents getter they called.
