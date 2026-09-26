@@ -1745,6 +1745,71 @@ def propose_delivery_vehicle_observation(
     return DeliveryVehicleObservationProposalResponse.model_validate(body)
 
 
+class DeliveryVehicleObservationProposalReadResponse(BaseModel):
+    workflowTaskId: UUID
+    observedVin: str | None
+    observedChassisNumber: str | None
+    computedReconciliationStatus: Literal["MATCH", "MISMATCH", "REVIEW_REQUIRED"]
+    appliedAtUtc: datetime | None
+
+
+@router.get(
+    "/vehicle-observation/proposals/{workflow_task_id}",
+    response_model=DeliveryVehicleObservationProposalReadResponse,
+)
+def get_delivery_vehicle_observation_proposal(
+    tenant_id: str,
+    journey_id: UUID,
+    workflow_task_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> DeliveryVehicleObservationProposalReadResponse:
+    """Lets a TL's DELIVERY_VIN_MANUAL_ENTRY_REVIEW Task Queue card show the
+    PC's actual proposed VIN/Chassis and computed reconciliation status
+    before approving -- the shared review-queue list response carries no
+    per-task-type payload fields, so this is its own small dedicated read,
+    same shape as LoanDisbursementPicker's own dedicated candidates query
+    for FINANCE_DISBURSEMENT_REVIEW rather than the list endpoint."""
+    _authorize_security(
+        authorization_client,
+        human_principal=human_principal,
+        tenant_id=tenant_id,
+    )
+    set_tenant_context(connection, tenant_id)
+    row = connection.execute(
+        text(
+            """
+            SELECT workflow_task_id, observed_vin, observed_chassis_number,
+                   computed_reconciliation_status, applied_at_utc
+            FROM auditcore.journey_delivery_vin_observation_proposals
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND workflow_task_id=:workflow_task_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "workflow_task_id": workflow_task_id,
+        },
+    ).mappings().one_or_none()
+    if row is None:
+        raise NotFoundError(
+            error_code="VAC-NF-033",
+            title="VIN observation proposal not found",
+            detail="This task has no associated VIN/Chassis proposal.",
+        )
+    return DeliveryVehicleObservationProposalReadResponse(
+        workflowTaskId=row["workflow_task_id"],
+        observedVin=row["observed_vin"],
+        observedChassisNumber=row["observed_chassis_number"],
+        computedReconciliationStatus=row["computed_reconciliation_status"],
+        appliedAtUtc=row["applied_at_utc"],
+    )
+
+
 def apply_confirmed_delivery_vin_observation(
     connection: Connection,
     *,

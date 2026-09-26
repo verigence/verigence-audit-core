@@ -720,6 +720,16 @@ def test_manual_vin_proposal_closes_pcs_task_and_awaits_tl_approval(delivery_set
     assert observed_vin is None
     assert proposal_applied is None
 
+    # A TL's task card reads this dedicated endpoint to see what the PC
+    # actually proposed before approving it.
+    proposal_read = client.get(
+        _delivery_url(setup, journey_id, f"vehicle-observation/proposals/{task_id}"),
+    )
+    assert proposal_read.status_code == 200, proposal_read.text
+    assert proposal_read.json()["observedVin"] == "MA1AB2CD3EF456780"
+    assert proposal_read.json()["computedReconciliationStatus"] == "REVIEW_REQUIRED"
+    assert proposal_read.json()["appliedAtUtc"] is None
+
     # tasks_api.py's complete/cancel actions depend on get_principal, not
     # get_human_principal -- a separate dependency (see
     # test_uc03_document_field_corrections.py's own fixture for the same
