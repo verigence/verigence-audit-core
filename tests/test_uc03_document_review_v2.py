@@ -8,7 +8,11 @@ from fastapi.routing import APIRoute
 # GET /booking/review was a second, separate call for the other stage on
 # every single page load.
 from audit_core import uc03_confidence_review_policy  # noqa: F401
-from audit_core.uc03_document_review_v2 import UnifiedReviewV2Response, _field_review_state, router
+from audit_core.uc03_document_review_v2 import (
+    UnifiedReviewV2Response,
+    _field_review_state,
+    router,
+)
 
 
 def test_review_field_at_90_is_ready() -> None:
