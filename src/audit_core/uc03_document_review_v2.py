@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel
 from sqlalchemy import Connection, Engine, text
@@ -47,6 +48,8 @@ router = APIRouter(
     prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}",
     tags=["uc03-document-review-v2"],
 )
+
+logger = structlog.get_logger(__name__)
 
 _FAILED_PROCESSING = {"FAILED", "ERROR", "REJECTED"}
 
@@ -141,6 +144,42 @@ class BookingReviewV2Response(BaseModel):
     unmappedFields: list[ReviewV2UnmappedField]
     documents: list[ReviewV2Document]
     missingDeclarations: list[ReviewV2MissingDeclaration]
+
+
+# Root-caused live (2026-09-26): the Web client has called
+# GET .../delivery/review since it shipped (uc03DocumentReviewV2.ts's own
+# DeliveryReviewV2 type has existed all along) but no such route was ever
+# registered anywhere in this service -- every single call 404'd, for
+# every Journey, unconditionally. A Delivery document that DI had
+# genuinely classified and extracted had no review dataset to appear in at
+# all, so it could never be found for the Edit Document modal. This is the
+# dominant cause of "an extracted document still won't open" for anything
+# past Booking. Mirrors BookingReviewV2Response exactly, minus
+# missingDeclarations (PC declarations/blocking gates are Booking-only and
+# already confirmed dead in every UI consumer).
+class DeliveryReviewV2Response(BaseModel):
+    journeyId: UUID
+    phase: Literal["DELIVERY"] = "DELIVERY"
+    captureSubmitted: bool
+    pcVerificationStatus: str
+    aggregateVersion: int
+    processingPending: bool
+    needsReviewCount: int
+    attributes: list[ReviewV2Attribute]
+    unmappedFields: list[ReviewV2UnmappedField]
+    documents: list[ReviewV2Document]
+
+
+# Direct instruction (2026-09-26): Review gets the same GET unification
+# Capture already has (GET /uc03/documents/capture-local) instead of ever
+# shipping as two permanently-separate stage reads -- one HTTP call, one
+# shared DI context, both stages tagged in the one response. Replaces GET
+# /booking/review and GET /delivery/review outright (removed, not kept
+# alongside this); JourneyDocumentsPage.tsx was their only caller.
+class UnifiedReviewV2Response(BaseModel):
+    journeyId: UUID
+    booking: BookingReviewV2Response
+    delivery: DeliveryReviewV2Response
 
 
 class AuditSourceComparisonV2Response(BaseModel):
@@ -552,24 +591,42 @@ def _v2_documents_for_stage(
                 )
             )
         except DiClientError as exc:
-            if exc.retryable:
-                documents.append(
-                    ReviewV2Document(
-                        documentId=document_id,
-                        requirementKey=requirement_key,
-                        label=label,
-                        documentTypeKey=(di_status.get("classifiedDocumentTypeKey") or link.get("classified_document_type_key")),
-                        originalFilename=str(di_status.get("originalFilename") or link.get("original_filename") or document_id),
-                        contentUrl=di_status.get("contentUrl"),
-                        processingStatus=str(di_status.get("processingStatus") or "PROCESSING"),
-                        extractionState="PENDING",
-                        fields=[],
-                    )
+            # A non-retryable DI error for ONE document used to raise
+            # DependencyUnavailableError here, which propagated out of the
+            # whole per-stage loop and failed this entire stage's review
+            # read -- every other, perfectly healthy, already-extracted
+            # document in the same stage became unopenable too (the
+            # frontend's own retry policy never retries a real HTTP error,
+            # so the query stayed empty for the rest of the page load).
+            # Root-caused live (2026-09-26): "click to open" failing for
+            # documents that HAD been extracted traced back to exactly this
+            # -- one bad document taking the rest down with it. Recording
+            # this one document as FAILED and continuing keeps every other
+            # document in the same stage independently openable, matching
+            # this same file's own retryable-error handling above (a single
+            # document's problem stays that document's problem).
+            logger.warning(
+                "uc03_review_document_di_error",
+                tenant_id=tenant_id,
+                journey_id=str(journey_id),
+                document_id=str(document_id),
+                retryable=exc.retryable,
+                status_code=exc.status_code,
+                code=exc.code,
+            )
+            documents.append(
+                ReviewV2Document(
+                    documentId=document_id,
+                    requirementKey=requirement_key,
+                    label=label,
+                    documentTypeKey=(di_status.get("classifiedDocumentTypeKey") or link.get("classified_document_type_key")),
+                    originalFilename=str(di_status.get("originalFilename") or link.get("original_filename") or document_id),
+                    contentUrl=di_status.get("contentUrl"),
+                    processingStatus=str(di_status.get("processingStatus") or "PROCESSING"),
+                    extractionState="PENDING" if exc.retryable else "FAILED",
+                    fields=[],
                 )
-            else:
-                raise DependencyUnavailableError(
-                    detail="Document review values are temporarily unavailable."
-                ) from exc
+            )
     return documents
 
 
@@ -615,10 +672,33 @@ def _legacy_documents(
                 )
             )
         except DiClientError as exc:
-            if not exc.retryable:
-                raise DependencyUnavailableError(
-                    detail="Document review values are temporarily unavailable."
-                ) from exc
+            # Same fix as _v2_documents_for_stage's own identical except
+            # block above, and for the same root-caused reason: one legacy
+            # document's DI error must never take down every other legacy
+            # document in this same list.
+            logger.warning(
+                "uc03_legacy_review_document_di_error",
+                tenant_id=tenant_id,
+                journey_id=str(journey_id),
+                document_id=str(document_id),
+                retryable=exc.retryable,
+                status_code=exc.status_code,
+                code=exc.code,
+            )
+            documents.append(
+                ReviewV2Document(
+                    documentId=document_id,
+                    evidenceId=UUID(str(link["evidence_id"])),
+                    requirementKey=requirement_key,
+                    label=label,
+                    documentTypeKey=document_type,
+                    originalFilename=f"{label} · {str(document_id)[:8]}",
+                    contentUrl=None,
+                    processingStatus="PROCESSING" if exc.retryable else "FAILED",
+                    extractionState="PENDING" if exc.retryable else "FAILED",
+                    fields=[],
+                )
+            )
     return documents
 
 
@@ -699,12 +779,68 @@ def _booking_review_data(
     return requirements, documents, attributes, unmapped
 
 
-# get_booking_review_v2 removed (Phase 0 monkeypatch removal): confirmed
-# dead (no callers anywhere, not even as a plain function) -- its route was
-# always discarded by install_uc03_confidence_review_policy's later
-# _replace_route call. get_booking_review_v2_confidence_policy
-# (uc03_confidence_review_policy.py) is the live handler, now decorated
-# directly on this router's GET /booking/review instead.
+def _unified_review_data(
+    *,
+    connection: Connection,
+    engine: Engine,
+    tenant_id: str,
+    journey_id: UUID,
+    security_client: SecurityOAuthClient,
+    di_client: DiClient,
+    v2_client: DiCaptureV2Client,
+) -> tuple[
+    list[dict[str, Any]],
+    list[ReviewV2Document], list[ReviewV2Attribute], list[ReviewV2UnmappedField],
+    list[ReviewV2Document], list[ReviewV2Attribute], list[ReviewV2UnmappedField],
+]:
+    """Backs GET /uc03/documents/review, the single read that replaced the
+    two separate GET /booking/review and GET /delivery/review (the latter
+    never even existed as a route at all -- see DeliveryReviewV2Response's
+    own comment). One _ensure_di_context call shared by both stages here --
+    a real security-token exchange plus journey/subject DB lookups, not a
+    cheap read -- so calling it once instead of twice on every single page
+    load is a genuine duplicate-work fix, not cosmetic. _booking_review_data
+    above (used by the confirm/decision/evidence-link-patch endpoints,
+    which each read one stage at a time by design) is untouched and keeps
+    its own independent _ensure_di_context call -- only this read path
+    shares one context across both stages."""
+    requirements = _base_requirements(connection, tenant_id, journey_id)
+    context_ref, token = _ensure_di_context(
+        connection=connection,
+        engine=engine,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        security_client=security_client,
+        di_client=di_client,
+    )
+    booking_documents = _all_review_documents(
+        connection=connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        token=token,
+        context_ref=context_ref,
+        di_client=di_client,
+        v2_client=v2_client,
+        stages=("BOOKING",),
+        requirements=requirements,
+    )
+    booking_attributes, booking_unmapped = _build_attributes(booking_documents, stages=("BOOKING",))
+    delivery_documents = _all_review_documents(
+        connection=connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        token=token,
+        context_ref=context_ref,
+        di_client=di_client,
+        v2_client=v2_client,
+        stages=("DELIVERY",),
+    )
+    delivery_attributes, delivery_unmapped = _build_attributes(delivery_documents, stages=("DELIVERY",))
+    return (
+        requirements,
+        booking_documents, booking_attributes, booking_unmapped,
+        delivery_documents, delivery_attributes, delivery_unmapped,
+    )
 
 
 @router.get("/audit/source-comparison", response_model=AuditSourceComparisonV2Response)

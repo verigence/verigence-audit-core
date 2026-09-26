@@ -1575,8 +1575,44 @@ def acknowledge_booking_document_link_with_auto_sync(
     return response
 
 
-@review_v2.router.get("/booking/review", response_model=review_v2.BookingReviewV2Response)
-def get_booking_review_v2_confidence_policy(
+def _confidence_policy_stage_result(
+    documents: list[review_v2.ReviewV2Document],
+    attributes: list[review_v2.ReviewV2Attribute],
+    unmapped: list[review_v2.ReviewV2UnmappedField],
+) -> tuple[int, bool]:
+    """Shared by both stages of get_unified_review_v2 below -- same
+    needsReviewCount + MISMATCH-downgrade policy Booking's read always
+    applied, now applied identically to Delivery's own read instead of
+    Delivery never having had a read at all."""
+    items = booking_review._current_review_items(attributes, unmapped)
+    needs_review = sum(1 for item in items.values() if item.decision_required)
+
+    # Existing Web clients historically turned MISMATCH into mandatory work. Keep
+    # mismatch evidence in Audit/source-comparison, but do not expose it as a
+    # review gate when every source is at/above the confidence threshold.
+    for attribute in attributes:
+        item = items.get(f"attribute:{attribute.attributeKey}")
+        if (
+            item is not None
+            and not item.decision_required
+            and attribute.comparisonState == "MISMATCH"
+        ):
+            attribute.comparisonState = "SINGLE_SOURCE"
+
+    actual_pending = any(document.extractionState == "PENDING" for document in documents)
+    # A current low-confidence exception must be reviewable even while other
+    # documents continue processing in the background.
+    return needs_review, actual_pending and needs_review == 0
+
+
+# Direct instruction (2026-09-26): replaces GET /booking/review and GET
+# /delivery/review outright -- the latter never existed as a route at all
+# (see UnifiedReviewV2Response's own comment). One HTTP call, one shared DI
+# context (see _unified_review_data's own comment for why that's a real,
+# not cosmetic, duplicate-work fix), both stages in one response.
+# JourneyDocumentsPage.tsx was the only caller of either old route.
+@review_v2.router.get("/uc03/documents/review", response_model=review_v2.UnifiedReviewV2Response)
+def get_unified_review_v2(
     tenant_id: str,
     journey_id: UUID,
     human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
@@ -1595,7 +1631,7 @@ def get_booking_review_v2_confidence_policy(
         review_v2.DiCaptureV2Client,
         Depends(review_v2.get_di_capture_v2_client),
     ],
-) -> review_v2.BookingReviewV2Response:
+) -> review_v2.UnifiedReviewV2Response:
     booking_review._scope(
         connection,
         tenant_id=tenant_id,
@@ -1603,12 +1639,29 @@ def get_booking_review_v2_confidence_policy(
         human_principal=human_principal,
         authorization_client=authorization_client,
     )
-    submitted, verification_status, aggregate_version = _booking_review_state(
+    # Booking's own submission-state read stays _booking_review_state
+    # (not the generic _stage_submission_state) -- the two differ when a
+    # stage row exists but isn't yet submitted: _booking_review_state
+    # surfaces the real pc_verification_status column value,
+    # _stage_submission_state hardcodes "NOT_SUBMITTED". Preserving
+    # Booking's existing, already-relied-on behavior exactly; Delivery has
+    # no prior behavior to preserve since its read never existed before.
+    booking_submitted, booking_verification, booking_version = _booking_review_state(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
     )
-    requirements, documents, attributes, unmapped = review_v2._booking_review_data(
+    delivery_submitted, delivery_verification, delivery_version = review_v2._stage_submission_state(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code="DELIVERY",
+    )
+    (
+        requirements,
+        booking_documents, booking_attributes, booking_unmapped,
+        delivery_documents, delivery_attributes, delivery_unmapped,
+    ) = review_v2._unified_review_data(
         connection=connection,
         engine=engine,
         tenant_id=tenant_id,
@@ -1617,39 +1670,42 @@ def get_booking_review_v2_confidence_policy(
         di_client=di_client,
         v2_client=v2_client,
     )
-    items = booking_review._current_review_items(attributes, unmapped)
-    needs_review = sum(1 for item in items.values() if item.decision_required)
+    booking_needs_review, booking_processing_pending = _confidence_policy_stage_result(
+        booking_documents, booking_attributes, booking_unmapped,
+    )
+    delivery_needs_review, delivery_processing_pending = _confidence_policy_stage_result(
+        delivery_documents, delivery_attributes, delivery_unmapped,
+    )
 
-    # Existing Web clients historically turned MISMATCH into mandatory work. Keep
-    # mismatch evidence in Audit/source-comparison, but do not expose it as a
-    # Booking-review gate when every source is at/above the confidence threshold.
-    for attribute in attributes:
-        item = items.get(f"attribute:{attribute.attributeKey}")
-        if (
-            item is not None
-            and not item.decision_required
-            and attribute.comparisonState == "MISMATCH"
-        ):
-            attribute.comparisonState = "SINGLE_SOURCE"
-
-    actual_pending = any(document.extractionState == "PENDING" for document in documents)
-    return review_v2.BookingReviewV2Response(
+    return review_v2.UnifiedReviewV2Response(
         journeyId=journey_id,
-        captureSubmitted=submitted,
-        pcVerificationStatus=verification_status,
-        aggregateVersion=aggregate_version,
-        # A current low-confidence exception must be reviewable even while other
-        # documents continue processing in the background.
-        processingPending=actual_pending and needs_review == 0,
-        needsReviewCount=needs_review,
-        attributes=attributes,
-        unmappedFields=unmapped,
-        documents=documents,
-        missingDeclarations=review_v2._missing_declarations(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            requirements=requirements,
+        booking=review_v2.BookingReviewV2Response(
+            journeyId=journey_id,
+            captureSubmitted=booking_submitted,
+            pcVerificationStatus=booking_verification,
+            aggregateVersion=booking_version,
+            processingPending=booking_processing_pending,
+            needsReviewCount=booking_needs_review,
+            attributes=booking_attributes,
+            unmappedFields=booking_unmapped,
+            documents=booking_documents,
+            missingDeclarations=review_v2._missing_declarations(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                requirements=requirements,
+            ),
+        ),
+        delivery=review_v2.DeliveryReviewV2Response(
+            journeyId=journey_id,
+            captureSubmitted=delivery_submitted,
+            pcVerificationStatus=delivery_verification,
+            aggregateVersion=delivery_version,
+            processingPending=delivery_processing_pending,
+            needsReviewCount=delivery_needs_review,
+            attributes=delivery_attributes,
+            unmappedFields=delivery_unmapped,
+            documents=delivery_documents,
         ),
     )
 
