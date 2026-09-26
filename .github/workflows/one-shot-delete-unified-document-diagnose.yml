@@ -26,28 +26,29 @@ jobs:
         run: |
           set -euo pipefail
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
-          railway logs --service "$AUDIT_SERVICE" --lines 2000 > /tmp/audit-runtime.log 2>&1 || true
+          railway logs --service "$AUDIT_SERVICE" --lines 8000 > /tmp/audit-runtime.log 2>&1 || true
+          wc -l /tmp/audit-runtime.log
           python - <<'PY'
           import re
           from pathlib import Path
 
           lines = Path('/tmp/audit-runtime.log').read_text(errors='replace').splitlines()
+          # Narrowed to the DELETE request path specifically -- the first
+          # pass's broader markers (sqlalchemy/psycopg/journey_document_
+          # extracted_fields) matched unrelated background sync-task noise
+          # instead (_sync_booking_document's own DI DOCUMENT_NOT_FOUND
+          # retries), which happen constantly and drowned out the real trace.
           markers = (
-              'delete_unified_document', 'VAC-SYS-001', 'Traceback', 'ERROR', 'Exception',
-              'ProgrammingError', 'IntegrityError', 'DataError', 'UndefinedColumn',
-              'InFailedSqlTransaction', 'sqlalchemy', 'psycopg',
-              '500 Internal Server Error', 'journey_document_extracted_fields',
-              'auditcore.evidence', '_documents_from_durable_store',
-              'materialize_delivery_documents_from_durable_store',
-              'materialize_booking_documents_from_durable_store',
+              'delete_unified_document', 'VAC-SYS-001', 'uc03_unified_document_capture',
+              'DELETE /v2/tenants', '"DELETE"',
           )
           selected = set()
           for i, line in enumerate(lines):
               if any(marker.lower() in line.lower() for marker in markers):
-                  for j in range(max(0, i - 10), min(len(lines), i + 30)):
+                  for j in range(max(0, i - 15), min(len(lines), i + 40)):
                       selected.add(j)
           output = [lines[i] for i in sorted(selected)]
-          text = '\n'.join(output[-500:])
+          text = '\n'.join(output[-600:])
           text = re.sub(r'(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}', '<email-redacted>', text)
           text = re.sub(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b', '<uuid-redacted>', text)
           print(text or 'NO_MATCHING_RUNTIME_ERROR_LINES')
