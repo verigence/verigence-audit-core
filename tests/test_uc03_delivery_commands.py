@@ -9,9 +9,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import get_human_principal
+from audit_core.dependencies import get_human_principal, get_principal
 from audit_core.main import app
-from audit_core.security import HumanPrincipal
+from audit_core.security import HumanPrincipal, Principal
 from audit_core.security_authorization import (
     SecurityAuthorizationDecision,
     get_security_authorization_client,
@@ -720,11 +720,23 @@ def test_manual_vin_proposal_closes_pcs_task_and_awaits_tl_approval(delivery_set
     assert observed_vin is None
     assert proposal_applied is None
 
-    approved = client.post(
-        f"/v1/tenants/{setup['tenant_id']}/tasks/{task_id}/complete",
-        headers={"Idempotency-Key": "delivery-vin-approve-001"},
-        json={"outcome": "CORRECT"},
+    # tasks_api.py's complete/cancel actions depend on get_principal, not
+    # get_human_principal -- a separate dependency (see
+    # test_uc03_document_field_corrections.py's own fixture for the same
+    # requirement on the exact same Complete action).
+    app.dependency_overrides[get_principal] = lambda: Principal(
+        subject="tl-1",
+        tenant_id=setup["tenant_id"],
+        permissions=("audit.work.read", "audit.work.update", "audit.work.manage"),
     )
+    try:
+        approved = client.post(
+            f"/v1/tenants/{setup['tenant_id']}/tasks/{task_id}/complete",
+            headers={"Idempotency-Key": "delivery-vin-approve-001"},
+            json={"outcome": "CORRECT"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_principal, None)
     assert approved.status_code == 200, approved.text
 
     with setup["engine"].begin() as connection:
@@ -767,11 +779,19 @@ def test_tl_rejecting_manual_vin_writes_nothing_and_reopens_a_fresh_pc_task(deli
     assert proposed.status_code == 200, proposed.text
     task_id = proposed.json()["taskId"]
 
-    rejected = client.post(
-        f"/v1/tenants/{setup['tenant_id']}/tasks/{task_id}/complete",
-        headers={"Idempotency-Key": "delivery-vin-reject-001"},
-        json={"outcome": "INCORRECT"},
+    app.dependency_overrides[get_principal] = lambda: Principal(
+        subject="tl-1",
+        tenant_id=setup["tenant_id"],
+        permissions=("audit.work.read", "audit.work.update", "audit.work.manage"),
     )
+    try:
+        rejected = client.post(
+            f"/v1/tenants/{setup['tenant_id']}/tasks/{task_id}/complete",
+            headers={"Idempotency-Key": "delivery-vin-reject-001"},
+            json={"outcome": "INCORRECT"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_principal, None)
     assert rejected.status_code == 200, rejected.text
 
     with setup["engine"].begin() as connection:
