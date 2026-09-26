@@ -724,8 +724,11 @@ def test_manual_vin_proposal_closes_pcs_task_and_awaits_tl_approval(delivery_set
     # get_human_principal -- a separate dependency (see
     # test_uc03_document_field_corrections.py's own fixture for the same
     # requirement on the exact same Complete action).
+    # Reuses the fixture's own business-assignment-scoped actor -- authorize()
+    # only checks permission strings, not assigned_role_code, so this stands
+    # in fine for "a TL" without needing a second business_assignments row.
     app.dependency_overrides[get_principal] = lambda: Principal(
-        subject="tl-1",
+        subject=setup["actor_id"],
         tenant_id=setup["tenant_id"],
         permissions=("audit.work.read", "audit.work.update", "audit.work.manage"),
     )
@@ -780,7 +783,7 @@ def test_tl_rejecting_manual_vin_writes_nothing_and_reopens_a_fresh_pc_task(deli
     task_id = proposed.json()["taskId"]
 
     app.dependency_overrides[get_principal] = lambda: Principal(
-        subject="tl-1",
+        subject=setup["actor_id"],
         tenant_id=setup["tenant_id"],
         permissions=("audit.work.read", "audit.work.update", "audit.work.manage"),
     )
