@@ -64,6 +64,7 @@ from decimal import Decimal
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from pydantic import BaseModel
 from sqlalchemy import Connection, Engine, text
@@ -106,6 +107,7 @@ router = APIRouter(
     prefix="/v2/tenants/{tenant_id}/journeys/{journey_id}/uc03/documents",
     tags=["uc03-unified-document-capture"],
 )
+logger = structlog.get_logger(__name__)
 
 
 def _seed_delivery_requirements(connection: Connection, *, tenant_id: str, journey_id: UUID) -> None:
@@ -1057,25 +1059,68 @@ def _read_unified_capture(
             detail="Document capture status is temporarily unavailable."
         )
 
-    apply_di_classification(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        di_documents=di_documents,
-        actor_id=_MACHINE_ACTOR,
-        actor_role="SYSTEM",
-        correlation_id="",
-    )
-    # Called once, not once per stage: an unrecognized document (DI could
-    # not classify it at all) always resolves to stage_code="BOOKING" by
-    # resolve_document_stage's own default, so calling this a second time
-    # with stage_code="DELIVERY" against the same merged list would only
-    # ever create a second, differently-keyed workflow task for the same
-    # document -- never a legitimate Delivery-side unrecognized finding.
-    sync_document_unrecognized_findings(
-        connection, tenant_id=tenant_id, journey_id=journey_id,
-        stage_code="BOOKING", di_documents=di_documents, correlation_id="",
-    )
+    # Best-effort, like every other reconciliation call in this codebase
+    # (reconcile_unified_documents' own per-phase DI failures, every
+    # materializer's own try/except) -- a live READ must never hard-fail
+    # because its own self-healing side effect hit a transient DB issue.
+    # Root-caused live (2026-09-26): apply_di_classification's UPDATE to
+    # document_capture_v2_documents has no lock/retry protection of its own
+    # (neither did the pre-existing per-stage _reconcile_documents/
+    # _reconcile_delivery_documents this replaces -- same gap, just rarely
+    # hit since each only ever touched one stage's documents per call). A
+    # concurrent document-sync background task (self-heal sweep or a DI
+    # webhook) can hold a lock on the same row for close to its own 45s
+    # budget (uc03_confidence_review_policy._sync_booking_document_once)
+    # while this request's own connection has only a 10s statement_timeout
+    # (dependencies.get_connection) -- long enough to raise psycopg.errors.
+    # QueryCanceled here and 500 the whole page. Falling back to whatever
+    # document_capture_v2_documents/journey_document_extracted_fields state
+    # already exists (skipping just this pass's classification/stage
+    # correction) means the PC still sees a working checklist immediately;
+    # the next poll or an explicit Recheck documents retries the correction.
+    try:
+        # A SAVEPOINT (begin_nested), not a bare try/except: a cancelled
+        # statement (QueryCanceled, or any other DB error) leaves the whole
+        # transaction aborted at the Postgres level -- every later query on
+        # this same connection (the requirements/documents reads below,
+        # _stage_completed, the final response build) would then fail too
+        # with "current transaction is aborted", turning one failed
+        # reconciliation into a total request failure regardless of this
+        # try/except. Rolling back to the savepoint on failure restores the
+        # connection to a clean, usable state for the rest of this request.
+        with connection.begin_nested():
+            apply_di_classification(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                di_documents=di_documents,
+                actor_id=_MACHINE_ACTOR,
+                actor_role="SYSTEM",
+                correlation_id="",
+            )
+    except Exception:
+        logger.warning(
+            "uc03_unified_capture_apply_di_classification_failed",
+            tenant_id=tenant_id,
+            journey_id=str(journey_id),
+            exc_info=True,
+        )
+    else:
+        # Called once, not once per stage: an unrecognized document (DI
+        # could not classify it at all) always resolves to stage_code=
+        # "BOOKING" by resolve_document_stage's own default, so calling
+        # this a second time with stage_code="DELIVERY" against the same
+        # merged list would only ever create a second, differently-keyed
+        # workflow task for the same document -- never a legitimate
+        # Delivery-side unrecognized finding. Skipped (not just best-effort
+        # itself) when classification above didn't run -- it reads the same
+        # di_documents list to decide what's newly unrecognized, and would
+        # otherwise raise tasks against classification state that was never
+        # actually applied this pass.
+        sync_document_unrecognized_findings(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            stage_code="BOOKING", di_documents=di_documents, correlation_id="",
+        )
 
     booking_documents = linked_documents_for_journey(
         connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
@@ -1288,8 +1333,13 @@ def delete_unified_document(
     # stale until some unrelated document's future sync happens to
     # recompute it (same reasoning as apply_di_classification's own
     # corrected_to_delivery/corrected_to_booking re-materialization call).
-    # Never raises -- both functions wrap their own body in try/except and
-    # return {"error": True} rather than propagate.
+    # Both functions catch their own body in try/except and return
+    # {"error": True} rather than raise a bare Python exception -- but a
+    # cancelled statement (or any DB error) inside that try/except still
+    # leaves the whole transaction aborted at the Postgres level, which
+    # their own except-and-return-dict can't undo. SAVEPOINT (begin_nested)
+    # so a rare DB-level failure here rolls back cleanly instead of taking
+    # down the DI delete call still to come on this same connection.
     #
     # Deliberately not extended to materialize_machine_booking_values
     # (Booking's generic-attribute projection, uc03_post_extraction_
@@ -1297,21 +1347,31 @@ def delete_unified_document(
     # different path (_preferred_rows/_winner_by_id), not _documents_from_
     # durable_store, and has not been audited for the same evidence-status
     # awareness -- a real, separate gap, left alone rather than guessed at.
-    if stage_code == "DELIVERY":
-        from audit_core.uc03_delivery_post_extraction_materialization import (
-            materialize_delivery_documents_from_durable_store,
-        )
+    try:
+        with connection.begin_nested():
+            if stage_code == "DELIVERY":
+                from audit_core.uc03_delivery_post_extraction_materialization import (
+                    materialize_delivery_documents_from_durable_store,
+                )
 
-        materialize_delivery_documents_from_durable_store(
-            connection, tenant_id=tenant_id, journey_id=journey_id,
-        )
-    else:
-        from audit_core.uc03_delivery_post_extraction_materialization import (
-            materialize_booking_documents_from_durable_store,
-        )
+                materialize_delivery_documents_from_durable_store(
+                    connection, tenant_id=tenant_id, journey_id=journey_id,
+                )
+            else:
+                from audit_core.uc03_delivery_post_extraction_materialization import (
+                    materialize_booking_documents_from_durable_store,
+                )
 
-        materialize_booking_documents_from_durable_store(
-            connection, tenant_id=tenant_id, journey_id=journey_id,
+                materialize_booking_documents_from_durable_store(
+                    connection, tenant_id=tenant_id, journey_id=journey_id,
+                )
+    except Exception:
+        logger.warning(
+            "uc03_unified_delete_rematerialize_failed",
+            tenant_id=tenant_id,
+            journey_id=str(journey_id),
+            stage_code=stage_code,
+            exc_info=True,
         )
     context_ref, token = _ensure_di_context(
         connection=connection,
@@ -1396,17 +1456,34 @@ def resync_unified_documents(
             security_client=security_client,
             di_client=di_client,
         )
-        reconcile_unified_documents(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            actor_id=f"manual-resync:{human_principal.subject}",
-            actor_role="PC",
-            correlation_id="",
-            v2_client=v2_client,
-            context_ref=context_ref,
-            token=token,
-        )
+        # SAVEPOINT, not a bare call: reconcile_unified_documents' own
+        # apply_di_classification has no lock/retry protection (see
+        # _read_unified_capture's matching comment) -- a lock-contention
+        # timeout here must not poison this connection's transaction for
+        # the rest of resync (the linked-documents reads, evidence
+        # backfill, and background-sync dispatch below all still run on
+        # this same connection). Degrading to "resync reports pre-existing
+        # state" beats a 500 on an explicit PC-triggered Recheck click.
+        try:
+            with connection.begin_nested():
+                reconcile_unified_documents(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    actor_id=f"manual-resync:{human_principal.subject}",
+                    actor_role="PC",
+                    correlation_id="",
+                    v2_client=v2_client,
+                    context_ref=context_ref,
+                    token=token,
+                )
+        except Exception:
+            logger.warning(
+                "uc03_unified_resync_reconcile_failed",
+                tenant_id=tenant_id,
+                journey_id=str(journey_id),
+                exc_info=True,
+            )
 
     booking_documents = _linked_documents(connection, tenant_id, journey_id)
     delivery_documents = _linked_delivery_documents(connection, tenant_id, journey_id)
