@@ -612,6 +612,29 @@ def apply_di_classification(
                     correlation_id=correlation_id,
                 )
             delivery_started = True
+        # Root-caused live (2026-09-26): this UPDATE used to be unconditional
+        # -- one write per document, every single call -- and this function
+        # is called on every live capture read (polled as often as every 1s
+        # while anything is still classifying) across BOTH DI phases merged.
+        # Postgres takes a row lock for an UPDATE whenever its WHERE clause
+        # matches, even to write back the exact same values, so on a journey
+        # with several documents this generated a lock-taking attempt per
+        # document on nearly every poll -- confirmed live: GET /booking/
+        # review (a completely different, untouched endpoint) hit "canceling
+        # statement due to statement timeout ... while locking tuple ... in
+        # relation document_capture_v2_documents", i.e. contention on this
+        # exact table, not isolated to the unified capture read. The extra
+        # IS DISTINCT FROM condition means the WHERE clause simply doesn't
+        # match a row whose values already agree with what's about to be
+        # written -- Postgres never attempts to lock it at all in that case,
+        # which is the overwhelmingly common case between two 1s-apart polls
+        # of the same, already-settled document. End state is identical
+        # either way; this only removes a write (and its lock) that would
+        # have changed nothing. Benefits every caller of this shared
+        # function, not just the unified read -- including _reconcile_
+        # documents/_reconcile_delivery_documents (uc03_document_capture_v2.py/
+        # uc03_delivery_capture_v2.py), which is exactly what the review
+        # endpoint above also depends on for its own document listing.
         connection.execute(
             text(
                 """
@@ -623,6 +646,12 @@ def apply_di_classification(
                     updated_at_utc=now()
                 WHERE tenant_id=:tenant_id AND journey_id=:journey_id
                   AND di_document_id=:document_id
+                  AND (
+                    capture_status IS DISTINCT FROM :capture_status
+                    OR classified_document_type_key IS DISTINCT FROM :classified_type
+                    OR requirement_key IS DISTINCT FROM :requirement_key
+                    OR stage_code IS DISTINCT FROM :stage_code
+                  )
                 """
             ),
             {
