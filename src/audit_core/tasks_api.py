@@ -235,6 +235,9 @@ def complete_task(
     from audit_core.uc03_customer_identity_consistency import (
         TASK_TYPE as _WRONG_DOCUMENT_TASK_TYPE,
     )
+    from audit_core.uc03_delivery_commands import (
+        _VIN_MANUAL_ENTRY_TASK_TYPE as _DELIVERY_VIN_REVIEW_TASK_TYPE,
+    )
     from audit_core.uc03_document_unrecognized import (
         TASK_TYPE as _DOCUMENT_VERIFICATION_TASK_TYPE,
     )
@@ -242,7 +245,16 @@ def complete_task(
         TASK_TYPE as _FINANCE_DISBURSEMENT_TASK_TYPE,
     )
 
-    _outcome_required_task_types = {_DOCUMENT_VERIFICATION_TASK_TYPE, _WRONG_DOCUMENT_TASK_TYPE}
+    _outcome_required_task_types = {
+        _DOCUMENT_VERIFICATION_TASK_TYPE,
+        _WRONG_DOCUMENT_TASK_TYPE,
+        # DELIVERY_VIN_MANUAL_ENTRY_REVIEW: TL's Approve/Reject on a PC's
+        # manually-typed VIN/Chassis, same CORRECT/INCORRECT vocabulary as
+        # the other outcome-gated task types above -- see
+        # uc03_delivery_commands.py's propose_delivery_vehicle_observation
+        # for the full flow this closes out.
+        _DELIVERY_VIN_REVIEW_TASK_TYPE,
+    }
     outcome = (payload.outcome or "").strip().upper() if payload else ""
     if task["task_type"] in _outcome_required_task_types and outcome not in _DOCUMENT_VERIFICATION_OUTCOMES:
         raise AuditCoreError(
@@ -273,6 +285,9 @@ def complete_task(
         # in cancel_task below -- neither side effect has anything to undo.
         from audit_core.uc03_customer_identity_consistency import (
             apply_wrong_document_verification,
+        )
+        from audit_core.uc03_delivery_commands import (
+            apply_confirmed_delivery_vin_observation,
         )
         from audit_core.uc03_document_field_corrections import (
             TASK_TYPE as _FIELD_CORRECTION_TASK_TYPE,
@@ -340,6 +355,20 @@ def complete_task(
                 actor_id=principal.subject,
                 correlation_id=get_correlation_id(request),
             )
+        elif task["task_type"] == _DELIVERY_VIN_REVIEW_TASK_TYPE:
+            # INCORRECT (TL doesn't approve the manually-typed VIN/Chassis)
+            # needs no hook: nothing was ever written, and the self-heal
+            # sweep (_ensure_vehicle_photos_task) opens a fresh PC task on
+            # its own once it notices the gap is still unresolved.
+            if outcome == "CORRECT":
+                apply_confirmed_delivery_vin_observation(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=task["journey_id"],
+                    workflow_task_id=task_id,
+                    actor_id=principal.subject,
+                    correlation_id=get_correlation_id(request),
+                )
         response = _response(
             get_workflow_task(connection, tenant_id=tenant_id, workflow_task_id=task_id)
         )

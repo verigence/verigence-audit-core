@@ -314,11 +314,15 @@ def _ensure_vehicle_photos_task(
     """Direct product ask (2026-09-24): once every REQUIRED Delivery document
     is in hand, a PC still needs proof of the vehicle itself -- a photo, or
     failing that a manually-entered VIN (record_delivery_vehicle_observation).
-    Deliberately independent of _delivery_audit_gaps: that function's own
-    document-completeness check reads the legacy journey_document_assessments
-    declaration table, which the Unified Capture v2 flow this checks against
-    never writes to -- a separate, pre-existing gap left untouched here.
-    Reuses the exact same document_capture_v2_documents/
+    Deliberately independent of _delivery_audit_gaps: that function now reads
+    the same canonical resolve_requirement_satisfaction() this one already
+    matches (both against document_capture_v2_documents/
+    journey_document_requirements, not the dead journey_document_assessments
+    declaration table this comment used to warn about -- see
+    _delivery_audit_gaps's own comment for when that was fixed). Kept as two
+    separate checks anyway since they ask two genuinely different questions
+    (documents present vs. vehicle proof present), not because one reads
+    stale data. Reuses the exact same document_capture_v2_documents/
     journey_document_requirements data the Delivery capture screen's own
     checklist already computes (requirements/audit_documents passed in by the
     caller), not a new parallel source of truth. Self-healing like
@@ -1149,6 +1153,84 @@ def start_delivery(
     return DeliveryCommandResponse.model_validate(body)
 
 
+def _write_delivery_intimation(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    actor_id: str,
+    answer: Literal["YES", "NO"],
+    reason: str | None,
+    intimated_at_utc: datetime | None,
+    correlation_id: str,
+) -> UUID | None:
+    """Core write shared by record_delivery_intimation's own direct endpoint
+    below and propose_delivery_vehicle_observation's manual-VIN-entry flow
+    (a manual entry implies the photo handover moment was missed, so it
+    records the same NOT-intimated fact this endpoint records directly) --
+    both record the identical fact the identical way, just from a different
+    trigger. Returns the raised finding's id, if the answer was NO."""
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.journey_delivery_audit_facts (
+                tenant_id, journey_id, intimation_answer,
+                non_intimation_reason, updated_by_actor_id
+            ) VALUES (
+                :tenant_id, :journey_id, :answer, :reason, :actor_id
+            )
+            ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
+                intimation_answer=EXCLUDED.intimation_answer,
+                non_intimation_reason=EXCLUDED.non_intimation_reason,
+                updated_by_actor_id=EXCLUDED.updated_by_actor_id,
+                version_no=auditcore.journey_delivery_audit_facts.version_no+1
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "answer": answer,
+            "reason": reason,
+            "actor_id": actor_id,
+        },
+    )
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.deliveries
+            SET delivery_intimated_at=CASE
+                    WHEN :answer='YES' THEN COALESCE(:intimated_at, delivery_intimated_at, now())
+                    ELSE NULL
+                END,
+                updated_at_utc=now(), version_no=version_no+1
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "answer": answer,
+            "intimated_at": intimated_at_utc,
+        },
+    )
+    flag_id: UUID | None = None
+    if answer == "NO":
+        flag_id = _machine_flag(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code="DELIVERY",
+            rule_key=_NOT_INTIMATED_RULE,
+            finding_type="DELIVERY_NOT_INTIMATED",
+            severity="HIGH",
+            title="Delivery was not intimated",
+            description=reason,
+            correlation_id=correlation_id,
+            safe_payload={},
+        )
+    return flag_id
+
+
 @router.put("/intimation", response_model=DeliveryIntimationResponse)
 def record_delivery_intimation(
     tenant_id: str,
@@ -1190,48 +1272,15 @@ def record_delivery_intimation(
         _require_delivery_mutable(state)
         next_version = int(state["version_no"]) + 1
         reason = (payload.reason or "").strip() or None
-        connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.journey_delivery_audit_facts (
-                    tenant_id, journey_id, intimation_answer,
-                    non_intimation_reason, updated_by_actor_id
-                ) VALUES (
-                    :tenant_id, :journey_id, :answer, :reason, :actor_id
-                )
-                ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
-                    intimation_answer=EXCLUDED.intimation_answer,
-                    non_intimation_reason=EXCLUDED.non_intimation_reason,
-                    updated_by_actor_id=EXCLUDED.updated_by_actor_id,
-                    version_no=auditcore.journey_delivery_audit_facts.version_no+1
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "answer": payload.answer,
-                "reason": reason,
-                "actor_id": human_principal.subject,
-            },
-        )
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.deliveries
-                SET delivery_intimated_at=CASE
-                        WHEN :answer='YES' THEN COALESCE(:intimated_at, delivery_intimated_at, now())
-                        ELSE NULL
-                    END,
-                    updated_at_utc=now(), version_no=version_no+1
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "answer": payload.answer,
-                "intimated_at": payload.intimatedAtUtc,
-            },
+        flag_id = _write_delivery_intimation(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            actor_id=human_principal.subject,
+            answer=payload.answer,
+            reason=reason,
+            intimated_at_utc=payload.intimatedAtUtc,
+            correlation_id=correlation_id,
         )
         _material_delivery_activity(
             connection,
@@ -1239,21 +1288,6 @@ def record_delivery_intimation(
             journey_id=journey_id,
             next_version=next_version,
         )
-        flag_id: UUID | None = None
-        if payload.answer == "NO":
-            flag_id = _machine_flag(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                stage_code="DELIVERY",
-                rule_key=_NOT_INTIMATED_RULE,
-                finding_type="DELIVERY_NOT_INTIMATED",
-                severity="HIGH",
-                title="Delivery was not intimated",
-                description=reason,
-                correlation_id=correlation_id,
-                safe_payload={},
-            )
         event_id = _append_delivery_event(
             connection,
             tenant_id=tenant_id,
@@ -1286,6 +1320,106 @@ def record_delivery_intimation(
     )
     _set_etag(response, body)
     return DeliveryIntimationResponse.model_validate(body)
+
+
+def _write_delivery_vehicle_observation(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    actor_id: str,
+    vin: str | None,
+    chassis_number: str | None,
+    source_evidence_id: UUID | None,
+    correlation_id: str,
+) -> tuple[str, str | None, str | None, UUID | None]:
+    """Core write shared by record_delivery_vehicle_observation's own direct
+    endpoint below and apply_confirmed_delivery_vin_observation (the
+    TL-approved manual-entry path, tasks_api.py's Complete-task dispatch) --
+    both record the identical fact the identical way, just from a different
+    trigger and a different gate (direct vs. TL-approved). Returns
+    (reconciliation_status, expected_vin, expected_chassis, flag_id)."""
+    expected = connection.execute(
+        text(
+            """
+            SELECT vin, chassis_number
+            FROM auditcore.vehicle_records
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
+    expected_vin = expected["vin"] if expected else None
+    expected_chassis = expected["chassis_number"] if expected else None
+    status = _vin_reconciliation(
+        expected_vin=expected_vin,
+        expected_chassis=expected_chassis,
+        observed_vin=vin,
+        observed_chassis=chassis_number,
+    )
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.journey_delivery_audit_facts (
+                tenant_id, journey_id, observed_vin,
+                observed_chassis_number, observed_source_evidence_id,
+                vin_reconciliation_status, vin_evaluator_key,
+                vin_evaluated_at_utc, updated_by_actor_id
+            ) VALUES (
+                :tenant_id, :journey_id, :vin, :chassis, :evidence_id,
+                :status, :evaluator, now(), :actor_id
+            )
+            ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
+                observed_vin=EXCLUDED.observed_vin,
+                observed_chassis_number=EXCLUDED.observed_chassis_number,
+                observed_source_evidence_id=EXCLUDED.observed_source_evidence_id,
+                vin_reconciliation_status=EXCLUDED.vin_reconciliation_status,
+                vin_evaluator_key=EXCLUDED.vin_evaluator_key,
+                vin_evaluated_at_utc=EXCLUDED.vin_evaluated_at_utc,
+                updated_by_actor_id=EXCLUDED.updated_by_actor_id,
+                version_no=auditcore.journey_delivery_audit_facts.version_no+1
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "vin": (vin or "").strip() or None,
+            "chassis": (chassis_number or "").strip() or None,
+            "evidence_id": source_evidence_id,
+            "status": status,
+            "evaluator": _VIN_EVALUATOR,
+            "actor_id": actor_id,
+        },
+    )
+    flag_id: UUID | None = None
+    if status == "MISMATCH":
+        flag_id = _machine_flag(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code="DELIVERY",
+            rule_key=_VIN_RULE,
+            finding_type="VIN_RECONCILIATION_MISMATCH",
+            severity="CRITICAL",
+            title="VIN/chassis reconciliation mismatch",
+            description="Comparable full vehicle identifiers conflict. Physical Delivery progression remains recordable.",
+            correlation_id=correlation_id,
+            safe_payload={"evaluatorKey": _VIN_EVALUATOR},
+        )
+    if (vin or "").strip():
+        # A manually-recorded VIN is the documented fallback for a
+        # journey with no vehicle photos -- resolves the vehicle-photos
+        # task the same way uploading a photo does (see
+        # uc03_delivery_vehicle_photos.upload_vehicle_photos). Harmless
+        # no-op when called from the TL-approval path above: PC's own
+        # task was already completed at propose time.
+        _complete_open_vehicle_photos_task(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            actor_id=actor_id,
+        )
+    return status, expected_vin, expected_chassis, flag_id
 
 
 @router.put("/vehicle-observation", response_model=DeliveryVehicleObservationResponse)
@@ -1349,57 +1483,15 @@ def record_delivery_vehicle_observation(
                     title="Unsupported evidence",
                     detail="The VIN/photo evidence is not linked to this Delivery.",
                 )
-        expected = connection.execute(
-            text(
-                """
-                SELECT vin, chassis_number
-                FROM auditcore.vehicle_records
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).mappings().one_or_none()
-        expected_vin = expected["vin"] if expected else None
-        expected_chassis = expected["chassis_number"] if expected else None
-        status = _vin_reconciliation(
-            expected_vin=expected_vin,
-            expected_chassis=expected_chassis,
-            observed_vin=payload.vin,
-            observed_chassis=payload.chassisNumber,
-        )
-        connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.journey_delivery_audit_facts (
-                    tenant_id, journey_id, observed_vin,
-                    observed_chassis_number, observed_source_evidence_id,
-                    vin_reconciliation_status, vin_evaluator_key,
-                    vin_evaluated_at_utc, updated_by_actor_id
-                ) VALUES (
-                    :tenant_id, :journey_id, :vin, :chassis, :evidence_id,
-                    :status, :evaluator, now(), :actor_id
-                )
-                ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
-                    observed_vin=EXCLUDED.observed_vin,
-                    observed_chassis_number=EXCLUDED.observed_chassis_number,
-                    observed_source_evidence_id=EXCLUDED.observed_source_evidence_id,
-                    vin_reconciliation_status=EXCLUDED.vin_reconciliation_status,
-                    vin_evaluator_key=EXCLUDED.vin_evaluator_key,
-                    vin_evaluated_at_utc=EXCLUDED.vin_evaluated_at_utc,
-                    updated_by_actor_id=EXCLUDED.updated_by_actor_id,
-                    version_no=auditcore.journey_delivery_audit_facts.version_no+1
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "vin": (payload.vin or "").strip() or None,
-                "chassis": (payload.chassisNumber or "").strip() or None,
-                "evidence_id": payload.sourceEvidenceId,
-                "status": status,
-                "evaluator": _VIN_EVALUATOR,
-                "actor_id": human_principal.subject,
-            },
+        status, expected_vin, expected_chassis, flag_id = _write_delivery_vehicle_observation(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            actor_id=human_principal.subject,
+            vin=payload.vin,
+            chassis_number=payload.chassisNumber,
+            source_evidence_id=payload.sourceEvidenceId,
+            correlation_id=correlation_id,
         )
         next_version = int(state["version_no"]) + 1
         _material_delivery_activity(
@@ -1408,32 +1500,6 @@ def record_delivery_vehicle_observation(
             journey_id=journey_id,
             next_version=next_version,
         )
-        flag_id: UUID | None = None
-        if status == "MISMATCH":
-            flag_id = _machine_flag(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                stage_code="DELIVERY",
-                rule_key=_VIN_RULE,
-                finding_type="VIN_RECONCILIATION_MISMATCH",
-                severity="CRITICAL",
-                title="VIN/chassis reconciliation mismatch",
-                description="Comparable full vehicle identifiers conflict. Physical Delivery progression remains recordable.",
-                correlation_id=correlation_id,
-                safe_payload={"evaluatorKey": _VIN_EVALUATOR},
-            )
-        if (payload.vin or "").strip():
-            # A manually-recorded VIN is the documented fallback for a
-            # journey with no vehicle photos -- resolves the vehicle-photos
-            # task the same way uploading a photo does (see
-            # uc03_delivery_vehicle_photos.upload_vehicle_photos).
-            _complete_open_vehicle_photos_task(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                actor_id=human_principal.subject,
-            )
         event_id = _append_delivery_event(
             connection,
             tenant_id=tenant_id,
@@ -1473,6 +1539,271 @@ def record_delivery_vehicle_observation(
     )
     _set_etag(response, body)
     return DeliveryVehicleObservationResponse.model_validate(body)
+
+
+_VIN_MANUAL_ENTRY_WORKFLOW_TYPE = "UC03_DELIVERY_VIN_MANUAL_ENTRY"
+_VIN_MANUAL_ENTRY_TASK_TYPE = "DELIVERY_VIN_MANUAL_ENTRY_REVIEW"
+_NO_PHOTO_INTIMATION_REASON = (
+    "Vehicle photo unavailable; VIN/Chassis entered manually and pending Team Lead approval."
+)
+
+
+class DeliveryVehicleObservationProposalCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    vin: str | None = Field(default=None, max_length=120)
+    chassisNumber: str | None = Field(default=None, max_length=120)
+
+    @model_validator(mode="after")
+    def require_identifier(self):
+        if not (self.vin or "").strip() and not (self.chassisNumber or "").strip():
+            raise ValueError("vin or chassisNumber is required")
+        return self
+
+
+class DeliveryVehicleObservationProposalResponse(BaseModel):
+    journeyId: UUID
+    taskId: UUID
+    computedReconciliationStatus: Literal["MATCH", "MISMATCH", "REVIEW_REQUIRED"]
+    aggregateVersion: int
+    eventId: UUID
+
+
+@router.post(
+    "/vehicle-observation/propose",
+    response_model=DeliveryVehicleObservationProposalResponse,
+)
+def propose_delivery_vehicle_observation(
+    tenant_id: str,
+    journey_id: UUID,
+    payload: DeliveryVehicleObservationProposalCommand,
+    request: Request,
+    response: Response,
+    idempotency_key: Annotated[
+        str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+    ],
+    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> DeliveryVehicleObservationProposalResponse:
+    """PC's own half of the photo-or-manual-VIN vehicle-proof requirement
+    (see _ensure_vehicle_photos_task's own docstring): when no photo is
+    available, a PC provides VIN/Chassis here -- via the
+    DELIVERY_VEHICLE_PHOTOS_MISSING Task Queue card, not a standalone form
+    page. Direct product instruction: a PC's own upload flow stays 100%
+    entry-free; any entry genuinely required happens through a Task Queue
+    action instead.
+
+    Unlike the direct PUT /vehicle-observation above, this never writes the
+    observation itself -- it records intimation=NO (a manual fallback
+    implies the photo handover moment was missed, same fact
+    PUT /intimation records directly) and raises a
+    DELIVERY_VIN_MANUAL_ENTRY_REVIEW task for a TL to approve, since a
+    manually-typed VIN has no photographic proof behind it.
+    apply_confirmed_delivery_vin_observation (wired into tasks_api.py's
+    Complete-task dispatch) does the actual write once a TL approves; if a
+    TL instead completes the task with outcome=INCORRECT, or never resolves
+    it at all, nothing is written and the existing self-heal sweep
+    (_ensure_vehicle_photos_task) opens a fresh PC task on its own -- no
+    separate "rejected" handling needed anywhere.
+    """
+    _authorize_security(
+        authorization_client,
+        human_principal=human_principal,
+        tenant_id=tenant_id,
+    )
+    set_tenant_context(connection, tenant_id)
+    context = _journey_context(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        actor_id=human_principal.subject,
+    )
+    expected_version = _parse_if_match(if_match)
+    correlation_id = get_correlation_id(request)
+
+    def execute() -> dict[str, Any]:
+        _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
+        state = _delivery_state(
+            connection, tenant_id=tenant_id, journey_id=journey_id, for_update=True
+        )
+        _require_expected_version(state, expected_version)
+        _require_delivery_mutable(state)
+        _write_delivery_intimation(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            actor_id=human_principal.subject,
+            answer="NO",
+            reason=_NO_PHOTO_INTIMATION_REASON,
+            intimated_at_utc=None,
+            correlation_id=correlation_id,
+        )
+        expected = connection.execute(
+            text(
+                """
+                SELECT vin, chassis_number
+                FROM auditcore.vehicle_records
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).mappings().one_or_none()
+        computed_status = _vin_reconciliation(
+            expected_vin=expected["vin"] if expected else None,
+            expected_chassis=expected["chassis_number"] if expected else None,
+            observed_vin=payload.vin,
+            observed_chassis=payload.chassisNumber,
+        )
+        task_id = create_workflow_task(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            workflow_type=_VIN_MANUAL_ENTRY_WORKFLOW_TYPE,
+            process_area="DELIVERY",
+            task_type=_VIN_MANUAL_ENTRY_TASK_TYPE,
+            assigned_role_code="TL",
+            severity="HIGH",
+            task_payload={
+                "observedVin": (payload.vin or "").strip() or None,
+                "observedChassisNumber": (payload.chassisNumber or "").strip() or None,
+                "computedReconciliationStatus": computed_status,
+            },
+            correlation_id=correlation_id,
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.journey_delivery_vin_observation_proposals (
+                    tenant_id, workflow_task_id, journey_id, observed_vin,
+                    observed_chassis_number, computed_reconciliation_status,
+                    proposed_by_actor_id
+                ) VALUES (
+                    :tenant_id, :task_id, :journey_id, :vin, :chassis, :status, :actor_id
+                )
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "task_id": task_id,
+                "journey_id": journey_id,
+                "vin": (payload.vin or "").strip() or None,
+                "chassis": (payload.chassisNumber or "").strip() or None,
+                "status": computed_status,
+                "actor_id": human_principal.subject,
+            },
+        )
+        # PC's own obligation is done the moment they've provided VIN/Chassis
+        # -- TL approval is a separate, subsequent gate on top, not a block
+        # on PC's own task closing.
+        _complete_open_vehicle_photos_task(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            actor_id=human_principal.subject,
+        )
+        next_version = int(state["version_no"]) + 1
+        _material_delivery_activity(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            next_version=next_version,
+        )
+        event_id = _append_delivery_event(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            event_type="DELIVERY_VEHICLE_OBSERVATION_PROPOSED",
+            source_kind="HUMAN",
+            actor_id=human_principal.subject,
+            actor_role_snapshot=context["operating_role"],
+            idempotency_key=idempotency_key,
+            correlation_id=correlation_id,
+            safe_payload={"computedReconciliationStatus": computed_status, "taskId": str(task_id)},
+            aggregate_version=next_version,
+        )
+        return DeliveryVehicleObservationProposalResponse(
+            journeyId=journey_id,
+            taskId=task_id,
+            computedReconciliationStatus=computed_status,
+            aggregateVersion=next_version,
+            eventId=event_id,
+        ).model_dump(mode="json")
+
+    body, _ = execute_idempotent_json_command(
+        connection,
+        tenant_id=tenant_id,
+        operation_key=f"uc03.delivery.vehicle-observation.propose:{journey_id}",
+        idempotency_key=idempotency_key,
+        request_payload={"expectedVersion": expected_version, **payload.model_dump(mode="json")},
+        execute=execute,
+    )
+    _set_etag(response, body)
+    return DeliveryVehicleObservationProposalResponse.model_validate(body)
+
+
+def apply_confirmed_delivery_vin_observation(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    workflow_task_id: UUID,
+    actor_id: str,
+    correlation_id: str,
+) -> None:
+    """Write the PC's manually-proposed VIN/Chassis as the real observation,
+    once a TL has approved it. Called from tasks_api.py's generic
+    Complete-task action when the task being completed is
+    DELIVERY_VIN_MANUAL_ENTRY_REVIEW -- mirrors apply_confirmed_field_
+    correction's own shape exactly (uc03_document_field_corrections.py).
+    Recomputes the reconciliation status fresh against live vehicle_records
+    rather than trusting the proposal's own computed_reconciliation_status
+    snapshot (vehicle_records could have changed between propose and
+    approve). Completing the task with outcome=INCORRECT needs no
+    equivalent hook: nothing was ever written, and the existing self-heal
+    sweep (_ensure_vehicle_photos_task) opens a fresh PC task on its own
+    since vehicle_photos_uploaded() and observed_vin both remain empty.
+    """
+    proposal = connection.execute(
+        text(
+            """
+            SELECT observed_vin, observed_chassis_number
+            FROM auditcore.journey_delivery_vin_observation_proposals
+            WHERE tenant_id=:tenant_id AND workflow_task_id=:workflow_task_id
+            FOR UPDATE
+            """
+        ),
+        {"tenant_id": tenant_id, "workflow_task_id": workflow_task_id},
+    ).mappings().one_or_none()
+    if proposal is None:
+        raise NotFoundError(
+            error_code="VAC-NF-033",
+            title="VIN observation proposal not found",
+            detail="This task has no associated VIN/Chassis proposal to apply.",
+        )
+    _write_delivery_vehicle_observation(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        actor_id=actor_id,
+        vin=proposal["observed_vin"],
+        chassis_number=proposal["observed_chassis_number"],
+        source_evidence_id=None,
+        correlation_id=correlation_id,
+    )
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.journey_delivery_vin_observation_proposals
+            SET applied_at_utc=now(), updated_at_utc=now(), version_no=version_no+1
+            WHERE tenant_id=:tenant_id AND workflow_task_id=:workflow_task_id
+            """
+        ),
+        {"tenant_id": tenant_id, "workflow_task_id": workflow_task_id},
+    )
 
 
 @router.post("/complete", response_model=DeliveryCommandResponse)

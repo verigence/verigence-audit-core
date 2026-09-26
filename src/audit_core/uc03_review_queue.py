@@ -719,6 +719,8 @@ _TASK_TITLE = {
     "DUPLICATE_RECEIPT_NOTICE": "Duplicate receipt -- won't be counted",
     "WRONG_DOCUMENT_REVIEW": "Verify customer name mismatch",
     "WRONG_DOCUMENT_DEALER_NOTICE": "Receipt dealer name mismatch",
+    "DELIVERY_VEHICLE_PHOTOS_MISSING": "Provide Delivery vehicle proof",
+    "DELIVERY_VIN_MANUAL_ENTRY_REVIEW": "Approve manually-entered VIN/Chassis",
 }
 
 # AUTO_SELF_SERVE's generic title tells a PC nothing about what to actually
@@ -779,6 +781,7 @@ _TASK_TYPE_FINDING_CLASS: dict[str, str] = {
     "MODEL_SELECTION_CORRECTION_REVIEW": "DATA_GAP",
     "INVOICE_SKU_MISMATCH_REASON": "DATA_GAP",
     "DELIVERY_VEHICLE_PHOTOS_MISSING": "DOCUMENT_GAP",
+    "DELIVERY_VIN_MANUAL_ENTRY_REVIEW": "DATA_GAP",
 }
 
 

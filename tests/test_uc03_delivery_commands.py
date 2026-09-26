@@ -206,7 +206,7 @@ def delivery_setup():
         )
 
         journey_ids: list[UUID] = []
-        for index in range(7):
+        for index in range(9):
             customer_id = connection.execute(
                 text(
                     """
@@ -257,6 +257,8 @@ def delivery_setup():
             (journey_ids[4], "BOOKING_CLOSED", "PROCEED_TO_DELIVERY"),
             (journey_ids[5], "BOOKING_CLOSED", "PROCEED_TO_DELIVERY"),
             (journey_ids[6], "BOOKING_CLOSED", "NO_DELIVERY"),
+            (journey_ids[7], "BOOKING_CLOSED", "PROCEED_TO_DELIVERY"),
+            (journey_ids[8], "BOOKING_CLOSED", "PROCEED_TO_DELIVERY"),
         ]
         for journey_id, status, disposition in booking_states:
             connection.execute(
@@ -635,3 +637,178 @@ def test_document_no_and_unverified_payment_do_not_block_physical_completion(
     )
     assert late_answer.status_code == 200, late_answer.text
     assert late_answer.json()["aggregateVersion"] == 4
+
+
+def _open_vehicle_photos_task_status(setup, journey_id: UUID) -> str | None:
+    with setup["engine"].begin() as connection:
+        return connection.execute(
+            text(
+                """
+                SELECT task_status FROM auditcore.workflow_tasks
+                WHERE tenant_id=:t AND journey_id=:j AND task_type='DELIVERY_VEHICLE_PHOTOS_MISSING'
+                ORDER BY created_at_utc DESC LIMIT 1
+                """
+            ),
+            {"t": setup["tenant_id"], "j": journey_id},
+        ).scalar_one_or_none()
+
+
+def test_manual_vin_proposal_closes_pcs_task_and_awaits_tl_approval(delivery_setup) -> None:
+    # Direct product instruction: a PC who can't get a vehicle photo enters
+    # VIN/Chassis manually via the Task Queue instead of a standalone form --
+    # their own task closes immediately, but nothing is written to
+    # journey_delivery_audit_facts until a TL approves it separately.
+    setup = delivery_setup
+    journey_id = setup["journey_ids"][7]
+    client = TestClient(app, raise_server_exceptions=False)
+    started = _start(client, setup, journey_id, "delivery-start-vin-propose-001")
+    assert started.status_code == 200, started.text
+
+    from audit_core.uc03_delivery_commands import _ensure_vehicle_photos_task
+
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        _ensure_vehicle_photos_task(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=journey_id,
+            requirements=[{"requirement_key": "gate_pass", "requirement_level": "REQUIRED",
+                           "requirement_status": "PENDING"}],
+            audit_documents=[{"requirement_key": "gate_pass", "capture_status": "CLASSIFIED"}],
+            correlation_id="",
+        )
+    assert _open_vehicle_photos_task_status(setup, journey_id) not in (None, "COMPLETED")
+
+    proposed = client.post(
+        _delivery_url(setup, journey_id, "vehicle-observation/propose"),
+        headers=_headers("delivery-vin-propose-001", 1),
+        json={"vin": "MA1AB2CD3EF456780", "chassisNumber": "MA1AB2CD3EF456780"},
+    )
+    assert proposed.status_code == 200, proposed.text
+    body = proposed.json()
+    # No vehicle_records row exists for this journey -- nothing comparable,
+    # so reconciliation is REVIEW_REQUIRED, not MATCH/MISMATCH.
+    assert body["computedReconciliationStatus"] == "REVIEW_REQUIRED"
+    task_id = body["taskId"]
+
+    # PC's own task is done the moment they've provided VIN/Chassis.
+    assert _open_vehicle_photos_task_status(setup, journey_id) == "COMPLETED"
+
+    with setup["engine"].begin() as connection:
+        intimation, observed_vin = connection.execute(
+            text(
+                """
+                SELECT intimation_answer, observed_vin
+                FROM auditcore.journey_delivery_audit_facts
+                WHERE tenant_id=:t AND journey_id=:j
+                """
+            ),
+            {"t": setup["tenant_id"], "j": journey_id},
+        ).one()
+        proposal_applied = connection.execute(
+            text(
+                """
+                SELECT applied_at_utc FROM auditcore.journey_delivery_vin_observation_proposals
+                WHERE tenant_id=:t AND workflow_task_id=:task_id
+                """
+            ),
+            {"t": setup["tenant_id"], "task_id": task_id},
+        ).scalar_one()
+    # Intimation is recorded (manual entry implies the handover moment was
+    # missed) but the VIN itself is NOT written yet -- pending TL approval.
+    assert intimation == "NO"
+    assert observed_vin is None
+    assert proposal_applied is None
+
+    approved = client.post(
+        f"/v1/tenants/{setup['tenant_id']}/tasks/{task_id}/complete",
+        headers={"Idempotency-Key": "delivery-vin-approve-001"},
+        json={"outcome": "CORRECT"},
+    )
+    assert approved.status_code == 200, approved.text
+
+    with setup["engine"].begin() as connection:
+        observed_vin, status = connection.execute(
+            text(
+                """
+                SELECT observed_vin, vin_reconciliation_status
+                FROM auditcore.journey_delivery_audit_facts
+                WHERE tenant_id=:t AND journey_id=:j
+                """
+            ),
+            {"t": setup["tenant_id"], "j": journey_id},
+        ).one()
+        proposal_applied = connection.execute(
+            text(
+                """
+                SELECT applied_at_utc FROM auditcore.journey_delivery_vin_observation_proposals
+                WHERE tenant_id=:t AND workflow_task_id=:task_id
+                """
+            ),
+            {"t": setup["tenant_id"], "task_id": task_id},
+        ).scalar_one()
+    assert observed_vin == "MA1AB2CD3EF456780"
+    assert status == "REVIEW_REQUIRED"
+    assert proposal_applied is not None
+
+
+def test_tl_rejecting_manual_vin_writes_nothing_and_reopens_a_fresh_pc_task(delivery_setup) -> None:
+    setup = delivery_setup
+    journey_id = setup["journey_ids"][8]
+    client = TestClient(app, raise_server_exceptions=False)
+    started = _start(client, setup, journey_id, "delivery-start-vin-reject-001")
+    assert started.status_code == 200, started.text
+
+    proposed = client.post(
+        _delivery_url(setup, journey_id, "vehicle-observation/propose"),
+        headers=_headers("delivery-vin-propose-002", 1),
+        json={"vin": "MA1AB2CD3EF456999"},
+    )
+    assert proposed.status_code == 200, proposed.text
+    task_id = proposed.json()["taskId"]
+
+    rejected = client.post(
+        f"/v1/tenants/{setup['tenant_id']}/tasks/{task_id}/complete",
+        headers={"Idempotency-Key": "delivery-vin-reject-001"},
+        json={"outcome": "INCORRECT"},
+    )
+    assert rejected.status_code == 200, rejected.text
+
+    with setup["engine"].begin() as connection:
+        observed_vin = connection.execute(
+            text(
+                """
+                SELECT observed_vin FROM auditcore.journey_delivery_audit_facts
+                WHERE tenant_id=:t AND journey_id=:j
+                """
+            ),
+            {"t": setup["tenant_id"], "j": journey_id},
+        ).scalar_one_or_none()
+        proposal_applied = connection.execute(
+            text(
+                """
+                SELECT applied_at_utc FROM auditcore.journey_delivery_vin_observation_proposals
+                WHERE tenant_id=:t AND workflow_task_id=:task_id
+                """
+            ),
+            {"t": setup["tenant_id"], "task_id": task_id},
+        ).scalar_one()
+    assert observed_vin is None
+    assert proposal_applied is None
+
+    from audit_core.uc03_delivery_commands import _ensure_vehicle_photos_task
+
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        _ensure_vehicle_photos_task(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=journey_id,
+            requirements=[{"requirement_key": "gate_pass", "requirement_level": "REQUIRED",
+                           "requirement_status": "PENDING"}],
+            audit_documents=[{"requirement_key": "gate_pass", "capture_status": "CLASSIFIED"}],
+            correlation_id="",
+        )
+    # The gap is still genuinely open (nothing was ever written) -- the
+    # self-heal sweep must be able to raise a fresh PC task.
+    assert _open_vehicle_photos_task_status(setup, journey_id) not in (None, "COMPLETED")
