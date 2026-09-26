@@ -149,13 +149,12 @@ def test_other_di_errors_still_raise_and_leave_evidence_active(
     di_client = _FailingDiClient(
         DiClientError(status_code=503, code="DI_UNAVAILABLE", retryable=True)
     )
-    with pytest.raises(DependencyUnavailableError):
-        with engine.begin() as c:
-            confidence_policy._sync_booking_document(
-                c, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
-                service_id="di-service", security_client=_FakeSecurityClient(),
-                di_client=di_client, bump_version=True,
-            )
+    with pytest.raises(DependencyUnavailableError), engine.begin() as c:
+        confidence_policy._sync_booking_document(
+            c, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+            service_id="di-service", security_client=_FakeSecurityClient(),
+            di_client=di_client, bump_version=True,
+        )
 
     row = _evidence_row(engine, tenant_id, journey_id, document_id)
     assert row["association_status"] == "ACTIVE"
