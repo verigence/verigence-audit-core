@@ -62,13 +62,39 @@ def seeded_tenant():
         ).scalar_one()
     # The setup transaction above must commit before any other connection
     # (the backfill function opens its own) can see this journey row.
-    yield {"engine": engine, "tenant_id": tenant_id, "journey_id": journey_id}
+    yield {"engine": engine, "tenant_id": tenant_id, "journey_id": journey_id, "customer_id": customer_id}
     engine.dispose()
 
 
-def _seed_field(engine, *, tenant_id, journey_id, stage_code, document_type_key, field_key, value):
+def _seed_field(engine, *, tenant_id, journey_id, stage_code, document_type_key, field_key, value,
+                 customer_id):
+    document_id = uuid4()
     with engine.begin() as c:
         c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        # A real ACTIVE evidence row for this document -- matches the
+        # precondition _sync_booking_document itself already enforces before
+        # ever writing a journey_document_extracted_fields row, and the
+        # (tenant_id, di_document_id) pair _documents_from_durable_store now
+        # joins on for canonical materialization (uc03_delivery_post_
+        # extraction_materialization.py). Without this, every seeded field
+        # here is silently excluded from materialization, same as it always
+        # would be for a real document with no evidence link.
+        c.execute(
+            text(
+                """
+                INSERT INTO auditcore.evidence (
+                    tenant_id, journey_id, customer_id, di_subject_id, di_document_id,
+                    document_type_key, evidence_purpose, association_status
+                ) VALUES (
+                    :t, :j, :cu, :subj, :doc,
+                    :dtk, 'DOCUMENT_REVIEW', 'ACTIVE'
+                )
+                ON CONFLICT (tenant_id, di_document_id) DO NOTHING
+                """
+            ),
+            {"t": tenant_id, "j": journey_id, "cu": customer_id, "subj": uuid4(),
+             "doc": document_id, "dtk": document_type_key},
+        )
         c.execute(
             text(
                 """
@@ -85,7 +111,7 @@ def _seed_field(engine, *, tenant_id, journey_id, stage_code, document_type_key,
                 )
                 """
             ),
-            {"t": tenant_id, "j": journey_id, "doc": uuid4(), "stage": stage_code,
+            {"t": tenant_id, "j": journey_id, "doc": document_id, "stage": stage_code,
              "dtk": document_type_key, "fk": field_key, "v": json.dumps(value)},
         )
 
@@ -104,13 +130,16 @@ def test_backfill_raises_wrong_document_for_an_old_journey(seeded_tenant) -> Non
     # identity-consistency producer existed: a KYC document and a
     # mismatching Booking Form already sit in durable storage, but nothing
     # has ever re-triggered the sync pipeline for them.
-    engine, tenant_id, journey_id = (
+    engine, tenant_id, journey_id, customer_id = (
         seeded_tenant["engine"], seeded_tenant["tenant_id"], seeded_tenant["journey_id"],
+        seeded_tenant["customer_id"],
     )
     _seed_field(engine, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
-                document_type_key="aadhaar", field_key="aadhaar_name", value="Sanjaya Kumar Mohanty")
+                document_type_key="aadhaar", field_key="aadhaar_name", value="Sanjaya Kumar Mohanty",
+                customer_id=customer_id)
     _seed_field(engine, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
-                document_type_key="booking_form", field_key="customer_name", value="Priya Nair")
+                document_type_key="booking_form", field_key="customer_name", value="Priya Nair",
+                customer_id=customer_id)
 
     result = backfill.backfill_document_sync_producers_for_tenant(engine, tenant_id=tenant_id)
 
@@ -133,11 +162,13 @@ def test_backfill_raises_wrong_document_for_an_old_journey(seeded_tenant) -> Non
 
 
 def test_backfill_sets_delivery_date_for_an_old_journey(seeded_tenant) -> None:
-    engine, tenant_id, journey_id = (
+    engine, tenant_id, journey_id, customer_id = (
         seeded_tenant["engine"], seeded_tenant["tenant_id"], seeded_tenant["journey_id"],
+        seeded_tenant["customer_id"],
     )
     _seed_field(engine, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
-                document_type_key="gate_pass", field_key="delivery_date", value="2026-08-05")
+                document_type_key="gate_pass", field_key="delivery_date", value="2026-08-05",
+                customer_id=customer_id)
 
     result = backfill.backfill_document_sync_producers_for_tenant(engine, tenant_id=tenant_id)
 
@@ -156,11 +187,13 @@ def test_backfill_sets_delivery_date_for_an_old_journey(seeded_tenant) -> None:
 
 
 def test_backfill_is_idempotent_on_rerun(seeded_tenant) -> None:
-    engine, tenant_id, journey_id = (
+    engine, tenant_id, journey_id, customer_id = (
         seeded_tenant["engine"], seeded_tenant["tenant_id"], seeded_tenant["journey_id"],
+        seeded_tenant["customer_id"],
     )
     _seed_field(engine, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
-                document_type_key="dealer_receipt", field_key="dealer_name", value="Some Other Motors")
+                document_type_key="dealer_receipt", field_key="dealer_name", value="Some Other Motors",
+                customer_id=customer_id)
 
     first = backfill.backfill_document_sync_producers_for_tenant(engine, tenant_id=tenant_id)
     assert first["identityFindingsRaised"] == 1
@@ -190,11 +223,13 @@ def test_backfill_is_idempotent_on_rerun(seeded_tenant) -> None:
 
 
 def test_one_journeys_failure_does_not_block_the_rest(seeded_tenant, monkeypatch) -> None:
-    engine, tenant_id, journey_id = (
+    engine, tenant_id, journey_id, customer_id = (
         seeded_tenant["engine"], seeded_tenant["tenant_id"], seeded_tenant["journey_id"],
+        seeded_tenant["customer_id"],
     )
     _seed_field(engine, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
-                document_type_key="dealer_receipt", field_key="dealer_name", value="Some Other Motors")
+                document_type_key="dealer_receipt", field_key="dealer_name", value="Some Other Motors",
+                customer_id=customer_id)
 
     def _boom(*args, **kwargs):
         raise RuntimeError("simulated failure")

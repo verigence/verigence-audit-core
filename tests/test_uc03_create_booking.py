@@ -152,9 +152,18 @@ def test_create_booking_folds_in_the_same_checklist_a_separate_capture_local_cal
     checklist/counters -- reported live as a visible lag on a brand-new
     booking ("it takes some seconds for the above counters to appear").
     create_booking now computes and returns that same snapshot inline. This
-    proves the folded-in value is exactly what the pre-existing, separate
-    endpoint would still independently compute for the same journey --
-    the fold changes when the read happens, not what it returns."""
+    proves the folded-in value is exactly what a separate read would still
+    independently compute for the same journey -- the fold changes when the
+    read happens, not what it returns.
+
+    GET /booking/capture-local no longer exists (Phase 4 unification --
+    replaced by GET /uc03/documents/capture-local, which covers both
+    stages). declarations/canContinue don't exist on that unified response
+    either -- confirmed dead in every frontend consumer (no caller of
+    setBookingCaptureV2Declaration, no reader of canContinue/declarations),
+    so the comparison here is narrowed to what still exists on both sides:
+    each BOOKING-stage requirement's shared fields.
+    """
     setup = uc03_create_booking_setup
     client = TestClient(app, raise_server_exceptions=False)
 
@@ -177,12 +186,24 @@ def test_create_booking_folds_in_the_same_checklist_a_separate_capture_local_cal
     assert isinstance(booking["canContinue"], bool)
 
     separate_read = client.get(
-        f"/v2/tenants/{setup['tenant_id']}/journeys/{journey_id}/booking/capture-local",
+        f"/v2/tenants/{setup['tenant_id']}/journeys/{journey_id}/uc03/documents/capture-local",
     )
     assert separate_read.status_code == 200, separate_read.text
-    assert booking["requirements"] == separate_read.json()["requirements"]
-    assert booking["declarations"] == separate_read.json()["declarations"]
-    assert booking["canContinue"] == separate_read.json()["canContinue"]
+    shared_fields = (
+        "requirementKey", "label", "documentTypeKey", "requirementLevel",
+        "conditionKey", "applicabilityState", "state", "document", "canView", "canDelete",
+    )
+
+    def _shared(requirement: dict) -> dict:
+        return {key: requirement[key] for key in shared_fields}
+
+    booking_requirements = [_shared(item) for item in booking["requirements"]]
+    unified_booking_requirements = [
+        _shared(item)
+        for item in separate_read.json()["requirements"]
+        if item["stageCode"] == "BOOKING"
+    ]
+    assert booking_requirements == unified_booking_requirements
 
 
 def test_create_booking_replay_still_returns_the_booking_snapshot(
