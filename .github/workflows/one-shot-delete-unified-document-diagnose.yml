@@ -26,7 +26,9 @@ jobs:
         run: |
           set -euo pipefail
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
-          railway logs --service "$AUDIT_SERVICE" --lines 8000 > /tmp/audit-runtime.log 2>&1 || true
+          # 8000 returned almost nothing (wc -l = 1) -- 2000 is the value
+          # that actually worked on the first diagnostic pass, keep it.
+          railway logs --service "$AUDIT_SERVICE" --lines 2000 > /tmp/audit-runtime.log 2>&1 || true
           wc -l /tmp/audit-runtime.log
           python - <<'PY'
           import re
