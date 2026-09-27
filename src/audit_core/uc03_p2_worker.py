@@ -755,6 +755,11 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
         token=token,
         tenant_id=work.tenant_id,
         external_context_ref=context_ref,
+        # DI's capture contract requires a phase; it is only DI's listing
+        # partition. P2 never tags a document with a stage: DI's
+        # classification picks the document type, the type's template
+        # decides the checklist it belongs to, and reconciliation reads
+        # both DI phases.
         phase="BOOKING",
         candidate_document_type_keys=override or candidates,
         requirement_refs_by_document_type_key=(
