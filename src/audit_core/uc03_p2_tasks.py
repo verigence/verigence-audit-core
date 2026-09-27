@@ -271,6 +271,15 @@ def submit_action(
     if action not in allowed:
         raise ValueError(f"Action {action} is not allowed for this task")
 
+    assigned_actor_id = task.get("assigned_actor_id")
+    assigned_role_code = str(task.get("assigned_role_code") or "")
+    if assigned_actor_id is not None and str(assigned_actor_id) != actor_id:
+        raise ValueError("This task is assigned to a different actor")
+    if assigned_actor_id is None and assigned_role_code and assigned_role_code != actor_role_code:
+        raise ValueError(
+            f"This task is assigned to role {assigned_role_code}, not {actor_role_code}"
+        )
+
     journey_id = UUID(str(task["journey_id"]))
     record_task_event(
         connection,
