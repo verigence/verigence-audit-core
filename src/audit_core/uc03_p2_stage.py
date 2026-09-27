@@ -28,6 +28,7 @@ from audit_core.uc03_duplicate_receipt_detection import (
     normalize_receipt_date,
     normalize_receipt_number,
 )
+from audit_core.uc03_p2_control_registry import ensure_p2_control_state_rows
 
 _BOOKING_DOC_GATES = {
     "BOOKING_FORM_EXTRACTED": ("booking_form", "booking_docket"),
@@ -291,11 +292,7 @@ def recompute_booking_stage(
                 :minimum, :receipt_total, :booking_state, :manual_pending
             )
             ON CONFLICT (tenant_id, journey_id)
-            DO UPDATE SET current_stage=CASE
-                            WHEN auditcore.p2_journey_runtime.current_stage LIKE 'DELIVERY_%'
-                            THEN auditcore.p2_journey_runtime.current_stage
-                            ELSE EXCLUDED.current_stage
-                          END,
+            DO UPDATE SET current_stage=EXCLUDED.current_stage,
                           booking_minimum_amount=EXCLUDED.booking_minimum_amount,
                           booking_receipt_total=EXCLUDED.booking_receipt_total,
                           booking_completion_state=EXCLUDED.booking_completion_state,
@@ -320,6 +317,107 @@ def recompute_booking_stage(
         "bookingReceiptTotal": str(receipt_total),
         "manualVerificationPending": manual_pending,
         "gates": gates,
+    }
+
+
+def _delivery_started(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+) -> bool:
+    return bool(
+        connection.execute(
+            text(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM auditcore.journey_stage_states
+                    WHERE tenant_id=:tenant_id
+                      AND journey_id=:journey_id
+                      AND stage_code='DELIVERY'
+                )
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one()
+    )
+
+
+def recompute_journey_stage(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+) -> dict[str, Any]:
+    """Recompute the current P2 stage from approved Booking gates and existing
+    Delivery business state.
+
+    Booking gates remain authoritative even after Delivery has started: a later
+    correction that invalidates a Booking gate reopens Booking readiness exactly
+    as the Phase 2 contract requires. Delivery may begin only after Booking is
+    complete in the P2 stage projection. Detailed Delivery verification/complete
+    criteria remain intentionally unconfigured.
+    """
+    booking = recompute_booking_stage(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+    )
+    ensure_p2_control_state_rows(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+    )
+    delivery_started = _delivery_started(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+    )
+
+    current_stage = str(booking["stage"])
+    delivery_state = "IN_PROGRESS"
+    if booking["bookingCompletionState"] == "COMPLETE" and delivery_started:
+        persisted_delivery = connection.execute(
+            text(
+                """
+                SELECT delivery_completion_state
+                FROM auditcore.p2_journey_runtime
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one_or_none()
+        delivery_state = str(persisted_delivery or "IN_PROGRESS")
+        if delivery_state == "COMPLETE":
+            current_stage = "DELIVERY_COMPLETE"
+        elif delivery_state == "BLOCKED":
+            current_stage = "DELIVERY_VERIFY_DOCUMENTS"
+        else:
+            current_stage = "DELIVERY_DOCUMENT_UPLOAD"
+
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_journey_runtime
+                SET current_stage=:current_stage,
+                    updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "current_stage": current_stage,
+            },
+        )
+
+    return {
+        **booking,
+        "stage": current_stage,
+        "deliveryStarted": delivery_started,
+        "deliveryCompletionState": delivery_state,
+        "deliveryConfiguration": "PENDING_BUSINESS_RULES",
     }
 
 
@@ -389,4 +487,41 @@ def read_booking_stage(
         "manualVerificationPending": int(runtime["manual_verification_pending_count"] or 0),
         "factVersion": int(runtime["fact_version"] or 0),
         "gates": gates,
+    }
+
+
+
+def read_delivery_stage(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+) -> dict[str, Any]:
+    """Read the isolated Delivery-stage summary without inventing business gates.
+
+    Delivery completion criteria remain intentionally unconfigured until they
+    are explicitly approved. The current persisted completion state is still
+    surfaced so Journey 360 and Documents use one consistent local read model.
+    """
+    runtime = connection.execute(
+        text(
+            """
+            SELECT current_stage, delivery_completion_state, fact_version
+            FROM auditcore.p2_journey_runtime
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
+
+    return {
+        "stage": str(runtime["current_stage"]) if runtime is not None else "BOOKING_DOCUMENT_UPLOAD",
+        "completionState": (
+            str(runtime["delivery_completion_state"])
+            if runtime is not None
+            else "IN_PROGRESS"
+        ),
+        "configuration": "PENDING_BUSINESS_RULES",
+        "factVersion": int(runtime["fact_version"] or 0) if runtime is not None else 0,
+        "gates": [],
     }
