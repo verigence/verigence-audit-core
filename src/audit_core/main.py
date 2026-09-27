@@ -71,9 +71,6 @@ from audit_core.uc03_booking_capture import router as uc03_booking_capture_route
 from audit_core.uc03_booking_commands import router as uc03_booking_router
 from audit_core.uc03_booking_details import router as uc03_booking_details_router
 from audit_core.uc03_booking_evidence import router as uc03_booking_evidence_router
-from audit_core.uc03_booking_evidence_details import (
-    router as uc03_booking_evidence_details_router,
-)
 from audit_core.uc03_booking_exchange import router as uc03_booking_exchange_router
 from audit_core.uc03_booking_integrations import (
     router as uc03_booking_integrations_router,
@@ -301,7 +298,6 @@ def create_app() -> FastAPI:
     application.include_router(uc03_booking_part1_router)
     application.include_router(uc03_identity_business_date_router)
     application.include_router(uc03_booking_evidence_router)
-    application.include_router(uc03_booking_evidence_details_router)
     application.include_router(uc03_booking_details_router)
     # uc03_booking_review_router removed (Phase 0 dead-code cleanup): its one
     # route, POST .../booking/details/review/{evidence_id}/approve-editable,

@@ -4,12 +4,12 @@ import json
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends
 from sqlalchemy import Connection, text
 
 from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.di_client import DiClient, DiClientError
-from audit_core.errors import ConflictError, DependencyUnavailableError, NotFoundError
+from audit_core.errors import ConflictError, DependencyUnavailableError
 from audit_core.evidence import get_di_client, get_security_oauth_client
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
@@ -311,79 +311,6 @@ def refresh_booking_extraction_strict(
         failedDocuments=failed,
         aggregateVersion=int(state["version_no"]),
     )
-
-
-@router.get("/evidence/{evidence_id}/review-content")
-def get_booking_evidence_review_content(
-    tenant_id: str,
-    journey_id: UUID,
-    evidence_id: UUID,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    security_client: Annotated[SecurityOAuthClient, Depends(get_security_oauth_client)],
-    di_client: Annotated[DiClient, Depends(get_di_client)],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> Response:
-    """Stream the original DI document to an authorized UC03 human reviewer."""
-    _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    row = connection.execute(
-        text(
-            """
-            SELECT customer_id, di_subject_id, di_document_id
-            FROM auditcore.evidence
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND evidence_id=:evidence_id AND association_status='ACTIVE'
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "evidence_id": evidence_id,
-        },
-    ).mappings().one_or_none()
-    if (
-        row is None
-        or row["customer_id"] is None
-        or row["di_subject_id"] is None
-        or row["di_document_id"] is None
-    ):
-        raise NotFoundError(
-            error_code="VAC-NF-006",
-            title="Evidence not found",
-            detail="The source document was not found for this Journey evidence.",
-        )
-
-    context_ref = _audit_context_ref(journey_id, row["customer_id"])
-    try:
-        token = security_client.get_service_token(audience=_DI_AUDIENCE)
-        content, mime_type, content_disposition = di_client.get_audit_document_content(
-            token=token,
-            tenant_id=tenant_id,
-            external_context_ref=context_ref,
-            document_id=str(row["di_document_id"]),
-        )
-    except (DiClientError, SecurityTokenError) as exc:
-        raise DependencyUnavailableError(
-            detail="The source document is temporarily unavailable. Please try again."
-        ) from exc
-
-    filename = None
-    if isinstance(content_disposition, str) and "filename=" in content_disposition:
-        filename = content_disposition.split("filename=", 1)[1].strip().strip('"')
-    headers = {
-        "Content-Disposition": f'inline; filename="{filename}"' if filename else "inline",
-        "Cache-Control": "private, no-store",
-    }
-    return Response(content=content, media_type=mime_type, headers=headers)
 
 
 @router.get("/uc03-workspace")
