@@ -132,3 +132,80 @@ def note_facts_changed(
         correlation_id=correlation_id,
     )
     return version
+
+
+def enqueue_work(
+    connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    work_type: str,
+    work_key: str,
+    payload: dict[str, Any],
+    correlation_id: str | None,
+    delay_seconds: int = 0,
+    requested_version: int | None = None,
+) -> None:
+    """Idempotently request work. Re-requesting an item always marks it dirty
+    (requested_version advances), so an item that is running when a new
+    request arrives runs again after it completes."""
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.p2_work_queue (
+                tenant_id, journey_id, work_type, work_key,
+                payload, requested_version, work_status,
+                next_attempt_at_utc, correlation_id
+            ) VALUES (
+                :tenant_id, :journey_id, :work_type, :work_key,
+                CAST(:payload AS jsonb), COALESCE(:requested_version, 1), 'PENDING',
+                CASE WHEN :delay_seconds > 0
+                     THEN now() + (:delay_seconds * interval '1 second')
+                     ELSE NULL END,
+                :correlation_id
+            )
+            ON CONFLICT (tenant_id, work_type, work_key)
+            DO UPDATE SET payload=EXCLUDED.payload,
+                          requested_version=GREATEST(
+                            COALESCE(auditcore.p2_work_queue.requested_version, 0) + 1,
+                            COALESCE(:requested_version, 0)
+                          ),
+                          work_status=CASE
+                            WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
+                              THEN auditcore.p2_work_queue.work_status
+                            ELSE 'PENDING'
+                          END,
+                          attempt_count=CASE
+                            WHEN auditcore.p2_work_queue.work_status IN ('COMPLETED','DEAD_LETTER','CANCELLED')
+                              THEN 0
+                            ELSE auditcore.p2_work_queue.attempt_count
+                          END,
+                          next_attempt_at_utc=CASE
+                            WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
+                              THEN auditcore.p2_work_queue.next_attempt_at_utc
+                            WHEN auditcore.p2_work_queue.work_status IN ('PENDING','RETRY_WAIT')
+                              AND auditcore.p2_work_queue.next_attempt_at_utc IS NOT NULL
+                              AND EXCLUDED.next_attempt_at_utc IS NOT NULL
+                              THEN LEAST(auditcore.p2_work_queue.next_attempt_at_utc,
+                                         EXCLUDED.next_attempt_at_utc)
+                            ELSE EXCLUDED.next_attempt_at_utc
+                          END,
+                          last_error=CASE
+                            WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
+                              THEN auditcore.p2_work_queue.last_error
+                            ELSE NULL
+                          END,
+                          updated_at_utc=now()
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "work_type": work_type,
+            "work_key": work_key,
+            "payload": json.dumps(payload, default=str),
+            "requested_version": requested_version,
+            "delay_seconds": delay_seconds,
+            "correlation_id": correlation_id,
+        },
+    )

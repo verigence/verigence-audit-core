@@ -1,9 +1,15 @@
 # Phase 2 control catalog: 25 active Audit Core controls + 47 enabled Rule Engine
 # rules (blueprint v2.2 sections 9-10). Audit Core owns execution state for both.
+# mode: RERUN (native runner) | EXTERNAL (Rule Engine) | GATE (P2 stage gates)
+#       | PAGES (P2 page outcomes) | SYNC (existing document sync) | EVENT (process event)
 version: 1
 controls:
   WRONG_DOCUMENT:
     executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
     category: Customer & Dealer Identity
     triggers:
     - DOCUMENT_SYNCED
@@ -17,6 +23,10 @@ controls:
       owner: TL
   DUPLICATE_RECEIPT:
     executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
     category: Payments & Reconciliation
     triggers:
     - DOCUMENT_SYNCED
@@ -30,6 +40,10 @@ controls:
       owner: TL
   MANUAL_VERIFICATION:
     executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
     category: Document Extraction & Completeness
     triggers:
     - DOCUMENT_SYNCED
@@ -44,6 +58,10 @@ controls:
       owner: PC
   MODEL_NOT_IDENTIFIED:
     executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
     category: Vehicle & Model Resolution
     triggers:
     - DOCUMENT_SYNCED
@@ -58,6 +76,10 @@ controls:
       owner: PC
   PAYMENT_BANK_UNMATCHED:
     executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
     category: Payments & Reconciliation
     triggers:
     - DOCUMENT_SYNCED
@@ -72,6 +94,10 @@ controls:
       owner: PC
   BK_DISCOUNT_EVIDENCE_MISSING:
     executor: NATIVE
+    mode: EVENT
+    event: Booking submission
+    phases:
+    - BOOKING
     category: Document Extraction & Completeness
     triggers:
     - DOCUMENT_SYNCED
@@ -85,6 +111,11 @@ controls:
       owner: PC
   BK_MIN_BOOKING_AMOUNT_NOT_MET:
     executor: NATIVE
+    mode: GATE
+    gates:
+    - BOOKING:MINIMUM_BOOKING_PAYMENT
+    phases:
+    - BOOKING
     category: Payments & Reconciliation
     triggers:
     - DOCUMENT_SYNCED
@@ -98,6 +129,10 @@ controls:
       owner: TL
   WF_BOOKING_INCOMPLETE_AT_DELIVERY_START:
     executor: NATIVE
+    mode: EVENT
+    event: Delivery start
+    phases:
+    - DELIVERY
     category: Delivery Process
     triggers:
     - DELIVERY_STARTED
@@ -111,6 +146,10 @@ controls:
       owner: TL
   DL_VIN_RECONCILIATION:
     executor: NATIVE
+    mode: EVENT
+    event: Delivery vehicle observation
+    phases:
+    - DELIVERY
     category: Vehicle & Model Resolution
     triggers:
     - DELIVERY_VEHICLE_OBSERVATION_RECORDED
@@ -124,6 +163,10 @@ controls:
       owner: TL
   DL_NOT_INTIMATED:
     executor: NATIVE
+    mode: EVENT
+    event: Delivery completion
+    phases:
+    - DELIVERY
     category: Delivery Process
     triggers:
     - DELIVERY_COMPLETED
@@ -137,6 +180,10 @@ controls:
       owner: PC
   DOC_REQUIRED_ANSWER_NO:
     executor: NATIVE
+    mode: EVENT
+    event: Delivery document declaration
+    phases:
+    - DELIVERY
     category: Document Extraction & Completeness
     triggers:
     - DELIVERY_DOCUMENT_ANSWERED_NO
@@ -151,6 +198,10 @@ controls:
       owner: PC
   WF_DELIVERY_COMPLETED_WITH_AUDIT_INCOMPLETE:
     executor: NATIVE
+    mode: EVENT
+    event: Delivery completion
+    phases:
+    - DELIVERY
     category: Delivery Process
     triggers:
     - DELIVERY_COMPLETED
@@ -164,6 +215,12 @@ controls:
       owner: TL
   DOCUMENT_UNRECOGNIZED:
     executor: NATIVE
+    mode: PAGES
+    page_statuses:
+    - NEEDS_REVIEW
+    phases:
+    - BOOKING
+    - DELIVERY
     category: Document Extraction & Completeness
     triggers:
     - CAPTURE_SCREEN_READ
@@ -177,6 +234,12 @@ controls:
       owner: PC
   DOCUMENT_MISSING:
     executor: NATIVE
+    mode: GATE
+    gates:
+    - DELIVERY:REQUIRED_DOCUMENTS
+    phases:
+    - BOOKING
+    - DELIVERY
     category: Document Extraction & Completeness
     triggers:
     - DOCUMENT_SYNCED
@@ -190,6 +253,10 @@ controls:
       owner: PC
   AUTOMATED_SYNC_FAILURE:
     executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
     category: System Health
     triggers:
     - DOCUMENT_SYNCED
@@ -203,6 +270,11 @@ controls:
       owner: PC
   BK_DOCKET_PRESENT:
     executor: NATIVE
+    mode: GATE
+    gates:
+    - BOOKING:BOOKING_FORM_EXTRACTED
+    phases:
+    - BOOKING
     category: Document Extraction & Completeness
     triggers:
     - DOCUMENT_SYNCED
@@ -218,6 +290,12 @@ controls:
       owner: PC
   BK_PAN_PRESENT:
     executor: NATIVE
+    mode: GATE
+    gates:
+    - BOOKING:PAN_EXTRACTED
+    - BOOKING:AADHAAR_EXTRACTED
+    phases:
+    - BOOKING
     category: Customer & Dealer Identity
     triggers:
     - DOCUMENT_SYNCED
@@ -233,6 +311,11 @@ controls:
       owner: TL
   BK_MIN_BOOKING_PROOF_PRESENT:
     executor: NATIVE
+    mode: GATE
+    gates:
+    - BOOKING:MINIMUM_BOOKING_PAYMENT
+    phases:
+    - BOOKING
     category: Payments & Reconciliation
     triggers:
     - DOCUMENT_SYNCED
@@ -248,6 +331,10 @@ controls:
       owner: PC
   BK_CONDITIONAL_DOCS_ADDRESSED:
     executor: NATIVE
+    mode: EVENT
+    event: Booking submission
+    phases:
+    - BOOKING
     category: Document Extraction & Completeness
     triggers:
     - DOCUMENT_SYNCED
@@ -263,6 +350,13 @@ controls:
       owner: PC
   BK_REQUIRED_CAPTURE_COMPLETE:
     executor: NATIVE
+    mode: GATE
+    gates:
+    - BOOKING:BOOKING_FORM_EXTRACTED
+    - BOOKING:PAN_EXTRACTED
+    - BOOKING:AADHAAR_EXTRACTED
+    phases:
+    - BOOKING
     category: Document Extraction & Completeness
     triggers:
     - DOCUMENT_SYNCED
@@ -278,6 +372,11 @@ controls:
       owner: TL
   DL_V2_REQUIRED_DOCUMENT_MISSING:
     executor: NATIVE
+    mode: GATE
+    gates:
+    - DELIVERY:REQUIRED_DOCUMENTS
+    phases:
+    - DELIVERY
     category: Document Extraction & Completeness
     triggers:
     - DOCUMENT_SYNCED
@@ -292,6 +391,12 @@ controls:
       owner: PC
   DL_V2_DOCUMENT_PROCESSING_FAILED:
     executor: NATIVE
+    mode: PAGES
+    page_statuses:
+    - FAILED
+    - DEAD_LETTER
+    phases:
+    - DELIVERY
     category: Document Extraction & Completeness
     triggers:
     - DOCUMENT_SYNCED
@@ -306,6 +411,9 @@ controls:
       owner: PC
   FINANCE_HYPOTHECATION_MISSING:
     executor: NATIVE
+    mode: SYNC
+    phases:
+    - DELIVERY
     category: Payments & Reconciliation
     triggers:
     - DOCUMENT_SYNCED
@@ -319,6 +427,10 @@ controls:
       owner: PC
   UC03_DI_LOW_CONFIDENCE_POST_SUBMIT:
     executor: NATIVE
+    mode: SYNC
+    phases:
+    - BOOKING
+    - DELIVERY
     category: Document Extraction & Completeness
     triggers:
     - DOCUMENT_SYNCED
@@ -332,6 +444,10 @@ controls:
       owner: PC
   DUPLICATE_BOOKING:
     executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
     category: Customer & Dealer Identity
     triggers:
     - DOCUMENT_SYNCED
@@ -345,8 +461,12 @@ controls:
       owner: TL
   ACCESSORY_BOOKING_VS_INVOICE:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: ACCESSORY
     phases:
+    - BOOKING
+    - DELIVERY
+    rule_engine_phases:
     - BOOKING
     - DELIVERY
     operands:
@@ -360,8 +480,11 @@ controls:
       owner: PC
   ACCESSORY_DATE_VS_DELIVERY:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: ACCESSORY
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: accessory_invoice_dms.invoice_date
@@ -374,8 +497,11 @@ controls:
       owner: PC
   ACCESSORY_DMS_VS_TALLY:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: ACCESSORY
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: accessory_invoice_dms.grand_total_amount
@@ -388,8 +514,11 @@ controls:
       owner: PC
   ACCESSORY_VIN_VS_VEHICLE_VIN:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: ACCESSORY
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: accessory_invoice_dms.chassis_number
@@ -402,8 +531,11 @@ controls:
       owner: PC
   ACCESSORY_VS_COST_SHEET:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: ACCESSORY
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: accessory_invoice_dms.grand_total_amount
@@ -415,8 +547,11 @@ controls:
       owner: PC
   BOOKING_AMOUNT_ZERO:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: PROCESS
     phases:
+    - BOOKING
+    rule_engine_phases:
     - BOOKING
     operands:
       left: booking_docket.booking_amount_paid
@@ -428,8 +563,11 @@ controls:
       owner: PC
   BOOKING_RECEIPT_SUM_VS_BOOKING_FORM:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: PRICE
     phases:
+    - BOOKING
+    rule_engine_phases:
     - BOOKING
     operands:
       left: dealer_receipt.amount_paid
@@ -442,8 +580,12 @@ controls:
       owner: PC
   BOOKING_TO_DELIVERY_EXCESS:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: DATE
     phases:
+    - BOOKING
+    - DELIVERY
+    rule_engine_phases:
     - BOOKING
     - DELIVERY
     operands:
@@ -457,8 +599,11 @@ controls:
       owner: PC
   CHASSIS_INVOICE_VS_DO:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: VEHICLE
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: customer_invoice_dms.chassis_number
@@ -471,8 +616,11 @@ controls:
       owner: PC
   CORPORATE_GSTIN_CERT_VS_INVOICE:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: CORPORATE
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     - CORPORATE
     operands:
@@ -486,8 +634,12 @@ controls:
       owner: PC
   CORPORATE_NAME_CERT_VS_INVOICE:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: CORPORATE
     phases:
+    - BOOKING
+    - DELIVERY
+    rule_engine_phases:
     - BOOKING
     - DELIVERY
     - CORPORATE
@@ -502,8 +654,11 @@ controls:
       owner: PC
   CORPORATE_PO_AMOUNT_VS_INVOICE:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: CORPORATE
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     - CORPORATE
     operands:
@@ -517,8 +672,11 @@ controls:
       owner: PC
   CORPORATE_PO_MISSING:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: CORPORATE
     phases:
+    - BOOKING
+    rule_engine_phases:
     - BOOKING
     - CORPORATE
     operands:
@@ -530,8 +688,11 @@ controls:
       owner: PC
   CUSTOMER_LEDGER_MISSING:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: COMPLETENESS
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     - FINANCE
     operands:
@@ -543,8 +704,12 @@ controls:
       owner: PC
   CUSTOMER_NAME_BOOKING_VS_INVOICE:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: VEHICLE
     phases:
+    - BOOKING
+    - DELIVERY
+    rule_engine_phases:
     - BOOKING
     - DELIVERY
     operands:
@@ -558,8 +723,11 @@ controls:
       owner: PC
   DEBIT_NOTE_INSURANCE_VS_COVER_NOTE:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: DEBIT_NOTE
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: debit_note.insurance_amount
@@ -572,8 +740,11 @@ controls:
       owner: PC
   DELIVERY_ORDER_MISSING:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: PROCESS
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: '-'
@@ -584,8 +755,11 @@ controls:
       owner: PC
   DELIVERY_RECEIPT_SUM_VS_INVOICE:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: PRICE
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     - FINANCE
     operands:
@@ -599,8 +773,11 @@ controls:
       owner: PC
   DISCOUNT_BOOKING_EXCEEDS_APPROVAL:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: DISCOUNT
     phases:
+    - BOOKING
+    rule_engine_phases:
     - BOOKING
     operands:
       left: booking_form.discount_amount
@@ -612,8 +789,11 @@ controls:
       owner: PC
   DISCOUNT_EXCEEDS_POLICY:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: DISCOUNT
     phases:
+    - BOOKING
+    rule_engine_phases:
     - BOOKING
     operands:
       left: discount_approval_form.approved_discount
@@ -625,8 +805,11 @@ controls:
       owner: PC
   DISCOUNT_HIDDEN_IN_EXCHANGE:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: DISCOUNT
     phases:
+    - BOOKING
+    rule_engine_phases:
     - BOOKING
     - EXCHANGE
     operands:
@@ -639,8 +822,11 @@ controls:
       owner: PC
   DISCOUNT_INVOICE_DMS_VS_TALLY:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: DISCOUNT
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: customer_invoice_dms.invoice_discount_amount
@@ -653,8 +839,12 @@ controls:
       owner: PC
   DISCOUNT_INVOICE_VS_BOOKING:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: DISCOUNT
     phases:
+    - BOOKING
+    - DELIVERY
+    rule_engine_phases:
     - BOOKING
     - DELIVERY
     operands:
@@ -668,8 +858,11 @@ controls:
       owner: PC
   DO_DATE_AFTER_GATE:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: DATE
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: delivery_order_cover.delivery_date
@@ -682,8 +875,11 @@ controls:
       owner: PC
   EXCHANGE_VALUE_VS_COST_SHEET:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: EXCHANGE
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     - EXCHANGE
     operands:
@@ -696,8 +892,11 @@ controls:
       owner: PC
   EXCHANGE_VALUE_VS_INVOICE_CREDIT:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: EXCHANGE
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     - EXCHANGE
     operands:
@@ -710,8 +909,11 @@ controls:
       owner: PC
   GATE_DATE_BEFORE_INVOICE:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: DATE
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: gate_pass.delivery_date
@@ -724,8 +926,11 @@ controls:
       owner: PC
   GATE_PASS_CHASSIS_EMPTY:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: PROCESS
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: gate_pass.chassis_number
@@ -737,8 +942,11 @@ controls:
       owner: PC
   GATE_PASS_MISSING:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: COMPLETENESS
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: '-'
@@ -749,8 +957,11 @@ controls:
       owner: PC
   INSURANCE_COVER_NOTE_MISSING:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: INSURANCE
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: '-'
@@ -761,8 +972,11 @@ controls:
       owner: PC
   INSURANCE_PREMIUM_COVER_VS_COST_SHEET:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: INSURANCE
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: insurance_cover.premium_amount
@@ -774,8 +988,11 @@ controls:
       owner: PC
   INSURANCE_PREMIUM_VS_DEBIT_NOTE:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: INSURANCE
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: insurance_cover.premium_amount
@@ -788,8 +1005,11 @@ controls:
       owner: PC
   INSURANCE_START_AFTER_DELIVERY:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: INSURANCE
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: insurance_cover.policy_start_date
@@ -802,8 +1022,11 @@ controls:
       owner: PC
   INVOICE_DATE_BEFORE_BOOKING:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: DATE
     phases:
+    - BOOKING
+    rule_engine_phases:
     - BOOKING
     operands:
       left: customer_invoice_dms.invoice_date
@@ -816,8 +1039,11 @@ controls:
       owner: PC
   INVOICE_MISSING:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: COMPLETENESS
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: '-'
@@ -828,8 +1054,11 @@ controls:
       owner: PC
   KYC_DOB_AADHAAR_VS_PAN:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: KYC
     phases:
+    - BOOKING
+    rule_engine_phases:
     - BOOKING
     operands:
       left: aadhaar.date_of_birth
@@ -842,8 +1071,11 @@ controls:
       owner: PC
   KYC_NAME_VS_BOOKING:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: KYC
     phases:
+    - BOOKING
+    rule_engine_phases:
     - BOOKING
     operands:
       left: aadhaar.aadhaar_name
@@ -856,8 +1088,11 @@ controls:
       owner: PC
   KYC_NAME_VS_INVOICE:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: KYC
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: aadhaar.aadhaar_name
@@ -870,8 +1105,12 @@ controls:
       owner: PC
   MODEL_VARIANT_BOOKING_VS_INVOICE:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: VEHICLE
     phases:
+    - BOOKING
+    - DELIVERY
+    rule_engine_phases:
     - BOOKING
     - DELIVERY
     operands:
@@ -885,8 +1124,12 @@ controls:
       owner: PC
   PAYMENT_MODE_CASH_UNRECEIPTED:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: PROCESS
     phases:
+    - BOOKING
+    - DELIVERY
+    rule_engine_phases:
     - BOOKING
     - DELIVERY
     operands:
@@ -899,8 +1142,11 @@ controls:
       owner: PC
   PAYMENT_SUM_VS_LEDGER:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: PRICE
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     - FINANCE
     operands:
@@ -913,8 +1159,11 @@ controls:
       owner: PC
   PRICE_BOOKING_VS_INVOICE:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: PRICE
     phases:
+    - BOOKING
+    rule_engine_phases:
     - BOOKING
     operands:
       left: booking_form.total_price
@@ -927,8 +1176,11 @@ controls:
       owner: PC
   PRICE_INVOICE_DMS_VS_TALLY:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: PRICE
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: customer_invoice_dms.grand_total_amount
@@ -941,8 +1193,11 @@ controls:
       owner: PC
   PRICE_INVOICE_VS_LEDGER:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: PRICE
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: customer_invoice_dms.grand_total_amount
@@ -955,8 +1210,11 @@ controls:
       owner: PC
   RTO_CHALLAN_MISSING:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: RTO
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: '-'
@@ -967,8 +1225,11 @@ controls:
       owner: PC
   TALLY_ACCESSORY_INVOICE_VS_DMS:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: TALLY_DMS
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: accessory_invoice_tally.grand_total_amount
@@ -981,8 +1242,11 @@ controls:
       owner: PC
   TALLY_VEHICLE_INVOICE_VS_DMS:
     executor: EXTERNAL_RULE_ENGINE
+    mode: EXTERNAL
     category: TALLY_DMS
     phases:
+    - DELIVERY
+    rule_engine_phases:
     - DELIVERY
     operands:
       left: tax_invoice_tally.grand_total_amount

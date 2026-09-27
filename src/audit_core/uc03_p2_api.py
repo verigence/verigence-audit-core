@@ -36,6 +36,7 @@ from audit_core.uc03_p2_access import (
     check_p2_permission,
     resolve_p2_scope,
 )
+from audit_core.uc03_p2_controls import control_statistics
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_stage import (
     active_conditions,
@@ -1554,14 +1555,19 @@ def overview_summary(
         tenant_id=tenant_id,
         journey_id=journey_id,
     )
-    empty_stage_controls = {
-        "tracked": 0,
-        "passed": 0,
-        "failed": 0,
-        "waiting": 0,
-        "retryPending": 0,
-        "errors": 0,
-    }
+    by_stage = control_statistics(connection, tenant_id=tenant_id, journey_id=journey_id)
+
+    def stage_controls(stage: str) -> dict[str, int]:
+        counts = by_stage[stage]
+        return {
+            "tracked": counts["total"],
+            "passed": counts["pass"],
+            "failed": counts["fail"],
+            "waiting": counts["waiting"],
+            "notApplicable": counts["notApplicable"],
+            "retryPending": counts["retry"],
+            "errors": counts["error"],
+        }
     statistics = {
         "booking": {
             "documentsRequired": booking_required,
@@ -1574,10 +1580,8 @@ def overview_summary(
             "manualVerificationPending": int(
                 booking.get("manualVerificationPending") or 0
             ),
-            # p2_control_state is currently Journey/control scoped and does not
-            # persist an authoritative stage dimension. Returning zero here is
-            # deliberate: do not fabricate Booking-vs-Delivery attribution.
-            "controls": dict(empty_stage_controls),
+            # Stage attribution comes from each control's template phases.
+            "controls": stage_controls("BOOKING"),
             "tasksOpen": booking_tasks_open,
             "tasksCompleted": booking_tasks_completed,
         },
@@ -1592,7 +1596,7 @@ def overview_summary(
             "insuranceRecords": int(operational["insurance_records"] or 0),
             "vehicleRecords": int(operational["vehicle_records"] or 0),
             "registrationRecords": int(operational["registration_records"] or 0),
-            "controls": dict(empty_stage_controls),
+            "controls": stage_controls("DELIVERY"),
             "tasksOpen": delivery_tasks_open,
             "tasksCompleted": delivery_tasks_completed,
         },

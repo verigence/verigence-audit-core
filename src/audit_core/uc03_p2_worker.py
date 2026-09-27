@@ -51,9 +51,15 @@ from audit_core.uc03_document_capture_v2 import (
     get_di_client,
     get_security_oauth_client,
 )
+from audit_core.uc03_p2_controls import (
+    evaluate_unit,
+    mark_unit_controls,
+    request_control_evaluation,
+)
 from audit_core.uc03_p2_grouping import PageFact, merge_pdf_pages, plan_documents
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_runtime import (
+    enqueue_work,
     fact_fingerprint,
     note_facts_changed,
     record_activity,
@@ -385,6 +391,15 @@ def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
                 reason="The page could not be sent for classification. Retry the page.",
                 last_error=error,
             )
+        elif work.work_type == "CONTROL_EVALUATE" and work.payload.get("unit"):
+            mark_unit_controls(
+                connection,
+                tenant_id=work.tenant_id,
+                journey_id=work.journey_id,
+                unit=str(work.payload["unit"]),
+                status="ERROR_TERMINAL",
+                reason="The control could not be evaluated after repeated attempts.",
+            )
         elif work.work_type == "SPLIT_BATCH":
             connection.execute(
                 text(
@@ -413,81 +428,7 @@ def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
         )
 
 
-def _enqueue(
-    connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-    work_type: str,
-    work_key: str,
-    payload: dict[str, Any],
-    correlation_id: str | None,
-    delay_seconds: int = 0,
-    requested_version: int | None = None,
-) -> None:
-    """Idempotently request work. Re-requesting an item always marks it dirty
-    (requested_version advances), so an item that is running when a new
-    request arrives runs again after it completes."""
-    connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.p2_work_queue (
-                tenant_id, journey_id, work_type, work_key,
-                payload, requested_version, work_status,
-                next_attempt_at_utc, correlation_id
-            ) VALUES (
-                :tenant_id, :journey_id, :work_type, :work_key,
-                CAST(:payload AS jsonb), COALESCE(:requested_version, 1), 'PENDING',
-                CASE WHEN :delay_seconds > 0
-                     THEN now() + (:delay_seconds * interval '1 second')
-                     ELSE NULL END,
-                :correlation_id
-            )
-            ON CONFLICT (tenant_id, work_type, work_key)
-            DO UPDATE SET payload=EXCLUDED.payload,
-                          requested_version=GREATEST(
-                            COALESCE(auditcore.p2_work_queue.requested_version, 0) + 1,
-                            COALESCE(:requested_version, 0)
-                          ),
-                          work_status=CASE
-                            WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
-                              THEN auditcore.p2_work_queue.work_status
-                            ELSE 'PENDING'
-                          END,
-                          attempt_count=CASE
-                            WHEN auditcore.p2_work_queue.work_status IN ('COMPLETED','DEAD_LETTER','CANCELLED')
-                              THEN 0
-                            ELSE auditcore.p2_work_queue.attempt_count
-                          END,
-                          next_attempt_at_utc=CASE
-                            WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
-                              THEN auditcore.p2_work_queue.next_attempt_at_utc
-                            WHEN auditcore.p2_work_queue.work_status IN ('PENDING','RETRY_WAIT')
-                              AND auditcore.p2_work_queue.next_attempt_at_utc IS NOT NULL
-                              AND EXCLUDED.next_attempt_at_utc IS NOT NULL
-                              THEN LEAST(auditcore.p2_work_queue.next_attempt_at_utc,
-                                         EXCLUDED.next_attempt_at_utc)
-                            ELSE EXCLUDED.next_attempt_at_utc
-                          END,
-                          last_error=CASE
-                            WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
-                              THEN auditcore.p2_work_queue.last_error
-                            ELSE NULL
-                          END,
-                          updated_at_utc=now()
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "work_type": work_type,
-            "work_key": work_key,
-            "payload": json.dumps(payload, default=str),
-            "requested_version": requested_version,
-            "delay_seconds": delay_seconds,
-            "correlation_id": correlation_id,
-        },
-    )
+_enqueue = enqueue_work
 
 
 def _settle_page(
@@ -1738,6 +1679,13 @@ def _stage_recompute(engine: Engine, work: WorkItem) -> None:
             tenant_id=work.tenant_id,
             journey_id=work.journey_id,
         )
+        # Gates are fresh: evaluate controls against the same facts.
+        request_control_evaluation(
+            connection,
+            tenant_id=work.tenant_id,
+            journey_id=work.journey_id,
+            correlation_id=work.correlation_id,
+        )
 
 
 def _task_event(
@@ -1947,248 +1895,33 @@ def _task_verify(engine: Engine, work: WorkItem) -> None:
         # requeues CONTROL_EVALUATE for VERIFYING tasks. No polling loop.
 
 
-_NATIVE_EXACT_RERUN = frozenset(
-    {
-        "WRONG_DOCUMENT",
-        "DUPLICATE_RECEIPT",
-        "DUPLICATE_BOOKING",
-        "MODEL_NOT_IDENTIFIED",
-        "MANUAL_VERIFICATION",
-        "PAYMENT_BANK_UNMATCHED",
-        "AUTOMATED_SYNC_FAILURE",
-    }
-)
-
-
-def _set_control_state(
-    engine: Engine,
-    work: WorkItem,
-    *,
-    control_code: str,
-    executor_type: str,
-    status: str,
-    reason: str | None,
-) -> None:
-    with engine.begin() as connection:
-        set_tenant_context(connection, work.tenant_id)
-        fact_version = connection.execute(
-            text(
-                """
-                SELECT fact_version
-                FROM auditcore.p2_journey_runtime
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                """
-            ),
-            {
-                "tenant_id": work.tenant_id,
-                "journey_id": work.journey_id,
-            },
-        ).scalar_one_or_none()
-        connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.p2_control_state (
-                    tenant_id, journey_id, control_code, executor_type,
-                    control_status, evaluated_fact_version,
-                    source_outcome, status_reason, last_error,
-                    last_evaluated_at_utc, updated_at_utc
-                ) VALUES (
-                    :tenant_id, :journey_id, :control_code, :executor_type,
-                    :status, :fact_version,
-                    NULL, :reason,
-                    CASE WHEN :status IN ('RETRY_PENDING','ERROR_TERMINAL')
-                         THEN :reason ELSE NULL END,
-                    now(), now()
-                )
-                ON CONFLICT (tenant_id, journey_id, control_code)
-                DO UPDATE SET executor_type=EXCLUDED.executor_type,
-                              control_status=EXCLUDED.control_status,
-                              evaluated_fact_version=EXCLUDED.evaluated_fact_version,
-                              status_reason=EXCLUDED.status_reason,
-                              last_error=EXCLUDED.last_error,
-                              last_evaluated_at_utc=EXCLUDED.last_evaluated_at_utc,
-                              updated_at_utc=now()
-                """
-            ),
-            {
-                "tenant_id": work.tenant_id,
-                "journey_id": work.journey_id,
-                "control_code": control_code,
-                "executor_type": executor_type,
-                "status": status,
-                "fact_version": fact_version,
-                "reason": reason,
-            },
-        )
-
-
-def _fresh_control_state(engine: Engine, work: WorkItem, control_code: str) -> dict[str, Any] | None:
-    with engine.begin() as connection:
-        set_tenant_context(connection, work.tenant_id)
-        row = connection.execute(
-            text(
-                """
-                SELECT control_status, evaluated_fact_version,
-                       source_outcome, status_reason, last_evaluated_at_utc
-                FROM auditcore.p2_control_state
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND control_code=:control_code
-                """
-            ),
-            {
-                "tenant_id": work.tenant_id,
-                "journey_id": work.journey_id,
-                "control_code": control_code,
-            },
-        ).mappings().one_or_none()
-        return dict(row) if row is not None else None
-
-
 def _control_evaluate(engine: Engine, work: WorkItem) -> None:
-    control_code = str(work.payload.get("controlCode") or "").strip()
-    if not control_code:
-        raise ValueError("CONTROL_EVALUATE requires controlCode")
-
-    with engine.begin() as connection:
-        set_tenant_context(connection, work.tenant_id)
-        definition = connection.execute(
-            text(
-                """
-                SELECT rule_code, executor, rerun_policy, enabled
-                FROM auditcore.rule_definitions
-                WHERE rule_code=:rule_code
-                """
-            ),
-            {"rule_code": control_code},
-        ).mappings().one_or_none()
-
-    if definition is not None:
-        if not bool(definition["enabled"]):
-            _set_control_state(
-                engine,
-                work,
-                control_code=control_code,
-                executor_type="NATIVE",
-                status="NOT_APPLICABLE",
-                reason="Rule is explicitly disabled in Audit Core.",
-            )
-            return
-
-        if str(definition["executor"]) != "AUDIT_CORE":
-            raise RuntimeError(
-                f"Unexpected persisted executor {definition['executor']} for {control_code}"
-            )
-
-        if str(definition["rerun_policy"]) != "RERUNNABLE":
-            latest = _fresh_control_state(engine, work, control_code)
-            if latest and latest["control_status"] in {
-                "PASS", "FAIL", "NOT_APPLICABLE", "WAITING_FOR_FACTS"
-            }:
-                return
-            _set_control_state(
-                engine,
-                work,
-                control_code=control_code,
-                executor_type="NATIVE",
-                status="ERROR_TERMINAL",
-                reason=(
-                    "This Audit Core rule is configured ONCE and has no safe "
-                    "post-action rerun contract."
-                ),
-            )
-            return
-
-        if control_code not in _NATIVE_EXACT_RERUN:
-            _set_control_state(
-                engine,
-                work,
-                control_code=control_code,
-                executor_type="NATIVE",
-                status="ERROR_TERMINAL",
-                reason=(
-                    "No verified exact rerun adapter is registered for this "
-                    "Audit Core rule."
-                ),
-            )
-            return
-
-        from audit_core.uc03_run_all_rules import (
-            _existing_stages,
-            _run_audit_core_rules_for_stage,
-        )
-
-        with engine.begin() as connection:
-            set_tenant_context(connection, work.tenant_id)
-            stages = _existing_stages(
-                connection,
-                tenant_id=work.tenant_id,
-                journey_id=work.journey_id,
-            )
-            matched = []
-            for stage in stages:
-                results = _run_audit_core_rules_for_stage(
-                    connection,
-                    tenant_id=work.tenant_id,
-                    journey_id=work.journey_id,
-                    stage=stage,
-                    correlation_id=work.correlation_id or "",
-                )
-                matched.extend(
-                    result for result in results if result.ruleCode == control_code
-                )
-
-        if not matched:
-            _set_control_state(
-                engine,
-                work,
-                control_code=control_code,
-                executor_type="NATIVE",
-                status="ERROR_TERMINAL",
-                reason="Verified native rerun adapter produced no result for this Journey.",
-            )
-        return
-
-    # No Audit Core definition means the control may belong to the external
-    # Rule Engine (those definitions intentionally are not persisted locally).
-    from audit_core.uc03_rule_engine_findings import run_rule_engine_phase
-    from audit_core.uc03_run_all_rules import _existing_stages
-
-    with engine.begin() as connection:
-        set_tenant_context(connection, work.tenant_id)
-        stages = _existing_stages(
-            connection,
+    unit = work.payload.get("unit")
+    if unit:
+        transitions = evaluate_unit(
+            engine,
             tenant_id=work.tenant_id,
             journey_id=work.journey_id,
+            unit=str(unit),
+            correlation_id=work.correlation_id,
+            force=bool(work.payload.get("force")),
         )
-
-    if not stages:
-        _set_control_state(
-            engine,
-            work,
-            control_code=control_code,
-            executor_type="RULE_ENGINE",
-            status="WAITING_FOR_FACTS",
-            reason="No Booking or Delivery stage exists yet.",
-        )
+        if transitions:
+            on_control_transitions(engine, work=work, transitions=transitions)
         return
-
-    before = _fresh_control_state(engine, work, control_code)
-    before_time = before["last_evaluated_at_utc"] if before else None
-    for stage in stages:
-        run_rule_engine_phase(
-            engine,
-            work.tenant_id,
-            work.journey_id,
-            stage,
-            stage,
-            work.correlation_id or "",
+    # Items queued before the ledger existed name a single control: evaluate
+    # every unit instead (units are fingerprint-skipped when nothing changed).
+    with engine.begin() as connection:
+        set_tenant_context(connection, work.tenant_id)
+        request_control_evaluation(
+            connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+            correlation_id=work.correlation_id, delay_seconds=0, force=True,
         )
 
-    after = _fresh_control_state(engine, work, control_code)
-    if after is None or after["last_evaluated_at_utc"] == before_time:
-        raise RuntimeError(
-            f"External Rule Engine produced no fresh execution for {control_code}"
-        )
+
+def on_control_transitions(engine: Engine, *, work: WorkItem, transitions: list) -> None:
+    """Hook for control state changes (task production/verification, M3)."""
+    return
 
 
 def process_work(engine: Engine, work: WorkItem) -> None:

@@ -28,6 +28,9 @@ PAGE_GROUPS = frozenset({"ADJACENT", "BATCH"})
 STAGES = ("BOOKING", "DELIVERY")
 GATE_KINDS = frozenset({"DOCUMENT_READY", "PAYMENT_MINIMUM", "NO_OPEN_TASKS"})
 CONTROL_EXECUTORS = frozenset({"NATIVE", "EXTERNAL_RULE_ENGINE"})
+CONTROL_MODES = frozenset({"RERUN", "EXTERNAL", "GATE", "PAGES", "SYNC", "EVENT"})
+# Readiness gates computed by the stage engine outside the configured gate list.
+SYNTHETIC_GATES = frozenset({"DELIVERY:REQUIRED_DOCUMENTS"})
 SUPPORTING_TEMPLATE = "supporting_document"
 
 # Rule Engine operands that name documents the current Audit Core checklist
@@ -124,6 +127,14 @@ class ControlTemplate:
     phases: tuple[str, ...] = ()
     operands: dict[str, Any] = field(default_factory=dict)
     depends_on_documents: tuple[str, ...] = ()
+    mode: str = "EXTERNAL"
+    gates: tuple[str, ...] = ()
+    page_statuses: tuple[str, ...] = ()
+    event: str | None = None
+    rule_engine_phases: tuple[str, ...] = ()
+
+    def applies_to_stage(self, stage: str) -> bool:
+        return not self.phases or stage in self.phases
 
 
 @dataclass(frozen=True)
@@ -204,6 +215,9 @@ class Registry:
         declared = [self.controls[c] for c in template.controls if c in self.controls]
         merged: dict[str, ControlTemplate] = {c.code: c for c in declared + by_dependency}
         return list(merged.values())
+
+    def controls_by_mode(self, mode: str) -> list[ControlTemplate]:
+        return [c for c in self.controls.values() if c.mode == mode]
 
     def di_fields(self, di_type: str) -> list[dict[str, Any]]:
         return list((self.di_schemas.get(di_type) or {}).get("fields") or [])
@@ -298,6 +312,11 @@ def build_registry(
             phases=_tuple(raw.get("phases")),
             operands=dict(raw.get("operands") or {}),
             depends_on_documents=_tuple(raw.get("depends_on_documents")),
+            mode=str(raw.get("mode") or "EXTERNAL"),
+            gates=_tuple(raw.get("gates")),
+            page_statuses=_tuple(raw.get("page_statuses")),
+            event=raw.get("event"),
+            rule_engine_phases=_tuple(raw.get("rule_engine_phases")),
         )
 
     tasks = {
@@ -381,6 +400,20 @@ def validate_registry(registry: Registry) -> list[str]:
         where = f"control {code}"
         if control.executor not in CONTROL_EXECUTORS:
             problems.append(f"{where}: unknown executor {control.executor}")
+        if control.mode not in CONTROL_MODES:
+            problems.append(f"{where}: unknown mode {control.mode}")
+        if (control.mode == "EXTERNAL") != (control.executor == "EXTERNAL_RULE_ENGINE"):
+            problems.append(f"{where}: mode {control.mode} does not match executor {control.executor}")
+        known_gates = {
+            f"{code}:{gate.key}" for code, stage in registry.stages.items() for gate in stage.gates
+        } | SYNTHETIC_GATES
+        if control.mode == "GATE" and not control.gates:
+            problems.append(f"{where}: GATE control without gates")
+        for gate in control.gates:
+            if gate not in known_gates:
+                problems.append(f"{where}: unknown gate {gate}")
+        if control.mode == "EVENT" and not control.event:
+            problems.append(f"{where}: EVENT control without an event")
         if control.task_type not in registry.tasks:
             problems.append(f"{where}: unknown task type {control.task_type}")
         for document in control.depends_on_documents:
