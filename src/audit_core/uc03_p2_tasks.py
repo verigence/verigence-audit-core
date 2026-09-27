@@ -14,6 +14,11 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+# Phase 2-only task code. Deliberately not named *TASK_TYPE: the legacy
+# UC03 review-queue classifier must not treat isolated p2_tasks as legacy
+# workflow_tasks.
+_REQUESTER_CONFIRMATION_CODE = "REQUESTER_CONFIRMATION"
+
 
 def _json(value: Any) -> str:
     return json.dumps(value, default=str, separators=(",", ":"))
@@ -220,7 +225,7 @@ def _create_requester_review(
         connection,
         tenant_id=tenant_id,
         journey_id=UUID(str(task["journey_id"])),
-        task_type="REQUESTER_CONFIRMATION",
+        task_type=_REQUESTER_CONFIRMATION_CODE,
         category="TASK_CONFIRMATION",
         origin_kind="SYSTEM",
         source_type="HUMAN_ACTION",
@@ -290,7 +295,7 @@ def submit_action(
         )
         return {"taskId": str(task_id), "status": "IN_PROGRESS"}
 
-    if task["task_type"] == "REQUESTER_CONFIRMATION":
+    if task["task_type"] == _REQUESTER_CONFIRMATION_CODE:
         root_id = UUID(str(task["root_task_id"]))
         if action == "ACCEPT":
             connection.execute(
