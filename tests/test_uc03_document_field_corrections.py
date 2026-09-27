@@ -530,3 +530,16 @@ def test_p2_correction_rejection_does_not_apply_proposed_value() -> None:
     assert "_apply_field_value(" not in reject_branch
     assert "VERIFIED_COMPLETE" in reject_branch
     assert '"outcome": "REJECT_CORRECTION"' in reject_branch
+
+
+
+def test_p2_task_actions_enforce_assigned_actor_or_role() -> None:
+    from audit_core import uc03_p2_tasks
+
+    source = inspect.getsource(uc03_p2_tasks.submit_action)
+    ownership = source.index('assigned_actor_id = task.get("assigned_actor_id")')
+    event_record = source.index("record_task_event(")
+
+    assert ownership < event_record
+    assert "This task is assigned to a different actor" in source
+    assert "This task is assigned to role" in source
