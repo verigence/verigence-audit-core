@@ -98,8 +98,15 @@ def list_vehicle_photos(
     human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
     authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
-    storage: Annotated[VehiclePhotoStorage, Depends(get_vehicle_photo_storage)],
 ) -> VehiclePhotoListResponse:
+    # Root-caused live (2026-09-27): storage used to be a FastAPI dependency
+    # (Depends(get_vehicle_photo_storage)) resolved before this function body
+    # ever ran, so a Journey with no Delivery started yet -- which
+    # _authorize_delivery below would otherwise cleanly 404 -- hit storage's
+    # own hard RuntimeError first instead, surfacing as an unconditional 500
+    # on every fresh Booking's Documents page. Storage is only actually
+    # needed to build a presigned URL for a row that exists; resolve it
+    # lazily, after authorization, and only if there's something to show.
     _authorize_delivery(
         connection,
         tenant_id=tenant_id,
@@ -119,6 +126,9 @@ def list_vehicle_photos(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
+    if not rows:
+        return VehiclePhotoListResponse(photos=[])
+    storage = get_vehicle_photo_storage()
     return VehiclePhotoListResponse(photos=[_public_photo(row, storage) for row in rows])
 
 

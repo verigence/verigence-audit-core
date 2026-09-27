@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass, field
 from uuid import uuid4
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
+from audit_core.dependencies import get_connection, get_human_principal
+from audit_core.main import app
+from audit_core.security import HumanPrincipal
+from audit_core.security_authorization import (
+    SecurityAuthorizationDecision,
+    get_security_authorization_client,
+)
 from audit_core.uc03_delivery_commands import (
     _complete_open_vehicle_photos_task,
     _ensure_vehicle_photos_task,
@@ -14,6 +23,21 @@ from audit_core.vehicle_photo_storage import (
     VehiclePhotoStorage,
     VehiclePhotoStorageSettings,
 )
+
+
+@dataclass
+class _AllowAllAuthorization:
+    calls: list[tuple[str, str, str]] = field(default_factory=list)
+
+    def check_user_permission(
+        self, *, user_id: str, tenant_id: str, permission_key: str,
+    ) -> SecurityAuthorizationDecision:
+        self.calls.append((user_id, tenant_id, permission_key))
+        return SecurityAuthorizationDecision(
+            allowed=True, reason_code="AUTHORIZED",
+            user_id=user_id, tenant_id=tenant_id, permission_key=permission_key,
+            role_key="PC",
+        )
 
 
 @pytest.fixture
@@ -250,3 +274,129 @@ def test_vehicle_photo_storage_put_and_presign_use_the_configured_bucket(monkeyp
     assert operation == "get_object"
     assert kwargs["Params"] == {"Bucket": "vehicle-photos-bucket", "Key": "tenant/photo.jpg"}
     assert kwargs["ExpiresIn"] == 60
+
+
+def _new_journey(engine, *, suffix: str, with_delivery_started: bool) -> tuple[str, object]:
+    tenant_id = f"tenant-vplr-{suffix}"
+    with engine.begin() as c:
+        category_id = c.execute(
+            text("INSERT INTO auditcore.product_categories (category_code, category_name) "
+                 "VALUES (:c, 'V') RETURNING product_category_id"),
+            {"c": f"VPLR-CAT-{suffix}"},
+        ).scalar_one()
+        oem_id = c.execute(
+            text("INSERT INTO auditcore.oems (oem_code, oem_name) VALUES (:c, 'O') RETURNING oem_id"),
+            {"c": f"VPLR-OEM-{suffix}"},
+        ).scalar_one()
+        c.execute(
+            text("""INSERT INTO auditcore.projects
+                (tenant_id, project_code, project_name, oem_id, product_category_id,
+                 effective_start_date, timezone_name, project_status)
+                VALUES (:t, :pc, 'VPLR', :o, :cat, CURRENT_DATE - 1, 'Asia/Kolkata', 'ACTIVE')"""),
+            {"t": tenant_id, "pc": f"VPLR-{suffix}", "o": oem_id, "cat": category_id},
+        )
+        dealer_id = c.execute(
+            text("INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
+                 "VALUES (:t, :c, 'D') RETURNING dealer_id"),
+            {"t": tenant_id, "c": f"VPLR-D-{suffix}"},
+        ).scalar_one()
+        outlet_id = c.execute(
+            text("INSERT INTO auditcore.dealer_outlets (tenant_id, dealer_id, outlet_code, outlet_name) "
+                 "VALUES (:t, :d, :c, 'O') RETURNING outlet_id"),
+            {"t": tenant_id, "d": dealer_id, "c": f"VPLR-O-{suffix}"},
+        ).scalar_one()
+        customer_id = c.execute(
+            text("""INSERT INTO auditcore.customers
+                (tenant_id, dealer_id, outlet_id, customer_type_code, display_name)
+                VALUES (:t, :d, :o, 'INDIVIDUAL', 'C') RETURNING customer_id"""),
+            {"t": tenant_id, "d": dealer_id, "o": outlet_id},
+        ).scalar_one()
+        journey_id = c.execute(
+            text("""INSERT INTO auditcore.journeys
+                (tenant_id, dealer_id, outlet_id, customer_id, journey_reference)
+                VALUES (:t, :d, :o, :cu, :r) RETURNING journey_id"""),
+            {"t": tenant_id, "d": dealer_id, "o": outlet_id, "cu": customer_id, "r": f"VPLR-J-{suffix}"},
+        ).scalar_one()
+        c.execute(
+            text("""INSERT INTO auditcore.journey_stage_states
+                (tenant_id, journey_id, stage_code, business_status, audit_state, audit_status,
+                 first_started_at_utc, latest_activity_at_utc, version_no)
+                VALUES (:t, :j, 'BOOKING', 'BOOKING_STARTED', 'IN_PROGRESS', 'NOT_EVALUATED',
+                        now(), now(), 1)"""),
+            {"t": tenant_id, "j": journey_id},
+        )
+        if with_delivery_started:
+            c.execute(
+                text("""INSERT INTO auditcore.journey_stage_states
+                    (tenant_id, journey_id, stage_code, business_status, audit_state, audit_status,
+                     first_started_at_utc, latest_activity_at_utc, version_no)
+                    VALUES (:t, :j, 'DELIVERY', 'DELIVERY_STARTED', 'NOT_STARTED', 'NOT_EVALUATED',
+                            now(), now(), 1)"""),
+                {"t": tenant_id, "j": journey_id},
+            )
+    return tenant_id, journey_id
+
+
+def test_list_vehicle_photos_404s_cleanly_before_delivery_starts_no_storage_needed() -> None:
+    """Root-caused live (2026-09-27): storage used to be resolved as a
+    FastAPI dependency before this route's body ever ran, so a Journey with
+    no Delivery started yet -- which should cleanly 404 -- instead hit
+    storage's own hard RuntimeError first, surfacing as an unconditional 500
+    on every fresh Booking's Documents page. CI never configures
+    AUDIT_CORE_PHOTO_STORAGE_* at all, so this is a live reproduction of the
+    exact bug, not a simulation of one."""
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for this integration test")
+    engine = create_engine(database_url)
+    suffix = uuid4().hex[:10]
+    tenant_id, journey_id = _new_journey(engine, suffix=suffix, with_delivery_started=False)
+    actor_id = f"pc-{suffix}"
+
+    def connection_override():
+        with engine.begin() as connection:
+            yield connection
+
+    app.dependency_overrides[get_connection] = connection_override
+    app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=actor_id)
+    app.dependency_overrides[get_security_authorization_client] = lambda: _AllowAllAuthorization()
+    try:
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get(
+            f"/v2/tenants/{tenant_id}/journeys/{journey_id}/delivery/vehicle-photos"
+        )
+        assert response.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+        engine.dispose()
+
+
+def test_list_vehicle_photos_returns_empty_with_no_photos_no_storage_needed() -> None:
+    """Same missing-storage-config environment as above, but Delivery HAS
+    started -- zero photos means storage's presigned-URL helper is never
+    needed, so this must succeed even though storage isn't configured."""
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for this integration test")
+    engine = create_engine(database_url)
+    suffix = uuid4().hex[:10]
+    tenant_id, journey_id = _new_journey(engine, suffix=suffix, with_delivery_started=True)
+    actor_id = f"pc-{suffix}"
+
+    def connection_override():
+        with engine.begin() as connection:
+            yield connection
+
+    app.dependency_overrides[get_connection] = connection_override
+    app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=actor_id)
+    app.dependency_overrides[get_security_authorization_client] = lambda: _AllowAllAuthorization()
+    try:
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get(
+            f"/v2/tenants/{tenant_id}/journeys/{journey_id}/delivery/vehicle-photos"
+        )
+        assert response.status_code == 200
+        assert response.json() == {"photos": []}
+    finally:
+        app.dependency_overrides.clear()
+        engine.dispose()
