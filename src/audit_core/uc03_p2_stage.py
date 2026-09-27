@@ -321,3 +321,72 @@ def recompute_booking_stage(
         "manualVerificationPending": manual_pending,
         "gates": gates,
     }
+
+
+def read_booking_stage(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+) -> dict[str, Any]:
+    runtime = connection.execute(
+        text(
+            """
+            SELECT current_stage, booking_completion_state,
+                   booking_minimum_amount, booking_receipt_total,
+                   manual_verification_pending_count, fact_version
+            FROM auditcore.p2_journey_runtime
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
+
+    gate_rows = connection.execute(
+        text(
+            """
+            SELECT gate_key, gate_status, details, evaluated_at_utc
+            FROM auditcore.p2_stage_gate_state
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND stage_code='BOOKING'
+            ORDER BY gate_key
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    gates = {
+        str(row["gate_key"]): {
+            "passed": str(row["gate_status"]) == "PASS",
+            **dict(row["details"] or {}),
+        }
+        for row in gate_rows
+    }
+
+    for gate_key in (*_BOOKING_DOC_GATES.keys(), "MINIMUM_BOOKING_PAYMENT", "NO_MANUAL_VERIFICATION_PENDING"):
+        gates.setdefault(gate_key, {"passed": False})
+
+    if runtime is None:
+        minimum = _minimum_booking_amount(connection, tenant_id=tenant_id)
+        return {
+            "stage": "BOOKING_DOCUMENT_UPLOAD",
+            "bookingCompletionState": "IN_PROGRESS",
+            "minimumBookingAmount": str(minimum),
+            "bookingReceiptTotal": "0",
+            "manualVerificationPending": 0,
+            "factVersion": 0,
+            "gates": gates,
+        }
+
+    return {
+        "stage": str(runtime["current_stage"]),
+        "bookingCompletionState": str(runtime["booking_completion_state"]),
+        "minimumBookingAmount": (
+            str(runtime["booking_minimum_amount"])
+            if runtime["booking_minimum_amount"] is not None
+            else str(_minimum_booking_amount(connection, tenant_id=tenant_id))
+        ),
+        "bookingReceiptTotal": str(runtime["booking_receipt_total"] or 0),
+        "manualVerificationPending": int(runtime["manual_verification_pending_count"] or 0),
+        "factVersion": int(runtime["fact_version"] or 0),
+        "gates": gates,
+    }
