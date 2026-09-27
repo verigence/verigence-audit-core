@@ -15,7 +15,7 @@ from audit_core.security_authorization import (
     SecurityAuthorizationDecision,
     get_security_authorization_client,
 )
-from tests.conftest import delete_tenant_data
+from conftest import delete_tenant_data
 
 
 @dataclass
