@@ -42,7 +42,7 @@ stages:
       label: Minimum booking amount received
       missing: Upload dealer receipts totalling at least the minimum booking amount.
     - key: NO_MANUAL_VERIFICATION_PENDING
-      kind: NO_OPEN_TASKS
+      kind: FIELDS_REVIEWED
       task_types:
       - MANUAL_VERIFICATION_REVIEW
       label: All low-confidence fields verified

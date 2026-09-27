@@ -630,6 +630,67 @@ class P2FieldCorrectionCommand(BaseModel):
 
 
 
+class P2FieldConfirmCommand(BaseModel):
+    canonicalFieldId: str = Field(min_length=1, max_length=160)
+    sourceFactVersion: int = Field(gt=0)
+
+
+@router.post("/documents/{document_id}/fields/{field_key}:confirm")
+def confirm_p2_document_field(
+    tenant_id: str,
+    journey_id: UUID,
+    document_id: UUID,
+    field_key: str,
+    command: P2FieldConfirmCommand,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """The PC checked the page and the extracted value is right: record the
+    review without changing the value (the machine value stays effective)."""
+    authorize_p2(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        permission_key=_UPDATE_PERMISSION,
+    )
+    _document_context(connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id)
+    confirmed = connection.execute(
+        text(
+            """
+            UPDATE auditcore.journey_document_extracted_fields
+            SET reviewed_by_actor_id=:actor_id, reviewed_at_utc=now(), updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND di_document_id=:document_id
+              AND field_key=:field_key AND source_canonical_field_id=:canonical_field_id
+              AND source_fact_version=:source_fact_version
+            RETURNING field_key
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "document_id": document_id,
+            "field_key": field_key,
+            "canonical_field_id": command.canonicalFieldId,
+            "source_fact_version": command.sourceFactVersion,
+            "actor_id": human_principal.subject,
+        },
+    ).scalars().all()
+    if not confirmed:
+        raise HTTPException(
+            status_code=409,
+            detail="The extracted field changed. Refresh the document and retry.",
+        )
+    note_facts_changed(
+        connection, tenant_id=tenant_id, journey_id=journey_id, reason="FIELD_CONFIRMED",
+    )
+    return {"documentId": str(document_id), "fieldKey": field_key, "confirmed": True}
+
+
 @router.patch("/documents/{document_id}/fields/{field_key}")
 def patch_p2_document_field(
     tenant_id: str,

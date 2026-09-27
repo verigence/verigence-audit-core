@@ -1719,7 +1719,11 @@ def list_tasks(
     connection: Annotated[Connection, Depends(get_connection)],
     status: str | None = None,
     journey_id: UUID | None = None,
+    includeLegacy: bool = False,
 ) -> dict[str, Any]:
+    """P2 worklist. P2 now raises its own tasks for every failing control and
+    low-confidence field, so legacy workflow tasks are shown only on request
+    (``includeLegacy=true``) during the transition."""
     _authorize(
         connection,
         tenant_id=tenant_id,
@@ -1781,7 +1785,7 @@ def list_tasks(
         },
     ).mappings().all()
 
-    legacy_rows = connection.execute(
+    legacy_rows = [] if not includeLegacy else connection.execute(
         text(
             """
             SELECT

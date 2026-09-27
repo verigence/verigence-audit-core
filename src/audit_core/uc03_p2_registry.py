@@ -26,7 +26,7 @@ REQUIREMENT_LEVELS = frozenset({"REQUIRED", "OPTIONAL", "CONDITIONAL", "SUPPORTI
 PAGE_SHAPES = frozenset({"SINGLE", "PARTS", "MULTI_PAGE"})
 PAGE_GROUPS = frozenset({"ADJACENT", "BATCH"})
 STAGES = ("BOOKING", "DELIVERY")
-GATE_KINDS = frozenset({"DOCUMENT_READY", "PAYMENT_MINIMUM", "NO_OPEN_TASKS"})
+GATE_KINDS = frozenset({"DOCUMENT_READY", "PAYMENT_MINIMUM", "NO_OPEN_TASKS", "FIELDS_REVIEWED"})
 CONTROL_EXECUTORS = frozenset({"NATIVE", "EXTERNAL_RULE_ENGINE"})
 CONTROL_MODES = frozenset({"RERUN", "EXTERNAL", "GATE", "PAGES", "SYNC", "EVENT"})
 # Readiness gates computed by the stage engine outside the configured gate list.

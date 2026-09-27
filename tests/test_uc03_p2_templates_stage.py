@@ -8,6 +8,7 @@ import pytest
 from conftest import delete_tenant_data
 from p2_support import (
     add_evidence,
+    add_extracted_field,
     add_ready_document,
     add_receipt_payment,
     create_p2_journey,
@@ -22,7 +23,11 @@ from audit_core.uc03_p2_registry import (
     get_registry,
     validate_registry,
 )
-from audit_core.uc03_p2_stage import read_booking_stage, recompute_journey_stage
+from audit_core.uc03_p2_stage import (
+    read_booking_stage,
+    recompute_journey_stage,
+    unreviewed_fields,
+)
 
 # ------------------------------------------------------------------ templates
 
@@ -163,31 +168,40 @@ def test_duplicate_and_voided_receipts_do_not_count(journey):
     assert gate["shortfall"] == "6000.00"
 
 
-def test_open_manual_verification_blocks_then_reopens(journey):
+def test_low_confidence_fields_block_until_reviewed_then_reopen(journey):
     add_ready_document(journey, "booking_form", customer_name="A")
     add_ready_document(journey, "pan_card", pan_number="P")
-    add_ready_document(journey, "aadhaar", aadhaar_number="1")
+    aadhaar = add_ready_document(journey, "aadhaar", aadhaar_number="1")
     add_receipt_payment(journey, amount="21000", receipt_number="R1", receipt_date="2026-09-01")
     assert _recompute(journey)["stage"] == "BOOKING_COMPLETE"
+
+    # a re-extraction brings a low-confidence Aadhaar name
+    add_extracted_field(journey, di_document_id=aadhaar, field_key="aadhaar_name", value="X",
+                        confidence=72.0, document_type="aadhaar")
+    result = _recompute(journey)
+    assert result["stage"] == "BOOKING_VERIFY_DOCUMENTS"
+    assert result["bookingCompletionState"] == "BLOCKED"
+    assert result["gates"]["NO_MANUAL_VERIFICATION_PENDING"]["documents"] == ["Aadhaar"]
 
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.p2_tasks (
-                    tenant_id, journey_id, task_type, category, origin_kind, source_type,
-                    dedupe_key, title, description, assigned_role_code, completion_protocol
-                ) VALUES (:t, :j, 'MANUAL_VERIFICATION_REVIEW', 'DOCUMENT_VERIFICATION', 'SYSTEM',
-                          'DOCUMENT_FIELD', :k, 'Verify', 'Verify field', 'PC', 'MACHINE_VERIFIED')
-                """
-            ),
-            {"t": journey.tenant_id, "j": journey.journey_id, "k": f"mv:{uuid4()}"},
+            text("UPDATE auditcore.journey_document_extracted_fields SET reviewed_at_utc=now(), "
+                 "reviewed_by_actor_id='pc' WHERE tenant_id=:t AND field_key='aadhaar_name'"),
+            {"t": journey.tenant_id},
         )
-    result = _recompute(journey)
-    assert result["stage"] == "BOOKING_VERIFY_DOCUMENTS"
-    assert result["bookingCompletionState"] == "BLOCKED"
-    assert result["manualVerificationPending"] == 1
+    assert _recompute(journey)["stage"] == "BOOKING_COMPLETE"
+
+
+def test_strict_money_fields_need_higher_confidence(journey):
+    receipt = add_ready_document(journey, "dealer_receipt", confidence=95.0, amount_paid="21000")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        pending = unreviewed_fields(connection, get_registry(), tenant_id=journey.tenant_id,
+                                    journey_id=journey.journey_id)
+    assert [(p["documentId"], p["fieldKey"], p["threshold"]) for p in pending] == [
+        (str(receipt), "amount_paid", 97.0)
+    ]
 
 
 def test_delivery_readiness_lists_missing_required_documents(journey):

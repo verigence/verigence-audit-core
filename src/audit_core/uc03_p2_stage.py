@@ -164,6 +164,67 @@ def open_task_count(connection: Connection, *, tenant_id: str, journey_id: UUID,
     return int(row or 0)
 
 
+def unreviewed_fields(
+    connection: Connection,
+    registry: Registry,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    stage: str | None = None,
+    document_id: UUID | None = None,
+) -> list[dict[str, Any]]:
+    """Low-confidence fields on ACTIVE documents that nobody has reviewed.
+
+    A field needs review when its confidence is below its template threshold
+    (strict fields use the stricter bar; missing confidence is never trusted),
+    it has a value, and it has not been confirmed or corrected."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT f.di_document_id, f.field_key, f.source_canonical_field_id,
+                   f.source_fact_version, f.confidence_score, f.effective_value,
+                   e.document_type_key, e.process_area
+            FROM auditcore.journey_document_extracted_fields f
+            JOIN auditcore.evidence e
+              ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id
+             AND e.di_document_id=f.di_document_id AND e.association_status='ACTIVE'
+            WHERE f.tenant_id=:tenant_id AND f.journey_id=:journey_id
+              AND f.reviewed_at_utc IS NULL
+              AND f.is_modified = false
+              AND f.effective_value IS NOT NULL
+              AND f.effective_value <> 'null'::jsonb
+              AND f.effective_value <> '""'::jsonb
+              AND (CAST(:document_id AS uuid) IS NULL OR f.di_document_id=CAST(:document_id AS uuid))
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "document_id": document_id},
+    ).mappings().all()
+    pending: list[dict[str, Any]] = []
+    for row in rows:
+        area = str(row["process_area"] or "").upper() or None
+        template = registry.template_for_di_type(row["document_type_key"], stage=area)
+        if template.is_supporting:
+            continue
+        if stage is not None and template.stage not in (stage, "ANY"):
+            continue
+        confidence = float(row["confidence_score"]) if row["confidence_score"] is not None else None
+        if not template.needs_review(str(row["field_key"]), confidence):
+            continue
+        pending.append(
+            {
+                "documentId": str(row["di_document_id"]),
+                "templateKey": template.key,
+                "documentName": template.display_name,
+                "fieldKey": str(row["field_key"]),
+                "canonicalFieldId": row["source_canonical_field_id"],
+                "sourceFactVersion": int(row["source_fact_version"] or 1),
+                "confidence": confidence,
+                "threshold": template.review_threshold_for(str(row["field_key"])),
+            }
+        )
+    return pending
+
+
 def active_conditions(connection: Connection, *, tenant_id: str, journey_id: UUID) -> set[str]:
     """Conditional requirements that apply: PC declaration or observed facts."""
     active: set[str] = set()
@@ -233,6 +294,12 @@ def _evaluate_gate(
             "duplicateReceiptsExcluded": duplicates,
             "shortfall": str(max(minimum - total, Decimal(0))),
         }
+    if gate.kind == "FIELDS_REVIEWED":
+        pending = unreviewed_fields(
+            connection, registry, tenant_id=tenant_id, journey_id=journey_id, stage="BOOKING",
+        )
+        documents = sorted({item["documentName"] for item in pending})
+        return {"passed": not pending, "pendingCount": len(pending), "documents": documents}
     if gate.kind == "NO_OPEN_TASKS":
         pending = open_task_count(
             connection, tenant_id=tenant_id, journey_id=journey_id, task_types=gate.task_types,
@@ -342,7 +409,8 @@ def recompute_journey_stage(
         not item["passed"] for item in gates.values() if item["kind"] in {"DOCUMENT_READY", "PAYMENT_MINIMUM"}
     )
     manual_pending = sum(
-        int(item.get("pendingCount") or 0) for item in gates.values() if item["kind"] == "NO_OPEN_TASKS"
+        int(item.get("pendingCount") or 0)
+        for item in gates.values() if item["kind"] in {"NO_OPEN_TASKS", "FIELDS_REVIEWED"}
     )
     delivery_started = bool(
         connection.execute(

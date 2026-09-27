@@ -28,6 +28,9 @@ _TERMINAL_STATUSES = frozenset({"VERIFIED_COMPLETE", "CANCELLED", "FAILED", "DEA
 # Work has been handed back to the system/requester; the assignee must wait.
 _AWAITING_STATUSES = frozenset({"VERIFYING", "AWAITING_REQUESTER_REVIEW", "ACTION_COMPLETED"})
 _COMMENTARY_ACTIONS = frozenset({"ADD_COMMENT", "PROVIDE_FEEDBACK"})
+# Accepting a machine finding as a legitimate business exception is a
+# supervisory decision, regardless of which role the task is assigned to.
+_EXCEPTION_ROLES = frozenset({"TL", "PM"})
 
 
 class TaskStateError(ValueError):
@@ -292,9 +295,13 @@ def submit_action(
 
     assigned_actor_id = task.get("assigned_actor_id")
     assigned_role_code = str(task.get("assigned_role_code") or "")
-    if assigned_actor_id is not None and str(assigned_actor_id) != actor_id:
+    supervisory = action == "ACCEPT_EXCEPTION"
+    if supervisory:
+        if actor_role_code not in _EXCEPTION_ROLES:
+            raise ValueError("Only a Team Lead or Project Manager can accept an exception")
+    elif assigned_actor_id is not None and str(assigned_actor_id) != actor_id:
         raise ValueError("This task is assigned to a different actor")
-    if assigned_actor_id is None and assigned_role_code and assigned_role_code != actor_role_code:
+    elif assigned_actor_id is None and assigned_role_code and assigned_role_code != actor_role_code:
         raise ValueError(
             f"This task is assigned to role {assigned_role_code}, not {actor_role_code}"
         )
@@ -325,6 +332,34 @@ def submit_action(
             {"tenant_id": tenant_id, "task_id": task_id},
         )
         return {"taskId": str(task_id), "status": "IN_PROGRESS"}
+
+    if supervisory:
+        if not (comment or "").strip():
+            raise ValueError("Accepting an exception requires a comment explaining why")
+        reference = dict(task["reference"] or {})
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_tasks
+                SET task_status='VERIFIED_COMPLETE', verified_at_utc=now(),
+                    completion_result=CAST(:result AS jsonb), updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND task_id=:task_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "task_id": task_id,
+                "result": _json({
+                    "outcome": "EXCEPTION_ACCEPTED",
+                    "acceptedIssueHash": reference.get("issueHash"),
+                    "acceptedBy": actor_id,
+                    "acceptedRole": actor_role_code,
+                    "acceptedAt": datetime.now(UTC).isoformat(),
+                    "comment": comment.strip(),
+                }),
+            },
+        )
+        return {"taskId": str(task_id), "status": "VERIFIED_COMPLETE", "outcome": "EXCEPTION_ACCEPTED"}
 
     if task["task_type"] == _FIELD_CORRECTION_REVIEW_CODE:
         reference = dict(task["reference"] or {})
@@ -569,6 +604,9 @@ def submit_action(
                     "actorId": actor_id,
                     "comment": comment,
                     "details": details or {},
+                    # Only evaluations that start after this instant may
+                    # return the task: results computed earlier are stale.
+                    "submittedAt": datetime.now(UTC).isoformat(),
                 }),
             },
         )

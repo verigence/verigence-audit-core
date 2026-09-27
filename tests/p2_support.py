@@ -243,14 +243,16 @@ def add_evidence(
         ).scalar_one()))
 
 
-def add_ready_document(journey: P2Journey, document_type_key: str, **fields: Any) -> UUID:
-    """ACTIVE evidence plus durable facts: the document counts as ready."""
+def add_ready_document(
+    journey: P2Journey, document_type_key: str, *, confidence: float = 99.0, **fields: Any,
+) -> UUID:
+    """ACTIVE evidence plus durable, high-confidence facts: the document is ready."""
     di_document_id = uuid4()
     add_evidence(journey, di_document_id=di_document_id, document_type_key=document_type_key)
     for key, value in (fields or {"marker": "x"}).items():
         add_extracted_field(
             journey, di_document_id=di_document_id, field_key=key, value=value,
-            document_type=document_type_key,
+            document_type=document_type_key, confidence=confidence,
         )
     return di_document_id
 

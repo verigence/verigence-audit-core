@@ -66,6 +66,10 @@ from audit_core.uc03_p2_runtime import (
 )
 from audit_core.uc03_p2_stage import recompute_journey_stage
 from audit_core.uc03_p2_storage import get_p2_document_storage
+from audit_core.uc03_p2_task_producer import (
+    apply_control_transitions,
+    sync_field_review_tasks,
+)
 from audit_core.uc03_unified_document_capture import (
     _merged_candidate_requirements,
     _receipt_defaults_to_delivery,
@@ -1679,6 +1683,8 @@ def _stage_recompute(engine: Engine, work: WorkItem) -> None:
             tenant_id=work.tenant_id,
             journey_id=work.journey_id,
         )
+        # Field-review work follows the same facts as the gate.
+        sync_field_review_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
         # Gates are fresh: evaluate controls against the same facts.
         request_control_evaluation(
             connection,
@@ -1688,216 +1694,53 @@ def _stage_recompute(engine: Engine, work: WorkItem) -> None:
         )
 
 
-def _task_event(
-    connection,
-    *,
-    work: WorkItem,
-    task_id: UUID,
-    event_type: str,
-    details: dict[str, Any],
-) -> None:
-    connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.p2_task_events (
-                tenant_id, task_id, journey_id, event_type,
-                actor_id, actor_role_code, details
-            ) VALUES (
-                :tenant_id, :task_id, :journey_id, :event_type,
-                'SYSTEM', 'SYSTEM', CAST(:details AS jsonb)
-            )
-            """
-        ),
-        {
-            "tenant_id": work.tenant_id,
-            "task_id": task_id,
-            "journey_id": work.journey_id,
-            "event_type": event_type,
-            "details": json.dumps(details, default=str),
-        },
-    )
-
-
 def _task_verify(engine: Engine, work: WorkItem) -> None:
+    """Machine verification of a task the assignee marked as done.
+
+    Never closes a task on the click: the originating condition is
+    re-evaluated and the result (in the producer) closes or returns it."""
     task_id = UUID(work.work_key)
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
         task = connection.execute(
             text(
                 """
-                SELECT task_id, source_type, source_code, reference,
-                       task_status, completion_protocol
+                SELECT task_id, source_type, source_code, task_status, completion_protocol
                 FROM auditcore.p2_tasks
                 WHERE tenant_id=:tenant_id AND task_id=:task_id
-                FOR UPDATE
                 """
             ),
             {"tenant_id": work.tenant_id, "task_id": task_id},
         ).mappings().one()
-
-        if task["task_status"] == "VERIFIED_COMPLETE":
-            return
         if task["task_status"] != "VERIFYING":
             return
         if task["completion_protocol"] != "MACHINE_VERIFIED":
-            raise RuntimeError(
-                f"Task {task_id} is VERIFYING but is not MACHINE_VERIFIED"
-            )
-
+            raise RuntimeError(f"Task {task_id} is VERIFYING but is not MACHINE_VERIFIED")
         source_type = str(task["source_type"] or "")
-        source_code = str(task["source_code"] or "")
-        if source_type != "RULE" or not source_code:
-            # Activity/document/resolver verification adapters are deliberately
-            # separate contracts. Never silently treat an unsupported machine
-            # verification source as complete.
+        if source_type == "DOCUMENT_FIELD":
+            sync_field_review_tasks(
+                connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+                evaluation_started_at=datetime.now(UTC),
+            )
+            return
+        if source_type != "RULE" or not task["source_code"]:
             raise RuntimeError(
-                f"No P2 machine verification adapter for {source_type}:{source_code}"
+                f"No P2 machine verification adapter for {source_type}:{task['source_code']}"
             )
-
-        state_row = connection.execute(
-            text(
-                """
-                SELECT control_status, evaluated_fact_version,
-                       source_outcome, status_reason
-                FROM auditcore.p2_control_state
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND control_code=:control_code
-                """
-            ),
-            {
-                "tenant_id": work.tenant_id,
-                "journey_id": work.journey_id,
-                "control_code": source_code,
-            },
-        ).mappings().one_or_none()
-
-        state = str(state_row["control_status"]) if state_row else None
-        if state == "PASS":
-            connection.execute(
-                text(
-                    """
-                    UPDATE auditcore.p2_tasks
-                    SET task_status='VERIFIED_COMPLETE',
-                        verified_at_utc=now(),
-                        completion_result=completion_result || CAST(:result AS jsonb),
-                        updated_at_utc=now()
-                    WHERE tenant_id=:tenant_id AND task_id=:task_id
-                    """
-                ),
-                {
-                    "tenant_id": work.tenant_id,
-                    "task_id": task_id,
-                    "result": json.dumps({
-                        "machineVerification": "PASS",
-                        "controlCode": source_code,
-                        "factVersion": state_row["evaluated_fact_version"],
-                    }),
-                },
-            )
-            _task_event(
-                connection,
-                work=work,
-                task_id=task_id,
-                event_type="MACHINE_VERIFICATION_PASS",
-                details={"controlCode": source_code},
-            )
-            return
-
-        if state == "FAIL":
-            connection.execute(
-                text(
-                    """
-                    UPDATE auditcore.p2_tasks
-                    SET task_status='RETURNED',
-                        completion_result=completion_result || CAST(:result AS jsonb),
-                        updated_at_utc=now()
-                    WHERE tenant_id=:tenant_id AND task_id=:task_id
-                    """
-                ),
-                {
-                    "tenant_id": work.tenant_id,
-                    "task_id": task_id,
-                    "result": json.dumps({
-                        "machineVerification": "FAIL",
-                        "controlCode": source_code,
-                        "factVersion": state_row["evaluated_fact_version"],
-                    }),
-                },
-            )
-            _task_event(
-                connection,
-                work=work,
-                task_id=task_id,
-                event_type="MACHINE_VERIFICATION_FAIL",
-                details={"controlCode": source_code},
-            )
-            return
-
-        if state == "ERROR_TERMINAL":
-            connection.execute(
-                text(
-                    """
-                    UPDATE auditcore.p2_tasks
-                    SET task_status='FAILED',
-                        completion_result=completion_result || CAST(:result AS jsonb),
-                        updated_at_utc=now()
-                    WHERE tenant_id=:tenant_id AND task_id=:task_id
-                    """
-                ),
-                {
-                    "tenant_id": work.tenant_id,
-                    "task_id": task_id,
-                    "result": json.dumps({
-                        "machineVerification": "ERROR_TERMINAL",
-                        "controlCode": source_code,
-                        "reason": state_row["status_reason"],
-                    }),
-                },
-            )
-            _task_event(
-                connection,
-                work=work,
-                task_id=task_id,
-                event_type="MACHINE_VERIFICATION_ERROR",
-                details={
-                    "controlCode": source_code,
-                    "reason": state_row["status_reason"],
-                },
-            )
-            return
-
-        fact_version = connection.execute(
-            text(
-                """
-                SELECT fact_version
-                FROM auditcore.p2_journey_runtime
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                """
-            ),
-            {
-                "tenant_id": work.tenant_id,
-                "journey_id": work.journey_id,
-            },
-        ).scalar_one_or_none()
-
-        _enqueue(
-            connection,
-            tenant_id=work.tenant_id,
-            journey_id=work.journey_id,
-            work_type="CONTROL_EVALUATE",
-            work_key=f"{work.journey_id}:{source_code}",
-            payload={"controlCode": source_code, "taskId": str(task_id)},
-            correlation_id=work.correlation_id,
-            requested_version=int(fact_version) if fact_version is not None else None,
+        if str(task["source_code"]) not in get_registry().controls:
+            raise RuntimeError(f"Task {task_id} references unknown control {task['source_code']}")
+        # Re-evaluate every unit now (fingerprints are bypassed); the control
+        # transition hook closes or returns the task from a fresh result.
+        request_control_evaluation(
+            connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+            correlation_id=work.correlation_id, delay_seconds=0, force=True,
         )
-        # Event-driven: the task stays VERIFYING. A rule_executions insert
-        # mirrors a fresh state and wakes TASK_VERIFY. A later fact change
-        # requeues CONTROL_EVALUATE for VERIFYING tasks. No polling loop.
 
 
 def _control_evaluate(engine: Engine, work: WorkItem) -> None:
     unit = work.payload.get("unit")
     if unit:
+        started_at = datetime.now(UTC)
         transitions = evaluate_unit(
             engine,
             tenant_id=work.tenant_id,
@@ -1907,7 +1750,7 @@ def _control_evaluate(engine: Engine, work: WorkItem) -> None:
             force=bool(work.payload.get("force")),
         )
         if transitions:
-            on_control_transitions(engine, work=work, transitions=transitions)
+            on_control_transitions(engine, work=work, transitions=transitions, started_at=started_at)
         return
     # Items queued before the ledger existed name a single control: evaluate
     # every unit instead (units are fingerprint-skipped when nothing changed).
@@ -1919,9 +1762,16 @@ def _control_evaluate(engine: Engine, work: WorkItem) -> None:
         )
 
 
-def on_control_transitions(engine: Engine, *, work: WorkItem, transitions: list) -> None:
-    """Hook for control state changes (task production/verification, M3)."""
-    return
+def on_control_transitions(engine: Engine, *, work: WorkItem, transitions: list, started_at: datetime) -> None:
+    """Raise, refresh, verify or return machine tasks from fresh control results."""
+    with engine.begin() as connection:
+        set_tenant_context(connection, work.tenant_id)
+        counts = apply_control_transitions(
+            connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+            transitions=transitions, evaluation_started_at=started_at,
+        )
+    if counts:
+        logger.info("p2_control_tasks", tenant_id=work.tenant_id, journey_id=str(work.journey_id), **counts)
 
 
 def process_work(engine: Engine, work: WorkItem) -> None:
