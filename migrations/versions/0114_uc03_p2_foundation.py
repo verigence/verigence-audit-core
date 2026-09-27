@@ -332,7 +332,7 @@ def upgrade() -> None:
           USING (tenant_id = auditcore.current_tenant_id())
           WITH CHECK (tenant_id = auditcore.current_tenant_id());
 
-        GRANT SELECT, INSERT, UPDATE, DELETE ON
+        GRANT SELECT, INSERT, UPDATE ON
           auditcore.p2_upload_batches,
           auditcore.p2_document_queue,
           auditcore.p2_work_queue,
@@ -343,6 +343,18 @@ def upgrade() -> None:
           auditcore.p2_task_events,
           auditcore.p2_activity_events
         TO audit_core_runtime;
+
+        REVOKE DELETE ON
+          auditcore.p2_upload_batches,
+          auditcore.p2_document_queue,
+          auditcore.p2_work_queue,
+          auditcore.p2_journey_runtime,
+          auditcore.p2_stage_gate_state,
+          auditcore.p2_control_state,
+          auditcore.p2_tasks,
+          auditcore.p2_task_events,
+          auditcore.p2_activity_events
+        FROM audit_core_runtime;
 
         GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA auditcore TO audit_core_runtime;
         """
