@@ -6,7 +6,7 @@ Key runtime rules:
 - browser uploads directly to existing S3-compatible Audit Core storage
 - Audit Core only acknowledges after the object exists and a durable work row is committed
 - PDF splitting, DI submission, reconciliation, rule/task verification are worker work
-- Security is the single authorization authority for P2 routes
+- P2 routes use one access adapter: Security permission + existing business-assignment Journey scope
 """
 from __future__ import annotations
 
@@ -910,19 +910,37 @@ def list_tasks(
                    raised_by_actor_id, raised_by_role_code, allowed_actions,
                    completion_protocol, task_status, due_at_utc,
                    created_at_utc, updated_at_utc
-            FROM auditcore.p2_tasks
-            WHERE tenant_id=:tenant_id
-              AND (:journey_id IS NULL OR journey_id=:journey_id)
-              AND (:status IS NULL OR task_status=:status)
+            FROM auditcore.p2_tasks t
+            WHERE t.tenant_id=:tenant_id
+              AND (:journey_id IS NULL OR t.journey_id=:journey_id)
+              AND (:status IS NULL OR t.task_status=:status)
+              AND EXISTS (
+                SELECT 1
+                FROM auditcore.journeys j
+                JOIN auditcore.business_assignments ba
+                  ON ba.tenant_id=j.tenant_id
+                 AND ba.security_actor_id=:actor_id
+                 AND ba.assignment_status='ACTIVE'
+                 AND ba.effective_from <= now()
+                 AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+                 AND (
+                   ba.dealer_id IS NULL
+                   OR (
+                     ba.dealer_id=j.dealer_id
+                     AND (ba.outlet_id IS NULL OR ba.outlet_id=j.outlet_id)
+                   )
+                 )
+                WHERE j.tenant_id=t.tenant_id AND j.journey_id=t.journey_id
+              )
             ORDER BY
-              CASE priority
+              CASE t.priority
                 WHEN 'URGENT' THEN 1
                 WHEN 'HIGH' THEN 2
                 WHEN 'NORMAL' THEN 3
                 ELSE 4
               END,
-              due_at_utc NULLS LAST,
-              created_at_utc
+              t.due_at_utc NULLS LAST,
+              t.created_at_utc
             LIMIT 500
             """
         ),
@@ -930,6 +948,7 @@ def list_tasks(
             "tenant_id": tenant_id,
             "journey_id": journey_id,
             "status": status,
+            "actor_id": human_principal.subject,
         },
     ).mappings().all()
     items: list[dict[str, Any]] = []
@@ -959,10 +978,30 @@ def task_action(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
-    access = _authorize(
+    _authorize(
         connection,
         tenant_id=tenant_id,
         journey_id=None,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        permission_key=_UPDATE_PERMISSION,
+    )
+    task_journey_id = connection.execute(
+        text(
+            """
+            SELECT journey_id
+            FROM auditcore.p2_tasks
+            WHERE tenant_id=:tenant_id AND task_id=:task_id
+            """
+        ),
+        {"tenant_id": tenant_id, "task_id": task_id},
+    ).scalar_one_or_none()
+    if task_journey_id is None:
+        raise HTTPException(status_code=404, detail="Task was not found.")
+    access = _authorize(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=UUID(str(task_journey_id)),
         human_principal=human_principal,
         authorization_client=authorization_client,
         permission_key=_UPDATE_PERMISSION,
@@ -974,7 +1013,7 @@ def task_action(
             task_id=task_id,
             action=command.action,
             actor_id=human_principal.subject,
-            actor_role_code=access.functional_role or "USER",
+            actor_role_code=access.operating_role or access.functional_role or "USER",
             comment=command.comment,
             details=command.details,
         )
