@@ -69,6 +69,7 @@ from audit_core.uc03_p2_storage import get_p2_document_storage
 from audit_core.uc03_p2_task_producer import (
     apply_control_transitions,
     sync_field_review_tasks,
+    sync_vehicle_photo_task,
 )
 from audit_core.uc03_unified_document_capture import (
     _merged_candidate_requirements,
@@ -1688,8 +1689,9 @@ def _stage_recompute(engine: Engine, work: WorkItem) -> None:
             tenant_id=work.tenant_id,
             journey_id=work.journey_id,
         )
-        # Field-review work follows the same facts as the gate.
+        # Field-review and vehicle-photo work follow the same facts as the gate.
         sync_field_review_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
+        sync_vehicle_photo_task(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
         # Gates are fresh: evaluate controls against the same facts.
         request_control_evaluation(
             connection,
@@ -1724,6 +1726,12 @@ def _task_verify(engine: Engine, work: WorkItem) -> None:
         source_type = str(task["source_type"] or "")
         if source_type == "DOCUMENT_FIELD":
             sync_field_review_tasks(
+                connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+                evaluation_started_at=datetime.now(UTC),
+            )
+            return
+        if source_type == "EVIDENCE" and task["source_code"] == "VEHICLE_PHOTOS":
+            sync_vehicle_photo_task(
                 connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
                 evaluation_started_at=datetime.now(UTC),
             )

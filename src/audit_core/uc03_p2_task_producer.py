@@ -456,3 +456,50 @@ def sync_field_review_tasks(
                             evidence={"allFieldsReviewed": True, "verifiedAt": datetime.now(UTC).isoformat()})
             counts["VERIFIED"] = counts.get("VERIFIED", 0) + 1
     return counts
+
+
+def sync_vehicle_photo_task(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    registry: Registry | None = None,
+    evaluation_started_at: datetime | None = None,
+) -> str | None:
+    """DELIVERY_VEHICLE_PHOTOS_MISSING while Delivery is under way and no
+    vehicle photo is on file; the task closes itself on the first photo."""
+    registry = registry or get_registry()
+    row = connection.execute(
+        text(
+            """
+            SELECT
+              (SELECT current_stage FROM auditcore.p2_journey_runtime
+                WHERE tenant_id=:t AND journey_id=:j) AS stage,
+              (SELECT COUNT(*) FROM auditcore.delivery_vehicle_photos
+                WHERE tenant_id=:t AND journey_id=:j AND deleted_at_utc IS NULL) AS photos
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one()
+    dedupe_key = f"vehicle-photos:{journey_id}"
+    in_delivery = str(row["stage"] or "").startswith("DELIVERY")
+    if in_delivery and not row["photos"]:
+        _, outcome = raise_or_refresh(
+            connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=dedupe_key,
+            task_type="DELIVERY_VEHICLE_PHOTOS_MISSING", source_type="EVIDENCE",
+            source_code="VEHICLE_PHOTOS",
+            title="Add vehicle photos",
+            description=(
+                "Delivery has started but no photo of the vehicle is on file. Take or upload photos "
+                "of the delivered vehicle (front, rear, sides, odometer) from the booking's Photos tab."
+            ),
+            reference={"generatedBy": "SYSTEM", "sourceType": "EVIDENCE", "sourceCode": "VEHICLE_PHOTOS",
+                       "photoCount": 0},
+            severity="MEDIUM", registry=registry, evaluation_started_at=evaluation_started_at,
+        )
+        return outcome
+    if row["photos"]:
+        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=dedupe_key,
+                        evidence={"photoCount": int(row["photos"]), "verifiedAt": datetime.now(UTC).isoformat()})
+        return "VERIFIED"
+    return None

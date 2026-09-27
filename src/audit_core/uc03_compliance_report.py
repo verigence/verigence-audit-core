@@ -533,6 +533,14 @@ def get_compliance_report(
         outlet_id=journey["outlet_id"],
     )
 
+    return build_compliance_report(connection, tenant_id=tenant_id, journey_id=journey_id)
+
+
+def build_compliance_report(
+    connection: Connection, *, tenant_id: str, journey_id: UUID
+) -> ComplianceReportResponse:
+    """The report body; callers authorize and set tenant context first
+    (shared by this route and the Phase 2 compliance report)."""
     header = _header(connection, tenant_id, journey_id)
     findings = _findings(connection, tenant_id, journey_id)
 

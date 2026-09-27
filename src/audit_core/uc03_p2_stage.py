@@ -361,11 +361,27 @@ def delivery_readiness(
             received.append(template.key)
         else:
             missing.append({"key": template.key, "label": template.display_name})
+    # Vehicle photos are plain evidence (never classified or extracted) but
+    # Delivery is not ready without them.
+    photos = int(connection.execute(
+        text(
+            """
+            SELECT COUNT(*) FROM auditcore.delivery_vehicle_photos
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND deleted_at_utc IS NULL
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalar_one())
+    if photos:
+        received.append("vehicle_photos")
+    else:
+        missing.append({"key": "vehicle_photos", "label": "Vehicle photos"})
     return {
         "passed": not missing,
-        "requiredCount": len(required),
+        "requiredCount": len(required) + 1,
         "receivedCount": len(received),
         "missing": missing,
+        "vehiclePhotos": photos,
     }
 
 

@@ -76,7 +76,11 @@ _FINGERPRINT_SQL = text(
       (SELECT concat_ws(':', COUNT(*), MAX(updated_at_utc))
          FROM auditcore.workflow_tasks
         WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-          AND task_type='MANUAL_VERIFICATION_REVIEW') AS legacy_review
+          AND task_type='MANUAL_VERIFICATION_REVIEW') AS legacy_review,
+      (SELECT concat_ws(':', COUNT(*) FILTER (WHERE deleted_at_utc IS NULL),
+                        MAX(COALESCE(deleted_at_utc, uploaded_at_utc)))
+         FROM auditcore.delivery_vehicle_photos
+        WHERE tenant_id=:tenant_id AND journey_id=:journey_id) AS photos
     """
 )
 
@@ -85,7 +89,7 @@ def fact_fingerprint(connection: Connection, *, tenant_id: str, journey_id: UUID
     row = connection.execute(
         _FINGERPRINT_SQL, {"tenant_id": tenant_id, "journey_id": journey_id}
     ).mappings().one()
-    material = "|".join(str(row[key] or "") for key in ("facts", "payments", "evidence", "legacy_review"))
+    material = "|".join(str(row[key] or "") for key in ("facts", "payments", "evidence", "legacy_review", "photos"))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 

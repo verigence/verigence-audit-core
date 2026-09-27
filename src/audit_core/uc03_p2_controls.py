@@ -250,6 +250,92 @@ def _finding_summary(connection: Connection, *, tenant_id: str, finding_id: UUID
     }
 
 
+def _open_finding_for(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                      code: str) -> UUID | None:
+    """The open finding a native rule raised, when the execution log did not
+    link it (the legacy runner records executions without a finding id).
+    Rule keys are the control code, or code:<qualifier> for per-pair rules
+    such as DUPLICATE_BOOKING:<other journey>."""
+    value = connection.execute(
+        text(
+            """
+            SELECT audit_finding_id FROM auditcore.audit_findings
+            WHERE tenant_id=:t AND journey_id=:j AND finding_status IN ('OPEN','ACKNOWLEDGED')
+              AND (rule_key=:code OR rule_key LIKE :prefix OR finding_type_code=:code)
+            ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END,
+                     created_at_utc DESC
+            LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "code": code, "prefix": f"{code}:%"},
+    ).scalar_one_or_none()
+    return UUID(str(value)) if value is not None else None
+
+
+def _raised_payload(connection: Connection, *, tenant_id: str, finding_id: UUID | None) -> dict[str, Any]:
+    if finding_id is None:
+        return {}
+    payload = connection.execute(
+        text(
+            """
+            SELECT safe_payload FROM auditcore.audit_finding_events
+            WHERE tenant_id=:t AND audit_finding_id=:f
+            ORDER BY occurred_at_utc LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "f": finding_id},
+    ).scalar_one_or_none()
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _resolve_stale_rule_engine_findings(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                                        stage: str, codes: list[str], correlation_id: str) -> int:
+    """A Rule Engine anomaly that is no longer reported is fixed: close its
+    finding so Findings, the compliance report and the legacy queue agree
+    with the control ledger."""
+    if not codes:
+        return 0
+    from audit_core.uc03_manual_verification import _resolve_finding
+    from audit_core.uc03_rule_engine_findings import _RULE_KEY_PREFIX
+
+    rows = connection.execute(
+        text(
+            """
+            SELECT audit_finding_id FROM auditcore.audit_findings
+            WHERE tenant_id=:t AND journey_id=:j AND finding_status IN ('OPEN','ACKNOWLEDGED')
+              AND rule_key = ANY(:keys)
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "keys": [f"{_RULE_KEY_PREFIX}{c}" for c in codes]},
+    ).scalars().all()
+    for finding_id in rows:
+        _resolve_finding(
+            connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage,
+            finding_id=finding_id, actor_id=None, correlation_id=correlation_id,
+            note="The Rule Engine no longer reports this anomaly.",
+        )
+    return len(rows)
+
+
+def _native_details(connection: Connection, *, tenant_id: str, control: ControlTemplate,
+                    finding_id: UUID | None) -> dict[str, Any]:
+    """Structured facts a reviewer needs from a native finding's payload."""
+    payload = _raised_payload(connection, tenant_id=tenant_id, finding_id=finding_id)
+    if not payload:
+        return {}
+    if control.code == "DUPLICATE_BOOKING":
+        return {
+            "matchBasis": payload.get("matchBasis"),
+            "matchConfidencePercent": payload.get("matchConfidencePercent"),
+            "matchConfidenceLabel": payload.get("matchConfidenceLabel"),
+            "otherJourneyId": payload.get("otherJourneyId") or payload.get("believedOriginalJourneyId"),
+            "believedOriginalJourneyId": payload.get("believedOriginalJourneyId"),
+            "originalityBasis": payload.get("originalityBasis"),
+        }
+    keep = ("leftValue", "rightValue", "expected", "observed", "variance", "standardNet", "actualNet")
+    return {k: payload[k] for k in keep if k in payload}
+
+
 # ----------------------------------------------------------------- executors
 
 def _evaluate_native(engine: Engine, *, tenant_id: str, journey_id: UUID, stage: str,
@@ -278,6 +364,10 @@ def _evaluate_native(engine: Engine, *, tenant_id: str, journey_id: UUID, stage:
             status = _OUTCOME_TO_STATE.get(outcome, "RETRY_PENDING")
             execution = executions.get(control.code) or {}
             finding_id = execution.get("audit_finding_id") if status == "FAIL" else None
+            if status == "FAIL" and finding_id is None:
+                finding_id = _open_finding_for(
+                    connection, tenant_id=tenant_id, journey_id=journey_id, code=control.code,
+                )
             reason = execution.get("reason")
             if status == "RETRY_PENDING":
                 errors.append(control.code)
@@ -286,7 +376,11 @@ def _evaluate_native(engine: Engine, *, tenant_id: str, journey_id: UUID, stage:
                 write_control_state(
                     connection, tenant_id=tenant_id, journey_id=journey_id, control=control,
                     status=status, stage=stage, reason=reason, finding_id=finding_id,
-                    details=_finding_summary(connection, tenant_id=tenant_id, finding_id=finding_id),
+                    details={
+                        **_finding_summary(connection, tenant_id=tenant_id, finding_id=finding_id),
+                        **_native_details(connection, tenant_id=tenant_id, control=control,
+                                          finding_id=finding_id),
+                    },
                     fact_version=version,
                 )
             )
@@ -392,6 +486,11 @@ def _evaluate_external(engine: Engine, *, tenant_id: str, journey_id: UUID, stag
                     finding_id=finding_id, fact_version=version,
                 )
             )
+        _resolve_stale_rule_engine_findings(
+            connection, tenant_id=tenant_id, journey_id=journey_id, stage=stage,
+            codes=[t.control_code for t in transitions if t.current in {"PASS", "NOT_APPLICABLE"}],
+            correlation_id=correlation_id,
+        )
     return transitions
 
 

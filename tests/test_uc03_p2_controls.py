@@ -223,3 +223,63 @@ def test_statistics_are_attributed_to_stages(journey):
         stats = controls.control_statistics(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     assert stats["BOOKING"]["total"] > 0 and stats["DELIVERY"]["total"] > 0
     assert sum(v for k, v in stats["BOOKING"].items() if k != "total") == stats["BOOKING"]["total"]
+
+
+def test_rule_engine_pass_resolves_the_stale_finding(journey, monkeypatch):
+    from audit_core.uc03_delivery_commands import _machine_flag
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        stale = _machine_flag(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id, stage_code="BOOKING",
+            rule_key="RE_KYC_NAME_VS_BOOKING", finding_type="CUSTOMER_IDENTITY_CONCERN", severity="HIGH",
+            title="Name differs", description="old anomaly", correlation_id="t", safe_payload={},
+            blocking_completion=False,
+        )
+    _wire_rule_engine(monkeypatch, FakeRuleEngine())
+    _evaluate(journey, "RULE_ENGINE:BOOKING")
+    assert _states(journey)["KYC_NAME_VS_BOOKING"]["control_status"] == "PASS"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        status = connection.execute(
+            text("SELECT finding_status FROM auditcore.audit_findings WHERE tenant_id=:t AND audit_finding_id=:f"),
+            {"t": journey.tenant_id, "f": stale},
+        ).scalar_one()
+    assert status == "RESOLVED"
+
+
+def _second_journey(journey):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        customer_id = connection.execute(
+            text("INSERT INTO auditcore.customers (tenant_id, dealer_id, outlet_id, customer_type_code, "
+                 "display_name) VALUES (:t, :d, :o, 'INDIVIDUAL', 'Second') RETURNING customer_id"),
+            {"t": journey.tenant_id, "d": journey.dealer_id, "o": journey.outlet_id},
+        ).scalar_one()
+        journey_id = connection.execute(
+            text("INSERT INTO auditcore.journeys (tenant_id, dealer_id, outlet_id, customer_id, journey_reference, "
+                 "created_at_utc) VALUES (:t, :d, :o, :c, :r, now() + interval '1 minute') RETURNING journey_id"),
+            {"t": journey.tenant_id, "d": journey.dealer_id, "o": journey.outlet_id, "c": customer_id,
+             "r": f"P2-J2-{uuid4().hex[:8]}"},
+        ).scalar_one()
+    from dataclasses import replace
+
+    return replace(journey, journey_id=journey_id, customer_id=customer_id)
+
+
+def test_duplicate_booking_fail_links_its_finding_and_match(journey):
+    add_ready_document(journey, "pan_card", pan_number="ABCDE1234F", pan_name="RAVI KUMAR")
+    second = _second_journey(journey)
+    add_ready_document(second, "pan_card", pan_number="ABCDE1234F", pan_name="RAVI KUMAR")
+    _evaluate(second, "NATIVE:BOOKING")
+    duplicate = _states(second)["DUPLICATE_BOOKING"]
+    assert duplicate["control_status"] == "FAIL"
+    assert duplicate["details"]["matchBasis"]
+    assert duplicate["details"]["believedOriginalJourneyId"] == str(journey.journey_id)
+    with second.engine.begin() as connection:
+        set_tenant_context(connection, second.tenant_id)
+        linked = connection.execute(
+            text("SELECT finding_id FROM auditcore.p2_control_state WHERE tenant_id=:t AND journey_id=:j "
+                 "AND control_code='DUPLICATE_BOOKING'"), {"t": second.tenant_id, "j": second.journey_id},
+        ).scalar_one()
+    assert linked is not None
