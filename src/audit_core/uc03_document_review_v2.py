@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -53,6 +54,16 @@ router = APIRouter(
 logger = structlog.get_logger(__name__)
 
 _FAILED_PROCESSING = {"FAILED", "ERROR", "REJECTED"}
+# _review_document is pure DI-client HTTP calls, no database connection --
+# safe to run concurrently across documents (unlike the stage-level fetches
+# in _all_review_documents, which share a connection via _reconcile_documents
+# and stay sequential for that reason). Root-caused live (2026-09-27): a
+# journey with several real documents still took 12.3s on
+# /uc03/documents/review after the empty-journey fix, because this exact
+# per-document loop ran one real DI round trip at a time. Capped, not
+# unbounded -- a journey with many repeatable-receipt uploads shouldn't open
+# dozens of concurrent connections to DI at once.
+_REVIEW_DOCUMENT_MAX_WORKERS = 8
 
 
 class ReviewV2Field(BaseModel):
@@ -575,10 +586,12 @@ def _v2_documents_for_stage(
         for row in (requirements or [])
         if row.get("requirement_key")
     }
-    documents: list[ReviewV2Document] = []
-    for di_status in di_documents:
-        if str(di_status.get("state") or "").upper() != "CLASSIFIED":
-            continue
+    classified = [
+        di_status for di_status in di_documents
+        if str(di_status.get("state") or "").upper() == "CLASSIFIED"
+    ]
+
+    def _fetch_one(di_status: dict[str, Any]) -> ReviewV2Document:
         document_id = UUID(str(di_status["documentId"]))
         link = link_by_id.get(str(document_id), {})
         requirement_key = str(link["requirement_key"]) if link.get("requirement_key") else None
@@ -589,20 +602,18 @@ def _v2_documents_for_stage(
             else str(di_status.get("classifiedDocumentTypeKey") or requirement_key or "Document")
         )
         try:
-            documents.append(
-                _review_document(
-                    token=token,
-                    tenant_id=tenant_id,
-                    context_ref=context_ref,
-                    di_client=di_client,
-                    document_id=document_id,
-                    label=label,
-                    original_filename=str(di_status.get("originalFilename") or link.get("original_filename") or document_id),
-                    document_type_key=(di_status.get("classifiedDocumentTypeKey") or link.get("classified_document_type_key")),
-                    requirement_key=requirement_key,
-                    content_url=di_status.get("contentUrl"),
-                    processing_status_hint=di_status.get("processingStatus"),
-                )
+            return _review_document(
+                token=token,
+                tenant_id=tenant_id,
+                context_ref=context_ref,
+                di_client=di_client,
+                document_id=document_id,
+                label=label,
+                original_filename=str(di_status.get("originalFilename") or link.get("original_filename") or document_id),
+                document_type_key=(di_status.get("classifiedDocumentTypeKey") or link.get("classified_document_type_key")),
+                requirement_key=requirement_key,
+                content_url=di_status.get("contentUrl"),
+                processing_status_hint=di_status.get("processingStatus"),
             )
         except DiClientError as exc:
             # A non-retryable DI error for ONE document used to raise
@@ -628,20 +639,22 @@ def _v2_documents_for_stage(
                 status_code=exc.status_code,
                 code=exc.code,
             )
-            documents.append(
-                ReviewV2Document(
-                    documentId=document_id,
-                    requirementKey=requirement_key,
-                    label=label,
-                    documentTypeKey=(di_status.get("classifiedDocumentTypeKey") or link.get("classified_document_type_key")),
-                    originalFilename=str(di_status.get("originalFilename") or link.get("original_filename") or document_id),
-                    contentUrl=di_status.get("contentUrl"),
-                    processingStatus=str(di_status.get("processingStatus") or "PROCESSING"),
-                    extractionState="PENDING" if exc.retryable else "FAILED",
-                    fields=[],
-                )
+            return ReviewV2Document(
+                documentId=document_id,
+                requirementKey=requirement_key,
+                label=label,
+                documentTypeKey=(di_status.get("classifiedDocumentTypeKey") or link.get("classified_document_type_key")),
+                originalFilename=str(di_status.get("originalFilename") or link.get("original_filename") or document_id),
+                contentUrl=di_status.get("contentUrl"),
+                processingStatus=str(di_status.get("processingStatus") or "PROCESSING"),
+                extractionState="PENDING" if exc.retryable else "FAILED",
+                fields=[],
             )
-    return documents
+
+    if not classified:
+        return []
+    with ThreadPoolExecutor(max_workers=min(len(classified), _REVIEW_DOCUMENT_MAX_WORKERS)) as executor:
+        return list(executor.map(_fetch_one, classified))
 
 
 def _legacy_documents(
@@ -655,35 +668,35 @@ def _legacy_documents(
     stages: tuple[str, ...],
     excluded_document_ids: set[str],
 ) -> list[ReviewV2Document]:
-    documents: list[ReviewV2Document] = []
-    for link in _legacy_evidence_links(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        stages=stages,
-    ):
+    links = [
+        link for link in _legacy_evidence_links(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stages=stages,
+        )
+        if str(link["di_document_id"]) not in excluded_document_ids
+    ]
+
+    def _fetch_one(link: dict[str, Any]) -> ReviewV2Document:
         document_id = UUID(str(link["di_document_id"]))
-        if str(document_id) in excluded_document_ids:
-            continue
         document_type = str(link["document_type_key"]) if link.get("document_type_key") else None
         requirement_key = str(link["requirement_key"]) if link.get("requirement_key") else None
         label = requirement_key.replace("_", " ").title() if requirement_key else (document_type or "Document")
         try:
-            documents.append(
-                _review_document(
-                    token=token,
-                    tenant_id=tenant_id,
-                    context_ref=context_ref,
-                    di_client=di_client,
-                    document_id=document_id,
-                    evidence_id=UUID(str(link["evidence_id"])),
-                    label=label,
-                    original_filename=f"{label} · {str(document_id)[:8]}",
-                    document_type_key=document_type,
-                    requirement_key=requirement_key,
-                    content_url=None,
-                    processing_status_hint=None,
-                )
+            return _review_document(
+                token=token,
+                tenant_id=tenant_id,
+                context_ref=context_ref,
+                di_client=di_client,
+                document_id=document_id,
+                evidence_id=UUID(str(link["evidence_id"])),
+                label=label,
+                original_filename=f"{label} · {str(document_id)[:8]}",
+                document_type_key=document_type,
+                requirement_key=requirement_key,
+                content_url=None,
+                processing_status_hint=None,
             )
         except DiClientError as exc:
             # Same fix as _v2_documents_for_stage's own identical except
@@ -699,21 +712,23 @@ def _legacy_documents(
                 status_code=exc.status_code,
                 code=exc.code,
             )
-            documents.append(
-                ReviewV2Document(
-                    documentId=document_id,
-                    evidenceId=UUID(str(link["evidence_id"])),
-                    requirementKey=requirement_key,
-                    label=label,
-                    documentTypeKey=document_type,
-                    originalFilename=f"{label} · {str(document_id)[:8]}",
-                    contentUrl=None,
-                    processingStatus="PROCESSING" if exc.retryable else "FAILED",
-                    extractionState="PENDING" if exc.retryable else "FAILED",
-                    fields=[],
-                )
+            return ReviewV2Document(
+                documentId=document_id,
+                evidenceId=UUID(str(link["evidence_id"])),
+                requirementKey=requirement_key,
+                label=label,
+                documentTypeKey=document_type,
+                originalFilename=f"{label} · {str(document_id)[:8]}",
+                contentUrl=None,
+                processingStatus="PROCESSING" if exc.retryable else "FAILED",
+                extractionState="PENDING" if exc.retryable else "FAILED",
+                fields=[],
             )
-    return documents
+
+    if not links:
+        return []
+    with ThreadPoolExecutor(max_workers=min(len(links), _REVIEW_DOCUMENT_MAX_WORKERS)) as executor:
+        return list(executor.map(_fetch_one, links))
 
 
 def _all_review_documents(
