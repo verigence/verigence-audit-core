@@ -859,6 +859,305 @@ def overview_summary(
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().one()
 
+    delivery_state = connection.execute(
+        text(
+            """
+            SELECT delivery_completion_state
+            FROM auditcore.p2_journey_runtime
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalar_one_or_none()
+    stage_summary = {
+        **booking,
+        "deliveryCompletionState": str(delivery_state or "IN_PROGRESS"),
+        "deliveryConfiguration": "PENDING_BUSINESS_RULES",
+    }
+
+    queue_rows = connection.execute(
+        text(
+            """
+            SELECT upper(COALESCE(business_stage,'')) AS stage,
+                   COUNT(*) AS pages,
+                   COUNT(*) FILTER (
+                     WHERE queue_status IN ('READY','NEEDS_REVIEW')
+                   ) AS pages_processed,
+                   COUNT(*) FILTER (
+                     WHERE queue_status IN ('FAILED','DEAD_LETTER')
+                   ) AS failures,
+                   COALESCE(SUM(GREATEST(attempt_count - 1, 0)),0) AS retries
+            FROM auditcore.p2_document_queue
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            GROUP BY upper(COALESCE(business_stage,''))
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    queue_by_stage = {str(row["stage"]): dict(row) for row in queue_rows}
+
+    delivery_requirements = connection.execute(
+        text(
+            """
+            SELECT
+              COUNT(*) FILTER (
+                WHERE upper(requirement_level)='REQUIRED'
+              ) AS required,
+              COUNT(*) FILTER (
+                WHERE upper(requirement_level)='REQUIRED'
+                  AND EXISTS (
+                    SELECT 1
+                    FROM auditcore.evidence e
+                    WHERE e.tenant_id=r.tenant_id
+                      AND e.journey_id=r.journey_id
+                      AND e.association_status='ACTIVE'
+                      AND upper(COALESCE(e.process_area,''))='DELIVERY'
+                      AND e.document_type_key=r.document_type_key
+                  )
+              ) AS received
+            FROM auditcore.journey_document_requirements r
+            WHERE r.tenant_id=:tenant_id
+              AND r.journey_id=:journey_id
+              AND upper(r.process_area)='DELIVERY'
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one()
+
+    delivery_business = connection.execute(
+        text(
+            """
+            SELECT
+              (
+                SELECT COUNT(DISTINCT e.di_document_id)
+                FROM auditcore.evidence e
+                WHERE e.tenant_id=:tenant_id
+                  AND e.journey_id=:journey_id
+                  AND e.association_status='ACTIVE'
+                  AND upper(COALESCE(e.process_area,''))='DELIVERY'
+                  AND e.document_type_key = ANY(:invoice_types)
+              ) AS invoices,
+              (
+                SELECT COUNT(*)
+                FROM auditcore.finance_records x
+                WHERE x.tenant_id=:tenant_id AND x.journey_id=:journey_id
+              ) AS finance_records,
+              (
+                SELECT COUNT(*)
+                FROM auditcore.insurance_records x
+                WHERE x.tenant_id=:tenant_id AND x.journey_id=:journey_id
+              ) AS insurance_records,
+              (
+                SELECT COUNT(*)
+                FROM auditcore.vehicle_records x
+                WHERE x.tenant_id=:tenant_id AND x.journey_id=:journey_id
+              ) AS vehicle_records,
+              (
+                SELECT COUNT(*)
+                FROM auditcore.registration_records x
+                WHERE x.tenant_id=:tenant_id AND x.journey_id=:journey_id
+              ) AS registration_records
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "invoice_types": [
+                "wholesale_invoice",
+                "customer_invoice_dms",
+                "tax_invoice_tally",
+                "accessory_invoice_dms",
+                "accessory_invoice_tally",
+                "ew_invoice",
+                "rsa_invoice",
+            ],
+        },
+    ).mappings().one()
+
+    control_rows = connection.execute(
+        text(
+            """
+            WITH latest_execution AS (
+              SELECT DISTINCT ON (rule_code)
+                     rule_code, triggering_event
+              FROM auditcore.rule_executions
+              WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              ORDER BY rule_code, evaluated_at_utc DESC, rule_execution_id DESC
+            ),
+            classified AS (
+              SELECT s.control_status,
+                     CASE
+                       WHEN upper(COALESCE(e.triggering_event,'')) LIKE '%BOOKING%'
+                         OR s.control_code LIKE 'BK\\_%' ESCAPE '\\'
+                         THEN 'BOOKING'
+                       WHEN upper(COALESCE(e.triggering_event,'')) LIKE '%DELIVERY%'
+                         OR s.control_code LIKE 'DL\\_%' ESCAPE '\\'
+                         THEN 'DELIVERY'
+                       ELSE 'JOURNEY'
+                     END AS stage
+              FROM auditcore.p2_control_state s
+              LEFT JOIN latest_execution e ON e.rule_code=s.control_code
+              WHERE s.tenant_id=:tenant_id AND s.journey_id=:journey_id
+            )
+            SELECT stage,
+                   COUNT(*) AS tracked,
+                   COUNT(*) FILTER (WHERE control_status='PASS') AS passed,
+                   COUNT(*) FILTER (WHERE control_status='FAIL') AS failed,
+                   COUNT(*) FILTER (
+                     WHERE control_status IN ('WAITING_FOR_FACTS','READY','EVALUATING')
+                   ) AS waiting,
+                   COUNT(*) FILTER (WHERE control_status='RETRY_PENDING') AS retry_pending,
+                   COUNT(*) FILTER (WHERE control_status='ERROR_TERMINAL') AS errors
+            FROM classified
+            GROUP BY stage
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    controls_by_stage = {str(row["stage"]): dict(row) for row in control_rows}
+
+    task_stage_rows = connection.execute(
+        text(
+            """
+            WITH task_rows AS (
+              SELECT upper(COALESCE(
+                         NULLIF(reference->>'stage',''),
+                         NULLIF(reference->>'processArea',''),
+                         ''
+                     )) AS stage,
+                     task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED') AS is_open,
+                     task_status='VERIFIED_COMPLETE' AS is_completed
+              FROM auditcore.p2_tasks
+              WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              UNION ALL
+              SELECT upper(COALESCE(wtd.process_area,'')) AS stage,
+                     wi.status IN ('OPEN','IN_PROGRESS') AS is_open,
+                     wi.status='RESOLVED' AS is_completed
+              FROM auditcore.work_items wi
+              JOIN auditcore.work_item_task_detail wtd
+                ON wtd.tenant_id=wi.tenant_id
+               AND wtd.work_item_id=wi.work_item_id
+              WHERE wi.tenant_id=:tenant_id
+                AND wi.subject_kind='JOURNEY'
+                AND wi.subject_ref=CAST(:journey_id AS text)
+                AND wi.item_kind='EXECUTION_TASK'
+            )
+            SELECT stage,
+                   COUNT(*) FILTER (WHERE is_open) AS open,
+                   COUNT(*) FILTER (WHERE is_completed) AS completed
+            FROM task_rows
+            GROUP BY stage
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    tasks_by_stage = {str(row["stage"]): dict(row) for row in task_stage_rows}
+
+    health = connection.execute(
+        text(
+            """
+            SELECT
+              (
+                SELECT COALESCE(SUM(GREATEST(q.attempt_count - 1, 0)),0)
+                FROM auditcore.p2_document_queue q
+                WHERE q.tenant_id=:tenant_id AND q.journey_id=:journey_id
+              ) AS retries,
+              (
+                SELECT COUNT(*)
+                FROM auditcore.p2_document_queue q
+                WHERE q.tenant_id=:tenant_id
+                  AND q.journey_id=:journey_id
+                  AND q.queue_status IN ('FAILED','DEAD_LETTER')
+              ) AS extraction_failures,
+              (
+                SELECT COUNT(DISTINCT (f.di_document_id, f.field_key))
+                FROM auditcore.journey_document_extracted_fields f
+                WHERE f.tenant_id=:tenant_id
+                  AND f.journey_id=:journey_id
+                  AND f.is_modified=true
+              ) AS corrected_fields
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one()
+
+    booking_queue = queue_by_stage.get("BOOKING", {})
+    delivery_queue = queue_by_stage.get("DELIVERY", {})
+    booking_controls = controls_by_stage.get("BOOKING", {})
+    delivery_controls = controls_by_stage.get("DELIVERY", {})
+    booking_tasks = tasks_by_stage.get("BOOKING", {})
+    delivery_tasks = tasks_by_stage.get("DELIVERY", {})
+
+    booking_document_gate_keys = (
+        "BOOKING_FORM_EXTRACTED",
+        "PAN_EXTRACTED",
+        "AADHAAR_EXTRACTED",
+    )
+    booking_documents_received = sum(
+        1
+        for key in booking_document_gate_keys
+        if bool((booking.get("gates") or {}).get(key, {}).get("passed"))
+    )
+
+    def control_statistics(row: dict[str, Any]) -> dict[str, int]:
+        return {
+            "tracked": int(row.get("tracked") or 0),
+            "passed": int(row.get("passed") or 0),
+            "failed": int(row.get("failed") or 0),
+            "waiting": int(row.get("waiting") or 0),
+            "retryPending": int(row.get("retry_pending") or 0),
+            "errors": int(row.get("errors") or 0),
+        }
+
+    statistics = {
+        "booking": {
+            "documentsRequired": len(booking_document_gate_keys),
+            "documentsReceived": booking_documents_received,
+            "pages": int(booking_queue.get("pages") or 0),
+            "pagesProcessed": int(booking_queue.get("pages_processed") or 0),
+            "paymentReceipts": int(payments["booking_receipts"] or 0),
+            "paymentReceived": str(payments["booking_total"] or 0),
+            "minimumPayment": str(booking.get("minimumBookingAmount") or 0),
+            "manualVerificationPending": int(
+                booking.get("manualVerificationPending") or 0
+            ),
+            "controls": control_statistics(booking_controls),
+            "tasksOpen": int(booking_tasks.get("open") or 0),
+            "tasksCompleted": int(booking_tasks.get("completed") or 0),
+        },
+        "delivery": {
+            "documentsRequired": int(delivery_requirements["required"] or 0),
+            "documentsReceived": int(delivery_requirements["received"] or 0),
+            "pages": int(delivery_queue.get("pages") or 0),
+            "pagesProcessed": int(delivery_queue.get("pages_processed") or 0),
+            "invoices": int(delivery_business["invoices"] or 0),
+            "paymentReceipts": int(payments["delivery_receipts"] or 0),
+            "financeRecords": int(delivery_business["finance_records"] or 0),
+            "insuranceRecords": int(delivery_business["insurance_records"] or 0),
+            "vehicleRecords": int(delivery_business["vehicle_records"] or 0),
+            "registrationRecords": int(
+                delivery_business["registration_records"] or 0
+            ),
+            "controls": control_statistics(delivery_controls),
+            "tasksOpen": int(delivery_tasks.get("open") or 0),
+            "tasksCompleted": int(delivery_tasks.get("completed") or 0),
+        },
+        "journey": {
+            "uploads": int(p2_upload["batches"] or 0),
+            # A first-class replace/re-upload contract is still pending; do
+            # not fabricate a number from unrelated uploads.
+            "reuploads": None,
+            "supersededDocuments": int(document_stats["superseded"] or 0),
+            "extractionFailures": int(health["extraction_failures"] or 0),
+            "retries": int(health["retries"] or 0),
+            "correctedFields": int(health["corrected_fields"] or 0),
+            "openFindings": int(findings["open"] or 0),
+            "totalTasks": int(tasks["total"] or 0),
+            "slaBreaches": int(tasks["overdue"] or 0),
+            "controls": control_statistics(controls_by_stage.get("JOURNEY", {})),
+        },
+    }
+
     def serializable(row: Any) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in dict(row).items():
@@ -870,12 +1169,13 @@ def overview_summary(
 
     return {
         "journey": serializable(header),
-        "stage": booking,
+        "stage": stage_summary,
         "documents": serializable(document_stats),
         "uploads": serializable(p2_upload),
         "payments": serializable(payments),
         "tasks": serializable(tasks),
         "findings": serializable(findings),
+        "statistics": statistics,
     }
 
 
@@ -978,37 +1278,38 @@ def list_tasks(
     p2_rows = connection.execute(
         text(
             """
-            SELECT task_id, journey_id, root_task_id, parent_task_id,
-                   round_number, task_type, category, origin_kind,
-                   source_type, source_code, title, description, reference,
-                   severity, priority, assigned_role_code, assigned_actor_id,
-                   raised_by_actor_id, raised_by_role_code, allowed_actions,
-                   completion_protocol, task_status, due_at_utc,
-                   created_at_utc, updated_at_utc
+            SELECT t.task_id, t.journey_id, t.root_task_id, t.parent_task_id,
+                   t.round_number, t.task_type, t.category, t.origin_kind,
+                   t.source_type, t.source_code, t.title, t.description, t.reference,
+                   t.severity, t.priority, t.assigned_role_code, t.assigned_actor_id,
+                   t.raised_by_actor_id, t.raised_by_role_code, t.allowed_actions,
+                   t.completion_protocol, t.task_status, t.due_at_utc,
+                   t.created_at_utc, t.updated_at_utc,
+                   c.display_name AS customer_name,
+                   d.dealer_name,
+                   o.outlet_name,
+                   NULLIF(concat_ws(' · ',
+                     NULLIF(jp.model_name_snapshot, ''),
+                     NULLIF(jp.variant_name_snapshot, ''),
+                     NULLIF(jp.colour_name_snapshot, '')
+                   ), '') AS vehicle
             FROM auditcore.p2_tasks t
+            JOIN auditcore.journeys j
+              ON j.tenant_id=t.tenant_id AND j.journey_id=t.journey_id
+            JOIN auditcore.customers c
+              ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+            JOIN auditcore.dealers d
+              ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
+            JOIN auditcore.dealer_outlets o
+              ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id
+             AND o.outlet_id=j.outlet_id
+            LEFT JOIN auditcore.journey_products jp
+              ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
             WHERE t.tenant_id=:tenant_id
               AND (:journey_id IS NULL OR t.journey_id=:journey_id)
               AND (
                 (:status IS NULL AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED'))
                 OR (:status IS NOT NULL AND t.task_status=:status)
-              )
-              AND EXISTS (
-                SELECT 1
-                FROM auditcore.journeys j
-                JOIN auditcore.business_assignments ba
-                  ON ba.tenant_id=j.tenant_id
-                 AND ba.security_actor_id=:actor_id
-                 AND ba.assignment_status='ACTIVE'
-                 AND ba.effective_from <= now()
-                 AND (ba.effective_to IS NULL OR ba.effective_to >= now())
-                 AND (
-                   ba.dealer_id IS NULL
-                   OR (
-                     ba.dealer_id=j.dealer_id
-                     AND (ba.outlet_id IS NULL OR ba.outlet_id=j.outlet_id)
-                   )
-                 )
-                WHERE j.tenant_id=t.tenant_id AND j.journey_id=t.journey_id
               )
             ORDER BY t.due_at_utc NULLS LAST, t.created_at_utc
             LIMIT 500
@@ -1018,7 +1319,6 @@ def list_tasks(
             "tenant_id": tenant_id,
             "journey_id": journey_id,
             "status": status,
-            "actor_id": human_principal.subject,
         },
     ).mappings().all()
 
@@ -1048,7 +1348,15 @@ def list_tasks(
               wtd.related_finding_id,
               wtd.task_payload AS reference,
               wi.created_at_utc,
-              wi.updated_at_utc
+              wi.updated_at_utc,
+              c.display_name AS customer_name,
+              d.dealer_name,
+              o.outlet_name,
+              NULLIF(concat_ws(' · ',
+                NULLIF(jp.model_name_snapshot, ''),
+                NULLIF(jp.variant_name_snapshot, ''),
+                NULLIF(jp.colour_name_snapshot, '')
+              ), '') AS vehicle
             FROM auditcore.work_items wi
             JOIN auditcore.work_item_task_detail wtd
               ON wtd.tenant_id=wi.tenant_id
@@ -1056,6 +1364,15 @@ def list_tasks(
             JOIN auditcore.journeys j
               ON j.tenant_id=wi.tenant_id
              AND j.journey_id::text=wi.subject_ref
+            JOIN auditcore.customers c
+              ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+            JOIN auditcore.dealers d
+              ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
+            JOIN auditcore.dealer_outlets o
+              ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id
+             AND o.outlet_id=j.outlet_id
+            LEFT JOIN auditcore.journey_products jp
+              ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
             WHERE wi.tenant_id=:tenant_id
               AND wi.item_kind='EXECUTION_TASK'
               AND wi.subject_kind='JOURNEY'
@@ -1063,22 +1380,6 @@ def list_tasks(
               AND (
                 (:status IS NULL AND wi.status IN ('OPEN','IN_PROGRESS'))
                 OR (:status IS NOT NULL AND wi.status=:status)
-              )
-              AND EXISTS (
-                SELECT 1
-                FROM auditcore.business_assignments ba
-                WHERE ba.tenant_id=j.tenant_id
-                  AND ba.security_actor_id=:actor_id
-                  AND ba.assignment_status='ACTIVE'
-                  AND ba.effective_from <= now()
-                  AND (ba.effective_to IS NULL OR ba.effective_to >= now())
-                  AND (
-                    ba.dealer_id IS NULL
-                    OR (
-                      ba.dealer_id=j.dealer_id
-                      AND (ba.outlet_id IS NULL OR ba.outlet_id=j.outlet_id)
-                    )
-                  )
               )
             ORDER BY wi.due_at_utc NULLS LAST, wi.priority DESC, wi.created_at_utc
             LIMIT 500
@@ -1088,7 +1389,6 @@ def list_tasks(
             "tenant_id": tenant_id,
             "journey_id": journey_id,
             "status": status,
-            "actor_id": human_principal.subject,
         },
     ).mappings().all()
 
@@ -1154,6 +1454,10 @@ def list_tasks(
                     if raw["related_finding_id"] is not None
                     else None
                 ),
+                "customer_name": raw.get("customer_name"),
+                "dealer_name": raw.get("dealer_name"),
+                "outlet_name": raw.get("outlet_name"),
+                "vehicle": raw.get("vehicle"),
             }
         )
 
