@@ -69,6 +69,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from pydantic import BaseModel
 from sqlalchemy import Connection, Engine, text
 
+from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_engine, get_human_principal
 from audit_core.di_capture_v2_client import DiCaptureV2Client, DiCaptureV2Error
 from audit_core.di_client import DiClient
@@ -1092,34 +1093,29 @@ def _read_unified_capture(
     # (reconcile_unified_documents' own per-phase DI failures, every
     # materializer's own try/except) -- a live READ must never hard-fail
     # because its own self-healing side effect hit a transient DB issue.
-    # Root-caused live (2026-09-26): apply_di_classification's UPDATE to
-    # document_capture_v2_documents has no lock/retry protection of its own
-    # (neither did the pre-existing per-stage _reconcile_documents/
-    # _reconcile_delivery_documents this replaces -- same gap, just rarely
-    # hit since each only ever touched one stage's documents per call). A
-    # concurrent document-sync background task (self-heal sweep or a DI
-    # webhook) can hold a lock on the same row for close to its own 45s
-    # budget (uc03_confidence_review_policy._sync_booking_document_once)
-    # while this request's own connection has only a 10s statement_timeout
-    # (dependencies.get_connection) -- long enough to raise psycopg.errors.
-    # QueryCanceled here and 500 the whole page. Falling back to whatever
-    # document_capture_v2_documents/journey_document_extracted_fields state
-    # already exists (skipping just this pass's classification/stage
-    # correction) means the PC still sees a working checklist immediately;
-    # the next poll or an explicit Recheck documents retries the correction.
+    # Root-caused live (2026-09-27): running this on the shared, request-
+    # scoped `connection` (dependencies.get_connection) meant its row lock
+    # on document_capture_v2_documents was held not just for this UPDATE,
+    # but for the rest of THIS request's entire remaining work (building
+    # both stage responses, _stage_completed, etc.), since that connection
+    # only commits when the whole request returns. Confirmed live via
+    # Railway logs: overlapping /capture calls for the same journey (a
+    # normal multi-tab/retry pattern) serialized behind one another's
+    # *entire* remaining runtime instead of just this write, with durations
+    # climbing from ~5s to ~15s over a sustained window as more overlapping
+    # requests queued up. A concurrent document-sync background task
+    # (uc03_confidence_review_policy._sync_booking_document_once) touching
+    # the same rows made this worse but wasn't the base cause -- this
+    # request's own connection was the long-held one. Running this on its
+    # own connection bounds the lock to this write's own execution time;
+    # READ COMMITTED means every later read on the shared `connection`
+    # below still sees this the moment it commits, so nothing downstream
+    # needs to change.
     try:
-        # A SAVEPOINT (begin_nested), not a bare try/except: a cancelled
-        # statement (QueryCanceled, or any other DB error) leaves the whole
-        # transaction aborted at the Postgres level -- every later query on
-        # this same connection (the requirements/documents reads below,
-        # _stage_completed, the final response build) would then fail too
-        # with "current transaction is aborted", turning one failed
-        # reconciliation into a total request failure regardless of this
-        # try/except. Rolling back to the savepoint on failure restores the
-        # connection to a clean, usable state for the rest of this request.
-        with connection.begin_nested():
+        with engine.begin() as classification_connection:
+            set_tenant_context(classification_connection, tenant_id)
             apply_di_classification(
-                connection,
+                classification_connection,
                 tenant_id=tenant_id,
                 journey_id=journey_id,
                 di_documents=di_documents,
