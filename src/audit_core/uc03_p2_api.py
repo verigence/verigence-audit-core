@@ -1277,10 +1277,10 @@ def list_tasks(
                    created_at_utc, updated_at_utc
             FROM auditcore.p2_tasks t
             WHERE t.tenant_id=:tenant_id
-              AND (:journey_id IS NULL OR t.journey_id=:journey_id)
+              AND (CAST(:journey_id AS uuid) IS NULL OR t.journey_id=CAST(:journey_id AS uuid))
               AND (
-                (:status IS NULL AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED'))
-                OR (:status IS NOT NULL AND t.task_status=:status)
+                (CAST(:status AS varchar) IS NULL AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED'))
+                OR (CAST(:status AS varchar) IS NOT NULL AND t.task_status=CAST(:status AS varchar))
               )
               AND EXISTS (
                 SELECT 1
@@ -1349,10 +1349,10 @@ def list_tasks(
             WHERE wi.tenant_id=:tenant_id
               AND wi.item_kind='EXECUTION_TASK'
               AND wi.subject_kind='JOURNEY'
-              AND (:journey_id IS NULL OR wi.subject_ref=:journey_id)
+              AND (CAST(:journey_id AS uuid) IS NULL OR wi.subject_ref=CAST(:journey_id AS uuid))
               AND (
-                (:status IS NULL AND wi.status IN ('OPEN','IN_PROGRESS'))
-                OR (:status IS NOT NULL AND wi.status=:status)
+                (CAST(:status AS varchar) IS NULL AND wi.status IN ('OPEN','IN_PROGRESS'))
+                OR (CAST(:status AS varchar) IS NOT NULL AND wi.status=CAST(:status AS varchar))
               )
               AND EXISTS (
                 SELECT 1
