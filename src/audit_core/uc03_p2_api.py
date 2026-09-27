@@ -1447,15 +1447,36 @@ def list_tasks(
             }
         )
 
-    # Python cannot compare timezone-aware and naive datetime.max directly.
-    # Convert the sort key to timestamp text, which is stable ISO order for
-    # PostgreSQL timestamptz values and keeps NULL due dates last.
+    # Phase 2 worklist order is action-first: priority first, then SLA,
+    # then operational state. Keep legacy numeric priority semantics intact
+    # rather than translating them into P2 labels.
+    p2_priority_order = {"URGENT": 0, "HIGH": 1, "NORMAL": 2, "LOW": 3}
+    status_order = {
+        "RETURNED": 0,
+        "READY": 1,
+        "IN_PROGRESS": 2,
+        "VERIFYING": 3,
+        "AWAITING_REQUESTER_REVIEW": 4,
+        "FAILED": 5,
+        "DEAD_LETTER": 6,
+    }
+
     def _safe_sort(item: dict[str, Any]) -> tuple:
         due = item.get("due_at_utc")
         created = item.get("created_at_utc")
+        if item.get("source_system") == "LEGACY":
+            # Legacy priority is numeric and higher means more urgent.
+            priority_key = (0, -int(item.get("priority_rank") or 0))
+        else:
+            priority_key = (
+                1,
+                p2_priority_order.get(str(item.get("priority") or "NORMAL").upper(), 2),
+            )
         return (
+            priority_key,
             due is None,
             due.isoformat() if hasattr(due, "isoformat") else str(due or ""),
+            status_order.get(str(item.get("task_status") or "").upper(), 20),
             created.isoformat() if hasattr(created, "isoformat") else str(created or ""),
         )
 
