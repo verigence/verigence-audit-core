@@ -1,8 +1,9 @@
 """Single Phase 2 access adapter.
 
-Security owns authentication and functional permission. Audit Core business
-assignments own Journey data scope (dealer/outlet and operating role). P2 routes
-must call this adapter rather than independently composing those checks.
+Security is the authorization authority for Phase 2. Audit Core may confirm
+tenant/Journey existence and may read business assignments only to derive
+operating-role context; a local assignment lookup must never become a second
+allow/deny authority.
 """
 from __future__ import annotations
 
@@ -58,6 +59,26 @@ def authorize_p2(
     set_tenant_context(connection, tenant_id)
     operating_role: str | None = None
     if journey_id is not None:
+        exists = connection.execute(
+            text(
+                """
+                SELECT 1
+                FROM auditcore.journeys
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one_or_none()
+        if exists is None:
+            raise NotFoundError(
+                error_code="VAC-NF-005",
+                title="Journey not found",
+                detail="Journey not found in this Tenant.",
+            )
+
+        # Context only. Security above already made the authorization decision.
+        # A missing or ambiguous local assignment must not independently deny
+        # a request that Security has allowed.
         row = connection.execute(
             text(
                 """
@@ -86,20 +107,8 @@ def authorize_p2(
             },
         ).scalar_one_or_none()
         roles = list(row or [])
-        if not roles:
-            # Do not disclose whether a Journey exists outside caller scope.
-            raise NotFoundError(
-                error_code="VAC-NF-005",
-                title="Journey not found",
-                detail="Journey not found in your current Project scope.",
-            )
-        if len(roles) > 1:
-            raise AuthorizationError(
-                error_code="VAC-AUTH-002",
-                status_code=403,
-                title="Ambiguous operating role",
-            )
-        operating_role = str(roles[0])
+        if len(roles) == 1:
+            operating_role = str(roles[0])
 
     return P2AccessContext(
         actor_id=human_principal.subject,
