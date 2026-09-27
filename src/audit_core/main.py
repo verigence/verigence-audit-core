@@ -128,10 +128,10 @@ from audit_core.uc03_model_resolution import router as uc03_model_resolution_rou
 from audit_core.uc03_model_selection_corrections import (
     router as uc03_model_selection_corrections_router,
 )
-from audit_core.uc03_p2_api import router as uc03_p2_router
 from audit_core.uc03_nightly_reprocessing_reports import (
     router as uc03_nightly_reprocessing_reports_router,
 )
+from audit_core.uc03_p2_api import router as uc03_p2_router
 from audit_core.uc03_pc_booking_documents import (
     router as uc03_pc_booking_documents_router,
 )
