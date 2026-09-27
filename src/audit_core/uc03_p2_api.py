@@ -791,9 +791,7 @@ def overview_summary(
     def serializable(row: Any) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in dict(row).items():
-            if isinstance(value, UUID):
-                result[key] = str(value)
-            elif hasattr(value, "as_tuple"):
+            if isinstance(value, UUID) or hasattr(value, "as_tuple"):
                 result[key] = str(value)
             else:
                 result[key] = value
