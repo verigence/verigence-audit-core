@@ -101,7 +101,14 @@ def _claim_for_tenant(engine: Engine, tenant_id: str, limit: int) -> list[WorkIt
                        payload, attempt_count, requested_version, correlation_id
                 FROM auditcore.p2_work_queue
                 WHERE tenant_id=:tenant_id
-                  AND work_status IN ('PENDING','RETRY_WAIT')
+                  AND (
+                    work_status IN ('PENDING','RETRY_WAIT')
+                    OR (
+                      work_status IN ('CLAIMED','PROCESSING')
+                      AND lease_expires_at_utc IS NOT NULL
+                      AND lease_expires_at_utc <= now()
+                    )
+                  )
                   AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc <= now())
                   AND (lease_expires_at_utc IS NULL OR lease_expires_at_utc <= now())
                 ORDER BY created_at_utc
