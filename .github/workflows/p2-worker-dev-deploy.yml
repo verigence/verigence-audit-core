@@ -112,6 +112,10 @@ jobs:
               'AUDIT_CORE_PHOTO_STORAGE_SECRET_ACCESS_KEY',
               'AUDIT_CORE_PHOTO_STORAGE_BUCKET',
           ))
+          # Rule Engine controls report ERROR_TERMINAL without these; warn, never print values.
+          for name in ('RULE_ENGINE_BASE_URL',):
+              if not str(data.get(name, '')).strip():
+                  print(f'::warning::{name} is not set on the P2 worker; Rule Engine checks will show "could not run".')
           if not (p2_storage or photo_storage):
               # Names only (never values) so a misnamed variable is obvious.
               import re
