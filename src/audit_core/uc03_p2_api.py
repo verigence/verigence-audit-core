@@ -158,7 +158,7 @@ def list_p2_journeys(
                   )
             ),
             task_rows AS (
-                SELECT tenant_id, journey_id, due_at_utc,
+                SELECT tenant_id, journey_id::text AS journey_id, due_at_utc,
                        task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED') AS is_open
                 FROM auditcore.p2_tasks
                 WHERE tenant_id=:tenant_id
@@ -233,7 +233,7 @@ def list_p2_journeys(
             LEFT JOIN document_stats ds
               ON ds.tenant_id=s.tenant_id AND ds.journey_id=s.journey_id
             LEFT JOIN task_stats ts
-              ON ts.tenant_id=s.tenant_id AND ts.journey_id=s.journey_id
+              ON ts.tenant_id=s.tenant_id AND ts.journey_id=s.journey_id::text
             LEFT JOIN finding_stats fs
               ON fs.tenant_id=s.tenant_id AND fs.journey_id=s.journey_id
             WHERE (
