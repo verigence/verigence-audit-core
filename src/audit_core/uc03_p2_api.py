@@ -38,6 +38,7 @@ from audit_core.uc03_p2_access import (
 )
 from audit_core.uc03_p2_controls import control_statistics
 from audit_core.uc03_p2_registry import get_registry
+from audit_core.uc03_p2_runtime import enqueue_work
 from audit_core.uc03_p2_stage import (
     active_conditions,
     read_booking_stage,
@@ -1074,6 +1075,167 @@ def list_documents(
         "checklist": checklist,
         "conditions": sorted(conditions),
     }
+
+
+_RETRYABLE_PAGE_STATES = ("FAILED", "DEAD_LETTER", "NEEDS_REVIEW")
+_RETYPEABLE_PAGE_STATES = ("SUPPORTING", "NEEDS_REVIEW", "READY", "FAILED")
+
+
+def _page_unit(connection: Connection, *, tenant_id: str, journey_id: UUID, queue_id: UUID) -> dict[str, Any]:
+    row = connection.execute(
+        text(
+            """
+            SELECT queue_id, batch_id, page_number, page_numbers, unit_kind, queue_status,
+                   client_upload_id, di_document_id, page_object_key, page_sha256, business_stage
+            FROM auditcore.p2_document_queue
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND queue_id=:queue_id
+            FOR UPDATE
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "queue_id": queue_id},
+    ).mappings().one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Page was not found.")
+    return dict(row)
+
+
+@router.post("/journeys/{journey_id}/pages/{queue_id}:retry", status_code=202)
+def retry_page(
+    tenant_id: str,
+    journey_id: UUID,
+    queue_id: UUID,
+    request: Request,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """Send a failed page to document intelligence again as a fresh document."""
+    _authorize(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
+    )
+    unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id)
+    if unit["queue_status"] not in _RETRYABLE_PAGE_STATES:
+        raise HTTPException(status_code=409, detail="Only failed pages can be retried.")
+    base = str(unit["client_upload_id"]).split("~r", 1)[0]
+    attempt = connection.execute(
+        text("SELECT COUNT(*) FROM auditcore.p2_document_queue WHERE tenant_id=:t AND client_upload_id LIKE :p"),
+        {"t": tenant_id, "p": f"{base}~r%"},
+    ).scalar_one()
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue
+            SET queue_status='QUEUED', client_upload_id=:client_upload_id, di_document_id=NULL,
+                di_state=NULL, di_processing_status=NULL, di_submitted_at_utc=NULL,
+                di_processed_seen_at_utc=NULL, status_reason=NULL, last_error=NULL,
+                attempt_count=0, extracted_field_count=0, updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+            """
+        ),
+        {"tenant_id": tenant_id, "queue_id": queue_id, "client_upload_id": f"{base}~r{int(attempt) + 1}"},
+    )
+    enqueue_work(
+        connection, tenant_id=tenant_id, journey_id=journey_id, work_type="DOCUMENT_INGEST",
+        work_key=str(queue_id), payload={"queueId": str(queue_id), "uploadedBy": human_principal.subject},
+        correlation_id=get_correlation_id(request),
+    )
+    _activity(
+        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="PAGE_RETRY_REQUESTED",
+        subject_type="DOCUMENT_PAGE", subject_id=str(queue_id), details={"attempt": int(attempt) + 1},
+        correlation_id=get_correlation_id(request),
+    )
+    return {"queueId": str(queue_id), "status": "QUEUED"}
+
+
+class SetPageTypeCommand(BaseModel):
+    templateKey: str = Field(min_length=1, max_length=120)
+
+
+@router.post("/journeys/{journey_id}/pages/{queue_id}:set-type", status_code=202)
+def set_page_type(
+    tenant_id: str,
+    journey_id: UUID,
+    queue_id: UUID,
+    command: SetPageTypeCommand,
+    request: Request,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """The PC says what a page really is. The page is resubmitted to document
+    intelligence with exactly that type; the earlier result is retired."""
+    access = _authorize(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
+    )
+    registry = get_registry()
+    template = registry.documents.get(command.templateKey)
+    if template is None or not template.di_types:
+        raise HTTPException(status_code=422, detail="Choose a document type from the checklist.")
+    unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id)
+    if unit["queue_status"] not in _RETYPEABLE_PAGE_STATES:
+        raise HTTPException(status_code=409, detail="This page is still being processed.")
+    pages = list(unit["page_numbers"] or [unit["page_number"]])
+    client_upload_id = f"p2t-{unit['batch_id']}-{'-'.join(map(str, pages))}-{template.key}-{queue_id.hex[:8]}"
+    new_id = uuid4()
+    # Retire the current unit first so a same-page group can be replaced.
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue
+            SET queue_status='MERGED', merged_into_queue_id=:new_id,
+                status_reason=:reason, updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+            """
+        ),
+        {"tenant_id": tenant_id, "queue_id": queue_id, "new_id": new_id,
+         "reason": f"Re-typed as {template.display_name} by {access.operating_role or 'PC'}."},
+    )
+    inserted = connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.p2_document_queue (
+                tenant_id, queue_id, batch_id, journey_id, page_number, page_numbers, page_sha256,
+                page_object_key, client_upload_id, queue_status, unit_kind, group_source,
+                candidate_override, classified_document_type, template_key, business_stage,
+                type_overridden_by_actor_id
+            ) VALUES (
+                :tenant_id, :new_id, :batch_id, :journey_id, :page_number, :page_numbers, :sha,
+                :object_key, :client_upload_id, 'QUEUED', 'GROUP', 'PC',
+                CAST(:candidates AS jsonb), :di_type, :template_key, :stage, :actor
+            )
+            ON CONFLICT (tenant_id, client_upload_id) DO NOTHING
+            RETURNING queue_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id, "new_id": new_id, "batch_id": unit["batch_id"], "journey_id": journey_id,
+            "page_number": pages[0], "page_numbers": pages, "sha": unit["page_sha256"],
+            "object_key": unit["page_object_key"], "client_upload_id": client_upload_id,
+            "candidates": json.dumps([template.di_types[0]]), "di_type": template.di_types[0],
+            "template_key": template.key, "stage": template.stage if template.stage != "ANY" else None,
+            "actor": human_principal.subject,
+        },
+    ).scalar_one_or_none()
+    if inserted is None:
+        raise HTTPException(status_code=409, detail="This page is already being re-typed.")
+    enqueue_work(
+        connection, tenant_id=tenant_id, journey_id=journey_id, work_type="DOCUMENT_INGEST",
+        work_key=str(new_id), payload={"queueId": str(new_id), "uploadedBy": human_principal.subject},
+        correlation_id=get_correlation_id(request),
+    )
+    _activity(
+        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="PAGE_RETYPED",
+        subject_type="DOCUMENT_PAGE", subject_id=str(queue_id),
+        details={"templateKey": template.key, "newQueueId": str(new_id)},
+        correlation_id=get_correlation_id(request),
+    )
+    return {"queueId": str(new_id), "status": "QUEUED", "templateKey": template.key}
 
 
 @router.get("/journeys/{journey_id}/events")

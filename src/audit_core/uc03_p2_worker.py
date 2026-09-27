@@ -1255,7 +1255,7 @@ def _group_batch(engine: Engine, work: WorkItem) -> None:
                         :template_key, :stage, :correlation_id
                     )
                     ON CONFLICT (tenant_id, batch_id, page_numbers)
-                      WHERE unit_kind='GROUP' AND queue_status <> 'CANCELLED'
+                      WHERE unit_kind='GROUP' AND queue_status NOT IN ('CANCELLED','MERGED')
                     DO NOTHING
                     RETURNING queue_id
                     """
@@ -1282,7 +1282,7 @@ def _group_batch(engine: Engine, work: WorkItem) -> None:
                         """
                         SELECT queue_id FROM auditcore.p2_document_queue
                         WHERE tenant_id=:tenant_id AND batch_id=:batch_id AND unit_kind='GROUP'
-                          AND page_numbers=:page_numbers AND queue_status <> 'CANCELLED'
+                          AND page_numbers=:page_numbers AND queue_status NOT IN ('CANCELLED','MERGED')
                         """
                     ),
                     {"tenant_id": work.tenant_id, "batch_id": batch_id, "page_numbers": list(document.page_numbers)},
