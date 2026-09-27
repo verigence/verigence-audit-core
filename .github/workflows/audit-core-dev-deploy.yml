@@ -71,6 +71,14 @@ jobs:
               "/v1/tenants/{tenant_id}/mahindra-masters/segments/{segment_id}/imports",
               "/v1/tenants/{tenant_id}/mahindra-masters/discount-policy/imports",
               "/v1/tenants/{tenant_id}/journeys/{journey_id}/booking/identity-context",
+              "/p2/v1/tenants/{tenant_id}/journeys",
+              "/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/uploads:init",
+              "/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/documents",
+              "/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/documents/{document_id}/review",
+              "/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/documents/{document_id}/content",
+              "/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/documents/{document_id}/field-corrections",
+              "/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/overview",
+              "/p2/v1/tenants/{tenant_id}/tasks",
           ]
           missing = [path for path in required if path not in paths]
           if missing:
