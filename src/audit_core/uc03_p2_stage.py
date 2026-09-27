@@ -31,7 +31,7 @@ from audit_core.uc03_duplicate_receipt_detection import (
 
 _BOOKING_DOC_GATES = {
     "BOOKING_FORM_EXTRACTED": ("booking_form", "booking_docket"),
-    "PAN_EXTRACTED": ("pan_card", "pan"),
+    "PAN_EXTRACTED": ("pan_card",),
     "AADHAAR_EXTRACTED": ("aadhaar",),
 }
 _OPEN_LEGACY_MANUAL_TASKS = ("PENDING", "READY", "CLAIMED", "IN_PROGRESS", "RETRY_WAIT")
