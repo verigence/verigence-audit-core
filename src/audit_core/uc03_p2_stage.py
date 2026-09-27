@@ -1,20 +1,26 @@
-"""Phase 2 journey-stage evaluation.
+"""Phase 2 Journey stage engine, driven by the P2 templates.
 
-This module is read-from-existing-business-state / write-to-p2-runtime only.
-It does not mutate legacy UC03 stage rows. Booking completion is deliberately
-limited to the product rule explicitly agreed for Phase 2:
+Stage gates come from ``p2_templates/document_templates.yaml`` (see
+uc03_p2_registry). The engine reads existing business state and writes only
+p2_* runtime rows:
 
-- Booking Form extracted
-- PAN extracted
-- Aadhaar extracted
-- non-duplicate BOOKING receipts aggregate >= configured minimum booking amount
-- no open manual-verification work
+- DOCUMENT_READY   an ACTIVE document of the template's type has durable facts
+- PAYMENT_MINIMUM  eligible (non-duplicate) receipts reach the tenant minimum.
+                   Receipts are counted chronologically across both stages
+                   (blueprint 20.2): the prefix that first meets the minimum is
+                   the Booking payment, so the gate is met exactly when the
+                   eligible total reaches the minimum. Receipts without a date
+                   still count as money received.
+- NO_OPEN_TASKS    no open task of the listed types (legacy or P2)
 
-Delivery gates are intentionally left configurable/unevaluated until their
-business completion contract is approved.
+Booking completes automatically when every gate passes and reopens
+deterministically if a later correction invalidates a gate. Delivery uses the
+same framework; its completion criteria stay unconfigured until approved
+(blueprint 20.3), but its document readiness is reported.
 """
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -28,78 +34,88 @@ from audit_core.uc03_duplicate_receipt_detection import (
     normalize_receipt_date,
     normalize_receipt_number,
 )
+from audit_core.uc03_p2_registry import DocumentTemplate, Gate, Registry, get_registry
+from audit_core.uc03_p2_runtime import record_activity
 
-_BOOKING_DOC_GATES = {
-    "BOOKING_FORM_EXTRACTED": ("booking_form", "booking_docket"),
-    "PAN_EXTRACTED": ("pan_card",),
-    "AADHAAR_EXTRACTED": ("aadhaar",),
-}
-_OPEN_LEGACY_MANUAL_TASKS = ("PENDING", "READY", "CLAIMED", "IN_PROGRESS", "RETRY_WAIT")
-_OPEN_P2_MANUAL_TASKS = (
+_OPEN_LEGACY_TASK_STATUSES = ("PENDING", "READY", "CLAIMED", "IN_PROGRESS", "RETRY_WAIT")
+_OPEN_P2_TASK_STATUSES = (
     "READY", "IN_PROGRESS", "ACTION_COMPLETED", "VERIFYING",
     "AWAITING_REQUESTER_REVIEW", "RETURNED",
 )
+# Legacy evidence rows may carry the pre-canonical key for the same document.
+_LEGACY_TYPE_ALIASES = {"booking_form": ("booking_docket",), "dealer_receipt": ("payment_receipt",)}
 
 
-def _document_extracted(
+def _evidence_types(template: DocumentTemplate) -> list[str]:
+    types: list[str] = [template.key]
+    for di_type in template.di_types:
+        types.append(di_type)
+        types.extend(_LEGACY_TYPE_ALIASES.get(di_type, ()))
+    return list(dict.fromkeys(types))
+
+
+def ready_document_count(
     connection: Connection,
     *,
     tenant_id: str,
     journey_id: UUID,
-    document_types: tuple[str, ...],
-) -> tuple[bool, int]:
-    row = connection.execute(
-        text(
-            """
-            SELECT COUNT(DISTINCT e.di_document_id) AS document_count
-            FROM auditcore.evidence e
-            WHERE e.tenant_id=:tenant_id
-              AND e.journey_id=:journey_id
-              AND e.association_status='ACTIVE'
-              AND e.document_type_key = ANY(:document_types)
-              AND EXISTS (
-                SELECT 1
-                FROM auditcore.journey_document_extracted_fields f
-                WHERE f.tenant_id=e.tenant_id
-                  AND f.journey_id=e.journey_id
-                  AND f.di_document_id=e.di_document_id
-                  AND f.effective_value IS NOT NULL
-              )
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "document_types": list(document_types),
-        },
-    ).mappings().one()
-    count = int(row["document_count"] or 0)
-    return count > 0, count
+    template: DocumentTemplate,
+) -> int:
+    return int(
+        connection.execute(
+            text(
+                """
+                SELECT COUNT(DISTINCT e.di_document_id)
+                FROM auditcore.evidence e
+                WHERE e.tenant_id=:tenant_id
+                  AND e.journey_id=:journey_id
+                  AND e.association_status='ACTIVE'
+                  AND e.document_type_key = ANY(:document_types)
+                  AND EXISTS (
+                    SELECT 1
+                    FROM auditcore.journey_document_extracted_fields f
+                    WHERE f.tenant_id=e.tenant_id
+                      AND f.journey_id=e.journey_id
+                      AND f.di_document_id=e.di_document_id
+                      AND f.effective_value IS NOT NULL
+                  )
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "document_types": _evidence_types(template),
+            },
+        ).scalar_one()
+        or 0
+    )
 
 
-def _booking_receipt_total(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-) -> Decimal:
+def eligible_receipt_total(connection: Connection, *, tenant_id: str, journey_id: UUID) -> tuple[Decimal, int, int]:
+    """(total, counted receipts, excluded duplicates) over every receipt-backed payment."""
     payments = connection.execute(
         text(
             """
-            SELECT payment_id, amount, receipt_date, receipt_number
-            FROM auditcore.payments
-            WHERE tenant_id=:tenant_id
-              AND journey_id=:journey_id
-              AND payment_stage='BOOKING'
-              AND amount IS NOT NULL
-              AND receipt_date IS NOT NULL
-            ORDER BY receipt_date ASC, payment_id ASC
+            SELECT p.payment_id, p.amount, p.receipt_date, p.receipt_number
+            FROM auditcore.payments p
+            WHERE p.tenant_id=:tenant_id
+              AND p.journey_id=:journey_id
+              AND p.status_source='EVIDENCE'
+              AND p.amount IS NOT NULL
+              AND p.amount > 0
+              -- a voided or superseded receipt document no longer counts
+              AND EXISTS (
+                SELECT 1 FROM auditcore.evidence e
+                WHERE e.tenant_id=p.tenant_id AND e.journey_id=p.journey_id
+                  AND e.di_document_id=p.source_di_document_id
+                  AND e.association_status='ACTIVE'
+              )
+            ORDER BY p.receipt_date ASC NULLS LAST, p.payment_id ASC
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
-
-    receipt_records = [
+    records = [
         ReceiptRecord(
             document_id=payment["payment_id"],
             stage_code="BOOKING",
@@ -111,59 +127,118 @@ def _booking_receipt_total(
         for payment in payments
     ]
     excluded: set[Any] = set()
-    for group in compute_duplicate_groups(receipt_records):
+    for group in compute_duplicate_groups(records):
         for duplicate in group.documents[1:]:
             excluded.add(duplicate.document_id)
-
     total = Decimal(0)
+    counted = 0
     for payment in payments:
-        if payment["payment_id"] not in excluded:
-            total += Decimal(str(payment["amount"]))
-    return total
+        if payment["payment_id"] in excluded:
+            continue
+        total += Decimal(str(payment["amount"]))
+        counted += 1
+    return total, counted, len(excluded)
 
 
-def _manual_verification_pending(
+def open_task_count(connection: Connection, *, tenant_id: str, journey_id: UUID, task_types: tuple[str, ...]) -> int:
+    row = connection.execute(
+        text(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM auditcore.workflow_tasks
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND task_type = ANY(:task_types) AND task_status = ANY(:legacy_open))
+            + (SELECT COUNT(*) FROM auditcore.p2_tasks
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND task_type = ANY(:task_types) AND task_status = ANY(:p2_open))
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "task_types": list(task_types),
+            "legacy_open": list(_OPEN_LEGACY_TASK_STATUSES),
+            "p2_open": list(_OPEN_P2_TASK_STATUSES),
+        },
+    ).scalar_one()
+    return int(row or 0)
+
+
+def active_conditions(connection: Connection, *, tenant_id: str, journey_id: UUID) -> set[str]:
+    """Conditional requirements that apply: PC declaration or observed facts."""
+    active: set[str] = set()
+    declared = connection.execute(
+        text(
+            """
+            SELECT condition_key, applicable
+            FROM auditcore.document_capture_v2_declarations
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    declared_map = {str(row["condition_key"]): bool(row["applicable"]) for row in declared}
+    facts = connection.execute(
+        text(
+            """
+            SELECT
+              EXISTS (
+                SELECT 1 FROM auditcore.journeys j
+                JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+                WHERE j.tenant_id=:tenant_id AND j.journey_id=:journey_id
+                  AND upper(c.customer_type_code) IN ('CORPORATE','COMPANY','BUSINESS')
+              ) AS corporate,
+              EXISTS (
+                SELECT 1 FROM auditcore.trade_in_cases t
+                WHERE t.tenant_id=:tenant_id AND t.journey_id=:journey_id
+              ) AS exchange
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one()
+    if declared_map.get("corporateCustomer", bool(facts["corporate"])):
+        active.add("CORPORATE_CUSTOMER")
+    if declared_map.get("exchangeTaken", bool(facts["exchange"])):
+        active.add("EXCHANGE_TAKEN")
+    return active
+
+
+def _evaluate_gate(
     connection: Connection,
+    registry: Registry,
+    gate: Gate,
     *,
     tenant_id: str,
     journey_id: UUID,
-) -> int:
-    legacy = connection.execute(
-        text(
-            """
-            SELECT COUNT(*)
-            FROM auditcore.workflow_tasks
-            WHERE tenant_id=:tenant_id
-              AND journey_id=:journey_id
-              AND task_type='MANUAL_VERIFICATION_REVIEW'
-              AND task_status = ANY(:statuses)
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "statuses": list(_OPEN_LEGACY_MANUAL_TASKS),
-        },
-    ).scalar_one()
-
-    p2 = connection.execute(
-        text(
-            """
-            SELECT COUNT(*)
-            FROM auditcore.p2_tasks
-            WHERE tenant_id=:tenant_id
-              AND journey_id=:journey_id
-              AND task_type='MANUAL_VERIFICATION_REVIEW'
-              AND task_status = ANY(:statuses)
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "statuses": list(_OPEN_P2_MANUAL_TASKS),
-        },
-    ).scalar_one()
-    return int(legacy or 0) + int(p2 or 0)
+    minimum: Decimal,
+) -> dict[str, Any]:
+    if gate.kind == "DOCUMENT_READY":
+        counts = {
+            key: ready_document_count(
+                connection, tenant_id=tenant_id, journey_id=journey_id, template=registry.document(key),
+            )
+            for key in gate.documents
+        }
+        passed = all(count > 0 for count in counts.values())
+        return {"passed": passed, "documentCount": sum(counts.values()), "documents": counts}
+    if gate.kind == "PAYMENT_MINIMUM":
+        total, counted, duplicates = eligible_receipt_total(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+        )
+        return {
+            "passed": total >= minimum,
+            "receiptTotal": str(total),
+            "minimumAmount": str(minimum),
+            "receiptCount": counted,
+            "duplicateReceiptsExcluded": duplicates,
+            "shortfall": str(max(minimum - total, Decimal(0))),
+        }
+    if gate.kind == "NO_OPEN_TASKS":
+        pending = open_task_count(
+            connection, tenant_id=tenant_id, journey_id=journey_id, task_types=gate.task_types,
+        )
+        return {"passed": pending == 0, "pendingCount": pending}
+    raise ValueError(f"Unsupported gate kind {gate.kind}")
 
 
 def _upsert_gate(
@@ -171,9 +246,10 @@ def _upsert_gate(
     *,
     tenant_id: str,
     journey_id: UUID,
+    stage_code: str,
     gate_key: str,
     passed: bool,
-    details_json: str,
+    details: dict[str, Any],
 ) -> None:
     connection.execute(
         text(
@@ -182,7 +258,7 @@ def _upsert_gate(
                 tenant_id, journey_id, stage_code, gate_key,
                 gate_status, details, evaluated_at_utc
             ) VALUES (
-                :tenant_id, :journey_id, 'BOOKING', :gate_key,
+                :tenant_id, :journey_id, :stage_code, :gate_key,
                 :gate_status, CAST(:details AS jsonb), now()
             )
             ON CONFLICT (tenant_id, journey_id, stage_code, gate_key)
@@ -194,137 +270,139 @@ def _upsert_gate(
         {
             "tenant_id": tenant_id,
             "journey_id": journey_id,
+            "stage_code": stage_code,
             "gate_key": gate_key,
             "gate_status": "PASS" if passed else "WAITING",
-            "details": details_json,
+            "details": json.dumps(details, default=str),
         },
     )
 
 
-def recompute_booking_stage(
+def delivery_readiness(
+    connection: Connection,
+    registry: Registry,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    conditions: set[str],
+) -> dict[str, Any]:
+    required = registry.required_documents("DELIVERY", conditions=conditions)
+    received: list[str] = []
+    missing: list[dict[str, str]] = []
+    for template in required:
+        if ready_document_count(connection, tenant_id=tenant_id, journey_id=journey_id, template=template) > 0:
+            received.append(template.key)
+        else:
+            missing.append({"key": template.key, "label": template.display_name})
+    return {
+        "passed": not missing,
+        "requiredCount": len(required),
+        "receivedCount": len(received),
+        "missing": missing,
+    }
+
+
+def recompute_journey_stage(
     connection: Connection,
     *,
     tenant_id: str,
     journey_id: UUID,
+    registry: Registry | None = None,
 ) -> dict[str, Any]:
-    import json
+    registry = registry or get_registry()
+    minimum = _minimum_booking_amount(connection, tenant_id=tenant_id)
+    booking = registry.stages["BOOKING"]
 
     gates: dict[str, dict[str, Any]] = {}
-    for gate_key, document_types in _BOOKING_DOC_GATES.items():
-        passed, count = _document_extracted(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            document_types=document_types,
+    for gate in booking.gates:
+        result = _evaluate_gate(
+            connection, registry, gate, tenant_id=tenant_id, journey_id=journey_id, minimum=minimum,
         )
-        gates[gate_key] = {"passed": passed, "documentCount": count}
+        result.update({"label": gate.label, "kind": gate.kind})
+        if not result["passed"]:
+            result["action"] = gate.missing
+        gates[gate.key] = result
         _upsert_gate(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            gate_key=gate_key,
-            passed=passed,
-            details_json=json.dumps({"documentCount": count}),
+            connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING",
+            gate_key=gate.key, passed=result["passed"], details=result,
         )
 
-    minimum = _minimum_booking_amount(connection, tenant_id=tenant_id)
-    receipt_total = _booking_receipt_total(
-        connection, tenant_id=tenant_id, journey_id=journey_id,
+    conditions = active_conditions(connection, tenant_id=tenant_id, journey_id=journey_id)
+    delivery = delivery_readiness(
+        connection, registry, tenant_id=tenant_id, journey_id=journey_id, conditions=conditions,
     )
-    payment_passed = receipt_total >= minimum
-    gates["MINIMUM_BOOKING_PAYMENT"] = {
-        "passed": payment_passed,
-        "receiptTotal": str(receipt_total),
-        "minimumAmount": str(minimum),
-    }
     _upsert_gate(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        gate_key="MINIMUM_BOOKING_PAYMENT",
-        passed=payment_passed,
-        details_json=json.dumps(
-            {"receiptTotal": str(receipt_total), "minimumAmount": str(minimum)}
-        ),
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY",
+        gate_key="REQUIRED_DOCUMENTS", passed=delivery["passed"],
+        details={**delivery, "label": "Delivery documents received", "kind": "READINESS"},
     )
 
-    manual_pending = _manual_verification_pending(
-        connection, tenant_id=tenant_id, journey_id=journey_id,
+    booking_complete = all(item["passed"] for item in gates.values())
+    evidence_or_payment_missing = any(
+        not item["passed"] for item in gates.values() if item["kind"] in {"DOCUMENT_READY", "PAYMENT_MINIMUM"}
     )
-    manual_passed = manual_pending == 0
-    gates["NO_MANUAL_VERIFICATION_PENDING"] = {
-        "passed": manual_passed,
-        "pendingCount": manual_pending,
-    }
-    _upsert_gate(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        gate_key="NO_MANUAL_VERIFICATION_PENDING",
-        passed=manual_passed,
-        details_json=json.dumps({"pendingCount": manual_pending}),
+    manual_pending = sum(
+        int(item.get("pendingCount") or 0) for item in gates.values() if item["kind"] == "NO_OPEN_TASKS"
+    )
+    delivery_started = bool(
+        connection.execute(
+            text(
+                """
+                SELECT EXISTS (
+                  SELECT 1 FROM auditcore.evidence e
+                  WHERE e.tenant_id=:tenant_id AND e.journey_id=:journey_id
+                    AND e.association_status='ACTIVE'
+                    AND upper(COALESCE(e.process_area,''))='DELIVERY'
+                ) OR EXISTS (
+                  SELECT 1 FROM auditcore.deliveries d
+                  WHERE d.tenant_id=:tenant_id AND d.journey_id=:journey_id
+                )
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one()
     )
 
-    complete = all(item["passed"] for item in gates.values())
-    any_document_missing = any(
-        not gates[key]["passed"] for key in _BOOKING_DOC_GATES
-    )
-    if complete:
-        delivery_started = bool(
-            connection.execute(
-                text(
-                    """
-                    SELECT EXISTS (
-                      SELECT 1
-                      FROM auditcore.evidence e
-                      WHERE e.tenant_id=:tenant_id
-                        AND e.journey_id=:journey_id
-                        AND e.association_status='ACTIVE'
-                        AND upper(COALESCE(e.process_area,''))='DELIVERY'
-                    ) OR EXISTS (
-                      SELECT 1
-                      FROM auditcore.deliveries d
-                      WHERE d.tenant_id=:tenant_id
-                        AND d.journey_id=:journey_id
-                    )
-                    """
-                ),
-                {"tenant_id": tenant_id, "journey_id": journey_id},
-            ).scalar_one()
-        )
-        current_stage = (
-            "DELIVERY_DOCUMENT_UPLOAD"
-            if delivery_started
-            else "BOOKING_COMPLETE"
-        )
-        booking_state = "COMPLETE"
-    elif any_document_missing or not payment_passed:
-        current_stage = "BOOKING_DOCUMENT_UPLOAD"
-        booking_state = "IN_PROGRESS"
+    if not booking_complete:
+        stage = "BOOKING_DOCUMENT_UPLOAD" if evidence_or_payment_missing else "BOOKING_VERIFY_DOCUMENTS"
+        booking_state = "IN_PROGRESS" if evidence_or_payment_missing else "BLOCKED"
+    elif not delivery_started:
+        stage, booking_state = "BOOKING_COMPLETE", "COMPLETE"
     else:
-        current_stage = "BOOKING_VERIFY_DOCUMENTS"
-        booking_state = "BLOCKED"
+        booking_state = "COMPLETE"
+        stage = "DELIVERY_VERIFY_DOCUMENTS" if delivery["passed"] else "DELIVERY_DOCUMENT_UPLOAD"
+    # Delivery completion is never automatic until its criteria are approved.
+    delivery_state = "IN_PROGRESS"
 
+    previous = connection.execute(
+        text(
+            """
+            SELECT current_stage, booking_completion_state
+            FROM auditcore.p2_journey_runtime
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
+    total_row = gates.get("MINIMUM_BOOKING_PAYMENT") or {}
     connection.execute(
         text(
             """
             INSERT INTO auditcore.p2_journey_runtime (
                 tenant_id, journey_id, current_stage,
                 booking_minimum_amount, booking_receipt_total,
-                booking_completion_state, manual_verification_pending_count
+                booking_completion_state, delivery_completion_state,
+                manual_verification_pending_count
             ) VALUES (
-                :tenant_id, :journey_id, :current_stage,
-                :minimum, :receipt_total, :booking_state, :manual_pending
+                :tenant_id, :journey_id, :stage,
+                :minimum, :receipt_total, :booking_state, :delivery_state, :manual_pending
             )
             ON CONFLICT (tenant_id, journey_id)
-            DO UPDATE SET current_stage=CASE
-                            WHEN auditcore.p2_journey_runtime.current_stage LIKE 'DELIVERY_%'
-                            THEN auditcore.p2_journey_runtime.current_stage
-                            ELSE EXCLUDED.current_stage
-                          END,
+            DO UPDATE SET current_stage=EXCLUDED.current_stage,
                           booking_minimum_amount=EXCLUDED.booking_minimum_amount,
                           booking_receipt_total=EXCLUDED.booking_receipt_total,
                           booking_completion_state=EXCLUDED.booking_completion_state,
+                          delivery_completion_state=EXCLUDED.delivery_completion_state,
                           manual_verification_pending_count=EXCLUDED.manual_verification_pending_count,
                           updated_at_utc=now()
             """
@@ -332,21 +410,44 @@ def recompute_booking_stage(
         {
             "tenant_id": tenant_id,
             "journey_id": journey_id,
-            "current_stage": current_stage,
+            "stage": stage,
             "minimum": minimum,
-            "receipt_total": receipt_total,
+            "receipt_total": Decimal(str(total_row.get("receiptTotal") or 0)),
             "booking_state": booking_state,
+            "delivery_state": delivery_state,
             "manual_pending": manual_pending,
         },
     )
-    return {
-        "stage": current_stage,
+    result = {
+        "stage": stage,
         "bookingCompletionState": booking_state,
+        "deliveryCompletionState": delivery_state,
         "minimumBookingAmount": str(minimum),
-        "bookingReceiptTotal": str(receipt_total),
+        "bookingReceiptTotal": str(total_row.get("receiptTotal") or "0"),
         "manualVerificationPending": manual_pending,
         "gates": gates,
+        "delivery": delivery,
+        "conditions": sorted(conditions),
     }
+    if previous is None or previous["current_stage"] != stage or previous["booking_completion_state"] != booking_state:
+        record_activity(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            event_type="STAGE_CHANGED",
+            subject_type="JOURNEY",
+            subject_id=str(journey_id),
+            details={
+                "from": previous["current_stage"] if previous else None,
+                "to": stage,
+                "bookingCompletionState": booking_state,
+            },
+        )
+    return result
+
+
+# Backwards-compatible name used by the worker and API.
+recompute_booking_stage = recompute_journey_stage
 
 
 def read_booking_stage(
@@ -355,10 +456,11 @@ def read_booking_stage(
     tenant_id: str,
     journey_id: UUID,
 ) -> dict[str, Any]:
+    registry = get_registry()
     runtime = connection.execute(
         text(
             """
-            SELECT current_stage, booking_completion_state,
+            SELECT current_stage, booking_completion_state, delivery_completion_state,
                    booking_minimum_amount, booking_receipt_total,
                    manual_verification_pending_count, fact_version
             FROM auditcore.p2_journey_runtime
@@ -367,52 +469,48 @@ def read_booking_stage(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().one_or_none()
-
     gate_rows = connection.execute(
         text(
             """
-            SELECT gate_key, gate_status, details, evaluated_at_utc
+            SELECT stage_code, gate_key, gate_status, details
             FROM auditcore.p2_stage_gate_state
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code='BOOKING'
-            ORDER BY gate_key
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
-    gates = {
-        str(row["gate_key"]): {
-            "passed": str(row["gate_status"]) == "PASS",
+    stored = {
+        (str(row["stage_code"]), str(row["gate_key"])): {
             **dict(row["details"] or {}),
+            "passed": str(row["gate_status"]) == "PASS",
         }
         for row in gate_rows
     }
-
-    for gate_key in (*_BOOKING_DOC_GATES.keys(), "MINIMUM_BOOKING_PAYMENT", "NO_MANUAL_VERIFICATION_PENDING"):
-        gates.setdefault(gate_key, {"passed": False})
-
-    if runtime is None:
-        minimum = _minimum_booking_amount(connection, tenant_id=tenant_id)
-        return {
-            "stage": "BOOKING_DOCUMENT_UPLOAD",
-            "bookingCompletionState": "IN_PROGRESS",
-            "minimumBookingAmount": str(minimum),
-            "bookingReceiptTotal": "0",
-            "manualVerificationPending": 0,
-            "factVersion": 0,
-            "gates": gates,
-        }
-
+    gates: dict[str, dict[str, Any]] = {}
+    for gate in registry.stages["BOOKING"].gates:
+        gates[gate.key] = stored.get(
+            ("BOOKING", gate.key),
+            {"passed": False, "label": gate.label, "kind": gate.kind, "action": gate.missing},
+        )
+    delivery = stored.get(("DELIVERY", "REQUIRED_DOCUMENTS"), {"passed": False})
+    minimum = (
+        runtime["booking_minimum_amount"]
+        if runtime is not None and runtime["booking_minimum_amount"] is not None
+        else _minimum_booking_amount(connection, tenant_id=tenant_id)
+    )
     return {
-        "stage": str(runtime["current_stage"]),
-        "bookingCompletionState": str(runtime["booking_completion_state"]),
-        "minimumBookingAmount": (
-            str(runtime["booking_minimum_amount"])
-            if runtime["booking_minimum_amount"] is not None
-            else str(_minimum_booking_amount(connection, tenant_id=tenant_id))
-        ),
-        "bookingReceiptTotal": str(runtime["booking_receipt_total"] or 0),
-        "manualVerificationPending": int(runtime["manual_verification_pending_count"] or 0),
-        "factVersion": int(runtime["fact_version"] or 0),
+        "stage": str(runtime["current_stage"]) if runtime else "BOOKING_DOCUMENT_UPLOAD",
+        "bookingCompletionState": str(runtime["booking_completion_state"]) if runtime else "IN_PROGRESS",
+        "deliveryCompletionState": str(runtime["delivery_completion_state"]) if runtime else "IN_PROGRESS",
+        "minimumBookingAmount": str(minimum),
+        "bookingReceiptTotal": str(runtime["booking_receipt_total"] or 0) if runtime else "0",
+        "manualVerificationPending": int(runtime["manual_verification_pending_count"] or 0) if runtime else 0,
+        "factVersion": int(runtime["fact_version"] or 0) if runtime else 0,
         "gates": gates,
+        "delivery": delivery,
+        "stages": [
+            {"code": state, "stage": code}
+            for code, template in sorted(registry.stages.items(), key=lambda item: item[1].order)
+            for state in template.states
+        ],
     }

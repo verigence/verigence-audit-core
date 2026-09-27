@@ -1,0 +1,4929 @@
+{
+ "schemas": {
+  "aadhaar": {
+   "display_name": "Aadhaar Card",
+   "fields": [
+    {
+     "description": "Aadhaar number exactly as visible. If masked, preserve the masking and never infer hidden digits.",
+     "key": "aadhaar_number",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Full name of the Aadhaar holder exactly as printed.",
+     "key": "aadhaar_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Complete date of birth if explicitly printed. If the document only contains a year of birth, do not invent a month or day.",
+     "key": "date_of_birth",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Gender exactly as printed on the Aadhaar document.",
+     "key": "gender",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Complete postal address printed on the Aadhaar document, if present.",
+     "key": "aadhaar_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Postal PIN code only when explicitly identifiable in the printed Aadhaar address; never infer or repair missing digits.",
+     "key": "address_pincode",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "State/UT only when explicitly identifiable from the printed Aadhaar address; do not derive it from the PIN code.",
+     "key": "address_state",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "District only when explicitly identifiable from the printed Aadhaar address; do not infer district from city, state, PIN code, or external geography knowledge.",
+     "key": "address_district",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Explicit Aadhaar relationship marker only when W/O, S/O, or D/O is visibly printed/written with a related person's name. Never infer a relationship from the address, surname, gender, or surrounding text.",
+     "key": "aadhaar_relationship_type",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Name immediately associated with an explicitly visible Aadhaar W/O, S/O, or D/O marker. Return null when no such explicit marker is present.",
+     "key": "aadhaar_relationship_name",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.2"
+  },
+  "accessory_invoice_dms": {
+   "display_name": "Accessory Invoice / Challan (DMS)",
+   "fields": [
+    {
+     "description": "Business purpose of this invoice based on visible content.",
+     "key": "invoice_purpose",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Legal/business nature explicitly stated or reliably evidenced by the document.",
+     "key": "invoice_nature",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice heading/title exactly as printed, for example TAX INVOICE or Retail Invoice.",
+     "key": "invoice_heading_as_printed",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Source/system only when visible or reliably evidenced; otherwise UNKNOWN.",
+     "key": "source_system",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Role of the invoice issuer based on the visible seller/issuer context.",
+     "key": "issuer_role",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice/reference number exactly as printed.",
+     "key": "invoice_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Invoice date exactly as printed; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "invoice_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer legal or trade name exactly as printed.",
+     "key": "seller_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller GSTIN exactly as printed.",
+     "key": "seller_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer address exactly as printed.",
+     "key": "seller_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer name exactly as printed.",
+     "key": "buyer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer ID only when explicitly printed.",
+     "key": "buyer_customer_id",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer GSTIN exactly as printed; null when the document says unregistered.",
+     "key": "buyer_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer GST registration status only from explicit document evidence; do not infer from a missing GSTIN.",
+     "key": "buyer_gstin_status",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer address exactly as printed.",
+     "key": "buyer_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Financier/hypothecation/loan institution exactly as printed.",
+     "key": "financed_by",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Gross/base amount before invoice-level discount only when explicitly stated.",
+     "key": "gross_amount_before_discount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice-level discount amount exactly as stated; do not calculate it.",
+     "key": "invoice_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Taxable/net selling value exactly as stated; do not derive it from other amounts.",
+     "key": "taxable_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST rate percentage when explicitly printed.",
+     "key": "cgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST amount exactly as printed.",
+     "key": "cgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST rate percentage when explicitly printed.",
+     "key": "sgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST amount exactly as printed.",
+     "key": "sgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST rate percentage when explicitly printed.",
+     "key": "igst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST amount exactly as printed.",
+     "key": "igst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "GST compensation cess or other cess amount only when explicitly printed.",
+     "key": "cess_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "TCS amount only when explicitly printed; return null for N/A.",
+     "key": "tcs_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Signed round-off amount exactly as printed; preserve negative values and paise.",
+     "key": "round_off_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Final invoice/grand total exactly as printed; do not recompute taxes or rounding.",
+     "key": "grand_total_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice amount-in-words text exactly as printed.",
+     "key": "amount_in_words",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Narration/remarks exactly as printed, if present.",
+     "key": "narration",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "JSON array of visible invoice line items. For each item preserve description_raw and extract only explicitly printed item_code, hsn_sac, quantity, unit_rate, gross_amount, discount_amount, taxable_amount, tax_rate, tax_amount and net_amount. Also classify each item into line_category using the description text and any HSN/SAC code: one of VEHICLE, ACCESSORY_GENUINE, ACCESSORY_NON_GENUINE, EXTENDED_WARRANTY, RSA, INSURANCE, FASTAG, SERVICE_PACKAGE, TCS, DISCOUNT_LINE, TAX_LINE, OTHER. Use OTHER when the item does not clearly fit; never guess a specific category from the amount alone.",
+     "key": "line_items",
+     "required": false,
+     "type": "array"
+    },
+    {
+     "description": "Complete vehicle description exactly as printed when present on any invoice.",
+     "key": "vehicle_description_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Explicit SKU/product/model code only when printed; never infer it.",
+     "key": "sku_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle model text exactly as printed; do not map to a master.",
+     "key": "model_name_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle variant/trim text exactly as printed; do not map to a master.",
+     "key": "variant_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "VIN exactly as printed; never reconstruct missing characters.",
+     "key": "vin_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Chassis number exactly as printed.",
+     "key": "chassis_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Engine number exactly as printed.",
+     "key": "engine_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle key number only when explicitly printed.",
+     "key": "key_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle colour exactly as printed.",
+     "key": "vehicle_color",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle registration number only when printed.",
+     "key": "vehicle_registration_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle HSN code exactly as printed.",
+     "key": "vehicle_hsn_code",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.1"
+  },
+  "accessory_invoice_tally": {
+   "display_name": "Accessory Invoice (Tally)",
+   "fields": [
+    {
+     "description": "Business purpose of this invoice based on visible content.",
+     "key": "invoice_purpose",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Legal/business nature explicitly stated or reliably evidenced by the document.",
+     "key": "invoice_nature",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice heading/title exactly as printed, for example TAX INVOICE or Retail Invoice.",
+     "key": "invoice_heading_as_printed",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Source/system only when visible or reliably evidenced; otherwise UNKNOWN.",
+     "key": "source_system",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Role of the invoice issuer based on the visible seller/issuer context.",
+     "key": "issuer_role",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice/reference number exactly as printed.",
+     "key": "invoice_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Invoice date exactly as printed; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "invoice_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer legal or trade name exactly as printed.",
+     "key": "seller_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller GSTIN exactly as printed.",
+     "key": "seller_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer address exactly as printed.",
+     "key": "seller_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer name exactly as printed.",
+     "key": "buyer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer ID only when explicitly printed.",
+     "key": "buyer_customer_id",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer GSTIN exactly as printed; null when the document says unregistered.",
+     "key": "buyer_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer GST registration status only from explicit document evidence; do not infer from a missing GSTIN.",
+     "key": "buyer_gstin_status",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer address exactly as printed.",
+     "key": "buyer_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Financier/hypothecation/loan institution exactly as printed.",
+     "key": "financed_by",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Gross/base amount before invoice-level discount only when explicitly stated.",
+     "key": "gross_amount_before_discount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice-level discount amount exactly as stated; do not calculate it.",
+     "key": "invoice_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Taxable/net selling value exactly as stated; do not derive it from other amounts.",
+     "key": "taxable_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST rate percentage when explicitly printed.",
+     "key": "cgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST amount exactly as printed.",
+     "key": "cgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST rate percentage when explicitly printed.",
+     "key": "sgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST amount exactly as printed.",
+     "key": "sgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST rate percentage when explicitly printed.",
+     "key": "igst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST amount exactly as printed.",
+     "key": "igst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "GST compensation cess or other cess amount only when explicitly printed.",
+     "key": "cess_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "TCS amount only when explicitly printed; return null for N/A.",
+     "key": "tcs_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Signed round-off amount exactly as printed; preserve negative values and paise.",
+     "key": "round_off_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Final invoice/grand total exactly as printed; do not recompute taxes or rounding.",
+     "key": "grand_total_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice amount-in-words text exactly as printed.",
+     "key": "amount_in_words",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Narration/remarks exactly as printed, if present.",
+     "key": "narration",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "JSON array of visible invoice line items. For each item preserve description_raw and extract only explicitly printed item_code, hsn_sac, quantity, unit_rate, gross_amount, discount_amount, taxable_amount, tax_rate, tax_amount and net_amount. Also classify each item into line_category using the description text and any HSN/SAC code: one of VEHICLE, ACCESSORY_GENUINE, ACCESSORY_NON_GENUINE, EXTENDED_WARRANTY, RSA, INSURANCE, FASTAG, SERVICE_PACKAGE, TCS, DISCOUNT_LINE, TAX_LINE, OTHER. Use OTHER when the item does not clearly fit; never guess a specific category from the amount alone.",
+     "key": "line_items",
+     "required": false,
+     "type": "array"
+    },
+    {
+     "description": "Complete vehicle description exactly as printed when present on any invoice.",
+     "key": "vehicle_description_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Explicit SKU/product/model code only when printed; never infer it.",
+     "key": "sku_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle model text exactly as printed; do not map to a master.",
+     "key": "model_name_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle variant/trim text exactly as printed; do not map to a master.",
+     "key": "variant_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "VIN exactly as printed; never reconstruct missing characters.",
+     "key": "vin_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Chassis number exactly as printed.",
+     "key": "chassis_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Engine number exactly as printed.",
+     "key": "engine_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle key number only when explicitly printed.",
+     "key": "key_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle colour exactly as printed.",
+     "key": "vehicle_color",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle registration number only when printed.",
+     "key": "vehicle_registration_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle HSN code exactly as printed.",
+     "key": "vehicle_hsn_code",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.1"
+  },
+  "bank_approval_letter": {
+   "display_name": "Bank Approval Letter",
+   "fields": [
+    {
+     "description": "Financier name exactly as printed.",
+     "key": "financier_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Financier branch exactly as printed.",
+     "key": "branch",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Sanction/approval letter number exactly as printed.",
+     "key": "sanction_letter_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Sanction date; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "sanction_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Offer/sanction validity end date; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "offer_valid_until",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Primary applicant name exactly as printed.",
+     "key": "applicant_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Primary applicant PAN exactly as printed.",
+     "key": "applicant_pan",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Co-applicant name exactly as printed, if present.",
+     "key": "co_applicant_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Guarantor name exactly as printed, if present.",
+     "key": "guarantor_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Loan account/application/reference number exactly as printed.",
+     "key": "loan_account_or_application_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle chassis/VIN stated in the approval, if present.",
+     "key": "chassis_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle make/model/variant text exactly as printed.",
+     "key": "make_model_variant",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Ex-showroom amount considered by the financier.",
+     "key": "ex_showroom_considered",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "On-road price considered by the financier.",
+     "key": "on_road_price_considered",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Insurance amount considered by the financier.",
+     "key": "insurance_considered",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Accessories amount considered by the financier.",
+     "key": "accessories_considered",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice or proforma value referenced in the approval.",
+     "key": "invoice_or_proforma_value_referenced",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Proforma/invoice reference number exactly as printed.",
+     "key": "proforma_reference_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Loan amount sanctioned/approved.",
+     "key": "sanctioned_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Loan-to-value percentage stated on the approval.",
+     "key": "ltv_percent_stated",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Margin money/down-payment requirement stated by the financier.",
+     "key": "margin_money_required",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Loan tenure in months as stated.",
+     "key": "tenure_months",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Interest rate as stated; return the numeric percentage when explicit.",
+     "key": "interest_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Interest-rate type exactly as stated, e.g. fixed/floating.",
+     "key": "rate_type",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "EMI amount stated on the approval.",
+     "key": "emi_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Processing fee stated on the approval.",
+     "key": "processing_fee",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Three-state observation of whether insurance is explicitly funded by the loan.",
+     "key": "insurance_funded",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "Subvention scheme/code referenced, if any.",
+     "key": "subvention_scheme_referenced",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Party explicitly stated to bear subvention.",
+     "key": "subvention_borne_by_stated",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Subvention amount stated, if any.",
+     "key": "subvention_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Dealer payout amount stated, if any.",
+     "key": "dealer_payout_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Beneficiary in whose favour disbursement is stated.",
+     "key": "disbursement_in_favour_of",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Disbursement mode exactly as stated.",
+     "key": "disbursement_mode",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Disbursement date when explicitly stated; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "disbursement_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "JSON array of condition-precedent clauses/requirements. Every item must be a string and no printed clause may be silently dropped.",
+     "key": "conditions_precedent",
+     "required": false,
+     "type": "array"
+    },
+    {
+     "description": "Three-state observation of authorising signature presence.",
+     "key": "signature_present",
+     "required": false,
+     "type": "boolean"
+    }
+   ],
+   "schema_version": "2.0"
+  },
+  "bank_statement_extract": {
+   "display_name": "Bank Statement Extract",
+   "fields": [
+    {
+     "description": "Bank/financial institution name if visible",
+     "key": "bank_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Account holder/customer name if visible",
+     "key": "account_holder_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Account number exactly as visible; preserve masking and never reconstruct hidden digits",
+     "key": "account_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Transaction date exactly as printed",
+     "key": "transaction_date",
+     "required": true,
+     "type": "date"
+    },
+    {
+     "description": "Value date if separately printed",
+     "key": "value_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Full narration/transaction description exactly as printed",
+     "key": "transaction_description",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Reference/RRN/UTR/NEFT/RTGS/IMPS identifier explicitly present in the narration or reference column",
+     "key": "reference_no",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Counterparty name only when explicitly identifiable from the printed transaction row",
+     "key": "counterparty_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Debit amount for the selected row",
+     "key": "debit_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Credit amount for the selected row",
+     "key": "credit_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Running/account balance printed for the selected row",
+     "key": "running_balance",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "True only when a visible highlight/circle/underline/tick or other manual mark clearly identifies the row",
+     "key": "manually_flagged",
+     "required": false,
+     "type": "boolean"
+    }
+   ],
+   "schema_version": "1.1"
+  },
+  "booking_form": {
+   "display_name": "Booking Form",
+   "fields": [
+    {
+     "description": "Name of the dealership exactly as visible",
+     "key": "dealer_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Dealer branch/outlet/location exactly as visible",
+     "key": "dealer_branch",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Booking, order, enquiry, or reference number printed/written on the form",
+     "key": "booking_reference_number",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Booking date explicitly visible on the form",
+     "key": "booking_date",
+     "required": true,
+     "type": "date"
+    },
+    {
+     "description": "Full customer name exactly as visible",
+     "key": "customer_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Customer contact/mobile number exactly as visible",
+     "key": "customer_phone",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Customer email address if explicitly visible",
+     "key": "customer_email",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Customer residential/postal address if explicitly visible",
+     "key": "customer_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Booked vehicle model exactly as visible",
+     "key": "vehicle_model",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Booked vehicle variant/trim exactly as visible",
+     "key": "vehicle_variant",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Booked/preferred vehicle colour exactly as visible",
+     "key": "vehicle_color",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle/product/SKU code only when explicitly printed or written on the Booking Form; never infer it from model, variant, price, or general knowledge",
+     "key": "sku_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Sales executive/consultant name if explicitly visible",
+     "key": "sales_person",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Person, party, dealer, customer, or agency shown as responsible for registration; return the text exactly as visible and do not infer responsibility",
+     "key": "registration_by",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Registration type/category exactly as explicitly printed or written; do not infer from customer or vehicle details",
+     "key": "registration_type",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Person, party, dealer, customer, insurer, or agency shown as arranging/providing insurance; return the text exactly as visible and do not infer responsibility",
+     "key": "insurance_by",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Whether exchange/trade-in is explicitly marked Yes/No on the form; return null when there is no explicit selection and never infer from an exchange value",
+     "key": "exchange_applicable",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "Exchange/trade-in value only when explicitly printed/written",
+     "key": "exchange_value",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Ex-showroom price only when explicitly printed/written",
+     "key": "ex_showroom_price",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Insurance charge only when explicitly printed/written",
+     "key": "insurance_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Registration charges only when shown as a distinct amount; do not derive them from a combined road-tax/registration amount",
+     "key": "registration_charges",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Road tax amount only when shown as a distinct amount; do not derive it from a combined road-tax/registration amount",
+     "key": "road_tax_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Legacy combined road-tax/registration charge only when the document itself presents a combined amount; do not sum separate registration and road-tax values",
+     "key": "road_tax_registration",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Tax Collected at Source (TCS) amount only when explicitly shown",
+     "key": "tcs_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Roadside Assistance (RSA) amount only when explicitly shown",
+     "key": "rsa_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Additional warranty amount only when explicitly shown",
+     "key": "additional_warranty_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Extended Warranty/EW amount only when explicitly shown as a separate charge",
+     "key": "extended_warranty_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Total/combined accessories charge only when explicitly printed/written",
+     "key": "accessories_cost",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Essential Kit/accessory kit amount only when explicitly shown as a separate line",
+     "key": "essential_kit_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Genuine accessories amount only when explicitly shown as a separate line",
+     "key": "genuine_accessories_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Non-genuine/non-OEM accessories amount only when explicitly shown as a separate line",
+     "key": "non_genuine_accessories_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "FASTag/Fast Tag charge only when explicitly shown",
+     "key": "fastag_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Green tax/green cess amount only when explicitly shown",
+     "key": "green_tax_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Service package/service plan/maintenance package amount only when explicitly shown",
+     "key": "service_package_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Other charge only when explicitly printed/written; do not include separately labelled TCS, RSA, warranty, FASTag, green tax, service package, registration, road tax, insurance, accessories, discount, or bonus amounts",
+     "key": "other_charges",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Total/lump-sum discount or scheme amount only when explicitly shown; do not calculate it and do not allocate it across discount types",
+     "key": "discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Sales discount amount only when explicitly labelled/shown",
+     "key": "sales_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Buffer discount amount only when explicitly labelled/shown",
+     "key": "buffer_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Exchange discount/benefit amount only when explicitly labelled/shown; keep separate from exchange vehicle value",
+     "key": "exchange_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Corporate discount/benefit amount only when explicitly labelled/shown",
+     "key": "corporate_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Scrappage/vehicle-scrappage discount or bonus amount only when explicitly labelled/shown",
+     "key": "scrappage_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Loyalty discount/benefit amount only when explicitly labelled/shown",
+     "key": "loyalty_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "In-house insurance discount/benefit amount only when explicitly labelled/shown",
+     "key": "inhouse_insurance_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "MR discount/benefit amount only when the document explicitly uses the MR label",
+     "key": "mr_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "OEM referral discount/benefit amount only when explicitly labelled/shown",
+     "key": "oem_referral_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Other specifically labelled discount amount only when explicitly shown; do not use this for an unlabelled total discount",
+     "key": "other_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Free accessory/accessory benefit discount amount only when explicitly shown as a monetary value",
+     "key": "free_accessory_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Bonus amount only when explicitly shown",
+     "key": "bonus_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Grand total/on-road price only when explicitly shown; never calculate a missing total",
+     "key": "total_price",
+     "required": true,
+     "type": "number"
+    },
+    {
+     "description": "Net amount/net deal only when explicitly shown; never calculate it from total, discounts, bonus, or payments",
+     "key": "net_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Booking advance/amount paid only when explicitly shown",
+     "key": "booking_amount_paid",
+     "required": true,
+     "type": "number"
+    },
+    {
+     "description": "Balance amount only when explicitly shown; never calculate it",
+     "key": "balance_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Payment mode exactly as printed, including UPI/card/cash/cheque/NEFT/RTGS/DD/pay order when applicable",
+     "key": "mode_of_payment",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Cheque/DD/NEFT/RTGS/UPI/card/reference number only when explicitly visible",
+     "key": "payment_reference_no",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Legacy raw expected-delivery value/timeframe exactly as stated, including an exact date when that is what the document shows",
+     "key": "expected_delivery",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Complete expected delivery calendar date only when explicitly stated; return null for vague periods such as '2 weeks' or 'October'",
+     "key": "expected_delivery_date",
+     "required": false,
+     "type": "date"
+    }
+   ],
+   "schema_version": "1.6"
+  },
+  "corporate_id": {
+   "display_name": "Corporate ID",
+   "fields": [
+    {
+     "description": "Observed evidence format: PHOTO_ID_CARD, EMPLOYMENT_LETTER, SALARY_SLIP, BUSINESS_CARD, EMAIL_PRINTOUT, HR_CERTIFICATE, OFFER_LETTER, OTHER.",
+     "key": "evidence_format",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Employer/organisation name exactly as printed.",
+     "key": "employer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Employer address exactly as printed.",
+     "key": "employer_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Employer GSTIN exactly as printed, if present.",
+     "key": "employer_gstin_printed",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Employee/customer name exactly as printed.",
+     "key": "employee_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Employee code or staff identifier exactly as printed.",
+     "key": "employee_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Designation/job title exactly as printed.",
+     "key": "designation",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Department exactly as printed.",
+     "key": "department",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Date of joining exactly as printed; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "date_of_joining",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "ID/evidence validity start date if stated; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "id_valid_from",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "ID/evidence validity end date if stated; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "id_valid_until",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Document date exactly as printed; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "document_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Salary-slip month/period exactly as printed.",
+     "key": "salary_slip_month",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Corporate scheme/code referenced on the evidence, if any.",
+     "key": "corporate_scheme_code_referenced",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Three-state observation: true when a person photo is clearly present, false when clearly absent, null when uncertain.",
+     "key": "photo_present",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "Three-state observation: true when an employer logo is clearly present, false when clearly absent, null when uncertain.",
+     "key": "employer_logo_present",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "Three-state observation of issuing-authority signature presence.",
+     "key": "issuing_authority_signature_present",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "Three-state observation: true when clearly a photocopy, false when clearly original/print, null when uncertain.",
+     "key": "is_photocopy",
+     "required": false,
+     "type": "boolean"
+    }
+   ],
+   "schema_version": "2.0"
+  },
+  "credit_note": {
+   "display_name": "Credit Note",
+   "fields": [
+    {
+     "description": "Business purpose of this invoice based on visible content.",
+     "key": "invoice_purpose",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Legal/business nature explicitly stated or reliably evidenced by the document.",
+     "key": "invoice_nature",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice heading/title exactly as printed, for example TAX INVOICE or Retail Invoice.",
+     "key": "invoice_heading_as_printed",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Source/system only when visible or reliably evidenced; otherwise UNKNOWN.",
+     "key": "source_system",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Role of the invoice issuer based on the visible seller/issuer context.",
+     "key": "issuer_role",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice/reference number exactly as printed.",
+     "key": "invoice_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Invoice date exactly as printed; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "invoice_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer legal or trade name exactly as printed.",
+     "key": "seller_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller GSTIN exactly as printed.",
+     "key": "seller_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer address exactly as printed.",
+     "key": "seller_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer name exactly as printed.",
+     "key": "buyer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer ID only when explicitly printed.",
+     "key": "buyer_customer_id",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer GSTIN exactly as printed; null when the document says unregistered.",
+     "key": "buyer_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer GST registration status only from explicit document evidence; do not infer from a missing GSTIN.",
+     "key": "buyer_gstin_status",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer address exactly as printed.",
+     "key": "buyer_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Financier/hypothecation/loan institution exactly as printed.",
+     "key": "financed_by",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Gross/base amount before invoice-level discount only when explicitly stated.",
+     "key": "gross_amount_before_discount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice-level discount amount exactly as stated; do not calculate it.",
+     "key": "invoice_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Taxable/net selling value exactly as stated; do not derive it from other amounts.",
+     "key": "taxable_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST rate percentage when explicitly printed.",
+     "key": "cgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST amount exactly as printed.",
+     "key": "cgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST rate percentage when explicitly printed.",
+     "key": "sgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST amount exactly as printed.",
+     "key": "sgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST rate percentage when explicitly printed.",
+     "key": "igst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST amount exactly as printed.",
+     "key": "igst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "GST compensation cess or other cess amount only when explicitly printed.",
+     "key": "cess_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "TCS amount only when explicitly printed; return null for N/A.",
+     "key": "tcs_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Signed round-off amount exactly as printed; preserve negative values and paise.",
+     "key": "round_off_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Final invoice/grand total exactly as printed; do not recompute taxes or rounding.",
+     "key": "grand_total_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice amount-in-words text exactly as printed.",
+     "key": "amount_in_words",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Narration/remarks exactly as printed, if present.",
+     "key": "narration",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "JSON array of visible invoice line items. For each item preserve description_raw and extract only explicitly printed item_code, hsn_sac, quantity, unit_rate, gross_amount, discount_amount, taxable_amount, tax_rate, tax_amount and net_amount. Also classify each item into line_category using the description text and any HSN/SAC code: one of VEHICLE, ACCESSORY_GENUINE, ACCESSORY_NON_GENUINE, EXTENDED_WARRANTY, RSA, INSURANCE, FASTAG, SERVICE_PACKAGE, TCS, DISCOUNT_LINE, TAX_LINE, OTHER. Use OTHER when the item does not clearly fit; never guess a specific category from the amount alone.",
+     "key": "line_items",
+     "required": false,
+     "type": "array"
+    },
+    {
+     "description": "Complete vehicle description exactly as printed when present on any invoice.",
+     "key": "vehicle_description_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Explicit SKU/product/model code only when printed; never infer it.",
+     "key": "sku_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle model text exactly as printed; do not map to a master.",
+     "key": "model_name_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle variant/trim text exactly as printed; do not map to a master.",
+     "key": "variant_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "VIN exactly as printed; never reconstruct missing characters.",
+     "key": "vin_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Chassis number exactly as printed.",
+     "key": "chassis_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Engine number exactly as printed.",
+     "key": "engine_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle key number only when explicitly printed.",
+     "key": "key_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle colour exactly as printed.",
+     "key": "vehicle_color",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle registration number only when printed.",
+     "key": "vehicle_registration_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle HSN code exactly as printed.",
+     "key": "vehicle_hsn_code",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.1"
+  },
+  "customer_invoice_dms": {
+   "display_name": "Customer Invoice (DMS)",
+   "fields": [
+    {
+     "description": "Business purpose of this invoice based on visible content.",
+     "key": "invoice_purpose",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Legal/business nature explicitly stated or reliably evidenced by the document.",
+     "key": "invoice_nature",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice heading/title exactly as printed, for example TAX INVOICE or Retail Invoice.",
+     "key": "invoice_heading_as_printed",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Source/system only when visible or reliably evidenced; otherwise UNKNOWN.",
+     "key": "source_system",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Role of the invoice issuer based on the visible seller/issuer context.",
+     "key": "issuer_role",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice/reference number exactly as printed.",
+     "key": "invoice_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Invoice date exactly as printed; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "invoice_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer legal or trade name exactly as printed.",
+     "key": "seller_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller GSTIN exactly as printed.",
+     "key": "seller_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer address exactly as printed.",
+     "key": "seller_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer name exactly as printed.",
+     "key": "buyer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer ID only when explicitly printed.",
+     "key": "buyer_customer_id",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer GSTIN exactly as printed; null when the document says unregistered.",
+     "key": "buyer_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer GST registration status only from explicit document evidence; do not infer from a missing GSTIN.",
+     "key": "buyer_gstin_status",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer address exactly as printed.",
+     "key": "buyer_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Financier/hypothecation/loan institution exactly as printed.",
+     "key": "financed_by",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Gross/base amount before invoice-level discount only when explicitly stated.",
+     "key": "gross_amount_before_discount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice-level discount amount exactly as stated; do not calculate it.",
+     "key": "invoice_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Taxable/net selling value exactly as stated; do not derive it from other amounts.",
+     "key": "taxable_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST rate percentage when explicitly printed.",
+     "key": "cgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST amount exactly as printed.",
+     "key": "cgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST rate percentage when explicitly printed.",
+     "key": "sgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST amount exactly as printed.",
+     "key": "sgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST rate percentage when explicitly printed.",
+     "key": "igst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST amount exactly as printed.",
+     "key": "igst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "GST compensation cess or other cess amount only when explicitly printed.",
+     "key": "cess_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "TCS amount only when explicitly printed; return null for N/A.",
+     "key": "tcs_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Signed round-off amount exactly as printed; preserve negative values and paise.",
+     "key": "round_off_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Final invoice/grand total exactly as printed; do not recompute taxes or rounding.",
+     "key": "grand_total_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice amount-in-words text exactly as printed.",
+     "key": "amount_in_words",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Narration/remarks exactly as printed, if present.",
+     "key": "narration",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "JSON array of visible invoice line items. For each item preserve description_raw and extract only explicitly printed item_code, hsn_sac, quantity, unit_rate, gross_amount, discount_amount, taxable_amount, tax_rate, tax_amount and net_amount. Also classify each item into line_category using the description text and any HSN/SAC code: one of VEHICLE, ACCESSORY_GENUINE, ACCESSORY_NON_GENUINE, EXTENDED_WARRANTY, RSA, INSURANCE, FASTAG, SERVICE_PACKAGE, TCS, DISCOUNT_LINE, TAX_LINE, OTHER. Use OTHER when the item does not clearly fit; never guess a specific category from the amount alone.",
+     "key": "line_items",
+     "required": false,
+     "type": "array"
+    },
+    {
+     "description": "Complete vehicle description exactly as printed when present on any invoice.",
+     "key": "vehicle_description_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Explicit SKU/product/model code only when printed; never infer it.",
+     "key": "sku_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle model text exactly as printed; do not map to a master.",
+     "key": "model_name_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle variant/trim text exactly as printed; do not map to a master.",
+     "key": "variant_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "VIN exactly as printed; never reconstruct missing characters.",
+     "key": "vin_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Chassis number exactly as printed.",
+     "key": "chassis_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Engine number exactly as printed.",
+     "key": "engine_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle key number only when explicitly printed.",
+     "key": "key_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle colour exactly as printed.",
+     "key": "vehicle_color",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle registration number only when printed.",
+     "key": "vehicle_registration_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle HSN code exactly as printed.",
+     "key": "vehicle_hsn_code",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.1"
+  },
+  "customer_kyc": {
+   "display_name": "Customer KYC",
+   "fields": [
+    {
+     "description": "Observed evidence format: PAN_CARD, AADHAAR, VOTER_ID, PASSPORT, DRIVING_LICENSE, KYC_FORM, OTHER.",
+     "key": "evidence_format",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Customer name exactly as printed.",
+     "key": "customer_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Father's/husband's/guardian's name if printed (commonly labelled S/O, W/O, D/O, or C/O).",
+     "key": "relation_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Type of identity document if this is a printed ID (e.g. PAN, Aadhaar, Voter ID, Passport, Driving Licence).",
+     "key": "id_type",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Identity/document number exactly as printed.",
+     "key": "id_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Date of birth if printed.",
+     "key": "date_of_birth",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Full address exactly as printed.",
+     "key": "address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "PIN/postal code exactly as printed.",
+     "key": "pin_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Phone number exactly as printed.",
+     "key": "phone_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Date the KYC form/declaration itself was signed or issued, if printed.",
+     "key": "document_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Three-state observation: true when a person photo is clearly present, false when clearly absent, null when uncertain.",
+     "key": "photo_present",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "Three-state observation of the customer's signature presence.",
+     "key": "signature_present",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "Three-state observation: true when clearly a photocopy/scan of an original ID, false when clearly an original print/form, null when uncertain.",
+     "key": "is_photocopy",
+     "required": false,
+     "type": "boolean"
+    }
+   ],
+   "schema_version": "1.0"
+  },
+  "customer_ledger": {
+   "display_name": "Customer Ledger",
+   "fields": [
+    {
+     "description": "Dealership/company name whose books the ledger belongs to, exactly as printed",
+     "key": "dealer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Customer/party/account name the ledger is maintained for, exactly as printed",
+     "key": "customer_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Ledger/account head name exactly as printed when different from the customer name",
+     "key": "ledger_account_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Ledger/account/party code or number exactly as printed",
+     "key": "ledger_account_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Booking/order/deal reference printed on the ledger, if any",
+     "key": "booking_reference_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Source system when the document visibly identifies it",
+     "key": "source_system",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Ledger period start date only when explicitly printed",
+     "key": "period_from",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Ledger period end date only when explicitly printed",
+     "key": "period_to",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Opening balance only when explicitly printed; keep the printed sign",
+     "key": "opening_balance",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Total of the debit column only when explicitly printed as a total; never sum the rows yourself",
+     "key": "total_debited",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Total of the credit column only when explicitly printed as a total; never sum the rows yourself",
+     "key": "total_credited",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Closing/running balance at the end of the ledger only when explicitly printed; keep the printed sign",
+     "key": "closing_balance",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Total of credit entries whose narration/voucher type is cash, only when the ledger prints such a subtotal; do not derive it",
+     "key": "cash_credit_total",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Credit entry representing bank/financier loan or finance disbursement, only when a row explicitly identifies it; do not infer from amount",
+     "key": "loan_credit",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Credit entry representing exchange/trade-in adjustment, only when a row explicitly identifies it",
+     "key": "exchange_credit",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "JSON array of visible ledger rows. For each row preserve entry_date (date), particulars_raw, voucher_type, voucher_number, debit_amount, credit_amount and running_balance exactly as printed; do not merge rows or compute missing values",
+     "key": "line_items",
+     "required": false,
+     "type": "array"
+    }
+   ],
+   "schema_version": "1.0"
+  },
+  "dealer_receipt": {
+   "display_name": "Dealer Receipt",
+   "fields": [
+    {
+     "description": "Dealership name exactly as printed",
+     "key": "dealer_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Dealer GSTIN if explicitly printed",
+     "key": "dealer_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Customer/payer name exactly as printed",
+     "key": "customer_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Customer contact number if explicitly printed",
+     "key": "customer_phone",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Receipt/voucher number exactly as printed",
+     "key": "receipt_number",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Receipt/payment date exactly as printed",
+     "key": "receipt_date",
+     "required": true,
+     "type": "date"
+    },
+    {
+     "description": "Amount received/paid",
+     "key": "amount_paid",
+     "required": true,
+     "type": "number"
+    },
+    {
+     "description": "Payment mode exactly as printed, for example cash, cheque, demand draft (DD), NEFT, RTGS, IMPS, bank transfer, banker's order (BO), pay order (PO), trade-in adjustment, refund, UPI or card",
+     "key": "payment_mode",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Cheque/DD/UTR/RRN/transaction/reference number exactly as printed",
+     "key": "payment_reference_no",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Payment instrument/reference date if printed",
+     "key": "payment_reference_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Bank name if printed",
+     "key": "bank_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Bank branch/location if printed",
+     "key": "bank_location",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Linked booking/order/reference number if printed",
+     "key": "booking_reference_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Receipt remarks exactly as printed",
+     "key": "remarks",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Amount in words if printed",
+     "key": "amount_in_words",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.1"
+  },
+  "debit_note": {
+   "display_name": "Debit Note",
+   "fields": [
+    {
+     "description": "Issuing dealership/company name exactly as printed",
+     "key": "dealer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Issuer GSTIN exactly as printed",
+     "key": "dealer_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Debit note number/reference exactly as printed",
+     "key": "debit_note_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Debit note date exactly as printed",
+     "key": "debit_note_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Customer/party name the debit note is raised against, exactly as printed",
+     "key": "customer_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice/reference the debit note is raised against, if printed",
+     "key": "against_invoice_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Booking/order/deal reference printed on the note, if any",
+     "key": "booking_reference_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Amount charged for insurance premium only when explicitly shown as an insurance line",
+     "key": "insurance_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Amount charged for RTO / registration / road tax only when explicitly shown as such a line",
+     "key": "rto_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Any other charge line only when explicitly printed and not insurance or RTO",
+     "key": "other_charges",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Debit note total only when explicitly printed as a total; never sum the lines yourself",
+     "key": "total_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Narration/particulars/reason text exactly as printed",
+     "key": "particulars",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "JSON array of visible lines. For each line preserve particulars_raw and extract only explicitly printed hsn_sac, quantity, rate and amount",
+     "key": "line_items",
+     "required": false,
+     "type": "array"
+    }
+   ],
+   "schema_version": "1.0"
+  },
+  "delivery_order_cover": {
+   "display_name": "Delivery Order Cover",
+   "fields": [
+    {
+     "description": "Dealership name if explicitly visible",
+     "key": "dealer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Delivery order/DO number exactly as visible",
+     "key": "delivery_order_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle delivery/handover date if explicitly visible",
+     "key": "delivery_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Customer receiving the vehicle",
+     "key": "customer_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Linked booking/order/reference number if visible",
+     "key": "booking_reference_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle model exactly as visible",
+     "key": "vehicle_model",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle variant/trim exactly as visible",
+     "key": "vehicle_variant",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle colour exactly as visible",
+     "key": "vehicle_color",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Chassis/VIN exactly as visible; never reconstruct missing characters",
+     "key": "chassis_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Engine number exactly as visible; never reconstruct missing characters",
+     "key": "engine_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle registration number if explicitly visible",
+     "key": "vehicle_registration_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Sales/delivery executive name if explicitly visible",
+     "key": "delivered_by",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Other document types explicitly listed as included/attached; do not infer from an unseen bundle",
+     "key": "embedded_document_types",
+     "required": false,
+     "type": "array"
+    }
+   ],
+   "schema_version": "1.1"
+  },
+  "ew_invoice": {
+   "display_name": "Extended Warranty Invoice",
+   "fields": [
+    {
+     "description": "Business purpose of this invoice based on visible content.",
+     "key": "invoice_purpose",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Legal/business nature explicitly stated or reliably evidenced by the document.",
+     "key": "invoice_nature",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice heading/title exactly as printed, for example TAX INVOICE or Retail Invoice.",
+     "key": "invoice_heading_as_printed",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Source/system only when visible or reliably evidenced; otherwise UNKNOWN.",
+     "key": "source_system",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Role of the invoice issuer based on the visible seller/issuer context.",
+     "key": "issuer_role",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice/reference number exactly as printed.",
+     "key": "invoice_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Invoice date exactly as printed; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "invoice_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer legal or trade name exactly as printed.",
+     "key": "seller_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller GSTIN exactly as printed.",
+     "key": "seller_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer address exactly as printed.",
+     "key": "seller_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer name exactly as printed.",
+     "key": "buyer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer ID only when explicitly printed.",
+     "key": "buyer_customer_id",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer GSTIN exactly as printed; null when the document says unregistered.",
+     "key": "buyer_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer GST registration status only from explicit document evidence; do not infer from a missing GSTIN.",
+     "key": "buyer_gstin_status",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer address exactly as printed.",
+     "key": "buyer_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Financier/hypothecation/loan institution exactly as printed.",
+     "key": "financed_by",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Gross/base amount before invoice-level discount only when explicitly stated.",
+     "key": "gross_amount_before_discount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice-level discount amount exactly as stated; do not calculate it.",
+     "key": "invoice_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Taxable/net selling value exactly as stated; do not derive it from other amounts.",
+     "key": "taxable_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST rate percentage when explicitly printed.",
+     "key": "cgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST amount exactly as printed.",
+     "key": "cgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST rate percentage when explicitly printed.",
+     "key": "sgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST amount exactly as printed.",
+     "key": "sgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST rate percentage when explicitly printed.",
+     "key": "igst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST amount exactly as printed.",
+     "key": "igst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "GST compensation cess or other cess amount only when explicitly printed.",
+     "key": "cess_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "TCS amount only when explicitly printed; return null for N/A.",
+     "key": "tcs_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Signed round-off amount exactly as printed; preserve negative values and paise.",
+     "key": "round_off_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Final invoice/grand total exactly as printed; do not recompute taxes or rounding.",
+     "key": "grand_total_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice amount-in-words text exactly as printed.",
+     "key": "amount_in_words",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Narration/remarks exactly as printed, if present.",
+     "key": "narration",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "JSON array of visible invoice line items. For each item preserve description_raw and extract only explicitly printed item_code, hsn_sac, quantity, unit_rate, gross_amount, discount_amount, taxable_amount, tax_rate, tax_amount and net_amount. Also classify each item into line_category using the description text and any HSN/SAC code: one of VEHICLE, ACCESSORY_GENUINE, ACCESSORY_NON_GENUINE, EXTENDED_WARRANTY, RSA, INSURANCE, FASTAG, SERVICE_PACKAGE, TCS, DISCOUNT_LINE, TAX_LINE, OTHER. Use OTHER when the item does not clearly fit; never guess a specific category from the amount alone.",
+     "key": "line_items",
+     "required": false,
+     "type": "array"
+    },
+    {
+     "description": "Complete vehicle description exactly as printed when present on any invoice.",
+     "key": "vehicle_description_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Explicit SKU/product/model code only when printed; never infer it.",
+     "key": "sku_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle model text exactly as printed; do not map to a master.",
+     "key": "model_name_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle variant/trim text exactly as printed; do not map to a master.",
+     "key": "variant_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "VIN exactly as printed; never reconstruct missing characters.",
+     "key": "vin_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Chassis number exactly as printed.",
+     "key": "chassis_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Engine number exactly as printed.",
+     "key": "engine_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle key number only when explicitly printed.",
+     "key": "key_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle colour exactly as printed.",
+     "key": "vehicle_color",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle registration number only when printed.",
+     "key": "vehicle_registration_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle HSN code exactly as printed.",
+     "key": "vehicle_hsn_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Plan/product/service name exactly as printed.",
+     "key": "plan_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Coverage/service start date only when explicitly printed.",
+     "key": "coverage_start_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Coverage/service end date only when explicitly printed.",
+     "key": "coverage_end_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Coverage/service tenure in months only when explicitly printed.",
+     "key": "tenure_months",
+     "required": false,
+     "type": "number"
+    }
+   ],
+   "schema_version": "1.1"
+  },
+  "gate_pass": {
+   "display_name": "Gate Pass",
+   "fields": [
+    {
+     "description": "Delivery/gate-pass date exactly as printed; normalize only when unambiguous.",
+     "key": "delivery_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Car/vehicle number exactly as printed, without assuming what identifier type it is.",
+     "key": "car_number_as_printed",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle registration number only when the document explicitly labels the value as registration number or the printed format is unambiguously a registration number.",
+     "key": "vehicle_registration_number",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.0"
+  },
+  "gst_certificate": {
+   "display_name": "GST Certificate",
+   "fields": [
+    {
+     "description": "GSTIN exactly as printed.",
+     "key": "gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Legal name of the registered person/entity.",
+     "key": "legal_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Trade name, if printed.",
+     "key": "trade_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Constitution of business exactly as printed.",
+     "key": "constitution_of_business",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Full address of the principal place of business.",
+     "key": "address_principal_place",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "State for the principal place of business.",
+     "key": "state",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "PIN code for the principal place of business.",
+     "key": "pincode",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Registration type such as Regular, Composition, Casual Taxable Person, SEZ, or the exact printed value.",
+     "key": "type_of_registration",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Date of liability exactly as printed; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "date_of_liability",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Validity start date exactly as printed; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "period_of_validity_from",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Validity end date exactly as printed. It may state Not Applicable; do not invent a date.",
+     "key": "period_of_validity_to",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Certificate issue date exactly as printed; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "date_of_issue",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "State jurisdiction exactly as printed.",
+     "key": "jurisdiction_state",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Centre jurisdiction exactly as printed.",
+     "key": "jurisdiction_centre",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "JSON array of authorised signatory names. Every array item must be a string; return [] only when the document clearly has no names.",
+     "key": "authorised_signatory_names",
+     "required": false,
+     "type": "array"
+    },
+    {
+     "description": "Verbatim text if the certificate mentions cancellation or suspension; otherwise null.",
+     "key": "cancellation_or_suspension_text",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Three-state observation: true when a digital signature is clearly present, false when clearly absent, null when unreadable/uncertain.",
+     "key": "has_digital_signature",
+     "required": false,
+     "type": "boolean"
+    }
+   ],
+   "schema_version": "2.0"
+  },
+  "gst_declaration": {
+   "display_name": "GST Declaration",
+   "fields": [
+    {
+     "description": "Declarant/customer name exactly as printed or handwritten.",
+     "key": "customer_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Father's/husband's/guardian's name if stated (commonly labelled S/O, W/O, D/O).",
+     "key": "relation_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Customer address exactly as stated.",
+     "key": "address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "PIN/postal code exactly as stated.",
+     "key": "pin_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle model purchased, exactly as stated.",
+     "key": "vehicle_model",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Date of purchase stated in the declaration.",
+     "key": "purchase_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Three-state: true when the declarant states they hold a GST number, false when they explicitly declare no GST number, null when not clearly stated.",
+     "key": "has_gst_number",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "The declared GSTIN, only when has_gst_number is true and a number is actually written.",
+     "key": "gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Three-state observation of the customer/owner's signature presence.",
+     "key": "customer_signature_present",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "Sales personnel name if printed/signed.",
+     "key": "sales_personnel_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Three-state observation of the sales personnel's signature presence.",
+     "key": "sales_personnel_signature_present",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "Date the declaration itself was signed, if separately stated from purchase_date.",
+     "key": "document_date",
+     "required": false,
+     "type": "date"
+    }
+   ],
+   "schema_version": "1.0"
+  },
+  "insurance_cover": {
+   "display_name": "Insurance Cover Note",
+   "fields": [
+    {
+     "description": "Insurance company name exactly as printed",
+     "key": "insurer_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Policy/cover-note number exactly as printed",
+     "key": "policy_number",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Policy type only when explicitly stated",
+     "key": "policy_type",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Insured/proposer name exactly as printed",
+     "key": "insured_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle registration number if explicitly visible",
+     "key": "vehicle_registration_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle make/model/variant exactly as visible",
+     "key": "vehicle_model",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Chassis/VIN exactly as visible; never reconstruct missing characters",
+     "key": "chassis_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Engine number exactly as visible; never reconstruct missing characters",
+     "key": "engine_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Total premium amount if explicitly stated",
+     "key": "premium_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Insured Declared Value (IDV) if explicitly stated",
+     "key": "idv_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Policy inception/start date",
+     "key": "policy_start_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Policy expiry/end date",
+     "key": "policy_end_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Policy/cover-note issue date if present",
+     "key": "issue_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Add-on covers explicitly listed, such as zero depreciation, RSA, engine protect, consumables, key cover, etc.; return null if none are printed",
+     "key": "add_ons",
+     "required": false,
+     "type": "array"
+    },
+    {
+     "description": "Agent/intermediary/broker name exactly as printed, if the policy was sold through one",
+     "key": "agent_intermediary_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Agent/intermediary/broker code or license number exactly as printed",
+     "key": "agent_intermediary_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "MISP (Motor Insurance Service Provider) code exactly as printed, when the dealership itself is registered as the selling MISP",
+     "key": "misp_code",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.1"
+  },
+  "invoice_generic": {
+   "display_name": "Other Invoice",
+   "fields": [
+    {
+     "description": "Business purpose of this invoice based on visible content.",
+     "key": "invoice_purpose",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Legal/business nature explicitly stated or reliably evidenced by the document.",
+     "key": "invoice_nature",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice heading/title exactly as printed, for example TAX INVOICE or Retail Invoice.",
+     "key": "invoice_heading_as_printed",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Source/system only when visible or reliably evidenced; otherwise UNKNOWN.",
+     "key": "source_system",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Role of the invoice issuer based on the visible seller/issuer context.",
+     "key": "issuer_role",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice/reference number exactly as printed.",
+     "key": "invoice_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Invoice date exactly as printed; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "invoice_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer legal or trade name exactly as printed.",
+     "key": "seller_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller GSTIN exactly as printed.",
+     "key": "seller_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer address exactly as printed.",
+     "key": "seller_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer name exactly as printed.",
+     "key": "buyer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer ID only when explicitly printed.",
+     "key": "buyer_customer_id",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer GSTIN exactly as printed; null when the document says unregistered.",
+     "key": "buyer_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer GST registration status only from explicit document evidence; do not infer from a missing GSTIN.",
+     "key": "buyer_gstin_status",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer address exactly as printed.",
+     "key": "buyer_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Financier/hypothecation/loan institution exactly as printed.",
+     "key": "financed_by",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Gross/base amount before invoice-level discount only when explicitly stated.",
+     "key": "gross_amount_before_discount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice-level discount amount exactly as stated; do not calculate it.",
+     "key": "invoice_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Taxable/net selling value exactly as stated; do not derive it from other amounts.",
+     "key": "taxable_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST rate percentage when explicitly printed.",
+     "key": "cgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST amount exactly as printed.",
+     "key": "cgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST rate percentage when explicitly printed.",
+     "key": "sgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST amount exactly as printed.",
+     "key": "sgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST rate percentage when explicitly printed.",
+     "key": "igst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST amount exactly as printed.",
+     "key": "igst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "GST compensation cess or other cess amount only when explicitly printed.",
+     "key": "cess_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "TCS amount only when explicitly printed; return null for N/A.",
+     "key": "tcs_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Signed round-off amount exactly as printed; preserve negative values and paise.",
+     "key": "round_off_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Final invoice/grand total exactly as printed; do not recompute taxes or rounding.",
+     "key": "grand_total_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice amount-in-words text exactly as printed.",
+     "key": "amount_in_words",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Narration/remarks exactly as printed, if present.",
+     "key": "narration",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "JSON array of visible invoice line items. For each item preserve description_raw and extract only explicitly printed item_code, hsn_sac, quantity, unit_rate, gross_amount, discount_amount, taxable_amount, tax_rate, tax_amount and net_amount. Also classify each item into line_category using the description text and any HSN/SAC code: one of VEHICLE, ACCESSORY_GENUINE, ACCESSORY_NON_GENUINE, EXTENDED_WARRANTY, RSA, INSURANCE, FASTAG, SERVICE_PACKAGE, TCS, DISCOUNT_LINE, TAX_LINE, OTHER. Use OTHER when the item does not clearly fit; never guess a specific category from the amount alone.",
+     "key": "line_items",
+     "required": false,
+     "type": "array"
+    },
+    {
+     "description": "Complete vehicle description exactly as printed when present on any invoice.",
+     "key": "vehicle_description_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Explicit SKU/product/model code only when printed; never infer it.",
+     "key": "sku_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle model text exactly as printed; do not map to a master.",
+     "key": "model_name_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle variant/trim text exactly as printed; do not map to a master.",
+     "key": "variant_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "VIN exactly as printed; never reconstruct missing characters.",
+     "key": "vin_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Chassis number exactly as printed.",
+     "key": "chassis_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Engine number exactly as printed.",
+     "key": "engine_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle key number only when explicitly printed.",
+     "key": "key_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle colour exactly as printed.",
+     "key": "vehicle_color",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle registration number only when printed.",
+     "key": "vehicle_registration_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle HSN code exactly as printed.",
+     "key": "vehicle_hsn_code",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.1"
+  },
+  "pan_card": {
+   "display_name": "PAN Card",
+   "fields": [
+    {
+     "description": "10-character Permanent Account Number. Format: 5 letters + 4 digits + 1 letter (e.g. DJFPK8448P). Printed below the label 'Permanent Account Number'.",
+     "key": "pan_number",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Full name of the card holder exactly as printed on the card. This is the holder's name, NOT the father's or other relationship name.",
+     "key": "pan_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Father's name only when the PAN document explicitly provides a separate father-name line or label. Do not return the card holder's name here.",
+     "key": "pan_father_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Explicit PAN relationship marker only when W/O, S/O, or D/O is visibly printed/written with a related person's name. Never infer S/O merely because a separate father-name line exists.",
+     "key": "pan_relationship_type",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Name immediately associated with an explicitly visible PAN W/O, S/O, or D/O marker. Return null when no such explicit marker is present.",
+     "key": "pan_relationship_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Date of birth as printed on the card in DD/MM/YYYY format. Normalize to ISO 8601 format: YYYY-MM-DD.",
+     "key": "date_of_birth",
+     "required": true,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.1"
+  },
+  "payment_receipt": {
+   "display_name": "Payment Receipt",
+   "fields": [
+    {
+     "description": "Dealership name exactly as printed",
+     "key": "dealer_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Dealer GSTIN if explicitly printed",
+     "key": "dealer_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Customer/payer name exactly as printed",
+     "key": "customer_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Customer contact number if explicitly printed",
+     "key": "customer_phone",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Receipt/voucher number exactly as printed",
+     "key": "receipt_number",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Receipt/payment date exactly as printed",
+     "key": "receipt_date",
+     "required": true,
+     "type": "date"
+    },
+    {
+     "description": "Amount received/paid",
+     "key": "amount_paid",
+     "required": true,
+     "type": "number"
+    },
+    {
+     "description": "Payment mode exactly as printed, for example cash, cheque, demand draft (DD), NEFT, RTGS, IMPS, bank transfer, banker's order (BO), pay order (PO), trade-in adjustment, refund, UPI or card",
+     "key": "payment_mode",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Cheque/DD/UTR/RRN/transaction/reference number exactly as printed",
+     "key": "payment_reference_no",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Payment instrument/reference date if printed",
+     "key": "payment_reference_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Bank name if printed",
+     "key": "bank_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Bank branch/location if printed",
+     "key": "bank_location",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Linked invoice/bill number this receipt is against, if printed (Delivery receipts are typically raised against an invoice, not a booking)",
+     "key": "invoice_reference_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Receipt remarks exactly as printed",
+     "key": "remarks",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Amount in words if printed",
+     "key": "amount_in_words",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.0"
+  },
+  "purchase_order": {
+   "display_name": "Purchase Order",
+   "fields": [
+    {
+     "description": "Purchase order number/reference exactly as printed",
+     "key": "po_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Purchase order date exactly as printed",
+     "key": "po_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Ordering company/organisation name exactly as printed",
+     "key": "buyer_company_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Buyer company GSTIN exactly as printed; null when the document says unregistered",
+     "key": "buyer_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer company address if explicitly printed",
+     "key": "buyer_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Dealer/supplier name the PO is addressed to, exactly as printed",
+     "key": "supplier_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Ordered vehicle model exactly as printed",
+     "key": "vehicle_model",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Ordered vehicle variant/trim exactly as printed",
+     "key": "vehicle_variant",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle/product/SKU code only when explicitly printed; never infer it",
+     "key": "sku_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Ordered quantity only when explicitly printed",
+     "key": "quantity",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Per-unit price only when explicitly printed",
+     "key": "unit_price",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Total purchase order value only when explicitly printed as a total; never compute it",
+     "key": "po_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Payment terms text exactly as printed",
+     "key": "payment_terms",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Name/designation of the person authorising the PO, exactly as printed",
+     "key": "authorised_by",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "True only when a visible signature/stamp of the authoriser is present on the document",
+     "key": "authoriser_signature_present",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "JSON array of visible lines. For each line preserve description_raw and extract only explicitly printed hsn_sac, quantity, unit_rate and amount",
+     "key": "line_items",
+     "required": false,
+     "type": "array"
+    }
+   ],
+   "schema_version": "1.0"
+  },
+  "rsa_invoice": {
+   "display_name": "RSA Invoice",
+   "fields": [
+    {
+     "description": "Business purpose of this invoice based on visible content.",
+     "key": "invoice_purpose",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Legal/business nature explicitly stated or reliably evidenced by the document.",
+     "key": "invoice_nature",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice heading/title exactly as printed, for example TAX INVOICE or Retail Invoice.",
+     "key": "invoice_heading_as_printed",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Source/system only when visible or reliably evidenced; otherwise UNKNOWN.",
+     "key": "source_system",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Role of the invoice issuer based on the visible seller/issuer context.",
+     "key": "issuer_role",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice/reference number exactly as printed.",
+     "key": "invoice_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Invoice date exactly as printed; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "invoice_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer legal or trade name exactly as printed.",
+     "key": "seller_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller GSTIN exactly as printed.",
+     "key": "seller_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer address exactly as printed.",
+     "key": "seller_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer name exactly as printed.",
+     "key": "buyer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer ID only when explicitly printed.",
+     "key": "buyer_customer_id",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer GSTIN exactly as printed; null when the document says unregistered.",
+     "key": "buyer_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer GST registration status only from explicit document evidence; do not infer from a missing GSTIN.",
+     "key": "buyer_gstin_status",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer address exactly as printed.",
+     "key": "buyer_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Financier/hypothecation/loan institution exactly as printed.",
+     "key": "financed_by",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Gross/base amount before invoice-level discount only when explicitly stated.",
+     "key": "gross_amount_before_discount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice-level discount amount exactly as stated; do not calculate it.",
+     "key": "invoice_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Taxable/net selling value exactly as stated; do not derive it from other amounts.",
+     "key": "taxable_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST rate percentage when explicitly printed.",
+     "key": "cgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST amount exactly as printed.",
+     "key": "cgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST rate percentage when explicitly printed.",
+     "key": "sgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST amount exactly as printed.",
+     "key": "sgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST rate percentage when explicitly printed.",
+     "key": "igst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST amount exactly as printed.",
+     "key": "igst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "GST compensation cess or other cess amount only when explicitly printed.",
+     "key": "cess_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "TCS amount only when explicitly printed; return null for N/A.",
+     "key": "tcs_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Signed round-off amount exactly as printed; preserve negative values and paise.",
+     "key": "round_off_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Final invoice/grand total exactly as printed; do not recompute taxes or rounding.",
+     "key": "grand_total_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice amount-in-words text exactly as printed.",
+     "key": "amount_in_words",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Narration/remarks exactly as printed, if present.",
+     "key": "narration",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "JSON array of visible invoice line items. For each item preserve description_raw and extract only explicitly printed item_code, hsn_sac, quantity, unit_rate, gross_amount, discount_amount, taxable_amount, tax_rate, tax_amount and net_amount. Also classify each item into line_category using the description text and any HSN/SAC code: one of VEHICLE, ACCESSORY_GENUINE, ACCESSORY_NON_GENUINE, EXTENDED_WARRANTY, RSA, INSURANCE, FASTAG, SERVICE_PACKAGE, TCS, DISCOUNT_LINE, TAX_LINE, OTHER. Use OTHER when the item does not clearly fit; never guess a specific category from the amount alone.",
+     "key": "line_items",
+     "required": false,
+     "type": "array"
+    },
+    {
+     "description": "Complete vehicle description exactly as printed when present on any invoice.",
+     "key": "vehicle_description_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Explicit SKU/product/model code only when printed; never infer it.",
+     "key": "sku_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle model text exactly as printed; do not map to a master.",
+     "key": "model_name_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle variant/trim text exactly as printed; do not map to a master.",
+     "key": "variant_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "VIN exactly as printed; never reconstruct missing characters.",
+     "key": "vin_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Chassis number exactly as printed.",
+     "key": "chassis_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Engine number exactly as printed.",
+     "key": "engine_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle key number only when explicitly printed.",
+     "key": "key_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle colour exactly as printed.",
+     "key": "vehicle_color",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle registration number only when printed.",
+     "key": "vehicle_registration_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle HSN code exactly as printed.",
+     "key": "vehicle_hsn_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Plan/product/service name exactly as printed.",
+     "key": "plan_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Coverage/service start date only when explicitly printed.",
+     "key": "coverage_start_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Coverage/service end date only when explicitly printed.",
+     "key": "coverage_end_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Coverage/service tenure in months only when explicitly printed.",
+     "key": "tenure_months",
+     "required": false,
+     "type": "number"
+    }
+   ],
+   "schema_version": "1.1"
+  },
+  "rto_challan": {
+   "display_name": "RTO Challan",
+   "fields": [
+    {
+     "description": "Vehicle registration number only when explicitly printed or labelled on the RTO paper/challan.",
+     "key": "registration_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Registration/RTO State only when explicitly printed; never infer it from the registration number or RTO code.",
+     "key": "registration_state",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Registration Territory/UT only when explicitly printed; never derive it from State, registration number, RTO code, or geography knowledge.",
+     "key": "registration_territory",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Registration/RTO district only when explicitly printed; never infer it from an RTO code, city, State, or geography knowledge.",
+     "key": "registration_district",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Ex-showroom amount only when explicitly labelled and printed; never calculate it from totals, taxes, fees, or another amount.",
+     "key": "ex_showroom_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Registration type/category exactly as printed; never classify or infer it from vehicle, customer, finance, or tax context.",
+     "key": "registration_type",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Hypothecation/HP charges only when explicitly labelled and printed; never derive or calculate them from finance details.",
+     "key": "hp_charges_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Vehicle chassis number exactly as printed; never derive it from a registration number or VIN.",
+     "key": "chassis_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Financer/bank name exactly as printed (e.g. against 'FinancerName' or 'Financed By'); null when the document shows no financer.",
+     "key": "financer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Bank reference number exactly as printed (e.g. against 'Bank Ref No').",
+     "key": "bank_reference_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Receipt/application number exactly as printed (e.g. against 'RECEIPT/APPL No'), preserved verbatim including any slash-separated parts.",
+     "key": "receipt_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Receipt date exactly as printed; never confuse it with a separate 'Printed On' timestamp.",
+     "key": "receipt_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Final grand total amount exactly as printed; never recompute it by summing the Particulars table.",
+     "key": "grand_total_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "JSON array with ONE ENTRY PER PRINTED ROW of the Particulars/charges table -- an RTO Challan's fee break-up routinely lists many separate rows (for example: Registration Fee, Road Tax, Hypothecation/HPA Charges, Smart Card Fee, Fitness Fee, Fancy/Choice Number Fee, Form Fee, Postal/Speed Post Charges, Agent Fee, Cess), each with its own amount -- return every one of them as its own array element, never a single summarized or totaled entry. Scan the ENTIRE table from its first printed row to its last before answering; a table with N printed rows must produce an array of exactly N items, never fewer. For each row preserve description_raw exactly as printed, and extract only explicitly printed amount, rebate_waiver_amount, fine_penalty_amount and total. Never merge two or more printed rows into one array element, never invent a row that is not printed, and never collapse the table down to only its total/grand-total row.",
+     "key": "line_items",
+     "required": false,
+     "type": "array"
+    }
+   ],
+   "schema_version": "2.0"
+  },
+  "scrappage_certificate_of_deposit": {
+   "display_name": "Scrappage Certificate of Deposit",
+   "fields": [
+    {
+     "description": "ORIGINAL when this is a plain Certificate of Deposit issued directly by the scrapping facility, TRANSFERRED when it is titled 'Transfer Certificate of Deposit' and records a sale of the certificate.",
+     "key": "certificate_variant",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "The Certificate/CD number exactly as printed (commonly labelled 'Certificate No' or 'COD...').",
+     "key": "certificate_number",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Registration number of the OLD (scrapped) vehicle this certificate is for -- never the new vehicle being purchased.",
+     "key": "old_vehicle_registration_number",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Old vehicle's Make/Maker exactly as printed.",
+     "key": "old_vehicle_make",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Old vehicle's Model exactly as printed.",
+     "key": "old_vehicle_model",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Old vehicle's Category/Class exactly as printed (e.g. LMV).",
+     "key": "old_vehicle_category",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Old vehicle's Vehicle Type exactly as printed (e.g. Transport, Non-Transport).",
+     "key": "old_vehicle_type",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Old vehicle's Fuel Type exactly as printed.",
+     "key": "old_vehicle_fuel_type",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Old vehicle's Cubic Capacity exactly as printed.",
+     "key": "old_vehicle_cubic_capacity",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Old vehicle's Seating Capacity exactly as printed.",
+     "key": "old_vehicle_seating_capacity",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Old vehicle's Year of Manufacturing exactly as printed (format varies, e.g. '09-1996' or '1996' -- preserve as printed, do not reformat).",
+     "key": "old_vehicle_year_of_manufacturing",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Old vehicle's Unladen Weight in kg exactly as printed.",
+     "key": "old_vehicle_unladen_weight_kg",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Old vehicle's Number of Cylinders exactly as printed.",
+     "key": "old_vehicle_number_of_cylinders",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Old vehicle's Registered Gross Vehicle Weight in kg exactly as printed.",
+     "key": "old_vehicle_gross_vehicle_weight_kg",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Old vehicle's Wheelbase in mm exactly as printed.",
+     "key": "old_vehicle_wheelbase_mm",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Name the certificate was originally issued to / scrapped in the name of (on a Transfer certificate, this is the 'from' party).",
+     "key": "original_owner_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Name the certificate currently belongs to: on an ORIGINAL certificate, same as original_owner_name; on a TRANSFERRED certificate, the 'transferred to' party -- whoever is claiming the benefit on the new purchase.",
+     "key": "current_holder_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Current holder's mobile number exactly as printed (may be partially masked).",
+     "key": "current_holder_mobile",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Current holder's PAN exactly as printed (may be partially masked).",
+     "key": "current_holder_pan",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Date the certificate was traded/transferred, only present on a TRANSFERRED certificate.",
+     "key": "trade_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Trade/transaction number, only present on a TRANSFERRED certificate.",
+     "key": "trade_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Date the certificate itself was issued.",
+     "key": "certificate_issue_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Date the certificate is valid until.",
+     "key": "certificate_valid_until_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Name of the RVSF (Registered Vehicle Scrapping Facility) that issued the certificate, only present on an ORIGINAL certificate.",
+     "key": "scrapping_facility_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "The RVSF's own registration/certification number (commonly labelled 'RVSF No'), only present on an ORIGINAL certificate.",
+     "key": "rvsf_registration_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "State/UT where the vehicle was scrapped, only present on an ORIGINAL certificate.",
+     "key": "state_of_scrapping",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.0"
+  },
+  "tax_invoice_tally": {
+   "display_name": "Tax Invoice (Tally)",
+   "fields": [
+    {
+     "description": "Business purpose of this invoice based on visible content.",
+     "key": "invoice_purpose",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Legal/business nature explicitly stated or reliably evidenced by the document.",
+     "key": "invoice_nature",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice heading/title exactly as printed, for example TAX INVOICE or Retail Invoice.",
+     "key": "invoice_heading_as_printed",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Source/system only when visible or reliably evidenced; otherwise UNKNOWN.",
+     "key": "source_system",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Role of the invoice issuer based on the visible seller/issuer context.",
+     "key": "issuer_role",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice/reference number exactly as printed.",
+     "key": "invoice_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Invoice date exactly as printed; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "invoice_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer legal or trade name exactly as printed.",
+     "key": "seller_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller GSTIN exactly as printed.",
+     "key": "seller_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer address exactly as printed.",
+     "key": "seller_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer name exactly as printed.",
+     "key": "buyer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer ID only when explicitly printed.",
+     "key": "buyer_customer_id",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer GSTIN exactly as printed; null when the document says unregistered.",
+     "key": "buyer_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer GST registration status only from explicit document evidence; do not infer from a missing GSTIN.",
+     "key": "buyer_gstin_status",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer address exactly as printed.",
+     "key": "buyer_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Financier/hypothecation/loan institution exactly as printed.",
+     "key": "financed_by",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Gross/base amount before invoice-level discount only when explicitly stated.",
+     "key": "gross_amount_before_discount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice-level discount amount exactly as stated; do not calculate it.",
+     "key": "invoice_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Taxable/net selling value exactly as stated; do not derive it from other amounts.",
+     "key": "taxable_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST rate percentage when explicitly printed.",
+     "key": "cgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST amount exactly as printed.",
+     "key": "cgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST rate percentage when explicitly printed.",
+     "key": "sgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST amount exactly as printed.",
+     "key": "sgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST rate percentage when explicitly printed.",
+     "key": "igst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST amount exactly as printed.",
+     "key": "igst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "GST compensation cess or other cess amount only when explicitly printed.",
+     "key": "cess_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "TCS amount only when explicitly printed; return null for N/A.",
+     "key": "tcs_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Signed round-off amount exactly as printed; preserve negative values and paise.",
+     "key": "round_off_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Final invoice/grand total exactly as printed; do not recompute taxes or rounding.",
+     "key": "grand_total_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice amount-in-words text exactly as printed.",
+     "key": "amount_in_words",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Narration/remarks exactly as printed, if present.",
+     "key": "narration",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "JSON array of visible invoice line items. For each item preserve description_raw and extract only explicitly printed item_code, hsn_sac, quantity, unit_rate, gross_amount, discount_amount, taxable_amount, tax_rate, tax_amount and net_amount. Also classify each item into line_category using the description text and any HSN/SAC code: one of VEHICLE, ACCESSORY_GENUINE, ACCESSORY_NON_GENUINE, EXTENDED_WARRANTY, RSA, INSURANCE, FASTAG, SERVICE_PACKAGE, TCS, DISCOUNT_LINE, TAX_LINE, OTHER. Use OTHER when the item does not clearly fit; never guess a specific category from the amount alone.",
+     "key": "line_items",
+     "required": false,
+     "type": "array"
+    },
+    {
+     "description": "Complete vehicle description exactly as printed when present on any invoice.",
+     "key": "vehicle_description_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Explicit SKU/product/model code only when printed; never infer it.",
+     "key": "sku_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle model text exactly as printed; do not map to a master.",
+     "key": "model_name_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle variant/trim text exactly as printed; do not map to a master.",
+     "key": "variant_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "VIN exactly as printed; never reconstruct missing characters.",
+     "key": "vin_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Chassis number exactly as printed.",
+     "key": "chassis_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Engine number exactly as printed.",
+     "key": "engine_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle key number only when explicitly printed.",
+     "key": "key_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle colour exactly as printed.",
+     "key": "vehicle_color",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle registration number only when printed.",
+     "key": "vehicle_registration_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle HSN code exactly as printed.",
+     "key": "vehicle_hsn_code",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.1"
+  },
+  "upi_screenshot": {
+   "display_name": "UPI Screenshot",
+   "fields": [
+    {
+     "description": "Payment app name if visible",
+     "key": "app_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Transaction status exactly as displayed",
+     "key": "transaction_status",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Amount paid in rupees",
+     "key": "amount_paid",
+     "required": true,
+     "type": "number"
+    },
+    {
+     "description": "Transaction date/time exactly as displayed",
+     "key": "transaction_datetime",
+     "required": true,
+     "type": "datetime"
+    },
+    {
+     "description": "App-assigned UPI transaction ID/reference exactly as visible",
+     "key": "upi_transaction_id",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Bank-side UPI RRN/reference if explicitly visible",
+     "key": "upi_rrn",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Payer/sender name if visible",
+     "key": "payer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Payer phone exactly as shown, preserving masking",
+     "key": "payer_masked_phone",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Payer UPI ID/VPA if visible",
+     "key": "payer_upi_id",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Payee/merchant/recipient name if visible",
+     "key": "payee_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Payee/merchant UPI ID/VPA if visible",
+     "key": "payee_upi_id",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Payment method only if explicitly shown",
+     "key": "payment_method",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.1"
+  },
+  "upi_transaction": {
+   "display_name": "UPI Transaction",
+   "fields": [
+    {
+     "description": "Payment app name if visible, e.g. PhonePe, Google Pay, Paytm, BHIM",
+     "key": "app_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Transaction status exactly as indicated on screen",
+     "key": "transaction_status",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Transaction amount in rupees",
+     "key": "amount_paid",
+     "required": true,
+     "type": "number"
+    },
+    {
+     "description": "Transaction date/time exactly as displayed",
+     "key": "transaction_datetime",
+     "required": true,
+     "type": "datetime"
+    },
+    {
+     "description": "App-assigned UPI transaction ID/reference exactly as visible",
+     "key": "upi_transaction_id",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Bank-side UPI RRN/reference exactly as visible; do not invent if absent",
+     "key": "upi_rrn",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Payer/sender name if visible",
+     "key": "payer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Payer phone number exactly as visible, preserving masking",
+     "key": "payer_masked_phone",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Payer UPI ID/VPA if visible",
+     "key": "payer_upi_id",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Payee/merchant/recipient name if visible",
+     "key": "payee_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Payee/merchant UPI ID/VPA if visible",
+     "key": "payee_upi_id",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Payment method only if explicitly shown",
+     "key": "payment_method",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.1"
+  },
+  "valuation_report": {
+   "display_name": "Valuation Report",
+   "fields": [
+    {
+     "description": "Valuation report/reference number exactly as printed.",
+     "key": "report_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Valuation date; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "valuation_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Valuation/offer validity end date; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "valuation_valid_until",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Valuation platform/valuer name exactly as printed. The normalized valuation_platform category is derived deterministically outside the model.",
+     "key": "platform_name_as_printed",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Evaluator/assessor name exactly as printed.",
+     "key": "evaluator_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Evaluator employee/code identifier exactly as printed.",
+     "key": "evaluator_employee_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Three-state observation of evaluator signature presence.",
+     "key": "evaluator_signature_present",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "Registration number of the vehicle being valued.",
+     "key": "registration_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Chassis/VIN of the vehicle being valued.",
+     "key": "chassis_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle make exactly as printed.",
+     "key": "make",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle model exactly as printed.",
+     "key": "model",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle variant exactly as printed.",
+     "key": "variant",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Fuel type exactly as printed.",
+     "key": "fuel_type",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Manufacture month/year exactly as printed.",
+     "key": "manufacture_month_year",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle registration date; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "registration_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Odometer reading in kilometres as stated.",
+     "key": "odometer_km",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Number of owners as stated.",
+     "key": "number_of_owners",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Overall valuation/condition grade exactly as printed.",
+     "key": "overall_grade",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "JSON array with one object per scored condition parameter, including printed blank rows. Each object: {name: string|null, score_as_printed: string|null, is_blank: boolean}.",
+     "key": "condition_parameters",
+     "required": false,
+     "type": "array"
+    },
+    {
+     "description": "Three-state observation of whether accident history is noted.",
+     "key": "accident_history_noted",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "Accident-history remarks exactly as printed.",
+     "key": "accident_remarks",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Three-state observation of whether flood damage is noted.",
+     "key": "flood_damage_noted",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "Three-state observation of whether chassis repair is noted.",
+     "key": "chassis_repair_noted",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "Tyre condition exactly as printed.",
+     "key": "tyres_condition",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Base/market value stated on the report.",
+     "key": "base_market_value",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Source stated for the base value, if any.",
+     "key": "base_value_source_stated",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Depreciation amount/adjustment stated on the report.",
+     "key": "depreciation_applied",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "JSON array of deduction rows. Each object: {head: string|null, amount: number|null, is_handwritten: boolean}. Preserve every visible row; do not silently drop malformed/blank rows.",
+     "key": "condition_deductions",
+     "required": false,
+     "type": "array"
+    },
+    {
+     "description": "Total deductions stated on the report.",
+     "key": "total_deductions_stated",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "JSON array of addition rows. Each object: {head: string|null, amount: number|null}. Preserve every visible row.",
+     "key": "additions",
+     "required": false,
+     "type": "array"
+    },
+    {
+     "description": "Fair/arrived value printed on the report before any final offer.",
+     "key": "computed_fair_value_stated",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Final amount actually offered to the customer as printed.",
+     "key": "final_offer_value",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Exchange bonus shown separately from the valuation, if any.",
+     "key": "exchange_bonus_indicated_separately",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Outstanding loan amount stated against the exchange vehicle.",
+     "key": "loan_outstanding_on_vehicle",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Count of photos explicitly attached/referenced when determinable.",
+     "key": "photos_attached_count",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Approver name exactly as printed.",
+     "key": "approval_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Approver designation exactly as printed.",
+     "key": "approval_designation",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Three-state observation of approval signature presence.",
+     "key": "approval_signature_present",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "Override remark exactly as printed, if any.",
+     "key": "override_remark",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Three-state observation of customer acceptance signature presence.",
+     "key": "customer_acceptance_signature",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "Three-state observation of whether the offer value is handwritten or visibly amended.",
+     "key": "offer_value_handwritten_or_amended",
+     "required": false,
+     "type": "boolean"
+    },
+    {
+     "description": "Three-state observation: true only when the build-up is absent and only a final figure is provided; false when a build-up is clearly present; null when uncertain.",
+     "key": "build_up_absent_only_final_figure_given",
+     "required": false,
+     "type": "boolean"
+    }
+   ],
+   "schema_version": "2.0"
+  },
+  "wholesale_invoice": {
+   "display_name": "Wholesale Invoice",
+   "fields": [
+    {
+     "description": "Business purpose of this invoice based on visible content.",
+     "key": "invoice_purpose",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Legal/business nature explicitly stated or reliably evidenced by the document.",
+     "key": "invoice_nature",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice heading/title exactly as printed, for example TAX INVOICE or Retail Invoice.",
+     "key": "invoice_heading_as_printed",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Source/system only when visible or reliably evidenced; otherwise UNKNOWN.",
+     "key": "source_system",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Role of the invoice issuer based on the visible seller/issuer context.",
+     "key": "issuer_role",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Invoice/reference number exactly as printed.",
+     "key": "invoice_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Invoice date exactly as printed; normalize to YYYY-MM-DD when unambiguous.",
+     "key": "invoice_date",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer legal or trade name exactly as printed.",
+     "key": "seller_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller GSTIN exactly as printed.",
+     "key": "seller_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Seller/issuer address exactly as printed.",
+     "key": "seller_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer name exactly as printed.",
+     "key": "buyer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer ID only when explicitly printed.",
+     "key": "buyer_customer_id",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer GSTIN exactly as printed; null when the document says unregistered.",
+     "key": "buyer_gstin",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer GST registration status only from explicit document evidence; do not infer from a missing GSTIN.",
+     "key": "buyer_gstin_status",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Buyer/customer address exactly as printed.",
+     "key": "buyer_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Financier/hypothecation/loan institution exactly as printed.",
+     "key": "financed_by",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Gross/base amount before invoice-level discount only when explicitly stated.",
+     "key": "gross_amount_before_discount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice-level discount amount exactly as stated; do not calculate it.",
+     "key": "invoice_discount_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Taxable/net selling value exactly as stated; do not derive it from other amounts.",
+     "key": "taxable_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST rate percentage when explicitly printed.",
+     "key": "cgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "CGST amount exactly as printed.",
+     "key": "cgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST rate percentage when explicitly printed.",
+     "key": "sgst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "SGST amount exactly as printed.",
+     "key": "sgst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST rate percentage when explicitly printed.",
+     "key": "igst_rate",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "IGST amount exactly as printed.",
+     "key": "igst_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "GST compensation cess or other cess amount only when explicitly printed.",
+     "key": "cess_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "TCS amount only when explicitly printed; return null for N/A.",
+     "key": "tcs_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Signed round-off amount exactly as printed; preserve negative values and paise.",
+     "key": "round_off_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Final invoice/grand total exactly as printed; do not recompute taxes or rounding.",
+     "key": "grand_total_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Invoice amount-in-words text exactly as printed.",
+     "key": "amount_in_words",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Narration/remarks exactly as printed, if present.",
+     "key": "narration",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "JSON array of visible invoice line items. For each item preserve description_raw and extract only explicitly printed item_code, hsn_sac, quantity, unit_rate, gross_amount, discount_amount, taxable_amount, tax_rate, tax_amount and net_amount. Also classify each item into line_category using the description text and any HSN/SAC code: one of VEHICLE, ACCESSORY_GENUINE, ACCESSORY_NON_GENUINE, EXTENDED_WARRANTY, RSA, INSURANCE, FASTAG, SERVICE_PACKAGE, TCS, DISCOUNT_LINE, TAX_LINE, OTHER. Use OTHER when the item does not clearly fit; never guess a specific category from the amount alone.",
+     "key": "line_items",
+     "required": false,
+     "type": "array"
+    },
+    {
+     "description": "Complete vehicle description exactly as printed when present on any invoice.",
+     "key": "vehicle_description_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Explicit SKU/product/model code only when printed; never infer it.",
+     "key": "sku_code",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle model text exactly as printed; do not map to a master.",
+     "key": "model_name_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle variant/trim text exactly as printed; do not map to a master.",
+     "key": "variant_raw",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "VIN exactly as printed; never reconstruct missing characters.",
+     "key": "vin_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Chassis number exactly as printed.",
+     "key": "chassis_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Engine number exactly as printed.",
+     "key": "engine_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle key number only when explicitly printed.",
+     "key": "key_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle colour exactly as printed.",
+     "key": "vehicle_color",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle registration number only when printed.",
+     "key": "vehicle_registration_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle HSN code exactly as printed.",
+     "key": "vehicle_hsn_code",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.1"
+  }
+ },
+ "source": {
+  "branch": "dev",
+  "repo": "verigence/verigence-di",
+  "sha": "1b10eda7cd351f41e190702fe47b70a189dc4310"
+ }
+}

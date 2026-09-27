@@ -51,12 +51,13 @@ from audit_core.uc03_document_capture_v2 import (
     get_di_client,
     get_security_oauth_client,
 )
+from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_runtime import (
     fact_fingerprint,
     note_facts_changed,
     record_activity,
 )
-from audit_core.uc03_p2_stage import recompute_booking_stage
+from audit_core.uc03_p2_stage import recompute_journey_stage
 from audit_core.uc03_p2_storage import get_p2_document_storage
 from audit_core.uc03_unified_document_capture import (
     _merged_candidate_requirements,
@@ -90,7 +91,7 @@ _PAGE_ACTIVE_STATES = (
     "RETRY_WAIT",
 )
 _PAGE_RECONCILE_STATES = ("CLASSIFYING", "EXTRACTING", "SYNCING_TO_AUDIT_CORE", "RETRY_WAIT")
-_PAGE_SETTLED_STATES = ("READY", "NEEDS_REVIEW", "FAILED", "DEAD_LETTER", "CANCELLED")
+_PAGE_SETTLED_STATES = ("READY", "SUPPORTING", "NEEDS_REVIEW", "FAILED", "DEAD_LETTER", "CANCELLED")
 
 
 class RescheduleWork(RuntimeError):
@@ -732,10 +733,17 @@ def _di_context_and_requirements(engine: Engine, work: WorkItem) -> tuple[str, s
             security_client=security_client,
             di_client=di_client,
         )
+        # Candidates: the Journey's own requirement types first (they carry
+        # requirement refs), then every template type so mixed PDFs, UPI proofs
+        # and optional documents classify instead of landing as UNKNOWN. DI
+        # ignores candidates that are not active for the tenant.
+        candidates = list(
+            dict.fromkeys(_candidate_type_keys(all_requirements) + get_registry().candidate_di_types())
+        )
         return (
             context_ref,
             token,
-            _candidate_type_keys(all_requirements),
+            candidates,
             _requirement_refs_by_document_type_key(open_requirements),
         )
 
@@ -928,7 +936,11 @@ def classify_page_outcome(
     if state == "FAILED" or processing == "FAILED":
         return PageOutcome("FAILED", "Document Intelligence could not read this page. Retry or re-upload it.")
     if state == "UNKNOWN":
-        return PageOutcome("NEEDS_REVIEW", "The document type was not recognised.")
+        # Docket covers, letters, e-mails, printouts: evidence, never a blocker.
+        return PageOutcome(
+            "SUPPORTING",
+            "Kept as supporting evidence. Set the document type if this is a checklist document.",
+        )
     if state == "CLASSIFIED" and processing == "PROCESSED":
         waited = (now - processed_seen_at).total_seconds() if processed_seen_at else 0.0
         if waited > _SYNC_GRACE_SECONDS:
@@ -1113,6 +1125,13 @@ def _reconcile_page(
         (local["classified_document_type_key"] if local else None)
         or (di_item or {}).get("classifiedDocumentTypeKey")
     )
+    template_key = (
+        get_registry().template_for_di_type(
+            document_type, stage=(local["stage_code"] if local else None)
+        ).key
+        if outcome.status not in {"FAILED", "CANCELLED"}
+        else None
+    )
     connection.execute(
         text(
             """
@@ -1120,6 +1139,8 @@ def _reconcile_page(
             SET queue_status=:status,
                 status_reason=:reason,
                 classified_document_type=COALESCE(:document_type, classified_document_type),
+                template_key=CASE WHEN type_overridden_by_actor_id IS NULL
+                                  THEN COALESCE(:template_key, template_key) ELSE template_key END,
                 business_stage=COALESCE(:business_stage, business_stage),
                 extracted_field_count=:field_count,
                 di_state=:di_state,
@@ -1131,6 +1152,7 @@ def _reconcile_page(
                 queue_status IS DISTINCT FROM :status
                 OR status_reason IS DISTINCT FROM :reason
                 OR classified_document_type IS DISTINCT FROM COALESCE(:document_type, classified_document_type)
+                OR template_key IS DISTINCT FROM COALESCE(:template_key, template_key)
                 OR business_stage IS DISTINCT FROM COALESCE(:business_stage, business_stage)
                 OR extracted_field_count IS DISTINCT FROM :field_count
                 OR di_state IS DISTINCT FROM :di_state
@@ -1145,6 +1167,7 @@ def _reconcile_page(
             "status": outcome.status,
             "reason": outcome.reason,
             "document_type": document_type,
+            "template_key": template_key,
             "business_stage": local["stage_code"] if local else None,
             "field_count": extracted_count,
             "di_state": (di_item or {}).get("state"),
@@ -1329,7 +1352,7 @@ def _refresh_batch_status(connection, tenant_id: str, batch_id: UUID) -> None:
         text(
             """
             SELECT COUNT(*) FILTER (WHERE queue_status <> 'CANCELLED') AS total,
-                   COUNT(*) FILTER (WHERE queue_status IN ('READY','NEEDS_REVIEW')) AS usable,
+                   COUNT(*) FILTER (WHERE queue_status IN ('READY','SUPPORTING','NEEDS_REVIEW')) AS usable,
                    COUNT(*) FILTER (WHERE queue_status IN ('FAILED','DEAD_LETTER')) AS failed
             FROM auditcore.p2_document_queue
             WHERE tenant_id=:tenant_id AND batch_id=:batch_id
@@ -1361,30 +1384,12 @@ def _refresh_batch_status(connection, tenant_id: str, batch_id: UUID) -> None:
 def _stage_recompute(engine: Engine, work: WorkItem) -> None:
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
-        result = recompute_booking_stage(
+        _owned(connection, work, lock=False)
+        # The engine records STAGE_CHANGED only when the stage actually moves.
+        recompute_journey_stage(
             connection,
             tenant_id=work.tenant_id,
             journey_id=work.journey_id,
-        )
-        connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.p2_activity_events (
-                    tenant_id, journey_id, event_type, subject_type,
-                    subject_id, details, correlation_id
-                ) VALUES (
-                    :tenant_id, :journey_id, 'BOOKING_STAGE_RECOMPUTED',
-                    'JOURNEY', :subject_id, CAST(:details AS jsonb), :correlation_id
-                )
-                """
-            ),
-            {
-                "tenant_id": work.tenant_id,
-                "journey_id": work.journey_id,
-                "subject_id": str(work.journey_id),
-                "details": json.dumps(result, default=str),
-                "correlation_id": work.correlation_id,
-            },
         )
 
 

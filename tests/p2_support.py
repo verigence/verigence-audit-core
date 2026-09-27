@@ -215,3 +215,92 @@ def queue_row(journey: P2Journey, work_type: str, work_key: str) -> dict[str, An
             {"t": journey.tenant_id, "wt": work_type, "wk": work_key},
         ).mappings().one_or_none()
     return dict(row) if row else None
+
+
+def add_evidence(
+    journey: P2Journey,
+    *,
+    di_document_id: UUID,
+    document_type_key: str,
+    process_area: str = "BOOKING",
+    status: str = "ACTIVE",
+) -> UUID:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return UUID(str(connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.evidence (
+                    tenant_id, journey_id, customer_id, di_subject_id, di_document_id,
+                    document_type_key, evidence_purpose, process_area, association_status
+                ) VALUES (:t, :j, :c, :s, :d, :k, 'JOURNEY_DOCUMENT', :p, :st)
+                RETURNING evidence_id
+                """
+            ),
+            {"t": journey.tenant_id, "j": journey.journey_id, "c": journey.customer_id,
+             "s": uuid4(), "d": di_document_id, "k": document_type_key, "p": process_area,
+             "st": status},
+        ).scalar_one()))
+
+
+def add_ready_document(journey: P2Journey, document_type_key: str, **fields: Any) -> UUID:
+    """ACTIVE evidence plus durable facts: the document counts as ready."""
+    di_document_id = uuid4()
+    add_evidence(journey, di_document_id=di_document_id, document_type_key=document_type_key)
+    for key, value in (fields or {"marker": "x"}).items():
+        add_extracted_field(
+            journey, di_document_id=di_document_id, field_key=key, value=value,
+            document_type=document_type_key,
+        )
+    return di_document_id
+
+
+def add_receipt_payment(
+    journey: P2Journey,
+    *,
+    amount: str,
+    receipt_number: str | None,
+    receipt_date: str | None,
+    di_document_id: UUID | None = None,
+) -> UUID:
+    di_document_id = di_document_id or add_ready_document(journey, "dealer_receipt", amount_paid=amount)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        booking_id = connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.bookings (tenant_id, journey_id) VALUES (:t, :j)
+                ON CONFLICT (tenant_id, journey_id) DO UPDATE SET updated_at_utc=now()
+                RETURNING booking_id
+                """
+            ),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        ).scalar_one()
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.payments (
+                    tenant_id, journey_id, amount, booking_id, payment_stage,
+                    status_source, source_di_document_id, receipt_number, receipt_date
+                ) VALUES (:t, :j, :a, :b, 'BOOKING', 'EVIDENCE', :d, :n, :rd)
+                """
+            ),
+            {"t": journey.tenant_id, "j": journey.journey_id, "a": amount, "b": booking_id,
+             "d": di_document_id, "n": receipt_number, "rd": receipt_date},
+        )
+    return di_document_id
+
+
+def set_minimum_booking_amount(journey: P2Journey, amount: str) -> None:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.tenant_rule_config (tenant_id, minimum_booking_amount)
+                VALUES (:t, :a)
+                ON CONFLICT (tenant_id) DO UPDATE SET minimum_booking_amount=EXCLUDED.minimum_booking_amount
+                """
+            ),
+            {"t": journey.tenant_id, "a": amount},
+        )

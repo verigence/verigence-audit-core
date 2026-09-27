@@ -36,7 +36,12 @@ from audit_core.uc03_p2_access import (
     check_p2_permission,
     resolve_p2_scope,
 )
-from audit_core.uc03_p2_stage import read_booking_stage
+from audit_core.uc03_p2_registry import get_registry
+from audit_core.uc03_p2_stage import (
+    active_conditions,
+    read_booking_stage,
+    ready_document_count,
+)
 from audit_core.uc03_p2_storage import (
     P2DocumentStorageError,
     get_p2_document_storage,
@@ -121,6 +126,76 @@ def _activity(
             "correlation_id": correlation_id,
         },
     )
+
+
+def _humanize(key: str) -> str:
+    text_ = key.replace("_", " ").strip()
+    return text_[:1].upper() + text_[1:]
+
+
+@router.get("/templates")
+def list_templates(
+    tenant_id: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+) -> dict[str, Any]:
+    """Document templates for the Web: labels, stage, requirement, page shape,
+    key fields and review thresholds. Static per deployment; cacheable."""
+    check_p2_permission(
+        tenant_id=tenant_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        permission_key=_READ_PERMISSION,
+    )
+    registry = get_registry()
+    templates = []
+    for template in registry.documents.values():
+        di_fields = registry.di_fields(template.di_types[0]) if template.di_types else []
+        templates.append(
+            {
+                "key": template.key,
+                "displayName": template.display_name,
+                "stage": template.stage,
+                "requirement": template.requirement,
+                "condition": template.condition,
+                "pageShape": template.pages.shape,
+                "maxPages": template.pages.max_pages,
+                "diTypes": list(template.di_types),
+                "extraction": template.di_schema,
+                "reviewThreshold": template.review_threshold,
+                "keyFields": list(template.key_fields),
+                "fields": [
+                    {
+                        "key": field["key"],
+                        "label": _humanize(field["key"]),
+                        "type": field["type"],
+                        "required": bool(field["required"]),
+                        "isKey": field["key"] in template.key_fields,
+                        "reviewThreshold": template.review_threshold_for(field["key"]),
+                    }
+                    for field in di_fields
+                ],
+                "journey360": list(template.journey_360),
+            }
+        )
+    return {
+        "version": 1,
+        "templates": templates,
+        "stages": [
+            {
+                "code": stage.code,
+                "states": list(stage.states),
+                "gates": [
+                    {"key": g.key, "kind": g.kind, "label": g.label, "action": g.missing}
+                    for g in stage.gates
+                ],
+                "completionApproved": stage.completion_approved,
+            }
+            for stage in sorted(registry.stages.values(), key=lambda item: item.order)
+        ],
+    }
 
 
 @router.get("/journeys")
@@ -881,8 +956,8 @@ def list_documents(
             """
             SELECT queue_id, batch_id, page_number, client_upload_id,
                    di_document_id, classified_document_type, business_stage,
-                   queue_status, attempt_count, extracted_field_count,
-                   last_error, created_at_utc, updated_at_utc
+                   queue_status, status_reason, template_key, attempt_count,
+                   extracted_field_count, last_error, created_at_utc, updated_at_utc
             FROM auditcore.p2_document_queue
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
             ORDER BY created_at_utc DESC, page_number
@@ -891,9 +966,18 @@ def list_documents(
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
 
+    registry = get_registry()
     by_batch: dict[str, list[dict[str, Any]]] = {}
     for page in pages:
         item = dict(page)
+        template = (
+            registry.documents.get(item["template_key"])
+            if item.get("template_key")
+            else None
+        )
+        item["templateKey"] = template.key if template else None
+        item["displayName"] = template.display_name if template else None
+        item["requirement"] = template.requirement if template else None
         batch_key = str(item.pop("batch_id"))
         item["queueId"] = str(item.pop("queue_id"))
         if item.get("di_document_id") is not None:
@@ -930,6 +1014,12 @@ def list_documents(
     documents = []
     for raw in evidence_rows:
         doc = dict(raw)
+        template = registry.template_for_di_type(
+            doc.get("document_type_key"), stage=str(doc.get("process_area") or "").upper() or None,
+        )
+        doc["templateKey"] = template.key
+        doc["displayName"] = template.display_name
+        doc["requirement"] = template.requirement
         doc["evidenceId"] = str(doc.pop("evidence_id"))
         doc["documentId"] = str(doc.pop("di_document_id"))
         if doc.get("supersedes_evidence_id") is not None:
@@ -939,10 +1029,33 @@ def list_documents(
             doc["supersedesEvidenceId"] = None
         documents.append(doc)
 
+    conditions = active_conditions(connection, tenant_id=tenant_id, journey_id=journey_id)
+    checklist = []
+    for stage_code in ("BOOKING", "DELIVERY"):
+        for template in registry.stage_documents(stage_code, conditions=conditions):
+            ready = ready_document_count(
+                connection, tenant_id=tenant_id, journey_id=journey_id, template=template,
+            )
+            checklist.append(
+                {
+                    "templateKey": template.key,
+                    "displayName": template.display_name,
+                    "stage": stage_code,
+                    "requirement": template.requirement,
+                    "status": "RECEIVED" if ready else "MISSING",
+                    "readyCount": ready,
+                    "documentIds": [
+                        d["documentId"] for d in documents
+                        if d["templateKey"] == template.key and d.get("association_status") == "ACTIVE"
+                    ],
+                }
+            )
     return {
         "journeyId": str(journey_id),
         "batches": result,
         "documents": documents,
+        "checklist": checklist,
+        "conditions": sorted(conditions),
     }
 
 
@@ -957,7 +1070,12 @@ def list_events(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
     limit: int = 100,
+    latest: bool = False,
 ) -> dict[str, Any]:
+    """Incremental feed. ``after`` is the last event id seen; ``latest=true``
+    returns the newest ``limit`` events newest-first (activity views), and
+    ``cursor`` is always the newest event id so a client can start polling
+    from "now" instead of replaying history."""
     _authorize(
         connection,
         tenant_id=tenant_id,
@@ -966,6 +1084,28 @@ def list_events(
         authorization_client=authorization_client,
         permission_key=_READ_PERMISSION,
     )
+    cursor = connection.execute(
+        text(
+            "SELECT COALESCE(MAX(event_id), 0) FROM auditcore.p2_activity_events "
+            "WHERE tenant_id=:tenant_id AND journey_id=:journey_id"
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalar_one()
+    if latest:
+        rows = connection.execute(
+            text(
+                """
+                SELECT event_id, event_type, subject_type, subject_id,
+                       details, created_at_utc
+                FROM auditcore.p2_activity_events
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                ORDER BY event_id DESC
+                LIMIT :limit
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "limit": min(max(limit, 1), 250)},
+        ).mappings().all()
+        return {"events": [dict(row) for row in rows], "cursor": int(cursor)}
     rows = connection.execute(
         text(
             """
@@ -985,7 +1125,7 @@ def list_events(
             "limit": min(max(limit, 1), 250),
         },
     ).mappings().all()
-    return {"events": [dict(row) for row in rows]}
+    return {"events": [dict(row) for row in rows], "cursor": int(cursor)}
 
 
 @router.get("/journeys/{journey_id}/stage")

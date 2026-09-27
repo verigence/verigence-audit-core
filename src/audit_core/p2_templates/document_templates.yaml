@@ -1,0 +1,1156 @@
+# Phase 2 document templates -- the single executable description of every
+# document the audit understands. Loaded and validated at startup by
+# audit_core.uc03_p2_registry; CI fails on any drift (unknown DI type, unknown
+# key field, unknown control, gate referencing an unknown template).
+#
+# requirement: REQUIRED | OPTIONAL | CONDITIONAL | SUPPORTING
+# pages.shape: SINGLE | PARTS | MULTI_PAGE   pages.group: ADJACENT | BATCH
+# extraction.review_threshold: fields below this confidence need PC review
+# extraction.strict_fields: money/identity fields reviewed below strict_review_threshold
+version: 1
+source:
+  blueprint: Verigence Phase 2 Design Blueprint v2.2 (27 Sep 2026)
+  di_schema_snapshot: di_schema_snapshot.json
+stages:
+  BOOKING:
+    order: 1
+    states:
+    - BOOKING_DOCUMENT_UPLOAD
+    - BOOKING_VERIFY_DOCUMENTS
+    - BOOKING_COMPLETE
+    gates:
+    - key: BOOKING_FORM_EXTRACTED
+      kind: DOCUMENT_READY
+      documents:
+      - booking_docket
+      label: Booking Docket ready
+      missing: Upload the Booking Docket (commitment form and order taking form).
+    - key: PAN_EXTRACTED
+      kind: DOCUMENT_READY
+      documents:
+      - pan_card
+      label: PAN ready
+      missing: Upload the customer's PAN card.
+    - key: AADHAAR_EXTRACTED
+      kind: DOCUMENT_READY
+      documents:
+      - aadhaar
+      label: Aadhaar ready
+      missing: Upload the customer's Aadhaar (front and back).
+    - key: MINIMUM_BOOKING_PAYMENT
+      kind: PAYMENT_MINIMUM
+      label: Minimum booking amount received
+      missing: Upload dealer receipts totalling at least the minimum booking amount.
+    - key: NO_MANUAL_VERIFICATION_PENDING
+      kind: NO_OPEN_TASKS
+      task_types:
+      - MANUAL_VERIFICATION_REVIEW
+      label: All low-confidence fields verified
+      missing: Review and confirm the highlighted low-confidence fields.
+  DELIVERY:
+    order: 2
+    states:
+    - DELIVERY_DOCUMENT_UPLOAD
+    - DELIVERY_VERIFY_DOCUMENTS
+    - DELIVERY_COMPLETE
+    completion_approved: false
+    gates: []
+document_types:
+  booking_docket:
+    display_name: Booking Docket
+    di_types:
+    - booking_form
+    stage: BOOKING
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages:
+      shape: PARTS
+      max_pages: 2
+      group: BATCH
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.6'
+      key_fields:
+      - customer_name
+      - booking_date
+      - vehicle_model
+      - vehicle_variant
+      - total_price
+      - booking_amount_paid
+      review_threshold: 90
+      strict_fields:
+      - total_price
+      - booking_amount_paid
+      - discount_amount
+      strict_review_threshold: 97
+    persistence:
+      typed: booking_form_review_values
+      canonical:
+      - bookings
+      - customers
+      - journey_products
+      - commercial_lines
+      - discount_applications
+      - journey_addons
+      - registration_records
+      - insurance_records
+      - trade_in_cases
+    processors:
+    - Booking materialization
+    - SKU resolution
+    - booking intimation
+    - deal reconciliation
+    controls:
+    - MODEL_NOT_IDENTIFIED
+    - BK_DOCKET_PRESENT
+    - BK_DISCOUNT_EVIDENCE_MISSING
+    - WRONG_DOCUMENT
+    - DUPLICATE_BOOKING
+    control_notes: MODEL_NOT_IDENTIFIED; BK_DOCKET_PRESENT; BK_DISCOUNT_EVIDENCE_MISSING; WRONG_DOCUMENT;
+      DUPLICATE_BOOKING
+    task_effects:
+    - Low-confidence review
+    - wrong-document review
+    - correction review
+    - re-upload when rejected
+    journey_360:
+    - CUSTOMER
+    - BOOKING
+    - VEHICLE
+    - DEAL
+  pan_card:
+    display_name: PAN Card
+    di_types:
+    - pan_card
+    stage: BOOKING
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages:
+      shape: SINGLE
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.1'
+      key_fields:
+      - pan_number
+      - pan_name
+      review_threshold: 90
+      strict_fields:
+      - pan_number
+      strict_review_threshold: 97
+    persistence:
+      typed: customer_identity_review_values
+      canonical:
+      - customers + reviewed fields
+    processors:
+    - Identity materialization / source resolution
+    controls:
+    - WRONG_DOCUMENT
+    - DUPLICATE_BOOKING
+    control_notes: WRONG_DOCUMENT; DUPLICATE_BOOKING; BK_PAN_PRESENT checkpoint
+    task_effects:
+    - Low-confidence review
+    - wrong-document review
+    - field correction
+    journey_360:
+    - CUSTOMER
+  aadhaar:
+    display_name: Aadhaar
+    di_types:
+    - aadhaar
+    stage: BOOKING
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages:
+      shape: PARTS
+      max_pages: 2
+      group: ADJACENT
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.2'
+      key_fields:
+      - aadhaar_number
+      - aadhaar_name
+      review_threshold: 90
+      strict_fields:
+      - aadhaar_number
+      strict_review_threshold: 97
+    persistence:
+      typed: customer_identity_review_values
+      canonical:
+      - customers + reviewed fields
+    processors:
+    - Identity materialization
+    - Aadhaar address ownership
+    controls:
+    - WRONG_DOCUMENT
+    - DUPLICATE_BOOKING
+    control_notes: WRONG_DOCUMENT; DUPLICATE_BOOKING; BK_PAN_PRESENT checkpoint
+    task_effects:
+    - Low-confidence review
+    - wrong-document review
+    - field correction
+    journey_360:
+    - CUSTOMER
+  dealer_receipt:
+    display_name: Booking Payment Receipt
+    di_types:
+    - dealer_receipt
+    stage: BOOKING
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages:
+      shape: SINGLE
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.1'
+      key_fields:
+      - receipt_number
+      - receipt_date
+      - amount_paid
+      review_threshold: 90
+      strict_fields:
+      - amount_paid
+      - receipt_number
+      strict_review_threshold: 97
+    persistence:
+      typed: dealer_receipt_review_values
+      canonical:
+      - payments
+    processors:
+    - Receipt materialization
+    - duplicate detection
+    - payment reconciliation
+    - minimum-booking evaluation
+    - finance candidate input
+    controls:
+    - DUPLICATE_RECEIPT
+    - WRONG_DOCUMENT
+    - PAYMENT_BANK_UNMATCHED
+    - BK_MIN_BOOKING_AMOUNT_NOT_MET
+    - BK_MIN_BOOKING_PROOF_PRESENT
+    control_notes: DUPLICATE_RECEIPT; WRONG_DOCUMENT; PAYMENT_BANK_UNMATCHED; BK_MIN_BOOKING_AMOUNT_NOT_MET;
+      BK_MIN_BOOKING_PROOF_PRESENT
+    task_effects:
+    - Low-confidence review
+    - duplicate-receipt notice
+    - wrong-document review
+    - re-upload
+    journey_360:
+    - PAYMENTS
+    - BOOKING
+    - FINANCE
+  customer_kyc:
+    display_name: Customer KYC Form
+    di_types:
+    - customer_kyc
+    stage: BOOKING
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages:
+      shape: MULTI_PAGE
+      max_pages: 4
+      group: ADJACENT
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.0'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed field store
+      canonical:
+      - customers / identity resolution where mapped
+    processors:
+    - Identity consistency
+    - duplicate-booking inputs
+    controls:
+    - WRONG_DOCUMENT
+    - DUPLICATE_BOOKING
+    - BK_REQUIRED_CAPTURE_COMPLETE
+    control_notes: WRONG_DOCUMENT; DUPLICATE_BOOKING; BK_REQUIRED_CAPTURE_COMPLETE
+    task_effects:
+    - Low-confidence review
+    - wrong-document review
+    - correction
+    journey_360:
+    - CUSTOMER
+  gst_certificate:
+    display_name: GST Registration Certificate
+    di_types:
+    - gst_certificate
+    stage: DELIVERY
+    requirement: CONDITIONAL
+    condition: CORPORATE_CUSTOMER
+    accepted_early: true
+    pages:
+      shape: MULTI_PAGE
+      max_pages: 6
+      group: ADJACENT
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '2.0'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed field store
+      canonical:
+      - source facts used by corporate controls
+    processors:
+    - Requirement applicability
+    - corporate evidence
+    controls: []
+    control_notes: Delivery completeness; corporate GST/name comparisons in Rule Engine
+    task_effects:
+    - Low-confidence review
+    - upload/re-upload
+    - feedback if requested
+    journey_360:
+    - DOCUMENTS
+    - CUSTOMER
+    - DEAL
+  corporate_id:
+    display_name: Corporate ID / Incorporation Certificate
+    di_types:
+    - corporate_id
+    stage: DELIVERY
+    requirement: CONDITIONAL
+    condition: CORPORATE_CUSTOMER
+    accepted_early: true
+    pages:
+      shape: MULTI_PAGE
+      max_pages: 4
+      group: ADJACENT
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '2.0'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed field store
+      canonical:
+      - supporting evidence / source facts
+    processors:
+    - Conditional evidence satisfaction
+    controls:
+    - BK_DISCOUNT_EVIDENCE_MISSING
+    control_notes: 'BK_DISCOUNT_EVIDENCE_MISSING: corporate discount support'
+    task_effects:
+    - Upload/re-upload
+    - low-confidence review
+    journey_360:
+    - DOCUMENTS
+    - DEAL
+  vehicle_rc:
+    display_name: Exchange Vehicle RC
+    di_types:
+    - vehicle_rc
+    stage: DELIVERY
+    requirement: CONDITIONAL
+    condition: EXCHANGE_TAKEN
+    accepted_early: true
+    pages:
+      shape: PARTS
+      max_pages: 2
+      group: ADJACENT
+    extraction:
+      di_schema: FALLBACK
+      di_schema_version: null
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed field store
+      canonical:
+      - trade-in supporting evidence
+    processors:
+    - Conditional evidence satisfaction
+    controls:
+    - BK_DISCOUNT_EVIDENCE_MISSING
+    control_notes: 'BK_DISCOUNT_EVIDENCE_MISSING: exchange support; delivery completeness'
+    task_effects:
+    - Upload/re-upload
+    - verification
+    journey_360:
+    - TRADE_IN
+    - DOCUMENTS
+    - DEAL
+  transfer_letter:
+    display_name: Transfer Letter
+    di_types:
+    - transfer_letter
+    stage: DELIVERY
+    requirement: OPTIONAL
+    condition: null
+    accepted_early: true
+    pages: &id001
+      shape: MULTI_PAGE
+      max_pages: 4
+      group: ADJACENT
+    extraction:
+      di_schema: FALLBACK
+      di_schema_version: null
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed field store
+      canonical:
+      - trade-in evidence
+    processors:
+    - Generic document processing
+    controls: []
+    control_notes: No dedicated native rule verified
+    task_effects:
+    - Low-confidence / verification when produced
+    journey_360:
+    - TRADE_IN
+    - DOCUMENTS
+  authorization_letter:
+    display_name: Authorization Letter
+    di_types:
+    - authorization_letter
+    stage: DELIVERY
+    requirement: OPTIONAL
+    condition: null
+    accepted_early: true
+    pages: *id001
+    extraction:
+      di_schema: FALLBACK
+      di_schema_version: null
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed field store
+      canonical:
+      - trade-in evidence
+    processors:
+    - Generic document processing
+    controls: []
+    control_notes: No dedicated native rule verified
+    task_effects:
+    - Low-confidence / verification when produced
+    journey_360:
+    - TRADE_IN
+    - DOCUMENTS
+  wholesale_invoice:
+    display_name: Wholesale Invoice
+    di_types:
+    - wholesale_invoice
+    stage: DELIVERY
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages: *id001
+    extraction:
+      di_schema: GENERALIZED_INVOICE
+      di_schema_version: '1.1'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: invoice_review_values
+      canonical:
+      - commercial_lines
+      - discount_applications
+      - journey_addons
+      - vehicle / finance facts where mapped
+    processors:
+    - Invoice materialization
+    - commercial projection
+    - invoice SKU fallback
+    controls:
+    - WRONG_DOCUMENT
+    control_notes: MODEL_NOT_IDENTIFIED fallback; WRONG_DOCUMENT; invoice runtime controls where applicable
+    task_effects:
+    - Low-confidence
+    - wrong-document
+    - invoice discrepancy when applicable
+    journey_360:
+    - INVOICES
+    - DEAL
+    - VEHICLE
+    - FINANCE
+  customer_invoice_dms:
+    display_name: Customer Invoice (DMS)
+    di_types:
+    - customer_invoice_dms
+    stage: DELIVERY
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages: *id001
+    extraction:
+      di_schema: GENERALIZED_INVOICE
+      di_schema_version: '1.1'
+      key_fields: []
+      review_threshold: 90
+      strict_fields:
+      - grand_total_amount
+      - chassis_number
+      strict_review_threshold: 97
+    persistence:
+      typed: invoice_review_values
+      canonical:
+      - commercial_lines
+      - discount_applications
+      - journey_addons
+      - vehicle_records
+      - finance_records
+    processors:
+    - Invoice materialization
+    - Deal
+    - Vehicle
+    - Finance
+    - SKU fallback/mismatch
+    controls:
+    - WRONG_DOCUMENT
+    - MODEL_NOT_IDENTIFIED
+    runtime_checks:
+    - INVOICE_FIELD_DISAGREEMENT
+    - INVOICE_SKU_MISMATCH
+    control_notes: WRONG_DOCUMENT; DUPLICATE_BOOKING inputs; INVOICE_FIELD_DISAGREEMENT:*; MODEL_NOT_IDENTIFIED;
+      INVOICE_SKU_MISMATCH + external invoice controls
+    task_effects:
+    - Low-confidence
+    - wrong-document
+    - INVOICE_DISCREPANCY_REVIEW
+    - correction
+    - re-upload
+    journey_360:
+    - INVOICES
+    - DEAL
+    - VEHICLE
+    - FINANCE
+    - CUSTOMER
+  tax_invoice_tally:
+    display_name: Tax Invoice (Tally)
+    di_types:
+    - tax_invoice_tally
+    stage: DELIVERY
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages: *id001
+    extraction:
+      di_schema: GENERALIZED_INVOICE
+      di_schema_version: '1.1'
+      key_fields: []
+      review_threshold: 90
+      strict_fields:
+      - grand_total_amount
+      strict_review_threshold: 97
+    persistence:
+      typed: invoice_review_values
+      canonical:
+      - commercial_lines
+      - discount_applications
+      - vehicle / finance facts where mapped
+    processors:
+    - Invoice materialization
+    - commercial projection
+    - SKU fallback/mismatch
+    controls: []
+    runtime_checks:
+    - INVOICE_FIELD_DISAGREEMENT
+    - INVOICE_SKU_MISMATCH
+    control_notes: INVOICE_FIELD_DISAGREEMENT:*; INVOICE_SKU_MISMATCH; external DMS-vs-Tally controls
+    task_effects:
+    - Low-confidence
+    - invoice discrepancy
+    - correction
+    journey_360:
+    - INVOICES
+    - DEAL
+    - VEHICLE
+  insurance_cover:
+    display_name: Insurance Cover Note
+    di_types:
+    - insurance_cover
+    stage: DELIVERY
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages:
+      shape: MULTI_PAGE
+      max_pages: 8
+      group: ADJACENT
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.1'
+      key_fields:
+      - insurer_name
+      - policy_number
+      - insured_name
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed fields + insurance_records
+      canonical:
+      - insurance_records
+      - commercial_lines (insurance amount)
+    processors:
+    - Insurance materialization
+    - identity / deal inputs
+    controls:
+    - WRONG_DOCUMENT
+    control_notes: WRONG_DOCUMENT; external insurance premium/date comparisons
+    task_effects:
+    - Low-confidence
+    - wrong-document
+    - correction / feedback
+    journey_360:
+    - INSURANCE
+    - DEAL
+    - VEHICLE
+  accessory_invoice_dms:
+    display_name: Accessory Invoice (DMS)
+    di_types:
+    - accessory_invoice_dms
+    stage: DELIVERY
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages: *id001
+    extraction:
+      di_schema: GENERALIZED_INVOICE
+      di_schema_version: '1.1'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: invoice_review_values
+      canonical:
+      - commercial_lines.accessories_cost
+      - journey_addons
+      - vehicle evidence
+    processors:
+    - Invoice/add-on materialization
+    - Deal
+    - Vehicle
+    controls: []
+    control_notes: Invoice discrepancy; external accessory comparisons
+    task_effects:
+    - Low-confidence
+    - invoice discrepancy
+    - correction
+    journey_360:
+    - INVOICES
+    - DEAL
+    - VEHICLE
+  accessory_invoice_tally:
+    display_name: Accessory Invoice (Tally)
+    di_types:
+    - accessory_invoice_tally
+    stage: DELIVERY
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages: *id001
+    extraction:
+      di_schema: GENERALIZED_INVOICE
+      di_schema_version: '1.1'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: invoice_review_values
+      canonical:
+      - accessory commercial evidence / journey_addons
+    processors:
+    - Invoice/add-on materialization
+    controls: []
+    control_notes: External Accessory Tally-vs-DMS controls
+    task_effects:
+    - Low-confidence
+    - invoice discrepancy
+    - correction
+    journey_360:
+    - INVOICES
+    - DEAL
+  rto_challan:
+    display_name: RTO Challan
+    di_types:
+    - rto_challan
+    stage: DELIVERY
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages:
+      shape: SINGLE
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '2.0'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed fields
+      canonical:
+      - registration_records
+      - finance_records
+      - commercial_lines
+    processors:
+    - Registration
+    - RTO commercial lines
+    - finance/hypothecation
+    controls:
+    - FINANCE_HYPOTHECATION_MISSING
+    control_notes: FINANCE_HYPOTHECATION_MISSING; delivery completeness; external RTO completeness
+    task_effects:
+    - Low-confidence
+    - correction
+    - evidence gap
+    journey_360:
+    - REGISTRATION
+    - FINANCE
+    - DEAL
+  customer_ledger:
+    display_name: Customer Ledger
+    di_types:
+    - customer_ledger
+    stage: DELIVERY
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages:
+      shape: MULTI_PAGE
+      max_pages: 12
+      group: ADJACENT
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.0'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed fields
+      canonical:
+      - commercial source values / payment comparison inputs
+    processors:
+    - Commercial source materialization
+    controls: []
+    control_notes: External invoice-vs-ledger / payment-vs-ledger controls
+    task_effects:
+    - Low-confidence
+    - feedback / evidence when rule generates work
+    journey_360:
+    - DEAL
+    - PAYMENTS
+  cost_sheet:
+    display_name: Cost Sheet
+    di_types:
+    - cost_sheet
+    stage: DELIVERY
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages: *id001
+    extraction:
+      di_schema: FALLBACK
+      di_schema_version: null
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed field store
+      canonical:
+      - commercial source values where mapped
+    processors:
+    - Commercial source materialization where mappings exist
+    controls: []
+    control_notes: External comparisons that consume reconciliation/master values; no dedicated native
+      finding producer verified
+    task_effects:
+    - Verification/correction when applicable
+    journey_360:
+    - DEAL
+  gate_pass:
+    display_name: Gate Pass
+    di_types:
+    - gate_pass
+    stage: DELIVERY
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages:
+      shape: SINGLE
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.0'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed fields
+      canonical:
+      - deliveries.actual_delivered_at + source facts
+    processors:
+    - Delivery-date materialization
+    controls: []
+    runtime_checks:
+    - DELIVERY_DATE_BEFORE_BOOKING_DATE
+    control_notes: DELIVERY_DATE_BEFORE_BOOKING_DATE runtime control; external delivery/date/chassis controls
+    task_effects:
+    - Low-confidence
+    - correction / rule-remediation
+    journey_360:
+    - DELIVERY
+    - VEHICLE
+    - AUDIT
+  ew_invoice:
+    display_name: Extended Warranty Invoice
+    di_types:
+    - ew_invoice
+    stage: DELIVERY
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages: *id001
+    extraction:
+      di_schema: GENERALIZED_INVOICE
+      di_schema_version: '1.1'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: invoice_review_values
+      canonical:
+      - commercial_lines.additional_warranty_amount
+      - journey_addons
+    processors:
+    - Invoice/add-on materialization
+    controls: []
+    control_notes: Invoice discrepancy / related external comparisons
+    task_effects:
+    - Low-confidence
+    - invoice discrepancy
+    - correction
+    journey_360:
+    - INVOICES
+    - DEAL
+  rsa_invoice:
+    display_name: RSA Invoice
+    di_types:
+    - rsa_invoice
+    stage: DELIVERY
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages: *id001
+    extraction:
+      di_schema: GENERALIZED_INVOICE
+      di_schema_version: '1.1'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: invoice_review_values
+      canonical:
+      - commercial_lines.rsa_amount
+      - journey_addons
+    processors:
+    - Invoice/add-on materialization
+    controls: []
+    control_notes: Invoice discrepancy / related external comparisons
+    task_effects:
+    - Low-confidence
+    - invoice discrepancy
+    - correction
+    journey_360:
+    - INVOICES
+    - DEAL
+  value_added_service_document:
+    display_name: Value Added Service Document
+    di_types:
+    - value_added_service_document
+    stage: DELIVERY
+    requirement: OPTIONAL
+    condition: null
+    accepted_early: true
+    pages: *id001
+    extraction:
+      di_schema: FALLBACK
+      di_schema_version: null
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed field store
+      canonical:
+      - source evidence only unless field mapping exists
+    processors:
+    - Generic document processing
+    controls: []
+    control_notes: No dedicated native rule verified
+    task_effects:
+    - Verification/correction when applicable
+    journey_360:
+    - DOCUMENTS
+  no_dues_certificate:
+    display_name: No Dues Certificate
+    di_types:
+    - no_dues_certificate
+    stage: DELIVERY
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages: *id001
+    extraction:
+      di_schema: FALLBACK
+      di_schema_version: null
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed field store
+      canonical:
+      - closure evidence
+    processors:
+    - Generic document processing
+    controls: []
+    control_notes: Delivery completeness; NDC-specific external rules are currently parked
+    task_effects:
+    - Upload/re-upload
+    - verification
+    journey_360:
+    - DELIVERY
+  payment_receipt:
+    display_name: Payment Receipt
+    di_types:
+    - dealer_receipt
+    stage: DELIVERY
+    requirement: REQUIRED
+    condition: null
+    accepted_early: true
+    pages:
+      shape: SINGLE
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.1'
+      key_fields:
+      - receipt_number
+      - receipt_date
+      - amount_paid
+      review_threshold: 90
+      strict_fields:
+      - amount_paid
+      - receipt_number
+      strict_review_threshold: 97
+    persistence:
+      typed: dealer_receipt_review_values
+      canonical:
+      - payments
+    processors:
+    - Receipt materialization
+    - duplicate detection
+    - payment reconciliation
+    - finance candidate input
+    controls:
+    - DUPLICATE_RECEIPT
+    - WRONG_DOCUMENT
+    control_notes: DUPLICATE_RECEIPT; WRONG_DOCUMENT; PAYMENT_BANK_UNMATCHED + external receipt sum rules
+    task_effects:
+    - Low-confidence
+    - duplicate-receipt notice
+    - wrong-document
+    - re-upload
+    journey_360:
+    - PAYMENTS
+    - FINANCE
+    - DEAL
+  bank_statement_extract:
+    display_name: Bank Statement
+    di_types:
+    - bank_statement_extract
+    stage: DELIVERY
+    requirement: OPTIONAL
+    condition: null
+    accepted_early: true
+    pages:
+      shape: MULTI_PAGE
+      max_pages: 30
+      group: ADJACENT
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.1'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: bank_statement_lines
+      canonical:
+      - payment_bank_matches
+      - payment_verification_events
+    processors:
+    - Bank statement materialization
+    - payment reconciliation
+    controls:
+    - PAYMENT_BANK_UNMATCHED
+    control_notes: PAYMENT_BANK_UNMATCHED
+    task_effects:
+    - Low-confidence / correction when applicable
+    journey_360:
+    - PAYMENTS
+  credit_note:
+    display_name: Credit Note
+    di_types:
+    - credit_note
+    stage: DELIVERY
+    requirement: OPTIONAL
+    condition: null
+    accepted_early: true
+    pages: *id001
+    extraction:
+      di_schema: GENERALIZED_INVOICE
+      di_schema_version: '1.1'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: invoice_review_values
+      canonical:
+      - discount_applications / commercial adjustment evidence
+    processors:
+    - Invoice/credit-note materialization
+    controls: []
+    control_notes: Invoice discrepancy / discount reconciliation where applicable
+    task_effects:
+    - Low-confidence
+    - discrepancy / correction
+    journey_360:
+    - INVOICES
+    - DEAL
+  gst_declaration:
+    display_name: GST Declaration
+    di_types:
+    - gst_declaration
+    stage: DELIVERY
+    requirement: OPTIONAL
+    condition: null
+    accepted_early: true
+    pages: *id001
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.0'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed fields
+      canonical:
+      - source evidence
+    processors:
+    - Generic document processing
+    controls: []
+    control_notes: No dedicated native business rule verified
+    task_effects:
+    - Verification/correction when applicable
+    journey_360:
+    - DOCUMENTS
+  scrappage_certificate_of_deposit:
+    display_name: Scrappage Certificate of Deposit
+    di_types:
+    - scrappage_certificate_of_deposit
+    stage: DELIVERY
+    requirement: OPTIONAL
+    condition: scrappage discount support when claimed
+    accepted_early: true
+    pages:
+      shape: MULTI_PAGE
+      max_pages: 3
+      group: ADJACENT
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.0'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: scrappage_certificate_review_values
+      canonical:
+      - scrappage reviewed projection / discount evidence
+    processors:
+    - Scrappage materialization
+    - conditional evidence satisfaction
+    controls:
+    - BK_DISCOUNT_EVIDENCE_MISSING
+    control_notes: 'BK_DISCOUNT_EVIDENCE_MISSING: scrappage support'
+    task_effects:
+    - Upload/re-upload
+    - low-confidence
+    - correction
+    journey_360:
+    - TRADE_IN
+    - DEAL
+  upi_screenshot:
+    display_name: UPI Payment Screenshot
+    di_types:
+    - upi_screenshot
+    stage: BOOKING
+    requirement: SUPPORTING
+    condition: null
+    accepted_early: true
+    pages:
+      shape: SINGLE
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.1'
+      key_fields:
+      - amount_paid
+      - transaction_datetime
+      - upi_transaction_id
+      review_threshold: 90
+    persistence:
+      typed: null
+      canonical: []
+    processors: []
+    controls: []
+    task_effects: []
+    journey_360:
+    - PAYMENTS
+    notes: Payment proof supporting a dealer receipt. Never added to the booking payment total (it is
+      usually the same money as the receipt).
+  delivery_order_cover:
+    display_name: Delivery Order (Financier)
+    di_types:
+    - delivery_order_cover
+    stage: DELIVERY
+    requirement: OPTIONAL
+    condition: null
+    accepted_early: true
+    pages:
+      shape: MULTI_PAGE
+      max_pages: 3
+      group: ADJACENT
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.1'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: null
+      canonical:
+      - finance_records
+    processors:
+    - Generic document processing
+    controls:
+    - CHASSIS_INVOICE_VS_DO
+    - DO_DATE_AFTER_GATE
+    - DELIVERY_ORDER_MISSING
+    task_effects:
+    - Low-confidence review
+    journey_360:
+    - FINANCE
+    - DELIVERY
+  supporting_document:
+    display_name: Supporting Document
+    di_types: []
+    stage: ANY
+    requirement: SUPPORTING
+    condition: null
+    accepted_early: true
+    pages:
+      shape: MULTI_PAGE
+      max_pages: 10
+      group: ADJACENT
+    extraction:
+      di_schema: NONE
+      di_schema_version: null
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: null
+      canonical: []
+    processors: []
+    controls: []
+    task_effects: []
+    journey_360:
+    - DOCUMENTS
+    notes: Pages DI cannot classify (docket covers, employer letters, emails, PAN verification printouts,
+      fee receipts). Kept as evidence, never blocking; the PC can re-type one.

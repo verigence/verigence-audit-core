@@ -1,0 +1,239 @@
+# Phase 2 task catalog (blueprint v2.2 section 11). Every P2 task type, its owner,
+# completion protocol and allowed actions.
+version: 1
+actions:
+- UPLOAD_DOCUMENT
+- REUPLOAD_DOCUMENT
+- REVIEW_DOCUMENT
+- CORRECT_EXTRACTED_FIELD
+- ADD_EVIDENCE
+- ADD_COMMENT
+- PROVIDE_FEEDBACK
+- REQUEST_CLARIFICATION
+- COMPLETE_ACTION
+- APPROVE_CORRECTION
+- REJECT_CORRECTION
+- ACCEPT
+- REJECT
+task_types:
+  PC_VERIFY_UNRECOGNIZED_DOCUMENT:
+    category: DOCUMENT_VERIFICATION
+    owner: PC
+    origin: SYSTEM
+    source: DOCUMENT
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - COMPLETE_ACTION
+    - ADD_COMMENT
+  MANUAL_VERIFICATION_REVIEW:
+    category: DOCUMENT_VERIFICATION
+    owner: PC
+    origin: SYSTEM
+    source: DOCUMENT_FIELD
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - CORRECT_EXTRACTED_FIELD
+    - ADD_COMMENT
+  WRONG_DOCUMENT_REVIEW:
+    category: DOCUMENT_VERIFICATION
+    owner: PC
+    origin: SYSTEM
+    source: DOCUMENT
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - UPLOAD_DOCUMENT
+    - REUPLOAD_DOCUMENT
+    - COMPLETE_ACTION
+    - ADD_COMMENT
+  WRONG_DOCUMENT_DEALER_NOTICE:
+    category: DOCUMENT_VERIFICATION
+    owner: PC
+    origin: SYSTEM
+    source: DOCUMENT
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - PROVIDE_FEEDBACK
+    - ADD_COMMENT
+  PC_DOCUMENT_REUPLOAD:
+    category: DOCUMENT_REUPLOAD
+    owner: PC
+    origin: SYSTEM
+    source: DOCUMENT
+    completion: MACHINE_VERIFIED
+    actions:
+    - UPLOAD_DOCUMENT
+    - REUPLOAD_DOCUMENT
+    - ADD_COMMENT
+  DUPLICATE_RECEIPT_NOTICE:
+    category: DOCUMENT_EXCEPTION
+    owner: PC
+    origin: SYSTEM
+    source: CONTROL
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - PROVIDE_FEEDBACK
+    - ADD_COMMENT
+  FIELD_CORRECTION_REVIEW:
+    category: CORRECTION_APPROVAL
+    owner: TL
+    origin: SYSTEM
+    source: DOCUMENT_FIELD
+    completion: MACHINE_VERIFIED
+    actions:
+    - APPROVE_CORRECTION
+    - REJECT_CORRECTION
+    - ADD_COMMENT
+  MODEL_SELECTION_CORRECTION_REVIEW:
+    category: CORRECTION_APPROVAL
+    owner: TL
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - APPROVE_CORRECTION
+    - REJECT_CORRECTION
+    - ADD_COMMENT
+  INVOICE_DISCREPANCY_REVIEW:
+    category: CROSS_DOCUMENT_REVIEW
+    owner: TL
+    origin: SYSTEM
+    source: CONTROL
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - PROVIDE_FEEDBACK
+    - COMPLETE_ACTION
+    - ADD_COMMENT
+  FINANCE_DISBURSEMENT_REVIEW:
+    category: BUSINESS_RESOLUTION
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - PROVIDE_FEEDBACK
+    - COMPLETE_ACTION
+    - ADD_COMMENT
+  FINANCE_DISBURSEMENT_CONFIRMED_NOTICE:
+    category: SUPERVISORY_NOTICE
+    owner: TL
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - COMPLETE_ACTION
+    - ADD_COMMENT
+  DELIVERY_VEHICLE_PHOTOS_MISSING:
+    category: EVIDENCE_GAP
+    owner: PC
+    origin: SYSTEM
+    source: DOCUMENT/EVIDENCE
+    completion: MACHINE_VERIFIED
+    actions:
+    - ADD_EVIDENCE
+    - ADD_COMMENT
+  DELIVERY_VIN_MANUAL_ENTRY_REVIEW:
+    category: CORRECTION_APPROVAL
+    owner: TL
+    origin: SYSTEM
+    source: DOCUMENT_FIELD
+    completion: MACHINE_VERIFIED
+    actions:
+    - APPROVE_CORRECTION
+    - REJECT_CORRECTION
+    - ADD_COMMENT
+  AUTO_SELF_SERVE:
+    category: FINDING_REMEDIATION
+    owner: PC
+    origin: SYSTEM
+    source: FINDING
+    completion: MACHINE_VERIFIED
+    actions:
+    - ADD_EVIDENCE
+    - CORRECT_EXTRACTED_FIELD
+    - ADD_COMMENT
+  TL_TAKE_ACTION:
+    category: FINDING_REMEDIATION
+    owner: PC
+    origin: HUMAN
+    source: HUMAN_ACTION
+    completion: REQUESTER_CONFIRMED
+    actions:
+    - UPLOAD_DOCUMENT
+    - REUPLOAD_DOCUMENT
+    - CORRECT_EXTRACTED_FIELD
+    - ADD_EVIDENCE
+    - PROVIDE_FEEDBACK
+    - ADD_COMMENT
+  FINDING_REVIEW:
+    category: FINDING_REMEDIATION
+    owner: TL
+    origin: SYSTEM
+    source: RULE
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - CORRECT_EXTRACTED_FIELD
+    - ADD_EVIDENCE
+    - PROVIDE_FEEDBACK
+    - ADD_COMMENT
+  FINDING_REMEDIATION:
+    category: FINDING_REMEDIATION
+    owner: PC
+    origin: SYSTEM
+    source: RULE
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - CORRECT_EXTRACTED_FIELD
+    - UPLOAD_DOCUMENT
+    - ADD_EVIDENCE
+    - ADD_COMMENT
+  DOCUMENT_REMEDIATION:
+    category: DOCUMENT_REUPLOAD
+    owner: PC
+    origin: SYSTEM
+    source: RULE
+    completion: MACHINE_VERIFIED
+    actions:
+    - UPLOAD_DOCUMENT
+    - REUPLOAD_DOCUMENT
+    - ADD_COMMENT
+  RULE_DISCREPANCY_REVIEW:
+    category: CROSS_DOCUMENT_REVIEW
+    owner: PC
+    origin: SYSTEM
+    source: RULE
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - CORRECT_EXTRACTED_FIELD
+    - ADD_EVIDENCE
+    - PROVIDE_FEEDBACK
+    - ADD_COMMENT
+  FIELD_CORRECTION_REVIEW_P2:
+    category: CORRECTION_APPROVAL
+    owner: TL
+    origin: SYSTEM
+    source: DOCUMENT_FIELD
+    completion: MACHINE_VERIFIED
+    actions:
+    - APPROVE_CORRECTION
+    - REJECT_CORRECTION
+    - ADD_COMMENT
+  REQUESTER_CONFIRMATION:
+    category: TASK_CONFIRMATION
+    owner: REQUESTER
+    origin: SYSTEM
+    source: HUMAN_ACTION
+    completion: REQUESTER_CONFIRMED
+    actions:
+    - ACCEPT
+    - REJECT
+    - ADD_COMMENT

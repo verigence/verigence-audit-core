@@ -74,7 +74,7 @@ NOW = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
         (None, 3, 1, None, "READY"),
         ({"state": "CLASSIFIED", "processingStatus": "PROCESSING"}, 0, 1, None, "EXTRACTING"),
         ({"state": "CLASSIFYING"}, 0, 1, None, "CLASSIFYING"),
-        ({"state": "UNKNOWN"}, 0, 1, None, "NEEDS_REVIEW"),
+        ({"state": "UNKNOWN"}, 0, 1, None, "SUPPORTING"),
         ({"state": "FAILED"}, 0, 1, None, "FAILED"),
         ({"state": "CLASSIFIED", "processingStatus": "FAILED"}, 0, 1, None, "FAILED"),
         ({"state": "DELETED"}, 0, 1, None, "CANCELLED"),
@@ -94,7 +94,7 @@ def test_page_outcome_never_waits_forever(di_item, fields, submitted_ago, proces
         now=NOW,
     )
     assert outcome.status == expected
-    if expected in {"FAILED", "NEEDS_REVIEW", "CANCELLED"}:
+    if expected in {"FAILED", "NEEDS_REVIEW", "CANCELLED", "SUPPORTING"}:
         assert outcome.reason
 
 
@@ -232,7 +232,7 @@ def test_one_di_listing_settles_every_page_of_the_journey(journey, monkeypatch):
     ])
     assert outcome == "DONE"
     assert client.list_calls == 2  # one listing per DI phase, not per page
-    assert _page_status(journey, unknown_q) == "NEEDS_REVIEW"
+    assert _page_status(journey, unknown_q) == "SUPPORTING"
     assert _page_status(journey, failed_q) == "FAILED"
     assert _page_status(journey, ready_q) == "READY"
     assert queue_row(journey, "STAGE_RECOMPUTE", f"booking:{journey.journey_id}") is not None

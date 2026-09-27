@@ -1,0 +1,995 @@
+# Phase 2 control catalog: 25 active Audit Core controls + 47 enabled Rule Engine
+# rules (blueprint v2.2 sections 9-10). Audit Core owns execution state for both.
+version: 1
+controls:
+  WRONG_DOCUMENT:
+    executor: NATIVE
+    category: Customer & Dealer Identity
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  DUPLICATE_RECEIPT:
+    executor: NATIVE
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  MANUAL_VERIFICATION:
+    executor: NATIVE
+    category: Document Extraction & Completeness
+    triggers:
+    - DOCUMENT_SYNCED
+    - CAPTURE_SCREEN_READ
+    rerun: RERUNNABLE
+    finding_class: DATA_GAP
+    severity: LOW
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: FINDING_REMEDIATION
+      owner: PC
+  MODEL_NOT_IDENTIFIED:
+    executor: NATIVE
+    category: Vehicle & Model Resolution
+    triggers:
+    - DOCUMENT_SYNCED
+    - DELIVERY_COMPLETED
+    rerun: RERUNNABLE
+    finding_class: DATA_GAP
+    severity: MEDIUM
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: FINDING_REMEDIATION
+      owner: PC
+  PAYMENT_BANK_UNMATCHED:
+    executor: NATIVE
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    - DELIVERY_COMPLETED path also uses surviving rule
+    rerun: RERUNNABLE
+    finding_class: DATA_GAP
+    severity: HIGH
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: FINDING_REMEDIATION
+      owner: PC
+  BK_DISCOUNT_EVIDENCE_MISSING:
+    executor: NATIVE
+    category: Document Extraction & Completeness
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: DOCUMENT_GAP
+    severity: HIGH
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: DOCUMENT_REMEDIATION
+      owner: PC
+  BK_MIN_BOOKING_AMOUNT_NOT_MET:
+    executor: NATIVE
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  WF_BOOKING_INCOMPLETE_AT_DELIVERY_START:
+    executor: NATIVE
+    category: Delivery Process
+    triggers:
+    - DELIVERY_STARTED
+    rerun: ONCE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  DL_VIN_RECONCILIATION:
+    executor: NATIVE
+    category: Vehicle & Model Resolution
+    triggers:
+    - DELIVERY_VEHICLE_OBSERVATION_RECORDED
+    rerun: ONCE
+    finding_class: VIOLATION
+    severity: CRITICAL
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  DL_NOT_INTIMATED:
+    executor: NATIVE
+    category: Delivery Process
+    triggers:
+    - DELIVERY_COMPLETED
+    rerun: ONCE
+    finding_class: DATA_GAP
+    severity: HIGH
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: FINDING_REMEDIATION
+      owner: PC
+  DOC_REQUIRED_ANSWER_NO:
+    executor: NATIVE
+    category: Document Extraction & Completeness
+    triggers:
+    - DELIVERY_DOCUMENT_ANSWERED_NO
+    - DELIVERY_COMPLETED
+    rerun: ONCE
+    finding_class: DOCUMENT_GAP
+    severity: HIGH
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: DOCUMENT_REMEDIATION
+      owner: PC
+  WF_DELIVERY_COMPLETED_WITH_AUDIT_INCOMPLETE:
+    executor: NATIVE
+    category: Delivery Process
+    triggers:
+    - DELIVERY_COMPLETED
+    rerun: ONCE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  DOCUMENT_UNRECOGNIZED:
+    executor: NATIVE
+    category: Document Extraction & Completeness
+    triggers:
+    - CAPTURE_SCREEN_READ
+    rerun: RERUNNABLE
+    finding_class: DATA_GAP
+    severity: LOW
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: FINDING_REMEDIATION
+      owner: PC
+  DOCUMENT_MISSING:
+    executor: NATIVE
+    category: Document Extraction & Completeness
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: DATA_GAP
+    severity: MEDIUM
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: FINDING_REMEDIATION
+      owner: PC
+  AUTOMATED_SYNC_FAILURE:
+    executor: NATIVE
+    category: System Health
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: DATA_GAP
+    severity: MEDIUM
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: FINDING_REMEDIATION
+      owner: PC
+  BK_DOCKET_PRESENT:
+    executor: NATIVE
+    category: Document Extraction & Completeness
+    triggers:
+    - DOCUMENT_SYNCED
+    - BOOKING_REVIEW_CONFIRMED
+    - BOOKING_SUBMITTED
+    rerun: RERUNNABLE
+    finding_class: DOCUMENT_GAP
+    severity: HIGH
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: DOCUMENT_REMEDIATION
+      owner: PC
+  BK_PAN_PRESENT:
+    executor: NATIVE
+    category: Customer & Dealer Identity
+    triggers:
+    - DOCUMENT_SYNCED
+    - BOOKING_REVIEW_CONFIRMED
+    - BOOKING_SUBMITTED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  BK_MIN_BOOKING_PROOF_PRESENT:
+    executor: NATIVE
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    - BOOKING_REVIEW_CONFIRMED
+    - BOOKING_SUBMITTED
+    rerun: RERUNNABLE
+    finding_class: DATA_GAP
+    severity: HIGH
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: FINDING_REMEDIATION
+      owner: PC
+  BK_CONDITIONAL_DOCS_ADDRESSED:
+    executor: NATIVE
+    category: Document Extraction & Completeness
+    triggers:
+    - DOCUMENT_SYNCED
+    - BOOKING_REVIEW_CONFIRMED
+    - BOOKING_SUBMITTED
+    rerun: RERUNNABLE
+    finding_class: DOCUMENT_GAP
+    severity: HIGH
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: DOCUMENT_REMEDIATION
+      owner: PC
+  BK_REQUIRED_CAPTURE_COMPLETE:
+    executor: NATIVE
+    category: Document Extraction & Completeness
+    triggers:
+    - DOCUMENT_SYNCED
+    - BOOKING_REVIEW_CONFIRMED
+    - BOOKING_SUBMITTED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  DL_V2_REQUIRED_DOCUMENT_MISSING:
+    executor: NATIVE
+    category: Document Extraction & Completeness
+    triggers:
+    - DOCUMENT_SYNCED
+    - delivery checkpoint
+    rerun: RERUNNABLE
+    finding_class: DOCUMENT_GAP
+    severity: MEDIUM
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: DOCUMENT_REMEDIATION
+      owner: PC
+  DL_V2_DOCUMENT_PROCESSING_FAILED:
+    executor: NATIVE
+    category: Document Extraction & Completeness
+    triggers:
+    - DOCUMENT_SYNCED
+    - delivery checkpoint
+    rerun: RERUNNABLE
+    finding_class: DOCUMENT_GAP
+    severity: MEDIUM
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: DOCUMENT_REMEDIATION
+      owner: PC
+  FINANCE_HYPOTHECATION_MISSING:
+    executor: NATIVE
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: DATA_GAP
+    severity: MEDIUM
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: FINDING_REMEDIATION
+      owner: PC
+  UC03_DI_LOW_CONFIDENCE_POST_SUBMIT:
+    executor: NATIVE
+    category: Document Extraction & Completeness
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: DOCUMENT_GAP
+    severity: INFO
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: DOCUMENT_REMEDIATION
+      owner: PC
+  DUPLICATE_BOOKING:
+    executor: NATIVE
+    category: Customer & Dealer Identity
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: CRITICAL
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  ACCESSORY_BOOKING_VS_INVOICE:
+    executor: EXTERNAL_RULE_ENGINE
+    category: ACCESSORY
+    phases:
+    - BOOKING
+    - DELIVERY
+    operands:
+      left: booking_form.accessories_cost
+      right: accessory_invoice_dms.grand_total_amount
+    depends_on_documents:
+    - booking_docket
+    - accessory_invoice_dms
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  ACCESSORY_DATE_VS_DELIVERY:
+    executor: EXTERNAL_RULE_ENGINE
+    category: ACCESSORY
+    phases:
+    - DELIVERY
+    operands:
+      left: accessory_invoice_dms.invoice_date
+      right: gate_pass.delivery_date
+    depends_on_documents:
+    - accessory_invoice_dms
+    - gate_pass
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  ACCESSORY_DMS_VS_TALLY:
+    executor: EXTERNAL_RULE_ENGINE
+    category: ACCESSORY
+    phases:
+    - DELIVERY
+    operands:
+      left: accessory_invoice_dms.grand_total_amount
+      right: accessory_invoice_tally.grand_total_amount
+    depends_on_documents:
+    - accessory_invoice_dms
+    - accessory_invoice_tally
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  ACCESSORY_VIN_VS_VEHICLE_VIN:
+    executor: EXTERNAL_RULE_ENGINE
+    category: ACCESSORY
+    phases:
+    - DELIVERY
+    operands:
+      left: accessory_invoice_dms.chassis_number
+      right: customer_invoice_dms.chassis_number
+    depends_on_documents:
+    - accessory_invoice_dms
+    - customer_invoice_dms
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  ACCESSORY_VS_COST_SHEET:
+    executor: EXTERNAL_RULE_ENGINE
+    category: ACCESSORY
+    phases:
+    - DELIVERY
+    operands:
+      left: accessory_invoice_dms.grand_total_amount
+      right: _reconciliation.addon:ACCESSORIES_TOTAL:standard
+    depends_on_documents:
+    - accessory_invoice_dms
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  BOOKING_AMOUNT_ZERO:
+    executor: EXTERNAL_RULE_ENGINE
+    category: PROCESS
+    phases:
+    - BOOKING
+    operands:
+      left: booking_docket.booking_amount_paid
+      right: '-'
+    depends_on_documents:
+    - booking_docket
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  BOOKING_RECEIPT_SUM_VS_BOOKING_FORM:
+    executor: EXTERNAL_RULE_ENGINE
+    category: PRICE
+    phases:
+    - BOOKING
+    operands:
+      left: dealer_receipt.amount_paid
+      right: booking_form.booking_amount_paid
+    depends_on_documents:
+    - dealer_receipt
+    - booking_docket
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  BOOKING_TO_DELIVERY_EXCESS:
+    executor: EXTERNAL_RULE_ENGINE
+    category: DATE
+    phases:
+    - BOOKING
+    - DELIVERY
+    operands:
+      left: gate_pass.delivery_date
+      right: booking_form.booking_date
+    depends_on_documents:
+    - gate_pass
+    - booking_docket
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  CHASSIS_INVOICE_VS_DO:
+    executor: EXTERNAL_RULE_ENGINE
+    category: VEHICLE
+    phases:
+    - DELIVERY
+    operands:
+      left: customer_invoice_dms.chassis_number
+      right: delivery_order_cover.chassis_number
+    depends_on_documents:
+    - customer_invoice_dms
+    - delivery_order_cover
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  CORPORATE_GSTIN_CERT_VS_INVOICE:
+    executor: EXTERNAL_RULE_ENGINE
+    category: CORPORATE
+    phases:
+    - DELIVERY
+    - CORPORATE
+    operands:
+      left: gst_certificate.gstin
+      right: customer_invoice_dms.buyer_gstin
+    depends_on_documents:
+    - gst_certificate
+    - customer_invoice_dms
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  CORPORATE_NAME_CERT_VS_INVOICE:
+    executor: EXTERNAL_RULE_ENGINE
+    category: CORPORATE
+    phases:
+    - BOOKING
+    - DELIVERY
+    - CORPORATE
+    operands:
+      left: gst_certificate.legal_name
+      right: customer_invoice_dms.buyer_name
+    depends_on_documents:
+    - gst_certificate
+    - customer_invoice_dms
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  CORPORATE_PO_AMOUNT_VS_INVOICE:
+    executor: EXTERNAL_RULE_ENGINE
+    category: CORPORATE
+    phases:
+    - DELIVERY
+    - CORPORATE
+    operands:
+      left: purchase_order.po_amount
+      right: customer_invoice_dms.grand_total_amount
+    depends_on_documents:
+    - purchase_order
+    - customer_invoice_dms
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  CORPORATE_PO_MISSING:
+    executor: EXTERNAL_RULE_ENGINE
+    category: CORPORATE
+    phases:
+    - BOOKING
+    - CORPORATE
+    operands:
+      left: '-'
+      right: '-'
+    depends_on_documents: []
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  CUSTOMER_LEDGER_MISSING:
+    executor: EXTERNAL_RULE_ENGINE
+    category: COMPLETENESS
+    phases:
+    - DELIVERY
+    - FINANCE
+    operands:
+      left: '-'
+      right: '-'
+    depends_on_documents: []
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  CUSTOMER_NAME_BOOKING_VS_INVOICE:
+    executor: EXTERNAL_RULE_ENGINE
+    category: VEHICLE
+    phases:
+    - BOOKING
+    - DELIVERY
+    operands:
+      left: booking_form.customer_name
+      right: customer_invoice_dms.buyer_name
+    depends_on_documents:
+    - booking_docket
+    - customer_invoice_dms
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  DEBIT_NOTE_INSURANCE_VS_COVER_NOTE:
+    executor: EXTERNAL_RULE_ENGINE
+    category: DEBIT_NOTE
+    phases:
+    - DELIVERY
+    operands:
+      left: debit_note.insurance_amount
+      right: insurance_cover.premium_amount
+    depends_on_documents:
+    - debit_note
+    - insurance_cover
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  DELIVERY_ORDER_MISSING:
+    executor: EXTERNAL_RULE_ENGINE
+    category: PROCESS
+    phases:
+    - DELIVERY
+    operands:
+      left: '-'
+      right: '-'
+    depends_on_documents: []
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  DELIVERY_RECEIPT_SUM_VS_INVOICE:
+    executor: EXTERNAL_RULE_ENGINE
+    category: PRICE
+    phases:
+    - DELIVERY
+    - FINANCE
+    operands:
+      left: payment_receipt.amount_paid
+      right: customer_invoice_dms.grand_total_amount
+    depends_on_documents:
+    - payment_receipt
+    - customer_invoice_dms
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  DISCOUNT_BOOKING_EXCEEDS_APPROVAL:
+    executor: EXTERNAL_RULE_ENGINE
+    category: DISCOUNT
+    phases:
+    - BOOKING
+    operands:
+      left: booking_form.discount_amount
+      right: _reconciliation.discount:TOTAL:standard
+    depends_on_documents:
+    - booking_docket
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  DISCOUNT_EXCEEDS_POLICY:
+    executor: EXTERNAL_RULE_ENGINE
+    category: DISCOUNT
+    phases:
+    - BOOKING
+    operands:
+      left: discount_approval_form.approved_discount
+      right: '-'
+    depends_on_documents:
+    - discount_approval_form
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  DISCOUNT_HIDDEN_IN_EXCHANGE:
+    executor: EXTERNAL_RULE_ENGINE
+    category: DISCOUNT
+    phases:
+    - BOOKING
+    - EXCHANGE
+    operands:
+      left: customer_invoice_dms.invoice_discount_amount
+      right: _reconciliation.discount:TOTAL:standard
+    depends_on_documents:
+    - customer_invoice_dms
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  DISCOUNT_INVOICE_DMS_VS_TALLY:
+    executor: EXTERNAL_RULE_ENGINE
+    category: DISCOUNT
+    phases:
+    - DELIVERY
+    operands:
+      left: customer_invoice_dms.invoice_discount_amount
+      right: tax_invoice_tally.invoice_discount_amount
+    depends_on_documents:
+    - customer_invoice_dms
+    - tax_invoice_tally
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  DISCOUNT_INVOICE_VS_BOOKING:
+    executor: EXTERNAL_RULE_ENGINE
+    category: DISCOUNT
+    phases:
+    - BOOKING
+    - DELIVERY
+    operands:
+      left: customer_invoice_dms.invoice_discount_amount
+      right: booking_form.discount_amount
+    depends_on_documents:
+    - customer_invoice_dms
+    - booking_docket
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  DO_DATE_AFTER_GATE:
+    executor: EXTERNAL_RULE_ENGINE
+    category: DATE
+    phases:
+    - DELIVERY
+    operands:
+      left: delivery_order_cover.delivery_date
+      right: gate_pass.delivery_date
+    depends_on_documents:
+    - delivery_order_cover
+    - gate_pass
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  EXCHANGE_VALUE_VS_COST_SHEET:
+    executor: EXTERNAL_RULE_ENGINE
+    category: EXCHANGE
+    phases:
+    - DELIVERY
+    - EXCHANGE
+    operands:
+      left: valuation_report.final_offer_value
+      right: _reconciliation.discount:EXCHANGE:standard
+    depends_on_documents:
+    - valuation_report
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  EXCHANGE_VALUE_VS_INVOICE_CREDIT:
+    executor: EXTERNAL_RULE_ENGINE
+    category: EXCHANGE
+    phases:
+    - DELIVERY
+    - EXCHANGE
+    operands:
+      left: valuation_report.final_offer_value
+      right: _reconciliation.discount:EXCHANGE:actual
+    depends_on_documents:
+    - valuation_report
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  GATE_DATE_BEFORE_INVOICE:
+    executor: EXTERNAL_RULE_ENGINE
+    category: DATE
+    phases:
+    - DELIVERY
+    operands:
+      left: gate_pass.delivery_date
+      right: customer_invoice_dms.invoice_date
+    depends_on_documents:
+    - gate_pass
+    - customer_invoice_dms
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  GATE_PASS_CHASSIS_EMPTY:
+    executor: EXTERNAL_RULE_ENGINE
+    category: PROCESS
+    phases:
+    - DELIVERY
+    operands:
+      left: gate_pass.chassis_number
+      right: '-'
+    depends_on_documents:
+    - gate_pass
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  GATE_PASS_MISSING:
+    executor: EXTERNAL_RULE_ENGINE
+    category: COMPLETENESS
+    phases:
+    - DELIVERY
+    operands:
+      left: '-'
+      right: '-'
+    depends_on_documents: []
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  INSURANCE_COVER_NOTE_MISSING:
+    executor: EXTERNAL_RULE_ENGINE
+    category: INSURANCE
+    phases:
+    - DELIVERY
+    operands:
+      left: '-'
+      right: '-'
+    depends_on_documents: []
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  INSURANCE_PREMIUM_COVER_VS_COST_SHEET:
+    executor: EXTERNAL_RULE_ENGINE
+    category: INSURANCE
+    phases:
+    - DELIVERY
+    operands:
+      left: insurance_cover.premium_amount
+      right: _reconciliation.commercial:insurance_amount:standard
+    depends_on_documents:
+    - insurance_cover
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  INSURANCE_PREMIUM_VS_DEBIT_NOTE:
+    executor: EXTERNAL_RULE_ENGINE
+    category: INSURANCE
+    phases:
+    - DELIVERY
+    operands:
+      left: insurance_cover.premium_amount
+      right: debit_note.insurance_amount
+    depends_on_documents:
+    - insurance_cover
+    - debit_note
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  INSURANCE_START_AFTER_DELIVERY:
+    executor: EXTERNAL_RULE_ENGINE
+    category: INSURANCE
+    phases:
+    - DELIVERY
+    operands:
+      left: insurance_cover.policy_start_date
+      right: gate_pass.delivery_date
+    depends_on_documents:
+    - insurance_cover
+    - gate_pass
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  INVOICE_DATE_BEFORE_BOOKING:
+    executor: EXTERNAL_RULE_ENGINE
+    category: DATE
+    phases:
+    - BOOKING
+    operands:
+      left: customer_invoice_dms.invoice_date
+      right: booking_form.booking_date
+    depends_on_documents:
+    - customer_invoice_dms
+    - booking_docket
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  INVOICE_MISSING:
+    executor: EXTERNAL_RULE_ENGINE
+    category: COMPLETENESS
+    phases:
+    - DELIVERY
+    operands:
+      left: '-'
+      right: '-'
+    depends_on_documents: []
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  KYC_DOB_AADHAAR_VS_PAN:
+    executor: EXTERNAL_RULE_ENGINE
+    category: KYC
+    phases:
+    - BOOKING
+    operands:
+      left: aadhaar.date_of_birth
+      right: pan_card.date_of_birth
+    depends_on_documents:
+    - aadhaar
+    - pan_card
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  KYC_NAME_VS_BOOKING:
+    executor: EXTERNAL_RULE_ENGINE
+    category: KYC
+    phases:
+    - BOOKING
+    operands:
+      left: aadhaar.aadhaar_name
+      right: booking_form.customer_name
+    depends_on_documents:
+    - aadhaar
+    - booking_docket
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  KYC_NAME_VS_INVOICE:
+    executor: EXTERNAL_RULE_ENGINE
+    category: KYC
+    phases:
+    - DELIVERY
+    operands:
+      left: aadhaar.aadhaar_name
+      right: customer_invoice_dms.buyer_name
+    depends_on_documents:
+    - aadhaar
+    - customer_invoice_dms
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  MODEL_VARIANT_BOOKING_VS_INVOICE:
+    executor: EXTERNAL_RULE_ENGINE
+    category: VEHICLE
+    phases:
+    - BOOKING
+    - DELIVERY
+    operands:
+      left: booking_form.vehicle_variant
+      right: customer_invoice_dms.variant_raw
+    depends_on_documents:
+    - booking_docket
+    - customer_invoice_dms
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  PAYMENT_MODE_CASH_UNRECEIPTED:
+    executor: EXTERNAL_RULE_ENGINE
+    category: PROCESS
+    phases:
+    - BOOKING
+    - DELIVERY
+    operands:
+      left: customer_ledger.cash_credit_total
+      right: _derived.payments_total
+    depends_on_documents:
+    - customer_ledger
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  PAYMENT_SUM_VS_LEDGER:
+    executor: EXTERNAL_RULE_ENGINE
+    category: PRICE
+    phases:
+    - DELIVERY
+    - FINANCE
+    operands:
+      left: _derived.payments_total
+      right: customer_ledger.total_credited
+    depends_on_documents:
+    - customer_ledger
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  PRICE_BOOKING_VS_INVOICE:
+    executor: EXTERNAL_RULE_ENGINE
+    category: PRICE
+    phases:
+    - BOOKING
+    operands:
+      left: booking_form.total_price
+      right: customer_invoice_dms.grand_total_amount
+    depends_on_documents:
+    - booking_docket
+    - customer_invoice_dms
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  PRICE_INVOICE_DMS_VS_TALLY:
+    executor: EXTERNAL_RULE_ENGINE
+    category: PRICE
+    phases:
+    - DELIVERY
+    operands:
+      left: customer_invoice_dms.grand_total_amount
+      right: tax_invoice_tally.grand_total_amount
+    depends_on_documents:
+    - customer_invoice_dms
+    - tax_invoice_tally
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  PRICE_INVOICE_VS_LEDGER:
+    executor: EXTERNAL_RULE_ENGINE
+    category: PRICE
+    phases:
+    - DELIVERY
+    operands:
+      left: customer_invoice_dms.grand_total_amount
+      right: customer_ledger.total_debited
+    depends_on_documents:
+    - customer_invoice_dms
+    - customer_ledger
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  RTO_CHALLAN_MISSING:
+    executor: EXTERNAL_RULE_ENGINE
+    category: RTO
+    phases:
+    - DELIVERY
+    operands:
+      left: '-'
+      right: '-'
+    depends_on_documents: []
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  TALLY_ACCESSORY_INVOICE_VS_DMS:
+    executor: EXTERNAL_RULE_ENGINE
+    category: TALLY_DMS
+    phases:
+    - DELIVERY
+    operands:
+      left: accessory_invoice_tally.grand_total_amount
+      right: accessory_invoice_dms.grand_total_amount
+    depends_on_documents:
+    - accessory_invoice_tally
+    - accessory_invoice_dms
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
+  TALLY_VEHICLE_INVOICE_VS_DMS:
+    executor: EXTERNAL_RULE_ENGINE
+    category: TALLY_DMS
+    phases:
+    - DELIVERY
+    operands:
+      left: tax_invoice_tally.grand_total_amount
+      right: customer_invoice_dms.grand_total_amount
+    depends_on_documents:
+    - tax_invoice_tally
+    - customer_invoice_dms
+    task:
+      type: RULE_DISCREPANCY_REVIEW
+      owner: PC
