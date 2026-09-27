@@ -304,3 +304,75 @@ def set_minimum_booking_amount(journey: P2Journey, amount: str) -> None:
             ),
             {"t": journey.tenant_id, "a": amount},
         )
+
+
+def add_batch_pages(
+    journey: P2Journey,
+    pages: list[tuple[str | None, str]],
+    *,
+    grouping_status: str = "PENDING",
+) -> tuple[UUID, list[dict[str, Any]]]:
+    """One multi-page upload whose pages DI has already classified.
+
+    ``pages`` is a list of (di_type or None, queue_status)."""
+    batch_id = uuid4()
+    rows: list[dict[str, Any]] = []
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.p2_upload_batches (
+                    tenant_id, batch_id, journey_id, original_filename, content_type,
+                    size_bytes, page_count, original_object_key, batch_status,
+                    uploaded_by_actor_id, grouping_status
+                ) VALUES (:t, :b, :j, 'packet.pdf', 'application/pdf', 100, :n, :k,
+                          'PROCESSING', :a, :g)
+                """
+            ),
+            {"t": journey.tenant_id, "b": batch_id, "j": journey.journey_id, "n": len(pages),
+             "k": f"p2/{batch_id}", "a": journey.actor_id, "g": grouping_status},
+        )
+        for number, (di_type, status) in enumerate(pages, start=1):
+            di_document_id = uuid4()
+            queue_id = connection.execute(
+                text(
+                    """
+                    INSERT INTO auditcore.p2_document_queue (
+                        tenant_id, batch_id, journey_id, page_number, page_numbers, page_sha256,
+                        page_object_key, client_upload_id, di_document_id, queue_status,
+                        classified_document_type, business_stage, di_submitted_at_utc
+                    ) VALUES (:t, :b, :j, :p, ARRAY[:p], :sha, :k, :c, :d, :s, :dt, 'BOOKING', now())
+                    RETURNING queue_id
+                    """
+                ),
+                {"t": journey.tenant_id, "b": batch_id, "j": journey.journey_id, "p": number,
+                 "sha": uuid4().hex, "k": f"p2/{batch_id}/pages/{number:04d}.pdf",
+                 "c": f"p2-{uuid4().hex}", "d": di_document_id, "s": status, "dt": di_type},
+            ).scalar_one()
+            rows.append({"queue_id": UUID(str(queue_id)), "di_document_id": di_document_id,
+                         "page_number": number, "object_key": f"p2/{batch_id}/pages/{number:04d}.pdf"})
+    return batch_id, rows
+
+
+class MemoryStorage:
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+
+    def get_object(self, key: str) -> bytes:
+        return self.objects[key]
+
+    def put_object(self, key: str, payload: bytes, *, content_type: str) -> None:
+        self.objects[key] = payload
+
+
+def one_page_pdf(width: int = 200) -> bytes:
+    import io
+
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=width, height=100)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()

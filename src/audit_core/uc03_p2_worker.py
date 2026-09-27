@@ -51,6 +51,7 @@ from audit_core.uc03_document_capture_v2 import (
     get_di_client,
     get_security_oauth_client,
 )
+from audit_core.uc03_p2_grouping import PageFact, merge_pdf_pages, plan_documents
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_runtime import (
     fact_fingerprint,
@@ -613,13 +614,13 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                     INSERT INTO auditcore.p2_document_queue (
                         tenant_id, queue_id, batch_id, journey_id, page_number,
                         page_sha256, page_object_key, client_upload_id,
-                        queue_status, correlation_id
+                        queue_status, correlation_id, unit_kind, page_numbers
                     ) VALUES (
                         :tenant_id, :queue_id, :batch_id, :journey_id, :page_number,
                         :page_sha, :object_key, :client_upload_id,
-                        'QUEUED', :correlation_id
+                        'QUEUED', :correlation_id, 'PAGE', ARRAY[:page_number]
                     )
-                    ON CONFLICT (tenant_id, batch_id, page_number)
+                    ON CONFLICT (tenant_id, batch_id, page_number) WHERE unit_kind='PAGE'
                     DO UPDATE SET page_sha256=EXCLUDED.page_sha256,
                                   page_object_key=EXCLUDED.page_object_key,
                                   client_upload_id=EXCLUDED.client_upload_id,
@@ -644,7 +645,7 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                     SELECT queue_id
                     FROM auditcore.p2_document_queue
                     WHERE tenant_id=:tenant_id AND batch_id=:batch_id
-                      AND page_number=:page_number
+                      AND page_number=:page_number AND unit_kind='PAGE'
                     """
                 ),
                 {
@@ -674,7 +675,9 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                 """
                 UPDATE auditcore.p2_upload_batches
                 SET sha256=:sha256, page_count=:page_count,
-                    batch_status='PROCESSING', updated_at_utc=now()
+                    batch_status='PROCESSING',
+                    grouping_status=CASE WHEN :page_count > 1 THEN 'PENDING' ELSE 'NOT_NEEDED' END,
+                    updated_at_utc=now()
                 WHERE tenant_id=:tenant_id AND batch_id=:batch_id
                 """
             ),
@@ -757,6 +760,7 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
                 """
                 SELECT q.queue_id, q.batch_id, q.page_number, q.page_object_key,
                        q.client_upload_id, q.di_document_id, q.queue_status,
+                       q.unit_kind, q.page_numbers, q.candidate_override,
                        b.original_filename, b.content_type AS original_content_type,
                        b.uploaded_by_actor_id
                 FROM auditcore.p2_document_queue q
@@ -786,11 +790,18 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
     storage = get_p2_document_storage()
     page_payload = storage.get_object(str(row["page_object_key"]))
     context_ref, token, candidates, requirement_refs = _di_context_and_requirements(engine, work)
+    # A grouped document was already classified page by page: submit it with
+    # exactly that type so DI extracts the whole document as one.
+    override = [str(key) for key in (row["candidate_override"] or [])]
     v2_client = get_di_capture_v2_client()
     content_type = "application/pdf" if str(row["page_object_key"]).endswith(".pdf") else str(row["original_content_type"] or "application/octet-stream")
     filename = (
         f"{str(row['original_filename']).rsplit('.', 1)[0]}"
-        f"-page-{int(row['page_number']):03d}.pdf"
+        + (
+            f"-pages-{'-'.join(f'{int(n):03d}' for n in row['page_numbers'])}.pdf"
+            if row["unit_kind"] == "GROUP"
+            else f"-page-{int(row['page_number']):03d}.pdf"
+        )
         if content_type == "application/pdf"
         else str(row["original_filename"])
     )
@@ -800,8 +811,10 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
         tenant_id=work.tenant_id,
         external_context_ref=context_ref,
         phase="BOOKING",
-        candidate_document_type_keys=candidates,
-        requirement_refs_by_document_type_key=requirement_refs,
+        candidate_document_type_keys=override or candidates,
+        requirement_refs_by_document_type_key=(
+            {k: v for k, v in requirement_refs.items() if k in override} if override else requirement_refs
+        ),
         files=[{
             "clientUploadId": str(row["client_upload_id"]),
             "filename": filename,
@@ -962,12 +975,24 @@ def _reconcile_delay(oldest_submitted: datetime | None, now: datetime) -> int:
     return 15
 
 
-def _journey_reconcile(engine: Engine, work: WorkItem) -> None:
-    """Reconcile every in-flight page of one Journey with a single DI listing.
+# Pages that have not yet been classified by DI; grouping waits for them.
+_PAGE_UNCLASSIFIED_STATES = (
+    "QUEUED", "PREPARING_PAGE", "DI_UPLOAD_PREPARING", "DI_UPLOADING",
+    "DI_FINALIZING", "CLASSIFYING", "RETRY_WAIT",
+)
+# Keep re-voiding a merged fragment for a while: a late DI document-link may
+# still land after the fragment was retired.
+_FRAGMENT_WATCH_MINUTES = 30
 
-    1. short read: which pages are waiting on DI
-    2. DI listing for both phases (no transaction open)
-    3. short write: apply classification, settle pages, request recompute
+
+def _journey_reconcile(engine: Engine, work: WorkItem) -> None:
+    """Reconcile every in-flight unit of one Journey with a single DI listing.
+
+    1. short read: units waiting on DI, merged fragments to retire, batches
+       awaiting page grouping
+    2. DI listing for both phases + fragment deletes (no transaction open)
+    3. short write: apply classification, settle units, void fragment
+       evidence, start grouping, request recompute
     """
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
@@ -988,21 +1013,65 @@ def _journey_reconcile(engine: Engine, work: WorkItem) -> None:
                 "states": list(_PAGE_RECONCILE_STATES),
             },
         ).mappings().all()
-    if not pending:
+        fragments = connection.execute(
+            text(
+                """
+                SELECT queue_id, di_document_id, retired_at_utc
+                FROM auditcore.p2_document_queue
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND queue_status='MERGED' AND di_document_id IS NOT NULL
+                  AND (retired_at_utc IS NULL
+                       OR retired_at_utc > now() - (:watch * interval '1 minute'))
+                """
+            ),
+            {"tenant_id": work.tenant_id, "journey_id": work.journey_id, "watch": _FRAGMENT_WATCH_MINUTES},
+        ).mappings().all()
+        grouping_due = connection.execute(
+            text(
+                """
+                SELECT b.batch_id
+                FROM auditcore.p2_upload_batches b
+                WHERE b.tenant_id=:tenant_id AND b.journey_id=:journey_id
+                  AND b.grouping_status='PENDING'
+                """
+            ),
+            {"tenant_id": work.tenant_id, "journey_id": work.journey_id},
+        ).scalars().all()
+    if not pending and not fragments and not grouping_due:
         return
 
-    context_ref, token, _, _ = _di_context_and_requirements(engine, work)
-    v2_client = get_di_capture_v2_client()
     di_documents: dict[str, dict[str, Any]] = {}
-    for phase in ("BOOKING", "DELIVERY"):
-        listing = v2_client.list_documents(
-            token=token,
-            tenant_id=work.tenant_id,
-            external_context_ref=context_ref,
-            phase=phase,
-        )
-        for item in listing.get("documents") or []:
-            di_documents.setdefault(str(item.get("documentId")), item)
+    if pending or fragments:
+        context_ref, token, _, _ = _di_context_and_requirements(engine, work)
+        v2_client = get_di_capture_v2_client()
+        for phase in ("BOOKING", "DELIVERY"):
+            listing = v2_client.list_documents(
+                token=token,
+                tenant_id=work.tenant_id,
+                external_context_ref=context_ref,
+                phase=phase,
+            )
+            for item in listing.get("documents") or []:
+                di_documents.setdefault(str(item.get("documentId")), item)
+        for fragment in fragments:
+            if str(fragment["di_document_id"]) in di_documents:
+                try:
+                    v2_client.delete_document(
+                        token=token,
+                        tenant_id=work.tenant_id,
+                        external_context_ref=context_ref,
+                        document_id=str(fragment["di_document_id"]),
+                    )
+                    di_documents.pop(str(fragment["di_document_id"]), None)
+                except Exception:
+                    # The original upload is retained and the fragment's
+                    # evidence is voided below either way; retry next poll.
+                    logger.warning(
+                        "p2_fragment_di_delete_failed",
+                        tenant_id=work.tenant_id,
+                        di_document_id=str(fragment["di_document_id"]),
+                        exc_info=True,
+                    )
 
     now = datetime.now(UTC)
     still_waiting = False
@@ -1011,15 +1080,16 @@ def _journey_reconcile(engine: Engine, work: WorkItem) -> None:
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
         _owned(connection, work)
-        apply_di_classification(
-            connection,
-            tenant_id=work.tenant_id,
-            journey_id=work.journey_id,
-            di_documents=list(di_documents.values()),
-            actor_id=str(work.payload.get("uploadedBy") or "SYSTEM"),
-            actor_role=str(work.payload.get("uploadedByRole") or "PC"),
-            correlation_id=work.correlation_id or "",
-        )
+        if di_documents:
+            apply_di_classification(
+                connection,
+                tenant_id=work.tenant_id,
+                journey_id=work.journey_id,
+                di_documents=list(di_documents.values()),
+                actor_id=str(work.payload.get("uploadedBy") or "SYSTEM"),
+                actor_role=str(work.payload.get("uploadedByRole") or "PC"),
+                correlation_id=work.correlation_id or "",
+            )
         for page in pending:
             outcome = _reconcile_page(
                 connection,
@@ -1035,6 +1105,13 @@ def _journey_reconcile(engine: Engine, work: WorkItem) -> None:
                 submitted = page["di_submitted_at_utc"] or page["created_at_utc"]
                 if oldest_waiting is None or submitted < oldest_waiting:
                     oldest_waiting = submitted
+        if fragments:
+            facts_changed = _retire_fragments(connection, work=work, fragments=list(fragments)) or facts_changed
+            still_waiting = still_waiting or any(f["retired_at_utc"] is None for f in fragments)
+        for batch_id in grouping_due:
+            if _start_grouping_when_classified(connection, work=work, batch_id=UUID(str(batch_id))):
+                continue
+            still_waiting = True
         if facts_changed:
             note_facts_changed(
                 connection,
@@ -1048,6 +1125,276 @@ def _journey_reconcile(engine: Engine, work: WorkItem) -> None:
         raise RescheduleWork(
             "Waiting for Document Intelligence to finish processing.",
             delay_seconds=_reconcile_delay(oldest_waiting, now),
+        )
+
+
+def _start_grouping_when_classified(connection, *, work: WorkItem, batch_id: UUID) -> bool:
+    """Queue BATCH_GROUP once every page of the batch has a classification.
+    Returns True when grouping was started."""
+    unclassified = connection.execute(
+        text(
+            """
+            SELECT COUNT(*) FROM auditcore.p2_document_queue
+            WHERE tenant_id=:tenant_id AND batch_id=:batch_id AND unit_kind='PAGE'
+              AND queue_status = ANY(:states)
+            """
+        ),
+        {"tenant_id": work.tenant_id, "batch_id": batch_id, "states": list(_PAGE_UNCLASSIFIED_STATES)},
+    ).scalar_one()
+    if unclassified:
+        return False
+    started = connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_upload_batches
+            SET grouping_status='GROUPING', updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND batch_id=:batch_id AND grouping_status='PENDING'
+            RETURNING batch_id
+            """
+        ),
+        {"tenant_id": work.tenant_id, "batch_id": batch_id},
+    ).scalar_one_or_none()
+    if started is not None:
+        _enqueue(
+            connection,
+            tenant_id=work.tenant_id,
+            journey_id=work.journey_id,
+            work_type="BATCH_GROUP",
+            work_key=str(batch_id),
+            payload=work.payload,
+            correlation_id=work.correlation_id,
+        )
+    return True
+
+
+def _retire_fragments(connection, *, work: WorkItem, fragments: list[dict[str, Any]]) -> bool:
+    """Void evidence of pages merged into a grouped document. Idempotent."""
+    stages: set[str] = set()
+    for fragment in fragments:
+        voided = connection.execute(
+            text(
+                """
+                UPDATE auditcore.evidence
+                SET association_status='VOIDED',
+                    void_reason='P2_MERGED_INTO_DOCUMENT',
+                    voided_at_utc=now()
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND di_document_id=:document_id AND association_status='ACTIVE'
+                RETURNING process_area
+                """
+            ),
+            {
+                "tenant_id": work.tenant_id,
+                "journey_id": work.journey_id,
+                "document_id": fragment["di_document_id"],
+            },
+        ).scalars().all()
+        stages.update(str(stage or "BOOKING").upper() for stage in voided)
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.document_capture_v2_documents
+                SET capture_status='SUPERSEDED', updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND di_document_id=:document_id AND capture_status <> 'SUPERSEDED'
+                """
+            ),
+            {
+                "tenant_id": work.tenant_id,
+                "journey_id": work.journey_id,
+                "document_id": fragment["di_document_id"],
+            },
+        )
+        if fragment["retired_at_utc"] is None:
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.p2_document_queue SET retired_at_utc=now(), updated_at_utc=now()
+                    WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+                    """
+                ),
+                {"tenant_id": work.tenant_id, "queue_id": fragment["queue_id"]},
+            )
+    for stage in sorted(stages):
+        _rematerialize_stage(connection, tenant_id=work.tenant_id, journey_id=work.journey_id, stage_code=stage)
+    return bool(stages)
+
+
+def _group_batch(engine: Engine, work: WorkItem) -> None:
+    """Combine classified pages of one upload into business documents."""
+    batch_id = UUID(work.work_key)
+    registry = get_registry()
+    with engine.begin() as connection:
+        set_tenant_context(connection, work.tenant_id)
+        batch = connection.execute(
+            text(
+                """
+                SELECT batch_id, grouping_status, original_filename
+                FROM auditcore.p2_upload_batches
+                WHERE tenant_id=:tenant_id AND batch_id=:batch_id
+                """
+            ),
+            {"tenant_id": work.tenant_id, "batch_id": batch_id},
+        ).mappings().one()
+        if batch["grouping_status"] not in {"GROUPING", "PENDING"}:
+            return
+        pages = connection.execute(
+            text(
+                """
+                SELECT queue_id, page_number, classified_document_type, business_stage,
+                       queue_status, page_object_key
+                FROM auditcore.p2_document_queue
+                WHERE tenant_id=:tenant_id AND batch_id=:batch_id
+                  AND unit_kind='PAGE' AND queue_status <> 'MERGED'
+                ORDER BY page_number
+                """
+            ),
+            {"tenant_id": work.tenant_id, "batch_id": batch_id},
+        ).mappings().all()
+
+    by_number = {int(page["page_number"]): dict(page) for page in pages}
+    plan = plan_documents(
+        [
+            PageFact(
+                page_number=int(page["page_number"]),
+                di_type=(
+                    page["classified_document_type"]
+                    if page["queue_status"] not in {"SUPPORTING", "FAILED", "DEAD_LETTER", "CANCELLED"}
+                    else None
+                ),
+                status=str(page["queue_status"]),
+                stage=page["business_stage"],
+            )
+            for page in pages
+        ],
+        registry,
+    )
+    grouped = [document for document in plan if document.is_multi_page]
+
+    storage = get_p2_document_storage()
+    merged_keys: dict[tuple[int, ...], tuple[str, str]] = {}
+    for document in grouped:
+        payload = merge_pdf_pages(
+            [storage.get_object(str(by_number[n]["page_object_key"])) for n in document.page_numbers]
+        )
+        digest = hashlib.sha256(payload).hexdigest()
+        label = "-".join(f"{n:04d}" for n in document.page_numbers)
+        key = (
+            f"p2-documents/{work.tenant_id}/{work.journey_id}/{batch_id}/groups/"
+            f"{label}-{digest[:12]}.pdf"
+        )
+        storage.put_object(key, payload, content_type="application/pdf")
+        merged_keys[document.page_numbers] = (key, digest)
+
+    with engine.begin() as connection:
+        set_tenant_context(connection, work.tenant_id)
+        _owned(connection, work)
+        summary = []
+        for document in grouped:
+            key, digest = merged_keys[document.page_numbers]
+            first = by_number[document.page_numbers[0]]
+            template = registry.document(document.template_key)
+            client_upload_id = f"p2g-{batch_id}-{'-'.join(map(str, document.page_numbers))}-{digest[:12]}"
+            group_id = connection.execute(
+                text(
+                    """
+                    INSERT INTO auditcore.p2_document_queue (
+                        tenant_id, batch_id, journey_id, page_number, page_numbers,
+                        page_sha256, page_object_key, client_upload_id, queue_status,
+                        unit_kind, group_source, candidate_override, classified_document_type,
+                        template_key, business_stage, correlation_id
+                    ) VALUES (
+                        :tenant_id, :batch_id, :journey_id, :first_page, :page_numbers,
+                        :digest, :object_key, :client_upload_id, 'QUEUED',
+                        'GROUP', 'SYSTEM', CAST(:candidates AS jsonb), :di_type,
+                        :template_key, :stage, :correlation_id
+                    )
+                    ON CONFLICT (tenant_id, batch_id, page_numbers)
+                      WHERE unit_kind='GROUP' AND queue_status <> 'CANCELLED'
+                    DO NOTHING
+                    RETURNING queue_id
+                    """
+                ),
+                {
+                    "tenant_id": work.tenant_id,
+                    "batch_id": batch_id,
+                    "journey_id": work.journey_id,
+                    "first_page": document.page_numbers[0],
+                    "page_numbers": list(document.page_numbers),
+                    "digest": digest,
+                    "object_key": key,
+                    "client_upload_id": client_upload_id,
+                    "candidates": json.dumps([document.di_type] if document.di_type else []),
+                    "di_type": document.di_type,
+                    "template_key": template.key,
+                    "stage": first["business_stage"],
+                    "correlation_id": work.correlation_id,
+                },
+            ).scalar_one_or_none()
+            if group_id is None:
+                group_id = connection.execute(
+                    text(
+                        """
+                        SELECT queue_id FROM auditcore.p2_document_queue
+                        WHERE tenant_id=:tenant_id AND batch_id=:batch_id AND unit_kind='GROUP'
+                          AND page_numbers=:page_numbers AND queue_status <> 'CANCELLED'
+                        """
+                    ),
+                    {"tenant_id": work.tenant_id, "batch_id": batch_id, "page_numbers": list(document.page_numbers)},
+                ).scalar_one()
+            pages_label = ", ".join(str(n) for n in document.page_numbers)
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.p2_document_queue
+                    SET queue_status='MERGED', merged_into_queue_id=:group_id,
+                        status_reason=:reason, updated_at_utc=now()
+                    WHERE tenant_id=:tenant_id AND batch_id=:batch_id AND unit_kind='PAGE'
+                      AND page_number = ANY(:page_numbers) AND queue_status <> 'MERGED'
+                    """
+                ),
+                {
+                    "tenant_id": work.tenant_id,
+                    "batch_id": batch_id,
+                    "group_id": group_id,
+                    "page_numbers": list(document.page_numbers),
+                    "reason": f"Combined into {template.display_name} (pages {pages_label}).",
+                },
+            )
+            _enqueue(
+                connection,
+                tenant_id=work.tenant_id,
+                journey_id=work.journey_id,
+                work_type="DOCUMENT_INGEST",
+                work_key=str(group_id),
+                payload={**work.payload, "queueId": str(group_id), "batchId": str(batch_id)},
+                correlation_id=work.correlation_id,
+            )
+            summary.append({"template": template.key, "pages": list(document.page_numbers)})
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_upload_batches
+                SET grouping_status='GROUPED', grouped_at_utc=now(), updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND batch_id=:batch_id
+                """
+            ),
+            {"tenant_id": work.tenant_id, "batch_id": batch_id},
+        )
+        _refresh_batch_status(connection, work.tenant_id, batch_id)
+        record_activity(
+            connection,
+            tenant_id=work.tenant_id,
+            journey_id=work.journey_id,
+            event_type="DOCUMENTS_GROUPED",
+            subject_type="UPLOAD_BATCH",
+            subject_id=str(batch_id),
+            details={
+                "pageCount": len(pages),
+                "documentCount": len(plan),
+                "grouped": summary,
+            },
+            correlation_id=work.correlation_id,
         )
 
 
@@ -1351,7 +1698,7 @@ def _refresh_batch_status(connection, tenant_id: str, batch_id: UUID) -> None:
     counts = connection.execute(
         text(
             """
-            SELECT COUNT(*) FILTER (WHERE queue_status <> 'CANCELLED') AS total,
+            SELECT COUNT(*) FILTER (WHERE queue_status NOT IN ('CANCELLED','MERGED')) AS total,
                    COUNT(*) FILTER (WHERE queue_status IN ('READY','SUPPORTING','NEEDS_REVIEW')) AS usable,
                    COUNT(*) FILTER (WHERE queue_status IN ('FAILED','DEAD_LETTER')) AS failed
             FROM auditcore.p2_document_queue
@@ -1850,6 +2197,7 @@ def process_work(engine: Engine, work: WorkItem) -> None:
         "DOCUMENT_INGEST": _ingest_document,
         "DOCUMENT_RECONCILE": _legacy_document_reconcile,
         "JOURNEY_RECONCILE": _journey_reconcile,
+        "BATCH_GROUP": _group_batch,
         "STAGE_RECOMPUTE": _stage_recompute,
         "TASK_VERIFY": _task_verify,
         "CONTROL_EVALUATE": _control_evaluate,

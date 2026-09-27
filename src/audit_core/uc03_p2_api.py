@@ -876,7 +876,8 @@ def get_upload_batch_status(
         text(
             """
             SELECT batch_id, original_filename, content_type, size_bytes,
-                   sha256, page_count, batch_status, created_at_utc, updated_at_utc
+                   sha256, page_count, batch_status, grouping_status,
+                   created_at_utc, updated_at_utc
             FROM auditcore.p2_upload_batches
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
               AND batch_id=:batch_id
@@ -943,7 +944,8 @@ def list_documents(
         text(
             """
             SELECT batch_id, original_filename, content_type, size_bytes,
-                   sha256, page_count, batch_status, created_at_utc, updated_at_utc
+                   sha256, page_count, batch_status, grouping_status,
+                   created_at_utc, updated_at_utc
             FROM auditcore.p2_upload_batches
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
             ORDER BY created_at_utc DESC
@@ -957,7 +959,8 @@ def list_documents(
             SELECT queue_id, batch_id, page_number, client_upload_id,
                    di_document_id, classified_document_type, business_stage,
                    queue_status, status_reason, template_key, attempt_count,
-                   extracted_field_count, last_error, created_at_utc, updated_at_utc
+                   extracted_field_count, last_error, created_at_utc, updated_at_utc,
+                   unit_kind, page_numbers, merged_into_queue_id, group_source
             FROM auditcore.p2_document_queue
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
             ORDER BY created_at_utc DESC, page_number
@@ -975,6 +978,11 @@ def list_documents(
             if item.get("template_key")
             else None
         )
+        item["unitKind"] = item.pop("unit_kind")
+        item["pageNumbers"] = list(item.pop("page_numbers") or [item["page_number"]])
+        merged_into = item.pop("merged_into_queue_id")
+        item["mergedIntoQueueId"] = str(merged_into) if merged_into else None
+        item["groupSource"] = item.pop("group_source")
         item["templateKey"] = template.key if template else None
         item["displayName"] = template.display_name if template else None
         item["requirement"] = template.requirement if template else None
@@ -989,7 +997,15 @@ def list_documents(
         item = dict(batch)
         batch_key = str(item.pop("batch_id"))
         item["batchId"] = batch_key
-        item["pages"] = by_batch.get(batch_key, [])
+        units = by_batch.get(batch_key, [])
+        # Documents first (grouped units and ungrouped pages); merged pages are
+        # listed under their document for page-level detail on demand.
+        item["pages"] = units
+        item["documents"] = [
+            {**unit, "memberPages": [u for u in units if u["mergedIntoQueueId"] == unit["queueId"]]}
+            for unit in units
+            if unit["queue_status"] != "MERGED"
+        ]
         result.append(item)
     evidence_rows = connection.execute(
         text(

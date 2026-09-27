@@ -575,6 +575,7 @@ document_types:
       shape: MULTI_PAGE
       max_pages: 8
       group: ADJACENT
+      absorb_unknown: true
     extraction:
       di_schema: DEDICATED
       di_schema_version: '1.1'
@@ -713,6 +714,7 @@ document_types:
       shape: MULTI_PAGE
       max_pages: 12
       group: ADJACENT
+      absorb_unknown: true
     extraction:
       di_schema: DEDICATED
       di_schema_version: '1.0'
@@ -960,6 +962,7 @@ document_types:
       shape: MULTI_PAGE
       max_pages: 30
       group: ADJACENT
+      absorb_unknown: true
     extraction:
       di_schema: DEDICATED
       di_schema_version: '1.1'
@@ -1136,9 +1139,7 @@ document_types:
     condition: null
     accepted_early: true
     pages:
-      shape: MULTI_PAGE
-      max_pages: 10
-      group: ADJACENT
+      shape: SINGLE
     extraction:
       di_schema: NONE
       di_schema_version: null

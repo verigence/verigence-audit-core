@@ -47,6 +47,7 @@ class PageRule:
     shape: str
     max_pages: int
     group: str
+    absorb_unknown: bool = False
 
 
 @dataclass(frozen=True)
@@ -239,6 +240,7 @@ def build_registry(
                 shape=str(pages.get("shape", "SINGLE")),
                 max_pages=int(pages.get("max_pages", 1)),
                 group=str(pages.get("group", "ADJACENT")),
+                absorb_unknown=bool(pages.get("absorb_unknown", False)),
             ),
             di_schema=str(extraction.get("di_schema", "FALLBACK")),
             di_schema_version=extraction.get("di_schema_version"),
