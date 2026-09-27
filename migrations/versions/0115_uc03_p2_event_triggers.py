@@ -139,6 +139,37 @@ def upgrade() -> None:
 
         GRANT EXECUTE ON FUNCTION auditcore.p2_request_stage_recompute(varchar, uuid)
           TO audit_core_runtime;
+
+        INSERT INTO auditcore.p2_journey_runtime (
+            tenant_id, journey_id, fact_version
+        )
+        SELECT j.tenant_id, j.journey_id, 1
+        FROM auditcore.journeys j
+        ON CONFLICT (tenant_id, journey_id) DO NOTHING;
+
+        INSERT INTO auditcore.p2_work_queue (
+            tenant_id, journey_id, work_type, work_key,
+            payload, requested_version, work_status
+        )
+        SELECT
+            j.tenant_id,
+            j.journey_id,
+            'STAGE_RECOMPUTE',
+            'booking:' || j.journey_id::text,
+            jsonb_build_object('stage', 'BOOKING'),
+            1,
+            'PENDING'
+        FROM auditcore.journeys j
+        ON CONFLICT (tenant_id, work_type, work_key)
+        DO UPDATE SET requested_version=GREATEST(
+                          COALESCE(auditcore.p2_work_queue.requested_version,0), 1
+                      ),
+                      work_status=CASE
+                        WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
+                          THEN auditcore.p2_work_queue.work_status
+                        ELSE 'PENDING'
+                      END,
+                      updated_at_utc=now();
         """
     )
 
