@@ -573,6 +573,75 @@ def finalize_upload(
     return {"batchId": str(batch_id), "status": "UPLOADED"}
 
 
+
+@router.get("/journeys/{journey_id}/uploads/{batch_id}")
+def get_upload_batch_status(
+    tenant_id: str,
+    journey_id: UUID,
+    batch_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    _authorize(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        permission_key=_READ_PERMISSION,
+    )
+    batch = connection.execute(
+        text(
+            """
+            SELECT batch_id, original_filename, content_type, size_bytes,
+                   sha256, page_count, batch_status, created_at_utc, updated_at_utc
+            FROM auditcore.p2_upload_batches
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND batch_id=:batch_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "batch_id": batch_id,
+        },
+    ).mappings().one_or_none()
+    if batch is None:
+        raise HTTPException(status_code=404, detail="Upload batch was not found.")
+    pages = connection.execute(
+        text(
+            """
+            SELECT queue_id, page_number, client_upload_id,
+                   di_document_id, classified_document_type, business_stage,
+                   queue_status, attempt_count, extracted_field_count,
+                   last_error, created_at_utc, updated_at_utc
+            FROM auditcore.p2_document_queue
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND batch_id=:batch_id
+            ORDER BY page_number
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "batch_id": batch_id,
+        },
+    ).mappings().all()
+    result = dict(batch)
+    result["batchId"] = str(result.pop("batch_id"))
+    result["pages"] = []
+    for raw in pages:
+        page = dict(raw)
+        page["queueId"] = str(page.pop("queue_id"))
+        if page.get("di_document_id") is not None:
+            page["diDocumentId"] = str(page.pop("di_document_id"))
+        result["pages"].append(page)
+    return {"journeyId": str(journey_id), "batch": result}
+
+
 @router.get("/journeys/{journey_id}/documents")
 def list_documents(
     tenant_id: str,
@@ -634,7 +703,43 @@ def list_documents(
         item["batchId"] = batch_key
         item["pages"] = by_batch.get(batch_key, [])
         result.append(item)
-    return {"journeyId": str(journey_id), "batches": result}
+    evidence_rows = connection.execute(
+        text(
+            """
+            SELECT e.evidence_id, e.di_document_id, e.document_type_key,
+                   e.process_area, e.association_status, e.supersedes_evidence_id,
+                   e.processing_status_cache, e.verification_status_cache,
+                   e.confirmation_status_cache, e.linked_at_utc,
+                   d.original_filename
+            FROM auditcore.evidence e
+            LEFT JOIN auditcore.document_capture_v2_documents d
+              ON d.tenant_id=e.tenant_id
+             AND d.journey_id=e.journey_id
+             AND d.di_document_id=e.di_document_id
+            WHERE e.tenant_id=:tenant_id AND e.journey_id=:journey_id
+              AND e.association_status IN ('ACTIVE','SUPERSEDED')
+            ORDER BY e.linked_at_utc DESC, e.evidence_id DESC
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    documents = []
+    for raw in evidence_rows:
+        doc = dict(raw)
+        doc["evidenceId"] = str(doc.pop("evidence_id"))
+        doc["documentId"] = str(doc.pop("di_document_id"))
+        if doc.get("supersedes_evidence_id") is not None:
+            doc["supersedesEvidenceId"] = str(doc.pop("supersedes_evidence_id"))
+        else:
+            doc.pop("supersedes_evidence_id", None)
+            doc["supersedesEvidenceId"] = None
+        documents.append(doc)
+
+    return {
+        "journeyId": str(journey_id),
+        "batches": result,
+        "documents": documents,
+    }
 
 
 @router.get("/journeys/{journey_id}/events")
