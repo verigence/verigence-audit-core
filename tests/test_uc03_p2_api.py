@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 import pytest
+from conftest import delete_tenant_data
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
@@ -15,7 +16,6 @@ from audit_core.security_authorization import (
     SecurityAuthorizationDecision,
     get_security_authorization_client,
 )
-from conftest import delete_tenant_data
 
 
 @dataclass
