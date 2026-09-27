@@ -1,23 +1,24 @@
 """Isolated UC03 Phase 2 HTTP API.
 
-All endpoints are additive under /p2/v1. Existing UC03 routes remain unchanged.
-Security remains the sole authorization authority: Phase 2 performs one
-Security permission decision and does not repeat the legacy DB-backed
-business_assignments authorization path.
+Everything here is additive under /p2/v1. Existing UC03 APIs stay unchanged.
+
+Key runtime rules:
+- browser uploads directly to existing S3-compatible Audit Core storage
+- Audit Core only acknowledges after the object exists and a durable work row is committed
+- PDF splitting, DI submission, reconciliation, rule/task verification are worker work
+- Security is the single authorization authority for P2 routes
 """
 from __future__ import annotations
 
-import hashlib
-import io
 import json
 import os
+import re
 from datetime import datetime
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from pypdf import PdfReader, PdfWriter
 from sqlalchemy import Connection, text
 
 from audit_core.authorization import AuthorizationError
@@ -32,6 +33,10 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_p2_stage import recompute_booking_stage
+from audit_core.uc03_p2_storage import (
+    P2DocumentStorageError,
+    get_p2_document_storage,
+)
 from audit_core.uc03_p2_tasks import create_p2_task, submit_action
 
 router = APIRouter(
@@ -42,7 +47,11 @@ router = APIRouter(
 _READ_PERMISSION = "audit.journey.read"
 _UPDATE_PERMISSION = "audit.journey.update"
 _DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
-_DEFAULT_MAX_PDF_PAGES = 100
+_ALLOWED_CONTENT_TYPES = {
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+}
 
 
 def _authorize(
@@ -72,16 +81,17 @@ def _authorize(
         )
     set_tenant_context(connection, tenant_id)
     if journey_id is not None:
-        found = connection.execute(
+        exists = connection.execute(
             text(
                 """
-                SELECT 1 FROM auditcore.journeys
+                SELECT 1
+                FROM auditcore.journeys
                 WHERE tenant_id=:tenant_id AND journey_id=:journey_id
                 """
             ),
             {"tenant_id": tenant_id, "journey_id": journey_id},
         ).scalar_one_or_none()
-        if found is None:
+        if exists is None:
             raise NotFoundError(
                 error_code="VAC-NF-005",
                 title="Journey not found",
@@ -90,39 +100,10 @@ def _authorize(
     return decision.role_key or "USER"
 
 
-def _split_pages(payload: bytes, *, content_type: str | None, filename: str) -> list[bytes]:
-    is_pdf = (content_type or "").lower() == "application/pdf" or filename.lower().endswith(".pdf")
-    if not is_pdf:
-        return [payload]
-
-    try:
-        reader = PdfReader(io.BytesIO(payload))
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"{filename}: PDF could not be read.") from exc
-    if reader.is_encrypted:
-        try:
-            reader.decrypt("")
-        except Exception as exc:
-            raise HTTPException(status_code=422, detail=f"{filename}: encrypted PDF is not supported.") from exc
-
-    page_count = len(reader.pages)
-    max_pages = int(os.environ.get("P2_MAX_PDF_PAGES", str(_DEFAULT_MAX_PDF_PAGES)))
-    if page_count < 1:
-        raise HTTPException(status_code=422, detail=f"{filename}: PDF contains no pages.")
-    if page_count > max_pages:
-        raise HTTPException(
-            status_code=413,
-            detail=f"{filename}: PDF contains {page_count} pages; maximum is {max_pages}.",
-        )
-
-    pages: list[bytes] = []
-    for page in reader.pages:
-        writer = PdfWriter()
-        writer.add_page(page)
-        output = io.BytesIO()
-        writer.write(output)
-        pages.append(output.getvalue())
-    return pages
+def _safe_filename(value: str) -> str:
+    name = value.strip() or "document"
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    return name[:180] or "document"
 
 
 def _activity(
@@ -134,7 +115,7 @@ def _activity(
     subject_type: str | None,
     subject_id: str | None,
     details: dict[str, Any],
-    correlation_id: str,
+    correlation_id: str | None,
 ) -> None:
     connection.execute(
         text(
@@ -160,19 +141,30 @@ def _activity(
     )
 
 
-@router.post("/journeys/{journey_id}/uploads")
-async def accept_uploads(
+class UploadInitFile(BaseModel):
+    filename: str = Field(min_length=1, max_length=500)
+    contentType: str = Field(min_length=1, max_length=160)
+    sizeBytes: int = Field(gt=0)
+    clientUploadId: str | None = Field(default=None, max_length=160)
+
+
+class UploadInitCommand(BaseModel):
+    files: list[UploadInitFile] = Field(min_length=1, max_length=50)
+
+
+@router.post("/journeys/{journey_id}/uploads:init")
+def init_uploads(
     tenant_id: str,
     journey_id: UUID,
+    command: UploadInitCommand,
     request: Request,
-    files: Annotated[list[UploadFile], File(...)],
     human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
     authorization_client: Annotated[
         SecurityAuthorizationClient, Depends(get_security_authorization_client)
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
-    role = _authorize(
+    _authorize(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
@@ -180,39 +172,57 @@ async def accept_uploads(
         authorization_client=authorization_client,
         permission_key=_UPDATE_PERMISSION,
     )
-    if not files:
-        raise HTTPException(status_code=422, detail="At least one file is required.")
-
     max_bytes = int(os.environ.get("P2_MAX_UPLOAD_BYTES", str(_DEFAULT_MAX_UPLOAD_BYTES)))
     correlation_id = get_correlation_id(request)
-    accepted: list[dict[str, Any]] = []
+    try:
+        storage = get_p2_document_storage()
+    except RuntimeError as exc:
+        raise DependencyUnavailableError(
+            detail="Phase 2 document storage is not configured."
+        ) from exc
 
-    for upload in files:
-        payload = await upload.read()
-        filename = upload.filename or "document"
-        if not payload:
-            raise HTTPException(status_code=422, detail=f"{filename}: file is empty.")
-        if len(payload) > max_bytes:
+    prepared: list[dict[str, Any]] = []
+    for item in command.files:
+        content_type = item.contentType.lower().strip()
+        if content_type not in _ALLOWED_CONTENT_TYPES:
+            raise HTTPException(
+                status_code=415,
+                detail=f"{item.filename}: unsupported content type {item.contentType}.",
+            )
+        if item.sizeBytes > max_bytes:
             raise HTTPException(
                 status_code=413,
-                detail=f"{filename}: file exceeds the {max_bytes // (1024 * 1024)} MB limit.",
+                detail=f"{item.filename}: file exceeds the {max_bytes // (1024 * 1024)} MB limit.",
             )
-
-        pages = _split_pages(payload, content_type=upload.content_type, filename=filename)
         batch_id = uuid4()
-        digest = hashlib.sha256(payload).hexdigest()
+        safe_name = _safe_filename(item.filename)
+        object_key = (
+            f"p2-documents/{tenant_id}/{journey_id}/{batch_id}/original/{safe_name}"
+        )
+        try:
+            upload_url = storage.presign_put(
+                object_key,
+                content_type=content_type,
+                expires_seconds=900,
+            )
+        except P2DocumentStorageError as exc:
+            raise DependencyUnavailableError(
+                detail="The document upload could not be prepared."
+            ) from exc
+
         connection.execute(
             text(
                 """
                 INSERT INTO auditcore.p2_upload_batches (
                     tenant_id, batch_id, journey_id, original_filename,
-                    content_type, size_bytes, sha256, page_count,
-                    original_payload, batch_status, uploaded_by_actor_id,
+                    content_type, size_bytes, page_count,
+                    original_object_key, batch_status, uploaded_by_actor_id,
                     correlation_id
                 ) VALUES (
                     :tenant_id, :batch_id, :journey_id, :filename,
-                    :content_type, :size_bytes, :sha256, :page_count,
-                    :payload, 'ACCEPTED', :actor_id, :correlation_id
+                    :content_type, :size_bytes, 0,
+                    :object_key, 'AWAITING_UPLOAD', :actor_id,
+                    :correlation_id
                 )
                 """
             ),
@@ -220,116 +230,159 @@ async def accept_uploads(
                 "tenant_id": tenant_id,
                 "batch_id": batch_id,
                 "journey_id": journey_id,
-                "filename": filename,
-                "content_type": upload.content_type,
-                "size_bytes": len(payload),
-                "sha256": digest,
-                "page_count": len(pages),
-                "payload": payload,
+                "filename": item.filename,
+                "content_type": content_type,
+                "size_bytes": item.sizeBytes,
+                "object_key": object_key,
                 "actor_id": human_principal.subject,
                 "correlation_id": correlation_id,
             },
         )
-
-        queued_pages: list[dict[str, Any]] = []
-        for page_number, page_payload in enumerate(pages, start=1):
-            queue_id = uuid4()
-            page_sha = hashlib.sha256(page_payload).hexdigest()
-            client_upload_id = f"p2-{batch_id}-{page_number}-{page_sha[:12]}"
-            connection.execute(
-                text(
-                    """
-                    INSERT INTO auditcore.p2_document_queue (
-                        tenant_id, queue_id, batch_id, journey_id,
-                        page_number, page_sha256, page_payload,
-                        client_upload_id, queue_status, correlation_id
-                    ) VALUES (
-                        :tenant_id, :queue_id, :batch_id, :journey_id,
-                        :page_number, :page_sha, :page_payload,
-                        :client_upload_id, 'QUEUED', :correlation_id
-                    )
-                    """
-                ),
-                {
-                    "tenant_id": tenant_id,
-                    "queue_id": queue_id,
-                    "batch_id": batch_id,
-                    "journey_id": journey_id,
-                    "page_number": page_number,
-                    "page_sha": page_sha,
-                    "page_payload": page_payload,
-                    "client_upload_id": client_upload_id,
-                    "correlation_id": correlation_id,
-                },
-            )
-            connection.execute(
-                text(
-                    """
-                    INSERT INTO auditcore.p2_work_queue (
-                        tenant_id, journey_id, work_type, work_key,
-                        payload, work_status, correlation_id
-                    ) VALUES (
-                        :tenant_id, :journey_id, 'DOCUMENT_INGEST', :work_key,
-                        CAST(:payload AS jsonb), 'PENDING', :correlation_id
-                    )
-                    ON CONFLICT (tenant_id, work_type, work_key) DO NOTHING
-                    """
-                ),
-                {
-                    "tenant_id": tenant_id,
-                    "journey_id": journey_id,
-                    "work_key": str(queue_id),
-                    "payload": json.dumps({
-                        "queueId": str(queue_id),
-                        "batchId": str(batch_id),
-                        "pageNumber": page_number,
-                        "sourceFilename": filename,
-                        "uploadedBy": human_principal.subject,
-                        "uploadedByRole": role,
-                    }),
-                    "correlation_id": correlation_id,
-                },
-            )
-            _activity(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                event_type="DOCUMENT_PAGE_QUEUED",
-                subject_type="DOCUMENT_PAGE",
-                subject_id=str(queue_id),
-                details={"batchId": str(batch_id), "pageNumber": page_number},
-                correlation_id=correlation_id,
-            )
-            queued_pages.append({
-                "queueId": str(queue_id),
-                "pageNumber": page_number,
-                "status": "QUEUED",
-            })
-
         _activity(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
-            event_type="UPLOAD_BATCH_ACCEPTED",
+            event_type="UPLOAD_INITIALIZED",
             subject_type="UPLOAD_BATCH",
             subject_id=str(batch_id),
             details={
-                "filename": filename,
-                "pageCount": len(pages),
-                "sizeBytes": len(payload),
-                "sha256": digest,
+                "filename": item.filename,
+                "contentType": content_type,
+                "sizeBytes": item.sizeBytes,
+                "clientUploadId": item.clientUploadId,
             },
             correlation_id=correlation_id,
         )
-        accepted.append({
-            "batchId": str(batch_id),
-            "filename": filename,
-            "pageCount": len(pages),
-            "status": "ACCEPTED",
-            "pages": queued_pages,
-        })
+        prepared.append(
+            {
+                "batchId": str(batch_id),
+                "clientUploadId": item.clientUploadId,
+                "filename": item.filename,
+                "uploadUrl": upload_url,
+                "uploadHeaders": {"Content-Type": content_type},
+                "expiresInSeconds": 900,
+            }
+        )
 
-    return {"journeyId": str(journey_id), "accepted": accepted}
+    return {"journeyId": str(journey_id), "uploads": prepared}
+
+
+@router.post("/journeys/{journey_id}/uploads/{batch_id}:finalize")
+def finalize_upload(
+    tenant_id: str,
+    journey_id: UUID,
+    batch_id: UUID,
+    request: Request,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    _authorize(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        permission_key=_UPDATE_PERMISSION,
+    )
+    batch = connection.execute(
+        text(
+            """
+            SELECT batch_id, original_filename, content_type, size_bytes,
+                   original_object_key, batch_status, uploaded_by_actor_id
+            FROM auditcore.p2_upload_batches
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND batch_id=:batch_id
+            FOR UPDATE
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "batch_id": batch_id,
+        },
+    ).mappings().one_or_none()
+    if batch is None:
+        raise HTTPException(status_code=404, detail="Upload batch was not found.")
+    if batch["batch_status"] in {"UPLOADED", "SPLITTING", "PROCESSING", "COMPLETED"}:
+        return {"batchId": str(batch_id), "status": str(batch["batch_status"])}
+
+    try:
+        metadata = get_p2_document_storage().head_object(str(batch["original_object_key"]))
+    except (RuntimeError, P2DocumentStorageError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="The uploaded object is not available yet. Retry finalize.",
+        ) from exc
+
+    expected_size = int(batch["size_bytes"])
+    actual_size = int(metadata["contentLength"])
+    if expected_size != actual_size:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Uploaded file size does not match the prepared upload "
+                f"({actual_size} vs {expected_size} bytes)."
+            ),
+        )
+
+    correlation_id = get_correlation_id(request)
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_upload_batches
+            SET batch_status='UPLOADED', updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND batch_id=:batch_id
+            """
+        ),
+        {"tenant_id": tenant_id, "batch_id": batch_id},
+    )
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.p2_work_queue (
+                tenant_id, journey_id, work_type, work_key,
+                payload, work_status, correlation_id
+            ) VALUES (
+                :tenant_id, :journey_id, 'SPLIT_BATCH', :work_key,
+                CAST(:payload AS jsonb), 'PENDING', :correlation_id
+            )
+            ON CONFLICT (tenant_id, work_type, work_key)
+            DO UPDATE SET work_status='PENDING',
+                          next_attempt_at_utc=NULL,
+                          last_error=NULL,
+                          updated_at_utc=now()
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "work_key": str(batch_id),
+            "payload": json.dumps(
+                {
+                    "batchId": str(batch_id),
+                    "uploadedBy": str(batch["uploaded_by_actor_id"]),
+                    "uploadedByRole": "PC",
+                }
+            ),
+            "correlation_id": correlation_id,
+        },
+    )
+    _activity(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        event_type="UPLOAD_ACCEPTED",
+        subject_type="UPLOAD_BATCH",
+        subject_id=str(batch_id),
+        details={
+            "filename": str(batch["original_filename"]),
+            "sizeBytes": actual_size,
+        },
+        correlation_id=correlation_id,
+    )
+    return {"batchId": str(batch_id), "status": "UPLOADED"}
 
 
 @router.get("/journeys/{journey_id}/documents")
@@ -400,13 +453,13 @@ def list_documents(
 def list_events(
     tenant_id: str,
     journey_id: UUID,
-    after: int = 0,
-    limit: int = 100,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)] = None,  # type: ignore[assignment]
+    after: int,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
     authorization_client: Annotated[
         SecurityAuthorizationClient, Depends(get_security_authorization_client)
-    ] = None,  # type: ignore[assignment]
-    connection: Annotated[Connection, Depends(get_connection)] = None,  # type: ignore[assignment]
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+    limit: int = 100,
 ) -> dict[str, Any]:
     _authorize(
         connection,
@@ -457,14 +510,19 @@ def stage_status(
         permission_key=_READ_PERMISSION,
     )
     booking = recompute_booking_stage(
-        connection, tenant_id=tenant_id, journey_id=journey_id,
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
     )
-    delivery = {
-        "completionState": "IN_PROGRESS",
-        "configuration": "PENDING_BUSINESS_RULES",
-        "gates": [],
+    return {
+        "journeyId": str(journey_id),
+        "booking": booking,
+        "delivery": {
+            "completionState": "IN_PROGRESS",
+            "configuration": "PENDING_BUSINESS_RULES",
+            "gates": [],
+        },
     }
-    return {"journeyId": str(journey_id), "booking": booking, "delivery": delivery}
 
 
 @router.get("/journeys/{journey_id}/overview")
@@ -486,15 +544,16 @@ def overview_summary(
         permission_key=_READ_PERMISSION,
     )
     booking = recompute_booking_stage(
-        connection, tenant_id=tenant_id, journey_id=journey_id,
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
     )
     header = connection.execute(
         text(
             """
             SELECT j.journey_id, j.created_at_utc, j.updated_at_utc,
                    c.display_name AS customer_name,
-                   d.dealer_name,
-                   o.outlet_name,
+                   d.dealer_name, o.outlet_name,
                    NULLIF(concat_ws(' · ',
                        NULLIF(jp.model_name_snapshot, ''),
                        NULLIF(jp.variant_name_snapshot, ''),
@@ -516,14 +575,18 @@ def overview_summary(
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().one()
 
-    doc_stats = connection.execute(
+    document_stats = connection.execute(
         text(
             """
             SELECT
               COUNT(*) FILTER (WHERE association_status='ACTIVE') AS total_active,
               COUNT(*) FILTER (WHERE association_status='SUPERSEDED') AS superseded,
-              COUNT(*) FILTER (WHERE association_status='ACTIVE' AND process_area='BOOKING') AS booking_docs,
-              COUNT(*) FILTER (WHERE association_status='ACTIVE' AND process_area='DELIVERY') AS delivery_docs
+              COUNT(*) FILTER (
+                WHERE association_status='ACTIVE' AND process_area='BOOKING'
+              ) AS booking_docs,
+              COUNT(*) FILTER (
+                WHERE association_status='ACTIVE' AND process_area='DELIVERY'
+              ) AS delivery_docs
             FROM auditcore.evidence
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
             """
@@ -531,57 +594,14 @@ def overview_summary(
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().one()
 
-    task_stats = connection.execute(
+    p2_upload = connection.execute(
         text(
             """
-            SELECT
-              COUNT(*) AS total,
-              COUNT(*) FILTER (WHERE task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED')) AS open,
-              COUNT(*) FILTER (WHERE task_status='VERIFIED_COMPLETE') AS completed,
-              COUNT(*) FILTER (WHERE due_at_utc < now()
-                AND task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED')) AS overdue
-            FROM auditcore.p2_tasks
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one()
-
-    finding_stats = connection.execute(
-        text(
-            """
-            SELECT
-              COUNT(*) FILTER (WHERE finding_status IN ('OPEN','ACKNOWLEDGED')) AS open,
-              COUNT(*) FILTER (WHERE finding_status='RESOLVED') AS resolved
-            FROM auditcore.audit_findings
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one()
-
-    payment_stats = connection.execute(
-        text(
-            """
-            SELECT
-              COALESCE(SUM(amount) FILTER (WHERE payment_stage='BOOKING'), 0) AS booking_total,
-              COALESCE(SUM(amount) FILTER (WHERE payment_stage='DELIVERY'), 0) AS delivery_total,
-              COUNT(*) FILTER (WHERE payment_stage='BOOKING') AS booking_receipts,
-              COUNT(*) FILTER (WHERE payment_stage='DELIVERY') AS delivery_receipts
-            FROM auditcore.payments
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one()
-
-    upload_stats = connection.execute(
-        text(
-            """
-            SELECT
-              COUNT(*) AS batches,
-              COALESCE(SUM(page_count),0) AS pages,
-              COUNT(*) FILTER (WHERE batch_status IN ('FAILED','PARTIAL_FAILURE')) AS failed_batches
+            SELECT COUNT(*) AS batches,
+                   COALESCE(SUM(page_count),0) AS pages,
+                   COUNT(*) FILTER (
+                     WHERE batch_status IN ('FAILED','PARTIAL_FAILURE')
+                   ) AS failed_batches
             FROM auditcore.p2_upload_batches
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
             """
@@ -589,14 +609,84 @@ def overview_summary(
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().one()
 
+    tasks = connection.execute(
+        text(
+            """
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (
+                     WHERE task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED')
+                   ) AS open,
+                   COUNT(*) FILTER (
+                     WHERE task_status='VERIFIED_COMPLETE'
+                   ) AS completed,
+                   COUNT(*) FILTER (
+                     WHERE due_at_utc < now()
+                       AND task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED')
+                   ) AS overdue
+            FROM auditcore.p2_tasks
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one()
+
+    findings = connection.execute(
+        text(
+            """
+            SELECT COUNT(*) FILTER (
+                     WHERE finding_status IN ('OPEN','ACKNOWLEDGED')
+                   ) AS open,
+                   COUNT(*) FILTER (
+                     WHERE finding_status='RESOLVED'
+                   ) AS resolved
+            FROM auditcore.audit_findings
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one()
+
+    payments = connection.execute(
+        text(
+            """
+            SELECT COALESCE(SUM(amount) FILTER (
+                     WHERE payment_stage='BOOKING'
+                   ),0) AS booking_total,
+                   COALESCE(SUM(amount) FILTER (
+                     WHERE payment_stage='DELIVERY'
+                   ),0) AS delivery_total,
+                   COUNT(*) FILTER (
+                     WHERE payment_stage='BOOKING'
+                   ) AS booking_receipts,
+                   COUNT(*) FILTER (
+                     WHERE payment_stage='DELIVERY'
+                   ) AS delivery_receipts
+            FROM auditcore.payments
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one()
+
+    def serializable(row: Any) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in dict(row).items():
+            if isinstance(value, UUID):
+                result[key] = str(value)
+            elif hasattr(value, "as_tuple"):
+                result[key] = str(value)
+            else:
+                result[key] = value
+        return result
+
     return {
-        "journey": {k: (str(v) if isinstance(v, UUID) else v) for k, v in dict(header).items()},
+        "journey": serializable(header),
         "stage": booking,
-        "documents": dict(doc_stats),
-        "uploads": dict(upload_stats),
-        "payments": {k: str(v) if hasattr(v, "as_tuple") else v for k, v in dict(payment_stats).items()},
-        "tasks": dict(task_stats),
-        "findings": dict(finding_stats),
+        "documents": serializable(document_stats),
+        "uploads": serializable(p2_upload),
+        "payments": serializable(payments),
+        "tasks": serializable(tasks),
+        "findings": serializable(findings),
     }
 
 
@@ -610,10 +700,18 @@ class HumanTaskCreate(BaseModel):
     assignedRoleCode: str = Field(min_length=1, max_length=80)
     assignedActorId: str | None = None
     dueAtUtc: datetime | None = None
-    allowedActions: list[str] = Field(default_factory=lambda: [
-        "REVIEW_DOCUMENT", "CORRECT_EXTRACTED_FIELD", "UPLOAD_DOCUMENT",
-        "ADD_EVIDENCE", "ADD_COMMENT", "PROVIDE_FEEDBACK", "COMPLETE_ACTION",
-    ])
+    allowedActions: list[str] = Field(
+        default_factory=lambda: [
+            "REVIEW_DOCUMENT",
+            "CORRECT_EXTRACTED_FIELD",
+            "UPLOAD_DOCUMENT",
+            "REUPLOAD_DOCUMENT",
+            "ADD_EVIDENCE",
+            "ADD_COMMENT",
+            "PROVIDE_FEEDBACK",
+            "COMPLETE_ACTION",
+        ]
+    )
     reference: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -636,8 +734,7 @@ def create_human_task(
         authorization_client=authorization_client,
         permission_key=_UPDATE_PERMISSION,
     )
-    task_id = uuid4()
-    dedupe_key = f"human:{task_id}"
+    unique = uuid4()
     created = create_p2_task(
         connection,
         tenant_id=tenant_id,
@@ -647,7 +744,7 @@ def create_human_task(
         origin_kind="HUMAN",
         source_type="HUMAN_ACTION",
         source_code=None,
-        dedupe_key=dedupe_key,
+        dedupe_key=f"human:{unique}",
         title=command.title,
         description=command.description,
         reference=command.reference,
@@ -667,13 +764,13 @@ def create_human_task(
 @router.get("/tasks")
 def list_tasks(
     tenant_id: str,
-    status: str | None = None,
-    journey_id: UUID | None = None,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)] = None,  # type: ignore[assignment]
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
     authorization_client: Annotated[
         SecurityAuthorizationClient, Depends(get_security_authorization_client)
-    ] = None,  # type: ignore[assignment]
-    connection: Annotated[Connection, Depends(get_connection)] = None,  # type: ignore[assignment]
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+    status: str | None = None,
+    journey_id: UUID | None = None,
 ) -> dict[str, Any]:
     _authorize(
         connection,
@@ -698,16 +795,24 @@ def list_tasks(
               AND (:journey_id IS NULL OR journey_id=:journey_id)
               AND (:status IS NULL OR task_status=:status)
             ORDER BY
-              CASE priority WHEN 'URGENT' THEN 1 WHEN 'HIGH' THEN 2
-                            WHEN 'NORMAL' THEN 3 ELSE 4 END,
+              CASE priority
+                WHEN 'URGENT' THEN 1
+                WHEN 'HIGH' THEN 2
+                WHEN 'NORMAL' THEN 3
+                ELSE 4
+              END,
               due_at_utc NULLS LAST,
               created_at_utc
             LIMIT 500
             """
         ),
-        {"tenant_id": tenant_id, "journey_id": journey_id, "status": status},
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "status": status,
+        },
     ).mappings().all()
-    items = []
+    items: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
         for key in ("task_id", "journey_id", "root_task_id", "parent_task_id"):
