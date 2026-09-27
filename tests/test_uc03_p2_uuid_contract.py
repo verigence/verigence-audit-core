@@ -3,6 +3,9 @@ import os
 import pytest
 from sqlalchemy import create_engine, text
 
+from audit_core import uc03_p2_api
+from audit_core.security import HumanPrincipal
+
 
 def test_p2_and_legacy_task_journey_ids_are_uuid_compatible() -> None:
     database_url = os.environ.get("DATABASE_URL")
@@ -41,5 +44,50 @@ def test_p2_and_legacy_task_journey_ids_are_uuid_compatible() -> None:
                     """
                 )
             ).all()
+    finally:
+        engine.dispose()
+
+
+
+def test_p2_task_queue_accepts_unfiltered_null_parameters(monkeypatch: pytest.MonkeyPatch) -> None:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for P2 Task Queue integration test")
+
+    engine = create_engine(database_url)
+    monkeypatch.setattr(uc03_p2_api, "_authorize", lambda *args, **kwargs: None)
+    try:
+        with engine.begin() as connection:
+            result = uc03_p2_api.list_tasks(
+                tenant_id="tenant-p2-empty-contract",
+                human_principal=HumanPrincipal(subject="actor-p2-contract"),
+                authorization_client=object(),
+                connection=connection,
+                status=None,
+                journey_id=None,
+            )
+            assert result["items"] == []
+    finally:
+        engine.dispose()
+
+
+def test_p2_journey_list_query_compiles_against_migrated_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for P2 Journey list integration test")
+
+    engine = create_engine(database_url)
+    monkeypatch.setattr(uc03_p2_api, "_authorize", lambda *args, **kwargs: None)
+    try:
+        with engine.begin() as connection:
+            result = uc03_p2_api.list_p2_journeys(
+                tenant_id="tenant-p2-empty-contract",
+                human_principal=HumanPrincipal(subject="actor-p2-contract"),
+                authorization_client=object(),
+                connection=connection,
+                q=None,
+                limit=100,
+            )
+            assert result == {"items": []}
     finally:
         engine.dispose()
