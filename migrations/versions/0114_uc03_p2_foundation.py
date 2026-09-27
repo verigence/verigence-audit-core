@@ -28,12 +28,13 @@ def upgrade() -> None:
             original_filename      varchar(500) NOT NULL,
             content_type           varchar(160),
             size_bytes             bigint NOT NULL CHECK (size_bytes >= 0),
-            sha256                 varchar(64) NOT NULL,
-            page_count             integer NOT NULL CHECK (page_count > 0),
+            sha256                 varchar(64),
+            page_count             integer NOT NULL DEFAULT 0 CHECK (page_count >= 0),
             original_object_key    varchar(700) NOT NULL,
-            batch_status           varchar(40) NOT NULL DEFAULT 'ACCEPTED'
+            batch_status           varchar(40) NOT NULL DEFAULT 'AWAITING_UPLOAD'
                                    CHECK (batch_status IN (
-                                     'ACCEPTED','PROCESSING','COMPLETED',
+                                     'AWAITING_UPLOAD','UPLOADED','SPLITTING',
+                                     'PROCESSING','COMPLETED',
                                      'PARTIAL_FAILURE','FAILED','CANCELLED'
                                    )),
             uploaded_by_actor_id   varchar(160) NOT NULL,
