@@ -14,10 +14,13 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_document_field_corrections import _apply_field_value
+
 # Phase 2-only task code. Deliberately not named *TASK_TYPE: the legacy
 # UC03 review-queue classifier must not treat isolated p2_tasks as legacy
 # workflow_tasks.
 _REQUESTER_CONFIRMATION_CODE = "REQUESTER_CONFIRMATION"
+_FIELD_CORRECTION_REVIEW_CODE = "FIELD_CORRECTION_REVIEW_P2"
 
 
 def _json(value: Any) -> str:
@@ -294,6 +297,107 @@ def submit_action(
             {"tenant_id": tenant_id, "task_id": task_id},
         )
         return {"taskId": str(task_id), "status": "IN_PROGRESS"}
+
+    if task["task_type"] == _FIELD_CORRECTION_REVIEW_CODE:
+        reference = dict(task["reference"] or {})
+        if action not in {"APPROVE_CORRECTION", "REJECT_CORRECTION"}:
+            raise ValueError(f"Action {action} is not valid for a correction review task")
+
+        if action == "REJECT_CORRECTION":
+            if not (comment or "").strip():
+                raise ValueError("Reject correction requires a comment")
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.p2_tasks
+                    SET task_status='VERIFIED_COMPLETE',
+                        verified_at_utc=now(),
+                        completion_result=CAST(:result AS jsonb),
+                        updated_at_utc=now()
+                    WHERE tenant_id=:tenant_id AND task_id=:task_id
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "task_id": task_id,
+                    "result": _json({
+                        "outcome": "REJECT_CORRECTION",
+                        "verifiedBy": actor_id,
+                        "verifiedAt": datetime.now(UTC).isoformat(),
+                        "comment": comment.strip(),
+                    }),
+                },
+            )
+            return {
+                "taskId": str(task_id),
+                "status": "VERIFIED_COMPLETE",
+                "outcome": "REJECT_CORRECTION",
+            }
+
+        required = (
+            "documentId",
+            "stage",
+            "fieldKey",
+            "canonicalFieldId",
+            "sourceFactVersion",
+            "proposedValue",
+        )
+        missing = [key for key in required if key not in reference]
+        if missing:
+            raise ValueError(
+                "Correction review task is missing required reference data: "
+                + ", ".join(missing)
+            )
+
+        evidence_id = reference.get("evidenceId")
+        confidence = reference.get("confidenceScore")
+        _apply_field_value(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code=str(reference["stage"]),
+            document_id=UUID(str(reference["documentId"])),
+            evidence_id=UUID(str(evidence_id)) if evidence_id else None,
+            document_type_key=(
+                str(reference["documentTypeKey"])
+                if reference.get("documentTypeKey")
+                else None
+            ),
+            field_key=str(reference["fieldKey"]),
+            canonical_field_id=str(reference["canonicalFieldId"]),
+            source_fact_version=int(reference["sourceFactVersion"]),
+            confidence_score=float(confidence) if confidence is not None else None,
+            original_value=reference.get("originalValue"),
+            new_value=reference["proposedValue"],
+            actor_id=actor_id,
+        )
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_tasks
+                SET task_status='VERIFIED_COMPLETE',
+                    verified_at_utc=now(),
+                    completion_result=CAST(:result AS jsonb),
+                    updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND task_id=:task_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "task_id": task_id,
+                "result": _json({
+                    "outcome": "APPROVE_CORRECTION",
+                    "verifiedBy": actor_id,
+                    "verifiedAt": datetime.now(UTC).isoformat(),
+                    "comment": comment,
+                }),
+            },
+        )
+        return {
+            "taskId": str(task_id),
+            "status": "VERIFIED_COMPLETE",
+            "outcome": "APPROVE_CORRECTION",
+        }
 
     if task["task_type"] == _REQUESTER_CONFIRMATION_CODE:
         root_id = UUID(str(task["root_task_id"]))
