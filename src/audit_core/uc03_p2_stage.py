@@ -28,6 +28,7 @@ from audit_core.uc03_duplicate_receipt_detection import (
     normalize_receipt_date,
     normalize_receipt_number,
 )
+from audit_core.uc03_p2_control_registry import ensure_p2_control_state_rows
 
 _BOOKING_DOC_GATES = {
     "BOOKING_FORM_EXTRACTED": ("booking_form", "booking_docket"),
@@ -359,6 +360,11 @@ def recompute_journey_stage(
     criteria remain intentionally unconfigured.
     """
     booking = recompute_booking_stage(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+    )
+    ensure_p2_control_state_rows(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
