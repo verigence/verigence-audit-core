@@ -113,6 +113,14 @@ jobs:
               'AUDIT_CORE_PHOTO_STORAGE_BUCKET',
           ))
           if not (p2_storage or photo_storage):
+              # Names only (never values) so a misnamed variable is obvious.
+              import re
+              hints = sorted(k for k in data if re.search(r'STORAGE|BUCKET|S3|R2_|ENDPOINT|ACCESS_KEY', k))
+              print('Storage-like variable names present on the worker:', ', '.join(hints) or '(none)')
+              for group in ('AUDIT_CORE_P2_STORAGE', 'AUDIT_CORE_PHOTO_STORAGE'):
+                  absent = [f'{group}_{s}' for s in ('ENDPOINT', 'ACCESS_KEY_ID', 'SECRET_ACCESS_KEY', 'BUCKET')
+                            if not str(data.get(f'{group}_{s}', '')).strip()]
+                  print(f'{group}: missing ' + (', '.join(absent) or 'nothing'))
               raise SystemExit('P2 worker has no complete P2 or fallback document-storage configuration')
           print('P2_WORKER_RUNTIME_CONFIG=PASS')
           PY
