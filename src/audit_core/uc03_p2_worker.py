@@ -36,7 +36,7 @@ from audit_core.uc03_document_capture_v2 import (
     get_di_client,
     get_security_oauth_client,
 )
-from audit_core.uc03_p2_stage import recompute_booking_stage
+from audit_core.uc03_p2_stage import recompute_journey_stage
 from audit_core.uc03_p2_storage import get_p2_document_storage
 from audit_core.uc03_unified_document_capture import (
     _merged_candidate_requirements,
@@ -1003,7 +1003,7 @@ def _refresh_batch_status(connection, tenant_id: str, batch_id: UUID) -> None:
 def _stage_recompute(engine: Engine, work: WorkItem) -> None:
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
-        result = recompute_booking_stage(
+        result = recompute_journey_stage(
             connection,
             tenant_id=work.tenant_id,
             journey_id=work.journey_id,
@@ -1015,7 +1015,7 @@ def _stage_recompute(engine: Engine, work: WorkItem) -> None:
                     tenant_id, journey_id, event_type, subject_type,
                     subject_id, details, correlation_id
                 ) VALUES (
-                    :tenant_id, :journey_id, 'BOOKING_STAGE_RECOMPUTED',
+                    :tenant_id, :journey_id, 'JOURNEY_STAGE_RECOMPUTED',
                     'JOURNEY', :subject_id, CAST(:details AS jsonb), :correlation_id
                 )
                 """
