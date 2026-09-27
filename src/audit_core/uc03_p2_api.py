@@ -163,7 +163,7 @@ def list_p2_journeys(
                   )
             ),
             task_rows AS (
-                SELECT tenant_id, journey_id::text AS journey_id, due_at_utc,
+                SELECT tenant_id, journey_id, due_at_utc,
                        task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED') AS is_open
                 FROM auditcore.p2_tasks
                 WHERE tenant_id=:tenant_id
@@ -238,7 +238,7 @@ def list_p2_journeys(
             LEFT JOIN document_stats ds
               ON ds.tenant_id=s.tenant_id AND ds.journey_id=s.journey_id
             LEFT JOIN task_stats ts
-              ON ts.tenant_id=s.tenant_id AND ts.journey_id=s.journey_id::text
+              ON ts.tenant_id=s.tenant_id AND ts.journey_id=s.journey_id
             LEFT JOIN finding_stats fs
               ON fs.tenant_id=s.tenant_id AND fs.journey_id=s.journey_id
             WHERE (
@@ -835,7 +835,7 @@ def _p2_stage_task_statistics(
                AND wtd.work_item_id=wi.work_item_id
               WHERE wi.tenant_id=:tenant_id
                 AND wi.subject_kind='JOURNEY'
-                AND wi.subject_ref=CAST(:journey_id AS text)
+                AND wi.subject_ref=:journey_id
                 AND wi.item_kind='EXECUTION_TASK'
                 AND upper(COALESCE(wtd.process_area,''))=:stage_code
             )
@@ -957,7 +957,7 @@ def overview_summary(
                 FROM auditcore.work_items
                 WHERE tenant_id=:tenant_id
                   AND subject_kind='JOURNEY'
-                  AND subject_ref=CAST(:journey_id AS text)
+                  AND subject_ref=:journey_id
                   AND item_kind='EXECUTION_TASK'
             )
             SELECT COUNT(*) AS total,
@@ -1345,11 +1345,11 @@ def list_tasks(
              AND wtd.work_item_id=wi.work_item_id
             JOIN auditcore.journeys j
               ON j.tenant_id=wi.tenant_id
-             AND j.journey_id::text=wi.subject_ref
+             AND j.journey_id=wi.subject_ref
             WHERE wi.tenant_id=:tenant_id
               AND wi.item_kind='EXECUTION_TASK'
               AND wi.subject_kind='JOURNEY'
-              AND (:journey_id IS NULL OR wi.subject_ref=CAST(:journey_id AS text))
+              AND (:journey_id IS NULL OR wi.subject_ref=:journey_id)
               AND (
                 (:status IS NULL AND wi.status IN ('OPEN','IN_PROGRESS'))
                 OR (:status IS NOT NULL AND wi.status=:status)
