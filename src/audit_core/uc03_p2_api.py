@@ -1935,6 +1935,8 @@ def list_tasks(
     status: str | None = None,
     journey_id: UUID | None = None,
     includeLegacy: bool = False,
+    view: str = "open",
+    role: str | None = None,
 ) -> dict[str, Any]:
     """P2 worklist. P2 now raises its own tasks for every failing control and
     low-confidence field, so legacy workflow tasks are shown only on request
@@ -1956,19 +1958,38 @@ def list_tasks(
     p2_rows = connection.execute(
         text(
             """
-            SELECT task_id, journey_id, root_task_id, parent_task_id,
-                   round_number, task_type, category, origin_kind,
-                   source_type, source_code, title, description, reference,
-                   severity, priority, assigned_role_code, assigned_actor_id,
-                   raised_by_actor_id, raised_by_role_code, allowed_actions,
-                   completion_protocol, task_status, due_at_utc,
-                   created_at_utc, updated_at_utc
+            SELECT t.task_id, t.journey_id, t.root_task_id, t.parent_task_id,
+                   t.round_number, t.task_type, t.category, t.origin_kind,
+                   t.source_type, t.source_code, t.title, t.description, t.reference,
+                   t.severity, t.priority, t.assigned_role_code, t.assigned_actor_id,
+                   t.raised_by_actor_id, t.raised_by_role_code, t.allowed_actions,
+                   t.completion_protocol, t.task_status, t.due_at_utc,
+                   t.created_at_utc, t.updated_at_utc, t.verified_at_utc,
+                   t.completion_result,
+                   c.display_name AS customer_name,
+                   o.outlet_name,
+                   NULLIF(concat_ws(' · ', NULLIF(jp.model_name_snapshot,''),
+                                           NULLIF(jp.variant_name_snapshot,'')), '') AS vehicle,
+                   (SELECT COUNT(*) FROM auditcore.p2_task_events ev
+                     WHERE ev.tenant_id=t.tenant_id AND ev.task_id=t.task_id
+                       AND ev.comment IS NOT NULL) AS comment_count
             FROM auditcore.p2_tasks t
+            JOIN auditcore.journeys jr ON jr.tenant_id=t.tenant_id AND jr.journey_id=t.journey_id
+            LEFT JOIN auditcore.customers c ON c.tenant_id=jr.tenant_id AND c.customer_id=jr.customer_id
+            LEFT JOIN auditcore.dealer_outlets o
+              ON o.tenant_id=jr.tenant_id AND o.dealer_id=jr.dealer_id AND o.outlet_id=jr.outlet_id
+            LEFT JOIN auditcore.journey_products jp ON jp.tenant_id=t.tenant_id AND jp.journey_id=t.journey_id
             WHERE t.tenant_id=:tenant_id
               AND (CAST(:journey_id AS uuid) IS NULL OR t.journey_id=CAST(:journey_id AS uuid))
+              AND (CAST(:role AS varchar) IS NULL OR t.assigned_role_code=CAST(:role AS varchar))
               AND (
-                (CAST(:status AS varchar) IS NULL AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED'))
-                OR (CAST(:status AS varchar) IS NOT NULL AND t.task_status=CAST(:status AS varchar))
+                (CAST(:status AS varchar) IS NOT NULL AND t.task_status=CAST(:status AS varchar))
+                OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='open'
+                    AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED'))
+                OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='done'
+                    AND t.task_status='VERIFIED_COMPLETE'
+                    AND t.verified_at_utc > now() - interval '14 days')
+                OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='all')
               )
               AND EXISTS (
                 SELECT 1
@@ -1997,6 +2018,8 @@ def list_tasks(
             "journey_id": journey_id,
             "status": status,
             "actor_id": human_principal.subject,
+            "view": view if view in {"open", "done", "all"} else "open",
+            "role": role,
         },
     ).mappings().all()
 
@@ -2176,6 +2199,51 @@ def list_tasks(
             "legacy": len(legacy_rows),
         },
     }
+
+
+@router.get("/tasks/{task_id}")
+def get_task(
+    tenant_id: str,
+    task_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """One task with its full history (actions, comments, verification)."""
+    decision = check_p2_permission(
+        tenant_id=tenant_id, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_READ_PERMISSION,
+    )
+    set_tenant_context(connection, tenant_id)
+    task = connection.execute(
+        text("SELECT * FROM auditcore.p2_tasks WHERE tenant_id=:t AND task_id=:id"),
+        {"t": tenant_id, "id": task_id},
+    ).mappings().one_or_none()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task was not found.")
+    resolve_p2_scope(
+        connection, tenant_id=tenant_id, journey_id=UUID(str(task["journey_id"])),
+        human_principal=human_principal, decision=decision,
+    )
+    events = connection.execute(
+        text(
+            """
+            SELECT task_event_id, event_type, actor_id, actor_role_code, comment, details, created_at_utc
+            FROM auditcore.p2_task_events
+            WHERE tenant_id=:t AND task_id=:id
+            ORDER BY task_event_id
+            """
+        ),
+        {"t": tenant_id, "id": task_id},
+    ).mappings().all()
+    item = dict(task)
+    for key in ("task_id", "journey_id", "root_task_id", "parent_task_id"):
+        if item.get(key) is not None:
+            item[key] = str(item[key])
+    item["events"] = [dict(event) for event in events]
+    return item
 
 
 class TaskActionCommand(BaseModel):
