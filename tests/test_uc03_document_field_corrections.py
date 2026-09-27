@@ -494,3 +494,39 @@ def test_act_on_flag_keeps_the_legacy_confirm_breach_hook() -> None:
     assert "apply_confirmed_field_correction_legacy" in source
     assert 'payload.action == "CONFIRM_BREACH"' in source
     assert "DI_VALUE_CORRECTION_PROPOSED" in source
+
+
+
+def test_p2_field_correction_review_has_dedicated_task_semantics() -> None:
+    """Phase 2 high-confidence review must not fall through to generic
+    MACHINE_VERIFIED control execution. Approval applies the reviewed value
+    through the same helper used by the established correction path; rejection
+    requires a comment and never applies the proposal."""
+    from audit_core import uc03_p2_tasks
+
+    source = inspect.getsource(uc03_p2_tasks.submit_action)
+    correction_branch = source.index(
+        'task["task_type"] == _FIELD_CORRECTION_REVIEW_CODE'
+    )
+    generic_machine_branch = source.index(
+        'task["completion_protocol"] == "MACHINE_VERIFIED"'
+    )
+
+    assert correction_branch < generic_machine_branch
+    assert "APPROVE_CORRECTION" in source
+    assert "REJECT_CORRECTION" in source
+    assert "_apply_field_value(" in source
+    assert "Reject correction requires a comment" in source
+
+
+def test_p2_correction_rejection_does_not_apply_proposed_value() -> None:
+    from audit_core import uc03_p2_tasks
+
+    source = inspect.getsource(uc03_p2_tasks.submit_action)
+    start = source.index('if action == "REJECT_CORRECTION":')
+    end = source.index("required = (", start)
+    reject_branch = source[start:end]
+
+    assert "_apply_field_value(" not in reject_branch
+    assert "VERIFIED_COMPLETE" in reject_branch
+    assert '"outcome": "REJECT_CORRECTION"' in reject_branch
