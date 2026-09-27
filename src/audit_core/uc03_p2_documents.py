@@ -27,12 +27,18 @@ from audit_core.security_authorization import (
 )
 from audit_core.security_integration import SecurityOAuthClient
 from audit_core.uc03_document_capture_v2 import (
+    _DI_AUDIENCE,
     _ensure_di_context,
     get_di_client,
     get_security_oauth_client,
 )
 from audit_core.uc03_document_field_corrections import _apply_field_value
-from audit_core.uc03_p2_access import authorize_p2
+from audit_core.uc03_p2_access import (
+    authorize_p2,
+    check_p2_permission,
+    resolve_p2_scope,
+)
+from audit_core.uc03_p2_runtime import note_facts_changed, record_activity
 from audit_core.uc03_p2_tasks import create_p2_task
 from audit_core.uc03_review_confidence import requires_pc_review
 
@@ -173,6 +179,38 @@ def _durable_fields(
     return [dict(row) for row in rows]
 
 
+def _related_tasks(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    document_id: UUID,
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        text(
+            """
+            SELECT task_id, task_type, title, task_status,
+                   source_type, source_code, created_at_utc
+            FROM auditcore.p2_tasks
+            WHERE tenant_id=:tenant_id
+              AND journey_id=:journey_id
+              AND (
+                reference->>'documentId'=:document_id
+                OR reference->>'document_id'=:document_id
+              )
+            ORDER BY created_at_utc DESC
+            LIMIT 50
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "document_id": str(document_id),
+        },
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
 def _durable_lookup(rows: list[dict[str, Any]]) -> dict[tuple[str, int], dict[str, Any]]:
     result: dict[tuple[str, int], dict[str, Any]] = {}
     for row in rows:
@@ -193,44 +231,53 @@ def get_p2_document_review(
     authorization_client: Annotated[
         SecurityAuthorizationClient, Depends(get_security_authorization_client)
     ],
-    connection: Annotated[Connection, Depends(get_connection)],
     engine: Annotated[Engine, Depends(get_engine)],
     security_client: Annotated[
         SecurityOAuthClient, Depends(get_security_oauth_client)
     ],
     di_client: Annotated[DiClient, Depends(get_di_client)],
 ) -> dict[str, Any]:
-    authorize_p2(
-        connection,
+    decision = check_p2_permission(
         tenant_id=tenant_id,
-        journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
         permission_key=_READ_PERMISSION,
     )
-    context = _document_context(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        document_id=document_id,
-    )
-    durable = _durable_fields(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        document_id=document_id,
-    )
+    security_client.get_service_token(audience=_DI_AUDIENCE)
+    with engine.begin() as connection:
+        resolve_p2_scope(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            human_principal=human_principal,
+            decision=decision,
+        )
+        context = _document_context(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            document_id=document_id,
+        )
+        durable = _durable_fields(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            document_id=document_id,
+        )
+        related_task_rows = _related_tasks(
+            connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+        )
+        context_ref, token = _ensure_di_context(
+            connection=connection,
+            engine=engine,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            security_client=security_client,
+            di_client=di_client,
+        )
     lookup = _durable_lookup(durable)
 
-    context_ref, token = _ensure_di_context(
-        connection=connection,
-        engine=engine,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        security_client=security_client,
-        di_client=di_client,
-    )
-
+    # DI reads happen with no database transaction open.
     di_document = None
     di_facts = ()
     di_error: str | None = None
@@ -327,29 +374,6 @@ def get_p2_document_review(
         for row in durable
         if bool(row.get("is_modified"))
     ]
-
-    related_task_rows = connection.execute(
-        text(
-            """
-            SELECT task_id, task_type, title, task_status,
-                   source_type, source_code, created_at_utc
-            FROM auditcore.p2_tasks
-            WHERE tenant_id=:tenant_id
-              AND journey_id=:journey_id
-              AND (
-                reference->>'documentId'=:document_id
-                OR reference->>'document_id'=:document_id
-              )
-            ORDER BY created_at_utc DESC
-            LIMIT 50
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "document_id": str(document_id),
-        },
-    ).mappings().all()
     related_tasks = [
         {
             "taskId": str(row["task_id"]),
@@ -516,35 +540,20 @@ def delete_p2_document(
             journey_id=journey_id,
         )
 
-    connection.execute(
-        text(
-            """
-            SELECT auditcore.p2_request_stage_recompute(
-                :tenant_id, :journey_id
-            )
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
+    note_facts_changed(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        reason="DOCUMENT_VOIDED",
     )
-    connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.p2_activity_events (
-                tenant_id, journey_id, event_type, subject_type,
-                subject_id, details
-            ) VALUES (
-                :tenant_id, :journey_id, 'DOCUMENT_VOIDED',
-                'DOCUMENT', :document_id,
-                jsonb_build_object('stage', :stage_code)
-            )
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "document_id": str(document_id),
-            "stage_code": stage_code,
-        },
+    record_activity(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        event_type="DOCUMENT_VOIDED",
+        subject_type="DOCUMENT",
+        subject_id=str(document_id),
+        details={"stage": stage_code},
     )
     return Response(status_code=204)
 
@@ -558,35 +567,41 @@ def get_p2_document_content(
     authorization_client: Annotated[
         SecurityAuthorizationClient, Depends(get_security_authorization_client)
     ],
-    connection: Annotated[Connection, Depends(get_connection)],
     engine: Annotated[Engine, Depends(get_engine)],
     security_client: Annotated[
         SecurityOAuthClient, Depends(get_security_oauth_client)
     ],
     di_client: Annotated[DiClient, Depends(get_di_client)],
 ) -> Response:
-    authorize_p2(
-        connection,
+    decision = check_p2_permission(
         tenant_id=tenant_id,
-        journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
         permission_key=_READ_PERMISSION,
     )
-    _document_context(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        document_id=document_id,
-    )
-    context_ref, token = _ensure_di_context(
-        connection=connection,
-        engine=engine,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        security_client=security_client,
-        di_client=di_client,
-    )
+    security_client.get_service_token(audience=_DI_AUDIENCE)
+    with engine.begin() as connection:
+        resolve_p2_scope(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            human_principal=human_principal,
+            decision=decision,
+        )
+        _document_context(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            document_id=document_id,
+        )
+        context_ref, token = _ensure_di_context(
+            connection=connection,
+            engine=engine,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            security_client=security_client,
+            di_client=di_client,
+        )
     try:
         payload, content_type, content_disposition = (
             di_client.get_audit_document_content(
@@ -675,7 +690,8 @@ def correct_p2_document_field(
             """
             SELECT evidence_id, source_document_type_key, field_key,
                    source_canonical_field_id, source_fact_version,
-                   confidence_score, extracted_value, effective_value
+                   confidence_score, extracted_value, effective_value,
+                   is_modified
             FROM auditcore.journey_document_extracted_fields
             WHERE tenant_id=:tenant_id
               AND journey_id=:journey_id
@@ -707,10 +723,14 @@ def correct_p2_document_field(
         if field["confidence_score"] is not None
         else None
     )
-    original_value = (
+    # The machine (DI) value is immutable evidence: every correction writes a
+    # new modified/effective value and carries the original extraction
+    # forward unchanged, however many times the field is corrected.
+    machine_value = field["extracted_value"]
+    current_effective = (
         field["effective_value"]
         if field["effective_value"] is not None
-        else field["extracted_value"]
+        else machine_value
     )
 
     if requires_pc_review(confidence):
@@ -729,9 +749,15 @@ def correct_p2_document_field(
             canonical_field_id=command.canonicalFieldId,
             source_fact_version=command.sourceFactVersion,
             confidence_score=confidence,
-            original_value=original_value,
+            original_value=machine_value,
             new_value=command.newValue,
             actor_id=human_principal.subject,
+        )
+        note_facts_changed(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            reason="FIELD_CORRECTED",
         )
         return {
             "documentId": str(document_id),
@@ -765,7 +791,8 @@ def correct_p2_document_field(
         "fieldKey": command.fieldKey,
         "sourceFactVersion": command.sourceFactVersion,
         "confidenceScore": confidence,
-        "originalValue": original_value,
+        "originalValue": machine_value,
+        "currentEffectiveValue": current_effective,
         "proposedValue": command.newValue,
         "proposalRemarks": command.remarks.strip(),
     }

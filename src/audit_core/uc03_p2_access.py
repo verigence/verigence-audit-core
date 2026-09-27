@@ -29,15 +29,15 @@ class P2AccessContext:
     operating_role: str | None
 
 
-def authorize_p2(
-    connection: Connection,
+def check_p2_permission(
     *,
     tenant_id: str,
-    journey_id: UUID | None,
     human_principal: HumanPrincipal,
     authorization_client: SecurityAuthorizationClient,
     permission_key: str,
-) -> P2AccessContext:
+):
+    """Security's functional-permission decision. Call before any DB work:
+    it may perform a network call (allow decisions are process-cached)."""
     try:
         decision = authorization_client.check_user_permission(
             user_id=human_principal.subject,
@@ -54,7 +54,22 @@ def authorize_p2(
             status_code=403,
             title="Permission denied",
         )
+    return decision
 
+
+def resolve_p2_scope(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID | None,
+    human_principal: HumanPrincipal,
+    decision,
+) -> P2AccessContext:
+    """Set Tenant context and resolve the caller's data scope for a Journey.
+
+    Security decides *what* the caller may do; Audit Core business
+    assignments decide *which* dealer/outlet Journeys the caller operates on.
+    The scope lookup never grants a permission Security denied."""
     set_tenant_context(connection, tenant_id)
     operating_role: str | None = None
     if journey_id is not None:
@@ -106,4 +121,28 @@ def authorize_p2(
         tenant_id=tenant_id,
         functional_role=decision.role_key,
         operating_role=operating_role,
+    )
+
+
+def authorize_p2(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID | None,
+    human_principal: HumanPrincipal,
+    authorization_client: SecurityAuthorizationClient,
+    permission_key: str,
+) -> P2AccessContext:
+    decision = check_p2_permission(
+        tenant_id=tenant_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        permission_key=permission_key,
+    )
+    return resolve_p2_scope(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        decision=decision,
     )

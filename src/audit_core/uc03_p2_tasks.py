@@ -15,12 +15,23 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from audit_core.uc03_document_field_corrections import _apply_field_value
+from audit_core.uc03_p2_runtime import note_facts_changed
 
 # Phase 2-only task code. Deliberately not named *TASK_TYPE: the legacy
 # UC03 review-queue classifier must not treat isolated p2_tasks as legacy
 # workflow_tasks.
 _REQUESTER_CONFIRMATION_CODE = "REQUESTER_CONFIRMATION"
 _FIELD_CORRECTION_REVIEW_CODE = "FIELD_CORRECTION_REVIEW_P2"
+
+# Terminal states accept commentary only; nothing can re-open them by a click.
+_TERMINAL_STATUSES = frozenset({"VERIFIED_COMPLETE", "CANCELLED", "FAILED", "DEAD_LETTER"})
+# Work has been handed back to the system/requester; the assignee must wait.
+_AWAITING_STATUSES = frozenset({"VERIFYING", "AWAITING_REQUESTER_REVIEW", "ACTION_COMPLETED"})
+_COMMENTARY_ACTIONS = frozenset({"ADD_COMMENT", "PROVIDE_FEEDBACK"})
+
+
+class TaskStateError(ValueError):
+    """The task's current status does not allow this action."""
 
 
 def _json(value: Any) -> str:
@@ -270,6 +281,14 @@ def submit_action(
     allowed = list(task["allowed_actions"] or [])
     if action not in allowed:
         raise ValueError(f"Action {action} is not allowed for this task")
+    status = str(task["task_status"])
+    if action not in _COMMENTARY_ACTIONS:
+        if status in _TERMINAL_STATUSES:
+            raise TaskStateError(f"This task is already {status.replace('_', ' ').lower()}.")
+        if status in _AWAITING_STATUSES:
+            raise TaskStateError(
+                "This task is waiting for verification; no further action is needed right now."
+            )
 
     assigned_actor_id = task.get("assigned_actor_id")
     assigned_role_code = str(task.get("assigned_role_code") or "")
@@ -358,6 +377,48 @@ def submit_action(
                 + ", ".join(missing)
             )
 
+        # Re-read the field under lock: the machine value is always taken from
+        # the durable store (never from the task payload), and a proposal made
+        # against a value that has since changed must be re-proposed.
+        current = connection.execute(
+            text(
+                """
+                SELECT extracted_value, effective_value
+                FROM auditcore.journey_document_extracted_fields
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND di_document_id=:document_id
+                  AND source_canonical_field_id=:canonical_field_id
+                  AND source_fact_version=:source_fact_version
+                  AND field_key=:field_key
+                ORDER BY updated_at_utc DESC
+                LIMIT 1
+                FOR UPDATE
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "document_id": UUID(str(reference["documentId"])),
+                "canonical_field_id": str(reference["canonicalFieldId"]),
+                "source_fact_version": int(reference["sourceFactVersion"]),
+                "field_key": str(reference["fieldKey"]),
+            },
+        ).mappings().one_or_none()
+        if current is None:
+            raise TaskStateError("The field no longer exists on this document.")
+        current_effective = (
+            current["effective_value"]
+            if current["effective_value"] is not None
+            else current["extracted_value"]
+        )
+        if (
+            "currentEffectiveValue" in reference
+            and _json(current_effective) != _json(reference["currentEffectiveValue"])
+        ):
+            raise TaskStateError(
+                "The field changed after this correction was proposed. Reject it and propose again."
+            )
+
         evidence_id = reference.get("evidenceId")
         confidence = reference.get("confidenceScore")
         _apply_field_value(
@@ -376,9 +437,15 @@ def submit_action(
             canonical_field_id=str(reference["canonicalFieldId"]),
             source_fact_version=int(reference["sourceFactVersion"]),
             confidence_score=float(confidence) if confidence is not None else None,
-            original_value=reference.get("originalValue"),
+            original_value=current["extracted_value"],
             new_value=reference["proposedValue"],
             actor_id=actor_id,
+        )
+        note_facts_changed(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            reason="FIELD_CORRECTION_APPROVED",
         )
         connection.execute(
             text(

@@ -6,6 +6,18 @@ Run as a separate process:
 The API process never executes document splitting, DI upload/finalize, rule
 verification or reconciliation inline. Work is claimed from auditcore.p2_work_queue
 with SKIP LOCKED under Tenant RLS and retried durably.
+
+Queue contract:
+- Every claim writes a fresh lease_token. Completion, failure and reschedule
+  only apply while the caller still owns that lease, so a worker whose lease
+  expired can never overwrite the outcome of the worker that reclaimed it.
+- attempt_count counts failures only (including a reclaimed expired lease,
+  which means the previous worker died mid-item). Polling reschedules are not
+  failures; long waits are bounded by per-page deadlines instead.
+- requested_version is a monotonically increasing "dirty" counter. Re-enqueueing
+  an item that is currently being processed bumps it, and completion requeues
+  the item when a newer request arrived while it ran, so no request is lost.
+- No DB transaction is held open across DI, Security or object-storage calls.
 """
 from __future__ import annotations
 
@@ -13,10 +25,12 @@ import hashlib
 import io
 import json
 import os
+import random
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -28,6 +42,7 @@ from sqlalchemy import Engine, text
 from audit_core.db import set_platform_super_admin_context, set_tenant_context
 from audit_core.dependencies import get_engine
 from audit_core.uc03_document_capture_v2 import (
+    _DI_AUDIENCE,
     _candidate_type_keys,
     _ensure_di_context,
     _requirement_refs_by_document_type_key,
@@ -36,29 +51,56 @@ from audit_core.uc03_document_capture_v2 import (
     get_di_client,
     get_security_oauth_client,
 )
+from audit_core.uc03_p2_runtime import (
+    fact_fingerprint,
+    note_facts_changed,
+    record_activity,
+)
 from audit_core.uc03_p2_stage import recompute_booking_stage
 from audit_core.uc03_p2_storage import get_p2_document_storage
 from audit_core.uc03_unified_document_capture import (
     _merged_candidate_requirements,
     _receipt_defaults_to_delivery,
     _requirements_owned_by_stage,
-    reconcile_unified_documents,
+    apply_di_classification,
 )
 
 logger = structlog.get_logger(__name__)
 
-_MAX_ATTEMPTS = int(os.environ.get("P2_WORKER_MAX_ATTEMPTS", "12"))
+_MAX_ATTEMPTS = int(os.environ.get("P2_WORKER_MAX_ATTEMPTS", "8"))
 _POLL_SECONDS = float(os.environ.get("P2_WORKER_POLL_SECONDS", "1.0"))
-_RECONCILE_DELAY_SECONDS = int(os.environ.get("P2_RECONCILE_DELAY_SECONDS", "2"))
 _MAX_PDF_PAGES = int(os.environ.get("P2_MAX_PDF_PAGES", "100"))
-_WORKER_CONCURRENCY = max(1, int(os.environ.get("P2_WORKER_CONCURRENCY", "4")))
+_WORKER_CONCURRENCY = max(1, int(os.environ.get("P2_WORKER_CONCURRENCY", "6")))
+_PER_JOURNEY_CONCURRENCY = max(1, int(os.environ.get("P2_PER_JOURNEY_CONCURRENCY", "3")))
+_LEASE_SECONDS = int(os.environ.get("P2_WORKER_LEASE_SECONDS", "600"))
+# A page that DI has not settled within this window is failed visibly (with a
+# Retry action in the UI) instead of being polled forever.
+_PAGE_DEADLINE_SECONDS = int(os.environ.get("P2_PAGE_DEADLINE_SECONDS", str(30 * 60)))
+# DI reports PROCESSED before the document-link sync has copied facts into
+# Audit Core. Allow the sync this long before treating "no facts" as a result.
+_SYNC_GRACE_SECONDS = int(os.environ.get("P2_SYNC_GRACE_SECONDS", "180"))
+_FACT_SWEEP_SECONDS = float(os.environ.get("P2_FACT_SWEEP_SECONDS", "30"))
+_FACT_SWEEP_WINDOW_MINUTES = int(os.environ.get("P2_FACT_SWEEP_WINDOW_MINUTES", "10"))
 _WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
+
+# Page states that still need DI/Audit Core progress.
+_PAGE_ACTIVE_STATES = (
+    "QUEUED", "PREPARING_PAGE", "DI_UPLOAD_PREPARING", "DI_UPLOADING",
+    "DI_FINALIZING", "CLASSIFYING", "EXTRACTING", "SYNCING_TO_AUDIT_CORE",
+    "RETRY_WAIT",
+)
+_PAGE_RECONCILE_STATES = ("CLASSIFYING", "EXTRACTING", "SYNCING_TO_AUDIT_CORE", "RETRY_WAIT")
+_PAGE_SETTLED_STATES = ("READY", "NEEDS_REVIEW", "FAILED", "DEAD_LETTER", "CANCELLED")
 
 
 class RescheduleWork(RuntimeError):
     def __init__(self, message: str, *, delay_seconds: int) -> None:
         super().__init__(message)
         self.delay_seconds = delay_seconds
+
+
+class LeaseLost(RuntimeError):
+    """The item was reclaimed by another worker; drop this result."""
 
 
 @dataclass(frozen=True)
@@ -72,122 +114,179 @@ class WorkItem:
     attempt_count: int
     requested_version: int | None
     correlation_id: str | None
+    lease_token: UUID
 
 
 def _active_tenants(engine: Engine) -> list[str]:
     with engine.begin() as connection:
         set_platform_super_admin_context(connection)
-        return list(
+        tenants = list(
             connection.execute(
                 text(
                     """
                     SELECT DISTINCT tenant_id
                     FROM auditcore.projects
                     WHERE project_status='ACTIVE'
-                    ORDER BY tenant_id
                     """
                 )
             ).scalars().all()
         )
+    # Fairness: a busy tenant must not starve the others of worker slots.
+    random.shuffle(tenants)
+    return tenants
+
+
+_CLAIM_SQL = text(
+    """
+    WITH inflight AS (
+        SELECT journey_id, COUNT(*) AS running
+        FROM auditcore.p2_work_queue
+        WHERE tenant_id=:tenant_id
+          AND work_status IN ('CLAIMED','PROCESSING')
+          AND lease_expires_at_utc > now()
+        GROUP BY journey_id
+    ),
+    ready AS (
+        SELECT work_id, journey_id, created_at_utc,
+               row_number() OVER (PARTITION BY journey_id ORDER BY created_at_utc) AS journey_rank
+        FROM auditcore.p2_work_queue
+        WHERE tenant_id=:tenant_id
+          AND (
+            work_status IN ('PENDING','RETRY_WAIT')
+            OR (work_status IN ('CLAIMED','PROCESSING') AND lease_expires_at_utc <= now())
+          )
+          AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc <= now())
+    ),
+    eligible AS (
+        SELECT r.work_id
+        FROM ready r
+        LEFT JOIN inflight i ON i.journey_id=r.journey_id
+        WHERE r.journey_rank + COALESCE(i.running, 0) <= :per_journey
+        ORDER BY r.created_at_utc
+        LIMIT :limit
+    )
+    SELECT w.tenant_id, w.work_id, w.journey_id, w.work_type, w.work_key,
+           w.payload, w.attempt_count, w.requested_version, w.correlation_id,
+           (w.work_status IN ('CLAIMED','PROCESSING')) AS reclaimed
+    FROM auditcore.p2_work_queue w
+    JOIN eligible e ON e.work_id=w.work_id
+    WHERE w.tenant_id=:tenant_id
+    ORDER BY w.created_at_utc
+    FOR UPDATE OF w SKIP LOCKED
+    """
+)
 
 
 def _claim_for_tenant(engine: Engine, tenant_id: str, limit: int) -> list[WorkItem]:
+    claimed: list[WorkItem] = []
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
         rows = connection.execute(
-            text(
-                """
-                SELECT tenant_id, work_id, journey_id, work_type, work_key,
-                       payload, attempt_count, requested_version, correlation_id
-                FROM auditcore.p2_work_queue
-                WHERE tenant_id=:tenant_id
-                  AND (
-                    work_status IN ('PENDING','RETRY_WAIT')
-                    OR (
-                      work_status IN ('CLAIMED','PROCESSING')
-                      AND lease_expires_at_utc IS NOT NULL
-                      AND lease_expires_at_utc <= now()
-                    )
-                  )
-                  AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc <= now())
-                  AND (lease_expires_at_utc IS NULL OR lease_expires_at_utc <= now())
-                ORDER BY created_at_utc
-                FOR UPDATE SKIP LOCKED
-                LIMIT :limit
-                """
-            ),
-            {"tenant_id": tenant_id, "limit": limit},
+            _CLAIM_SQL,
+            {"tenant_id": tenant_id, "limit": limit, "per_journey": _PER_JOURNEY_CONCURRENCY},
         ).mappings().all()
-        if not rows:
-            return []
-        ids = [row["work_id"] for row in rows]
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.p2_work_queue
-                SET work_status='CLAIMED',
-                    attempt_count=attempt_count+1,
-                    lease_expires_at_utc=now() + interval '5 minutes',
-                    updated_at_utc=now()
-                WHERE tenant_id=:tenant_id AND work_id = ANY(:ids)
-                """
-            ),
-            {"tenant_id": tenant_id, "ids": ids},
-        )
-        return [
-            WorkItem(
-                tenant_id=str(row["tenant_id"]),
-                work_id=UUID(str(row["work_id"])),
-                journey_id=UUID(str(row["journey_id"])),
-                work_type=str(row["work_type"]),
-                work_key=str(row["work_key"]),
-                payload=dict(row["payload"] or {}),
-                attempt_count=int(row["attempt_count"] or 0) + 1,
-                requested_version=(
-                    int(row["requested_version"])
-                    if row["requested_version"] is not None
-                    else None
+        for row in rows:
+            token = uuid4()
+            # A reclaimed expired lease means the previous worker died while
+            # holding the item: that counts as a failed attempt, so a crash-
+            # looping item eventually dead-letters instead of cycling forever.
+            attempts = int(row["attempt_count"] or 0) + (1 if row["reclaimed"] else 0)
+            if row["reclaimed"] and attempts >= _MAX_ATTEMPTS:
+                connection.execute(
+                    text(
+                        """
+                        UPDATE auditcore.p2_work_queue
+                        SET work_status='DEAD_LETTER', attempt_count=:attempts,
+                            lease_token=NULL, lease_expires_at_utc=NULL,
+                            last_error='Worker lease expired repeatedly while processing.',
+                            updated_at_utc=now()
+                        WHERE tenant_id=:tenant_id AND work_id=:work_id
+                        """
+                    ),
+                    {"tenant_id": tenant_id, "work_id": row["work_id"], "attempts": attempts},
+                )
+                continue
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.p2_work_queue
+                    SET work_status='CLAIMED',
+                        attempt_count=:attempts,
+                        claim_count=claim_count+1,
+                        lease_token=:token,
+                        lease_expires_at_utc=now() + (:lease_seconds * interval '1 second'),
+                        updated_at_utc=now()
+                    WHERE tenant_id=:tenant_id AND work_id=:work_id
+                    """
                 ),
-                correlation_id=row["correlation_id"],
+                {
+                    "tenant_id": tenant_id,
+                    "work_id": row["work_id"],
+                    "attempts": attempts,
+                    "token": token,
+                    "lease_seconds": _LEASE_SECONDS,
+                },
             )
-            for row in rows
-        ]
+            claimed.append(
+                WorkItem(
+                    tenant_id=str(row["tenant_id"]),
+                    work_id=UUID(str(row["work_id"])),
+                    journey_id=UUID(str(row["journey_id"])),
+                    work_type=str(row["work_type"]),
+                    work_key=str(row["work_key"]),
+                    payload=dict(row["payload"] or {}),
+                    attempt_count=attempts,
+                    requested_version=(
+                        int(row["requested_version"])
+                        if row["requested_version"] is not None
+                        else None
+                    ),
+                    correlation_id=row["correlation_id"],
+                    lease_token=token,
+                )
+            )
+    return claimed
+
+
+def _owned(connection, work: WorkItem, *, lock: bool = True) -> dict[str, Any]:
+    """Return the queue row if this worker still owns the lease, else raise."""
+    row = connection.execute(
+        text(
+            f"""
+            SELECT requested_version, lease_token
+            FROM auditcore.p2_work_queue
+            WHERE tenant_id=:tenant_id AND work_id=:work_id
+            {"FOR UPDATE" if lock else ""}
+            """
+        ),
+        {"tenant_id": work.tenant_id, "work_id": work.work_id},
+    ).mappings().one_or_none()
+    if row is None or row["lease_token"] != work.lease_token:
+        raise LeaseLost(f"Lease lost for work item {work.work_id}")
+    return dict(row)
 
 
 def _complete(engine: Engine, work: WorkItem) -> None:
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
-        row = connection.execute(
-            text(
-                """
-                SELECT requested_version
-                FROM auditcore.p2_work_queue
-                WHERE tenant_id=:tenant_id AND work_id=:work_id
-                FOR UPDATE
-                """
-            ),
-            {"tenant_id": work.tenant_id, "work_id": work.work_id},
-        ).mappings().one()
-
+        row = _owned(connection, work)
         latest_requested = (
-            int(row["requested_version"])
-            if row["requested_version"] is not None
-            else None
+            int(row["requested_version"]) if row["requested_version"] is not None else None
         )
         processed = work.requested_version
         stale_after_run = (
-            processed is not None
-            and latest_requested is not None
-            and latest_requested > processed
+            latest_requested is not None
+            and (processed is None or latest_requested > processed)
         )
-
         connection.execute(
             text(
                 """
                 UPDATE auditcore.p2_work_queue
-                SET work_status=:status,
-                    processed_version=COALESCE(:processed_version, processed_version),
+                SET work_status=CAST(:status AS varchar),
+                    processed_version=COALESCE(CAST(:processed_version AS bigint), processed_version),
+                    attempt_count=CASE WHEN CAST(:status AS varchar)='COMPLETED' THEN 0 ELSE attempt_count END,
                     next_attempt_at_utc=NULL,
+                    lease_token=NULL,
                     lease_expires_at_utc=NULL,
                     last_error=NULL,
                     updated_at_utc=now()
@@ -206,12 +305,21 @@ def _complete(engine: Engine, work: WorkItem) -> None:
 def _reschedule(engine: Engine, work: WorkItem, exc: RescheduleWork) -> None:
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
+        row = _owned(connection, work)
+        newer_request = (
+            row["requested_version"] is not None
+            and (work.requested_version is None or int(row["requested_version"]) > work.requested_version)
+        )
         connection.execute(
             text(
                 """
                 UPDATE auditcore.p2_work_queue
                 SET work_status='PENDING',
-                    next_attempt_at_utc=now() + (:delay_seconds * interval '1 second'),
+                    next_attempt_at_utc=CASE
+                      WHEN :immediate THEN NULL
+                      ELSE now() + (:delay_seconds * interval '1 second')
+                    END,
+                    lease_token=NULL,
                     lease_expires_at_utc=NULL,
                     last_error=:last_error,
                     updated_at_utc=now()
@@ -221,46 +329,32 @@ def _reschedule(engine: Engine, work: WorkItem, exc: RescheduleWork) -> None:
             {
                 "tenant_id": work.tenant_id,
                 "work_id": work.work_id,
+                "immediate": newer_request,
                 "delay_seconds": max(1, exc.delay_seconds),
                 "last_error": str(exc)[:1800],
             },
         )
-        if work.work_type == "DOCUMENT_RECONCILE":
-            try:
-                queue_id = UUID(work.work_key)
-            except ValueError:
-                queue_id = None
-            if queue_id is not None:
-                connection.execute(
-                    text(
-                        """
-                        UPDATE auditcore.p2_document_queue
-                        SET queue_status=CASE
-                              WHEN queue_status='RETRY_WAIT' THEN 'CLASSIFYING'
-                              ELSE queue_status
-                            END,
-                            updated_at_utc=now()
-                        WHERE tenant_id=:tenant_id AND queue_id=:queue_id
-                        """
-                    ),
-                    {"tenant_id": work.tenant_id, "queue_id": queue_id},
-                )
 
 
 def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
-    terminal = work.attempt_count >= _MAX_ATTEMPTS
-    delay = min(300, max(2, 2 ** min(work.attempt_count, 8)))
+    attempts = work.attempt_count + 1
+    terminal = attempts >= _MAX_ATTEMPTS
+    delay = min(300, 2 ** min(attempts, 8))
+    error = f"{exc.__class__.__name__}: {str(exc)[:1800]}"
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
+        _owned(connection, work)
         connection.execute(
             text(
                 """
                 UPDATE auditcore.p2_work_queue
                 SET work_status=:status,
+                    attempt_count=:attempts,
                     next_attempt_at_utc=CASE
                       WHEN :terminal THEN NULL
                       ELSE now() + (:delay_seconds * interval '1 second')
                     END,
+                    lease_token=NULL,
                     lease_expires_at_utc=NULL,
                     last_error=:last_error,
                     updated_at_utc=now()
@@ -271,81 +365,50 @@ def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
                 "tenant_id": work.tenant_id,
                 "work_id": work.work_id,
                 "status": "DEAD_LETTER" if terminal else "RETRY_WAIT",
+                "attempts": attempts,
                 "terminal": terminal,
                 "delay_seconds": delay,
-                "last_error": f"{exc.__class__.__name__}: {str(exc)[:1800]}",
+                "last_error": error,
             },
         )
-        if work.work_type in {"DOCUMENT_INGEST", "DOCUMENT_RECONCILE"}:
-            queue_status = "DEAD_LETTER" if terminal else "RETRY_WAIT"
-            try:
-                queue_id = UUID(work.work_key)
-            except ValueError:
-                queue_id = None
-            if queue_id is not None:
-                batch_id = connection.execute(
-                    text(
-                        """
-                        UPDATE auditcore.p2_document_queue
-                        SET queue_status=:queue_status,
-                            last_error=:last_error,
-                            updated_at_utc=now()
-                        WHERE tenant_id=:tenant_id AND queue_id=:queue_id
-                        RETURNING batch_id
-                        """
-                    ),
-                    {
-                        "tenant_id": work.tenant_id,
-                        "queue_id": queue_id,
-                        "queue_status": queue_status,
-                        "last_error": f"{exc.__class__.__name__}: {str(exc)[:1800]}",
-                    },
-                ).scalar_one_or_none()
-                if terminal and batch_id is not None:
-                    _refresh_batch_status(connection, work.tenant_id, UUID(str(batch_id)))
-        elif work.work_type == "SPLIT_BATCH" and terminal:
-            try:
-                batch_id = UUID(work.work_key)
-            except ValueError:
-                batch_id = None
-            if batch_id is not None:
-                connection.execute(
-                    text(
-                        """
-                        UPDATE auditcore.p2_upload_batches
-                        SET batch_status='FAILED', updated_at_utc=now()
-                        WHERE tenant_id=:tenant_id AND batch_id=:batch_id
-                        """
-                    ),
-                    {"tenant_id": work.tenant_id, "batch_id": batch_id},
-                )
+        if not terminal:
+            return
 
-        if terminal:
+        if work.work_type == "DOCUMENT_INGEST":
+            _settle_page(
+                connection,
+                tenant_id=work.tenant_id,
+                queue_id=UUID(work.work_key),
+                status="FAILED",
+                reason="The page could not be sent for classification. Retry the page.",
+                last_error=error,
+            )
+        elif work.work_type == "SPLIT_BATCH":
             connection.execute(
                 text(
                     """
-                    INSERT INTO auditcore.p2_activity_events (
-                        tenant_id, journey_id, event_type, subject_type,
-                        subject_id, details, correlation_id
-                    ) VALUES (
-                        :tenant_id, :journey_id, 'P2_WORK_DEAD_LETTER',
-                        'WORK_ITEM', :subject_id, CAST(:details AS jsonb), :correlation_id
-                    )
+                    UPDATE auditcore.p2_upload_batches
+                    SET batch_status='FAILED', updated_at_utc=now()
+                    WHERE tenant_id=:tenant_id AND batch_id=:batch_id
                     """
                 ),
-                {
-                    "tenant_id": work.tenant_id,
-                    "journey_id": work.journey_id,
-                    "subject_id": str(work.work_id),
-                    "details": json.dumps({
-                        "workType": work.work_type,
-                        "workKey": work.work_key,
-                        "attempts": work.attempt_count,
-                        "error": str(exc)[:1800],
-                    }),
-                    "correlation_id": work.correlation_id,
-                },
+                {"tenant_id": work.tenant_id, "batch_id": UUID(work.work_key)},
             )
+        record_activity(
+            connection,
+            tenant_id=work.tenant_id,
+            journey_id=work.journey_id,
+            event_type="P2_WORK_DEAD_LETTER",
+            subject_type="WORK_ITEM",
+            subject_id=str(work.work_id),
+            details={
+                "workType": work.work_type,
+                "workKey": work.work_key,
+                "attempts": attempts,
+                "error": str(exc)[:1800],
+            },
+            correlation_id=work.correlation_id,
+        )
 
 
 def _enqueue(
@@ -360,6 +423,9 @@ def _enqueue(
     delay_seconds: int = 0,
     requested_version: int | None = None,
 ) -> None:
+    """Idempotently request work. Re-requesting an item always marks it dirty
+    (requested_version advances), so an item that is running when a new
+    request arrives runs again after it completes."""
     connection.execute(
         text(
             """
@@ -369,7 +435,7 @@ def _enqueue(
                 next_attempt_at_utc, correlation_id
             ) VALUES (
                 :tenant_id, :journey_id, :work_type, :work_key,
-                CAST(:payload AS jsonb), :requested_version, 'PENDING',
+                CAST(:payload AS jsonb), COALESCE(:requested_version, 1), 'PENDING',
                 CASE WHEN :delay_seconds > 0
                      THEN now() + (:delay_seconds * interval '1 second')
                      ELSE NULL END,
@@ -377,28 +443,29 @@ def _enqueue(
             )
             ON CONFLICT (tenant_id, work_type, work_key)
             DO UPDATE SET payload=EXCLUDED.payload,
-                          requested_version=CASE
-                            WHEN EXCLUDED.requested_version IS NULL
-                              THEN auditcore.p2_work_queue.requested_version
-                            ELSE GREATEST(
-                              COALESCE(auditcore.p2_work_queue.requested_version,0),
-                              EXCLUDED.requested_version
-                            )
-                          END,
+                          requested_version=GREATEST(
+                            COALESCE(auditcore.p2_work_queue.requested_version, 0) + 1,
+                            COALESCE(:requested_version, 0)
+                          ),
                           work_status=CASE
                             WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
                               THEN auditcore.p2_work_queue.work_status
                             ELSE 'PENDING'
                           END,
+                          attempt_count=CASE
+                            WHEN auditcore.p2_work_queue.work_status IN ('COMPLETED','DEAD_LETTER','CANCELLED')
+                              THEN 0
+                            ELSE auditcore.p2_work_queue.attempt_count
+                          END,
                           next_attempt_at_utc=CASE
                             WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
                               THEN auditcore.p2_work_queue.next_attempt_at_utc
+                            WHEN auditcore.p2_work_queue.work_status IN ('PENDING','RETRY_WAIT')
+                              AND auditcore.p2_work_queue.next_attempt_at_utc IS NOT NULL
+                              AND EXCLUDED.next_attempt_at_utc IS NOT NULL
+                              THEN LEAST(auditcore.p2_work_queue.next_attempt_at_utc,
+                                         EXCLUDED.next_attempt_at_utc)
                             ELSE EXCLUDED.next_attempt_at_utc
-                          END,
-                          lease_expires_at_utc=CASE
-                            WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
-                              THEN auditcore.p2_work_queue.lease_expires_at_utc
-                            ELSE NULL
                           END,
                           last_error=CASE
                             WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
@@ -419,6 +486,40 @@ def _enqueue(
             "correlation_id": correlation_id,
         },
     )
+
+
+def _settle_page(
+    connection,
+    *,
+    tenant_id: str,
+    queue_id: UUID,
+    status: str,
+    reason: str | None,
+    last_error: str | None = None,
+) -> UUID | None:
+    batch_id = connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue
+            SET queue_status=:status,
+                status_reason=:reason,
+                last_error=COALESCE(:last_error, last_error),
+                updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+            RETURNING batch_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "queue_id": queue_id,
+            "status": status,
+            "reason": reason,
+            "last_error": last_error,
+        },
+    ).scalar_one_or_none()
+    if batch_id is not None:
+        _refresh_batch_status(connection, tenant_id, UUID(str(batch_id)))
+    return UUID(str(batch_id)) if batch_id is not None else None
 
 
 def _single_page_pdf(page) -> bytes:
@@ -502,6 +603,7 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
 
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
+        _owned(connection, work)
         for record in page_records:
             queue_id = uuid4()
             connection.execute(
@@ -582,33 +684,24 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                 "page_count": len(page_records),
             },
         )
-        connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.p2_activity_events (
-                    tenant_id, journey_id, event_type, subject_type,
-                    subject_id, details, correlation_id
-                ) VALUES (
-                    :tenant_id, :journey_id, 'UPLOAD_SPLIT_COMPLETE',
-                    'UPLOAD_BATCH', :subject_id, CAST(:details AS jsonb), :correlation_id
-                )
-                """
-            ),
-            {
-                "tenant_id": work.tenant_id,
-                "journey_id": work.journey_id,
-                "subject_id": str(batch["batch_id"]),
-                "details": json.dumps(
-                    {"pageCount": len(page_records), "sha256": digest}
-                ),
-                "correlation_id": work.correlation_id,
-            },
+        record_activity(
+            connection,
+            tenant_id=work.tenant_id,
+            journey_id=work.journey_id,
+            event_type="UPLOAD_SPLIT_COMPLETE",
+            subject_type="UPLOAD_BATCH",
+            subject_id=str(batch["batch_id"]),
+            details={"pageCount": len(page_records), "sha256": digest},
+            correlation_id=work.correlation_id,
         )
 
 
 def _di_context_and_requirements(engine: Engine, work: WorkItem) -> tuple[str, str, list[str], dict[str, str]]:
     security_client = get_security_oauth_client()
     di_client = get_di_client()
+    # Warm the service-token cache before any transaction opens, so the
+    # context read below does not wait on Security inside a transaction.
+    security_client.get_service_token(audience=_DI_AUDIENCE)
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
         booking, delivery = _merged_candidate_requirements(
@@ -666,17 +759,10 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
             ),
             {"tenant_id": work.tenant_id, "queue_id": queue_id},
         ).mappings().one()
+        if row["queue_status"] in _PAGE_SETTLED_STATES:
+            return
         if row["di_document_id"] is not None:
-            _enqueue(
-                connection,
-                tenant_id=work.tenant_id,
-                journey_id=work.journey_id,
-                work_type="DOCUMENT_RECONCILE",
-                work_key=str(queue_id),
-                payload=work.payload,
-                correlation_id=work.correlation_id,
-                delay_seconds=_RECONCILE_DELAY_SECONDS,
-            )
+            _enqueue_journey_reconcile(connection, work=work)
             return
         connection.execute(
             text(
@@ -774,6 +860,9 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
                 UPDATE auditcore.p2_document_queue
                 SET di_document_id=:document_id,
                     queue_status='CLASSIFYING',
+                    di_state='STORED',
+                    di_submitted_at_utc=COALESCE(di_submitted_at_utc, now()),
+                    status_reason=NULL,
                     updated_at_utc=now()
                 WHERE tenant_id=:tenant_id AND queue_id=:queue_id
                 """
@@ -784,100 +873,188 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
                 "document_id": di_document_id,
             },
         )
-        _enqueue(
-            connection,
-            tenant_id=work.tenant_id,
-            journey_id=work.journey_id,
-            work_type="DOCUMENT_RECONCILE",
-            work_key=str(queue_id),
-            payload={
-                **work.payload,
-                "diDocumentId": str(di_document_id),
-            },
-            correlation_id=work.correlation_id,
-            delay_seconds=_RECONCILE_DELAY_SECONDS,
-        )
+        _enqueue_journey_reconcile(connection, work=work)
 
 
-def _reconcile_document(engine: Engine, work: WorkItem) -> None:
-    queue_id = UUID(work.work_key)
+def _enqueue_journey_reconcile(connection, *, work: WorkItem, delay_seconds: int = 2) -> None:
+    _enqueue(
+        connection,
+        tenant_id=work.tenant_id,
+        journey_id=work.journey_id,
+        work_type="JOURNEY_RECONCILE",
+        work_key=str(work.journey_id),
+        payload={
+            "uploadedBy": work.payload.get("uploadedBy"),
+            "uploadedByRole": work.payload.get("uploadedByRole"),
+        },
+        correlation_id=work.correlation_id,
+        delay_seconds=delay_seconds,
+    )
+
+
+@dataclass(frozen=True)
+class PageOutcome:
+    status: str
+    reason: str | None
+
+
+def classify_page_outcome(
+    *,
+    di_item: dict[str, Any] | None,
+    extracted_count: int,
+    submitted_at: datetime | None,
+    processed_seen_at: datetime | None,
+    now: datetime,
+) -> PageOutcome:
+    """Map DI's durable capture state onto one P2 page state.
+
+    DI capture states: RECEIVING, STORED, CLASSIFYING, CLASSIFIED, UNKNOWN,
+    FAILED, DELETED. DI processing (extraction) status: NOT_STARTED,
+    PROCESSING, RETRY_PENDING, PROCESSED, FAILED. Facts reach Audit Core via
+    the existing document-link sync, so READY means Audit Core has durable
+    facts, not merely that DI finished."""
+    age = (now - submitted_at).total_seconds() if submitted_at else 0.0
+    if extracted_count > 0:
+        return PageOutcome("READY", None)
+    if di_item is None:
+        if age > 300:
+            return PageOutcome("FAILED", "The page is no longer known to Document Intelligence. Retry the page.")
+        return PageOutcome("CLASSIFYING", None)
+
+    state = str(di_item.get("state") or "")
+    processing = str(di_item.get("processingStatus") or "")
+    if state == "DELETED":
+        return PageOutcome("CANCELLED", "The page was removed from Document Intelligence.")
+    if state == "FAILED" or processing == "FAILED":
+        return PageOutcome("FAILED", "Document Intelligence could not read this page. Retry or re-upload it.")
+    if state == "UNKNOWN":
+        return PageOutcome("NEEDS_REVIEW", "The document type was not recognised.")
+    if state == "CLASSIFIED" and processing == "PROCESSED":
+        waited = (now - processed_seen_at).total_seconds() if processed_seen_at else 0.0
+        if waited > _SYNC_GRACE_SECONDS:
+            return PageOutcome("NEEDS_REVIEW", "No fields could be extracted from this page.")
+        return PageOutcome("SYNCING_TO_AUDIT_CORE", None)
+    if age > _PAGE_DEADLINE_SECONDS:
+        return PageOutcome("FAILED", "Processing did not finish in time. Retry the page.")
+    if state == "CLASSIFIED":
+        return PageOutcome("EXTRACTING", None)
+    return PageOutcome("CLASSIFYING", None)
+
+
+def _reconcile_delay(oldest_submitted: datetime | None, now: datetime) -> int:
+    age = (now - oldest_submitted).total_seconds() if oldest_submitted else 0.0
+    if age < 60:
+        return 2
+    if age < 300:
+        return 5
+    return 15
+
+
+def _journey_reconcile(engine: Engine, work: WorkItem) -> None:
+    """Reconcile every in-flight page of one Journey with a single DI listing.
+
+    1. short read: which pages are waiting on DI
+    2. DI listing for both phases (no transaction open)
+    3. short write: apply classification, settle pages, request recompute
+    """
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
-        queue = connection.execute(
+        pending = connection.execute(
             text(
                 """
-                SELECT queue_id, batch_id, di_document_id, queue_status
+                SELECT queue_id, batch_id, di_document_id, queue_status,
+                       di_submitted_at_utc, di_processed_seen_at_utc, created_at_utc
                 FROM auditcore.p2_document_queue
-                WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND di_document_id IS NOT NULL
+                  AND queue_status = ANY(:states)
                 """
             ),
-            {"tenant_id": work.tenant_id, "queue_id": queue_id},
-        ).mappings().one()
-        if queue["di_document_id"] is None:
-            raise RuntimeError("P2 page has no DI document id")
-        di_document_id = UUID(str(queue["di_document_id"]))
+            {
+                "tenant_id": work.tenant_id,
+                "journey_id": work.journey_id,
+                "states": list(_PAGE_RECONCILE_STATES),
+            },
+        ).mappings().all()
+    if not pending:
+        return
 
     context_ref, token, _, _ = _di_context_and_requirements(engine, work)
     v2_client = get_di_capture_v2_client()
-
-    # Reuse the current unified reconciliation so legacy durable evidence and
-    # materializers continue to receive the same document/classification semantics.
-    with engine.begin() as connection:
-        set_tenant_context(connection, work.tenant_id)
-        reconcile_unified_documents(
-            connection,
-            tenant_id=work.tenant_id,
-            journey_id=work.journey_id,
-            actor_id=str(work.payload.get("uploadedBy") or "SYSTEM"),
-            actor_role=str(work.payload.get("uploadedByRole") or "PC"),
-            correlation_id=work.correlation_id or "",
-            v2_client=v2_client,
-            context_ref=context_ref,
-            token=token,
-        )
-
-    # Read DI state without keeping a DB transaction open.
-    di_item: dict[str, Any] | None = None
+    di_documents: dict[str, dict[str, Any]] = {}
     for phase in ("BOOKING", "DELIVERY"):
-        payload = v2_client.list_documents(
+        listing = v2_client.list_documents(
             token=token,
             tenant_id=work.tenant_id,
             external_context_ref=context_ref,
             phase=phase,
         )
-        for item in payload.get("documents") or []:
-            if str(item.get("documentId")) == str(di_document_id):
-                di_item = item
-                break
-        if di_item is not None:
-            break
+        for item in listing.get("documents") or []:
+            di_documents.setdefault(str(item.get("documentId")), item)
 
+    now = datetime.now(UTC)
+    still_waiting = False
+    oldest_waiting: datetime | None = None
+    facts_changed = False
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
-        extracted_count = int(
-            connection.execute(
-                text(
-                    """
-                    SELECT COUNT(*)
-                    FROM auditcore.journey_document_extracted_fields
-                    WHERE tenant_id=:tenant_id
-                      AND journey_id=:journey_id
-                      AND di_document_id=:document_id
-                    """
-                ),
-                {
-                    "tenant_id": work.tenant_id,
-                    "journey_id": work.journey_id,
-                    "document_id": di_document_id,
-                },
-            ).scalar_one()
-            or 0
+        _owned(connection, work)
+        apply_di_classification(
+            connection,
+            tenant_id=work.tenant_id,
+            journey_id=work.journey_id,
+            di_documents=list(di_documents.values()),
+            actor_id=str(work.payload.get("uploadedBy") or "SYSTEM"),
+            actor_role=str(work.payload.get("uploadedByRole") or "PC"),
+            correlation_id=work.correlation_id or "",
         )
-        local = connection.execute(
+        for page in pending:
+            outcome = _reconcile_page(
+                connection,
+                work=work,
+                page=dict(page),
+                di_item=di_documents.get(str(page["di_document_id"])),
+                now=now,
+            )
+            if outcome.status == "READY":
+                facts_changed = True
+            if outcome.status not in _PAGE_SETTLED_STATES:
+                still_waiting = True
+                submitted = page["di_submitted_at_utc"] or page["created_at_utc"]
+                if oldest_waiting is None or submitted < oldest_waiting:
+                    oldest_waiting = submitted
+        if facts_changed:
+            note_facts_changed(
+                connection,
+                tenant_id=work.tenant_id,
+                journey_id=work.journey_id,
+                reason="DOCUMENT_READY",
+                correlation_id=work.correlation_id,
+            )
+
+    if still_waiting:
+        raise RescheduleWork(
+            "Waiting for Document Intelligence to finish processing.",
+            delay_seconds=_reconcile_delay(oldest_waiting, now),
+        )
+
+
+def _reconcile_page(
+    connection,
+    *,
+    work: WorkItem,
+    page: dict[str, Any],
+    di_item: dict[str, Any] | None,
+    now: datetime,
+) -> PageOutcome:
+    queue_id = UUID(str(page["queue_id"]))
+    di_document_id = UUID(str(page["di_document_id"]))
+    extracted_count = int(
+        connection.execute(
             text(
                 """
-                SELECT classified_document_type_key, stage_code
-                FROM auditcore.document_capture_v2_documents
+                SELECT COUNT(*)
+                FROM auditcore.journey_document_extracted_fields
                 WHERE tenant_id=:tenant_id AND journey_id=:journey_id
                   AND di_document_id=:document_id
                 """
@@ -887,93 +1064,121 @@ def _reconcile_document(engine: Engine, work: WorkItem) -> None:
                 "journey_id": work.journey_id,
                 "document_id": di_document_id,
             },
-        ).mappings().one_or_none()
+        ).scalar_one()
+        or 0
+    )
+    local = connection.execute(
+        text(
+            """
+            SELECT classified_document_type_key, stage_code
+            FROM auditcore.document_capture_v2_documents
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND di_document_id=:document_id
+            """
+        ),
+        {
+            "tenant_id": work.tenant_id,
+            "journey_id": work.journey_id,
+            "document_id": di_document_id,
+        },
+    ).mappings().one_or_none()
 
-        if extracted_count > 0:
-            status = "READY"
-        elif di_item is None:
-            status = "RETRY_WAIT"
-        elif di_item.get("classifiedDocumentTypeKey"):
-            status = "EXTRACTING"
-        else:
-            status = "CLASSIFYING"
+    processed_seen_at = page["di_processed_seen_at_utc"]
+    if (
+        processed_seen_at is None
+        and di_item is not None
+        and di_item.get("processingStatus") == "PROCESSED"
+    ):
+        processed_seen_at = now
+    outcome = classify_page_outcome(
+        di_item=di_item,
+        extracted_count=extracted_count,
+        submitted_at=page["di_submitted_at_utc"] or page["created_at_utc"],
+        processed_seen_at=processed_seen_at,
+        now=now,
+    )
 
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.p2_document_queue
-                SET queue_status=:status,
-                    classified_document_type=:document_type,
-                    business_stage=:business_stage,
-                    extracted_field_count=:field_count,
-                    updated_at_utc=now()
-                WHERE tenant_id=:tenant_id AND queue_id=:queue_id
-                """
-            ),
-            {
-                "tenant_id": work.tenant_id,
-                "queue_id": queue_id,
-                "status": status,
-                "document_type": (
-                    local["classified_document_type_key"] if local
-                    else (di_item or {}).get("classifiedDocumentTypeKey")
-                ),
-                "business_stage": local["stage_code"] if local else None,
-                "field_count": extracted_count,
+    if outcome.status == "READY" and not _apply_replacement_lineage(
+        connection,
+        tenant_id=work.tenant_id,
+        journey_id=work.journey_id,
+        batch_id=UUID(str(page["batch_id"])),
+        new_document_id=di_document_id,
+    ):
+        # Facts exist but the replacement's evidence row has not been
+        # activated yet; keep syncing rather than half-applying lineage.
+        outcome = PageOutcome("SYNCING_TO_AUDIT_CORE", None)
+
+    document_type = (
+        (local["classified_document_type_key"] if local else None)
+        or (di_item or {}).get("classifiedDocumentTypeKey")
+    )
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue
+            SET queue_status=:status,
+                status_reason=:reason,
+                classified_document_type=COALESCE(:document_type, classified_document_type),
+                business_stage=COALESCE(:business_stage, business_stage),
+                extracted_field_count=:field_count,
+                di_state=:di_state,
+                di_processing_status=:di_processing_status,
+                di_processed_seen_at_utc=:processed_seen_at,
+                updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+              AND (
+                queue_status IS DISTINCT FROM :status
+                OR status_reason IS DISTINCT FROM :reason
+                OR classified_document_type IS DISTINCT FROM COALESCE(:document_type, classified_document_type)
+                OR business_stage IS DISTINCT FROM COALESCE(:business_stage, business_stage)
+                OR extracted_field_count IS DISTINCT FROM :field_count
+                OR di_state IS DISTINCT FROM :di_state
+                OR di_processing_status IS DISTINCT FROM :di_processing_status
+                OR di_processed_seen_at_utc IS DISTINCT FROM :processed_seen_at
+              )
+            """
+        ),
+        {
+            "tenant_id": work.tenant_id,
+            "queue_id": queue_id,
+            "status": outcome.status,
+            "reason": outcome.reason,
+            "document_type": document_type,
+            "business_stage": local["stage_code"] if local else None,
+            "field_count": extracted_count,
+            "di_state": (di_item or {}).get("state"),
+            "di_processing_status": (di_item or {}).get("processingStatus"),
+            "processed_seen_at": processed_seen_at,
+        },
+    )
+
+    if outcome.status in _PAGE_SETTLED_STATES and page["queue_status"] not in _PAGE_SETTLED_STATES:
+        _refresh_batch_status(connection, work.tenant_id, UUID(str(page["batch_id"])))
+        record_activity(
+            connection,
+            tenant_id=work.tenant_id,
+            journey_id=work.journey_id,
+            event_type="DOCUMENT_READY" if outcome.status == "READY" else "DOCUMENT_SETTLED",
+            subject_type="DOCUMENT_PAGE",
+            subject_id=str(queue_id),
+            details={
+                "diDocumentId": str(di_document_id),
+                "documentType": document_type,
+                "fieldCount": extracted_count,
+                "status": outcome.status,
+                "reason": outcome.reason,
             },
+            correlation_id=work.correlation_id,
         )
+    return outcome
 
-        if status == "READY":
-            _apply_replacement_lineage(
-                connection,
-                tenant_id=work.tenant_id,
-                journey_id=work.journey_id,
-                batch_id=UUID(str(queue["batch_id"])),
-                new_document_id=di_document_id,
-            )
-            _enqueue(
-                connection,
-                tenant_id=work.tenant_id,
-                journey_id=work.journey_id,
-                work_type="STAGE_RECOMPUTE",
-                work_key=f"booking:{work.journey_id}",
-                payload={"stage": "BOOKING"},
-                correlation_id=work.correlation_id,
-            )
-            connection.execute(
-                text(
-                    """
-                    INSERT INTO auditcore.p2_activity_events (
-                        tenant_id, journey_id, event_type, subject_type,
-                        subject_id, details, correlation_id
-                    ) VALUES (
-                        :tenant_id, :journey_id, 'DOCUMENT_READY',
-                        'DOCUMENT_PAGE', :subject_id, CAST(:details AS jsonb),
-                        :correlation_id
-                    )
-                    """
-                ),
-                {
-                    "tenant_id": work.tenant_id,
-                    "journey_id": work.journey_id,
-                    "subject_id": str(queue_id),
-                    "details": json.dumps({
-                        "diDocumentId": str(di_document_id),
-                        "documentType": (
-                            local["classified_document_type_key"] if local else None
-                        ),
-                        "fieldCount": extracted_count,
-                    }),
-                    "correlation_id": work.correlation_id,
-                },
-            )
-            _refresh_batch_status(connection, work.tenant_id, UUID(str(queue["batch_id"])))
-        else:
-            raise RescheduleWork(
-                f"DI document {di_document_id} is still {status}",
-                delay_seconds=_RECONCILE_DELAY_SECONDS,
-            )
 
+def _legacy_document_reconcile(engine: Engine, work: WorkItem) -> None:
+    """Items queued before 0121 reconcile through the Journey-level path."""
+    with engine.begin() as connection:
+        set_tenant_context(connection, work.tenant_id)
+        _enqueue_journey_reconcile(connection, work=work, delay_seconds=0)
 
 
 def _apply_replacement_lineage(
@@ -983,7 +1188,12 @@ def _apply_replacement_lineage(
     journey_id: UUID,
     batch_id: UUID,
     new_document_id: UUID,
-) -> None:
+) -> bool:
+    """Supersede the replaced document once the replacement is live.
+
+    Returns False while the replacement has no ACTIVE evidence yet (the
+    caller keeps the page syncing); True once lineage is applied or when the
+    batch is not a replacement at all."""
     replacement = connection.execute(
         text(
             """
@@ -999,9 +1209,9 @@ def _apply_replacement_lineage(
     old_document_id = replacement["replaces_document_id"]
     old_evidence_id = replacement["replaces_evidence_id"]
     if old_document_id is None or old_evidence_id is None:
-        return
+        return True
     if replacement["replacement_applied_at_utc"] is not None:
-        return
+        return True
 
     new_evidence = connection.execute(
         text(
@@ -1022,10 +1232,7 @@ def _apply_replacement_lineage(
         },
     ).scalar_one_or_none()
     if new_evidence is None:
-        raise RescheduleWork(
-            "Replacement document has not produced active Audit Core evidence yet.",
-            delay_seconds=_RECONCILE_DELAY_SECONDS,
-        )
+        return False
 
     connection.execute(
         text(
@@ -1055,7 +1262,7 @@ def _apply_replacement_lineage(
         ),
         {"tenant_id": tenant_id, "old_evidence_id": old_evidence_id},
     )
-    connection.execute(
+    old_stage = connection.execute(
         text(
             """
             UPDATE auditcore.document_capture_v2_documents
@@ -1063,6 +1270,7 @@ def _apply_replacement_lineage(
             WHERE tenant_id=:tenant_id
               AND journey_id=:journey_id
               AND di_document_id=:old_document_id
+            RETURNING stage_code
             """
         ),
         {
@@ -1070,7 +1278,10 @@ def _apply_replacement_lineage(
             "journey_id": journey_id,
             "old_document_id": old_document_id,
         },
-    )
+    ).scalar_one_or_none()
+    # The superseded document's facts must stop feeding canonical Journey
+    # state: re-materialize the stage it belonged to from ACTIVE evidence.
+    _rematerialize_stage(connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=old_stage)
     connection.execute(
         text(
             """
@@ -1081,40 +1292,44 @@ def _apply_replacement_lineage(
         ),
         {"tenant_id": tenant_id, "batch_id": batch_id},
     )
-    connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.p2_activity_events (
-                tenant_id, journey_id, event_type, subject_type,
-                subject_id, details
-            ) VALUES (
-                :tenant_id, :journey_id, 'DOCUMENT_REPLACED',
-                'DOCUMENT', :new_document_id,
-                jsonb_build_object(
-                    'replacesDocumentId', :old_document_id,
-                    'newEvidenceId', :new_evidence_id,
-                    'oldEvidenceId', :old_evidence_id
-                )
-            )
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "new_document_id": str(new_document_id),
-            "old_document_id": str(old_document_id),
-            "new_evidence_id": str(new_evidence),
-            "old_evidence_id": str(old_evidence_id),
+    record_activity(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        event_type="DOCUMENT_REPLACED",
+        subject_type="DOCUMENT",
+        subject_id=str(new_document_id),
+        details={
+            "replacesDocumentId": str(old_document_id),
+            "newEvidenceId": str(new_evidence),
+            "oldEvidenceId": str(old_evidence_id),
         },
     )
+    return True
+
+
+def _rematerialize_stage(connection, *, tenant_id: str, journey_id: UUID, stage_code: str | None) -> None:
+    from audit_core.uc03_delivery_post_extraction_materialization import (
+        materialize_booking_documents_from_durable_store,
+        materialize_delivery_documents_from_durable_store,
+    )
+
+    if str(stage_code or "BOOKING").upper() == "DELIVERY":
+        materialize_delivery_documents_from_durable_store(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+        )
+    else:
+        materialize_booking_documents_from_durable_store(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+        )
 
 
 def _refresh_batch_status(connection, tenant_id: str, batch_id: UUID) -> None:
     counts = connection.execute(
         text(
             """
-            SELECT COUNT(*) AS total,
-                   COUNT(*) FILTER (WHERE queue_status='READY') AS ready,
+            SELECT COUNT(*) FILTER (WHERE queue_status <> 'CANCELLED') AS total,
+                   COUNT(*) FILTER (WHERE queue_status IN ('READY','NEEDS_REVIEW')) AS usable,
                    COUNT(*) FILTER (WHERE queue_status IN ('FAILED','DEAD_LETTER')) AS failed
             FROM auditcore.p2_document_queue
             WHERE tenant_id=:tenant_id AND batch_id=:batch_id
@@ -1122,11 +1337,13 @@ def _refresh_batch_status(connection, tenant_id: str, batch_id: UUID) -> None:
         ),
         {"tenant_id": tenant_id, "batch_id": batch_id},
     ).mappings().one()
-    total, ready, failed = int(counts["total"]), int(counts["ready"]), int(counts["failed"])
-    if total > 0 and ready == total:
+    total, usable, failed = int(counts["total"]), int(counts["usable"]), int(counts["failed"])
+    if total > 0 and usable == total:
         status = "COMPLETED"
-    elif failed > 0 and ready + failed == total:
-        status = "PARTIAL_FAILURE" if ready else "FAILED"
+    elif failed > 0 and usable + failed == total:
+        status = "PARTIAL_FAILURE" if usable else "FAILED"
+    elif total == 0:
+        status = "CANCELLED"
     else:
         status = "PROCESSING"
     connection.execute(
@@ -1626,7 +1843,8 @@ def process_work(engine: Engine, work: WorkItem) -> None:
     handlers = {
         "SPLIT_BATCH": _split_batch,
         "DOCUMENT_INGEST": _ingest_document,
-        "DOCUMENT_RECONCILE": _reconcile_document,
+        "DOCUMENT_RECONCILE": _legacy_document_reconcile,
+        "JOURNEY_RECONCILE": _journey_reconcile,
         "STAGE_RECOMPUTE": _stage_recompute,
         "TASK_VERIFY": _task_verify,
         "CONTROL_EVALUATE": _control_evaluate,
@@ -1637,14 +1855,95 @@ def process_work(engine: Engine, work: WorkItem) -> None:
     handler(engine, work)
 
 
+_SWEEP_CANDIDATES_SQL = text(
+    """
+    SELECT journey_id FROM auditcore.journey_document_extracted_fields
+     WHERE tenant_id=:tenant_id AND updated_at_utc > now() - (:minutes * interval '1 minute')
+    UNION
+    SELECT journey_id FROM auditcore.payments
+     WHERE tenant_id=:tenant_id AND updated_at_utc > now() - (:minutes * interval '1 minute')
+    UNION
+    SELECT journey_id FROM auditcore.workflow_tasks
+     WHERE tenant_id=:tenant_id AND task_type='MANUAL_VERIFICATION_REVIEW'
+       AND updated_at_utc > now() - (:minutes * interval '1 minute')
+    """
+)
+
+
+def _fact_sweep(engine: Engine, tenant_id: str) -> int:
+    """Safety net for fact changes made outside P2 code paths.
+
+    Journeys touched in the recent window are fingerprinted; only a real
+    change against the stored fingerprint requests recomputation, so the
+    sweep is idempotent and cheap. The window is deliberately wider than the
+    sweep interval so a long-running writer transaction (whose updated_at is
+    its start time) is still observed after it commits."""
+    changed = 0
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        journeys = connection.execute(
+            _SWEEP_CANDIDATES_SQL,
+            {"tenant_id": tenant_id, "minutes": _FACT_SWEEP_WINDOW_MINUTES},
+        ).scalars().all()
+        for journey_id in journeys:
+            current = fact_fingerprint(connection, tenant_id=tenant_id, journey_id=journey_id)
+            stored = connection.execute(
+                text(
+                    """
+                    SELECT fact_fingerprint FROM auditcore.p2_journey_runtime
+                    WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                    """
+                ),
+                {"tenant_id": tenant_id, "journey_id": journey_id},
+            ).scalar_one_or_none()
+            if stored == current:
+                continue
+            note_facts_changed(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                reason="FACT_SWEEP",
+            )
+            changed += 1
+    return changed
+
+
+_last_sweep_at: dict[str, float] = {}
+
+
+def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
+    now = time.monotonic()
+    if now - _last_sweep_at.get(tenant_id, 0.0) < _FACT_SWEEP_SECONDS:
+        return
+    _last_sweep_at[tenant_id] = now
+    try:
+        changed = _fact_sweep(engine, tenant_id)
+        if changed:
+            logger.info("p2_fact_sweep_changes", tenant_id=tenant_id, journeys=changed)
+    except Exception:
+        logger.warning("p2_fact_sweep_failed", tenant_id=tenant_id, exc_info=True)
+
+
+def _settle(engine: Engine, work: WorkItem, action, *args) -> None:
+    try:
+        action(engine, work, *args)
+    except LeaseLost:
+        logger.warning(
+            "p2_work_lease_lost",
+            tenant_id=work.tenant_id,
+            work_type=work.work_type,
+            work_key=work.work_key,
+        )
+
+
 def run_once(engine: Engine | None = None) -> int:
     engine = engine or get_engine()
     claimed: list[WorkItem] = []
     for tenant_id in _active_tenants(engine):
+        _maybe_sweep(engine, tenant_id)
         remaining = _WORKER_CONCURRENCY - len(claimed)
-        if remaining <= 0:
-            break
-        claimed.extend(_claim_for_tenant(engine, tenant_id, remaining))
+        if remaining > 0:
+            claimed.extend(_claim_for_tenant(engine, tenant_id, remaining))
     if not claimed:
         return 0
 
@@ -1655,7 +1954,14 @@ def run_once(engine: Engine | None = None) -> int:
             try:
                 future.result()
             except RescheduleWork as exc:
-                _reschedule(engine, work, exc)
+                _settle(engine, work, _reschedule, exc)
+            except LeaseLost:
+                logger.warning(
+                    "p2_work_lease_lost",
+                    tenant_id=work.tenant_id,
+                    work_type=work.work_type,
+                    work_key=work.work_key,
+                )
             except Exception as exc:
                 logger.warning(
                     "p2_work_failed",
@@ -1663,11 +1969,12 @@ def run_once(engine: Engine | None = None) -> int:
                     journey_id=str(work.journey_id),
                     work_type=work.work_type,
                     work_key=work.work_key,
+                    attempt=work.attempt_count + 1,
                     exc_info=True,
                 )
-                _fail(engine, work, exc)
+                _settle(engine, work, _fail, exc)
             else:
-                _complete(engine, work)
+                _settle(engine, work, _complete)
     return len(claimed)
 
 
@@ -1677,9 +1984,15 @@ def main() -> None:
         "p2_worker_started",
         worker_id=_WORKER_ID,
         concurrency=_WORKER_CONCURRENCY,
+        per_journey_concurrency=_PER_JOURNEY_CONCURRENCY,
     )
     while True:
-        processed = run_once(engine)
+        try:
+            processed = run_once(engine)
+        except Exception:
+            # A database blip must not kill the worker process.
+            logger.warning("p2_worker_cycle_failed", exc_info=True)
+            processed = 0
         if processed == 0:
             time.sleep(_POLL_SECONDS)
 

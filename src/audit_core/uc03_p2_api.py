@@ -19,9 +19,10 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, Engine, text
 
-from audit_core.dependencies import get_connection, get_human_principal
+from audit_core.db import set_tenant_context
+from audit_core.dependencies import get_connection, get_engine, get_human_principal
 from audit_core.errors import DependencyUnavailableError
 from audit_core.observability import get_correlation_id
 from audit_core.security import HumanPrincipal
@@ -29,7 +30,12 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
-from audit_core.uc03_p2_access import P2AccessContext, authorize_p2
+from audit_core.uc03_p2_access import (
+    P2AccessContext,
+    authorize_p2,
+    check_p2_permission,
+    resolve_p2_scope,
+)
 from audit_core.uc03_p2_stage import read_booking_stage
 from audit_core.uc03_p2_storage import (
     P2DocumentStorageError,
@@ -520,9 +526,9 @@ def replace_document(
             detail="Phase 2 document storage is not configured."
         ) from exc
 
-    batch_id = uuid4()
-    object_key = (
-        f"p2-documents/{tenant_id}/{journey_id}/{batch_id}/original/"
+    candidate_batch_id = uuid4()
+    candidate_key = (
+        f"p2-documents/{tenant_id}/{journey_id}/{candidate_batch_id}/original/"
         f"{_safe_filename(command.filename)}"
     )
     connection.execute(
@@ -539,23 +545,67 @@ def replace_document(
                 :object_key, 'AWAITING_UPLOAD', :actor_id,
                 :correlation_id, :document_id, :evidence_id
             )
+            ON CONFLICT (tenant_id, journey_id, client_upload_id)
+              WHERE client_upload_id IS NOT NULL
+            DO NOTHING
             """
         ),
         {
             "tenant_id": tenant_id,
-            "batch_id": batch_id,
+            "batch_id": candidate_batch_id,
             "journey_id": journey_id,
             "client_upload_id": command.clientUploadId,
             "filename": command.filename,
             "content_type": content_type,
             "size_bytes": command.sizeBytes,
-            "object_key": object_key,
+            "object_key": candidate_key,
             "actor_id": human_principal.subject,
             "correlation_id": get_correlation_id(request),
             "document_id": document_id,
             "evidence_id": evidence["evidence_id"],
         },
     )
+    existing = connection.execute(
+        text(
+            """
+            SELECT batch_id, original_object_key, batch_status, replaces_document_id,
+                   original_filename, content_type, size_bytes
+            FROM auditcore.p2_upload_batches
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND client_upload_id=:client_upload_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "client_upload_id": command.clientUploadId,
+        },
+    ).mappings().one()
+    if (
+        existing["replaces_document_id"] != document_id
+        or str(existing["original_filename"]) != command.filename
+        or str(existing["content_type"]) != content_type
+        or int(existing["size_bytes"]) != command.sizeBytes
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"{command.filename}: clientUploadId was already used for a different upload.",
+        )
+    batch_id = UUID(str(existing["batch_id"]))
+    object_key = str(existing["original_object_key"])
+    if existing["batch_status"] != "AWAITING_UPLOAD":
+        return {
+            "journeyId": str(journey_id),
+            "batchId": str(batch_id),
+            "clientUploadId": command.clientUploadId,
+            "filename": command.filename,
+            "status": str(existing["batch_status"]),
+            "alreadyAccepted": True,
+            "uploadUrl": None,
+            "uploadHeaders": {},
+            "expiresInSeconds": 0,
+            "replacesDocumentId": str(document_id),
+        }
     try:
         upload_url = storage.presign_put(
             object_key,
@@ -593,7 +643,7 @@ def replace_document(
     }
 
 
-@router.post("/journeys/{journey_id}/uploads/{batch_id}:finalize")
+@router.post("/journeys/{journey_id}/uploads/{batch_id}:finalize", status_code=202)
 def finalize_upload(
     tenant_id: str,
     journey_id: UUID,
@@ -603,35 +653,43 @@ def finalize_upload(
     authorization_client: Annotated[
         SecurityAuthorizationClient, Depends(get_security_authorization_client)
     ],
-    connection: Annotated[Connection, Depends(get_connection)],
+    engine: Annotated[Engine, Depends(get_engine)],
 ) -> dict[str, Any]:
-    access = _authorize(
-        connection,
+    """Accept an uploaded object durably.
+
+    1. short read (scope + batch)          -- no locks held afterwards
+    2. object-storage HEAD                  -- no transaction open
+    3. conditional state transition + work  -- one small transaction
+    Only after step 3 commits is 202 returned. Concurrent/retried finalize
+    calls are idempotent: exactly one wins the AWAITING_UPLOAD transition."""
+    decision = check_p2_permission(
         tenant_id=tenant_id,
-        journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
         permission_key=_UPDATE_PERMISSION,
     )
-    batch = connection.execute(
-        text(
-            """
-            SELECT batch_id, original_filename, content_type, size_bytes,
-                   original_object_key, batch_status, uploaded_by_actor_id
-            FROM auditcore.p2_upload_batches
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND batch_id=:batch_id
-            FOR UPDATE
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "batch_id": batch_id,
-        },
-    ).mappings().one_or_none()
+    with engine.begin() as connection:
+        access = resolve_p2_scope(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            human_principal=human_principal,
+            decision=decision,
+        )
+        batch = connection.execute(
+            text(
+                """
+                SELECT batch_id, original_filename, size_bytes,
+                       original_object_key, batch_status, uploaded_by_actor_id
+                FROM auditcore.p2_upload_batches
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND batch_id=:batch_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "batch_id": batch_id},
+        ).mappings().one_or_none()
     if batch is None:
         raise HTTPException(status_code=404, detail="Upload batch was not found.")
-    if batch["batch_status"] in {"UPLOADED", "SPLITTING", "PROCESSING", "COMPLETED"}:
+    if batch["batch_status"] != "AWAITING_UPLOAD":
         return {"batchId": str(batch_id), "status": str(batch["batch_status"])}
 
     try:
@@ -641,7 +699,6 @@ def finalize_upload(
             status_code=409,
             detail="The uploaded object is not available yet. Retry finalize.",
         ) from exc
-
     expected_size = int(batch["size_bytes"])
     actual_size = int(metadata["contentLength"])
     if expected_size != actual_size:
@@ -654,60 +711,69 @@ def finalize_upload(
         )
 
     correlation_id = get_correlation_id(request)
-    connection.execute(
-        text(
-            """
-            UPDATE auditcore.p2_upload_batches
-            SET batch_status='UPLOADED', updated_at_utc=now()
-            WHERE tenant_id=:tenant_id AND batch_id=:batch_id
-            """
-        ),
-        {"tenant_id": tenant_id, "batch_id": batch_id},
-    )
-    connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.p2_work_queue (
-                tenant_id, journey_id, work_type, work_key,
-                payload, work_status, correlation_id
-            ) VALUES (
-                :tenant_id, :journey_id, 'SPLIT_BATCH', :work_key,
-                CAST(:payload AS jsonb), 'PENDING', :correlation_id
-            )
-            ON CONFLICT (tenant_id, work_type, work_key)
-            DO UPDATE SET work_status='PENDING',
-                          next_attempt_at_utc=NULL,
-                          last_error=NULL,
-                          updated_at_utc=now()
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "work_key": str(batch_id),
-            "payload": json.dumps(
-                {
-                    "batchId": str(batch_id),
-                    "uploadedBy": str(batch["uploaded_by_actor_id"]),
-                    "uploadedByRole": access.operating_role or access.functional_role or "USER",
-                }
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        accepted = connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_upload_batches
+                SET batch_status='UPLOADED', updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND batch_id=:batch_id
+                  AND batch_status='AWAITING_UPLOAD'
+                RETURNING batch_id
+                """
             ),
-            "correlation_id": correlation_id,
-        },
-    )
-    _activity(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        event_type="UPLOAD_ACCEPTED",
-        subject_type="UPLOAD_BATCH",
-        subject_id=str(batch_id),
-        details={
-            "filename": str(batch["original_filename"]),
-            "sizeBytes": actual_size,
-        },
-        correlation_id=correlation_id,
-    )
+            {"tenant_id": tenant_id, "batch_id": batch_id},
+        ).scalar_one_or_none()
+        if accepted is None:
+            current = connection.execute(
+                text(
+                    "SELECT batch_status FROM auditcore.p2_upload_batches "
+                    "WHERE tenant_id=:tenant_id AND batch_id=:batch_id"
+                ),
+                {"tenant_id": tenant_id, "batch_id": batch_id},
+            ).scalar_one()
+            return {"batchId": str(batch_id), "status": str(current)}
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.p2_work_queue (
+                    tenant_id, journey_id, work_type, work_key,
+                    payload, work_status, correlation_id, requested_version
+                ) VALUES (
+                    :tenant_id, :journey_id, 'SPLIT_BATCH', :work_key,
+                    CAST(:payload AS jsonb), 'PENDING', :correlation_id, 1
+                )
+                ON CONFLICT (tenant_id, work_type, work_key) DO NOTHING
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "work_key": str(batch_id),
+                "payload": json.dumps(
+                    {
+                        "batchId": str(batch_id),
+                        "uploadedBy": str(batch["uploaded_by_actor_id"]),
+                        "uploadedByRole": access.operating_role or access.functional_role or "USER",
+                    }
+                ),
+                "correlation_id": correlation_id,
+            },
+        )
+        _activity(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            event_type="UPLOAD_ACCEPTED",
+            subject_type="UPLOAD_BATCH",
+            subject_id=str(batch_id),
+            details={
+                "filename": str(batch["original_filename"]),
+                "sizeBytes": actual_size,
+            },
+            correlation_id=correlation_id,
+        )
     return {"batchId": str(batch_id), "status": "UPLOADED"}
 
 
@@ -1750,14 +1816,13 @@ def task_action(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
-    _authorize(
-        connection,
+    decision = check_p2_permission(
         tenant_id=tenant_id,
-        journey_id=None,
         human_principal=human_principal,
         authorization_client=authorization_client,
         permission_key=_UPDATE_PERMISSION,
     )
+    set_tenant_context(connection, tenant_id)
     task_journey_id = connection.execute(
         text(
             """
@@ -1770,13 +1835,12 @@ def task_action(
     ).scalar_one_or_none()
     if task_journey_id is None:
         raise HTTPException(status_code=404, detail="Task was not found.")
-    access = _authorize(
+    access = resolve_p2_scope(
         connection,
         tenant_id=tenant_id,
         journey_id=UUID(str(task_journey_id)),
         human_principal=human_principal,
-        authorization_client=authorization_client,
-        permission_key=_UPDATE_PERMISSION,
+        decision=decision,
     )
     try:
         return submit_action(

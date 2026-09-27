@@ -280,7 +280,7 @@ def downgrade() -> None:
         )
         RETURNS bigint
         LANGUAGE plpgsql
-        AS $
+        AS $$
         DECLARE
             v_version bigint;
         BEGIN
@@ -329,7 +329,7 @@ def downgrade() -> None:
 
             RETURN v_version;
         END;
-        $;
+        $$;
 
         DROP FUNCTION IF EXISTS auditcore.p2_requeue_verifying_controls(varchar, uuid, bigint);
 
