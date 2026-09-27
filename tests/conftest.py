@@ -14,6 +14,8 @@ os.environ.setdefault("APP_ENV", "test")
 # of this shape must now call delete_tenant_data(engine, tenant_id) after
 # its own yield.
 _TENANT_DATA_DELETE_ORDER = (
+    "p2_task_events", "p2_activity_events", "p2_control_state", "p2_stage_gate_state",
+    "p2_work_queue", "p2_document_queue", "p2_tasks", "p2_journey_runtime", "p2_upload_batches",
     "activity_records", "administrative_operations", "audit_chain_heads", "audit_events",
     "audit_finding_events", "audit_state_events", "booking_form_review_values", "business_assignments",
     "commercial_line_source_values", "commercial_lines", "crm_interactions", "customer_identity_index",
