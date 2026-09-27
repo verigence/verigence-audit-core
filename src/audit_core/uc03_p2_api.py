@@ -30,7 +30,7 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_p2_access import P2AccessContext, authorize_p2
-from audit_core.uc03_p2_stage import read_booking_stage
+from audit_core.uc03_p2_stage import read_booking_stage, read_delivery_stage
 from audit_core.uc03_p2_storage import (
     P2DocumentStorageError,
     get_p2_document_storage,
@@ -700,11 +700,11 @@ def stage_status(
     return {
         "journeyId": str(journey_id),
         "booking": booking,
-        "delivery": {
-            "completionState": "IN_PROGRESS",
-            "configuration": "PENDING_BUSINESS_RULES",
-            "gates": [],
-        },
+        "delivery": read_delivery_stage(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+        ),
     }
 
 
@@ -727,6 +727,11 @@ def overview_summary(
         permission_key=_READ_PERMISSION,
     )
     booking = read_booking_stage(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+    )
+    delivery = read_delivery_stage(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
@@ -870,7 +875,11 @@ def overview_summary(
 
     return {
         "journey": serializable(header),
-        "stage": booking,
+        "stage": {
+            **booking,
+            "deliveryCompletionState": delivery["completionState"],
+            "deliveryConfiguration": delivery["configuration"],
+        },
         "documents": serializable(document_stats),
         "uploads": serializable(p2_upload),
         "payments": serializable(payments),
