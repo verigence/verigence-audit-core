@@ -30,6 +30,8 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_p2_access import P2AccessContext, authorize_p2
+from audit_core.uc03_p2_blueprint import P2_GENERALIZED_INVOICE_TYPES
+from audit_core.uc03_p2_control_registry import control_codes_for_stage
 from audit_core.uc03_p2_stage import read_booking_stage, read_delivery_stage
 from audit_core.uc03_p2_storage import (
     P2DocumentStorageError,
@@ -708,6 +710,91 @@ def stage_status(
     }
 
 
+def _p2_control_statistics(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    stage: str,
+) -> dict[str, int]:
+    expected_codes = control_codes_for_stage(stage)
+    if not expected_codes:
+        return {
+            "expected": 0, "passed": 0, "failed": 0,
+            "waiting": 0, "retryPending": 0, "errors": 0,
+        }
+    rows = connection.execute(
+        text(
+            """
+            SELECT control_status, COUNT(*) AS count
+            FROM auditcore.p2_control_state
+            WHERE tenant_id=:tenant_id
+              AND journey_id=:journey_id
+              AND control_code = ANY(CAST(:control_codes AS varchar[]))
+            GROUP BY control_status
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "control_codes": sorted(expected_codes),
+        },
+    ).mappings().all()
+    counts = {str(row["control_status"]): int(row["count"]) for row in rows}
+    observed = sum(counts.values())
+    missing = max(len(expected_codes) - observed, 0)
+    return {
+        "expected": len(expected_codes),
+        "passed": counts.get("PASS", 0) + counts.get("NOT_APPLICABLE", 0),
+        "failed": counts.get("FAIL", 0),
+        "waiting": (
+            missing
+            + counts.get("WAITING_FOR_FACTS", 0)
+            + counts.get("READY", 0)
+            + counts.get("EVALUATING", 0)
+        ),
+        "retryPending": counts.get("RETRY_PENDING", 0),
+        "errors": counts.get("ERROR_TERMINAL", 0),
+    }
+
+
+def _p2_requirement_statistics(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    stage: str,
+) -> dict[str, int]:
+    row = connection.execute(
+        text(
+            """
+            SELECT COUNT(*) AS required,
+                   COUNT(*) FILTER (
+                     WHERE EXISTS (
+                       SELECT 1
+                       FROM auditcore.evidence e
+                       WHERE e.tenant_id=r.tenant_id
+                         AND e.journey_id=r.journey_id
+                         AND e.association_status='ACTIVE'
+                         AND e.document_type_key=r.document_type_key
+                     )
+                   ) AS received
+            FROM auditcore.journey_document_requirements r
+            WHERE r.tenant_id=:tenant_id
+              AND r.journey_id=:journey_id
+              AND upper(r.process_area)=:stage
+              AND r.requirement_level='REQUIRED'
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "stage": stage.upper(),
+        },
+    ).mappings().one()
+    return {"required": int(row["required"] or 0), "received": int(row["received"] or 0)}
+
+
 @router.get("/journeys/{journey_id}/overview")
 def overview_summary(
     tenant_id: str,
@@ -864,6 +951,100 @@ def overview_summary(
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().one()
 
+    booking_requirements = _p2_requirement_statistics(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage="BOOKING",
+    )
+    delivery_requirements = _p2_requirement_statistics(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage="DELIVERY",
+    )
+    booking_controls = _p2_control_statistics(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage="BOOKING",
+    )
+    delivery_controls = _p2_control_statistics(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage="DELIVERY",
+    )
+
+    page_stats = connection.execute(
+        text(
+            """
+            SELECT
+              COUNT(*) FILTER (WHERE business_stage='BOOKING') AS booking_pages,
+              COUNT(*) FILTER (
+                WHERE business_stage='BOOKING' AND queue_status='READY'
+              ) AS booking_pages_processed,
+              COUNT(*) FILTER (WHERE business_stage='DELIVERY') AS delivery_pages,
+              COUNT(*) FILTER (
+                WHERE business_stage='DELIVERY' AND queue_status='READY'
+              ) AS delivery_pages_processed,
+              COUNT(*) FILTER (
+                WHERE queue_status IN ('FAILED','DEAD_LETTER')
+              ) AS extraction_failures,
+              COALESCE(SUM(GREATEST(attempt_count - 1, 0)),0) AS retries
+            FROM auditcore.p2_document_queue
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one()
+
+    delivery_business = connection.execute(
+        text(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM auditcore.evidence e
+               WHERE e.tenant_id=:tenant_id AND e.journey_id=:journey_id
+                 AND e.association_status='ACTIVE'
+                 AND e.document_type_key = ANY(CAST(:invoice_types AS varchar[]))
+              ) AS invoices,
+              (SELECT COUNT(*) FROM auditcore.finance_records f
+               WHERE f.tenant_id=:tenant_id AND f.journey_id=:journey_id
+              ) AS finance_records,
+              (SELECT COUNT(*) FROM auditcore.insurance_records i
+               WHERE i.tenant_id=:tenant_id AND i.journey_id=:journey_id
+              ) AS insurance_records,
+              (SELECT COUNT(*) FROM auditcore.vehicle_records v
+               WHERE v.tenant_id=:tenant_id AND v.journey_id=:journey_id
+              ) AS vehicle_records,
+              (SELECT COUNT(*) FROM auditcore.registration_records r
+               WHERE r.tenant_id=:tenant_id AND r.journey_id=:journey_id
+              ) AS registration_records
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "invoice_types": sorted(P2_GENERALIZED_INVOICE_TYPES),
+        },
+    ).mappings().one()
+
+    corrected_fields = int(
+        connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM auditcore.journey_document_extracted_fields
+                WHERE tenant_id=:tenant_id
+                  AND journey_id=:journey_id
+                  AND modified_value IS NOT NULL
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one()
+        or 0
+    )
+
     def serializable(row: Any) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in dict(row).items():
@@ -885,6 +1066,43 @@ def overview_summary(
         "payments": serializable(payments),
         "tasks": serializable(tasks),
         "findings": serializable(findings),
+        "statistics": {
+            "booking": {
+                "documentsRequired": booking_requirements["required"],
+                "documentsReceived": booking_requirements["received"],
+                "pages": int(page_stats["booking_pages"] or 0),
+                "pagesProcessed": int(page_stats["booking_pages_processed"] or 0),
+                "paymentReceipts": int(payments["booking_receipts"] or 0),
+                "paymentReceived": str(payments["booking_total"] or 0),
+                "minimumPayment": booking["minimumBookingAmount"],
+                "manualVerificationPending": booking["manualVerificationPending"],
+                "controls": booking_controls,
+            },
+            "delivery": {
+                "documentsRequired": delivery_requirements["required"],
+                "documentsReceived": delivery_requirements["received"],
+                "pages": int(page_stats["delivery_pages"] or 0),
+                "pagesProcessed": int(page_stats["delivery_pages_processed"] or 0),
+                "invoices": int(delivery_business["invoices"] or 0),
+                "paymentReceipts": int(payments["delivery_receipts"] or 0),
+                "financeRecords": int(delivery_business["finance_records"] or 0),
+                "insuranceRecords": int(delivery_business["insurance_records"] or 0),
+                "vehicleRecords": int(delivery_business["vehicle_records"] or 0),
+                "registrationRecords": int(delivery_business["registration_records"] or 0),
+                "controls": delivery_controls,
+            },
+            "journey": {
+                "uploads": int(p2_upload["batches"] or 0),
+                "reuploads": None,
+                "supersededDocuments": int(document_stats["superseded"] or 0),
+                "extractionFailures": int(page_stats["extraction_failures"] or 0),
+                "retries": int(page_stats["retries"] or 0),
+                "correctedFields": corrected_fields,
+                "openFindings": int(findings["open"] or 0),
+                "totalTasks": int(tasks["total"] or 0),
+                "slaBreaches": int(tasks["overdue"] or 0),
+            },
+        },
     }
 
 
