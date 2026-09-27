@@ -82,10 +82,10 @@ def upgrade() -> None:
             v_tenant_id varchar;
             v_journey_id uuid;
         BEGIN
-            v_tenant_id := COALESCE(NEW.tenant_id, OLD.tenant_id);
-            v_journey_id := COALESCE(NEW.journey_id, OLD.journey_id);
+            v_tenant_id := NEW.tenant_id;
+            v_journey_id := NEW.journey_id;
             PERFORM auditcore.p2_request_stage_recompute(v_tenant_id, v_journey_id);
-            RETURN COALESCE(NEW, OLD);
+            RETURN NEW;
         END;
         $$;
 
@@ -94,18 +94,18 @@ def upgrade() -> None:
         LANGUAGE plpgsql
         AS $$
         BEGIN
-            IF COALESCE(NEW.task_type, OLD.task_type) <> 'MANUAL_VERIFICATION_REVIEW' THEN
-                RETURN COALESCE(NEW, OLD);
+            IF NEW.task_type <> 'MANUAL_VERIFICATION_REVIEW' THEN
+                RETURN NEW;
             END IF;
             IF TG_OP = 'UPDATE'
                AND NEW.task_status IS NOT DISTINCT FROM OLD.task_status THEN
                 RETURN NEW;
             END IF;
             PERFORM auditcore.p2_request_stage_recompute(
-                COALESCE(NEW.tenant_id, OLD.tenant_id),
-                COALESCE(NEW.journey_id, OLD.journey_id)
+                NEW.tenant_id,
+                NEW.journey_id
             );
-            RETURN COALESCE(NEW, OLD);
+            RETURN NEW;
         END;
         $$;
 
