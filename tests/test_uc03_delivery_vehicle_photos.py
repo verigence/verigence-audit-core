@@ -276,7 +276,7 @@ def test_vehicle_photo_storage_put_and_presign_use_the_configured_bucket(monkeyp
     assert kwargs["ExpiresIn"] == 60
 
 
-def _new_journey(engine, *, suffix: str, with_delivery_started: bool) -> tuple[str, object]:
+def _new_journey(engine, *, suffix: str, with_delivery_started: bool, actor_id: str) -> tuple[str, object]:
     tenant_id = f"tenant-vplr-{suffix}"
     with engine.begin() as c:
         category_id = c.execute(
@@ -334,6 +334,17 @@ def _new_journey(engine, *, suffix: str, with_delivery_started: bool) -> tuple[s
                             now(), now(), 1)"""),
                 {"t": tenant_id, "j": journey_id},
             )
+        # _journey_context (via _scope/_authorize_delivery) does its own real,
+        # DB-backed business_assignments check independent of the fake
+        # authorization_client below -- root-caused live (2026-09-27) as the
+        # actual cause of a 403 these tests saw instead of the expected
+        # 404/200, same class of gap as require_business_scope elsewhere.
+        c.execute(
+            text("""INSERT INTO auditcore.business_assignments
+                (tenant_id, security_actor_id, business_role_code, dealer_id, outlet_id)
+                VALUES (:t, :actor_id, 'PC', :d, :o)"""),
+            {"t": tenant_id, "actor_id": actor_id, "d": dealer_id, "o": outlet_id},
+        )
     return tenant_id, journey_id
 
 
@@ -350,8 +361,8 @@ def test_list_vehicle_photos_404s_cleanly_before_delivery_starts_no_storage_need
         pytest.skip("DATABASE_URL is required for this integration test")
     engine = create_engine(database_url)
     suffix = uuid4().hex[:10]
-    tenant_id, journey_id = _new_journey(engine, suffix=suffix, with_delivery_started=False)
     actor_id = f"pc-{suffix}"
+    tenant_id, journey_id = _new_journey(engine, suffix=suffix, with_delivery_started=False, actor_id=actor_id)
 
     def connection_override():
         with engine.begin() as connection:
@@ -380,8 +391,8 @@ def test_list_vehicle_photos_returns_empty_with_no_photos_no_storage_needed() ->
         pytest.skip("DATABASE_URL is required for this integration test")
     engine = create_engine(database_url)
     suffix = uuid4().hex[:10]
-    tenant_id, journey_id = _new_journey(engine, suffix=suffix, with_delivery_started=True)
     actor_id = f"pc-{suffix}"
+    tenant_id, journey_id = _new_journey(engine, suffix=suffix, with_delivery_started=True, actor_id=actor_id)
 
     def connection_override():
         with engine.begin() as connection:
