@@ -75,7 +75,7 @@ jobs:
 
           while IFS= read -r key; do
             [ -n "$key" ] || continue
-            printf -v ref '${{%s.%s}}' "$AUDIT_SERVICE" "$key"
+            printf -v ref '$%s' "{{${AUDIT_SERVICE}.${key}}}"
             railway variable set --service "$WORKER_SERVICE" --environment dev --skip-deploys "$key=$ref" >/dev/null
           done </tmp/worker-ref-keys.txt
 
