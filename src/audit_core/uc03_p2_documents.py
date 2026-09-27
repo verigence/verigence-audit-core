@@ -493,32 +493,28 @@ def delete_p2_document(
         )
 
     # Recompute canonical projections from the remaining ACTIVE evidence.
-    try:
-        with connection.begin_nested():
-            if stage_code == "DELIVERY":
-                from audit_core.uc03_delivery_post_extraction_materialization import (
-                    materialize_delivery_documents_from_durable_store,
-                )
+    # This is deliberately fail-closed: if projection recomputation fails,
+    # the request transaction rolls back the evidence void as well.
+    if stage_code == "DELIVERY":
+        from audit_core.uc03_delivery_post_extraction_materialization import (
+            materialize_delivery_documents_from_durable_store,
+        )
 
-                materialize_delivery_documents_from_durable_store(
-                    connection,
-                    tenant_id=tenant_id,
-                    journey_id=journey_id,
-                )
-            else:
-                from audit_core.uc03_delivery_post_extraction_materialization import (
-                    materialize_booking_documents_from_durable_store,
-                )
+        materialize_delivery_documents_from_durable_store(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+        )
+    else:
+        from audit_core.uc03_delivery_post_extraction_materialization import (
+            materialize_booking_documents_from_durable_store,
+        )
 
-                materialize_booking_documents_from_durable_store(
-                    connection,
-                    tenant_id=tenant_id,
-                    journey_id=journey_id,
-                )
-    except Exception:
-        # The evidence void remains authoritative. A projection failure is
-        # retried by the normal P2 stage/reconciliation work below.
-        pass
+        materialize_booking_documents_from_durable_store(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+        )
 
     connection.execute(
         text(
