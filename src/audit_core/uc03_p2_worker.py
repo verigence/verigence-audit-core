@@ -351,16 +351,18 @@ def _enqueue(
     payload: dict[str, Any],
     correlation_id: str | None,
     delay_seconds: int = 0,
+    requested_version: int | None = None,
 ) -> None:
     connection.execute(
         text(
             """
             INSERT INTO auditcore.p2_work_queue (
                 tenant_id, journey_id, work_type, work_key,
-                payload, work_status, next_attempt_at_utc, correlation_id
+                payload, requested_version, work_status,
+                next_attempt_at_utc, correlation_id
             ) VALUES (
                 :tenant_id, :journey_id, :work_type, :work_key,
-                CAST(:payload AS jsonb), 'PENDING',
+                CAST(:payload AS jsonb), :requested_version, 'PENDING',
                 CASE WHEN :delay_seconds > 0
                      THEN now() + (:delay_seconds * interval '1 second')
                      ELSE NULL END,
@@ -368,10 +370,34 @@ def _enqueue(
             )
             ON CONFLICT (tenant_id, work_type, work_key)
             DO UPDATE SET payload=EXCLUDED.payload,
-                          work_status='PENDING',
-                          next_attempt_at_utc=EXCLUDED.next_attempt_at_utc,
-                          lease_expires_at_utc=NULL,
-                          last_error=NULL,
+                          requested_version=CASE
+                            WHEN EXCLUDED.requested_version IS NULL
+                              THEN auditcore.p2_work_queue.requested_version
+                            ELSE GREATEST(
+                              COALESCE(auditcore.p2_work_queue.requested_version,0),
+                              EXCLUDED.requested_version
+                            )
+                          END,
+                          work_status=CASE
+                            WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
+                              THEN auditcore.p2_work_queue.work_status
+                            ELSE 'PENDING'
+                          END,
+                          next_attempt_at_utc=CASE
+                            WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
+                              THEN auditcore.p2_work_queue.next_attempt_at_utc
+                            ELSE EXCLUDED.next_attempt_at_utc
+                          END,
+                          lease_expires_at_utc=CASE
+                            WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
+                              THEN auditcore.p2_work_queue.lease_expires_at_utc
+                            ELSE NULL
+                          END,
+                          last_error=CASE
+                            WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
+                              THEN auditcore.p2_work_queue.last_error
+                            ELSE NULL
+                          END,
                           updated_at_utc=now()
             """
         ),
@@ -381,6 +407,7 @@ def _enqueue(
             "work_type": work_type,
             "work_key": work_key,
             "payload": json.dumps(payload, default=str),
+            "requested_version": requested_version,
             "delay_seconds": delay_seconds,
             "correlation_id": correlation_id,
         },
@@ -996,6 +1023,36 @@ def _stage_recompute(engine: Engine, work: WorkItem) -> None:
         )
 
 
+def _task_event(
+    connection,
+    *,
+    work: WorkItem,
+    task_id: UUID,
+    event_type: str,
+    details: dict[str, Any],
+) -> None:
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.p2_task_events (
+                tenant_id, task_id, journey_id, event_type,
+                actor_id, actor_role_code, details
+            ) VALUES (
+                :tenant_id, :task_id, :journey_id, :event_type,
+                'SYSTEM', 'SYSTEM', CAST(:details AS jsonb)
+            )
+            """
+        ),
+        {
+            "tenant_id": work.tenant_id,
+            "task_id": task_id,
+            "journey_id": work.journey_id,
+            "event_type": event_type,
+            "details": json.dumps(details, default=str),
+        },
+    )
+
+
 def _task_verify(engine: Engine, work: WorkItem) -> None:
     task_id = UUID(work.work_key)
     with engine.begin() as connection:
@@ -1003,7 +1060,8 @@ def _task_verify(engine: Engine, work: WorkItem) -> None:
         task = connection.execute(
             text(
                 """
-                SELECT task_id, source_type, source_code, reference, task_status
+                SELECT task_id, source_type, source_code, reference,
+                       task_status, completion_protocol
                 FROM auditcore.p2_tasks
                 WHERE tenant_id=:tenant_id AND task_id=:task_id
                 FOR UPDATE
@@ -1011,16 +1069,31 @@ def _task_verify(engine: Engine, work: WorkItem) -> None:
             ),
             {"tenant_id": work.tenant_id, "task_id": task_id},
         ).mappings().one()
+
         if task["task_status"] == "VERIFIED_COMPLETE":
             return
         if task["task_status"] != "VERIFYING":
-            raise RuntimeError(f"Task is not awaiting machine verification: {task['task_status']}")
+            return
+        if task["completion_protocol"] != "MACHINE_VERIFIED":
+            raise RuntimeError(
+                f"Task {task_id} is VERIFYING but is not MACHINE_VERIFIED"
+            )
 
+        source_type = str(task["source_type"] or "")
         source_code = str(task["source_code"] or "")
-        state = connection.execute(
+        if source_type != "RULE" or not source_code:
+            # Activity/document/resolver verification adapters are deliberately
+            # separate contracts. Never silently treat an unsupported machine
+            # verification source as complete.
+            raise RuntimeError(
+                f"No P2 machine verification adapter for {source_type}:{source_code}"
+            )
+
+        state_row = connection.execute(
             text(
                 """
-                SELECT control_status
+                SELECT control_status, evaluated_fact_version,
+                       source_outcome, status_reason
                 FROM auditcore.p2_control_state
                 WHERE tenant_id=:tenant_id AND journey_id=:journey_id
                   AND control_code=:control_code
@@ -1031,64 +1104,374 @@ def _task_verify(engine: Engine, work: WorkItem) -> None:
                 "journey_id": work.journey_id,
                 "control_code": source_code,
             },
-        ).scalar_one_or_none()
+        ).mappings().one_or_none()
 
+        state = str(state_row["control_status"]) if state_row else None
         if state == "PASS":
             connection.execute(
                 text(
                     """
                     UPDATE auditcore.p2_tasks
                     SET task_status='VERIFIED_COMPLETE',
-                        verified_at_utc=now(), updated_at_utc=now()
+                        verified_at_utc=now(),
+                        completion_result=completion_result || CAST(:result AS jsonb),
+                        updated_at_utc=now()
                     WHERE tenant_id=:tenant_id AND task_id=:task_id
                     """
                 ),
-                {"tenant_id": work.tenant_id, "task_id": task_id},
+                {
+                    "tenant_id": work.tenant_id,
+                    "task_id": task_id,
+                    "result": json.dumps({
+                        "machineVerification": "PASS",
+                        "controlCode": source_code,
+                        "factVersion": state_row["evaluated_fact_version"],
+                    }),
+                },
+            )
+            _task_event(
+                connection,
+                work=work,
+                task_id=task_id,
+                event_type="MACHINE_VERIFICATION_PASS",
+                details={"controlCode": source_code},
             )
             return
+
         if state == "FAIL":
             connection.execute(
                 text(
                     """
                     UPDATE auditcore.p2_tasks
-                    SET task_status='RETURNED', updated_at_utc=now()
+                    SET task_status='RETURNED',
+                        completion_result=completion_result || CAST(:result AS jsonb),
+                        updated_at_utc=now()
                     WHERE tenant_id=:tenant_id AND task_id=:task_id
                     """
                 ),
-                {"tenant_id": work.tenant_id, "task_id": task_id},
+                {
+                    "tenant_id": work.tenant_id,
+                    "task_id": task_id,
+                    "result": json.dumps({
+                        "machineVerification": "FAIL",
+                        "controlCode": source_code,
+                        "factVersion": state_row["evaluated_fact_version"],
+                    }),
+                },
+            )
+            _task_event(
+                connection,
+                work=work,
+                task_id=task_id,
+                event_type="MACHINE_VERIFICATION_FAIL",
+                details={"controlCode": source_code},
             )
             return
 
-        # Fail closed: until a P2 control executor has evaluated the exact
-        # originating control, the task remains VERIFYING and work retries.
-        if source_code:
-            _enqueue(
-                connection,
-                tenant_id=work.tenant_id,
-                journey_id=work.journey_id,
-                work_type="CONTROL_EVALUATE",
-                work_key=f"{work.journey_id}:{source_code}",
-                payload={"controlCode": source_code, "taskId": str(task_id)},
-                correlation_id=work.correlation_id,
+        if state == "ERROR_TERMINAL":
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.p2_tasks
+                    SET task_status='FAILED',
+                        completion_result=completion_result || CAST(:result AS jsonb),
+                        updated_at_utc=now()
+                    WHERE tenant_id=:tenant_id AND task_id=:task_id
+                    """
+                ),
+                {
+                    "tenant_id": work.tenant_id,
+                    "task_id": task_id,
+                    "result": json.dumps({
+                        "machineVerification": "ERROR_TERMINAL",
+                        "controlCode": source_code,
+                        "reason": state_row["status_reason"],
+                    }),
+                },
             )
-        raise RescheduleWork(
-            f"Originating control {source_code or '<missing>'} has no PASS/FAIL P2 result yet",
-            delay_seconds=2,
+            _task_event(
+                connection,
+                work=work,
+                task_id=task_id,
+                event_type="MACHINE_VERIFICATION_ERROR",
+                details={
+                    "controlCode": source_code,
+                    "reason": state_row["status_reason"],
+                },
+            )
+            return
+
+        fact_version = connection.execute(
+            text(
+                """
+                SELECT fact_version
+                FROM auditcore.p2_journey_runtime
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                """
+            ),
+            {
+                "tenant_id": work.tenant_id,
+                "journey_id": work.journey_id,
+            },
+        ).scalar_one_or_none()
+
+        _enqueue(
+            connection,
+            tenant_id=work.tenant_id,
+            journey_id=work.journey_id,
+            work_type="CONTROL_EVALUATE",
+            work_key=f"{work.journey_id}:{source_code}",
+            payload={"controlCode": source_code, "taskId": str(task_id)},
+            correlation_id=work.correlation_id,
+            requested_version=int(fact_version) if fact_version is not None else None,
+        )
+        # Event-driven: the task stays VERIFYING. A rule_executions insert
+        # mirrors a fresh state and wakes TASK_VERIFY. A later fact change
+        # requeues CONTROL_EVALUATE for VERIFYING tasks. No polling loop.
+
+
+_NATIVE_EXACT_RERUN = frozenset(
+    {
+        "WRONG_DOCUMENT",
+        "DUPLICATE_RECEIPT",
+        "DUPLICATE_BOOKING",
+        "MODEL_NOT_IDENTIFIED",
+        "MANUAL_VERIFICATION",
+        "PAYMENT_BANK_UNMATCHED",
+        "AUTOMATED_SYNC_FAILURE",
+    }
+)
+
+
+def _set_control_state(
+    engine: Engine,
+    work: WorkItem,
+    *,
+    control_code: str,
+    executor_type: str,
+    status: str,
+    reason: str | None,
+) -> None:
+    with engine.begin() as connection:
+        set_tenant_context(connection, work.tenant_id)
+        fact_version = connection.execute(
+            text(
+                """
+                SELECT fact_version
+                FROM auditcore.p2_journey_runtime
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                """
+            ),
+            {
+                "tenant_id": work.tenant_id,
+                "journey_id": work.journey_id,
+            },
+        ).scalar_one_or_none()
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.p2_control_state (
+                    tenant_id, journey_id, control_code, executor_type,
+                    control_status, evaluated_fact_version,
+                    source_outcome, status_reason, last_error,
+                    last_evaluated_at_utc, updated_at_utc
+                ) VALUES (
+                    :tenant_id, :journey_id, :control_code, :executor_type,
+                    :status, :fact_version,
+                    NULL, :reason,
+                    CASE WHEN :status IN ('RETRY_PENDING','ERROR_TERMINAL')
+                         THEN :reason ELSE NULL END,
+                    now(), now()
+                )
+                ON CONFLICT (tenant_id, journey_id, control_code)
+                DO UPDATE SET executor_type=EXCLUDED.executor_type,
+                              control_status=EXCLUDED.control_status,
+                              evaluated_fact_version=EXCLUDED.evaluated_fact_version,
+                              status_reason=EXCLUDED.status_reason,
+                              last_error=EXCLUDED.last_error,
+                              last_evaluated_at_utc=EXCLUDED.last_evaluated_at_utc,
+                              updated_at_utc=now()
+                """
+            ),
+            {
+                "tenant_id": work.tenant_id,
+                "journey_id": work.journey_id,
+                "control_code": control_code,
+                "executor_type": executor_type,
+                "status": status,
+                "fact_version": fact_version,
+                "reason": reason,
+            },
         )
 
 
+def _fresh_control_state(engine: Engine, work: WorkItem, control_code: str) -> dict[str, Any] | None:
+    with engine.begin() as connection:
+        set_tenant_context(connection, work.tenant_id)
+        row = connection.execute(
+            text(
+                """
+                SELECT control_status, evaluated_fact_version,
+                       source_outcome, status_reason, last_evaluated_at_utc
+                FROM auditcore.p2_control_state
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND control_code=:control_code
+                """
+            ),
+            {
+                "tenant_id": work.tenant_id,
+                "journey_id": work.journey_id,
+                "control_code": control_code,
+            },
+        ).mappings().one_or_none()
+        return dict(row) if row is not None else None
+
+
 def _control_evaluate(engine: Engine, work: WorkItem) -> None:
-    # P2 is the single control-state authority, but existing native/external
-    # engines remain executors. A control is only registered here once its exact
-    # execution adapter is validated; unknown controls retry/dead-letter instead
-    # of being silently marked PASS.
-    control_code = str(work.payload.get("controlCode") or "")
+    control_code = str(work.payload.get("controlCode") or "").strip()
     if not control_code:
         raise ValueError("CONTROL_EVALUATE requires controlCode")
-    raise RuntimeError(
-        f"P2 control executor is not registered for {control_code}; "
-        "verification remains fail-closed"
-    )
+
+    with engine.begin() as connection:
+        set_tenant_context(connection, work.tenant_id)
+        definition = connection.execute(
+            text(
+                """
+                SELECT rule_code, executor, rerun_policy, enabled
+                FROM auditcore.rule_definitions
+                WHERE rule_code=:rule_code
+                """
+            ),
+            {"rule_code": control_code},
+        ).mappings().one_or_none()
+
+    if definition is not None:
+        if not bool(definition["enabled"]):
+            _set_control_state(
+                engine,
+                work,
+                control_code=control_code,
+                executor_type="NATIVE",
+                status="NOT_APPLICABLE",
+                reason="Rule is explicitly disabled in Audit Core.",
+            )
+            return
+
+        if str(definition["executor"]) != "AUDIT_CORE":
+            raise RuntimeError(
+                f"Unexpected persisted executor {definition['executor']} for {control_code}"
+            )
+
+        if str(definition["rerun_policy"]) != "RERUNNABLE":
+            latest = _fresh_control_state(engine, work, control_code)
+            if latest and latest["control_status"] in {
+                "PASS", "FAIL", "NOT_APPLICABLE", "WAITING_FOR_FACTS"
+            }:
+                return
+            _set_control_state(
+                engine,
+                work,
+                control_code=control_code,
+                executor_type="NATIVE",
+                status="ERROR_TERMINAL",
+                reason=(
+                    "This Audit Core rule is configured ONCE and has no safe "
+                    "post-action rerun contract."
+                ),
+            )
+            return
+
+        if control_code not in _NATIVE_EXACT_RERUN:
+            _set_control_state(
+                engine,
+                work,
+                control_code=control_code,
+                executor_type="NATIVE",
+                status="ERROR_TERMINAL",
+                reason=(
+                    "No verified exact rerun adapter is registered for this "
+                    "Audit Core rule."
+                ),
+            )
+            return
+
+        from audit_core.uc03_run_all_rules import (
+            _existing_stages,
+            _run_audit_core_rules_for_stage,
+        )
+
+        with engine.begin() as connection:
+            set_tenant_context(connection, work.tenant_id)
+            stages = _existing_stages(
+                connection,
+                tenant_id=work.tenant_id,
+                journey_id=work.journey_id,
+            )
+            matched = []
+            for stage in stages:
+                results = _run_audit_core_rules_for_stage(
+                    connection,
+                    tenant_id=work.tenant_id,
+                    journey_id=work.journey_id,
+                    stage=stage,
+                    correlation_id=work.correlation_id or "",
+                )
+                matched.extend(
+                    result for result in results if result.ruleCode == control_code
+                )
+
+        if not matched:
+            _set_control_state(
+                engine,
+                work,
+                control_code=control_code,
+                executor_type="NATIVE",
+                status="ERROR_TERMINAL",
+                reason="Verified native rerun adapter produced no result for this Journey.",
+            )
+        return
+
+    # No Audit Core definition means the control may belong to the external
+    # Rule Engine (those definitions intentionally are not persisted locally).
+    from audit_core.uc03_rule_engine_findings import run_rule_engine_phase
+    from audit_core.uc03_run_all_rules import _existing_stages
+
+    with engine.begin() as connection:
+        set_tenant_context(connection, work.tenant_id)
+        stages = _existing_stages(
+            connection,
+            tenant_id=work.tenant_id,
+            journey_id=work.journey_id,
+        )
+
+    if not stages:
+        _set_control_state(
+            engine,
+            work,
+            control_code=control_code,
+            executor_type="RULE_ENGINE",
+            status="WAITING_FOR_FACTS",
+            reason="No Booking or Delivery stage exists yet.",
+        )
+        return
+
+    before = _fresh_control_state(engine, work, control_code)
+    before_time = before["last_evaluated_at_utc"] if before else None
+    for stage in stages:
+        run_rule_engine_phase(
+            engine,
+            work.tenant_id,
+            work.journey_id,
+            stage,
+            stage,
+            work.correlation_id or "",
+        )
+
+    after = _fresh_control_state(engine, work, control_code)
+    if after is None or after["last_evaluated_at_utc"] == before_time:
+        raise RuntimeError(
+            f"External Rule Engine produced no fresh execution for {control_code}"
+        )
 
 
 def process_work(engine: Engine, work: WorkItem) -> None:
