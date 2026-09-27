@@ -183,6 +183,7 @@ def _durable_lookup(rows: list[dict[str, Any]]) -> dict[tuple[str, int], dict[st
     return result
 
 
+@router.get("/documents/{document_id}")
 @router.get("/documents/{document_id}/review")
 def get_p2_document_review(
     tenant_id: str,
@@ -457,6 +458,36 @@ class P2FieldCorrectionCommand(BaseModel):
     sourceFactVersion: int = Field(gt=0)
     newValue: Any = Field(...)
     remarks: str | None = Field(default=None, max_length=2000)
+
+
+
+@router.patch("/documents/{document_id}/fields/{field_key}")
+def patch_p2_document_field(
+    tenant_id: str,
+    journey_id: UUID,
+    document_id: UUID,
+    field_key: str,
+    command: P2FieldCorrectionCommand,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    if command.fieldKey != field_key:
+        raise HTTPException(
+            status_code=422,
+            detail="Field key in the path and correction payload must match.",
+        )
+    return correct_p2_document_field(
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        document_id=document_id,
+        command=command,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        connection=connection,
+    )
 
 
 @router.post("/documents/{document_id}/field-corrections")
