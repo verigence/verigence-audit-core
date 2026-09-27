@@ -72,6 +72,7 @@ class WorkItem:
     work_key: str
     payload: dict[str, Any]
     attempt_count: int
+    requested_version: int | null
     correlation_id: str | None
 
 
@@ -99,7 +100,7 @@ def _claim_for_tenant(engine: Engine, tenant_id: str, limit: int) -> list[WorkIt
             text(
                 """
                 SELECT tenant_id, work_id, journey_id, work_type, work_key,
-                       payload, attempt_count, correlation_id
+                       payload, attempt_count, requested_version, correlation_id
                 FROM auditcore.p2_work_queue
                 WHERE tenant_id=:tenant_id
                   AND work_status IN ('PENDING','RETRY_WAIT')
@@ -137,6 +138,11 @@ def _claim_for_tenant(engine: Engine, tenant_id: str, limit: int) -> list[WorkIt
                 work_key=str(row["work_key"]),
                 payload=dict(row["payload"] or {}),
                 attempt_count=int(row["attempt_count"] or 0) + 1,
+                requested_version=(
+                    int(row["requested_version"])
+                    if row["requested_version"] is not None
+                    else None
+                ),
                 correlation_id=row["correlation_id"],
             )
             for row in rows
@@ -146,19 +152,49 @@ def _claim_for_tenant(engine: Engine, tenant_id: str, limit: int) -> list[WorkIt
 def _complete(engine: Engine, work: WorkItem) -> None:
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
+        row = connection.execute(
+            text(
+                """
+                SELECT requested_version
+                FROM auditcore.p2_work_queue
+                WHERE tenant_id=:tenant_id AND work_id=:work_id
+                FOR UPDATE
+                """
+            ),
+            {"tenant_id": work.tenant_id, "work_id": work.work_id},
+        ).mappings().one()
+
+        latest_requested = (
+            int(row["requested_version"])
+            if row["requested_version"] is not None
+            else None
+        )
+        processed = work.requested_version
+        stale_after_run = (
+            processed is not None
+            and latest_requested is not None
+            and latest_requested > processed
+        )
+
         connection.execute(
             text(
                 """
                 UPDATE auditcore.p2_work_queue
-                SET work_status='COMPLETED',
-                    processed_version=COALESCE(requested_version, processed_version),
+                SET work_status=:status,
+                    processed_version=COALESCE(:processed_version, processed_version),
+                    next_attempt_at_utc=NULL,
                     lease_expires_at_utc=NULL,
                     last_error=NULL,
                     updated_at_utc=now()
                 WHERE tenant_id=:tenant_id AND work_id=:work_id
                 """
             ),
-            {"tenant_id": work.tenant_id, "work_id": work.work_id},
+            {
+                "tenant_id": work.tenant_id,
+                "work_id": work.work_id,
+                "status": "PENDING" if stale_after_run else "COMPLETED",
+                "processed_version": processed,
+            },
         )
 
 
