@@ -898,7 +898,13 @@ def list_tasks(
         authorization_client=authorization_client,
         permission_key=_READ_PERMISSION,
     )
-    rows = connection.execute(
+
+    # P2-native tasks own the new completion protocols. Existing workflow
+    # tasks are NOT copied into p2_tasks: migrations 0097/0099 already mirror
+    # every legacy workflow task into work_items/work_item_task_detail,
+    # including historical backfill. Reading that mirror avoids duplicate
+    # tasks and preserves the old task engine's task-specific completion hooks.
+    p2_rows = connection.execute(
         text(
             """
             SELECT task_id, journey_id, root_task_id, parent_task_id,
@@ -911,7 +917,10 @@ def list_tasks(
             FROM auditcore.p2_tasks t
             WHERE t.tenant_id=:tenant_id
               AND (:journey_id IS NULL OR t.journey_id=:journey_id)
-              AND (:status IS NULL OR t.task_status=:status)
+              AND (
+                (:status IS NULL AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED'))
+                OR (:status IS NOT NULL AND t.task_status=:status)
+              )
               AND EXISTS (
                 SELECT 1
                 FROM auditcore.journeys j
@@ -930,15 +939,7 @@ def list_tasks(
                  )
                 WHERE j.tenant_id=t.tenant_id AND j.journey_id=t.journey_id
               )
-            ORDER BY
-              CASE t.priority
-                WHEN 'URGENT' THEN 1
-                WHEN 'HIGH' THEN 2
-                WHEN 'NORMAL' THEN 3
-                ELSE 4
-              END,
-              t.due_at_utc NULLS LAST,
-              t.created_at_utc
+            ORDER BY t.due_at_utc NULLS LAST, t.created_at_utc
             LIMIT 500
             """
         ),
@@ -949,14 +950,172 @@ def list_tasks(
             "actor_id": human_principal.subject,
         },
     ).mappings().all()
+
+    legacy_rows = connection.execute(
+        text(
+            """
+            SELECT
+              wi.work_item_id AS task_id,
+              wi.subject_ref AS journey_id,
+              wtd.task_type,
+              wi.origin_kind,
+              wi.owner_role_code AS assigned_role_code,
+              wi.assigned_actor_id,
+              wi.priority AS priority_rank,
+              wi.due_at_utc,
+              wi.status AS task_status,
+              wi.title,
+              COALESCE(
+                NULLIF(wtd.task_payload->>'comment',''),
+                NULLIF(wtd.task_payload->>'description',''),
+                NULLIF(wtd.last_error_summary,''),
+                wi.summary
+              ) AS description,
+              COALESCE(wtd.severity, 'MEDIUM') AS severity,
+              wtd.process_area,
+              wtd.effect_key,
+              wtd.related_finding_id,
+              wtd.task_payload AS reference,
+              wi.created_at_utc,
+              wi.updated_at_utc
+            FROM auditcore.work_items wi
+            JOIN auditcore.work_item_task_detail wtd
+              ON wtd.tenant_id=wi.tenant_id
+             AND wtd.work_item_id=wi.work_item_id
+            JOIN auditcore.journeys j
+              ON j.tenant_id=wi.tenant_id
+             AND j.journey_id=wi.subject_ref
+            WHERE wi.tenant_id=:tenant_id
+              AND wi.item_kind='EXECUTION_TASK'
+              AND wi.subject_kind='JOURNEY'
+              AND (:journey_id IS NULL OR wi.subject_ref=:journey_id)
+              AND (
+                (:status IS NULL AND wi.status IN ('OPEN','IN_PROGRESS'))
+                OR (:status IS NOT NULL AND wi.status=:status)
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM auditcore.business_assignments ba
+                WHERE ba.tenant_id=j.tenant_id
+                  AND ba.security_actor_id=:actor_id
+                  AND ba.assignment_status='ACTIVE'
+                  AND ba.effective_from <= now()
+                  AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+                  AND (
+                    ba.dealer_id IS NULL
+                    OR (
+                      ba.dealer_id=j.dealer_id
+                      AND (ba.outlet_id IS NULL OR ba.outlet_id=j.outlet_id)
+                    )
+                  )
+              )
+            ORDER BY wi.due_at_utc NULLS LAST, wi.priority DESC, wi.created_at_utc
+            LIMIT 500
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "status": status,
+            "actor_id": human_principal.subject,
+        },
+    ).mappings().all()
+
     items: list[dict[str, Any]] = []
-    for row in rows:
+    for row in p2_rows:
         item = dict(row)
         for key in ("task_id", "journey_id", "root_task_id", "parent_task_id"):
             if item.get(key) is not None:
                 item[key] = str(item[key])
+        item["source_system"] = "P2"
+        item["priority_rank"] = None
+        item["legacy_queue_url"] = None
         items.append(item)
-    return {"items": items}
+
+    for row in legacy_rows:
+        raw = dict(row)
+        reference = dict(raw.get("reference") or {})
+        task_id = str(raw["task_id"])
+        journey = str(raw["journey_id"])
+        source_code = (
+            reference.get("ruleKey")
+            or reference.get("ruleCode")
+            or raw.get("effect_key")
+        )
+        items.append(
+            {
+                "task_id": task_id,
+                "journey_id": journey,
+                "root_task_id": None,
+                "parent_task_id": None,
+                "round_number": 1,
+                "task_type": str(raw["task_type"]),
+                "category": str(raw["task_type"]),
+                "origin_kind": str(raw["origin_kind"] or "SYSTEM"),
+                "source_type": "LEGACY_WORKFLOW_TASK",
+                "source_code": str(source_code) if source_code else None,
+                "title": str(raw["title"] or raw["task_type"]),
+                "description": str(
+                    raw["description"]
+                    or "Existing Verigence workflow task. Open the existing Task Queue for its current action flow."
+                ),
+                "reference": reference,
+                "severity": str(raw["severity"] or "MEDIUM"),
+                # Preserve the legacy queue's native numeric priority rather
+                # than inventing a label translation that could change meaning.
+                "priority": None,
+                "priority_rank": int(raw["priority_rank"] or 0),
+                "assigned_role_code": raw["assigned_role_code"],
+                "assigned_actor_id": raw["assigned_actor_id"],
+                "raised_by_actor_id": None,
+                "raised_by_role_code": None,
+                "allowed_actions": [],
+                "completion_protocol": "LEGACY_WORKFLOW",
+                "task_status": str(raw["task_status"]),
+                "due_at_utc": raw["due_at_utc"],
+                "created_at_utc": raw["created_at_utc"],
+                "updated_at_utc": raw["updated_at_utc"],
+                "source_system": "LEGACY",
+                "legacy_queue_url": "/reviews",
+                "process_area": raw["process_area"],
+                "related_finding_id": (
+                    str(raw["related_finding_id"])
+                    if raw["related_finding_id"] is not None
+                    else None
+                ),
+            }
+        )
+
+    def _task_sort(item: dict[str, Any]) -> tuple:
+        due = item.get("due_at_utc")
+        # Cross-engine priority vocabularies are intentionally not compared.
+        # A common due/SLA ordering is factual and keeps urgent work visible.
+        return (
+            due is None,
+            due or datetime.max.replace(tzinfo=None),
+            item.get("created_at_utc"),
+        )
+
+    # Python cannot compare timezone-aware and naive datetime.max directly.
+    # Convert the sort key to timestamp text, which is stable ISO order for
+    # PostgreSQL timestamptz values and keeps NULL due dates last.
+    def _safe_sort(item: dict[str, Any]) -> tuple:
+        due = item.get("due_at_utc")
+        created = item.get("created_at_utc")
+        return (
+            due is None,
+            due.isoformat() if hasattr(due, "isoformat") else str(due or ""),
+            created.isoformat() if hasattr(created, "isoformat") else str(created or ""),
+        )
+
+    items.sort(key=_safe_sort)
+    return {
+        "items": items[:500],
+        "sources": {
+            "p2": len(p2_rows),
+            "legacy": len(legacy_rows),
+        },
+    }
 
 
 class TaskActionCommand(BaseModel):
