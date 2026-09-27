@@ -8,7 +8,7 @@ original requester, who accepts or rejects; reject requires a comment.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -312,7 +312,7 @@ def submit_action(
                     "result": _json({
                         "outcome": "ACCEPT",
                         "verifiedBy": actor_id,
-                        "verifiedAt": datetime.now(timezone.utc).isoformat(),
+                        "verifiedAt": datetime.now(UTC).isoformat(),
                         "comment": comment,
                     }),
                 },
