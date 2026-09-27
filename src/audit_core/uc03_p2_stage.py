@@ -115,7 +115,7 @@ def _booking_receipt_total(
         for duplicate in group.documents[1:]:
             excluded.add(duplicate.document_id)
 
-    total = Decimal("0")
+    total = Decimal(0)
     for payment in payments:
         if payment["payment_id"] not in excluded:
             total += Decimal(str(payment["amount"]))
