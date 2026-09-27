@@ -273,6 +273,8 @@ def get_p2_document_review(
                 ),
                 "confidenceScore": fact.confidence_score,
                 "isModified": bool(persisted.get("is_modified")) if persisted else False,
+                "reviewedByActorId": persisted.get("reviewed_by_actor_id") if persisted else None,
+                "reviewedAtUtc": persisted.get("reviewed_at_utc") if persisted else None,
                 "pageNo": fact.page_no,
                 "evidenceRegion": fact.evidence_region,
             }
@@ -300,10 +302,74 @@ def get_p2_document_review(
                     else None
                 ),
                 "isModified": bool(row.get("is_modified")),
+                "reviewedByActorId": row.get("reviewed_by_actor_id"),
+                "reviewedAtUtc": row.get("reviewed_at_utc"),
                 "pageNo": None,
                 "evidenceRegion": None,
             }
         )
+
+    correction_history = [
+        {
+            "fieldKey": str(row["field_key"]),
+            "canonicalFieldId": (
+                str(row["source_canonical_field_id"])
+                if row.get("source_canonical_field_id")
+                else None
+            ),
+            "sourceFactVersion": int(row.get("source_fact_version") or 0),
+            "extractedValue": row.get("extracted_value"),
+            "effectiveValue": row.get("effective_value"),
+            "reviewedByActorId": row.get("reviewed_by_actor_id"),
+            "reviewedAtUtc": row.get("reviewed_at_utc"),
+        }
+        for row in durable
+        if bool(row.get("is_modified"))
+    ]
+
+    related_task_rows = connection.execute(
+        text(
+            """
+            SELECT task_id, task_type, title, task_status,
+                   source_type, source_code, created_at_utc
+            FROM auditcore.p2_tasks
+            WHERE tenant_id=:tenant_id
+              AND journey_id=:journey_id
+              AND (
+                reference->>'documentId'=:document_id
+                OR reference->>'document_id'=:document_id
+              )
+            ORDER BY created_at_utc DESC
+            LIMIT 50
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "document_id": str(document_id),
+        },
+    ).mappings().all()
+    related_tasks = [
+        {
+            "taskId": str(row["task_id"]),
+            "taskType": str(row["task_type"]),
+            "title": str(row["title"]),
+            "status": str(row["task_status"]),
+            "sourceType": str(row["source_type"]),
+            "sourceCode": (
+                str(row["source_code"]) if row["source_code"] is not None else None
+            ),
+            "createdAtUtc": row["created_at_utc"],
+        }
+        for row in related_task_rows
+    ]
+    related_rules = sorted(
+        {
+            str(row["source_code"])
+            for row in related_task_rows
+            if row["source_type"] == "RULE" and row["source_code"]
+        }
+    )
 
     return {
         "journeyId": str(journey_id),
@@ -322,6 +388,9 @@ def get_p2_document_review(
         "contentAvailable": di_document is not None,
         "diReadError": di_error,
         "fields": fields,
+        "correctionHistory": correction_history,
+        "relatedTasks": related_tasks,
+        "relatedRules": related_rules,
     }
 
 
