@@ -1,0 +1,174 @@
+name: Deploy Phase 2 Worker DEV
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: p2-worker-dev-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      WORKER_SERVICE: verigence-p2-worker
+      DEPLOY_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Check out exact tested revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+
+      - name: Link approved Railway DEV project
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN secret is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --json >/tmp/link.json
+          railway service list --json >/tmp/services.json
+
+      - name: Ensure dedicated P2 worker service
+        shell: bash
+        run: |
+          set -euo pipefail
+          if python - <<'PY'
+          import json, os
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/services.json').read_text())
+          wanted=os.environ['WORKER_SERVICE']
+          raise SystemExit(0 if any(row.get('name') == wanted for row in rows) else 1)
+          PY
+          then
+            echo "P2_WORKER_SERVICE=EXISTING"
+          else
+            railway add --service "$WORKER_SERVICE" --json >/tmp/add-worker.json
+            echo "P2_WORKER_SERVICE=CREATED"
+          fi
+
+      - name: Copy Audit Core DEV runtime variables to worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          python - <<'PY' >/tmp/worker-vars.bin
+          import json
+          from pathlib import Path
+          variables=json.loads(Path('/tmp/audit-vars.json').read_text())
+          excluded={'PORT'}
+          for key, value in sorted(variables.items()):
+              if key.startswith('RAILWAY_') or key in excluded:
+                  continue
+              if value is None:
+                  continue
+              print(f"{key}={value}\0", end='')
+          PY
+          while IFS= read -r -d '' pair; do
+            railway variable set --service "$WORKER_SERVICE" "$pair" >/dev/null
+          done </tmp/worker-vars.bin
+          rm -f /tmp/worker-vars.bin /tmp/audit-vars.json
+
+      - name: Configure P2 worker process
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway environment edit --environment dev             --service-config "$WORKER_SERVICE" deploy.startCommand             "PYTHONPATH=src python -m audit_core.uc03_p2_worker" >/dev/null
+          railway environment edit --environment dev             --service-config "$WORKER_SERVICE" deploy.restartPolicyType             "ON_FAILURE" >/dev/null
+          railway environment edit --environment dev             --service-config "$WORKER_SERVICE" deploy.restartPolicyMaxRetries             "10" >/dev/null
+
+      - name: Validate worker runtime configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway variable list --service "$WORKER_SERVICE" --json >/tmp/worker-vars.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/worker-vars.json').read_text())
+          required=['DATABASE_URL','SECURITY_BASE_URL','SECURITY_CLIENT_ID','SECURITY_CLIENT_SECRET','DI_BASE_URL']
+          missing=[name for name in required if not str(data.get(name,'')).strip()]
+          if missing:
+              raise SystemExit('P2 worker missing required runtime variable(s): '+', '.join(missing))
+          p2_storage=all(str(data.get(name,'')).strip() for name in (
+              'AUDIT_CORE_P2_STORAGE_ENDPOINT',
+              'AUDIT_CORE_P2_STORAGE_ACCESS_KEY_ID',
+              'AUDIT_CORE_P2_STORAGE_SECRET_ACCESS_KEY',
+              'AUDIT_CORE_P2_STORAGE_BUCKET',
+          ))
+          photo_storage=all(str(data.get(name,'')).strip() for name in (
+              'AUDIT_CORE_PHOTO_STORAGE_ENDPOINT',
+              'AUDIT_CORE_PHOTO_STORAGE_ACCESS_KEY_ID',
+              'AUDIT_CORE_PHOTO_STORAGE_SECRET_ACCESS_KEY',
+              'AUDIT_CORE_PHOTO_STORAGE_BUCKET',
+          ))
+          if not (p2_storage or photo_storage):
+              raise SystemExit('P2 worker has no complete P2 or fallback document-storage configuration')
+          print('P2_WORKER_RUNTIME_CONFIG=PASS')
+          PY
+          rm -f /tmp/worker-vars.json
+
+      - name: Deploy tested SHA to P2 worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway deployment list --service "$WORKER_SERVICE" --limit 1 --json >/tmp/before.json
+          previous_id="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/before.json').read_text())
+          print(rows[0].get('id','') if rows else '')
+          PY
+          )"
+          echo "P2_WORKER_PREVIOUS_DEPLOYMENT_ID=$previous_id" >> "$GITHUB_ENV"
+          railway up . --path-as-root --service "$WORKER_SERVICE" --detach --yes             --message "P2 Worker DEV ${DEPLOY_SHA}" >/dev/null
+
+      - name: Verify fresh P2 worker deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            railway deployment list --service "$WORKER_SERVICE" --limit 1 --json >/tmp/deployment.json
+            read -r deployment_id status <<<"$(python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('/tmp/deployment.json').read_text())
+          if not rows:
+              print(' ')
+          else:
+              print(rows[0].get('id',''), rows[0].get('status',''))
+          PY
+          )"
+            if [[ -z "$deployment_id" || "$deployment_id" == "${P2_WORKER_PREVIOUS_DEPLOYMENT_ID:-}" ]]; then
+              echo "Waiting for new P2 worker deployment (attempt $attempt/30)"
+              sleep 10
+              continue
+            fi
+            case "$status" in
+              SUCCESS)
+                echo "P2_WORKER_DEPLOYMENT=PASS"
+                echo "P2_WORKER_DEPLOYMENT_ID=$deployment_id"
+                railway logs --service "$WORKER_SERVICE" --latest --deployment --lines 80 || true
+                exit 0
+                ;;
+              FAILED|CRASHED|REMOVED)
+                railway logs --service "$WORKER_SERVICE" --latest --deployment --lines 220 || true
+                echo "::error::P2 worker deployment $deployment_id failed: $status"
+                exit 1
+                ;;
+            esac
+            sleep 10
+          done
+          railway logs --service "$WORKER_SERVICE" --latest --deployment --lines 220 || true
+          echo "::error::P2 worker deployment did not reach SUCCESS"
+          exit 1

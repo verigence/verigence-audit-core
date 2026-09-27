@@ -270,7 +270,33 @@ def recompute_booking_stage(
         not gates[key]["passed"] for key in _BOOKING_DOC_GATES
     )
     if complete:
-        current_stage = "BOOKING_COMPLETE"
+        delivery_started = bool(
+            connection.execute(
+                text(
+                    """
+                    SELECT EXISTS (
+                      SELECT 1
+                      FROM auditcore.evidence e
+                      WHERE e.tenant_id=:tenant_id
+                        AND e.journey_id=:journey_id
+                        AND e.association_status='ACTIVE'
+                        AND upper(COALESCE(e.process_area,''))='DELIVERY'
+                    ) OR EXISTS (
+                      SELECT 1
+                      FROM auditcore.deliveries d
+                      WHERE d.tenant_id=:tenant_id
+                        AND d.journey_id=:journey_id
+                    )
+                    """
+                ),
+                {"tenant_id": tenant_id, "journey_id": journey_id},
+            ).scalar_one()
+        )
+        current_stage = (
+            "DELIVERY_DOCUMENT_UPLOAD"
+            if delivery_started
+            else "BOOKING_COMPLETE"
+        )
         booking_state = "COMPLETE"
     elif any_document_missing or not payment_passed:
         current_stage = "BOOKING_DOCUMENT_UPLOAD"

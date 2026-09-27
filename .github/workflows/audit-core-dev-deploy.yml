@@ -71,10 +71,26 @@ jobs:
               "/v1/tenants/{tenant_id}/mahindra-masters/segments/{segment_id}/imports",
               "/v1/tenants/{tenant_id}/mahindra-masters/discount-policy/imports",
               "/v1/tenants/{tenant_id}/journeys/{journey_id}/booking/identity-context",
+              "/p2/v1/tenants/{tenant_id}/journeys",
+              "/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/documents",
+              "/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/uploads/{batch_id}",
+              "/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/documents/{document_id}",
+              "/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/documents/{document_id}/fields/{field_key}",
+              "/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/documents/{document_id}/replace",
+              "/p2/v1/tenants/{tenant_id}/tasks",
           ]
           missing = [path for path in required if path not in paths]
           if missing:
               raise SystemExit("Missing Audit Core API path(s) before deploy: " + ", ".join(missing))
+          p2_document_methods = paths["/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/documents/{document_id}"]
+          if "get" not in p2_document_methods or "delete" not in p2_document_methods:
+              raise SystemExit("P2 document facade must expose GET and DELETE")
+          p2_field_methods = paths["/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/documents/{document_id}/fields/{field_key}"]
+          if "patch" not in p2_field_methods:
+              raise SystemExit("P2 document field facade must expose PATCH")
+          p2_replace_methods = paths["/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/documents/{document_id}/replace"]
+          if "post" not in p2_replace_methods:
+              raise SystemExit("P2 document facade must expose replacement POST")
           project_methods = paths["/v1/tenants/{tenant_id}/project"]
           if "delete" not in project_methods:
               raise SystemExit("Missing UC02 Project hard-delete method before deploy")

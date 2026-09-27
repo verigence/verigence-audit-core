@@ -236,6 +236,16 @@ jobs:
     uses: ./.github/workflows/audit-core-dev-deploy.yml
     secrets: inherit
 
+  deploy-p2-worker-dev:
+    name: Deploy tested P2 worker SHA to Railway DEV
+    needs: deploy-dev
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/dev' &&
+      needs.deploy-dev.result == 'success'
+    uses: ./.github/workflows/p2-worker-dev-deploy.yml
+    secrets: inherit
+
   diagnose-security-create:
     name: Diagnose live Security tenant create
     needs: deploy-dev

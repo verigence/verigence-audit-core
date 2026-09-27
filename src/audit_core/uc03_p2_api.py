@@ -455,6 +455,144 @@ def init_uploads(
     return {"journeyId": str(journey_id), "uploads": prepared}
 
 
+
+@router.post("/journeys/{journey_id}/documents/{document_id}/replace")
+def replace_document(
+    tenant_id: str,
+    journey_id: UUID,
+    document_id: UUID,
+    command: UploadInitFile,
+    request: Request,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    _authorize(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        permission_key=_UPDATE_PERMISSION,
+    )
+    evidence = connection.execute(
+        text(
+            """
+            SELECT evidence_id
+            FROM auditcore.evidence
+            WHERE tenant_id=:tenant_id
+              AND journey_id=:journey_id
+              AND di_document_id=:document_id
+              AND association_status='ACTIVE'
+            LIMIT 1
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "document_id": document_id,
+        },
+    ).mappings().one_or_none()
+    if evidence is None:
+        raise HTTPException(
+            status_code=404,
+            detail="The active document to replace was not found.",
+        )
+
+    content_type = command.contentType.lower().strip()
+    if content_type not in _ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail=f"{command.filename}: unsupported content type {command.contentType}.",
+        )
+    max_bytes = int(os.environ.get("P2_MAX_UPLOAD_BYTES", str(_DEFAULT_MAX_UPLOAD_BYTES)))
+    if command.sizeBytes > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{command.filename}: file exceeds the {max_bytes // (1024 * 1024)} MB limit.",
+        )
+    try:
+        storage = get_p2_document_storage()
+    except RuntimeError as exc:
+        raise DependencyUnavailableError(
+            detail="Phase 2 document storage is not configured."
+        ) from exc
+
+    batch_id = uuid4()
+    object_key = (
+        f"p2-documents/{tenant_id}/{journey_id}/{batch_id}/original/"
+        f"{_safe_filename(command.filename)}"
+    )
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.p2_upload_batches (
+                tenant_id, batch_id, journey_id, client_upload_id,
+                original_filename, content_type, size_bytes, page_count,
+                original_object_key, batch_status, uploaded_by_actor_id,
+                correlation_id, replaces_document_id, replaces_evidence_id
+            ) VALUES (
+                :tenant_id, :batch_id, :journey_id, :client_upload_id,
+                :filename, :content_type, :size_bytes, 0,
+                :object_key, 'AWAITING_UPLOAD', :actor_id,
+                :correlation_id, :document_id, :evidence_id
+            )
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "batch_id": batch_id,
+            "journey_id": journey_id,
+            "client_upload_id": command.clientUploadId,
+            "filename": command.filename,
+            "content_type": content_type,
+            "size_bytes": command.sizeBytes,
+            "object_key": object_key,
+            "actor_id": human_principal.subject,
+            "correlation_id": get_correlation_id(request),
+            "document_id": document_id,
+            "evidence_id": evidence["evidence_id"],
+        },
+    )
+    try:
+        upload_url = storage.presign_put(
+            object_key,
+            content_type=content_type,
+            expires_seconds=900,
+        )
+    except P2DocumentStorageError as exc:
+        raise DependencyUnavailableError(
+            detail="The replacement upload could not be prepared."
+        ) from exc
+
+    _activity(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        event_type="DOCUMENT_REPLACEMENT_INITIALIZED",
+        subject_type="UPLOAD_BATCH",
+        subject_id=str(batch_id),
+        details={
+            "replacesDocumentId": str(document_id),
+            "filename": command.filename,
+        },
+        correlation_id=get_correlation_id(request),
+    )
+    return {
+        "journeyId": str(journey_id),
+        "batchId": str(batch_id),
+        "clientUploadId": command.clientUploadId,
+        "filename": command.filename,
+        "status": "AWAITING_UPLOAD",
+        "uploadUrl": upload_url,
+        "uploadHeaders": {"Content-Type": content_type},
+        "expiresInSeconds": 900,
+        "replacesDocumentId": str(document_id),
+    }
+
+
 @router.post("/journeys/{journey_id}/uploads/{batch_id}:finalize")
 def finalize_upload(
     tenant_id: str,
@@ -573,6 +711,75 @@ def finalize_upload(
     return {"batchId": str(batch_id), "status": "UPLOADED"}
 
 
+
+@router.get("/journeys/{journey_id}/uploads/{batch_id}")
+def get_upload_batch_status(
+    tenant_id: str,
+    journey_id: UUID,
+    batch_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    _authorize(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        permission_key=_READ_PERMISSION,
+    )
+    batch = connection.execute(
+        text(
+            """
+            SELECT batch_id, original_filename, content_type, size_bytes,
+                   sha256, page_count, batch_status, created_at_utc, updated_at_utc
+            FROM auditcore.p2_upload_batches
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND batch_id=:batch_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "batch_id": batch_id,
+        },
+    ).mappings().one_or_none()
+    if batch is None:
+        raise HTTPException(status_code=404, detail="Upload batch was not found.")
+    pages = connection.execute(
+        text(
+            """
+            SELECT queue_id, page_number, client_upload_id,
+                   di_document_id, classified_document_type, business_stage,
+                   queue_status, attempt_count, extracted_field_count,
+                   last_error, created_at_utc, updated_at_utc
+            FROM auditcore.p2_document_queue
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND batch_id=:batch_id
+            ORDER BY page_number
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "batch_id": batch_id,
+        },
+    ).mappings().all()
+    result = dict(batch)
+    result["batchId"] = str(result.pop("batch_id"))
+    result["pages"] = []
+    for raw in pages:
+        page = dict(raw)
+        page["queueId"] = str(page.pop("queue_id"))
+        if page.get("di_document_id") is not None:
+            page["diDocumentId"] = str(page.pop("di_document_id"))
+        result["pages"].append(page)
+    return {"journeyId": str(journey_id), "batch": result}
+
+
 @router.get("/journeys/{journey_id}/documents")
 def list_documents(
     tenant_id: str,
@@ -634,7 +841,43 @@ def list_documents(
         item["batchId"] = batch_key
         item["pages"] = by_batch.get(batch_key, [])
         result.append(item)
-    return {"journeyId": str(journey_id), "batches": result}
+    evidence_rows = connection.execute(
+        text(
+            """
+            SELECT e.evidence_id, e.di_document_id, e.document_type_key,
+                   e.process_area, e.association_status, e.supersedes_evidence_id,
+                   e.processing_status_cache, e.verification_status_cache,
+                   e.confirmation_status_cache, e.linked_at_utc,
+                   d.original_filename
+            FROM auditcore.evidence e
+            LEFT JOIN auditcore.document_capture_v2_documents d
+              ON d.tenant_id=e.tenant_id
+             AND d.journey_id=e.journey_id
+             AND d.di_document_id=e.di_document_id
+            WHERE e.tenant_id=:tenant_id AND e.journey_id=:journey_id
+              AND e.association_status IN ('ACTIVE','SUPERSEDED')
+            ORDER BY e.linked_at_utc DESC, e.evidence_id DESC
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    documents = []
+    for raw in evidence_rows:
+        doc = dict(raw)
+        doc["evidenceId"] = str(doc.pop("evidence_id"))
+        doc["documentId"] = str(doc.pop("di_document_id"))
+        if doc.get("supersedes_evidence_id") is not None:
+            doc["supersedesEvidenceId"] = str(doc.pop("supersedes_evidence_id"))
+        else:
+            doc.pop("supersedes_evidence_id", None)
+            doc["supersedesEvidenceId"] = None
+        documents.append(doc)
+
+    return {
+        "journeyId": str(journey_id),
+        "batches": result,
+        "documents": documents,
+    }
 
 
 @router.get("/journeys/{journey_id}/events")
