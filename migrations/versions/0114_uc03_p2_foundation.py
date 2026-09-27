@@ -44,6 +44,7 @@ def upgrade() -> None:
             PRIMARY KEY (tenant_id, batch_id),
             FOREIGN KEY (tenant_id, journey_id)
               REFERENCES auditcore.journeys(tenant_id, journey_id)
+              ON DELETE CASCADE
         );
 
         CREATE INDEX ix_p2_upload_batches_journey
@@ -80,9 +81,11 @@ def upgrade() -> None:
             UNIQUE (tenant_id, batch_id, page_number),
             UNIQUE (tenant_id, client_upload_id),
             FOREIGN KEY (tenant_id, batch_id)
-              REFERENCES auditcore.p2_upload_batches(tenant_id, batch_id),
+              REFERENCES auditcore.p2_upload_batches(tenant_id, batch_id)
+              ON DELETE CASCADE,
             FOREIGN KEY (tenant_id, journey_id)
               REFERENCES auditcore.journeys(tenant_id, journey_id)
+              ON DELETE CASCADE
         );
 
         CREATE INDEX ix_p2_document_queue_journey
@@ -120,6 +123,7 @@ def upgrade() -> None:
             UNIQUE (tenant_id, work_type, work_key),
             FOREIGN KEY (tenant_id, journey_id)
               REFERENCES auditcore.journeys(tenant_id, journey_id)
+              ON DELETE CASCADE
         );
 
         CREATE INDEX ix_p2_work_queue_claim
@@ -154,6 +158,7 @@ def upgrade() -> None:
             PRIMARY KEY (tenant_id, journey_id),
             FOREIGN KEY (tenant_id, journey_id)
               REFERENCES auditcore.journeys(tenant_id, journey_id)
+              ON DELETE CASCADE
         );
 
         CREATE TABLE auditcore.p2_stage_gate_state (
@@ -168,6 +173,7 @@ def upgrade() -> None:
             PRIMARY KEY (tenant_id, journey_id, stage_code, gate_key),
             FOREIGN KEY (tenant_id, journey_id)
               REFERENCES auditcore.journeys(tenant_id, journey_id)
+              ON DELETE CASCADE
         );
 
         CREATE TABLE auditcore.p2_control_state (
@@ -190,6 +196,7 @@ def upgrade() -> None:
             PRIMARY KEY (tenant_id, journey_id, control_code),
             FOREIGN KEY (tenant_id, journey_id)
               REFERENCES auditcore.journeys(tenant_id, journey_id)
+              ON DELETE CASCADE
         );
 
         CREATE TABLE auditcore.p2_tasks (
@@ -237,6 +244,7 @@ def upgrade() -> None:
             UNIQUE (tenant_id, dedupe_key),
             FOREIGN KEY (tenant_id, journey_id)
               REFERENCES auditcore.journeys(tenant_id, journey_id)
+              ON DELETE CASCADE
         );
 
         CREATE INDEX ix_p2_tasks_queue
@@ -255,9 +263,11 @@ def upgrade() -> None:
             created_at_utc         timestamptz NOT NULL DEFAULT now(),
             PRIMARY KEY (tenant_id, task_event_id),
             FOREIGN KEY (tenant_id, task_id)
-              REFERENCES auditcore.p2_tasks(tenant_id, task_id),
+              REFERENCES auditcore.p2_tasks(tenant_id, task_id)
+              ON DELETE CASCADE,
             FOREIGN KEY (tenant_id, journey_id)
               REFERENCES auditcore.journeys(tenant_id, journey_id)
+              ON DELETE CASCADE
         );
 
         CREATE TABLE auditcore.p2_activity_events (
@@ -273,6 +283,7 @@ def upgrade() -> None:
             PRIMARY KEY (tenant_id, event_id),
             FOREIGN KEY (tenant_id, journey_id)
               REFERENCES auditcore.journeys(tenant_id, journey_id)
+              ON DELETE CASCADE
         );
 
         CREATE INDEX ix_p2_activity_events_journey
