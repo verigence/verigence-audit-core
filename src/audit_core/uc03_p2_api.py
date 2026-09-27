@@ -157,18 +157,27 @@ def list_p2_journeys(
                       )
                   )
             ),
+            task_rows AS (
+                SELECT tenant_id, journey_id, due_at_utc,
+                       task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED') AS is_open
+                FROM auditcore.p2_tasks
+                WHERE tenant_id=:tenant_id
+                UNION ALL
+                SELECT tenant_id, subject_ref AS journey_id, due_at_utc,
+                       status IN ('OPEN','IN_PROGRESS') AS is_open
+                FROM auditcore.work_items
+                WHERE tenant_id=:tenant_id
+                  AND item_kind='EXECUTION_TASK'
+                  AND subject_kind='JOURNEY'
+            ),
             task_stats AS (
                 SELECT tenant_id, journey_id,
                        COUNT(*) AS total_tasks,
+                       COUNT(*) FILTER (WHERE is_open) AS open_tasks,
                        COUNT(*) FILTER (
-                         WHERE task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED')
-                       ) AS open_tasks,
-                       COUNT(*) FILTER (
-                         WHERE due_at_utc < now()
-                           AND task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED')
+                         WHERE is_open AND due_at_utc < now()
                        ) AS overdue_tasks
-                FROM auditcore.p2_tasks
-                WHERE tenant_id=:tenant_id
+                FROM task_rows
                 GROUP BY tenant_id, journey_id
             ),
             finding_stats AS (
@@ -732,19 +741,27 @@ def overview_summary(
     tasks = connection.execute(
         text(
             """
+            WITH task_rows AS (
+                SELECT due_at_utc,
+                       task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED') AS is_open,
+                       task_status='VERIFIED_COMPLETE' AS is_completed
+                FROM auditcore.p2_tasks
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                UNION ALL
+                SELECT due_at_utc,
+                       status IN ('OPEN','IN_PROGRESS') AS is_open,
+                       status='RESOLVED' AS is_completed
+                FROM auditcore.work_items
+                WHERE tenant_id=:tenant_id
+                  AND subject_kind='JOURNEY'
+                  AND subject_ref=:journey_id
+                  AND item_kind='EXECUTION_TASK'
+            )
             SELECT COUNT(*) AS total,
-                   COUNT(*) FILTER (
-                     WHERE task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED')
-                   ) AS open,
-                   COUNT(*) FILTER (
-                     WHERE task_status='VERIFIED_COMPLETE'
-                   ) AS completed,
-                   COUNT(*) FILTER (
-                     WHERE due_at_utc < now()
-                       AND task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED')
-                   ) AS overdue
-            FROM auditcore.p2_tasks
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                   COUNT(*) FILTER (WHERE is_open) AS open,
+                   COUNT(*) FILTER (WHERE is_completed) AS completed,
+                   COUNT(*) FILTER (WHERE is_open AND due_at_utc < now()) AS overdue
+            FROM task_rows
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
@@ -1084,16 +1101,6 @@ def list_tasks(
                     else None
                 ),
             }
-        )
-
-    def _task_sort(item: dict[str, Any]) -> tuple:
-        due = item.get("due_at_utc")
-        # Cross-engine priority vocabularies are intentionally not compared.
-        # A common due/SLA ordering is factual and keeps urgent work visible.
-        return (
-            due is None,
-            due or datetime.max.replace(tzinfo=None),
-            item.get("created_at_utc"),
         )
 
     # Python cannot compare timezone-aware and naive datetime.max directly.
