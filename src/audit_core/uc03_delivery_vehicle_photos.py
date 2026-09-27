@@ -80,6 +80,14 @@ def vehicle_photos_uploaded(connection: Connection, *, tenant_id: str, journey_i
 
 
 def _public_photo(row, storage: VehiclePhotoStorage) -> VehiclePhoto:
+    # Phase 2 captures photos through its own document storage (which may be
+    # a different bucket); sign those with the store that holds them.
+    if row.get("capture_source") == "P2":
+        from audit_core.uc03_p2_storage import get_p2_document_storage
+
+        content_url = get_p2_document_storage().presign_get(row["object_key"])
+    else:
+        content_url = storage.get_presigned_url(row["object_key"])
     return VehiclePhoto(
         photoId=row["photo_id"],
         originalFilename=row["original_filename"],
@@ -87,7 +95,7 @@ def _public_photo(row, storage: VehiclePhotoStorage) -> VehiclePhoto:
         sizeBytes=row["size_bytes"],
         uploadedByActorId=row["uploaded_by_actor_id"],
         uploadedAtUtc=row["uploaded_at_utc"].isoformat(),
-        contentUrl=storage.get_presigned_url(row["object_key"]),
+        contentUrl=content_url,
     )
 
 
@@ -118,7 +126,7 @@ def list_vehicle_photos(
         text(
             """
             SELECT photo_id, original_filename, content_type, size_bytes, object_key,
-                   uploaded_by_actor_id, uploaded_at_utc
+                   uploaded_by_actor_id, uploaded_at_utc, capture_source
             FROM auditcore.delivery_vehicle_photos
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND deleted_at_utc IS NULL
             ORDER BY uploaded_at_utc
