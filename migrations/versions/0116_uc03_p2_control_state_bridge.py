@@ -258,9 +258,67 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute(
-        """
+        r"""
         DROP TRIGGER IF EXISTS trg_p2_rule_execution_mirror ON auditcore.rule_executions;
         DROP FUNCTION IF EXISTS auditcore.p2_mirror_rule_execution();
+
+        CREATE OR REPLACE FUNCTION auditcore.p2_request_stage_recompute(
+            p_tenant_id varchar,
+            p_journey_id uuid
+        )
+        RETURNS bigint
+        LANGUAGE plpgsql
+        AS $
+        DECLARE
+            v_version bigint;
+        BEGIN
+            INSERT INTO auditcore.p2_journey_runtime (
+                tenant_id, journey_id, fact_version
+            ) VALUES (
+                p_tenant_id, p_journey_id, 1
+            )
+            ON CONFLICT (tenant_id, journey_id)
+            DO UPDATE SET fact_version = auditcore.p2_journey_runtime.fact_version + 1,
+                          updated_at_utc = now()
+            RETURNING fact_version INTO v_version;
+
+            INSERT INTO auditcore.p2_work_queue (
+                tenant_id, journey_id, work_type, work_key,
+                payload, requested_version, work_status
+            ) VALUES (
+                p_tenant_id, p_journey_id, 'STAGE_RECOMPUTE',
+                'booking:' || p_journey_id::text,
+                jsonb_build_object('stage', 'BOOKING'),
+                v_version,
+                'PENDING'
+            )
+            ON CONFLICT (tenant_id, work_type, work_key)
+            DO UPDATE SET requested_version = GREATEST(
+                              COALESCE(auditcore.p2_work_queue.requested_version, 0),
+                              EXCLUDED.requested_version
+                          ),
+                          payload = EXCLUDED.payload,
+                          work_status = CASE
+                              WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
+                                  THEN auditcore.p2_work_queue.work_status
+                              ELSE 'PENDING'
+                          END,
+                          next_attempt_at_utc = CASE
+                              WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
+                                  THEN auditcore.p2_work_queue.next_attempt_at_utc
+                              ELSE NULL
+                          END,
+                          last_error = CASE
+                              WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
+                                  THEN auditcore.p2_work_queue.last_error
+                              ELSE NULL
+                          END,
+                          updated_at_utc = now();
+
+            RETURN v_version;
+        END;
+        $;
+
         DROP FUNCTION IF EXISTS auditcore.p2_requeue_verifying_controls(varchar, uuid, bigint);
 
         ALTER TABLE auditcore.p2_control_state
