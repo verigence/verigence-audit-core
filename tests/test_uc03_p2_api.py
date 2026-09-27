@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -16,6 +17,7 @@ from audit_core.security_authorization import (
     SecurityAuthorizationDecision,
     get_security_authorization_client,
 )
+from audit_core import uc03_p2_stage
 
 
 @dataclass
@@ -266,3 +268,80 @@ def test_p2_task_api_returns_readable_journey_context(p2_api_setup) -> None:
     assert task["outlet_name"] == "P2 Outlet"
     assert task["journey_id"] == str(journey)
     assert task["reference"]["documentTypeKey"] == "booking_form"
+
+
+
+def test_p2_stage_reopens_booking_after_delivery_has_started(
+    p2_api_setup,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A correction that invalidates Booking must reopen Booking even after
+    Delivery has started; the P2 projection must never get stuck in DELIVERY_*.
+    """
+    setup = p2_api_setup
+    tenant = setup["tenant_id"]
+    journey = setup["journey_id"]
+
+    monkeypatch.setattr(
+        uc03_p2_stage,
+        "_minimum_booking_amount",
+        lambda connection, *, tenant_id: Decimal("50000"),
+    )
+    monkeypatch.setattr(
+        uc03_p2_stage,
+        "_booking_receipt_total",
+        lambda connection, *, tenant_id, journey_id: Decimal("50000"),
+    )
+    monkeypatch.setattr(
+        uc03_p2_stage,
+        "_manual_verification_pending",
+        lambda connection, *, tenant_id, journey_id: 0,
+    )
+    monkeypatch.setattr(
+        uc03_p2_stage,
+        "_delivery_started",
+        lambda connection, *, tenant_id, journey_id: True,
+    )
+    monkeypatch.setattr(
+        uc03_p2_stage,
+        "_document_extracted",
+        lambda connection, *, tenant_id, journey_id, document_types: (True, 1),
+    )
+
+    with setup["engine"].begin() as connection:
+        result = uc03_p2_stage.recompute_journey_stage(
+            connection,
+            tenant_id=tenant,
+            journey_id=journey,
+        )
+        assert result["bookingCompletionState"] == "COMPLETE"
+        assert result["stage"] == "DELIVERY_DOCUMENT_UPLOAD"
+
+    def document_state(connection, *, tenant_id, journey_id, document_types):
+        del connection, tenant_id, journey_id
+        if "pan_card" in document_types:
+            return False, 0
+        return True, 1
+
+    monkeypatch.setattr(uc03_p2_stage, "_document_extracted", document_state)
+
+    with setup["engine"].begin() as connection:
+        reopened = uc03_p2_stage.recompute_journey_stage(
+            connection,
+            tenant_id=tenant,
+            journey_id=journey,
+        )
+        persisted = connection.execute(
+            text(
+                """
+                SELECT current_stage
+                FROM auditcore.p2_journey_runtime
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                """
+            ),
+            {"tenant_id": tenant, "journey_id": journey},
+        ).scalar_one()
+
+    assert reopened["bookingCompletionState"] == "IN_PROGRESS"
+    assert reopened["stage"] == "BOOKING_DOCUMENT_UPLOAD"
+    assert persisted == "BOOKING_DOCUMENT_UPLOAD"
