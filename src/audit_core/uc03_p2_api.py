@@ -808,7 +808,7 @@ def overview_summary(
                 FROM auditcore.work_items
                 WHERE tenant_id=:tenant_id
                   AND subject_kind='JOURNEY'
-                  AND subject_ref=:journey_id
+                  AND subject_ref=CAST(:journey_id AS text)
                   AND item_kind='EXECUTION_TASK'
             )
             SELECT COUNT(*) AS total,
