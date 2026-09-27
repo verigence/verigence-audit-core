@@ -274,7 +274,7 @@ class UploadInitFile(BaseModel):
     filename: str = Field(min_length=1, max_length=500)
     contentType: str = Field(min_length=1, max_length=160)
     sizeBytes: int = Field(gt=0)
-    clientUploadId: str | None = Field(default=None, max_length=160)
+    clientUploadId: str = Field(min_length=8, max_length=160)
 
 
 class UploadInitCommand(BaseModel):
@@ -323,73 +323,127 @@ def init_uploads(
                 status_code=413,
                 detail=f"{item.filename}: file exceeds the {max_bytes // (1024 * 1024)} MB limit.",
             )
-        batch_id = uuid4()
+        candidate_batch_id = uuid4()
         safe_name = _safe_filename(item.filename)
-        object_key = (
-            f"p2-documents/{tenant_id}/{journey_id}/{batch_id}/original/{safe_name}"
+        candidate_object_key = (
+            f"p2-documents/{tenant_id}/{journey_id}/{candidate_batch_id}/original/{safe_name}"
         )
-        try:
-            upload_url = storage.presign_put(
-                object_key,
-                content_type=content_type,
-                expires_seconds=900,
-            )
-        except P2DocumentStorageError as exc:
-            raise DependencyUnavailableError(
-                detail="The document upload could not be prepared."
-            ) from exc
-
-        connection.execute(
+        inserted = connection.execute(
             text(
                 """
                 INSERT INTO auditcore.p2_upload_batches (
-                    tenant_id, batch_id, journey_id, original_filename,
-                    content_type, size_bytes, page_count,
+                    tenant_id, batch_id, journey_id, client_upload_id,
+                    original_filename, content_type, size_bytes, page_count,
                     original_object_key, batch_status, uploaded_by_actor_id,
                     correlation_id
                 ) VALUES (
-                    :tenant_id, :batch_id, :journey_id, :filename,
-                    :content_type, :size_bytes, 0,
+                    :tenant_id, :batch_id, :journey_id, :client_upload_id,
+                    :filename, :content_type, :size_bytes, 0,
                     :object_key, 'AWAITING_UPLOAD', :actor_id,
                     :correlation_id
                 )
+                ON CONFLICT (tenant_id, journey_id, client_upload_id)
+                  WHERE client_upload_id IS NOT NULL
+                DO NOTHING
+                RETURNING batch_id
                 """
             ),
             {
                 "tenant_id": tenant_id,
-                "batch_id": batch_id,
+                "batch_id": candidate_batch_id,
                 "journey_id": journey_id,
+                "client_upload_id": item.clientUploadId,
                 "filename": item.filename,
                 "content_type": content_type,
                 "size_bytes": item.sizeBytes,
-                "object_key": object_key,
+                "object_key": candidate_object_key,
                 "actor_id": human_principal.subject,
                 "correlation_id": correlation_id,
             },
-        )
-        _activity(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            event_type="UPLOAD_INITIALIZED",
-            subject_type="UPLOAD_BATCH",
-            subject_id=str(batch_id),
-            details={
-                "filename": item.filename,
-                "contentType": content_type,
-                "sizeBytes": item.sizeBytes,
-                "clientUploadId": item.clientUploadId,
-            },
-            correlation_id=correlation_id,
-        )
+        ).scalar_one_or_none()
+
+        created = inserted is not None
+        if created:
+            batch_id = candidate_batch_id
+            object_key = candidate_object_key
+            batch_status = "AWAITING_UPLOAD"
+            _activity(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                event_type="UPLOAD_INITIALIZED",
+                subject_type="UPLOAD_BATCH",
+                subject_id=str(batch_id),
+                details={
+                    "filename": item.filename,
+                    "contentType": content_type,
+                    "sizeBytes": item.sizeBytes,
+                    "clientUploadId": item.clientUploadId,
+                },
+                correlation_id=correlation_id,
+            )
+        else:
+            existing = connection.execute(
+                text(
+                    """
+                    SELECT batch_id, original_filename, content_type, size_bytes,
+                           original_object_key, batch_status
+                    FROM auditcore.p2_upload_batches
+                    WHERE tenant_id=:tenant_id
+                      AND journey_id=:journey_id
+                      AND client_upload_id=:client_upload_id
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "journey_id": journey_id,
+                    "client_upload_id": item.clientUploadId,
+                },
+            ).mappings().one()
+            if (
+                str(existing["original_filename"]) != item.filename
+                or str(existing["content_type"]) != content_type
+                or int(existing["size_bytes"]) != item.sizeBytes
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{item.filename}: clientUploadId was already used "
+                        "for different file metadata."
+                    ),
+                )
+            batch_id = UUID(str(existing["batch_id"]))
+            object_key = str(existing["original_object_key"])
+            batch_status = str(existing["batch_status"])
+
+        already_accepted = batch_status != "AWAITING_UPLOAD"
+        upload_url: str | None = None
+        if not already_accepted:
+            try:
+                upload_url = storage.presign_put(
+                    object_key,
+                    content_type=content_type,
+                    expires_seconds=900,
+                )
+            except P2DocumentStorageError as exc:
+                raise DependencyUnavailableError(
+                    detail="The document upload could not be prepared."
+                ) from exc
+
         prepared.append(
             {
                 "batchId": str(batch_id),
                 "clientUploadId": item.clientUploadId,
                 "filename": item.filename,
+                "status": batch_status,
+                "alreadyAccepted": already_accepted,
                 "uploadUrl": upload_url,
-                "uploadHeaders": {"Content-Type": content_type},
-                "expiresInSeconds": 900,
+                "uploadHeaders": (
+                    {"Content-Type": content_type}
+                    if upload_url is not None
+                    else {}
+                ),
+                "expiresInSeconds": 900 if upload_url is not None else 0,
             }
         )
 
