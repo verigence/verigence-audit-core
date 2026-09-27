@@ -978,37 +978,38 @@ def list_tasks(
     p2_rows = connection.execute(
         text(
             """
-            SELECT task_id, journey_id, root_task_id, parent_task_id,
-                   round_number, task_type, category, origin_kind,
-                   source_type, source_code, title, description, reference,
-                   severity, priority, assigned_role_code, assigned_actor_id,
-                   raised_by_actor_id, raised_by_role_code, allowed_actions,
-                   completion_protocol, task_status, due_at_utc,
-                   created_at_utc, updated_at_utc
+            SELECT t.task_id, t.journey_id, t.root_task_id, t.parent_task_id,
+                   t.round_number, t.task_type, t.category, t.origin_kind,
+                   t.source_type, t.source_code, t.title, t.description, t.reference,
+                   t.severity, t.priority, t.assigned_role_code, t.assigned_actor_id,
+                   t.raised_by_actor_id, t.raised_by_role_code, t.allowed_actions,
+                   t.completion_protocol, t.task_status, t.due_at_utc,
+                   t.created_at_utc, t.updated_at_utc,
+                   c.display_name AS customer_name,
+                   d.dealer_name,
+                   o.outlet_name,
+                   NULLIF(concat_ws(' · ',
+                     NULLIF(jp.model_name_snapshot, ''),
+                     NULLIF(jp.variant_name_snapshot, ''),
+                     NULLIF(jp.colour_name_snapshot, '')
+                   ), '') AS vehicle
             FROM auditcore.p2_tasks t
+            JOIN auditcore.journeys j
+              ON j.tenant_id=t.tenant_id AND j.journey_id=t.journey_id
+            JOIN auditcore.customers c
+              ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+            JOIN auditcore.dealers d
+              ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
+            JOIN auditcore.dealer_outlets o
+              ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id
+             AND o.outlet_id=j.outlet_id
+            LEFT JOIN auditcore.journey_products jp
+              ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
             WHERE t.tenant_id=:tenant_id
               AND (:journey_id IS NULL OR t.journey_id=:journey_id)
               AND (
                 (:status IS NULL AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED'))
                 OR (:status IS NOT NULL AND t.task_status=:status)
-              )
-              AND EXISTS (
-                SELECT 1
-                FROM auditcore.journeys j
-                JOIN auditcore.business_assignments ba
-                  ON ba.tenant_id=j.tenant_id
-                 AND ba.security_actor_id=:actor_id
-                 AND ba.assignment_status='ACTIVE'
-                 AND ba.effective_from <= now()
-                 AND (ba.effective_to IS NULL OR ba.effective_to >= now())
-                 AND (
-                   ba.dealer_id IS NULL
-                   OR (
-                     ba.dealer_id=j.dealer_id
-                     AND (ba.outlet_id IS NULL OR ba.outlet_id=j.outlet_id)
-                   )
-                 )
-                WHERE j.tenant_id=t.tenant_id AND j.journey_id=t.journey_id
               )
             ORDER BY t.due_at_utc NULLS LAST, t.created_at_utc
             LIMIT 500
@@ -1018,7 +1019,6 @@ def list_tasks(
             "tenant_id": tenant_id,
             "journey_id": journey_id,
             "status": status,
-            "actor_id": human_principal.subject,
         },
     ).mappings().all()
 
@@ -1048,7 +1048,15 @@ def list_tasks(
               wtd.related_finding_id,
               wtd.task_payload AS reference,
               wi.created_at_utc,
-              wi.updated_at_utc
+              wi.updated_at_utc,
+              c.display_name AS customer_name,
+              d.dealer_name,
+              o.outlet_name,
+              NULLIF(concat_ws(' · ',
+                NULLIF(jp.model_name_snapshot, ''),
+                NULLIF(jp.variant_name_snapshot, ''),
+                NULLIF(jp.colour_name_snapshot, '')
+              ), '') AS vehicle
             FROM auditcore.work_items wi
             JOIN auditcore.work_item_task_detail wtd
               ON wtd.tenant_id=wi.tenant_id
@@ -1056,6 +1064,15 @@ def list_tasks(
             JOIN auditcore.journeys j
               ON j.tenant_id=wi.tenant_id
              AND j.journey_id::text=wi.subject_ref
+            JOIN auditcore.customers c
+              ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+            JOIN auditcore.dealers d
+              ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
+            JOIN auditcore.dealer_outlets o
+              ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id
+             AND o.outlet_id=j.outlet_id
+            LEFT JOIN auditcore.journey_products jp
+              ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
             WHERE wi.tenant_id=:tenant_id
               AND wi.item_kind='EXECUTION_TASK'
               AND wi.subject_kind='JOURNEY'
@@ -1063,22 +1080,6 @@ def list_tasks(
               AND (
                 (:status IS NULL AND wi.status IN ('OPEN','IN_PROGRESS'))
                 OR (:status IS NOT NULL AND wi.status=:status)
-              )
-              AND EXISTS (
-                SELECT 1
-                FROM auditcore.business_assignments ba
-                WHERE ba.tenant_id=j.tenant_id
-                  AND ba.security_actor_id=:actor_id
-                  AND ba.assignment_status='ACTIVE'
-                  AND ba.effective_from <= now()
-                  AND (ba.effective_to IS NULL OR ba.effective_to >= now())
-                  AND (
-                    ba.dealer_id IS NULL
-                    OR (
-                      ba.dealer_id=j.dealer_id
-                      AND (ba.outlet_id IS NULL OR ba.outlet_id=j.outlet_id)
-                    )
-                  )
               )
             ORDER BY wi.due_at_utc NULLS LAST, wi.priority DESC, wi.created_at_utc
             LIMIT 500
@@ -1088,7 +1089,6 @@ def list_tasks(
             "tenant_id": tenant_id,
             "journey_id": journey_id,
             "status": status,
-            "actor_id": human_principal.subject,
         },
     ).mappings().all()
 
@@ -1154,6 +1154,10 @@ def list_tasks(
                     if raw["related_finding_id"] is not None
                     else None
                 ),
+                "customer_name": raw.get("customer_name"),
+                "dealer_name": raw.get("dealer_name"),
+                "outlet_name": raw.get("outlet_name"),
+                "vehicle": raw.get("vehicle"),
             }
         )
 
