@@ -36,6 +36,11 @@ from audit_core.uc03_p2_storage import (
     get_p2_document_storage,
 )
 from audit_core.uc03_p2_tasks import create_p2_task, submit_action
+from audit_core.uc03_requirement_satisfaction import (
+    linked_documents_for_journey,
+    requirements_for_journey,
+    resolve_requirement_satisfaction,
+)
 
 router = APIRouter(
     prefix="/p2/v1/tenants/{tenant_id}",
@@ -708,6 +713,150 @@ def stage_status(
     }
 
 
+
+def _p2_control_statistics(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+) -> dict[str, int]:
+    row = connection.execute(
+        text(
+            """
+            SELECT COUNT(*) AS tracked,
+                   COUNT(*) FILTER (WHERE control_status='PASS') AS passed,
+                   COUNT(*) FILTER (WHERE control_status='FAIL') AS failed,
+                   COUNT(*) FILTER (WHERE control_status IN ('WAITING_FOR_FACTS','READY','EVALUATING')) AS waiting,
+                   COUNT(*) FILTER (WHERE control_status='RETRY_PENDING') AS retry_pending,
+                   COUNT(*) FILTER (WHERE control_status='ERROR_TERMINAL') AS errors
+            FROM auditcore.p2_control_state
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one()
+    return {
+        "tracked": int(row["tracked"] or 0),
+        "passed": int(row["passed"] or 0),
+        "failed": int(row["failed"] or 0),
+        "waiting": int(row["waiting"] or 0),
+        "retryPending": int(row["retry_pending"] or 0),
+        "errors": int(row["errors"] or 0),
+    }
+
+
+def _p2_requirement_statistics(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    stage_code: str,
+) -> tuple[int, int]:
+    requirements = requirements_for_journey(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code=stage_code,
+    )
+    documents = linked_documents_for_journey(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code=stage_code,
+    )
+    satisfaction = resolve_requirement_satisfaction(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code=stage_code,
+        requirements=requirements,
+        documents=documents,
+    )
+    governed = [
+        item
+        for item in satisfaction.values()
+        if item.requirement_level in ("REQUIRED", "CONDITIONAL")
+        and item.reason != "NOT_APPLICABLE"
+        and not item.is_extension
+    ]
+    return len(governed), sum(1 for item in governed if item.satisfied)
+
+
+def _p2_page_statistics(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    stage_code: str,
+) -> tuple[int, int]:
+    row = connection.execute(
+        text(
+            """
+            SELECT COUNT(*) AS pages,
+                   COUNT(*) FILTER (
+                     WHERE queue_status IN ('READY','NEEDS_REVIEW','FAILED','DEAD_LETTER')
+                   ) AS processed
+            FROM auditcore.p2_document_queue
+            WHERE tenant_id=:tenant_id
+              AND journey_id=:journey_id
+              AND upper(COALESCE(business_stage,''))=:stage_code
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "stage_code": stage_code,
+        },
+    ).mappings().one()
+    return int(row["pages"] or 0), int(row["processed"] or 0)
+
+
+def _p2_stage_task_statistics(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    stage_code: str,
+) -> tuple[int, int]:
+    row = connection.execute(
+        text(
+            """
+            WITH stage_tasks AS (
+              SELECT task_status AS status
+              FROM auditcore.p2_tasks
+              WHERE tenant_id=:tenant_id
+                AND journey_id=:journey_id
+                AND upper(COALESCE(reference->>'stage',''))=:stage_code
+              UNION ALL
+              SELECT wi.status
+              FROM auditcore.work_items wi
+              JOIN auditcore.work_item_task_detail wtd
+                ON wtd.tenant_id=wi.tenant_id
+               AND wtd.work_item_id=wi.work_item_id
+              WHERE wi.tenant_id=:tenant_id
+                AND wi.subject_kind='JOURNEY'
+                AND wi.subject_ref=CAST(:journey_id AS text)
+                AND wi.item_kind='EXECUTION_TASK'
+                AND upper(COALESCE(wtd.process_area,''))=:stage_code
+            )
+            SELECT COUNT(*) FILTER (
+                     WHERE status NOT IN ('VERIFIED_COMPLETE','CANCELLED','RESOLVED','CLOSED')
+                   ) AS open,
+                   COUNT(*) FILTER (
+                     WHERE status IN ('VERIFIED_COMPLETE','RESOLVED','CLOSED')
+                   ) AS completed
+            FROM stage_tasks
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "stage_code": stage_code,
+        },
+    ).mappings().one()
+    return int(row["open"] or 0), int(row["completed"] or 0)
+
+
 @router.get("/journeys/{journey_id}/overview")
 def overview_summary(
     tenant_id: str,
@@ -859,6 +1008,146 @@ def overview_summary(
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().one()
 
+
+    booking_required, booking_received = _p2_requirement_statistics(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code="BOOKING",
+    )
+    delivery_required, delivery_received = _p2_requirement_statistics(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code="DELIVERY",
+    )
+    booking_pages, booking_pages_processed = _p2_page_statistics(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code="BOOKING",
+    )
+    delivery_pages, delivery_pages_processed = _p2_page_statistics(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code="DELIVERY",
+    )
+    booking_tasks_open, booking_tasks_completed = _p2_stage_task_statistics(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code="BOOKING",
+    )
+    delivery_tasks_open, delivery_tasks_completed = _p2_stage_task_statistics(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        stage_code="DELIVERY",
+    )
+
+    operational = connection.execute(
+        text(
+            """
+            SELECT
+              (SELECT COUNT(*)
+                 FROM auditcore.invoice_review_values i
+                WHERE i.tenant_id=:tenant_id AND i.journey_id=:journey_id) AS invoices,
+              (SELECT COUNT(*)
+                 FROM auditcore.finance_records f
+                WHERE f.tenant_id=:tenant_id AND f.journey_id=:journey_id) AS finance_records,
+              (SELECT COUNT(*)
+                 FROM auditcore.insurance_records i
+                WHERE i.tenant_id=:tenant_id AND i.journey_id=:journey_id) AS insurance_records,
+              (SELECT COUNT(*)
+                 FROM auditcore.vehicle_records v
+                WHERE v.tenant_id=:tenant_id AND v.journey_id=:journey_id) AS vehicle_records,
+              (SELECT COUNT(*)
+                 FROM auditcore.registration_records r
+                WHERE r.tenant_id=:tenant_id AND r.journey_id=:journey_id) AS registration_records,
+              (SELECT COUNT(*)
+                 FROM auditcore.p2_document_queue q
+                WHERE q.tenant_id=:tenant_id AND q.journey_id=:journey_id
+                  AND q.queue_status IN ('FAILED','DEAD_LETTER')) AS extraction_failures,
+              (SELECT COALESCE(SUM(GREATEST(q.attempt_count - 1, 0)),0)
+                 FROM auditcore.p2_document_queue q
+                WHERE q.tenant_id=:tenant_id AND q.journey_id=:journey_id) AS document_retries,
+              (SELECT COALESCE(SUM(GREATEST(w.attempt_count - 1, 0)),0)
+                 FROM auditcore.p2_work_queue w
+                WHERE w.tenant_id=:tenant_id AND w.journey_id=:journey_id) AS work_retries,
+              (SELECT COUNT(*)
+                 FROM auditcore.journey_document_extracted_fields f
+                WHERE f.tenant_id=:tenant_id AND f.journey_id=:journey_id
+                  AND f.is_modified=true) AS corrected_fields
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one()
+
+    controls = _p2_control_statistics(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+    )
+    empty_stage_controls = {
+        "tracked": 0,
+        "passed": 0,
+        "failed": 0,
+        "waiting": 0,
+        "retryPending": 0,
+        "errors": 0,
+    }
+    statistics = {
+        "booking": {
+            "documentsRequired": booking_required,
+            "documentsReceived": booking_received,
+            "pages": booking_pages,
+            "pagesProcessed": booking_pages_processed,
+            "paymentReceipts": int(payments["booking_receipts"] or 0),
+            "paymentReceived": str(payments["booking_total"] or 0),
+            "minimumPayment": str(booking.get("minimumBookingAmount") or 0),
+            "manualVerificationPending": int(
+                booking.get("manualVerificationPending") or 0
+            ),
+            # p2_control_state is currently Journey/control scoped and does not
+            # persist an authoritative stage dimension. Returning zero here is
+            # deliberate: do not fabricate Booking-vs-Delivery attribution.
+            "controls": dict(empty_stage_controls),
+            "tasksOpen": booking_tasks_open,
+            "tasksCompleted": booking_tasks_completed,
+        },
+        "delivery": {
+            "documentsRequired": delivery_required,
+            "documentsReceived": delivery_received,
+            "pages": delivery_pages,
+            "pagesProcessed": delivery_pages_processed,
+            "invoices": int(operational["invoices"] or 0),
+            "paymentReceipts": int(payments["delivery_receipts"] or 0),
+            "financeRecords": int(operational["finance_records"] or 0),
+            "insuranceRecords": int(operational["insurance_records"] or 0),
+            "vehicleRecords": int(operational["vehicle_records"] or 0),
+            "registrationRecords": int(operational["registration_records"] or 0),
+            "controls": dict(empty_stage_controls),
+            "tasksOpen": delivery_tasks_open,
+            "tasksCompleted": delivery_tasks_completed,
+        },
+        "journey": {
+            "uploads": int(p2_upload["batches"] or 0),
+            # P2 does not yet persist a first-class replacement/reupload event.
+            # Superseded evidence is the only durable, non-invented proxy.
+            "reuploads": int(document_stats["superseded"] or 0),
+            "supersededDocuments": int(document_stats["superseded"] or 0),
+            "extractionFailures": int(operational["extraction_failures"] or 0),
+            "retries": int(operational["document_retries"] or 0)
+                + int(operational["work_retries"] or 0),
+            "correctedFields": int(operational["corrected_fields"] or 0),
+            "openFindings": int(findings["open"] or 0),
+            "totalTasks": int(tasks["total"] or 0),
+            "slaBreaches": int(tasks["overdue"] or 0),
+            "controls": controls,
+        },
+    }
+
     def serializable(row: Any) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in dict(row).items():
@@ -876,6 +1165,7 @@ def overview_summary(
         "payments": serializable(payments),
         "tasks": serializable(tasks),
         "findings": serializable(findings),
+        "statistics": statistics,
     }
 
 
@@ -1157,15 +1447,36 @@ def list_tasks(
             }
         )
 
-    # Python cannot compare timezone-aware and naive datetime.max directly.
-    # Convert the sort key to timestamp text, which is stable ISO order for
-    # PostgreSQL timestamptz values and keeps NULL due dates last.
+    # Phase 2 worklist order is action-first: priority first, then SLA,
+    # then operational state. Keep legacy numeric priority semantics intact
+    # rather than translating them into P2 labels.
+    p2_priority_order = {"URGENT": 0, "HIGH": 1, "NORMAL": 2, "LOW": 3}
+    status_order = {
+        "RETURNED": 0,
+        "READY": 1,
+        "IN_PROGRESS": 2,
+        "VERIFYING": 3,
+        "AWAITING_REQUESTER_REVIEW": 4,
+        "FAILED": 5,
+        "DEAD_LETTER": 6,
+    }
+
     def _safe_sort(item: dict[str, Any]) -> tuple:
         due = item.get("due_at_utc")
         created = item.get("created_at_utc")
+        if item.get("source_system") == "LEGACY":
+            # Legacy priority is numeric and higher means more urgent.
+            priority_key = (0, -int(item.get("priority_rank") or 0))
+        else:
+            priority_key = (
+                1,
+                p2_priority_order.get(str(item.get("priority") or "NORMAL").upper(), 2),
+            )
         return (
+            priority_key,
             due is None,
             due.isoformat() if hasattr(due, "isoformat") else str(due or ""),
+            status_order.get(str(item.get("task_status") or "").upper(), 20),
             created.isoformat() if hasattr(created, "isoformat") else str(created or ""),
         )
 
