@@ -395,6 +395,164 @@ def get_p2_document_review(
     }
 
 
+
+@router.delete("/documents/{document_id}", status_code=204)
+def delete_p2_document(
+    tenant_id: str,
+    journey_id: UUID,
+    document_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> Response:
+    authorize_p2(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        permission_key=_UPDATE_PERMISSION,
+    )
+    context = _document_context(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        document_id=document_id,
+    )
+    stage_code = str(context["stage_code"] or "BOOKING").upper()
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.evidence
+            SET association_status='VOIDED',
+                void_reason='P2_DOCUMENT_VOIDED',
+                voided_by_actor_id=:actor_id,
+                voided_at_utc=now()
+            WHERE tenant_id=:tenant_id
+              AND journey_id=:journey_id
+              AND di_document_id=:document_id
+              AND association_status='ACTIVE'
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "document_id": document_id,
+            "actor_id": human_principal.subject,
+        },
+    )
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.document_capture_v2_documents
+            SET capture_status='SUPERSEDED', updated_at_utc=now()
+            WHERE tenant_id=:tenant_id
+              AND journey_id=:journey_id
+              AND di_document_id=:document_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "document_id": document_id,
+        },
+    )
+    queue_id = context.get("queue_id")
+    if queue_id is not None:
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_document_queue
+                SET queue_status='CANCELLED',
+                    updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+                """
+            ),
+            {"tenant_id": tenant_id, "queue_id": queue_id},
+        )
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_work_queue
+                SET work_status='CANCELLED',
+                    updated_at_utc=now()
+                WHERE tenant_id=:tenant_id
+                  AND journey_id=:journey_id
+                  AND work_key=:work_key
+                  AND work_type IN ('DOCUMENT_INGEST','DOCUMENT_RECONCILE')
+                  AND work_status NOT IN ('COMPLETED','DEAD_LETTER','CANCELLED')
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "work_key": str(queue_id),
+            },
+        )
+
+    # Recompute canonical projections from the remaining ACTIVE evidence.
+    try:
+        with connection.begin_nested():
+            if stage_code == "DELIVERY":
+                from audit_core.uc03_delivery_post_extraction_materialization import (
+                    materialize_delivery_documents_from_durable_store,
+                )
+
+                materialize_delivery_documents_from_durable_store(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                )
+            else:
+                from audit_core.uc03_delivery_post_extraction_materialization import (
+                    materialize_booking_documents_from_durable_store,
+                )
+
+                materialize_booking_documents_from_durable_store(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                )
+    except Exception:
+        # The evidence void remains authoritative. A projection failure is
+        # retried by the normal P2 stage/reconciliation work below.
+        pass
+
+    connection.execute(
+        text(
+            """
+            SELECT auditcore.p2_request_stage_recompute(
+                :tenant_id, :journey_id
+            )
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    )
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.p2_activity_events (
+                tenant_id, journey_id, event_type, subject_type,
+                subject_id, details
+            ) VALUES (
+                :tenant_id, :journey_id, 'DOCUMENT_VOIDED',
+                'DOCUMENT', :document_id,
+                jsonb_build_object('stage', :stage_code)
+            )
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "document_id": str(document_id),
+            "stage_code": stage_code,
+        },
+    )
+    return Response(status_code=204)
+
+
 @router.get("/documents/{document_id}/content")
 def get_p2_document_content(
     tenant_id: str,
