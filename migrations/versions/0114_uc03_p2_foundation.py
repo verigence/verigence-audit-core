@@ -30,7 +30,7 @@ def upgrade() -> None:
             size_bytes             bigint NOT NULL CHECK (size_bytes >= 0),
             sha256                 varchar(64) NOT NULL,
             page_count             integer NOT NULL CHECK (page_count > 0),
-            original_payload       bytea NOT NULL,
+            original_object_key    varchar(700) NOT NULL,
             batch_status           varchar(40) NOT NULL DEFAULT 'ACCEPTED'
                                    CHECK (batch_status IN (
                                      'ACCEPTED','PROCESSING','COMPLETED',
@@ -55,7 +55,7 @@ def upgrade() -> None:
             journey_id                 uuid NOT NULL,
             page_number                integer NOT NULL CHECK (page_number > 0),
             page_sha256                varchar(64) NOT NULL,
-            page_payload               bytea NOT NULL,
+            page_object_key            varchar(700) NOT NULL,
             client_upload_id           varchar(160) NOT NULL,
             di_document_id             uuid,
             classified_document_type   varchar(160),
@@ -95,7 +95,7 @@ def upgrade() -> None:
             journey_id             uuid NOT NULL,
             work_type              varchar(80) NOT NULL
                                    CHECK (work_type IN (
-                                     'DOCUMENT_INGEST','DOCUMENT_RECONCILE',
+                                     'SPLIT_BATCH','DOCUMENT_INGEST','DOCUMENT_RECONCILE',
                                      'STAGE_RECOMPUTE','CONTROL_EVALUATE',
                                      'TASK_VERIFY'
                                    )),
@@ -276,6 +276,60 @@ def upgrade() -> None:
 
         CREATE INDEX ix_p2_activity_events_journey
           ON auditcore.p2_activity_events(tenant_id, journey_id, event_id);
+
+        ALTER TABLE auditcore.p2_upload_batches ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE auditcore.p2_upload_batches FORCE ROW LEVEL SECURITY;
+        CREATE POLICY tenant_isolation_p2_upload_batches ON auditcore.p2_upload_batches
+          USING (tenant_id = auditcore.current_tenant_id())
+          WITH CHECK (tenant_id = auditcore.current_tenant_id());
+
+        ALTER TABLE auditcore.p2_document_queue ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE auditcore.p2_document_queue FORCE ROW LEVEL SECURITY;
+        CREATE POLICY tenant_isolation_p2_document_queue ON auditcore.p2_document_queue
+          USING (tenant_id = auditcore.current_tenant_id())
+          WITH CHECK (tenant_id = auditcore.current_tenant_id());
+
+        ALTER TABLE auditcore.p2_work_queue ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE auditcore.p2_work_queue FORCE ROW LEVEL SECURITY;
+        CREATE POLICY tenant_isolation_p2_work_queue ON auditcore.p2_work_queue
+          USING (tenant_id = auditcore.current_tenant_id())
+          WITH CHECK (tenant_id = auditcore.current_tenant_id());
+
+        ALTER TABLE auditcore.p2_journey_runtime ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE auditcore.p2_journey_runtime FORCE ROW LEVEL SECURITY;
+        CREATE POLICY tenant_isolation_p2_journey_runtime ON auditcore.p2_journey_runtime
+          USING (tenant_id = auditcore.current_tenant_id())
+          WITH CHECK (tenant_id = auditcore.current_tenant_id());
+
+        ALTER TABLE auditcore.p2_stage_gate_state ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE auditcore.p2_stage_gate_state FORCE ROW LEVEL SECURITY;
+        CREATE POLICY tenant_isolation_p2_stage_gate_state ON auditcore.p2_stage_gate_state
+          USING (tenant_id = auditcore.current_tenant_id())
+          WITH CHECK (tenant_id = auditcore.current_tenant_id());
+
+        ALTER TABLE auditcore.p2_control_state ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE auditcore.p2_control_state FORCE ROW LEVEL SECURITY;
+        CREATE POLICY tenant_isolation_p2_control_state ON auditcore.p2_control_state
+          USING (tenant_id = auditcore.current_tenant_id())
+          WITH CHECK (tenant_id = auditcore.current_tenant_id());
+
+        ALTER TABLE auditcore.p2_tasks ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE auditcore.p2_tasks FORCE ROW LEVEL SECURITY;
+        CREATE POLICY tenant_isolation_p2_tasks ON auditcore.p2_tasks
+          USING (tenant_id = auditcore.current_tenant_id())
+          WITH CHECK (tenant_id = auditcore.current_tenant_id());
+
+        ALTER TABLE auditcore.p2_task_events ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE auditcore.p2_task_events FORCE ROW LEVEL SECURITY;
+        CREATE POLICY tenant_isolation_p2_task_events ON auditcore.p2_task_events
+          USING (tenant_id = auditcore.current_tenant_id())
+          WITH CHECK (tenant_id = auditcore.current_tenant_id());
+
+        ALTER TABLE auditcore.p2_activity_events ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE auditcore.p2_activity_events FORCE ROW LEVEL SECURITY;
+        CREATE POLICY tenant_isolation_p2_activity_events ON auditcore.p2_activity_events
+          USING (tenant_id = auditcore.current_tenant_id())
+          WITH CHECK (tenant_id = auditcore.current_tenant_id());
 
         GRANT SELECT, INSERT, UPDATE, DELETE ON
           auditcore.p2_upload_batches,
