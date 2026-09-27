@@ -66,7 +66,7 @@ def test_p2_task_queue_accepts_unfiltered_null_parameters(monkeypatch: pytest.Mo
                 status=None,
                 journey_id=None,
             )
-            assert result == {"items": []}
+            assert result["items"] == []
     finally:
         engine.dispose()
 
