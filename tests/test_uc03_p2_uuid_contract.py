@@ -3,8 +3,8 @@ import os
 import pytest
 from sqlalchemy import create_engine, text
 
-from audit_core.security import HumanPrincipal
 from audit_core import uc03_p2_api
+from audit_core.security import HumanPrincipal
 
 
 def test_p2_and_legacy_task_journey_ids_are_uuid_compatible() -> None:
