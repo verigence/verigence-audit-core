@@ -1055,11 +1055,11 @@ def list_tasks(
              AND wtd.work_item_id=wi.work_item_id
             JOIN auditcore.journeys j
               ON j.tenant_id=wi.tenant_id
-             AND j.journey_id=wi.subject_ref
+             AND j.journey_id::text=wi.subject_ref
             WHERE wi.tenant_id=:tenant_id
               AND wi.item_kind='EXECUTION_TASK'
               AND wi.subject_kind='JOURNEY'
-              AND (:journey_id IS NULL OR wi.subject_ref=:journey_id)
+              AND (:journey_id IS NULL OR wi.subject_ref=CAST(:journey_id AS text))
               AND (
                 (:status IS NULL AND wi.status IN ('OPEN','IN_PROGRESS'))
                 OR (:status IS NOT NULL AND wi.status=:status)
