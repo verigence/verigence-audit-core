@@ -37,8 +37,8 @@ from audit_core.uc03_p2_storage import (
 )
 from audit_core.uc03_p2_tasks import create_p2_task, submit_action
 from audit_core.uc03_requirement_satisfaction import (
-    requirements_for_journey,
     linked_documents_for_journey,
+    requirements_for_journey,
     resolve_requirement_satisfaction,
 )
 
