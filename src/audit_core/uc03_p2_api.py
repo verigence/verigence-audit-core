@@ -112,6 +112,155 @@ def _activity(
     )
 
 
+@router.get("/journeys")
+def list_p2_journeys(
+    tenant_id: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+    q: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    _authorize(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=None,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        permission_key=_READ_PERMISSION,
+    )
+    search = (q or "").strip()
+    rows = connection.execute(
+        text(
+            """
+            WITH scoped AS (
+                SELECT j.tenant_id, j.journey_id, j.customer_id, j.dealer_id,
+                       j.outlet_id, j.created_at_utc, j.updated_at_utc
+                FROM auditcore.journeys j
+                WHERE j.tenant_id=:tenant_id
+                  AND EXISTS (
+                    SELECT 1
+                    FROM auditcore.business_assignments ba
+                    WHERE ba.tenant_id=j.tenant_id
+                      AND ba.security_actor_id=:actor_id
+                      AND ba.assignment_status='ACTIVE'
+                      AND ba.effective_from <= now()
+                      AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+                      AND (
+                        ba.dealer_id IS NULL
+                        OR (
+                          ba.dealer_id=j.dealer_id
+                          AND (ba.outlet_id IS NULL OR ba.outlet_id=j.outlet_id)
+                        )
+                      )
+                  )
+            ),
+            task_stats AS (
+                SELECT tenant_id, journey_id,
+                       COUNT(*) AS total_tasks,
+                       COUNT(*) FILTER (
+                         WHERE task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED')
+                       ) AS open_tasks,
+                       COUNT(*) FILTER (
+                         WHERE due_at_utc < now()
+                           AND task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED')
+                       ) AS overdue_tasks
+                FROM auditcore.p2_tasks
+                WHERE tenant_id=:tenant_id
+                GROUP BY tenant_id, journey_id
+            ),
+            finding_stats AS (
+                SELECT tenant_id, journey_id,
+                       COUNT(*) FILTER (
+                         WHERE finding_status IN ('OPEN','ACKNOWLEDGED')
+                       ) AS open_findings
+                FROM auditcore.audit_findings
+                WHERE tenant_id=:tenant_id
+                GROUP BY tenant_id, journey_id
+            ),
+            document_stats AS (
+                SELECT tenant_id, journey_id,
+                       COUNT(*) FILTER (WHERE association_status='ACTIVE') AS documents
+                FROM auditcore.evidence
+                WHERE tenant_id=:tenant_id
+                GROUP BY tenant_id, journey_id
+            )
+            SELECT s.journey_id,
+                   c.display_name AS customer_name,
+                   c.mobile_last4,
+                   d.dealer_name,
+                   o.outlet_name,
+                   NULLIF(concat_ws(' · ',
+                     NULLIF(jp.model_name_snapshot,''),
+                     NULLIF(jp.variant_name_snapshot,''),
+                     NULLIF(jp.colour_name_snapshot,'')
+                   ), '') AS vehicle,
+                   COALESCE(pr.current_stage, 'BOOKING_DOCUMENT_UPLOAD') AS current_stage,
+                   COALESCE(pr.booking_completion_state, 'IN_PROGRESS') AS booking_completion_state,
+                   COALESCE(pr.delivery_completion_state, 'IN_PROGRESS') AS delivery_completion_state,
+                   COALESCE(pr.booking_receipt_total,0) AS booking_receipt_total,
+                   pr.booking_minimum_amount,
+                   COALESCE(pr.manual_verification_pending_count,0) AS manual_verification_pending_count,
+                   COALESCE(ds.documents,0) AS documents,
+                   COALESCE(ts.total_tasks,0) AS total_tasks,
+                   COALESCE(ts.open_tasks,0) AS open_tasks,
+                   COALESCE(ts.overdue_tasks,0) AS overdue_tasks,
+                   COALESCE(fs.open_findings,0) AS open_findings,
+                   s.updated_at_utc
+            FROM scoped s
+            JOIN auditcore.customers c
+              ON c.tenant_id=s.tenant_id AND c.customer_id=s.customer_id
+            JOIN auditcore.dealers d
+              ON d.tenant_id=s.tenant_id AND d.dealer_id=s.dealer_id
+            JOIN auditcore.dealer_outlets o
+              ON o.tenant_id=s.tenant_id AND o.dealer_id=s.dealer_id
+             AND o.outlet_id=s.outlet_id
+            LEFT JOIN auditcore.journey_products jp
+              ON jp.tenant_id=s.tenant_id AND jp.journey_id=s.journey_id
+            LEFT JOIN auditcore.p2_journey_runtime pr
+              ON pr.tenant_id=s.tenant_id AND pr.journey_id=s.journey_id
+            LEFT JOIN document_stats ds
+              ON ds.tenant_id=s.tenant_id AND ds.journey_id=s.journey_id
+            LEFT JOIN task_stats ts
+              ON ts.tenant_id=s.tenant_id AND ts.journey_id=s.journey_id
+            LEFT JOIN finding_stats fs
+              ON fs.tenant_id=s.tenant_id AND fs.journey_id=s.journey_id
+            WHERE (
+              :search = ''
+              OR c.display_name ILIKE '%' || :search || '%'
+              OR d.dealer_name ILIKE '%' || :search || '%'
+              OR o.outlet_name ILIKE '%' || :search || '%'
+              OR COALESCE(jp.model_name_snapshot,'') ILIKE '%' || :search || '%'
+              OR s.journey_id::text ILIKE '%' || :search || '%'
+            )
+            ORDER BY
+              COALESCE(ts.overdue_tasks,0) DESC,
+              COALESCE(ts.open_tasks,0) DESC,
+              s.updated_at_utc DESC
+            LIMIT :limit
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "actor_id": human_principal.subject,
+            "search": search,
+            "limit": min(max(limit, 1), 250),
+        },
+    ).mappings().all()
+
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["journey_id"] = str(item["journey_id"])
+        for key in ("booking_receipt_total", "booking_minimum_amount"):
+            if item.get(key) is not None:
+                item[key] = str(item[key])
+        items.append(item)
+    return {"items": items}
+
+
 class UploadInitFile(BaseModel):
     filename: str = Field(min_length=1, max_length=500)
     contentType: str = Field(min_length=1, max_length=160)
