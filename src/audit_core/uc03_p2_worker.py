@@ -184,6 +184,26 @@ def _reschedule(engine: Engine, work: WorkItem, exc: RescheduleWork) -> None:
                 "last_error": str(exc)[:1800],
             },
         )
+        if work.work_type == "DOCUMENT_RECONCILE":
+            try:
+                queue_id = UUID(work.work_key)
+            except ValueError:
+                queue_id = None
+            if queue_id is not None:
+                connection.execute(
+                    text(
+                        """
+                        UPDATE auditcore.p2_document_queue
+                        SET queue_status=CASE
+                              WHEN queue_status='RETRY_WAIT' THEN 'CLASSIFYING'
+                              ELSE queue_status
+                            END,
+                            updated_at_utc=now()
+                        WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+                        """
+                    ),
+                    {"tenant_id": work.tenant_id, "queue_id": queue_id},
+                )
 
 
 def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
@@ -215,6 +235,50 @@ def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
                 "last_error": f"{exc.__class__.__name__}: {str(exc)[:1800]}",
             },
         )
+        if work.work_type in {"DOCUMENT_INGEST", "DOCUMENT_RECONCILE"}:
+            queue_status = "DEAD_LETTER" if terminal else "RETRY_WAIT"
+            try:
+                queue_id = UUID(work.work_key)
+            except ValueError:
+                queue_id = None
+            if queue_id is not None:
+                batch_id = connection.execute(
+                    text(
+                        """
+                        UPDATE auditcore.p2_document_queue
+                        SET queue_status=:queue_status,
+                            last_error=:last_error,
+                            updated_at_utc=now()
+                        WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+                        RETURNING batch_id
+                        """
+                    ),
+                    {
+                        "tenant_id": work.tenant_id,
+                        "queue_id": queue_id,
+                        "queue_status": queue_status,
+                        "last_error": f"{exc.__class__.__name__}: {str(exc)[:1800]}",
+                    },
+                ).scalar_one_or_none()
+                if terminal and batch_id is not None:
+                    _refresh_batch_status(connection, work.tenant_id, UUID(str(batch_id)))
+        elif work.work_type == "SPLIT_BATCH" and terminal:
+            try:
+                batch_id = UUID(work.work_key)
+            except ValueError:
+                batch_id = None
+            if batch_id is not None:
+                connection.execute(
+                    text(
+                        """
+                        UPDATE auditcore.p2_upload_batches
+                        SET batch_status='FAILED', updated_at_utc=now()
+                        WHERE tenant_id=:tenant_id AND batch_id=:batch_id
+                        """
+                    ),
+                    {"tenant_id": work.tenant_id, "batch_id": batch_id},
+                )
+
         if terminal:
             connection.execute(
                 text(
@@ -509,7 +573,8 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
                 """
                 SELECT q.queue_id, q.batch_id, q.page_number, q.page_object_key,
                        q.client_upload_id, q.di_document_id, q.queue_status,
-                       b.original_filename, b.uploaded_by_actor_id
+                       b.original_filename, b.content_type AS original_content_type,
+                       b.uploaded_by_actor_id
                 FROM auditcore.p2_document_queue q
                 JOIN auditcore.p2_upload_batches b
                   ON b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
@@ -545,7 +610,7 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
     page_payload = storage.get_object(str(row["page_object_key"]))
     context_ref, token, candidates, requirement_refs = _di_context_and_requirements(engine, work)
     v2_client = get_di_capture_v2_client()
-    content_type = "application/pdf" if str(row["page_object_key"]).endswith(".pdf") else "application/octet-stream"
+    content_type = "application/pdf" if str(row["page_object_key"]).endswith(".pdf") else str(row["original_content_type"] or "application/octet-stream")
     filename = (
         f"{str(row['original_filename']).rsplit('.', 1)[0]}"
         f"-page-{int(row['page_number']):03d}.pdf"
