@@ -109,6 +109,13 @@ def upgrade() -> None:
         END;
         $$;
 
+        DROP TRIGGER IF EXISTS trg_p2_evidence_change
+          ON auditcore.evidence;
+        CREATE TRIGGER trg_p2_evidence_change
+          AFTER INSERT OR UPDATE OF association_status, document_type_key, process_area
+          ON auditcore.evidence
+          FOR EACH ROW EXECUTE FUNCTION auditcore.p2_fact_change_trigger();
+
         DROP TRIGGER IF EXISTS trg_p2_extracted_fact_change
           ON auditcore.journey_document_extracted_fields;
         CREATE TRIGGER trg_p2_extracted_fact_change
@@ -178,6 +185,7 @@ def downgrade() -> None:
     op.execute(
         """
         DROP TRIGGER IF EXISTS trg_p2_manual_task_change ON auditcore.p2_tasks;
+        DROP TRIGGER IF EXISTS trg_p2_evidence_change ON auditcore.evidence;
         DROP TRIGGER IF EXISTS trg_p2_legacy_manual_task_change ON auditcore.workflow_tasks;
         DROP TRIGGER IF EXISTS trg_p2_payment_change ON auditcore.payments;
         DROP TRIGGER IF EXISTS trg_p2_extracted_fact_change
