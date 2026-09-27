@@ -789,25 +789,50 @@ def _sync_booking_document(
                 detail="Document extraction facts are temporarily unavailable."
             ) from exc
 
-    connection.execute(
-        text(
-            """
-            UPDATE auditcore.evidence
-            SET processing_status_cache=:processing,
-                verification_status_cache=:verification,
-                confirmation_status_cache=:confirmation,
-                cache_updated_at_utc=now()
-            WHERE tenant_id=:tenant_id AND evidence_id=:evidence_id
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "evidence_id": link["evidence_id"],
-            "processing": document.processing_status,
-            "verification": document.verification_state,
-            "confirmation": document.confirmation_status,
-        },
-    )
+    # Root-caused live (2026-09-27): this UPDATE takes an implicit foreign-
+    # key lock on this document's journey_document_requirements row (the
+    # evidence -> requirement reference), and everything else in this
+    # function from here on -- fact upserts, half a dozen rule syncs, SKU
+    # resolution, materialization -- runs on the SAME connection/transaction
+    # afterward, so that lock stayed held for this whole document's entire
+    # remaining sync, not just this write. On a journey with many documents
+    # syncing close together (each serialized through _sync_booking_document's
+    # own per-journey advisory lock, so one after another, not concurrently),
+    # any *unrelated* foreground write to the same requirement row (e.g.
+    # /capture's own conditional-applicability UPDATE, on its own
+    # long-lived request connection) queued behind whichever document's sync
+    # happened to be mid-pipeline, for that document's entire remaining
+    # runtime -- confirmed live via Railway logs: "canceling statement due
+    # to statement timeout ... while locking tuple ... in relation
+    # journey_document_requirements". Nothing later in this function reads
+    # these cache columns back (they exist only for other, separate read
+    # paths -- evidence_read.py, uc03_journey_overview_projection.py, the
+    # Journey Overview/booking-capture listings); everything downstream here
+    # works off the `document`/`confirmed`/`facts` values already held in
+    # memory from the DI calls above. Committing this write on its own
+    # connection, immediately, releases that lock in milliseconds instead of
+    # holding it for the rest of this document's sync.
+    with get_engine().begin() as cache_connection:
+        set_tenant_context(cache_connection, tenant_id)
+        cache_connection.execute(
+            text(
+                """
+                UPDATE auditcore.evidence
+                SET processing_status_cache=:processing,
+                    verification_status_cache=:verification,
+                    confirmation_status_cache=:confirmation,
+                    cache_updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND evidence_id=:evidence_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "evidence_id": link["evidence_id"],
+                "processing": document.processing_status,
+                "verification": document.verification_state,
+                "confirmation": document.confirmation_status,
+            },
+        )
 
     from audit_core.uc03_async_sync_tasks import sync_document_confirmation_status
     from audit_core.uc03_manual_verification import _friendly_label
