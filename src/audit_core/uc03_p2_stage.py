@@ -390,3 +390,40 @@ def read_booking_stage(
         "factVersion": int(runtime["fact_version"] or 0),
         "gates": gates,
     }
+
+
+
+def read_delivery_stage(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+) -> dict[str, Any]:
+    """Read the isolated Delivery-stage summary without inventing business gates.
+
+    Delivery completion criteria remain intentionally unconfigured until they
+    are explicitly approved. The current persisted completion state is still
+    surfaced so Journey 360 and Documents use one consistent local read model.
+    """
+    runtime = connection.execute(
+        text(
+            """
+            SELECT current_stage, delivery_completion_state, fact_version
+            FROM auditcore.p2_journey_runtime
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
+
+    return {
+        "stage": str(runtime["current_stage"]) if runtime is not None else "BOOKING_DOCUMENT_UPLOAD",
+        "completionState": (
+            str(runtime["delivery_completion_state"])
+            if runtime is not None
+            else "IN_PROGRESS"
+        ),
+        "configuration": "PENDING_BUSINESS_RULES",
+        "factVersion": int(runtime["fact_version"] or 0) if runtime is not None else 0,
+        "gates": [],
+    }
