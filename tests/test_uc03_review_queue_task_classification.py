@@ -144,6 +144,12 @@ def test_every_task_type_used_in_the_codebase_is_a_conscious_mapping_decision() 
     src_dir = Path(rq.__file__).parent
     found: set[str] = set()
     for path in src_dir.glob("*.py"):
+        # Phase 2 has an isolated p2_tasks queue and does not feed the legacy
+        # workflow_tasks Review Queue this test protects. Keep this legacy
+        # completeness assertion scoped to the legacy runtime rather than
+        # forcing P2-only task types into _TASK_TYPE_FINDING_CLASS.
+        if path.name.startswith("uc03_p2_"):
+            continue
         text = path.read_text()
         found.update(re.findall(r'task_type\s*=\s*"([A-Z_]+)"', text))
         found.update(re.findall(r'^_?[A-Z_]*TASK_TYPE\s*=\s*"([A-Z_]+)"', text, re.MULTILINE))
