@@ -37,6 +37,18 @@ def upgrade() -> None:
             v_status varchar(40);
             v_fact_version bigint;
         BEGIN
+            -- The legacy rule_executions table intentionally has no Journey FK
+            -- (tests and historical tooling can write synthetic execution rows).
+            -- P2 must never make those pre-existing writes fail.
+            IF NOT EXISTS (
+                SELECT 1
+                FROM auditcore.journeys j
+                WHERE j.tenant_id=NEW.tenant_id
+                  AND j.journey_id=NEW.journey_id
+            ) THEN
+                RETURN NEW;
+            END IF;
+
             SELECT CASE
                      WHEN rd.executor = 'AUDIT_CORE' THEN 'NATIVE'
                      ELSE 'RULE_ENGINE'
