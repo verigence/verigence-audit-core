@@ -421,6 +421,9 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
             {"tenant_id": work.tenant_id, "batch_id": batch["batch_id"]},
         )
 
+    # All object-storage I/O is deliberately outside a DB transaction. A retry
+    # writes the same deterministic page object keys, so an API/worker restart
+    # cannot create duplicate queue identities and no DB connection is held idle.
     payload = storage.get_object(str(batch["original_object_key"]))
     digest = hashlib.sha256(payload).hexdigest()
     content_type = str(batch["content_type"] or "")
@@ -441,22 +444,32 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
     else:
         pages = [(payload, content_type)]
 
+    page_records: list[dict[str, Any]] = []
+    for page_number, (page_payload, page_content_type) in enumerate(pages, start=1):
+        page_sha = hashlib.sha256(page_payload).hexdigest()
+        object_key = (
+            f"p2-documents/{work.tenant_id}/{work.journey_id}/"
+            f"{batch['batch_id']}/pages/{page_number:04d}-{page_sha[:12]}.pdf"
+            if page_content_type == "application/pdf"
+            else f"p2-documents/{work.tenant_id}/{work.journey_id}/"
+                 f"{batch['batch_id']}/pages/{page_number:04d}-{page_sha[:12]}"
+        )
+        storage.put_object(object_key, page_payload, content_type=page_content_type)
+        page_records.append(
+            {
+                "pageNumber": page_number,
+                "pageSha": page_sha,
+                "objectKey": object_key,
+                "clientUploadId": (
+                    f"p2-{batch['batch_id']}-{page_number}-{page_sha[:12]}"
+                ),
+            }
+        )
+
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
-        for page_number, (page_payload, page_content_type) in enumerate(pages, start=1):
-            page_sha = hashlib.sha256(page_payload).hexdigest()
+        for record in page_records:
             queue_id = uuid4()
-            object_key = (
-                f"p2-documents/{work.tenant_id}/{work.journey_id}/"
-                f"{batch['batch_id']}/pages/{page_number:04d}-{page_sha[:12]}.pdf"
-                if page_content_type == "application/pdf"
-                else f"p2-documents/{work.tenant_id}/{work.journey_id}/"
-                     f"{batch['batch_id']}/pages/{page_number:04d}-{page_sha[:12]}"
-            )
-            # Object storage is external I/O. It occurs before the row insert so
-            # a failed write never leaves a queue row claiming the page exists.
-            storage.put_object(object_key, page_payload, content_type=page_content_type)
-            client_upload_id = f"p2-{batch['batch_id']}-{page_number}-{page_sha[:12]}"
             connection.execute(
                 text(
                     """
@@ -472,8 +485,8 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                     ON CONFLICT (tenant_id, batch_id, page_number)
                     DO UPDATE SET page_sha256=EXCLUDED.page_sha256,
                                   page_object_key=EXCLUDED.page_object_key,
+                                  client_upload_id=EXCLUDED.client_upload_id,
                                   updated_at_utc=now()
-                    RETURNING queue_id
                     """
                 ),
                 {
@@ -481,10 +494,10 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                     "queue_id": queue_id,
                     "batch_id": batch["batch_id"],
                     "journey_id": work.journey_id,
-                    "page_number": page_number,
-                    "page_sha": page_sha,
-                    "object_key": object_key,
-                    "client_upload_id": client_upload_id,
+                    "page_number": record["pageNumber"],
+                    "page_sha": record["pageSha"],
+                    "object_key": record["objectKey"],
+                    "client_upload_id": record["clientUploadId"],
                     "correlation_id": work.correlation_id,
                 },
             )
@@ -500,7 +513,7 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                 {
                     "tenant_id": work.tenant_id,
                     "batch_id": batch["batch_id"],
-                    "page_number": page_number,
+                    "page_number": record["pageNumber"],
                 },
             ).scalar_one()
             _enqueue(
@@ -512,7 +525,7 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                 payload={
                     "queueId": str(actual_queue_id),
                     "batchId": str(batch["batch_id"]),
-                    "pageNumber": page_number,
+                    "pageNumber": record["pageNumber"],
                     "uploadedBy": str(batch["uploaded_by_actor_id"]),
                     "uploadedByRole": str(work.payload.get("uploadedByRole") or "PC"),
                 },
@@ -532,7 +545,7 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                 "tenant_id": work.tenant_id,
                 "batch_id": batch["batch_id"],
                 "sha256": digest,
-                "page_count": len(pages),
+                "page_count": len(page_records),
             },
         )
         connection.execute(
@@ -551,7 +564,9 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                 "tenant_id": work.tenant_id,
                 "journey_id": work.journey_id,
                 "subject_id": str(batch["batch_id"]),
-                "details": json.dumps({"pageCount": len(pages), "sha256": digest}),
+                "details": json.dumps(
+                    {"pageCount": len(page_records), "sha256": digest}
+                ),
                 "correlation_id": work.correlation_id,
             },
         )
