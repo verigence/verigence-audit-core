@@ -1,0 +1,109 @@
+name: UC02 Commercial and Role Live Diagnose
+
+on:
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - name: Install tools and link DEV service
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global @railway/cli >/dev/null
+          python -m pip install 'psycopg[binary]' >/dev/null
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo 'RAILWAY token unavailable'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/vars.json
+
+      - name: Inspect recent Commercial upload failures
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway logs --service "$AUDIT_SERVICE" --lines 1200 > /tmp/audit.log 2>&1 || true
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          lines = Path('/tmp/audit.log').read_text(errors='replace').splitlines()
+          needles = re.compile(r'(mahindra|master|workbook|native|validation|unhandled|exception|traceback|error)', re.I)
+          hits = [line for line in lines if needles.search(line)]
+          print('RECENT_RELEVANT_LOG_LINES=' + str(len(hits)))
+          for line in hits[-180:]:
+              line = re.sub(r'Bearer\s+[A-Za-z0-9._-]+', 'Bearer ***', line, flags=re.I)
+              line = re.sub(r'postgres(?:ql)?://[^\s\"]+', 'postgresql://***', line, flags=re.I)
+              print(line[:2000])
+          PY
+
+      - name: Inspect MahindraOrissa persisted state
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import psycopg
+          variables = json.loads(Path('/tmp/vars.json').read_text())
+          url = str(variables.get('DATABASE_URL','')).strip()
+          if not url:
+              raise SystemExit('DATABASE_URL missing from Railway service')
+          if url.startswith('postgresql+psycopg://'):
+              url = 'postgresql://' + url.split('://',1)[1]
+          with psycopg.connect(url) as conn:
+              with conn.cursor() as cur:
+                  cur.execute("SELECT tenant_id, project_name FROM auditcore.projects WHERE lower(project_name)=lower(%s)", ('MahindraOrissa',))
+                  project = cur.fetchone()
+                  if not project:
+                      raise SystemExit('MahindraOrissa project not found')
+                  tenant_id, project_name = project
+                  print('PROJECT=' + project_name)
+
+                  cur.execute("""
+                    SELECT COALESCE(s.segment_code,'PROJECT'), i.status, i.rows_parsed,
+                           i.valid_rows, i.error_rows, i.original_file_name, i.effective_from
+                    FROM auditcore.project_master_imports i
+                    LEFT JOIN auditcore.segments s ON s.segment_id=i.segment_id
+                    WHERE i.tenant_id=%s
+                      AND i.master_key IN ('MAHINDRA_SEGMENT_MASTER','DISCOUNT_POLICY')
+                    ORDER BY i.created_at_utc DESC
+                    LIMIT 12
+                  """, (tenant_id,))
+                  imports = cur.fetchall()
+                  print('MASTER_IMPORT_COUNT_SHOWN=' + str(len(imports)))
+                  for segment,status,parsed,valid,errors,filename,wef in imports:
+                      print(f'MASTER|{segment}|{status}|rows={parsed}|valid={valid}|errors={errors}|file={filename}|wef={wef}')
+
+                  cur.execute("""
+                    SELECT business_role_code, assignment_status,
+                           count(*)::int,
+                           count(*) FILTER (WHERE effective_from <= now() AND (effective_to IS NULL OR effective_to > now()))::int
+                    FROM auditcore.business_assignments
+                    WHERE tenant_id=%s
+                    GROUP BY business_role_code, assignment_status
+                    ORDER BY business_role_code, assignment_status
+                  """, (tenant_id,))
+                  rows = cur.fetchall()
+                  print('ROLE_ASSIGNMENT_GROUPS=' + str(len(rows)))
+                  for role,status,total,current in rows:
+                      print(f'ROLE|{role}|{status}|total={total}|currently_effective={current}')
+
+                  cur.execute("""
+                    SELECT status, current_step, count(*)::int
+                    FROM auditcore.administrative_operations
+                    WHERE tenant_id=%s AND operation_type='ROLE_MAPPING'
+                    GROUP BY status,current_step
+                    ORDER BY status,current_step
+                  """, (tenant_id,))
+                  ops = cur.fetchall()
+                  print('ROLE_OPERATION_GROUPS=' + str(len(ops)))
+                  for status,step,count in ops:
+                      print(f'ROLE_OP|{status}|{step}|count={count}')
+          PY
