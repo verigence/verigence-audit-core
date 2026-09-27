@@ -17,7 +17,6 @@ import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -28,7 +27,6 @@ from sqlalchemy import Engine, text
 
 from audit_core.db import set_platform_super_admin_context, set_tenant_context
 from audit_core.dependencies import get_engine
-from audit_core.di_capture_v2_client import DiCaptureV2Client, DiCaptureV2Error
 from audit_core.uc03_document_capture_v2 import (
     _candidate_type_keys,
     _ensure_di_context,
@@ -39,7 +37,7 @@ from audit_core.uc03_document_capture_v2 import (
     get_security_oauth_client,
 )
 from audit_core.uc03_p2_stage import recompute_booking_stage
-from audit_core.uc03_p2_storage import P2DocumentStorageError, get_p2_document_storage
+from audit_core.uc03_p2_storage import get_p2_document_storage
 from audit_core.uc03_unified_document_capture import (
     _merged_candidate_requirements,
     _receipt_defaults_to_delivery,
@@ -72,7 +70,7 @@ class WorkItem:
     work_key: str
     payload: dict[str, Any]
     attempt_count: int
-    requested_version: int | null
+    requested_version: int | None
     correlation_id: str | None
 
 
