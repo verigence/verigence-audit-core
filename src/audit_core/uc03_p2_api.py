@@ -30,7 +30,7 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_p2_access import P2AccessContext, authorize_p2
-from audit_core.uc03_p2_stage import recompute_booking_stage
+from audit_core.uc03_p2_stage import read_booking_stage
 from audit_core.uc03_p2_storage import (
     P2DocumentStorageError,
     get_p2_document_storage,
@@ -629,7 +629,7 @@ def stage_status(
         authorization_client=authorization_client,
         permission_key=_READ_PERMISSION,
     )
-    booking = recompute_booking_stage(
+    booking = read_booking_stage(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
@@ -663,7 +663,7 @@ def overview_summary(
         authorization_client=authorization_client,
         permission_key=_READ_PERMISSION,
     )
-    booking = recompute_booking_stage(
+    booking = read_booking_stage(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
