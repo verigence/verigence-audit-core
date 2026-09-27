@@ -21,17 +21,15 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
-from audit_core.authorization import AuthorizationError
-from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_human_principal
-from audit_core.errors import DependencyUnavailableError, NotFoundError
+from audit_core.errors import DependencyUnavailableError
 from audit_core.observability import get_correlation_id
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
-    SecurityAuthorizationError,
     get_security_authorization_client,
 )
+from audit_core.uc03_p2_access import P2AccessContext, authorize_p2
 from audit_core.uc03_p2_stage import recompute_booking_stage
 from audit_core.uc03_p2_storage import (
     P2DocumentStorageError,
@@ -62,42 +60,15 @@ def _authorize(
     human_principal: HumanPrincipal,
     authorization_client: SecurityAuthorizationClient,
     permission_key: str,
-) -> str:
-    try:
-        decision = authorization_client.check_user_permission(
-            user_id=human_principal.subject,
-            tenant_id=tenant_id,
-            permission_key=permission_key,
-        )
-    except SecurityAuthorizationError as exc:
-        raise DependencyUnavailableError(
-            detail="Phase 2 work is temporarily unavailable. Please try again."
-        ) from exc
-    if not decision.allowed:
-        raise AuthorizationError(
-            error_code="VAC-AUTH-002",
-            status_code=403,
-            title="Permission denied",
-        )
-    set_tenant_context(connection, tenant_id)
-    if journey_id is not None:
-        exists = connection.execute(
-            text(
-                """
-                SELECT 1
-                FROM auditcore.journeys
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).scalar_one_or_none()
-        if exists is None:
-            raise NotFoundError(
-                error_code="VAC-NF-005",
-                title="Journey not found",
-                detail="Journey not found in the requested Tenant.",
-            )
-    return decision.role_key or "USER"
+) -> P2AccessContext:
+    return authorize_p2(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        permission_key=permission_key,
+    )
 
 
 def _safe_filename(value: str) -> str:
@@ -279,7 +250,7 @@ def finalize_upload(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
-    _authorize(
+    access = _authorize(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
@@ -363,7 +334,7 @@ def finalize_upload(
                 {
                     "batchId": str(batch_id),
                     "uploadedBy": str(batch["uploaded_by_actor_id"]),
-                    "uploadedByRole": "PC",
+                    "uploadedByRole": access.operating_role or access.functional_role or "USER",
                 }
             ),
             "correlation_id": correlation_id,
@@ -726,7 +697,7 @@ def create_human_task(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
-    role = _authorize(
+    access = _authorize(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
@@ -753,7 +724,7 @@ def create_human_task(
         assigned_role_code=command.assignedRoleCode,
         assigned_actor_id=command.assignedActorId,
         raised_by_actor_id=human_principal.subject,
-        raised_by_role_code=role,
+        raised_by_role_code=access.operating_role or access.functional_role or "USER",
         allowed_actions=command.allowedActions,
         completion_protocol="REQUESTER_CONFIRMED",
         due_at_utc=command.dueAtUtc,
@@ -839,7 +810,7 @@ def task_action(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
-    role = _authorize(
+    access = _authorize(
         connection,
         tenant_id=tenant_id,
         journey_id=None,
@@ -854,7 +825,7 @@ def task_action(
             task_id=task_id,
             action=command.action,
             actor_id=human_principal.subject,
-            actor_role_code=role,
+            actor_role_code=access.functional_role or "USER",
             comment=command.comment,
             details=command.details,
         )
