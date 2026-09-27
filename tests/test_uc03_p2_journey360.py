@@ -165,3 +165,47 @@ def test_compliance_report_extends_legacy_with_ledger_and_verdict(journey):
     labels = {line["label"] for line in body["deal"]["flaggedLines"]}
     assert "Ex-showroom price" in labels
     assert client.get(f"{base}/duplicates").json() == {"pairs": []}
+
+
+def test_partly_invoiced_deal_is_not_reported_short(journey):
+    """A component not billed yet keeps its booking value in the current
+    total, and variances compare only lines present on both sides."""
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, standard_amount, actual_amount)
+                VALUES (:t, :j, 'ex_showroom_price', 1000000, 1000000), (:t, :j, 'registration_charges', 90000, 90000)
+                """
+            ),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+        _source(connection, journey, "COMMERCIAL", "ex_showroom_price", "booking_form", "1000000")
+        _source(connection, journey, "COMMERCIAL", "registration_charges", "booking_form", "90000")
+        _source(connection, journey, "COMMERCIAL", "ex_showroom_price", "tax_invoice_tally", "1000000")
+        summary = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)["summary"]
+    assert Decimal(summary["net"]["current"]) == 1090000
+    assert Decimal(summary["variance"]["currentVsStandard"]) == 0
+    assert Decimal(summary["variance"]["billedVsBooking"]) == 0
+    assert summary["invoicedComponents"] == 1 and summary["components"] == 2
+
+
+def test_discount_without_entitlement_is_an_over_grant(journey):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.discount_applications (
+                    tenant_id, journey_id, discount_key, standard_eligible_amount, actual_discount_amount,
+                    eligibility_result, actual_source_kind
+                ) VALUES (:t, :j, 'CORPORATE_PRIVILEGE', NULL, 5000, 'NOT_ELIGIBLE', 'EVIDENCE')
+                """
+            ),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+        _source(connection, journey, "DISCOUNT", "CORPORATE_PRIVILEGE", "booking_form", "5000")
+        [row] = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)["discounts"]
+    assert Decimal(row["entitled"]) == 0 and Decimal(row["variance"]) == 5000
+    assert "OVER_ENTITLEMENT" in row["flags"]

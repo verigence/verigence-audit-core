@@ -22,6 +22,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_duplicate_booking_detection import _BASIS_LABEL
 from audit_core.uc03_masters_alignment import (
     CONDITIONAL_DISCOUNT_EVIDENCE_DOCUMENT,
     DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY,
@@ -156,6 +157,20 @@ def component_label(key: str) -> str:
 
 def discount_label(key: str) -> str:
     return _DISCOUNT_LABELS.get(key) or key.replace("_", " ").capitalize()
+
+
+_ACRONYMS = {
+    "pan": "PAN", "gst": "GST", "gstin": "GSTIN", "vin": "VIN", "rto": "RTO", "dms": "DMS", "ew": "EW",
+    "rsa": "RSA", "tcs": "TCS", "hsn": "HSN", "ifsc": "IFSC", "upi": "UPI", "do": "DO", "po": "PO",
+    "dob": "Date of birth", "id": "ID", "no": "No.", "kyc": "KYC", "misp": "MISP", "cgst": "CGST",
+    "sgst": "SGST", "igst": "IGST", "utr": "UTR", "neft": "NEFT", "rtgs": "RTGS",
+}
+
+
+def field_label(key: str) -> str:
+    words = [_ACRONYMS.get(w, w) for w in key.split("_") if w]
+    text_ = " ".join(words)
+    return text_[:1].upper() + text_[1:]
 
 
 def _document_label(document_type: str | None) -> str:
@@ -522,6 +537,11 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         per_source = [s for s in sources if s["line_kind"] == "DISCOUNT" and s["component_key"] == key]
         cols = _columns(per_source)
         entitled = row.get("standard_eligible_amount")
+        # Given with no scheme entitlement (reconciliation marks it
+        # NOT_ELIGIBLE; a discretionary dealer discount never has one): the
+        # entitlement is zero, so the whole amount is the over-grant.
+        if entitled is None and (row.get("eligibility_result") == "NOT_ELIGIBLE" or key == "ADDITIONAL_DISCOUNT"):
+            entitled = Decimal(0)
         reference = cols["billed"] if cols["billed"] is not None else cols["booking"]
         if reference is None:
             reference = row.get("actual_discount_amount")
@@ -555,13 +575,38 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             "sources": _source_list(per_source),
         })
 
-    std_total, bk_total, bl_total, lg_total = (
-        _column_total(all_rows, c) for c in ("standard", "booking", "billed", "ledger")
+    # "Current" is what the deal stands at now: the billed value where the
+    # component has been invoiced, else what the booking offered. Totals of a
+    # partly-invoiced deal therefore never look short.
+    for row in all_rows:
+        row["current"] = row["billed"] if row["billed"] is not None else row["booking"]
+    for row in discount_rows:
+        row["current"] = next(
+            (row[c] for c in ("billed", "booking", "effective") if row[c] is not None), None,
+        )
+    std_total, bk_total, cur_total, bl_total, lg_total = (
+        _column_total(all_rows, c) for c in ("standard", "booking", "current", "billed", "ledger")
     )
-    d_std, d_bk, d_bl = (_column_total(discount_rows, c) for c in ("entitled", "booking", "billed"))
-    net_std, net_bk, net_bl = _net(std_total, d_std), _net(bk_total, d_bk), _net(bl_total, d_bl)
+    d_std, d_bk, d_cur, d_bl = (_column_total(discount_rows, c) for c in ("entitled", "booking", "current", "billed"))
+    net_std, net_bk, net_cur = _net(std_total, d_std), _net(bk_total, d_bk), _net(cur_total, d_cur)
+
+    def matched(left: str, right: str) -> str | None:
+        """Charges less discounts, compared only where both sides have a
+        value, so a component missing on one side is never a variance."""
+        pairs = [(r[left], r[right]) for r in all_rows if r[left] is not None and r[right] is not None]
+        d_left = "entitled" if left == "standard" else left
+        d_right = "entitled" if right == "standard" else right
+        d_pairs = [(r[d_left], r[d_right]) for r in discount_rows
+                   if r[d_left] is not None and r[d_right] is not None]
+        if not pairs and not d_pairs:
+            return None
+        charges = sum((Decimal(a) - Decimal(b) for a, b in pairs), Decimal(0))
+        discounts_delta = sum((Decimal(a) - Decimal(b) for a, b in d_pairs), Decimal(0))
+        return str(charges - discounts_delta)
+
     paid = _paid(connection, tenant_id=tenant_id, journey_id=journey_id)
-    payable = net_bl or net_bk or net_std
+    payable = net_cur or net_std
+    invoiced = sum(1 for r in all_rows if r["billed"] is not None)
     return {
         "sku": {
             "skuCode": sku["sku_code"] if sku else None,
@@ -583,14 +628,17 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             for key, label in _DECLARED_TOTAL_KEYS.items() if key in declared
         ],
         "summary": {
-            "gross": {"standard": std_total, "booking": bk_total, "billed": bl_total, "ledger": lg_total},
-            "discounts": {"standard": d_std, "booking": d_bk, "billed": d_bl},
-            "net": {"standard": net_std, "booking": net_bk, "billed": net_bl},
+            "gross": {"standard": std_total, "booking": bk_total, "current": cur_total,
+                      "billed": bl_total, "ledger": lg_total},
+            "discounts": {"standard": d_std, "booking": d_bk, "current": d_cur, "billed": d_bl},
+            "net": {"standard": net_std, "booking": net_bk, "current": net_cur},
             "variance": {
-                "bookingVsStandard": _minus(net_bk, net_std),
-                "billedVsStandard": _minus(net_bl, net_std),
-                "billedVsBooking": _minus(net_bl, net_bk),
+                "bookingVsStandard": matched("booking", "standard"),
+                "currentVsStandard": matched("current", "standard"),
+                "billedVsBooking": matched("billed", "booking"),
             },
+            "invoicedComponents": invoiced,
+            "components": len(all_rows),
             "paid": {"receipts": str(paid["receipts"]), "loan": str(paid["loan"]), "total": str(paid["total"])},
             "payable": payable,
             "balanceDue": _minus(payable, paid["total"]),
@@ -701,14 +749,15 @@ def documents(connection: Connection, *, tenant_id: str, journey_id: UUID) -> di
         template = (
             registry.documents.get(e["template_key"]) if e["template_key"] else None
         ) or registry.template_for_di_type(e["document_type_key"], stage=e["process_area"])
-        key_order = list(template.key_fields)
+        schema_order = [f["key"] for f in registry.di_fields(template.di_types[0])] if template.di_types else []
+        key_order = list(template.key_fields) + [k for k in schema_order if k not in template.key_fields]
         rows = []
         for f in by_document.get(str(e["di_document_id"]), []):
             confidence = float(f["confidence_score"]) if f["confidence_score"] is not None else None
             value = f["effective_value"] if f["effective_value"] is not None else f["extracted_value"]
             rows.append({
                 "key": f["field_key"],
-                "label": str(f["field_key"]).replace("_", " ").capitalize(),
+                "label": field_label(str(f["field_key"])),
                 "value": value,
                 "machineValue": f["extracted_value"],
                 "corrected": bool(f["is_modified"]),
@@ -858,9 +907,45 @@ _STATUS_ORDER = {
 }
 
 
+_DERIVED_SOURCES = {"derived": "computed", "deal_reconciliation": "price masters", "masters": "price masters",
+                    "journey": "journey", "payments": "payments"}
+
+
+def _operand_label(operand: str) -> str | None:
+    document, _, field = operand.partition(".")
+    if not field:
+        return None
+    field = field.replace(":", "_").lower()
+    document = document.strip("_")
+    source = _DERIVED_SOURCES.get(document) or _document_label(document)
+    return f"{field_label(field)} ({source})"
+
+
+def control_labels(connection: Connection) -> dict[str, str]:
+    """Human names: the rule catalog title for Audit Core rules, else what a
+    Rule Engine control compares ("X (doc) vs Y (doc)"), else the code."""
+    titles = {
+        str(code): str(title)
+        for code, title in connection.execute(
+            text("SELECT rule_code, title FROM auditcore.rule_definitions WHERE title IS NOT NULL")
+        ).all()
+    }
+    labels: dict[str, str] = {}
+    for control in get_registry().controls.values():
+        label = titles.get(control.code)
+        operands = control.operands or {}
+        if not label and isinstance(operands.get("left"), str) and isinstance(operands.get("right"), str):
+            left, right = _operand_label(operands["left"]), _operand_label(operands["right"])
+            if left and right:
+                label = f"{left} vs {right}"
+        labels[control.code] = label or control.code.replace("_", " ").capitalize()
+    return labels
+
+
 def compliance(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     """Every control with its state and reason, grouped by stage."""
     registry = get_registry()
+    labels = control_labels(connection)
     rows = connection.execute(
         text(
             """
@@ -877,7 +962,7 @@ def compliance(connection: Connection, *, tenant_id: str, journey_id: UUID) -> d
         details = (row["details"] if row else None) or {}
         item = {
             "code": control.code,
-            "label": control.code.replace("_", " ").capitalize(),
+            "label": labels[control.code],
             "category": control.category,
             "severity": control.severity,
             "executor": control.executor,
@@ -969,6 +1054,7 @@ def duplicates(connection: Connection, *, tenant_id: str, journey_id: UUID) -> d
             "status": r["finding_status"],
             "raisedAtUtc": r["created_at_utc"],
             "matchBasis": payload.get("matchBasis"),
+            "matchBasisLabel": _BASIS_LABEL.get(str(payload.get("matchBasis") or ""), payload.get("matchBasis")),
             "matchConfidencePercent": payload.get("matchConfidencePercent"),
             "matchConfidenceLabel": payload.get("matchConfidenceLabel"),
             "originalityBasis": payload.get("originalityBasis"),
