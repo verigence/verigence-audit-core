@@ -924,6 +924,13 @@ def _reconcile_document(engine: Engine, work: WorkItem) -> None:
         )
 
         if status == "READY":
+            _apply_replacement_lineage(
+                connection,
+                tenant_id=work.tenant_id,
+                journey_id=work.journey_id,
+                batch_id=UUID(str(queue["batch_id"])),
+                new_document_id=di_document_id,
+            )
             _enqueue(
                 connection,
                 tenant_id=work.tenant_id,
@@ -966,6 +973,140 @@ def _reconcile_document(engine: Engine, work: WorkItem) -> None:
                 f"DI document {di_document_id} is still {status}",
                 delay_seconds=_RECONCILE_DELAY_SECONDS,
             )
+
+
+
+def _apply_replacement_lineage(
+    connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    batch_id: UUID,
+    new_document_id: UUID,
+) -> None:
+    replacement = connection.execute(
+        text(
+            """
+            SELECT replaces_document_id, replaces_evidence_id,
+                   replacement_applied_at_utc
+            FROM auditcore.p2_upload_batches
+            WHERE tenant_id=:tenant_id AND batch_id=:batch_id
+            FOR UPDATE
+            """
+        ),
+        {"tenant_id": tenant_id, "batch_id": batch_id},
+    ).mappings().one()
+    old_document_id = replacement["replaces_document_id"]
+    old_evidence_id = replacement["replaces_evidence_id"]
+    if old_document_id is None or old_evidence_id is None:
+        return
+    if replacement["replacement_applied_at_utc"] is not None:
+        return
+
+    new_evidence = connection.execute(
+        text(
+            """
+            SELECT evidence_id
+            FROM auditcore.evidence
+            WHERE tenant_id=:tenant_id
+              AND journey_id=:journey_id
+              AND di_document_id=:document_id
+              AND association_status='ACTIVE'
+            LIMIT 1
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "document_id": new_document_id,
+        },
+    ).scalar_one_or_none()
+    if new_evidence is None:
+        raise RescheduleWork(
+            "Replacement document has not produced active Audit Core evidence yet.",
+            delay_seconds=_RECONCILE_DELAY_SECONDS,
+        )
+
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.evidence
+            SET supersedes_evidence_id=:old_evidence_id
+            WHERE tenant_id=:tenant_id AND evidence_id=:new_evidence_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "new_evidence_id": new_evidence,
+            "old_evidence_id": old_evidence_id,
+        },
+    )
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.evidence
+            SET association_status='SUPERSEDED',
+                void_reason='REPLACED_BY_P2_REUPLOAD',
+                voided_at_utc=now()
+            WHERE tenant_id=:tenant_id
+              AND evidence_id=:old_evidence_id
+              AND association_status='ACTIVE'
+            """
+        ),
+        {"tenant_id": tenant_id, "old_evidence_id": old_evidence_id},
+    )
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.document_capture_v2_documents
+            SET capture_status='SUPERSEDED', updated_at_utc=now()
+            WHERE tenant_id=:tenant_id
+              AND journey_id=:journey_id
+              AND di_document_id=:old_document_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "old_document_id": old_document_id,
+        },
+    )
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_upload_batches
+            SET replacement_applied_at_utc=now(), updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND batch_id=:batch_id
+            """
+        ),
+        {"tenant_id": tenant_id, "batch_id": batch_id},
+    )
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.p2_activity_events (
+                tenant_id, journey_id, event_type, subject_type,
+                subject_id, details
+            ) VALUES (
+                :tenant_id, :journey_id, 'DOCUMENT_REPLACED',
+                'DOCUMENT', :new_document_id,
+                jsonb_build_object(
+                    'replacesDocumentId', :old_document_id,
+                    'newEvidenceId', :new_evidence_id,
+                    'oldEvidenceId', :old_evidence_id
+                )
+            )
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "new_document_id": str(new_document_id),
+            "old_document_id": str(old_document_id),
+            "new_evidence_id": str(new_evidence),
+            "old_evidence_id": str(old_evidence_id),
+        },
+    )
 
 
 def _refresh_batch_status(connection, tenant_id: str, batch_id: UUID) -> None:
