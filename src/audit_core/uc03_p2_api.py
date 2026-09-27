@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, Engine, text
 
@@ -198,6 +198,59 @@ def list_templates(
             for stage in sorted(registry.stages.values(), key=lambda item: item.order)
         ],
     }
+
+
+class P2CreateJourneyCommand(BaseModel):
+    outletId: UUID
+    customerName: str = Field(min_length=1, max_length=200)
+
+
+@router.post("/journeys", status_code=201)
+def create_p2_journey(
+    tenant_id: str,
+    command: P2CreateJourneyCommand,
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """Start a new Booking Journey for a customer at the PC's outlet.
+
+    Reuses the existing, idempotent Create Booking transaction so there is one
+    way to create a Journey; the PC then lands on the document workspace and
+    everything else is driven by the uploaded documents."""
+    from audit_core.uc03_booking_commands import _authorize_security
+    from audit_core.uc03_create_booking import (
+        _create_context,
+        _execute_create_booking_atomic,
+    )
+
+    _authorize_security(authorization_client, human_principal=human_principal, tenant_id=tenant_id)
+    customer_name = " ".join(command.customerName.split())
+    if not customer_name:
+        raise HTTPException(status_code=422, detail="Enter the customer's name.")
+    set_tenant_context(connection, tenant_id)
+    context = _create_context(
+        connection, tenant_id=tenant_id, actor_id=human_principal.subject, outlet_id=command.outletId,
+    )
+    body = _execute_create_booking_atomic(
+        connection,
+        tenant_id=tenant_id,
+        context=context,
+        customer_name=customer_name,
+        actor_id=human_principal.subject,
+        idempotency_key=idempotency_key,
+        request_payload={"outletId": str(command.outletId), "customerName": customer_name},
+    )
+    journey_id = UUID(str(body["journeyId"]))
+    _activity(
+        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="JOURNEY_STARTED",
+        subject_type="JOURNEY", subject_id=str(journey_id), details={"customerName": customer_name},
+        correlation_id=None,
+    )
+    return {"journeyId": str(journey_id), "customerId": str(body["customerId"]), "outletId": str(body["outletId"])}
 
 
 @router.get("/journeys")
