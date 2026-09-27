@@ -57,6 +57,12 @@ _WORKER_CONCURRENCY = max(1, int(os.environ.get("P2_WORKER_CONCURRENCY", "4")))
 _WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 
+class RescheduleWork(RuntimeError):
+    def __init__(self, message: str, *, delay_seconds: int) -> None:
+        super().__init__(message)
+        self.delay_seconds = delay_seconds
+
+
 @dataclass(frozen=True)
 class WorkItem:
     tenant_id: str
@@ -153,6 +159,30 @@ def _complete(engine: Engine, work: WorkItem) -> None:
                 """
             ),
             {"tenant_id": work.tenant_id, "work_id": work.work_id},
+        )
+
+
+def _reschedule(engine: Engine, work: WorkItem, exc: RescheduleWork) -> None:
+    with engine.begin() as connection:
+        set_tenant_context(connection, work.tenant_id)
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_work_queue
+                SET work_status='PENDING',
+                    next_attempt_at_utc=now() + (:delay_seconds * interval '1 second'),
+                    lease_expires_at_utc=NULL,
+                    last_error=:last_error,
+                    updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND work_id=:work_id
+                """
+            ),
+            {
+                "tenant_id": work.tenant_id,
+                "work_id": work.work_id,
+                "delay_seconds": max(1, exc.delay_seconds),
+                "last_error": str(exc)[:1800],
+            },
         )
 
 
@@ -784,14 +814,8 @@ def _reconcile_document(engine: Engine, work: WorkItem) -> None:
             )
             _refresh_batch_status(connection, work.tenant_id, UUID(str(queue["batch_id"])))
         else:
-            _enqueue(
-                connection,
-                tenant_id=work.tenant_id,
-                journey_id=work.journey_id,
-                work_type="DOCUMENT_RECONCILE",
-                work_key=str(queue_id),
-                payload=work.payload,
-                correlation_id=work.correlation_id,
+            raise RescheduleWork(
+                f"DI document {di_document_id} is still {status}",
                 delay_seconds=_RECONCILE_DELAY_SECONDS,
             )
 
@@ -933,8 +957,9 @@ def _task_verify(engine: Engine, work: WorkItem) -> None:
                 payload={"controlCode": source_code, "taskId": str(task_id)},
                 correlation_id=work.correlation_id,
             )
-        raise RuntimeError(
-            f"Originating control {source_code or '<missing>'} has no PASS/FAIL P2 result yet"
+        raise RescheduleWork(
+            f"Originating control {source_code or '<missing>'} has no PASS/FAIL P2 result yet",
+            delay_seconds=2,
         )
 
 
@@ -984,6 +1009,8 @@ def run_once(engine: Engine | None = None) -> int:
             work = futures[future]
             try:
                 future.result()
+            except RescheduleWork as exc:
+                _reschedule(engine, work, exc)
             except Exception as exc:
                 logger.warning(
                     "p2_work_failed",
