@@ -733,7 +733,15 @@ def _sync_total_variance(
             ),
             {"tenant_id": tenant_id, "fid": finding_id},
         ).scalar_one()
-        if open_task_count == 0:
+        # A Phase 2 Journey gets its Team Lead task from the DEAL_UNDERCHARGED
+        # control (per component and net); only the finding is kept here so
+        # the Deal page still highlights the shortfall.
+        phase2 = connection.execute(
+            text("SELECT EXISTS (SELECT 1 FROM auditcore.p2_journey_runtime WHERE tenant_id=:tenant_id "
+                 "AND journey_id=:journey_id)"),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        ).scalar_one()
+        if open_task_count == 0 and not phase2:
             create_workflow_task(
                 connection,
                 tenant_id=tenant_id,

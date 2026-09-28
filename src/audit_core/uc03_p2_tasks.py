@@ -311,9 +311,14 @@ def submit_action(
     assigned_actor_id = task.get("assigned_actor_id")
     assigned_role_code = str(task.get("assigned_role_code") or "")
     supervisory = action == "ACCEPT_EXCEPTION"
+    # An observation (cash intimated? NDC signed in your presence?) is keyed
+    # in by whoever knows: the PC it is assigned to, or a TL / PM.
+    observation = task["task_type"] == _OBSERVATION_TASK and actor_role_code in _EXCEPTION_ROLES
     if supervisory:
         if actor_role_code not in _EXCEPTION_ROLES:
             raise ValueError("Only a Team Lead or Project Manager can accept an exception")
+    elif observation:
+        pass
     elif assigned_actor_id is not None and str(assigned_actor_id) != actor_id:
         raise ValueError("This task is assigned to a different actor")
     elif assigned_actor_id is None and assigned_role_code and assigned_role_code != actor_role_code:
@@ -688,6 +693,7 @@ def submit_action(
     }
 
 
+_OBSERVATION_TASK = "PC_CONFIRMATION"
 _MANUAL_VERIFICATION_TASKS = frozenset({
     "MANUAL_VERIFICATION_REVIEW", "FIELD_CORRECTION_REVIEW", "FIELD_CORRECTION_REVIEW_P2", "PC_CORRECTION",
     "DELIVERY_VIN_MANUAL_ENTRY_REVIEW", "MODEL_SELECTION_CORRECTION_REVIEW", "PC_CONFIRMATION",
