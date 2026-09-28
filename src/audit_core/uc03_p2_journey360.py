@@ -2000,7 +2000,7 @@ def _timeline(connection: Connection, *, tenant_id: str, journey_id: UUID) -> di
 _ACTIVITY_KIND = {
     "JOURNEY_STARTED": "journey",
     "UPLOAD_INITIALIZED": "document", "UPLOAD_ACCEPTED": "document", "UPLOAD_SPLIT_COMPLETE": "document",
-    "UPLOAD_DUPLICATE": "document",
+    "UPLOAD_DUPLICATE": "document", "P2_WORK_DEAD_LETTER": "document", "JOURNEY_CANCELLED": "journey",
     "DOCUMENTS_GROUPED": "document", "DOCUMENT_READY": "document", "DOCUMENT_SETTLED": "document",
     "DOCUMENT_REPLACEMENT_INITIALIZED": "document", "DOCUMENT_REPLACED": "document",
     "DOCUMENT_REMOVED": "document", "DOCUMENT_VOIDED": "document",

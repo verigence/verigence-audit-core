@@ -281,6 +281,47 @@ def create_p2_journey(
     return {"journeyId": str(journey_id), "customerId": str(body["customerId"]), "outletId": str(body["outletId"])}
 
 
+class P2CancelJourneyCommand(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
+@router.post("/journeys/{journey_id}:cancel")
+def cancel_p2_journey(
+    tenant_id: str,
+    journey_id: UUID,
+    command: P2CancelJourneyCommand,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """Delete a booking that a failed document upload left stuck: it closes
+    as cancelled with its documents and history kept, and the Team Lead is
+    told. Refused while the booking is complete or nothing has failed."""
+    from audit_core.uc03_p2_runtime import note_facts_changed
+    from audit_core.uc03_p2_workflow import cancel_stuck_journey
+
+    access = _authorize(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
+    )
+    set_tenant_context(connection, tenant_id)
+    outcome = cancel_stuck_journey(
+        connection, tenant_id=tenant_id, journey_id=journey_id, actor_id=human_principal.subject,
+        actor_role=access.operating_role or access.functional_role, reason=command.reason,
+    )
+    if outcome == "COMPLETED":
+        raise HTTPException(status_code=409, detail="This booking is complete and cannot be deleted.")
+    if outcome == "ALREADY_CLOSED":
+        raise HTTPException(status_code=409, detail="This booking is already closed.")
+    if outcome == "NOT_STUCK":
+        raise HTTPException(status_code=409, detail="Nothing has failed on this booking: only a booking whose "
+                                                    "document upload failed after the retries can be deleted.")
+    note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id, reason="JOURNEY_CANCELLED")
+    return {"journeyId": str(journey_id), "status": "BOOKING_CANCELLED"}
+
+
 @router.get("/journeys")
 def list_p2_journeys(
     tenant_id: str,
@@ -410,7 +451,7 @@ def list_p2_journeys(
                      WHERE jr.tenant_id=p.tenant_id AND jr.journey_id=p.journey_id) AS delivery_reviewed_at,
                    bs.capture_completed_at_utc AS booking_submitted_at,
                    ds.capture_completed_at_utc AS delivery_submitted_at,
-                   ev.documents,
+                   ev.documents, pq.failed_pages, pq.retrying_pages,
                    tk.total_tasks, tk.open_tasks, tk.overdue_tasks, tk.pc_open_tasks, tk.tl_open_tasks,
                    fd.open_findings
             FROM page p
@@ -432,6 +473,15 @@ def list_p2_journeys(
               SELECT COUNT(*) AS documents FROM auditcore.evidence
               WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id AND association_status='ACTIVE'
             ) ev ON true
+            LEFT JOIN LATERAL (
+              -- pages whose processing failed for good, and pages waiting for a retry
+              SELECT COUNT(*) FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER'))
+                     + (SELECT COUNT(*) FROM auditcore.p2_upload_batches b
+                         WHERE b.tenant_id=p.tenant_id AND b.journey_id=p.journey_id AND b.batch_status='FAILED') AS failed_pages,
+                     COUNT(*) FILTER (WHERE q.queue_status='RETRY_WAIT') AS retrying_pages
+              FROM auditcore.p2_document_queue q
+              WHERE q.tenant_id=p.tenant_id AND q.journey_id=p.journey_id
+            ) pq ON true
             LEFT JOIN LATERAL (
               SELECT COUNT(*) AS total_tasks,
                      COUNT(*) FILTER (WHERE is_open) AS open_tasks,

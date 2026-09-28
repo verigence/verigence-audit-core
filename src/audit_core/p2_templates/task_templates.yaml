@@ -84,6 +84,30 @@ task_types:
     - PROVIDE_FEEDBACK
     - ACCEPT_EXCEPTION
     - ADD_COMMENT
+  # A page that could not be processed after the retries (or that the
+  # document service refused outright): the PC retries it, replaces the
+  # upload, or deletes the booking. Closes itself when the page is
+  # processed or removed.
+  PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE:
+    category: DOCUMENT_EXCEPTION
+    owner: PC
+    origin: SYSTEM
+    source: DOCUMENT
+    completion: MACHINE_VERIFIED
+    actions:
+    - REUPLOAD_DOCUMENT
+    - ADD_COMMENT
+  # A PC deleted a booking that a failed document upload left stuck: the
+  # TL is told.
+  JOURNEY_CANCELLED_NOTICE:
+    category: SUPERVISORY_NOTICE
+    owner: TL
+    origin: SYSTEM
+    source: DOCUMENT
+    completion: MACHINE_VERIFIED
+    actions:
+    - COMPLETE_ACTION
+    - ADD_COMMENT
   FIELD_CORRECTION_REVIEW:
     category: CORRECTION_APPROVAL
     owner: TL

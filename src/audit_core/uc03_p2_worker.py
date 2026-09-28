@@ -41,6 +41,7 @@ from sqlalchemy import Engine, text
 
 from audit_core.db import set_platform_super_admin_context, set_tenant_context
 from audit_core.dependencies import get_engine
+from audit_core.di_capture_v2_client import DiCaptureV2Error
 from audit_core.uc03_document_capture_v2 import (
     _DI_AUDIENCE,
     _candidate_type_keys,
@@ -79,6 +80,7 @@ from audit_core.uc03_p2_task_producer import (
     sync_document_missing_tasks,
     sync_field_review_tasks,
     sync_name_consistency_tasks,
+    sync_processing_failure_tasks,
     sync_vehicle_photo_task,
 )
 from audit_core.uc03_p2_workflow import mark_delivery_reviewed
@@ -91,7 +93,12 @@ from audit_core.uc03_unified_document_capture import (
 
 logger = structlog.get_logger(__name__)
 
-_MAX_ATTEMPTS = int(os.environ.get("P2_WORKER_MAX_ATTEMPTS", "8"))
+# Retries for a step that hit a transient fault (the document service or
+# storage down, rate limited): two quick ones for a blip, two spaced ones
+# for an outage, then the PC is told. A fault that cannot recover (the
+# document service refused the request, an unreadable file) is told at once.
+_RETRY_DELAYS_SECONDS = (60, 240, 1800, 3600)
+_MAX_ATTEMPTS = int(os.environ.get("P2_WORKER_MAX_ATTEMPTS", str(len(_RETRY_DELAYS_SECONDS) + 1)))
 _POLL_SECONDS = float(os.environ.get("P2_WORKER_POLL_SECONDS", "1.0"))
 _MAX_PDF_PAGES = int(os.environ.get("P2_MAX_PDF_PAGES", "100"))
 _WORKER_CONCURRENCY = max(1, int(os.environ.get("P2_WORKER_CONCURRENCY", "6")))
@@ -113,7 +120,9 @@ _PAGE_ACTIVE_STATES = (
     "DI_FINALIZING", "CLASSIFYING", "EXTRACTING", "SYNCING_TO_AUDIT_CORE",
     "RETRY_WAIT",
 )
-_PAGE_RECONCILE_STATES = ("CLASSIFYING", "EXTRACTING", "SYNCING_TO_AUDIT_CORE", "RETRY_WAIT")
+# A page in RETRY_WAIT is waiting for its ingest step to run again; the
+# reconcile sweep leaves it alone until then.
+_PAGE_RECONCILE_STATES = ("CLASSIFYING", "EXTRACTING", "SYNCING_TO_AUDIT_CORE")
 _PAGE_SETTLED_STATES = ("READY", "SUPPORTING", "NEEDS_REVIEW", "FAILED", "DEAD_LETTER", "CANCELLED")
 
 
@@ -360,10 +369,49 @@ def _reschedule(engine: Engine, work: WorkItem, exc: RescheduleWork) -> None:
         )
 
 
+def _di_error_body(exc: DiCaptureV2Error) -> dict[str, Any]:
+    try:
+        body = json.loads(exc.detail)
+    except (TypeError, ValueError):
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Whether trying again can help: the document service says so when it
+    answers, else its status code does; an unreadable file never recovers."""
+    if isinstance(exc, DiCaptureV2Error):
+        flag = _di_error_body(exc).get("retryable")
+        if isinstance(flag, bool):
+            return flag
+        return exc.status_code in (408, 425, 429) or exc.status_code >= 500
+    return not isinstance(exc, ValueError)
+
+
+def _plain_cause(exc: Exception) -> str:
+    """Why the step failed, in words a PC can act on."""
+    if isinstance(exc, DiCaptureV2Error):
+        body = _di_error_body(exc)
+        what = body.get("detail") or body.get("title") or str(exc.detail)[:200]
+        return f"The document service could not accept this page: {what}"
+    if isinstance(exc, ValueError):
+        return str(exc)[:300] or "The file could not be read."
+    text_ = str(exc)[:200]
+    return f"The page could not be processed ({exc.__class__.__name__}{': ' + text_ if text_ else ''})."
+
+
+def _delay_text(seconds: int) -> str:
+    if seconds >= 3600:
+        return f"{seconds // 3600} hour" + ("" if seconds < 7200 else "s")
+    return f"{max(1, seconds // 60)} minute" + ("" if seconds < 120 else "s")
+
+
 def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
     attempts = work.attempt_count + 1
-    terminal = attempts >= _MAX_ATTEMPTS
-    delay = min(300, 2 ** min(attempts, 8))
+    retryable = _is_retryable(exc)
+    terminal = (not retryable) or attempts >= _MAX_ATTEMPTS
+    delay = _RETRY_DELAYS_SECONDS[min(attempts, len(_RETRY_DELAYS_SECONDS)) - 1]
+    cause = _plain_cause(exc)
     error = f"{exc.__class__.__name__}: {str(exc)[:1800]}"
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
@@ -396,6 +444,16 @@ def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
             },
         )
         if not terminal:
+            if work.work_type == "DOCUMENT_INGEST":
+                _settle_page(
+                    connection,
+                    tenant_id=work.tenant_id,
+                    queue_id=UUID(work.work_key),
+                    status="RETRY_WAIT",
+                    reason=(f"{cause} Retrying automatically in {_delay_text(delay)} (attempt {attempts} of "
+                            f"{_MAX_ATTEMPTS}). You can leave this page and check back later."),
+                    last_error=error,
+                )
             return
 
         if work.work_type == "DOCUMENT_INGEST":
@@ -404,9 +462,11 @@ def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
                 tenant_id=work.tenant_id,
                 queue_id=UUID(work.work_key),
                 status="FAILED",
-                reason="The page could not be sent for classification. Retry the page.",
+                reason=(f"{cause} " + (f"Not processed after {attempts} attempts. " if retryable else "")
+                        + "Retry the page, remove the upload, or delete this booking."),
                 last_error=error,
             )
+            sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
         elif work.work_type == "CONTROL_EVALUATE" and work.payload.get("unit"):
             mark_unit_controls(
                 connection,
@@ -427,6 +487,7 @@ def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
                 ),
                 {"tenant_id": work.tenant_id, "batch_id": UUID(work.work_key)},
             )
+            sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
         record_activity(
             connection,
             tenant_id=work.tenant_id,
@@ -947,7 +1008,7 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
                 SET di_document_id=:document_id,
                     queue_status='CLASSIFYING',
                     di_state='STORED',
-                    di_submitted_at_utc=COALESCE(di_submitted_at_utc, now()),
+                    di_submitted_at_utc=now(),
                     status_reason=NULL,
                     updated_at_utc=now()
                 WHERE tenant_id=:tenant_id AND queue_id=:queue_id
@@ -1809,6 +1870,8 @@ def _sync_rule_tasks(connection, *, tenant_id: str, journey_id: UUID, started_at
         "document_missing": sync_document_missing_tasks(
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
         "name_consistency": sync_name_consistency_tasks(
+            connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
+        "processing_failure": sync_processing_failure_tasks(
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
         "vehicle_photo": sync_vehicle_photo_task(
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
