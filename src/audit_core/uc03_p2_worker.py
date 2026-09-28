@@ -1904,11 +1904,11 @@ def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
     if "DELIVERY_COMPLETED" in settled.get("transitions", ()):
         sync_delivery_review_task(connection, tenant_id=tenant_id, journey_id=journey_id,
                                   evaluation_started_at=started_at)
-    # The 7th-day event for the mandatory delivery documents, queued once the
-    # first delivery document is in (no-op until then, and after).
-    from audit_core.uc03_p2_audit_rules import schedule_delivery_documents_check
+    # The 7th-day event: the Delivery must be complete within the window of
+    # the date printed on the earliest invoice, cover note or gate pass.
+    from audit_core.uc03_p2_audit_rules import schedule_delivery_completion_check
 
-    schedule_delivery_documents_check(connection, tenant_id=tenant_id, journey_id=journey_id)
+    schedule_delivery_completion_check(connection, tenant_id=tenant_id, journey_id=journey_id)
     transitions = list(dict.fromkeys([*first.get("transitions", ()), *settled.get("transitions", ())]))
     return {**settled, "transitions": transitions}
 

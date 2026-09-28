@@ -18,7 +18,7 @@ and answer the questions a manual deal audit asks:
   Cash intimation          CASH_INTIMATION_UNCONFIRMED (PC question), CASH_NOT_INTIMATED
   NDC signature            NDC_SIGNATURE_UNCONFIRMED (PC question), NDC_NOT_SIGNED
   Accessories fitted       ACCESSORIES_FITTED_UNCONFIRMED (PC question), ACCESSORY_FITTED_UNBILLED
-  Documents overdue        DELIVERY_DOCUMENTS_OVERDUE  mandatory delivery documents within the window
+  Delivery in time         DELIVERY_NOT_COMPLETED_IN_TIME  complete within N days of the printed date
 
 A "Manual Observations" control cannot be read from a document: its task
 asks a question and fails until a PC, TL or PM answers it (the answer and
@@ -30,11 +30,12 @@ re-runs the Delivery checks for each Journey whose delivery has started and
 is not yet reviewed, so the time-based checks fire without a document
 event: the settlement window (P2_SETTLEMENT_GRACE_DAYS, 7), the financier
 window (P2_FINANCE_DISBURSEMENT_DAYS, 12), the resale window
-(P2_TRADE_IN_RESALE_DAYS, 90) and the mandatory-documents window
-(P2_DELIVERY_DOCUMENTS_DAYS, 7). The documents window also has its own
-event: ``schedule_delivery_documents_check`` queues the checks to run
-exactly on the 7th day after the first delivery document, so the Team Lead's
-High task is raised that day, not the next night.
+(P2_TRADE_IN_RESALE_DAYS, 90) and the delivery-completion window
+(P2_DELIVERY_COMPLETION_DAYS, 7, from the date printed on the earliest of
+the invoice, insurance cover note and gate pass). The completion window
+also has its own event: ``schedule_delivery_completion_check`` queues the
+checks for the morning the window closes, so the Team Lead's High task,
+listing everything still pending, is raised that day.
 
 A failing violation check is an Audit Finding (rule_key = the control code)
 with the check's wording; it resolves itself when the check passes, and a
@@ -50,7 +51,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from functools import cached_property
 from typing import Any
@@ -74,9 +75,9 @@ _LINE_TOLERANCE = Decimal(100)
 _SETTLEMENT_DAYS = int(os.environ.get("P2_SETTLEMENT_GRACE_DAYS", "7"))       # balance due after delivery
 _FINANCE_DAYS = int(os.environ.get("P2_FINANCE_DISBURSEMENT_DAYS", "12"))    # financier pays the delivery order
 _TRADE_IN_RESALE_DAYS = int(os.environ.get("P2_TRADE_IN_RESALE_DAYS", "90"))  # exchange vehicle resold
-# Once the first delivery document is in, every mandatory delivery document
-# must follow within this many days.
-_DELIVERY_DOCUMENTS_DAYS = int(os.environ.get("P2_DELIVERY_DOCUMENTS_DAYS", "7"))
+# The Delivery must be complete within this many days of the date printed on
+# the earliest of the invoice, the insurance cover note and the gate pass.
+_DELIVERY_COMPLETION_DAYS = int(os.environ.get("P2_DELIVERY_COMPLETION_DAYS", "7"))
 # Statutory limits, set per deployment: a single cash receipt above the
 # limit (Income-tax Act s.269ST), TCS on a vehicle priced above the threshold.
 _CASH_RECEIPT_LIMIT = Decimal(os.environ.get("P2_CASH_RECEIPT_LIMIT", "200000"))
@@ -275,35 +276,71 @@ class _Facts:
         return None
 
     @cached_property
-    def delivery_started(self) -> datetime | None:
-        """When the first delivery document was linked, or None."""
-        from audit_core.uc03_p2_registry import get_registry
-
-        delivery_types = sorted({
-            di_type for t in get_registry().documents.values() if t.stage == "DELIVERY" for di_type in t.di_types
-        })
-        return self.connection.execute(
-            text(
-                """
-                SELECT MIN(linked_at_utc) FROM auditcore.evidence
-                WHERE tenant_id=:t AND journey_id=:j AND association_status='ACTIVE'
-                  AND (upper(COALESCE(process_area, ''))='DELIVERY' OR document_type_key = ANY(:types))
-                """
-            ),
-            {**self._params, "types": delivery_types},
-        ).scalar_one_or_none()
+    def delivery_clock(self) -> dict[str, Any] | None:
+        """The earliest date printed on an invoice, the insurance cover note or
+        the gate pass: {"date", "document"}; None until one is read."""
+        found: list[tuple[date, str]] = []
+        for doc in self.documents("customer_invoice_dms", "tax_invoice_tally", "insurance_cover", "gate_pass"):
+            fields = doc["fields"]
+            for key in ("invoice_date", "issue_date", "policy_start_date", "delivery_date"):
+                printed = _day(fields.get(key))
+                if printed:
+                    found.append((printed, doc["documentType"]))
+        if not found:
+            return None
+        printed, document_type = min(found)
+        return {"date": printed, "document": document_type.replace("_", " ")}
 
     @cached_property
-    def missing_delivery_documents(self) -> list[dict[str, Any]]:
-        """Mandatory (and evidence-triggered conditional) delivery documents
-        not received yet, as the stage checklist lists them."""
+    def delivery_complete(self) -> bool:
+        return self.connection.execute(
+            text("SELECT delivery_completion_state='COMPLETE' FROM auditcore.p2_journey_runtime "
+                 "WHERE tenant_id=:t AND journey_id=:j"),
+            self._params,
+        ).scalar_one_or_none() or False
+
+    @cached_property
+    def delivery_pending(self) -> list[str]:
+        """What still stands between this Journey and a completed Delivery,
+        in the stage engine's own words: the documents missing, the vehicle
+        proof, the PC tasks open."""
         from audit_core.uc03_p2_registry import get_registry
         from audit_core.uc03_p2_stage import condition_reasons, requirement_items
 
+        pending: list[str] = []
         reasons = condition_reasons(self.connection, tenant_id=self.tenant_id, journey_id=self.journey_id)
-        items = requirement_items(self.connection, get_registry(), tenant_id=self.tenant_id,
-                                  journey_id=self.journey_id, stage="DELIVERY", reasons=reasons)
-        return [i for i in items if i["required"] and not i["received"]]
+        missing = [
+            i["label"] for i in requirement_items(self.connection, get_registry(), tenant_id=self.tenant_id,
+                                                  journey_id=self.journey_id, stage="DELIVERY", reasons=reasons)
+            if i["required"] and not i["received"]
+        ]
+        if missing:
+            pending.append("documents missing: " + ", ".join(missing))
+        gates = self._rows(
+            """
+            SELECT gate_key, details FROM auditcore.p2_stage_gate_state
+            WHERE tenant_id=:t AND journey_id=:j AND stage_code='DELIVERY' AND gate_status<>'PASS'
+            ORDER BY gate_key
+            """
+        )
+        for gate in gates:
+            details = dict(gate["details"] or {})
+            if gate["gate_key"] == "REQUIRED_DOCUMENTS":
+                continue  # named above
+            if gate["gate_key"] == "PC_TASKS_CLOSED":
+                titles = self._rows(
+                    """
+                    SELECT title FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j
+                      AND assigned_role_code='PC'
+                      AND task_status IN ('READY','IN_PROGRESS','RETURNED','ACTION_COMPLETED','VERIFYING')
+                    ORDER BY created_at_utc
+                    """
+                )
+                if titles:
+                    pending.append(f"{len(titles)} PC task(s) open: " + "; ".join(str(r["title"]) for r in titles))
+                continue
+            pending.append(str(details.get("action") or details.get("label") or gate["gate_key"]).rstrip("."))
+        return pending
 
     @cached_property
     def booking_date(self) -> date | None:
@@ -866,24 +903,26 @@ def ndc_not_signed(facts: _Facts) -> RuleOutcome:
     return RuleOutcome(code, "PASS", f"Signed by the customer in the auditor's presence (confirmed on {_when(answer['at'])}){_remark(answer)}.")
 
 
-def delivery_documents_overdue(facts: _Facts) -> RuleOutcome:
-    code = "DELIVERY_DOCUMENTS_OVERDUE"
-    started = facts.delivery_started
-    if started is None:
-        return RuleOutcome(code, "PASS", "No delivery document uploaded yet.")
-    missing = facts.missing_delivery_documents
-    if not missing:
-        return RuleOutcome(code, "PASS", "Every mandatory delivery document is in.")
-    names = ", ".join(m["label"] for m in missing)
-    deadline = started + timedelta(days=_DELIVERY_DOCUMENTS_DAYS)
-    if datetime.now(UTC) < deadline:
-        return RuleOutcome(code, "SKIPPED", f"Still missing: {names}. Due by {_when(deadline)} "
-                                            f"({_DELIVERY_DOCUMENTS_DAYS} days after the first delivery document).")
+def delivery_not_completed_in_time(facts: _Facts) -> RuleOutcome:
+    code = "DELIVERY_NOT_COMPLETED_IN_TIME"
+    clock = facts.delivery_clock
+    if clock is None:
+        return RuleOutcome(code, "PASS", "No invoice, insurance cover note or gate pass read yet.")
+    if facts.delivery_complete:
+        return RuleOutcome(code, "PASS", f"Delivery completed within {_DELIVERY_COMPLETION_DAYS} days of the "
+                                         f"{clock['document']} dated {_when(clock['date'])}.")
+    deadline = clock["date"] + timedelta(days=_DELIVERY_COMPLETION_DAYS)
+    pending = facts.delivery_pending or ["the delivery is not marked complete"]
+    summary = "; ".join(pending)
+    if facts.today < deadline:
+        return RuleOutcome(code, "SKIPPED", f"Delivery due by {_when(deadline)} ({_DELIVERY_COMPLETION_DAYS} days "
+                                            f"from the {clock['document']} dated {_when(clock['date'])}). "
+                                            f"Pending: {summary}.")
     return RuleOutcome(code, "FAIL", (
-        f"Delivery documents started on {_when(started)}; still missing {(facts.today - started.date()).days} days "
-        f"later: {names}."
-    ), {"findingTitle": f"Mandatory delivery documents missing: {names}",
-        "documentTypes": [t for m in missing for t in m["templates"]], "missing": [m["label"] for m in missing]})
+        f"Delivery not completed {(facts.today - clock['date']).days} days after the {clock['document']} dated "
+        f"{_when(clock['date'])}. Pending: {summary}."
+    ), {"findingTitle": "Delivery not completed in time: " + summary[:200], "pending": pending,
+        "clockDocument": clock["document"], "clockDate": clock["date"].isoformat()})
 
 
 def accessories_fitted_unconfirmed(facts: _Facts) -> RuleOutcome:
@@ -931,7 +970,7 @@ _DELIVERY_RULES = (
     do_payment_not_received, do_short_payment,
     trade_in_not_resold, trade_in_sold_at_loss, post_delivery_refund,
     ndc_signature_unconfirmed, ndc_not_signed, accessories_fitted_unconfirmed, accessory_fitted_unbilled,
-    delivery_documents_overdue,
+    delivery_not_completed_in_time,
 )
 RULE_CODES = {
     "BOOKING": tuple(r.__name__.upper() for r in _BOOKING_RULES),
@@ -943,7 +982,7 @@ RULE_CODES = {
 _FINDING_TYPES = {
     "DEAL_UNDERCHARGED": "PRICING_ANOMALY", "TCS_SHORT": "PRICING_ANOMALY", "EXCESS_DISCOUNT": "DISCOUNT_ANOMALY",
     "TRADE_IN_NOT_RESOLD": "COMMERCIAL_EXCEPTION", "TRADE_IN_SOLD_AT_LOSS": "COMMERCIAL_EXCEPTION",
-    "DELIVERY_DOCUMENTS_OVERDUE": "DELIVERY_DOCUMENT_MISSING",
+    "DELIVERY_NOT_COMPLETED_IN_TIME": "DELIVERY_EXCEPTION",
     "NDC_NOT_SIGNED": "PROCESS_NON_COMPLIANCE", "ACCESSORY_FITTED_UNBILLED": "PROCESS_NON_COMPLIANCE",
 }
 _DEFAULT_FINDING_TYPE = "PAYMENT_EXCEPTION"
@@ -1050,30 +1089,35 @@ def run_p2_audit_rules(
     return outcomes
 
 
-def schedule_delivery_documents_check(
+def schedule_delivery_completion_check(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str | None = None,
 ) -> str | None:
-    """The 7th-day event: once the first delivery document is in, queue the
-    Delivery checks to run exactly P2_DELIVERY_DOCUMENTS_DAYS later, when
-    DELIVERY_DOCUMENTS_OVERDUE raises its High task to the Team Lead if a
-    mandatory document is still missing. Queued once per Journey."""
+    """The 7th-day event: as soon as an invoice, insurance cover note or gate
+    pass is read, queue the Delivery checks for the morning after
+    P2_DELIVERY_COMPLETION_DAYS from the earliest printed date, when
+    DELIVERY_NOT_COMPLETED_IN_TIME raises its High task to the Team Lead
+    with everything still pending. Moves earlier if an earlier-dated
+    document arrives; never re-fires once spent."""
     facts = _Facts(connection, tenant_id, journey_id)
-    started = facts.delivery_started
-    if started is None:
+    clock = facts.delivery_clock
+    if clock is None or facts.delivery_complete:
         return None
-    key = f"unit:{journey_id}:NATIVE:DELIVERY:documents-window"
-    exists = connection.execute(
-        text("SELECT 1 FROM auditcore.p2_work_queue WHERE tenant_id=:t AND work_type='CONTROL_EVALUATE' "
-             "AND work_key=:k"),
+    key = f"unit:{journey_id}:NATIVE:DELIVERY:delivery-window"
+    fire_at = datetime.combine(clock["date"] + timedelta(days=_DELIVERY_COMPLETION_DAYS), time(0, 30), tzinfo=UTC)
+    existing = connection.execute(
+        text("SELECT work_status, next_attempt_at_utc FROM auditcore.p2_work_queue "
+             "WHERE tenant_id=:t AND work_type='CONTROL_EVALUATE' AND work_key=:k"),
         {"t": tenant_id, "k": key},
-    ).scalar_one_or_none()
-    if exists:
+    ).mappings().one_or_none()
+    if existing is not None and not (
+        existing["work_status"] == "PENDING" and existing["next_attempt_at_utc"] is not None
+        and existing["next_attempt_at_utc"] > fire_at
+    ):
         return None
-    fire_at = started + timedelta(days=_DELIVERY_DOCUMENTS_DAYS)
     enqueue_work(
         connection, tenant_id=tenant_id, journey_id=journey_id, work_type="CONTROL_EVALUATE", work_key=key,
         payload={"unit": "NATIVE:DELIVERY", "force": True,
-                 "reason": f"{_DELIVERY_DOCUMENTS_DAYS} days after the first delivery document"},
+                 "reason": f"{_DELIVERY_COMPLETION_DAYS} days from the {clock['document']} dated {clock['date']}"},
         correlation_id=correlation_id,
         delay_seconds=max(0, int((fire_at - datetime.now(UTC)).total_seconds())),
     )
@@ -1119,4 +1163,4 @@ def queue_nightly_review(connection: Connection, *, tenant_id: str, today: date 
 
 
 __all__ = ["RULE_CODES", "RuleOutcome", "queue_nightly_review", "run_p2_audit_rules",
-           "schedule_delivery_documents_check"]
+           "schedule_delivery_completion_check"]
