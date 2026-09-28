@@ -1555,6 +1555,15 @@ def act_on_flag(
             correlation_id=correlation_id,
         )
         next_status = verdict["next_status"]
+        if next_status in {"RESOLVED", "VOIDED"}:
+            # The Phase 2 task raised for this finding closes with the verdict.
+            from audit_core.uc03_p2_task_producer import close_tasks_for_finding
+
+            close_tasks_for_finding(
+                connection, tenant_id=tenant_id, finding_id=flag_id,
+                verdict=verdict.get("disposition") or next_status, actor_id=human_principal.subject,
+                actor_role=context["operating_role"], comment=verdict.get("reason"),
+            )
         # Unified Documents review (2026-09-13): a Confirm-Breach verdict on a
         # DI_VALUE_CORRECTION_PROPOSED finding actually applies the proposed
         # value. LEGACY PATH as of 2026-09-17

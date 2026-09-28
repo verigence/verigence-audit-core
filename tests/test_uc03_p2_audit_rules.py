@@ -375,6 +375,74 @@ def test_cash_limit_tcs_and_payment_before_booking(journey):
     assert "TCS ₹5,000 charged against ₹15,000 due (1% of the ex-showroom price ₹15,00,000; ₹10,000 short)" in result["TCS_SHORT"].reason
 
 
+# ---------------------------------------------------- the TL's verdict
+
+
+def _verdict(journey, code: str, action: str, comment: str, *, role: str = "TL") -> dict:
+    task = _task(journey, code)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return submit_action(connection, tenant_id=journey.tenant_id, task_id=task["task_id"], action=action,
+                             actor_id=f"{role.lower()}-1", actor_role_code=role, comment=comment,
+                             details={"rejectionCategory": "DATA_ALREADY_CORRECT"})
+
+
+def test_a_team_lead_verdict_closes_the_finding_and_its_task_for_good(journey):
+    _line(journey, "ex_showroom_price", "1000000", "990000")
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "tax_invoice_tally", "990000")
+    _evaluate(journey, "NATIVE:BOOKING")
+    task = _task(journey, "DEAL_UNDERCHARGED")
+    assert task["task_type"] == "FINDING_REVIEW" and task["reference"]["findingId"]
+    assert "CONFIRM_BREACH" in _sql(journey, "SELECT allowed_actions FROM auditcore.p2_tasks WHERE tenant_id=:t "
+                                             "AND task_id=:id", id=task["task_id"]).scalar_one()
+
+    with pytest.raises(ValueError, match="assigned to role TL"):
+        _verdict(journey, "DEAL_UNDERCHARGED", "CONFIRM_BREACH", "Dealer sold below list", role="PC")
+    result = _verdict(journey, "DEAL_UNDERCHARGED", "CONFIRM_BREACH", "Dealer sold below list to close the month")
+    assert result["status"] == "VERIFIED_COMPLETE" and result["outcome"] == "CONFIRMED_BREACH"
+    status, _, _ = _finding(journey, "DEAL_UNDERCHARGED")
+    assert status == "RESOLVED"
+    disposition, reason = _sql(journey, "SELECT disposition, resolution_reason FROM auditcore.audit_findings "
+                                        "WHERE tenant_id=:t AND rule_key='DEAL_UNDERCHARGED'").one()
+    assert (disposition, reason) == ("CONFIRMED_BREACH", "Dealer sold below list to close the month")
+    assert _task(journey, "DEAL_UNDERCHARGED")["task_status"] == "VERIFIED_COMPLETE"
+
+    # The check still fails, but the verdict stands: no new finding, no new task.
+    _evaluate(journey, "NATIVE:BOOKING")
+    assert _states(journey)["DEAL_UNDERCHARGED"]["control_status"] == "FAIL"
+    assert _sql(journey, "SELECT count(*) FROM auditcore.audit_findings WHERE tenant_id=:t "
+                         "AND rule_key='DEAL_UNDERCHARGED'").scalar_one() == 1
+    assert _task(journey, "DEAL_UNDERCHARGED")["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_the_delivery_review_waits_for_every_verdict(journey):
+    from audit_core.uc03_p2_registry import get_registry
+    from audit_core.uc03_p2_task_producer import raise_or_refresh
+
+    _line(journey, "ex_showroom_price", "1000000", "990000")
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "tax_invoice_tally", "990000")
+    _evaluate(journey, "NATIVE:BOOKING")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        raise_or_refresh(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                         dedupe_key=f"delivery-review:{journey.journey_id}", task_type="DELIVERY_REVIEW",
+                         source_type="REVIEW", source_code="DELIVERY_REVIEW", title="Review the completed delivery",
+                         description="x", reference={"sourceCode": "DELIVERY_REVIEW"}, severity="MEDIUM",
+                         registry=get_registry())
+    review = _sql(journey, "SELECT task_id FROM auditcore.p2_tasks WHERE tenant_id=:t AND task_type='DELIVERY_REVIEW'").scalar_one()
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        with pytest.raises(ValueError, match="Give a verdict on 1 open finding.*Deal charged below the standard price"):
+            submit_action(connection, tenant_id=journey.tenant_id, task_id=review, action="COMPLETE_ACTION",
+                          actor_id="tl-1", actor_role_code="TL", comment=None)
+    _verdict(journey, "DEAL_UNDERCHARGED", "MARK_FALSE_POSITIVE", "Price list was superseded")
+    assert _finding(journey, "DEAL_UNDERCHARGED")[0] == "RESOLVED"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert submit_action(connection, tenant_id=journey.tenant_id, task_id=review, action="COMPLETE_ACTION",
+                             actor_id="tl-1", actor_role_code="TL", comment=None)["status"] == "VERIFYING"
+
+
 # ------------------------------------ the documents window and the night
 
 
