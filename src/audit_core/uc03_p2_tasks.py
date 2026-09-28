@@ -381,6 +381,29 @@ def submit_action(
         )
         return {"taskId": str(task_id), "status": "VERIFIED_COMPLETE", "outcome": "EXCEPTION_ACCEPTED"}
 
+    if action in _VERDICT_ACTIONS:
+        return _apply_verdict(connection, tenant_id=tenant_id, task=task, action=action, actor_id=actor_id,
+                              actor_role_code=actor_role_code, comment=comment, details=details)
+
+    if task["task_type"] == "DELIVERY_REVIEW" and action == "COMPLETE_ACTION":
+        # The delivery is reviewed only once every violation has its verdict.
+        open_findings = connection.execute(
+            text(
+                """
+                SELECT title FROM auditcore.audit_findings
+                WHERE tenant_id=:t AND journey_id=:j AND finding_status IN ('OPEN','ACKNOWLEDGED')
+                  AND (finding_class='VIOLATION' OR origin_kind='HUMAN')
+                ORDER BY created_at_utc
+                """
+            ),
+            {"t": tenant_id, "j": journey_id},
+        ).scalars().all()
+        if open_findings:
+            raise ValueError(
+                f"Give a verdict on {len(open_findings)} open finding(s) first: "
+                + "; ".join(str(t) for t in open_findings[:6]) + (" …" if len(open_findings) > 6 else "")
+            )
+
     if action == "PROVIDE_VEHICLE_ID":
         # No pictures of the car: the PC enters the VIN / chassis / engine
         # number instead; the task is then machine-verified like any other
@@ -694,6 +717,61 @@ def submit_action(
 
 
 _OBSERVATION_TASK = "PC_CONFIRMATION"
+_VERDICT_ACTIONS = frozenset({"CONFIRM_BREACH", "MARK_FALSE_POSITIVE"})
+
+
+def _apply_verdict(
+    connection: Connection, *, tenant_id: str, task: dict[str, Any], action: str, actor_id: str,
+    actor_role_code: str, comment: str | None, details: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The Team Lead's verdict on the finding behind this task, through the
+    same finding state machine as the Findings screen; the finding closes
+    with the verdict and so does every task raised for it."""
+    from audit_core.uc03_audit_flags import FlagLifecycleCommand, apply_finding_verdict
+    from audit_core.uc03_finding_routing import class_profile, classify_finding
+    from audit_core.uc03_p2_task_producer import close_tasks_for_finding
+
+    if actor_role_code not in _EXCEPTION_ROLES:
+        raise ValueError("Only a Team Lead or Project Manager can give a verdict on a finding")
+    reason = (comment or "").strip()
+    if not reason:
+        raise ValueError("A verdict needs a short reason")
+    if len(reason.split()) > 50:
+        raise ValueError("Keep the reason to 50 words or fewer")
+    reference = dict(task["reference"] or {})
+    if not reference.get("findingId"):
+        raise ValueError("This task is not linked to a finding")
+    finding_id = UUID(str(reference["findingId"]))
+    row = connection.execute(
+        text(
+            """
+            SELECT journey_id, stage_code, finding_status, finding_class, finding_type_code, rule_key, owner_role_code
+            FROM auditcore.audit_findings WHERE tenant_id=:t AND audit_finding_id=:f FOR UPDATE
+            """
+        ),
+        {"t": tenant_id, "f": finding_id},
+    ).mappings().one_or_none()
+    if row is None:
+        raise ValueError("The finding behind this task no longer exists")
+    if row["finding_status"] in {"OPEN", "ACKNOWLEDGED"}:
+        finding_class = row["finding_class"] or classify_finding(row["rule_key"], row["finding_type_code"])
+        category = str((details or {}).get("rejectionCategory") or "OTHER").upper()
+        apply_finding_verdict(
+            connection, tenant_id=tenant_id, flag_id=finding_id, journey_id=UUID(str(row["journey_id"])),
+            daily_ops_run_id=None, process_area=str(row["stage_code"]), finding_class=finding_class,
+            resolution_mode=class_profile(finding_class).resolution_mode, current_status=str(row["finding_status"]),
+            current_owner_role=row["owner_role_code"],
+            payload=FlagLifecycleCommand(
+                action=action, remarks=reason, resolutionReason=reason,
+                rejectionCategory=category if action == "MARK_FALSE_POSITIVE" else None,
+            ),
+            operating_role=actor_role_code, actor_id=actor_id, correlation_id=None,
+        )
+    verdict = "CONFIRMED_BREACH" if action == "CONFIRM_BREACH" else "FALSE_POSITIVE"
+    close_tasks_for_finding(connection, tenant_id=tenant_id, finding_id=finding_id, verdict=verdict,
+                            actor_id=actor_id, actor_role=actor_role_code, comment=reason)
+    return {"taskId": str(task["task_id"]), "status": "VERIFIED_COMPLETE", "outcome": verdict,
+            "findingId": str(finding_id)}
 _MANUAL_VERIFICATION_TASKS = frozenset({
     "MANUAL_VERIFICATION_REVIEW", "FIELD_CORRECTION_REVIEW", "FIELD_CORRECTION_REVIEW_P2", "PC_CORRECTION",
     "DELIVERY_VIN_MANUAL_ENTRY_REVIEW", "MODEL_SELECTION_CORRECTION_REVIEW", "PC_CONFIRMATION",

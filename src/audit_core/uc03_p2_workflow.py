@@ -128,10 +128,18 @@ def mark_delivery_completed(connection: Connection, *, tenant_id: str, journey_i
 def mark_delivery_reviewed(connection: Connection, *, tenant_id: str, journey_id: UUID, actor_id: str | None,
                            actor_role: str | None, correlation_id: str | None = None) -> bool:
     """The TL reviewed the completed Delivery."""
+    # The outcome follows the verdicts: any confirmed breach makes it BREACH.
     updated = connection.execute(
         text(
             """
-            UPDATE auditcore.journeys SET review_completed_at_utc=COALESCE(review_completed_at_utc, now())
+            UPDATE auditcore.journeys
+            SET review_completed_at_utc=COALESCE(review_completed_at_utc, now()),
+                audit_state='REVIEW_COMPLETE',
+                audit_outcome=CASE WHEN EXISTS (
+                    SELECT 1 FROM auditcore.audit_findings f
+                    WHERE f.tenant_id=journeys.tenant_id AND f.journey_id=journeys.journey_id
+                      AND f.disposition='CONFIRMED_BREACH') THEN 'BREACH' ELSE 'NO_BREACH' END,
+                updated_at_utc=now()
             WHERE tenant_id=:t AND journey_id=:j AND review_completed_at_utc IS NULL
             RETURNING version_no
             """

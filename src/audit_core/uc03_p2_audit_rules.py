@@ -1019,6 +1019,21 @@ def _sync_finding(connection: Connection, *, tenant_id: str, journey_id: UUID, s
         return None
     title = str(result.details.get("findingTitle") or result.code.replace("_", " ").capitalize())[:300]
     severity = str(control.severity or "MEDIUM")
+    if existing is None:
+        verdict = connection.execute(
+            text(
+                """
+                SELECT disposition FROM auditcore.audit_findings
+                WHERE tenant_id=:t AND journey_id=:j AND rule_key=:k AND finding_status='RESOLVED'
+                ORDER BY resolved_at_utc DESC NULLS LAST, created_at_utc DESC LIMIT 1
+                """
+            ),
+            {"t": tenant_id, "j": journey_id, "k": result.code},
+        ).scalar_one_or_none()
+        if verdict in {"CONFIRMED_BREACH", "FALSE_POSITIVE"}:
+            # A Team Lead already gave the verdict on this check for this
+            # Journey; it is not raised again (Findings can reopen it).
+            return None
     if existing is not None:
         connection.execute(
             text("UPDATE auditcore.audit_findings SET title=:title, description=:description, severity=:severity "

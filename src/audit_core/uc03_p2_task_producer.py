@@ -276,6 +276,10 @@ def raise_or_refresh(
     if status == "VERIFIED_COMPLETE":
         if result.get("acceptedIssueHash") == reference["issueHash"]:
             return task_id, "ACCEPTED_EXCEPTION"
+        if result.get("verdict"):
+            # A Team Lead's verdict on this check's finding stands for the
+            # Journey; the finding is reopened from Findings if ever needed.
+            return task_id, "ACCEPTED_EXCEPTION"
         new_status, outcome = "READY", "REOPENED"
     elif status == "VERIFYING":
         submitted = result.get("submittedAt")
@@ -319,6 +323,46 @@ def raise_or_refresh(
         actor_id="SYSTEM", actor_role_code="SYSTEM", details={"reason": description},
     )
     return task_id, outcome if outcome != "UNCHANGED" else "UPDATED"
+
+
+def close_tasks_for_finding(connection: Connection, *, tenant_id: str, finding_id: UUID, verdict: str,
+                            actor_id: str | None, actor_role: str | None, comment: str | None) -> int:
+    """A Team Lead's verdict on a finding (confirmed breach, false positive,
+    resolved) closes every open task raised for it; the verdict is kept on
+    the task so the check does not raise it again."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT task_id, journey_id, reference FROM auditcore.p2_tasks
+            WHERE tenant_id=:t AND reference->>'findingId'=:f AND task_status = ANY(:open)
+            FOR UPDATE
+            """
+        ),
+        {"t": tenant_id, "f": str(finding_id), "open": list(_OPEN)},
+    ).mappings().all()
+    now = datetime.now(UTC).isoformat()
+    for row in rows:
+        reference = dict(row["reference"] or {})
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_tasks
+                SET task_status='VERIFIED_COMPLETE', verified_at_utc=now(),
+                    completion_result=COALESCE(completion_result, '{}'::jsonb) || CAST(:result AS jsonb),
+                    updated_at_utc=now()
+                WHERE tenant_id=:t AND task_id=:id
+                """
+            ),
+            {"t": tenant_id, "id": row["task_id"], "result": _json({
+                "outcome": verdict, "verdict": verdict, "acceptedIssueHash": reference.get("issueHash"),
+                "verdictBy": actor_id, "verdictRole": actor_role, "verdictAt": now, "comment": comment,
+            })},
+        )
+        record_task_event(connection, tenant_id=tenant_id, journey_id=UUID(str(row["journey_id"])),
+                          task_id=UUID(str(row["task_id"])), event_type="VERDICT", actor_id=actor_id or "SYSTEM",
+                          actor_role_code=actor_role or "SYSTEM", comment=comment,
+                          details={"verdict": verdict, "findingId": str(finding_id)})
+    return len(rows)
 
 
 def resolve_if_open(connection: Connection, *, tenant_id: str, journey_id: UUID, dedupe_key: str,

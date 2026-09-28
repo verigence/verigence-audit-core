@@ -17,6 +17,9 @@ actions:
 - REJECT
 - ACCEPT_EXCEPTION
 - PROVIDE_VEHICLE_ID
+# A Team Lead's verdict on the finding behind a task (Phase 1 finding actions).
+- CONFIRM_BREACH
+- MARK_FALSE_POSITIVE
 exception_roles:
 - TL
 - PM
@@ -203,6 +206,9 @@ task_types:
     - ADD_EVIDENCE
     - PROVIDE_FEEDBACK
     - ADD_COMMENT
+  # A violation for the Team Lead: confirm the breach or reject it as a
+  # false positive (the finding closes with the verdict), or fix the facts
+  # and let the check pass.
   FINDING_REVIEW:
     category: FINDING_REMEDIATION
     owner: TL
@@ -210,6 +216,8 @@ task_types:
     source: RULE
     completion: MACHINE_VERIFIED
     actions:
+    - CONFIRM_BREACH
+    - MARK_FALSE_POSITIVE
     - REVIEW_DOCUMENT
     - CORRECT_EXTRACTED_FIELD
     - ADD_EVIDENCE
