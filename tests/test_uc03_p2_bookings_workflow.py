@@ -86,6 +86,7 @@ def test_booking_completion_closes_the_existing_stage_and_lists_split(journey):
     assert client.get(f"{base}/journeys", params={"state": "closed"}).json()["items"] == []
     summary = client.get(f"{base}/journeys:summary").json()
     assert summary["week"]["bookingsCompleted"] == 1 and summary["open"]["bookings"] == 0
+    assert summary["closed"] == {"bookings": 1, "deliveries": 0} and summary["tasks"]["open"] >= 0
     timeline = client.get(f"{base}/journeys/{journey.journey_id}/360/timeline").json()
     assert timeline["stages"]["BOOKING"]["status"] == "BOOKING_CLOSED"
     assert timeline["stages"]["BOOKING"]["completedAtUtc"] is not None

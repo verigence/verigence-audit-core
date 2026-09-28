@@ -464,9 +464,10 @@ def journeys_summary(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
-    """What matters on the Bookings screen: what is open now, and what was
-    started and completed this week and this month (India time), with the
-    average time a booking and a delivery took to complete."""
+    """What matters on the Booking & Delivery screen: what is open now, what
+    has been closed all-time, how many tasks are open across the journeys in
+    scope, and what was started and completed this week and this month
+    (India time) with the average time a booking and a delivery took."""
     _authorize(
         connection, tenant_id=tenant_id, journey_id=None, human_principal=human_principal,
         authorization_client=authorization_client, permission_key=_READ_PERMISSION,
@@ -509,6 +510,12 @@ def journeys_summary(
             SELECT
               COUNT(*) FILTER (WHERE booking_completed IS NULL AND NOT cancelled) AS open_bookings,
               COUNT(*) FILTER (WHERE in_delivery AND delivery_completed IS NULL AND NOT cancelled) AS open_deliveries,
+              COUNT(*) FILTER (WHERE booking_completed IS NOT NULL) AS closed_bookings,
+              COUNT(*) FILTER (WHERE delivery_completed IS NOT NULL) AS closed_deliveries,
+              (SELECT COUNT(*) FROM auditcore.p2_tasks t
+                WHERE t.tenant_id=:tenant_id
+                  AND t.journey_id IN (SELECT s.journey_id FROM scoped s)
+                  AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')) AS open_tasks,
               COUNT(*) FILTER (WHERE booking_started >= b.week_start) AS week_started,
               COUNT(*) FILTER (WHERE booking_completed >= b.week_start) AS week_bookings_completed,
               COUNT(*) FILTER (WHERE delivery_completed >= b.week_start) AS week_deliveries_completed,
@@ -530,6 +537,10 @@ def journeys_summary(
 
     return {
         "open": {"bookings": int(row["open_bookings"] or 0), "deliveries": int(row["open_deliveries"] or 0)},
+        # All-time closed stages and the open tasks across every journey in
+        # scope: the five numbers the Booking & Delivery screen shows.
+        "closed": {"bookings": int(row["closed_bookings"] or 0), "deliveries": int(row["closed_deliveries"] or 0)},
+        "tasks": {"open": int(row["open_tasks"] or 0)},
         "week": {
             "bookingsStarted": int(row["week_started"] or 0),
             "bookingsCompleted": int(row["week_bookings_completed"] or 0),
