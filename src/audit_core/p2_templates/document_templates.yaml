@@ -311,7 +311,9 @@ document_types:
     di_types:
     - customer_kyc
     stage: BOOKING
-    requirement: OPTIONAL
+    # KYC on a Journey is the PAN Card or Aadhaar. A dealer's own KYC form is
+    # still read when one is uploaded, but is never asked for or listed.
+    requirement: SUPPORTING
     condition: null
     accepted_early: true
     pages:
