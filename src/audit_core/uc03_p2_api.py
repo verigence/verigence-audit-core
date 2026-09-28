@@ -43,13 +43,14 @@ from audit_core.uc03_p2_stage import (
     condition_reasons,
     read_booking_stage,
     ready_document_count,
+    requirement_items,
 )
 from audit_core.uc03_p2_storage import (
     P2DocumentStorageError,
     get_p2_document_storage,
 )
 from audit_core.uc03_p2_submission import upload_status
-from audit_core.uc03_p2_tasks import create_p2_task, submit_action
+from audit_core.uc03_p2_tasks import create_p2_task, submit_action, task_queue_tab
 from audit_core.uc03_requirement_satisfaction import (
     linked_documents_for_journey,
     requirements_for_journey,
@@ -1235,25 +1236,33 @@ def list_documents(
     conditions = set(reasons)
     checklist = []
     for stage_code in ("BOOKING", "DELIVERY"):
-        for template in registry.stage_documents(stage_code, conditions=conditions):
-            ready = ready_document_count(
-                connection, tenant_id=tenant_id, journey_id=journey_id, template=template,
-            )
-            checklist.append(
-                {
-                    "templateKey": template.key,
-                    "displayName": template.display_name,
-                    "stage": stage_code,
-                    "requirement": template.requirement,
-                    "reason": reasons.get(template.condition) if template.condition else None,
-                    "status": "RECEIVED" if ready else "MISSING",
-                    "readyCount": ready,
-                    "documentIds": [
-                        d["documentId"] for d in documents
-                        if d["templateKey"] == template.key and d.get("association_status") == "ACTIVE"
-                    ],
-                }
-            )
+        for item in requirement_items(connection, registry, tenant_id=tenant_id, journey_id=journey_id,
+                                      stage=stage_code, reasons=reasons):
+            for template_key in item["templates"]:
+                template = registry.documents[template_key]
+                ready = ready_document_count(
+                    connection, tenant_id=tenant_id, journey_id=journey_id, template=template,
+                )
+                status = "RECEIVED" if ready else ("COVERED" if item["received"] else "MISSING")
+                checklist.append(
+                    {
+                        "templateKey": template.key,
+                        "displayName": template.display_name,
+                        "stage": stage_code,
+                        # Conditional documents that evidence made mandatory are mandatory.
+                        "requirement": "REQUIRED" if item["required"] else template.requirement,
+                        "conditional": template.requirement == "CONDITIONAL",
+                        "group": template.group,
+                        "groupLabel": item["label"] if template.group else None,
+                        "reason": item["reason"],
+                        "status": status,
+                        "readyCount": ready,
+                        "documentIds": [
+                            d["documentId"] for d in documents
+                            if d["templateKey"] == template.key and d.get("association_status") == "ACTIVE"
+                        ],
+                    }
+                )
     return {
         "journeyId": str(journey_id),
         "batches": result,
@@ -2380,27 +2389,6 @@ def list_tasks(
     }
 
 
-_MANUAL_VERIFICATION_TASKS = frozenset({
-    "MANUAL_VERIFICATION_REVIEW", "FIELD_CORRECTION_REVIEW", "FIELD_CORRECTION_REVIEW_P2", "PC_CORRECTION",
-    "DELIVERY_VIN_MANUAL_ENTRY_REVIEW", "MODEL_SELECTION_CORRECTION_REVIEW",
-})
-_DOCUMENT_TASKS = frozenset({
-    "PC_DOCUMENT_REUPLOAD", "DOCUMENT_REMEDIATION", "WRONG_DOCUMENT_REVIEW", "WRONG_DOCUMENT_DEALER_NOTICE",
-    "PC_VERIFY_UNRECOGNIZED_DOCUMENT", "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE", "DUPLICATE_RECEIPT_NOTICE",
-    "DELIVERY_VEHICLE_PHOTOS_MISSING",
-})
-_DOCUMENT_CATEGORIES = frozenset({"DOCUMENT_REUPLOAD", "DOCUMENT_EXCEPTION", "EVIDENCE_GAP", "DOCUMENT_VERIFICATION"})
-
-
-def task_queue_tab(task_type: str, category: str) -> str:
-    """Which Task Queue tab a task belongs to: MANUAL_VERIFICATION (values to
-    confirm or corrections to approve), DOCUMENTS (something to upload,
-    re-upload or re-type) or OTHER (checks and findings; listed under All)."""
-    if task_type in _MANUAL_VERIFICATION_TASKS or category == "CORRECTION_APPROVAL":
-        return "MANUAL_VERIFICATION"
-    if task_type in _DOCUMENT_TASKS or category in _DOCUMENT_CATEGORIES:
-        return "DOCUMENTS"
-    return "OTHER"
 
 
 @router.get("/tasks/{task_id}")

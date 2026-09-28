@@ -7,10 +7,14 @@
 # pages.shape: SINGLE | PARTS | MULTI_PAGE   pages.group: ADJACENT | BATCH
 # extraction.review_threshold: fields below this confidence need PC review
 # extraction.strict_fields: money/identity fields reviewed below strict_review_threshold
+# condition: evidence key(s), 'a|b' = any; derived from the documents by
+# uc03_p2_stage.condition_reasons (conditional becomes mandatory on evidence).
+# group: templates sharing a group satisfy the requirement with any one of them.
 version: 1
 source:
   blueprint: Verigence Phase 2 Design Blueprint v2.2 (27 Sep 2026)
   di_schema_snapshot: di_schema_snapshot.json
+  requirements: 'Document1: Booking / Delivery mandatory and conditional documents (28 Sep 2026)'
 stages:
   BOOKING:
     order: 1
@@ -23,38 +27,44 @@ stages:
       kind: DOCUMENT_READY
       documents:
       - booking_docket
-      label: Booking Docket ready
-      missing: Upload the Booking Docket (commitment form and order taking form).
-    - key: PAN_EXTRACTED
+      label: Booking Docket received
+      missing: Upload the Booking Docket (sales contract).
+    - key: KYC_EXTRACTED
       kind: DOCUMENT_READY
+      match: ANY
       documents:
       - pan_card
-      label: PAN ready
-      missing: Upload the customer's PAN card.
-    - key: AADHAAR_EXTRACTED
-      kind: DOCUMENT_READY
-      documents:
       - aadhaar
-      label: Aadhaar ready
-      missing: Upload the customer's Aadhaar (front and back).
+      label: Customer KYC (PAN or Aadhaar) received
+      missing: Upload the customer's PAN or Aadhaar.
     - key: MINIMUM_BOOKING_PAYMENT
       kind: PAYMENT_MINIMUM
       label: Minimum booking amount received
-      missing: Upload dealer receipts totalling at least the minimum booking amount.
-    - key: NO_MANUAL_VERIFICATION_PENDING
-      kind: FIELDS_REVIEWED
-      task_types:
-      - MANUAL_VERIFICATION_REVIEW
-      label: All low-confidence fields verified
-      missing: Review and confirm the highlighted low-confidence fields.
+      missing: Upload payment receipts totalling at least the minimum booking amount.
   DELIVERY:
     order: 2
     states:
     - DELIVERY_DOCUMENT_UPLOAD
     - DELIVERY_VERIFY_DOCUMENTS
     - DELIVERY_COMPLETE
-    completion_approved: false
-    gates: []
+    completion_approved: true
+    gates:
+    - key: REQUIRED_DOCUMENTS
+      kind: REQUIRED_DOCUMENTS
+      label: Mandatory and applicable conditional delivery documents received
+      missing: Upload the delivery documents still missing.
+    - key: VEHICLE_PROOF
+      kind: VEHICLE_PROOF
+      label: Vehicle photos (or VIN / chassis) recorded
+      missing: Upload pictures of the car being delivered, or enter the VIN / chassis number from the task.
+    - key: PC_TASKS_CLOSED
+      kind: OPEN_TASKS
+      role: PC
+      tabs:
+      - DOCUMENTS
+      - MANUAL_VERIFICATION
+      label: Document, verification and duplicate tasks closed
+      missing: Close the open document and verification tasks.
 document_types:
   booking_docket:
     display_name: Booking Docket
@@ -107,8 +117,7 @@ document_types:
     - BK_DISCOUNT_EVIDENCE_MISSING
     - WRONG_DOCUMENT
     - DUPLICATE_BOOKING
-    control_notes: MODEL_NOT_IDENTIFIED; BK_DOCKET_PRESENT; BK_DISCOUNT_EVIDENCE_MISSING; WRONG_DOCUMENT;
-      DUPLICATE_BOOKING
+    control_notes: MODEL_NOT_IDENTIFIED; BK_DOCKET_PRESENT; BK_DISCOUNT_EVIDENCE_MISSING; WRONG_DOCUMENT; DUPLICATE_BOOKING
     task_effects:
     - Low-confidence review
     - wrong-document review
@@ -155,6 +164,7 @@ document_types:
     - field correction
     journey_360:
     - CUSTOMER
+    group: KYC
   aadhaar:
     display_name: Aadhaar
     di_types:
@@ -194,6 +204,7 @@ document_types:
     - field correction
     journey_360:
     - CUSTOMER
+    group: KYC
   dealer_receipt:
     display_name: Booking Payment Receipt
     di_types:
@@ -232,8 +243,7 @@ document_types:
     - PAYMENT_BANK_UNMATCHED
     - BK_MIN_BOOKING_AMOUNT_NOT_MET
     - BK_MIN_BOOKING_PROOF_PRESENT
-    control_notes: DUPLICATE_RECEIPT; WRONG_DOCUMENT; PAYMENT_BANK_UNMATCHED; BK_MIN_BOOKING_AMOUNT_NOT_MET;
-      BK_MIN_BOOKING_PROOF_PRESENT
+    control_notes: DUPLICATE_RECEIPT; WRONG_DOCUMENT; PAYMENT_BANK_UNMATCHED; BK_MIN_BOOKING_AMOUNT_NOT_MET; BK_MIN_BOOKING_PROOF_PRESENT
     task_effects:
     - Low-confidence review
     - duplicate-receipt notice
@@ -248,7 +258,7 @@ document_types:
     di_types:
     - customer_kyc
     stage: BOOKING
-    requirement: REQUIRED
+    requirement: OPTIONAL
     condition: null
     accepted_early: true
     pages:
@@ -284,7 +294,7 @@ document_types:
     - gst_certificate
     stage: DELIVERY
     requirement: CONDITIONAL
-    condition: CORPORATE_CUSTOMER
+    condition: corporateCustomer
     accepted_early: true
     pages:
       shape: MULTI_PAGE
@@ -318,7 +328,7 @@ document_types:
     - corporate_id
     stage: DELIVERY
     requirement: CONDITIONAL
-    condition: CORPORATE_CUSTOMER
+    condition: corporateDiscount
     accepted_early: true
     pages:
       shape: MULTI_PAGE
@@ -350,7 +360,7 @@ document_types:
     - vehicle_rc
     stage: DELIVERY
     requirement: CONDITIONAL
-    condition: EXCHANGE_TAKEN
+    condition: exchangeBenefit
     accepted_early: true
     pages:
       shape: PARTS
@@ -382,8 +392,8 @@ document_types:
     di_types:
     - transfer_letter
     stage: DELIVERY
-    requirement: OPTIONAL
-    condition: null
+    requirement: CONDITIONAL
+    condition: exchangeBenefit
     accepted_early: true
     pages: &id001
       shape: MULTI_PAGE
@@ -407,13 +417,14 @@ document_types:
     journey_360:
     - TRADE_IN
     - DOCUMENTS
+    group: EXCHANGE_TRANSFER
   authorization_letter:
     display_name: Authorization Letter
     di_types:
     - authorization_letter
     stage: DELIVERY
-    requirement: OPTIONAL
-    condition: null
+    requirement: CONDITIONAL
+    condition: exchangeBenefit
     accepted_early: true
     pages: *id001
     extraction:
@@ -434,12 +445,13 @@ document_types:
     journey_360:
     - TRADE_IN
     - DOCUMENTS
+    group: EXCHANGE_TRANSFER
   wholesale_invoice:
     display_name: Wholesale Invoice
     di_types:
     - wholesale_invoice
     stage: DELIVERY
-    requirement: REQUIRED
+    requirement: OPTIONAL
     condition: null
     accepted_early: true
     pages: *id001
@@ -608,8 +620,8 @@ document_types:
     di_types:
     - accessory_invoice_dms
     stage: DELIVERY
-    requirement: REQUIRED
-    condition: null
+    requirement: CONDITIONAL
+    condition: accessoriesSold
     accepted_early: true
     pages: *id001
     extraction:
@@ -642,8 +654,8 @@ document_types:
     di_types:
     - accessory_invoice_tally
     stage: DELIVERY
-    requirement: REQUIRED
-    condition: null
+    requirement: CONDITIONAL
+    condition: accessoriesSold
     accepted_early: true
     pages: *id001
     extraction:
@@ -671,8 +683,8 @@ document_types:
     di_types:
     - rto_challan
     stage: DELIVERY
-    requirement: REQUIRED
-    condition: null
+    requirement: CONDITIONAL
+    condition: registrationByDealer
     accepted_early: true
     pages:
       shape: SINGLE
@@ -755,8 +767,8 @@ document_types:
     processors:
     - Commercial source materialization where mappings exist
     controls: []
-    control_notes: External comparisons that consume reconciliation/master values; no dedicated native
-      finding producer verified
+    control_notes: External comparisons that consume reconciliation/master values; no dedicated native finding producer
+      verified
     task_effects:
     - Verification/correction when applicable
     journey_360:
@@ -766,7 +778,7 @@ document_types:
     di_types:
     - gate_pass
     stage: DELIVERY
-    requirement: REQUIRED
+    requirement: OPTIONAL
     condition: null
     accepted_early: true
     pages:
@@ -798,8 +810,8 @@ document_types:
     di_types:
     - ew_invoice
     stage: DELIVERY
-    requirement: REQUIRED
-    condition: null
+    requirement: CONDITIONAL
+    condition: ewSold
     accepted_early: true
     pages: *id001
     extraction:
@@ -828,8 +840,8 @@ document_types:
     di_types:
     - rsa_invoice
     stage: DELIVERY
-    requirement: REQUIRED
-    condition: null
+    requirement: CONDITIONAL
+    condition: rsaSold
     accepted_early: true
     pages: *id001
     extraction:
@@ -1043,7 +1055,7 @@ document_types:
     - scrappage_certificate_of_deposit
     stage: DELIVERY
     requirement: CONDITIONAL
-    condition: SCRAPPAGE_CLAIMED
+    condition: scrappageClaimed
     accepted_early: true
     pages:
       shape: MULTI_PAGE
@@ -1097,15 +1109,15 @@ document_types:
     task_effects: []
     journey_360:
     - PAYMENTS
-    notes: Payment proof supporting a dealer receipt. Never added to the booking payment total (it is
-      usually the same money as the receipt).
+    notes: Payment proof supporting a dealer receipt. Never added to the booking payment total (it is usually the
+      same money as the receipt).
   delivery_order_cover:
     display_name: Delivery Order (Financier)
     di_types:
     - delivery_order_cover
     stage: DELIVERY
-    requirement: OPTIONAL
-    condition: null
+    requirement: CONDITIONAL
+    condition: financeCase
     accepted_early: true
     pages:
       shape: MULTI_PAGE
@@ -1131,6 +1143,135 @@ document_types:
     journey_360:
     - FINANCE
     - DELIVERY
+  bank_approval_letter:
+    display_name: Bank Approval Letter
+    di_types:
+    - bank_approval_letter
+    stage: DELIVERY
+    requirement: CONDITIONAL
+    condition: financeCase
+    accepted_early: true
+    pages:
+      shape: MULTI_PAGE
+      max_pages: 6
+      group: ADJACENT
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.0'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed field store
+      canonical:
+      - finance case evidence
+    processors:
+    - Requirement applicability
+    controls: []
+    control_notes: finance case evidence
+    task_effects:
+    - Low-confidence review
+    - upload/re-upload
+    - feedback if requested
+    journey_360:
+    - DOCUMENTS
+    - FINANCE
+  purchase_order:
+    display_name: Purchase Order
+    di_types:
+    - purchase_order
+    stage: DELIVERY
+    requirement: CONDITIONAL
+    condition: corporateCustomer
+    accepted_early: true
+    pages:
+      shape: MULTI_PAGE
+      max_pages: 6
+      group: ADJACENT
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.0'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed field store
+      canonical:
+      - corporate / institutional sale evidence
+    processors:
+    - Requirement applicability
+    controls: []
+    control_notes: corporate / institutional sale evidence
+    task_effects:
+    - Low-confidence review
+    - upload/re-upload
+    - feedback if requested
+    journey_360:
+    - DOCUMENTS
+    - CUSTOMER
+    - DEAL
+  debit_note:
+    display_name: Debit Note (insurance / registration)
+    di_types:
+    - debit_note
+    stage: DELIVERY
+    requirement: CONDITIONAL
+    condition: insuranceByDealer|registrationByDealer
+    accepted_early: true
+    pages:
+      shape: MULTI_PAGE
+      max_pages: 6
+      group: ADJACENT
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.0'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed field store
+      canonical:
+      - dealership insurance / registration evidence
+    processors:
+    - Requirement applicability
+    controls: []
+    control_notes: dealership insurance / registration evidence
+    task_effects:
+    - Low-confidence review
+    - upload/re-upload
+    - feedback if requested
+    journey_360:
+    - DOCUMENTS
+    - DEAL
+  valuation_report:
+    display_name: Trade-in Valuation Report
+    di_types:
+    - valuation_report
+    stage: DELIVERY
+    requirement: CONDITIONAL
+    condition: exchangeBenefit
+    accepted_early: true
+    pages:
+      shape: MULTI_PAGE
+      max_pages: 6
+      group: ADJACENT
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.0'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed field store
+      canonical:
+      - exchange / trade-in evidence
+    processors:
+    - Requirement applicability
+    controls: []
+    control_notes: exchange / trade-in evidence
+    task_effects:
+    - Low-confidence review
+    - upload/re-upload
+    - feedback if requested
+    journey_360:
+    - DOCUMENTS
+    - TRADE_IN
   supporting_document:
     display_name: Supporting Document
     di_types: []
@@ -1153,5 +1294,5 @@ document_types:
     task_effects: []
     journey_360:
     - DOCUMENTS
-    notes: Pages DI cannot classify (docket covers, employer letters, emails, PAN verification printouts,
-      fee receipts). Kept as evidence, never blocking; the PC can re-type one.
+    notes: Pages DI cannot classify (docket covers, employer letters, emails, PAN verification printouts, fee receipts).
+      Kept as evidence, never blocking; the PC can re-type one.

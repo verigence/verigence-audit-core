@@ -16,6 +16,7 @@ actions:
 - ACCEPT
 - REJECT
 - ACCEPT_EXCEPTION
+- PROVIDE_VEHICLE_ID
 exception_roles:
 - TL
 - PM
@@ -143,6 +144,7 @@ task_types:
     completion: MACHINE_VERIFIED
     actions:
     - ADD_EVIDENCE
+    - PROVIDE_VEHICLE_ID
     - ADD_COMMENT
   DELIVERY_VIN_MANUAL_ENTRY_REVIEW:
     category: CORRECTION_APPROVAL
@@ -245,4 +247,22 @@ task_types:
     actions:
     - ACCEPT
     - REJECT
+    - ADD_COMMENT
+  DOCUMENT_MISSING:
+    category: DOCUMENT_REUPLOAD
+    owner: PC
+    origin: SYSTEM
+    source: DOCUMENT
+    completion: MACHINE_VERIFIED
+    actions:
+    - UPLOAD_DOCUMENT
+    - ADD_COMMENT
+  DELIVERY_REVIEW:
+    category: TASK_CONFIRMATION
+    owner: TL
+    origin: SYSTEM
+    source: REVIEW
+    completion: MACHINE_VERIFIED
+    actions:
+    - COMPLETE_ACTION
     - ADD_COMMENT

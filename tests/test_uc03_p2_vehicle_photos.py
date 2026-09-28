@@ -114,6 +114,19 @@ def test_delivery_photo_task_raises_and_closes_itself(journey):
             ),
             {"t": created.tenant_id, "j": created.journey_id},
         )
+        # no task while other delivery documents are still missing
+        assert sync_vehicle_photo_task(connection, tenant_id=created.tenant_id,
+                                       journey_id=created.journey_id) is None
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.p2_stage_gate_state (tenant_id, journey_id, stage_code, gate_key,
+                    gate_status, details, evaluated_at_utc)
+                VALUES (:t, :j, 'DELIVERY', 'REQUIRED_DOCUMENTS', 'PASS', '{}'::jsonb, now())
+                """
+            ),
+            {"t": created.tenant_id, "j": created.journey_id},
+        )
         assert sync_vehicle_photo_task(connection, tenant_id=created.tenant_id,
                                        journey_id=created.journey_id) == "RAISED"
     client = TestClient(app, raise_server_exceptions=False)

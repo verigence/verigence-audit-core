@@ -458,6 +458,96 @@ def sync_field_review_tasks(
     return counts
 
 
+def _stage_rows(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[tuple[str, str], dict[str, Any]]:
+    rows = connection.execute(
+        text(
+            """
+            SELECT stage_code, gate_key, gate_status, details FROM auditcore.p2_stage_gate_state
+            WHERE tenant_id=:t AND journey_id=:j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()
+    return {(str(r["stage_code"]), str(r["gate_key"])): {**dict(r["details"] or {}), "passed": r["gate_status"] == "PASS"}
+            for r in rows}
+
+
+def _resolve_prefix_except(connection: Connection, *, tenant_id: str, journey_id: UUID, prefix: str,
+                           keep: set[str], evidence: dict[str, Any]) -> int:
+    open_keys = connection.execute(
+        text(
+            """
+            SELECT dedupe_key FROM auditcore.p2_tasks
+            WHERE tenant_id=:t AND journey_id=:j AND dedupe_key LIKE :prefix AND task_status = ANY(:open)
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "prefix": f"{prefix}%", "open": list(_OPEN)},
+    ).scalars().all()
+    closed = 0
+    for key in open_keys:
+        if key not in keep:
+            resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key, evidence=evidence)
+            closed += 1
+    return closed
+
+
+def sync_document_missing_tasks(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    registry: Registry | None = None,
+    evaluation_started_at: datetime | None = None,
+) -> dict[str, int]:
+    """One Document Missing task (PC) per conditional document that
+    evidence made mandatory and that is not in yet -- e.g. a corporate
+    discount on the booking form or invoice asks for the Corporate ID. The
+    task closes itself when the document is read, or when the evidence no
+    longer applies."""
+    from audit_core.uc03_p2_stage import condition_reasons, requirement_items
+
+    registry = registry or get_registry()
+    reasons = condition_reasons(connection, tenant_id=tenant_id, journey_id=journey_id)
+    wanted: set[str] = set()
+    counts: dict[str, int] = {}
+    for stage in ("BOOKING", "DELIVERY"):
+        for item in requirement_items(connection, registry, tenant_id=tenant_id, journey_id=journey_id,
+                                      stage=stage, reasons=reasons):
+            if item["requirement"] != "CONDITIONAL" or not item["required"] or item["received"]:
+                continue
+            key = f"document-missing:{journey_id}:{item['key']}"
+            wanted.add(key)
+            conditions = ", ".join(CONDITION_TEXT.get(c, c) for c in item["conditions"])
+            _, outcome = raise_or_refresh(
+                connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                task_type="DOCUMENT_MISSING", source_type="DOCUMENT", source_code="DOCUMENT_MISSING",
+                title=f"Upload the {item['label']}",
+                description=(f"{item['reason']} The {item['label']} is therefore mandatory for this "
+                             f"{'booking' if stage == 'BOOKING' else 'delivery'} ({conditions}). "
+                             "Upload it; this task closes itself once it is read."),
+                reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": "DOCUMENT_MISSING",
+                           "requirementKey": item["key"], "templateKeys": item["templates"],
+                           "conditions": item["conditions"], "stage": stage},
+                severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
+            )
+            counts[outcome] = counts.get(outcome, 0) + 1
+    closed = _resolve_prefix_except(
+        connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"document-missing:{journey_id}:",
+        keep=wanted, evidence={"documentReceivedOrNotRequired": True, "verifiedAt": datetime.now(UTC).isoformat()},
+    )
+    if closed:
+        counts["VERIFIED"] = counts.get("VERIFIED", 0) + closed
+    return counts
+
+
+CONDITION_TEXT = {
+    "financeCase": "finance case", "corporateDiscount": "corporate discount", "corporateCustomer": "corporate customer",
+    "exchangeBenefit": "exchange benefit", "insuranceByDealer": "insurance through the dealership",
+    "registrationByDealer": "registration through the dealership", "rsaSold": "RSA sold",
+    "ewSold": "extended warranty sold", "accessoriesSold": "accessories sold", "scrappageClaimed": "scrappage benefit",
+}
+
+
 def sync_vehicle_photo_task(
     connection: Connection,
     *,
@@ -466,40 +556,75 @@ def sync_vehicle_photo_task(
     registry: Registry | None = None,
     evaluation_started_at: datetime | None = None,
 ) -> str | None:
-    """DELIVERY_VEHICLE_PHOTOS_MISSING while Delivery is under way and no
-    vehicle photo is on file; the task closes itself on the first photo."""
+    """Once every other Delivery document is in but there is no proof of the
+    vehicle, the PC is asked to upload pictures of the car being delivered
+    (VIN, sides, interior) or enter the VIN / chassis / engine number. The
+    task closes itself on the first picture or entered identity."""
+    from audit_core.uc03_p2_stage import vehicle_proof
+
     registry = registry or get_registry()
-    row = connection.execute(
-        text(
-            """
-            SELECT
-              (SELECT current_stage FROM auditcore.p2_journey_runtime
-                WHERE tenant_id=:t AND journey_id=:j) AS stage,
-              (SELECT COUNT(*) FROM auditcore.delivery_vehicle_photos
-                WHERE tenant_id=:t AND journey_id=:j AND deleted_at_utc IS NULL) AS photos
-            """
-        ),
+    gates = _stage_rows(connection, tenant_id=tenant_id, journey_id=journey_id)
+    docs = gates.get(("DELIVERY", "REQUIRED_DOCUMENTS")) or {}
+    proof = vehicle_proof(connection, tenant_id=tenant_id, journey_id=journey_id)
+    stage = connection.execute(
+        text("SELECT current_stage FROM auditcore.p2_journey_runtime WHERE tenant_id=:t AND journey_id=:j"),
         {"t": tenant_id, "j": journey_id},
-    ).mappings().one()
+    ).scalar_one_or_none()
     dedupe_key = f"vehicle-photos:{journey_id}"
-    in_delivery = str(row["stage"] or "").startswith("DELIVERY")
-    if in_delivery and not row["photos"]:
+    if proof.get("passed"):
+        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=dedupe_key,
+                        evidence={"photos": proof.get("photos"), "manualIdentity": proof.get("manualIdentity"),
+                                  "verifiedAt": datetime.now(UTC).isoformat()})
+        return "VERIFIED"
+    if str(stage or "").startswith("DELIVERY") and docs.get("passed"):
         _, outcome = raise_or_refresh(
             connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=dedupe_key,
-            task_type="DELIVERY_VEHICLE_PHOTOS_MISSING", source_type="EVIDENCE",
-            source_code="VEHICLE_PHOTOS",
-            title="Add vehicle photos",
+            task_type="DELIVERY_VEHICLE_PHOTOS_MISSING", source_type="EVIDENCE", source_code="VEHICLE_PHOTOS",
+            title="Add pictures of the car, or enter the VIN / engine number",
             description=(
-                "Delivery has started but no photo of the vehicle is on file. Take or upload photos "
-                "of the delivered vehicle (front, rear, sides, odometer) from the booking's Photos tab."
+                "Every other delivery document is in, but there is no proof of the vehicle. Upload pictures of the "
+                "car being delivered (VIN plate, sides, interior) from the booking's Vehicle photos tab, or enter "
+                "the VIN / chassis / engine number here. The Team Lead sees the entry in the delivery review."
             ),
-            reference={"generatedBy": "SYSTEM", "sourceType": "EVIDENCE", "sourceCode": "VEHICLE_PHOTOS",
-                       "photoCount": 0},
-            severity="MEDIUM", registry=registry, evaluation_started_at=evaluation_started_at,
+            reference={"generatedBy": "SYSTEM", "sourceType": "EVIDENCE", "sourceCode": "VEHICLE_PHOTOS"},
+            severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
         )
         return outcome
-    if row["photos"]:
-        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=dedupe_key,
-                        evidence={"photoCount": int(row["photos"]), "verifiedAt": datetime.now(UTC).isoformat()})
-        return "VERIFIED"
     return None
+
+
+def sync_delivery_review_task(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    registry: Registry | None = None,
+    evaluation_started_at: datetime | None = None,
+) -> str | None:
+    """A completed Delivery is marked for TL review: one Review Delivery
+    task for the Team Lead, closed when the TL marks the review done."""
+    from audit_core.uc03_p2_workflow import delivery_reviewed
+
+    registry = registry or get_registry()
+    state = connection.execute(
+        text("SELECT delivery_completion_state FROM auditcore.p2_journey_runtime WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one_or_none()
+    dedupe_key = f"delivery-review:{journey_id}"
+    if state != "COMPLETE":
+        return None
+    if delivery_reviewed(connection, tenant_id=tenant_id, journey_id=journey_id):
+        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=dedupe_key,
+                        evidence={"reviewed": True, "verifiedAt": datetime.now(UTC).isoformat()})
+        return "VERIFIED"
+    _, outcome = raise_or_refresh(
+        connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=dedupe_key,
+        task_type="DELIVERY_REVIEW", source_type="REVIEW", source_code="DELIVERY_REVIEW",
+        title="Review the completed delivery",
+        description=("Every delivery document is in, the vehicle is proven and the PC's tasks are closed. All "
+                     "compliance checks have run. Review the Journey 360 and its compliance report, then mark the "
+                     "review done."),
+        reference={"generatedBy": "SYSTEM", "sourceType": "REVIEW", "sourceCode": "DELIVERY_REVIEW"},
+        severity="MEDIUM", registry=registry, evaluation_started_at=evaluation_started_at,
+    )
+    return outcome

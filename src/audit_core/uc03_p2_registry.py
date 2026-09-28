@@ -26,18 +26,21 @@ REQUIREMENT_LEVELS = frozenset({"REQUIRED", "OPTIONAL", "CONDITIONAL", "SUPPORTI
 PAGE_SHAPES = frozenset({"SINGLE", "PARTS", "MULTI_PAGE"})
 PAGE_GROUPS = frozenset({"ADJACENT", "BATCH"})
 STAGES = ("BOOKING", "DELIVERY")
-GATE_KINDS = frozenset({"DOCUMENT_READY", "PAYMENT_MINIMUM", "NO_OPEN_TASKS", "FIELDS_REVIEWED"})
+GATE_KINDS = frozenset({
+    "DOCUMENT_READY", "PAYMENT_MINIMUM", "NO_OPEN_TASKS", "FIELDS_REVIEWED",
+    "REQUIRED_DOCUMENTS", "VEHICLE_PROOF", "OPEN_TASKS",
+})
 CONTROL_EXECUTORS = frozenset({"NATIVE", "EXTERNAL_RULE_ENGINE"})
-CONTROL_MODES = frozenset({"RERUN", "EXTERNAL", "GATE", "PAGES", "SYNC", "EVENT"})
+CONTROL_MODES = frozenset({"RERUN", "EXTERNAL", "GATE", "PAGES", "SYNC", "EVENT", "REQUIREMENTS"})
 # Readiness gates computed by the stage engine outside the configured gate list.
-SYNTHETIC_GATES = frozenset({"DELIVERY:REQUIRED_DOCUMENTS"})
+SYNTHETIC_GATES: frozenset[str] = frozenset()
 SUPPORTING_TEMPLATE = "supporting_document"
 
 # Rule Engine operands that name documents the current Audit Core checklist
 # does not carry (blueprint v2.2 section 10: kept exactly as the Rule Engine
 # defines them). Controls depending on them stay WAITING_FOR_FACTS.
 EXTERNAL_ONLY_OPERAND_DOCUMENTS = frozenset(
-    {"purchase_order", "debit_note", "valuation_report", "discount_approval_form"}
+    {"discount_approval_form"}
 )
 
 
@@ -75,6 +78,14 @@ class DocumentTemplate:
     task_effects: tuple[str, ...]
     persistence: dict[str, Any]
     notes: str | None = None
+    # Templates sharing a group satisfy one requirement with any one of them
+    # (PAN or Aadhaar; transfer letter or authorization letter).
+    group: str | None = None
+
+    @property
+    def conditions(self) -> tuple[str, ...]:
+        """Evidence keys that make a CONDITIONAL document mandatory (any)."""
+        return tuple(c.strip() for c in (self.condition or "").split("|") if c.strip())
 
     @property
     def is_supporting(self) -> bool:
@@ -100,6 +111,9 @@ class Gate:
     missing: str
     documents: tuple[str, ...] = ()
     task_types: tuple[str, ...] = ()
+    match: str = "ALL"
+    role: str | None = None
+    tabs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -200,7 +214,7 @@ class Registry:
             t for t in self.documents.values()
             if t.stage == stage
             and not t.is_supporting
-            and (t.requirement != "CONDITIONAL" or (t.condition in active))
+            and (t.requirement != "CONDITIONAL" or bool(active.intersection(t.conditions)))
         ]
 
     def required_documents(self, stage: str, *, conditions: set[str] | None = None) -> list[DocumentTemplate]:
@@ -272,6 +286,7 @@ def build_registry(
             task_effects=_tuple(raw.get("task_effects")),
             persistence=dict(raw.get("persistence") or {}),
             notes=raw.get("notes"),
+            group=raw.get("group"),
         )
 
     stages: dict[str, StageTemplate] = {}
@@ -288,6 +303,9 @@ def build_registry(
                     missing=str(g["missing"]),
                     documents=_tuple(g.get("documents")),
                     task_types=_tuple(g.get("task_types")),
+                    match=str(g.get("match", "ALL")),
+                    role=g.get("role"),
+                    tabs=_tuple(g.get("tabs")),
                 )
                 for g in raw.get("gates") or []
             ),

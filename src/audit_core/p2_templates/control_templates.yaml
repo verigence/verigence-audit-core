@@ -94,8 +94,7 @@ controls:
       owner: PC
   BK_DISCOUNT_EVIDENCE_MISSING:
     executor: NATIVE
-    mode: EVENT
-    event: Booking submission
+    mode: REQUIREMENTS
     phases:
     - BOOKING
     category: Document Extraction & Completeness
@@ -292,8 +291,7 @@ controls:
     executor: NATIVE
     mode: GATE
     gates:
-    - BOOKING:PAN_EXTRACTED
-    - BOOKING:AADHAAR_EXTRACTED
+    - BOOKING:KYC_EXTRACTED
     phases:
     - BOOKING
     category: Customer & Dealer Identity
@@ -331,8 +329,7 @@ controls:
       owner: PC
   BK_CONDITIONAL_DOCS_ADDRESSED:
     executor: NATIVE
-    mode: EVENT
-    event: Booking submission
+    mode: REQUIREMENTS
     phases:
     - BOOKING
     category: Document Extraction & Completeness
@@ -353,8 +350,7 @@ controls:
     mode: GATE
     gates:
     - BOOKING:BOOKING_FORM_EXTRACTED
-    - BOOKING:PAN_EXTRACTED
-    - BOOKING:AADHAAR_EXTRACTED
+    - BOOKING:KYC_EXTRACTED
     phases:
     - BOOKING
     category: Document Extraction & Completeness

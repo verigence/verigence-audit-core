@@ -68,9 +68,12 @@ from audit_core.uc03_p2_stage import recompute_journey_stage
 from audit_core.uc03_p2_storage import get_p2_document_storage
 from audit_core.uc03_p2_task_producer import (
     apply_control_transitions,
+    sync_delivery_review_task,
+    sync_document_missing_tasks,
     sync_field_review_tasks,
     sync_vehicle_photo_task,
 )
+from audit_core.uc03_p2_workflow import mark_delivery_reviewed
 from audit_core.uc03_unified_document_capture import (
     _merged_candidate_requirements,
     _receipt_defaults_to_delivery,
@@ -1679,25 +1682,46 @@ def _refresh_batch_status(connection, tenant_id: str, batch_id: UUID) -> None:
     )
 
 
+def _sync_rule_tasks(connection, *, tenant_id: str, journey_id: UUID, started_at: datetime | None = None) -> None:
+    """Every task the document rules raise or close by themselves."""
+    sync_field_review_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at)
+    sync_document_missing_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at)
+    sync_vehicle_photo_task(connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at)
+    sync_delivery_review_task(connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at)
+
+
+def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
+                   started_at: datetime | None = None) -> dict[str, Any]:
+    """Recompute the stage from the documents, raise / close the rule tasks
+    that follow from it, and recompute once more (closing tasks can pass
+    the last Delivery gate). Returns the settled result with every
+    transition seen on the way."""
+    # The engine records STAGE_CHANGED only when the stage actually moves.
+    first = recompute_journey_stage(connection, tenant_id=tenant_id, journey_id=journey_id)
+    _sync_rule_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, started_at=started_at)
+    settled = recompute_journey_stage(connection, tenant_id=tenant_id, journey_id=journey_id, complete_delivery=True)
+    if "DELIVERY_COMPLETED" in settled.get("transitions", ()):
+        sync_delivery_review_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                  evaluation_started_at=started_at)
+    transitions = list(dict.fromkeys([*first.get("transitions", ()), *settled.get("transitions", ())]))
+    return {**settled, "transitions": transitions}
+
+
 def _stage_recompute(engine: Engine, work: WorkItem) -> None:
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
         _owned(connection, work, lock=False)
-        # The engine records STAGE_CHANGED only when the stage actually moves.
-        recompute_journey_stage(
-            connection,
-            tenant_id=work.tenant_id,
-            journey_id=work.journey_id,
-        )
-        # Field-review and vehicle-photo work follow the same facts as the gate.
-        sync_field_review_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
-        sync_vehicle_photo_task(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
-        # Gates are fresh: evaluate controls against the same facts.
+        result = settle_journey(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
+        # Delivery documents just became complete: every compliance rule runs
+        # now (forced), not at a button press.
+        force = "DELIVERY_DOCUMENTS_COMPLETE" in result.get("transitions", ())
         request_control_evaluation(
             connection,
             tenant_id=work.tenant_id,
             journey_id=work.journey_id,
             correlation_id=work.correlation_id,
+            delay_seconds=0 if force else 3,
+            force=force,
         )
 
 
@@ -1730,11 +1754,32 @@ def _task_verify(engine: Engine, work: WorkItem) -> None:
                 evaluation_started_at=datetime.now(UTC),
             )
             return
-        if source_type == "EVIDENCE" and task["source_code"] == "VEHICLE_PHOTOS":
-            sync_vehicle_photo_task(
-                connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
-                evaluation_started_at=datetime.now(UTC),
-            )
+        if source_type in {"EVIDENCE", "DOCUMENT", "REVIEW"}:
+            if source_type == "REVIEW":
+                reviewer = connection.execute(
+                    text(
+                        """
+                        SELECT actor_id, actor_role_code FROM auditcore.p2_task_events
+                        WHERE tenant_id=:t AND task_id=:task AND event_type='COMPLETE_ACTION'
+                        ORDER BY created_at_utc DESC LIMIT 1
+                        """
+                    ),
+                    {"t": work.tenant_id, "task": task_id},
+                ).mappings().one_or_none()
+                mark_delivery_reviewed(
+                    connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+                    actor_id=reviewer["actor_id"] if reviewer else None,
+                    actor_role=reviewer["actor_role_code"] if reviewer else None,
+                    correlation_id=work.correlation_id,
+                )
+            # Fresh facts first, then the producer closes or returns the task.
+            result = settle_journey(connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+                                    started_at=datetime.now(UTC))
+            if "DELIVERY_DOCUMENTS_COMPLETE" in result["transitions"]:
+                request_control_evaluation(
+                    connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+                    correlation_id=work.correlation_id, delay_seconds=0, force=True,
+                )
             return
         if source_type != "RULE" or not task["source_code"]:
             raise RuntimeError(

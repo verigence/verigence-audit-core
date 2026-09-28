@@ -336,6 +336,9 @@ def _native_details(connection: Connection, *, tenant_id: str, control: ControlT
     return {k: payload[k] for k in keep if k in payload}
 
 
+_DISCOUNT_CONDITIONS = frozenset({"corporateDiscount", "exchangeBenefit", "scrappageClaimed"})
+
+
 # ----------------------------------------------------------------- executors
 
 def _evaluate_native(engine: Engine, *, tenant_id: str, journey_id: UUID, stage: str,
@@ -523,6 +526,14 @@ def _evaluate_derived(engine: Engine, *, tenant_id: str, journey_id: UUID, regis
             ).all()
         )
         sync_codes = [c.code for c in registry.controls.values() if c.mode in {"SYNC", "EVENT"}]
+        from audit_core.uc03_p2_stage import condition_reasons, requirement_items
+
+        reasons = condition_reasons(connection, tenant_id=tenant_id, journey_id=journey_id)
+        requirement_rows = [
+            item for stage_code in ("BOOKING", "DELIVERY")
+            for item in requirement_items(connection, registry, tenant_id=tenant_id, journey_id=journey_id,
+                                          stage=stage_code, reasons=reasons)
+        ]
         executions = _latest_executions(connection, tenant_id=tenant_id, journey_id=journey_id, codes=sync_codes)
 
         for control in registry.controls.values():
@@ -552,6 +563,22 @@ def _evaluate_derived(engine: Engine, *, tenant_id: str, journey_id: UUID, regis
                 elif flagged:
                     status, reason = "FAIL", f"{flagged} page(s) need attention."
                     details = {"pageCount": flagged}
+                else:
+                    status, reason = "PASS", None
+            elif control.mode == "REQUIREMENTS":
+                # Conditional documents made mandatory by evidence. Missing
+                # ones already have a Document Missing task, so this check
+                # waits rather than failing (it never raises a second task).
+                missing = [
+                    item for item in requirement_rows
+                    if item["requirement"] == "CONDITIONAL" and item["required"] and not item["received"]
+                    and (control.code != "BK_DISCOUNT_EVIDENCE_MISSING"
+                         or set(item["conditions"]) & _DISCOUNT_CONDITIONS)
+                ]
+                if missing:
+                    status = "WAITING_FOR_FACTS"
+                    reason = "Waiting for: " + "; ".join(f"{m['label']} ({m['reason']})" for m in missing)
+                    details = {"missing": [m["label"] for m in missing]}
                 else:
                     status, reason = "PASS", None
             elif control.mode in {"SYNC", "EVENT"}:

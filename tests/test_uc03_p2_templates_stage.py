@@ -54,12 +54,16 @@ def test_every_blueprint_document_has_a_template():
 
 def test_booking_gates_match_the_approved_contract():
     gates = {g.key: g for g in get_registry().stages["BOOKING"].gates}
-    assert set(gates) == {
-        "BOOKING_FORM_EXTRACTED", "PAN_EXTRACTED", "AADHAAR_EXTRACTED",
-        "MINIMUM_BOOKING_PAYMENT", "NO_MANUAL_VERIFICATION_PENDING",
+    # Booking completes on the Booking Docket, PAN or Aadhaar, and receipts
+    # reaching the minimum booking amount (requirements document, 28 Sep 2026)
+    assert set(gates) == {"BOOKING_FORM_EXTRACTED", "KYC_EXTRACTED", "MINIMUM_BOOKING_PAYMENT"}
+    assert gates["KYC_EXTRACTED"].match == "ANY"
+    assert set(gates["KYC_EXTRACTED"].documents) == {"pan_card", "aadhaar"}
+    delivery = get_registry().stages["DELIVERY"]
+    assert delivery.completion_approved is True
+    assert {g.key: g.kind for g in delivery.gates} == {
+        "REQUIRED_DOCUMENTS": "REQUIRED_DOCUMENTS", "VEHICLE_PROOF": "VEHICLE_PROOF", "PC_TASKS_CLOSED": "OPEN_TASKS",
     }
-    assert gates["NO_MANUAL_VERIFICATION_PENDING"].task_types == ("MANUAL_VERIFICATION_REVIEW",)
-    assert get_registry().stages["DELIVERY"].completion_approved is False
 
 
 def test_receipts_resolve_by_stage_and_unknown_types_are_supporting():
@@ -137,17 +141,27 @@ def test_booking_completes_from_documents_and_payment(journey):
 
 def test_missing_document_explains_the_next_action(journey):
     add_ready_document(journey, "booking_docket", customer_name="A")  # legacy key still counts
-    add_ready_document(journey, "aadhaar", aadhaar_number="1234")
     add_receipt_payment(journey, amount="25000", receipt_number="R1", receipt_date="2026-09-01")
     result = _recompute(journey)
     assert result["stage"] == "BOOKING_DOCUMENT_UPLOAD"
     assert result["gates"]["BOOKING_FORM_EXTRACTED"]["passed"] is True
-    assert "PAN" in result["gates"]["PAN_EXTRACTED"]["action"]
+    assert "PAN or Aadhaar" in result["gates"]["KYC_EXTRACTED"]["action"]
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         stored = read_booking_stage(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     assert stored["stage"] == "BOOKING_DOCUMENT_UPLOAD"
-    assert stored["gates"]["PAN_EXTRACTED"]["passed"] is False
+    assert stored["gates"]["KYC_EXTRACTED"]["passed"] is False
+
+
+def test_either_pan_or_aadhaar_completes_the_kyc(journey):
+    add_ready_document(journey, "booking_form", customer_name="A")
+    add_ready_document(journey, "aadhaar", aadhaar_number="1234")  # no PAN
+    add_receipt_payment(journey, amount="21000", receipt_number="R1", receipt_date="2026-09-01")
+    result = _recompute(journey)
+    assert result["gates"]["KYC_EXTRACTED"]["passed"] is True
+    assert result["stage"] == "BOOKING_COMPLETE"
+    assert "BOOKING_COMPLETED" in result["transitions"]
+    assert "BOOKING_COMPLETED" not in _recompute(journey)["transitions"]  # once
 
 
 def test_duplicate_and_voided_receipts_do_not_count(journey):
@@ -168,29 +182,22 @@ def test_duplicate_and_voided_receipts_do_not_count(journey):
     assert gate["shortfall"] == "6000.00"
 
 
-def test_low_confidence_fields_block_until_reviewed_then_reopen(journey):
+def test_low_confidence_fields_raise_tasks_but_do_not_hold_the_booking(journey):
+    # Booking completion is document driven; a low-confidence value becomes a
+    # PC manual verification task, which holds the Delivery instead.
     add_ready_document(journey, "booking_form", customer_name="A")
     add_ready_document(journey, "pan_card", pan_number="P")
     aadhaar = add_ready_document(journey, "aadhaar", aadhaar_number="1")
     add_receipt_payment(journey, amount="21000", receipt_number="R1", receipt_date="2026-09-01")
-    assert _recompute(journey)["stage"] == "BOOKING_COMPLETE"
-
-    # a re-extraction brings a low-confidence Aadhaar name
     add_extracted_field(journey, di_document_id=aadhaar, field_key="aadhaar_name", value="X",
                         confidence=72.0, document_type="aadhaar")
     result = _recompute(journey)
-    assert result["stage"] == "BOOKING_VERIFY_DOCUMENTS"
-    assert result["bookingCompletionState"] == "BLOCKED"
-    assert result["gates"]["NO_MANUAL_VERIFICATION_PENDING"]["documents"] == ["Aadhaar"]
-
+    assert result["stage"] == "BOOKING_COMPLETE"
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
-        connection.execute(
-            text("UPDATE auditcore.journey_document_extracted_fields SET reviewed_at_utc=now(), "
-                 "reviewed_by_actor_id='pc' WHERE tenant_id=:t AND field_key='aadhaar_name'"),
-            {"t": journey.tenant_id},
-        )
-    assert _recompute(journey)["stage"] == "BOOKING_COMPLETE"
+        pending = unreviewed_fields(connection, get_registry(), tenant_id=journey.tenant_id,
+                                    journey_id=journey.journey_id)
+    assert [p["fieldKey"] for p in pending] == ["aadhaar_name"]
 
 
 def test_strict_money_fields_need_higher_confidence(journey):
@@ -207,5 +214,7 @@ def test_strict_money_fields_need_higher_confidence(journey):
 def test_delivery_readiness_lists_missing_required_documents(journey):
     result = _recompute(journey)
     missing = {item["key"] for item in result["delivery"]["missing"]}
-    assert {"customer_invoice_dms", "insurance_cover", "gate_pass"} <= missing
+    assert {"no_dues_certificate", "customer_invoice_dms", "tax_invoice_tally", "insurance_cover",
+            "customer_ledger", "cost_sheet", "payment_receipt", "vehicle_proof"} <= missing
+    assert "gate_pass" not in missing  # optional
     assert "gst_certificate" not in missing  # conditional, customer is not corporate

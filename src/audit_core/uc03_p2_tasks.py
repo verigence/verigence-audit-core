@@ -269,6 +269,21 @@ def _create_requester_review(
     )
 
 
+def _vehicle_identity(details: dict[str, Any] | None) -> dict[str, str | None]:
+    raw = details or {}
+    values: dict[str, str | None] = {}
+    for key in ("vin", "chassisNumber", "engineNumber"):
+        cleaned = "".join(ch for ch in str(raw.get(key) or "") if ch.isalnum()).upper()
+        if cleaned and not 5 <= len(cleaned) <= 25:
+            raise ValueError(f"{key} must be 5 to 25 letters or digits")
+        values[key] = cleaned or None
+    if values["vin"] and len(values["vin"]) != 17:
+        raise ValueError("A VIN has 17 characters")
+    if not any(values.values()):
+        raise ValueError("Enter the VIN, chassis number or engine number")
+    return values
+
+
 def submit_action(
     connection: Connection,
     *,
@@ -360,6 +375,25 @@ def submit_action(
             },
         )
         return {"taskId": str(task_id), "status": "VERIFIED_COMPLETE", "outcome": "EXCEPTION_ACCEPTED"}
+
+    if action == "PROVIDE_VEHICLE_ID":
+        # No pictures of the car: the PC enters the VIN / chassis / engine
+        # number instead; the task is then machine-verified like any other
+        # and the entry is part of the TL's delivery review.
+        entered = _vehicle_identity(details)
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.p2_vehicle_identifications (
+                    tenant_id, journey_id, vin, chassis_number, engine_number,
+                    entered_by_actor_id, entered_by_role, task_id
+                ) VALUES (:t, :j, :vin, :chassis, :engine, :actor, :role, :task)
+                """
+            ),
+            {"t": tenant_id, "j": journey_id, "vin": entered["vin"], "chassis": entered["chassisNumber"],
+             "engine": entered["engineNumber"], "actor": actor_id, "role": actor_role_code, "task": task_id},
+        )
+        note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id, reason="VEHICLE_IDENTITY_ENTERED")
 
     if task["task_type"] == _FIELD_CORRECTION_REVIEW_CODE:
         reference = dict(task["reference"] or {})
@@ -652,3 +686,26 @@ def submit_action(
         "status": "AWAITING_REQUESTER_REVIEW",
         "reviewTaskId": str(review_task_id),
     }
+
+
+_MANUAL_VERIFICATION_TASKS = frozenset({
+    "MANUAL_VERIFICATION_REVIEW", "FIELD_CORRECTION_REVIEW", "FIELD_CORRECTION_REVIEW_P2", "PC_CORRECTION",
+    "DELIVERY_VIN_MANUAL_ENTRY_REVIEW", "MODEL_SELECTION_CORRECTION_REVIEW",
+})
+_DOCUMENT_TASKS = frozenset({
+    "PC_DOCUMENT_REUPLOAD", "DOCUMENT_REMEDIATION", "WRONG_DOCUMENT_REVIEW", "WRONG_DOCUMENT_DEALER_NOTICE",
+    "PC_VERIFY_UNRECOGNIZED_DOCUMENT", "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE", "DUPLICATE_RECEIPT_NOTICE",
+    "DELIVERY_VEHICLE_PHOTOS_MISSING", "DOCUMENT_MISSING",
+})
+_DOCUMENT_CATEGORIES = frozenset({"DOCUMENT_REUPLOAD", "DOCUMENT_EXCEPTION", "EVIDENCE_GAP", "DOCUMENT_VERIFICATION"})
+
+
+def task_queue_tab(task_type: str, category: str) -> str:
+    """Which Task Queue tab a task belongs to: MANUAL_VERIFICATION (values to
+    confirm or corrections to approve), DOCUMENTS (something to upload,
+    re-upload or re-type) or OTHER (checks and findings; listed under All)."""
+    if task_type in _MANUAL_VERIFICATION_TASKS or category == "CORRECTION_APPROVAL":
+        return "MANUAL_VERIFICATION"
+    if task_type in _DOCUMENT_TASKS or category in _DOCUMENT_CATEGORIES:
+        return "DOCUMENTS"
+    return "OTHER"

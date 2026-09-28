@@ -1,5 +1,5 @@
 """P2 bookings screen and the existing journey workflow: internal Journey
-ID, open/closed split, summary, submission (timer rule) and milestones."""
+ID, open/closed split, summary, upload counts and milestones."""
 from __future__ import annotations
 
 from uuid import uuid4
@@ -25,7 +25,7 @@ from audit_core.uc03_p2_workflow import mark_booking_completed
 
 
 @pytest.fixture
-def journey(monkeypatch):
+def journey():
     engine = database_engine()
     created = create_p2_journey(engine, prefix="p2bk")
     with engine.begin() as connection:
@@ -37,10 +37,6 @@ def journey(monkeypatch):
                 VALUES (:t, :j, 'BOOKING', 'BOOKING_STARTED', 'NOT_STARTED', 'NOT_EVALUATED', now(), now(), 1)"""),
             {"t": created.tenant_id, "j": created.journey_id},
         )
-    # submission's background rules are exercised elsewhere
-    import audit_core.uc03_p2_submission as submission
-
-    monkeypatch.setattr(submission, "_after_submit", lambda *a, **k: None)
     app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=created.actor_id)
     app.dependency_overrides[get_security_authorization_client] = lambda: AllowAllAuthorization()
     try:
@@ -66,44 +62,15 @@ def test_new_journeys_get_an_internal_journey_id(journey):
     assert reference.startswith("VJ") and len(reference) == len("VJ2609-000001")
 
 
-def test_submission_waits_for_classification_or_four_minutes(journey):
+def test_documents_show_upload_counts_and_no_submit_step(journey):
     base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}"
     client = _client()
-    assert client.post(f"{base}:submit").status_code == 409  # nothing uploaded
-    batch_id, _ = add_batch_pages(journey, [("booking_form", "CLASSIFYING"), ("pan_card", "READY")])
+    add_batch_pages(journey, [("booking_form", "CLASSIFYING"), ("pan_card", "READY")])
     status = client.get(f"{base}/documents").json()
     assert status["counts"]["documents"] == 2 and status["counts"]["extracted"] == 1
-    assert status["submission"]["canSubmit"] is False and status["submission"]["secondsRemaining"] > 0
-    assert client.post(f"{base}:submit").status_code == 409
-
-    # 4 minutes later the PC may submit even though a page is still being identified
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        connection.execute(
-            text("UPDATE auditcore.p2_upload_batches SET created_at_utc=now() - interval '5 minutes' "
-                 "WHERE tenant_id=:t AND batch_id=:b"), {"t": journey.tenant_id, "b": batch_id},
-        )
-    assert client.get(f"{base}/documents").json()["submission"]["canSubmit"] is True
-    response = client.post(f"{base}:submit")
-    assert response.status_code == 200, response.text
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        stage = connection.execute(
-            text("SELECT business_status, capture_completed_at_utc, version_no FROM auditcore.journey_stage_states "
-                 "WHERE tenant_id=:t AND journey_id=:j AND stage_code='BOOKING'"),
-            {"t": journey.tenant_id, "j": journey.journey_id},
-        ).mappings().one()
-        event = connection.execute(
-            text("SELECT actor_id, actor_role_snapshot FROM auditcore.journey_workflow_events "
-                 "WHERE tenant_id=:t AND journey_id=:j AND event_type='P2_BOOKING_DOCUMENTS_SUBMITTED'"),
-            {"t": journey.tenant_id, "j": journey.journey_id},
-        ).mappings().one()
-    assert stage["business_status"] == "BOOKING_IN_PROGRESS" and stage["capture_completed_at_utc"] is not None
-    assert stage["version_no"] == 2
-    assert event["actor_id"] == journey.actor_id
-    # after submitting, the timer restarts only with new uploads
-    after = client.get(f"{base}/documents").json()["submission"]
-    assert after["canSubmit"] is False and after["submittedAtUtc"] is not None
+    assert status["counts"]["notClassified"] == 1
+    assert "submission" not in status
+    assert client.post(f"{base}:submit").status_code in (404, 405)  # completion is rule driven
 
 
 def test_booking_completion_closes_the_existing_stage_and_lists_split(journey):
@@ -137,7 +104,7 @@ def test_booking_completion_closes_the_existing_stage_and_lists_split(journey):
 def test_claimed_corporate_discount_requires_the_corporate_id(journey):
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
-        assert "CORPORATE_CUSTOMER" not in condition_reasons(
+        assert "corporateDiscount" not in condition_reasons(
             connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
         connection.execute(
             text("""INSERT INTO auditcore.commercial_line_source_values (tenant_id, journey_id, line_kind,
@@ -146,8 +113,9 @@ def test_claimed_corporate_discount_requires_the_corporate_id(journey):
             {"t": journey.tenant_id, "j": journey.journey_id, "d": uuid4()},
         )
         reasons = condition_reasons(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
-    assert "corporate discount" in reasons["CORPORATE_CUSTOMER"]
+    assert "corporate privilege of ₹5,000" in reasons["corporateDiscount"]
     checklist = _client().get(
         f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}/documents").json()["checklist"]
     corporate = [c for c in checklist if c["templateKey"] == "corporate_id"]
-    assert corporate and "corporate discount" in corporate[0]["reason"]
+    assert corporate and corporate[0]["requirement"] == "REQUIRED" and corporate[0]["status"] == "MISSING"
+    assert "corporate privilege" in corporate[0]["reason"]

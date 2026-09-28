@@ -85,7 +85,9 @@ _FINGERPRINT_SQL = text(
                         (SELECT MAX(updated_at_utc) FROM auditcore.finance_records f
                           WHERE f.tenant_id=:tenant_id AND f.journey_id=:journey_id),
                         (SELECT pricing_effective_on FROM auditcore.bookings b
-                          WHERE b.tenant_id=:tenant_id AND b.journey_id=:journey_id))
+                          WHERE b.tenant_id=:tenant_id AND b.journey_id=:journey_id),
+                        (SELECT COUNT(*) FROM auditcore.p2_vehicle_identifications vi
+                          WHERE vi.tenant_id=:tenant_id AND vi.journey_id=:journey_id))
          FROM auditcore.journey_products jp
         WHERE jp.tenant_id=:tenant_id AND jp.journey_id=:journey_id) AS deal
     """
