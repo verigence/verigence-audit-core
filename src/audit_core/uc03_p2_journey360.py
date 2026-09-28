@@ -197,7 +197,19 @@ def journey_etag(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
                         WHERE tenant_id=:t AND journey_id=:j), '') AS controls_at,
               COALESCE((SELECT MAX(COALESCE(deleted_at_utc, uploaded_at_utc))::text
                         FROM auditcore.delivery_vehicle_photos
-                        WHERE tenant_id=:t AND journey_id=:j), '') AS photos_at
+                        WHERE tenant_id=:t AND journey_id=:j), '') AS photos_at,
+              -- Deal facts can change outside the P2 pipeline (model pick,
+              -- loan disbursement, pricing date via existing endpoints).
+              COALESCE((SELECT MAX(updated_at_utc)::text FROM auditcore.journey_products
+                        WHERE tenant_id=:t AND journey_id=:j), '') AS product_at,
+              COALESCE((SELECT MAX(updated_at_utc)::text FROM auditcore.commercial_lines
+                        WHERE tenant_id=:t AND journey_id=:j), '') AS lines_at,
+              COALESCE((SELECT MAX(updated_at_utc)::text FROM auditcore.discount_applications
+                        WHERE tenant_id=:t AND journey_id=:j), '') AS discounts_at,
+              COALESCE((SELECT MAX(updated_at_utc)::text FROM auditcore.finance_records
+                        WHERE tenant_id=:t AND journey_id=:j), '') AS finance_at,
+              COALESCE((SELECT MAX(updated_at_utc)::text FROM auditcore.bookings
+                        WHERE tenant_id=:t AND journey_id=:j), '') AS booking_at
             """
         ),
         {"t": tenant_id, "j": journey_id},

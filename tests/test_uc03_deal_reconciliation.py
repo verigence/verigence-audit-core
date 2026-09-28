@@ -772,3 +772,34 @@ def test_skipped_when_sku_not_pinned(journey) -> None:
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
     assert result.get("skipped") is True
+
+
+def test_pricing_date_override_prices_the_deal_on_that_dates_master(journey) -> None:
+    """Booking date -10 days falls under version 1; a pricing date of
+    yesterday falls under version 2, which carries a different price."""
+    c = journey
+    seeded = _seed_pinned_sku(c, model="THAR", variant="LX", components={"EX_SHOWROOM": "1500000"})
+    pl_id = c.execute(
+        text("SELECT price_list_id FROM auditcore.price_list_versions WHERE tenant_id=:t AND price_list_version_id=:v"),
+        {"t": c.tenant_id, "v": seeded["plv_id"]},
+    ).scalar_one()
+    v2 = c.execute(
+        text("INSERT INTO auditcore.price_list_versions (tenant_id, price_list_id, version_no, lifecycle_status, "
+             "effective_from) VALUES (:t, :pl, 2, 'DRAFT', CURRENT_DATE - 3) RETURNING price_list_version_id"),
+        {"t": c.tenant_id, "pl": pl_id},
+    ).scalar_one()
+    c.execute(
+        text("INSERT INTO auditcore.price_list_items (tenant_id, price_list_version_id, product_sku_id, "
+             "component_key, standard_amount) VALUES (:t, :v, :s, 'EX_SHOWROOM', 1550000)"),
+        {"t": c.tenant_id, "v": v2, "s": seeded["sku_id"]},
+    )
+    c.execute(text("UPDATE auditcore.price_list_versions SET lifecycle_status='PUBLISHED' "
+                   "WHERE tenant_id=:t AND price_list_version_id=:v"), {"t": c.tenant_id, "v": v2})
+
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert _commercial(c, "ex_showroom_price") == Decimal(1500000)
+
+    c.execute(text("UPDATE auditcore.bookings SET pricing_effective_on=CURRENT_DATE - 1 "
+                   "WHERE tenant_id=:t AND journey_id=:j"), {"t": c.tenant_id, "j": c.journey_id})
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert _commercial(c, "ex_showroom_price") == Decimal(1550000)

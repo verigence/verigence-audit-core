@@ -1034,7 +1034,7 @@ def sync_model_resolution_from_invoice(
             connection.execute(
                 text(
                     """
-                    SELECT COALESCE(b.booking_date, CURRENT_DATE)
+                    SELECT COALESCE(b.pricing_effective_on, b.booking_date, CURRENT_DATE)
                     FROM auditcore.journeys j
                     LEFT JOIN auditcore.bookings b
                       ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
@@ -1134,7 +1134,7 @@ def _current_match(
         connection.execute(
             text(
                 """
-                SELECT COALESCE(b.booking_date, CURRENT_DATE)
+                SELECT COALESCE(b.pricing_effective_on, b.booking_date, CURRENT_DATE)
                 FROM auditcore.journeys j
                 LEFT JOIN auditcore.bookings b
                   ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
@@ -1355,7 +1355,9 @@ def get_model_resolution_candidates(
     }
 
 
-def get_model_catalog(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+def get_model_catalog(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, effective_on: date | None = None,
+) -> dict[str, Any]:
     """Every SKU in this Journey's currently effective price list, unconditionally.
 
     Unlike ``get_model_resolution_candidates`` (which requires an OPEN
@@ -1365,11 +1367,13 @@ def get_model_catalog(connection: Connection, *, tenant_id: str, journey_id: UUI
     (``uc03_model_selection_corrections.py``). No finding, no gate --
     just the masters as they stand today.
     """
-    effective_on = date.fromisoformat(
+    # ``effective_on`` browses the masters as of another date (Phase 2's
+    # pricing-date choice); by default the Journey's own pricing date.
+    effective_on = effective_on or date.fromisoformat(
         connection.execute(
             text(
                 """
-                SELECT COALESCE(b.booking_date, CURRENT_DATE)
+                SELECT COALESCE(b.pricing_effective_on, b.booking_date, CURRENT_DATE)
                 FROM auditcore.journeys j
                 LEFT JOIN auditcore.bookings b
                   ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
@@ -1472,7 +1476,7 @@ def confirm_model_resolution_sku(
         connection.execute(
             text(
                 """
-                SELECT COALESCE(b.booking_date, CURRENT_DATE)
+                SELECT COALESCE(b.pricing_effective_on, b.booking_date, CURRENT_DATE)
                 FROM auditcore.journeys j
                 LEFT JOIN auditcore.bookings b
                   ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id

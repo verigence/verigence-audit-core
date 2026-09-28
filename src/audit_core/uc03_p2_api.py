@@ -273,13 +273,32 @@ def list_p2_journeys(
         permission_key=_READ_PERMISSION,
     )
     search = (q or "").strip()
+    # Page first, then count: the page of journeys is chosen from indexed
+    # columns (newest activity first) and every count below is an indexed
+    # per-journey lookup for just that page -- never a tenant-wide
+    # aggregation, which is what timed the list out on real data.
     rows = connection.execute(
         text(
             """
-            WITH scoped AS (
-                SELECT j.tenant_id, j.journey_id, j.customer_id, j.dealer_id,
-                       j.outlet_id, j.created_at_utc, j.updated_at_utc
+            WITH page AS (
+                SELECT j.tenant_id, j.journey_id, j.journey_reference, j.customer_id, j.dealer_id,
+                       j.outlet_id, j.created_at_utc, j.updated_at_utc,
+                       COALESCE(c.legal_name, c.display_name) AS customer_name, c.mobile_last4,
+                       d.dealer_name, o.outlet_name,
+                       NULLIF(concat_ws(' · ',
+                         NULLIF(jp.model_name_snapshot,''),
+                         NULLIF(jp.variant_name_snapshot,''),
+                         NULLIF(jp.colour_name_snapshot,'')
+                       ), '') AS vehicle
                 FROM auditcore.journeys j
+                JOIN auditcore.customers c
+                  ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+                JOIN auditcore.dealers d
+                  ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
+                JOIN auditcore.dealer_outlets o
+                  ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id AND o.outlet_id=j.outlet_id
+                LEFT JOIN auditcore.journey_products jp
+                  ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
                 WHERE j.tenant_id=:tenant_id
                   AND EXISTS (
                     SELECT 1
@@ -297,99 +316,84 @@ def list_p2_journeys(
                         )
                       )
                   )
-            ),
-            task_rows AS (
-                SELECT tenant_id, journey_id, due_at_utc,
-                       task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED') AS is_open
-                FROM auditcore.p2_tasks
-                WHERE tenant_id=:tenant_id
-                UNION ALL
-                SELECT tenant_id, subject_ref AS journey_id, due_at_utc,
-                       status IN ('OPEN','IN_PROGRESS') AS is_open
-                FROM auditcore.work_items
-                WHERE tenant_id=:tenant_id
-                  AND item_kind='EXECUTION_TASK'
-                  AND subject_kind='JOURNEY'
-            ),
-            task_stats AS (
-                SELECT tenant_id, journey_id,
-                       COUNT(*) AS total_tasks,
-                       COUNT(*) FILTER (WHERE is_open) AS open_tasks,
-                       COUNT(*) FILTER (
-                         WHERE is_open AND due_at_utc < now()
-                       ) AS overdue_tasks
-                FROM task_rows
-                GROUP BY tenant_id, journey_id
-            ),
-            finding_stats AS (
-                SELECT tenant_id, journey_id,
-                       COUNT(*) FILTER (
-                         WHERE finding_status IN ('OPEN','ACKNOWLEDGED')
-                       ) AS open_findings
-                FROM auditcore.audit_findings
-                WHERE tenant_id=:tenant_id
-                GROUP BY tenant_id, journey_id
-            ),
-            document_stats AS (
-                SELECT tenant_id, journey_id,
-                       COUNT(*) FILTER (WHERE association_status='ACTIVE') AS documents
-                FROM auditcore.evidence
-                WHERE tenant_id=:tenant_id
-                GROUP BY tenant_id, journey_id
+                  AND (
+                    :search = ''
+                    OR c.display_name ILIKE '%' || :search || '%'
+                    OR COALESCE(c.legal_name,'') ILIKE '%' || :search || '%'
+                    OR d.dealer_name ILIKE '%' || :search || '%'
+                    OR o.outlet_name ILIKE '%' || :search || '%'
+                    OR COALESCE(jp.model_name_snapshot,'') ILIKE '%' || :search || '%'
+                    OR COALESCE(j.journey_reference,'') ILIKE '%' || :search || '%'
+                    OR j.journey_id::text ILIKE '%' || :search || '%'
+                  )
+                ORDER BY j.updated_at_utc DESC, j.journey_id DESC
+                LIMIT :limit
             )
-            SELECT s.journey_id,
-                   c.display_name AS customer_name,
-                   c.mobile_last4,
-                   d.dealer_name,
-                   o.outlet_name,
-                   NULLIF(concat_ws(' · ',
-                     NULLIF(jp.model_name_snapshot,''),
-                     NULLIF(jp.variant_name_snapshot,''),
-                     NULLIF(jp.colour_name_snapshot,'')
-                   ), '') AS vehicle,
-                   COALESCE(pr.current_stage, 'BOOKING_DOCUMENT_UPLOAD') AS current_stage,
+            SELECT p.journey_id, p.journey_reference, p.customer_name, p.mobile_last4,
+                   p.dealer_name, p.outlet_name, p.vehicle, p.created_at_utc, p.updated_at_utc,
+                   COALESCE(pr.current_stage,
+                     CASE
+                       WHEN ds.business_completed_at_utc IS NOT NULL OR dl.actual_delivered_at IS NOT NULL
+                         THEN 'DELIVERY_COMPLETE'
+                       WHEN ds.journey_id IS NOT NULL OR dl.journey_id IS NOT NULL
+                         THEN 'DELIVERY_DOCUMENT_UPLOAD'
+                       WHEN bs.business_completed_at_utc IS NOT NULL OR bs.booking_confirm_date IS NOT NULL
+                         THEN 'BOOKING_COMPLETE'
+                       ELSE 'BOOKING_DOCUMENT_UPLOAD'
+                     END) AS current_stage,
                    COALESCE(pr.booking_completion_state, 'IN_PROGRESS') AS booking_completion_state,
                    COALESCE(pr.delivery_completion_state, 'IN_PROGRESS') AS delivery_completion_state,
-                   COALESCE(pr.booking_receipt_total,0) AS booking_receipt_total,
+                   COALESCE(pr.booking_receipt_total, pay.booking_total, 0) AS booking_receipt_total,
                    pr.booking_minimum_amount,
                    COALESCE(pr.manual_verification_pending_count,0) AS manual_verification_pending_count,
-                   COALESCE(ds.documents,0) AS documents,
-                   COALESCE(ts.total_tasks,0) AS total_tasks,
-                   COALESCE(ts.open_tasks,0) AS open_tasks,
-                   COALESCE(ts.overdue_tasks,0) AS overdue_tasks,
-                   COALESCE(fs.open_findings,0) AS open_findings,
-                   s.updated_at_utc
-            FROM scoped s
-            JOIN auditcore.customers c
-              ON c.tenant_id=s.tenant_id AND c.customer_id=s.customer_id
-            JOIN auditcore.dealers d
-              ON d.tenant_id=s.tenant_id AND d.dealer_id=s.dealer_id
-            JOIN auditcore.dealer_outlets o
-              ON o.tenant_id=s.tenant_id AND o.dealer_id=s.dealer_id
-             AND o.outlet_id=s.outlet_id
-            LEFT JOIN auditcore.journey_products jp
-              ON jp.tenant_id=s.tenant_id AND jp.journey_id=s.journey_id
+                   COALESCE(bs.booking_confirm_date, bs.booking_confirmed_at_utc::date) AS booking_confirm_date,
+                   dl.actual_delivered_at AS delivered_at,
+                   dl.planned_delivery_at AS planned_delivery_at,
+                   (pr.journey_id IS NOT NULL) AS phase2,
+                   ev.documents,
+                   tk.total_tasks, tk.open_tasks, tk.overdue_tasks,
+                   fd.open_findings
+            FROM page p
             LEFT JOIN auditcore.p2_journey_runtime pr
-              ON pr.tenant_id=s.tenant_id AND pr.journey_id=s.journey_id
-            LEFT JOIN document_stats ds
-              ON ds.tenant_id=s.tenant_id AND ds.journey_id=s.journey_id
-            LEFT JOIN task_stats ts
-              ON ts.tenant_id=s.tenant_id AND ts.journey_id=s.journey_id
-            LEFT JOIN finding_stats fs
-              ON fs.tenant_id=s.tenant_id AND fs.journey_id=s.journey_id
-            WHERE (
-              :search = ''
-              OR c.display_name ILIKE '%' || :search || '%'
-              OR d.dealer_name ILIKE '%' || :search || '%'
-              OR o.outlet_name ILIKE '%' || :search || '%'
-              OR COALESCE(jp.model_name_snapshot,'') ILIKE '%' || :search || '%'
-              OR s.journey_id::text ILIKE '%' || :search || '%'
-            )
-            ORDER BY
-              COALESCE(ts.overdue_tasks,0) DESC,
-              COALESCE(ts.open_tasks,0) DESC,
-              s.updated_at_utc DESC
-            LIMIT :limit
+              ON pr.tenant_id=p.tenant_id AND pr.journey_id=p.journey_id
+            LEFT JOIN auditcore.journey_stage_states bs
+              ON bs.tenant_id=p.tenant_id AND bs.journey_id=p.journey_id AND bs.stage_code='BOOKING'
+            LEFT JOIN auditcore.journey_stage_states ds
+              ON ds.tenant_id=p.tenant_id AND ds.journey_id=p.journey_id AND ds.stage_code='DELIVERY'
+            LEFT JOIN auditcore.deliveries dl
+              ON dl.tenant_id=p.tenant_id AND dl.journey_id=p.journey_id
+            LEFT JOIN LATERAL (
+              SELECT COALESCE(SUM(amount) FILTER (WHERE amount > 0), 0) AS booking_total
+              FROM auditcore.payments
+              WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id
+                AND COALESCE(payment_stage, 'BOOKING')='BOOKING'
+            ) pay ON true
+            LEFT JOIN LATERAL (
+              SELECT COUNT(*) AS documents FROM auditcore.evidence
+              WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id AND association_status='ACTIVE'
+            ) ev ON true
+            LEFT JOIN LATERAL (
+              SELECT COUNT(*) AS total_tasks,
+                     COUNT(*) FILTER (WHERE is_open) AS open_tasks,
+                     COUNT(*) FILTER (WHERE is_open AND due_at_utc < now()) AS overdue_tasks
+              FROM (
+                SELECT due_at_utc, task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER') AS is_open
+                FROM auditcore.p2_tasks
+                WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id
+                UNION ALL
+                SELECT due_at_utc, task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT') AS is_open
+                FROM auditcore.workflow_tasks
+                WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id
+                  AND assigned_role_code IN ('PC','TL','PM','EXECUTIVE')
+                  AND pr.journey_id IS NULL
+              ) t
+            ) tk ON true
+            LEFT JOIN LATERAL (
+              SELECT COUNT(*) AS open_findings FROM auditcore.audit_findings
+              WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id
+                AND finding_status IN ('OPEN','ACKNOWLEDGED')
+            ) fd ON true
+            ORDER BY p.updated_at_utc DESC, p.journey_id DESC
             """
         ),
         {
@@ -404,6 +408,8 @@ def list_p2_journeys(
     for row in rows:
         item = dict(row)
         item["journey_id"] = str(item["journey_id"])
+        for key in ("documents", "total_tasks", "open_tasks", "overdue_tasks", "open_findings"):
+            item[key] = int(item.get(key) or 0)
         for key in ("booking_receipt_total", "booking_minimum_amount"):
             if item.get(key) is not None:
                 item[key] = str(item[key])
@@ -1934,13 +1940,19 @@ def list_tasks(
     connection: Annotated[Connection, Depends(get_connection)],
     status: str | None = None,
     journey_id: UUID | None = None,
-    includeLegacy: bool = False,
+    includeLegacy: bool | None = None,
     view: str = "open",
     role: str | None = None,
+    tab: str = "all",
 ) -> dict[str, Any]:
-    """P2 worklist. P2 now raises its own tasks for every failing control and
-    low-confidence field, so legacy workflow tasks are shown only on request
-    (``includeLegacy=true``) during the transition."""
+    """P2 worklist across P2 and existing (Phase 1) tasks, grouped by the
+    client per Journey.
+
+    Legacy workflow tasks are included by default for Journeys that Phase 2
+    has not processed (existing data), so a P2 Journey never shows the same
+    issue twice; ``includeLegacy=true`` shows every legacy task, ``false``
+    none. ``tab`` narrows to DOCUMENTS or MANUAL_VERIFICATION; counts for
+    every tab are always returned."""
     _authorize(
         connection,
         tenant_id=tenant_id,
@@ -1966,8 +1978,8 @@ def list_tasks(
                    t.completion_protocol, t.task_status, t.due_at_utc,
                    t.created_at_utc, t.updated_at_utc, t.verified_at_utc,
                    t.completion_result,
-                   c.display_name AS customer_name,
-                   o.outlet_name,
+                   COALESCE(c.legal_name, c.display_name) AS customer_name,
+                   o.outlet_name, jr.journey_reference,
                    NULLIF(concat_ws(' · ', NULLIF(jp.model_name_snapshot,''),
                                            NULLIF(jp.variant_name_snapshot,'')), '') AS vehicle,
                    (SELECT COUNT(*) FROM auditcore.p2_task_events ev
@@ -1985,7 +1997,7 @@ def list_tasks(
               AND (
                 (CAST(:status AS varchar) IS NOT NULL AND t.task_status=CAST(:status AS varchar))
                 OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='open'
-                    AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED'))
+                    AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER'))
                 OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='done'
                     AND t.task_status='VERIFIED_COMPLETE'
                     AND t.verified_at_utc > now() - interval '14 days')
@@ -2023,47 +2035,69 @@ def list_tasks(
         },
     ).mappings().all()
 
-    legacy_rows = [] if not includeLegacy else connection.execute(
+    legacy_mode = "all" if includeLegacy else ("none" if includeLegacy is False else "unprocessed")
+    view_mode = view if view in {"open", "done", "all"} else "open"
+    # Existing (Phase 1) human tasks, read from their own table. Background
+    # jobs in the same table (rule runs, reconciles) have no human owner and
+    # are never shown.
+    legacy_rows = [] if legacy_mode == "none" else connection.execute(
         text(
             """
             SELECT
-              wi.work_item_id AS task_id,
-              wi.subject_ref AS journey_id,
-              wtd.task_type,
-              wi.origin_kind,
-              wi.owner_role_code AS assigned_role_code,
-              wi.assigned_actor_id,
-              wi.priority AS priority_rank,
-              wi.due_at_utc,
-              wi.status AS task_status,
-              wi.title,
+              COALESCE(c.legal_name, c.display_name) AS customer_name,
+              o.outlet_name, j.journey_reference,
+              NULLIF(concat_ws(' · ', NULLIF(jp.model_name_snapshot,''),
+                                      NULLIF(jp.variant_name_snapshot,'')), '') AS vehicle,
+              wt.workflow_task_id AS task_id,
+              wt.journey_id,
+              wt.task_type,
+              'SYSTEM' AS origin_kind,
+              wt.assigned_role_code,
+              wt.assigned_actor_id,
+              wt.priority AS priority_rank,
+              wt.due_at_utc,
+              wt.task_status,
+              COALESCE(NULLIF(wt.task_payload->>'title',''), initcap(replace(lower(wt.task_type), '_', ' '))) AS title,
               COALESCE(
-                NULLIF(wtd.task_payload->>'comment',''),
-                NULLIF(wtd.task_payload->>'description',''),
-                NULLIF(wtd.last_error_summary,''),
-                wi.summary
+                NULLIF(wt.task_payload->>'comment',''),
+                NULLIF(wt.task_payload->>'description',''),
+                NULLIF(wt.task_payload->>'message',''),
+                NULLIF(wt.last_error_summary,'')
               ) AS description,
-              COALESCE(wtd.severity, 'MEDIUM') AS severity,
-              wtd.process_area,
-              wtd.effect_key,
-              wtd.related_finding_id,
-              wtd.task_payload AS reference,
-              wi.created_at_utc,
-              wi.updated_at_utc
-            FROM auditcore.work_items wi
-            JOIN auditcore.work_item_task_detail wtd
-              ON wtd.tenant_id=wi.tenant_id
-             AND wtd.work_item_id=wi.work_item_id
+              COALESCE(wt.severity, 'MEDIUM') AS severity,
+              wt.process_area,
+              wt.effect_key,
+              wt.related_finding_id,
+              wt.task_payload AS reference,
+              wt.created_at_utc,
+              wt.updated_at_utc
+            FROM auditcore.workflow_tasks wt
             JOIN auditcore.journeys j
-              ON j.tenant_id=wi.tenant_id
-             AND j.journey_id=wi.subject_ref
-            WHERE wi.tenant_id=:tenant_id
-              AND wi.item_kind='EXECUTION_TASK'
-              AND wi.subject_kind='JOURNEY'
-              AND (CAST(:journey_id AS uuid) IS NULL OR wi.subject_ref=CAST(:journey_id AS uuid))
+              ON j.tenant_id=wt.tenant_id AND j.journey_id=wt.journey_id
+            LEFT JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+            LEFT JOIN auditcore.dealer_outlets o
+              ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id AND o.outlet_id=j.outlet_id
+            LEFT JOIN auditcore.journey_products jp ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
+            WHERE wt.tenant_id=:tenant_id
+              AND wt.journey_id IS NOT NULL
+              AND wt.assigned_role_code IN ('PC','TL','PM','EXECUTIVE')
+              AND (CAST(:role AS varchar) IS NULL OR wt.assigned_role_code=CAST(:role AS varchar))
+              AND (CAST(:journey_id AS uuid) IS NULL OR wt.journey_id=CAST(:journey_id AS uuid))
               AND (
-                (CAST(:status AS varchar) IS NULL AND wi.status IN ('OPEN','IN_PROGRESS'))
-                OR (CAST(:status AS varchar) IS NOT NULL AND wi.status=CAST(:status AS varchar))
+                CAST(:legacy_mode AS varchar)='all'
+                OR NOT EXISTS (
+                  SELECT 1 FROM auditcore.p2_journey_runtime pr
+                  WHERE pr.tenant_id=wt.tenant_id AND pr.journey_id=wt.journey_id
+                )
+              )
+              AND (
+                (CAST(:status AS varchar) IS NOT NULL AND wt.task_status=CAST(:status AS varchar))
+                OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='open'
+                    AND wt.task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT'))
+                OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='done'
+                    AND wt.task_status='COMPLETED'
+                    AND wt.updated_at_utc > now() - interval '14 days')
+                OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='all')
               )
               AND EXISTS (
                 SELECT 1
@@ -2081,7 +2115,7 @@ def list_tasks(
                     )
                   )
               )
-            ORDER BY wi.due_at_utc NULLS LAST, wi.priority DESC, wi.created_at_utc
+            ORDER BY wt.due_at_utc NULLS LAST, wt.priority DESC, wt.created_at_utc
             LIMIT 500
             """
         ),
@@ -2090,6 +2124,9 @@ def list_tasks(
             "journey_id": journey_id,
             "status": status,
             "actor_id": human_principal.subject,
+            "legacy_mode": legacy_mode,
+            "view": view_mode,
+            "role": role,
         },
     ).mappings().all()
 
@@ -2149,6 +2186,11 @@ def list_tasks(
                 "updated_at_utc": raw["updated_at_utc"],
                 "source_system": "LEGACY",
                 "legacy_queue_url": "/reviews",
+                "customer_name": raw["customer_name"],
+                "outlet_name": raw["outlet_name"],
+                "vehicle": raw["vehicle"],
+                "journey_reference": raw["journey_reference"],
+                "comment_count": 0,
                 "process_area": raw["process_area"],
                 "related_finding_id": (
                     str(raw["related_finding_id"])
@@ -2192,13 +2234,45 @@ def list_tasks(
         )
 
     items.sort(key=_safe_sort)
+    counts = {"ALL": len(items), "DOCUMENTS": 0, "MANUAL_VERIFICATION": 0}
+    for item in items:
+        item["queue_tab"] = task_queue_tab(str(item.get("task_type") or ""), str(item.get("category") or ""))
+        if item["queue_tab"] in counts:
+            counts[item["queue_tab"]] += 1
+    wanted = tab.upper()
+    if wanted in {"DOCUMENTS", "MANUAL_VERIFICATION"}:
+        items = [item for item in items if item["queue_tab"] == wanted]
     return {
         "items": items[:500],
+        "counts": counts,
         "sources": {
             "p2": len(p2_rows),
             "legacy": len(legacy_rows),
         },
     }
+
+
+_MANUAL_VERIFICATION_TASKS = frozenset({
+    "MANUAL_VERIFICATION_REVIEW", "FIELD_CORRECTION_REVIEW", "FIELD_CORRECTION_REVIEW_P2", "PC_CORRECTION",
+    "DELIVERY_VIN_MANUAL_ENTRY_REVIEW", "MODEL_SELECTION_CORRECTION_REVIEW",
+})
+_DOCUMENT_TASKS = frozenset({
+    "PC_DOCUMENT_REUPLOAD", "DOCUMENT_REMEDIATION", "WRONG_DOCUMENT_REVIEW", "WRONG_DOCUMENT_DEALER_NOTICE",
+    "PC_VERIFY_UNRECOGNIZED_DOCUMENT", "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE", "DUPLICATE_RECEIPT_NOTICE",
+    "DELIVERY_VEHICLE_PHOTOS_MISSING",
+})
+_DOCUMENT_CATEGORIES = frozenset({"DOCUMENT_REUPLOAD", "DOCUMENT_EXCEPTION", "EVIDENCE_GAP", "DOCUMENT_VERIFICATION"})
+
+
+def task_queue_tab(task_type: str, category: str) -> str:
+    """Which Task Queue tab a task belongs to: MANUAL_VERIFICATION (values to
+    confirm or corrections to approve), DOCUMENTS (something to upload,
+    re-upload or re-type) or OTHER (checks and findings; listed under All)."""
+    if task_type in _MANUAL_VERIFICATION_TASKS or category == "CORRECTION_APPROVAL":
+        return "MANUAL_VERIFICATION"
+    if task_type in _DOCUMENT_TASKS or category in _DOCUMENT_CATEGORIES:
+        return "DOCUMENTS"
+    return "OTHER"
 
 
 @router.get("/tasks/{task_id}")

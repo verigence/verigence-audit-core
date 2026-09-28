@@ -84,7 +84,7 @@ def _context(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
             SELECT jp.product_sku_id,
                    s.model_id,
                    s.variant_id,
-                   COALESCE(b.booking_date, CURRENT_DATE)   AS effective_on,
+                   COALESCE(b.pricing_effective_on, b.booking_date, CURRENT_DATE)   AS effective_on,
                    cu.customer_type_code,
                    rr.registration_type_code
             FROM auditcore.journey_products jp

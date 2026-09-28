@@ -86,7 +86,7 @@ def _current_effective_rows(
         connection.execute(
             text(
                 """
-                SELECT COALESCE(b.booking_date, CURRENT_DATE)
+                SELECT COALESCE(b.pricing_effective_on, b.booking_date, CURRENT_DATE)
                 FROM auditcore.journeys j
                 LEFT JOIN auditcore.bookings b
                   ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
