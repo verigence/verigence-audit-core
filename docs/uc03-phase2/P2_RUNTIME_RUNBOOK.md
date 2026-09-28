@@ -43,19 +43,21 @@ Operational tuning:
 - `P2_MAX_UPLOAD_BYTES` default 50 MiB
 - `P2_MAX_PDF_PAGES` default 100
 
-Deal-audit time windows (days after delivery; the worker re-runs the Delivery
-checks the morning after each window closes):
+Deal-audit time windows (days), each checked again every night for deliveries in
+progress (`P2_NIGHTLY_REVIEW_UTC`, default `20:30` UTC = 02:00 IST; one
+`CONTROL_EVALUATE` work item per Journey per night, idempotent):
 
 - `P2_SETTLEMENT_GRACE_DAYS` default 7 — balance received after delivery within /
   beyond this many days (`PAYMENT_AFTER_DELIVERY_*`)
 - `P2_FINANCE_DISBURSEMENT_DAYS` default 12 — financier must pay the delivery
   order within this many days (`DO_PAYMENT_NOT_RECEIVED`)
 - `P2_TRADE_IN_RESALE_DAYS` default 90 — an exchange vehicle must be resold within
-  this many days (`TRADE_IN_NOT_RESOLD`); this window is scheduled only for a
-  deal with an exchange vehicle
-
-The windows are queued as soon as the delivery date is known (gate pass read or
-delivery recorded), not only when P2 marks the delivery complete.
+  this many days (`TRADE_IN_NOT_RESOLD`); only a deal with an exchange vehicle
+- `P2_DELIVERY_DOCUMENTS_DAYS` default 7 — once the first delivery document is in,
+  every mandatory delivery document within this many days
+  (`DELIVERY_DOCUMENTS_OVERDUE`, a High finding to the TL naming the documents);
+  this one also has its own event, queued when the first delivery document
+  arrives and fired exactly that many days later
 
 Statutory limits:
 

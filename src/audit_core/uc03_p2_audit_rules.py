@@ -18,17 +18,27 @@ and answer the questions a manual deal audit asks:
   Cash intimation          CASH_INTIMATION_UNCONFIRMED (PC question), CASH_NOT_INTIMATED
   NDC signature            NDC_SIGNATURE_UNCONFIRMED (PC question), NDC_NOT_SIGNED
   Accessories fitted       ACCESSORIES_FITTED_UNCONFIRMED (PC question), ACCESSORY_FITTED_UNBILLED
+  Documents overdue        DELIVERY_DOCUMENTS_OVERDUE  mandatory delivery documents within the window
 
 A "Manual Observations" control cannot be read from a document: its task
 asks a question and fails until a PC, TL or PM answers it (the answer and
 their remark are the task's completion result); the paired violation
-control fails when the answer is No and carries the remark. Time-based checks are re-run by the worker when each window
-closes (``schedule_post_delivery_checks``): the settlement window
-(P2_SETTLEMENT_GRACE_DAYS, 7) and the financier window
-(P2_FINANCE_DISBURSEMENT_DAYS, 12) for every delivery, the resale window
-(P2_TRADE_IN_RESALE_DAYS, 90) only when an exchange vehicle was taken. A
-deal still short, still without its loan, or whose exchange car is still
-unsold raises its finding without anyone pressing a button.
+control fails when the answer is No and carries the remark.
+
+Every night (``queue_nightly_review``, P2_NIGHTLY_REVIEW_UTC) the worker
+re-runs the Delivery checks for each Journey whose delivery has started and
+is not yet reviewed, so the time-based checks fire without a document
+event: the settlement window (P2_SETTLEMENT_GRACE_DAYS, 7), the financier
+window (P2_FINANCE_DISBURSEMENT_DAYS, 12), the resale window
+(P2_TRADE_IN_RESALE_DAYS, 90) and the mandatory-documents window
+(P2_DELIVERY_DOCUMENTS_DAYS, 7). The documents window also has its own
+event: ``schedule_delivery_documents_check`` queues the checks to run
+exactly on the 7th day after the first delivery document, so the Team Lead's
+High task is raised that day, not the next night.
+
+A failing violation check is an Audit Finding (rule_key = the control code)
+with the check's wording; it resolves itself when the check passes, and a
+Team Lead may close it from Findings.
 
 Every rule reads only; it records one Execution Log row per run and the
 control ledger turns the outcome into a task. Nothing here blocks a real
@@ -36,10 +46,11 @@ delivery from being recorded.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from functools import cached_property
 from typing import Any
@@ -63,6 +74,9 @@ _LINE_TOLERANCE = Decimal(100)
 _SETTLEMENT_DAYS = int(os.environ.get("P2_SETTLEMENT_GRACE_DAYS", "7"))       # balance due after delivery
 _FINANCE_DAYS = int(os.environ.get("P2_FINANCE_DISBURSEMENT_DAYS", "12"))    # financier pays the delivery order
 _TRADE_IN_RESALE_DAYS = int(os.environ.get("P2_TRADE_IN_RESALE_DAYS", "90"))  # exchange vehicle resold
+# Once the first delivery document is in, every mandatory delivery document
+# must follow within this many days.
+_DELIVERY_DOCUMENTS_DAYS = int(os.environ.get("P2_DELIVERY_DOCUMENTS_DAYS", "7"))
 # Statutory limits, set per deployment: a single cash receipt above the
 # limit (Income-tax Act s.269ST), TCS on a vehicle priced above the threshold.
 _CASH_RECEIPT_LIMIT = Decimal(os.environ.get("P2_CASH_RECEIPT_LIMIT", "200000"))
@@ -259,6 +273,37 @@ class _Facts:
                 "handover": None, "resale": None, "resaleValue": None,
             }
         return None
+
+    @cached_property
+    def delivery_started(self) -> datetime | None:
+        """When the first delivery document was linked, or None."""
+        from audit_core.uc03_p2_registry import get_registry
+
+        delivery_types = sorted({
+            di_type for t in get_registry().documents.values() if t.stage == "DELIVERY" for di_type in t.di_types
+        })
+        return self.connection.execute(
+            text(
+                """
+                SELECT MIN(linked_at_utc) FROM auditcore.evidence
+                WHERE tenant_id=:t AND journey_id=:j AND association_status='ACTIVE'
+                  AND (upper(COALESCE(process_area, ''))='DELIVERY' OR document_type_key = ANY(:types))
+                """
+            ),
+            {**self._params, "types": delivery_types},
+        ).scalar_one_or_none()
+
+    @cached_property
+    def missing_delivery_documents(self) -> list[dict[str, Any]]:
+        """Mandatory (and evidence-triggered conditional) delivery documents
+        not received yet, as the stage checklist lists them."""
+        from audit_core.uc03_p2_registry import get_registry
+        from audit_core.uc03_p2_stage import condition_reasons, requirement_items
+
+        reasons = condition_reasons(self.connection, tenant_id=self.tenant_id, journey_id=self.journey_id)
+        items = requirement_items(self.connection, get_registry(), tenant_id=self.tenant_id,
+                                  journey_id=self.journey_id, stage="DELIVERY", reasons=reasons)
+        return [i for i in items if i["required"] and not i["received"]]
 
     @cached_property
     def booking_date(self) -> date | None:
@@ -821,6 +866,26 @@ def ndc_not_signed(facts: _Facts) -> RuleOutcome:
     return RuleOutcome(code, "PASS", f"Signed by the customer in the auditor's presence (confirmed on {_when(answer['at'])}){_remark(answer)}.")
 
 
+def delivery_documents_overdue(facts: _Facts) -> RuleOutcome:
+    code = "DELIVERY_DOCUMENTS_OVERDUE"
+    started = facts.delivery_started
+    if started is None:
+        return RuleOutcome(code, "PASS", "No delivery document uploaded yet.")
+    missing = facts.missing_delivery_documents
+    if not missing:
+        return RuleOutcome(code, "PASS", "Every mandatory delivery document is in.")
+    names = ", ".join(m["label"] for m in missing)
+    deadline = started + timedelta(days=_DELIVERY_DOCUMENTS_DAYS)
+    if datetime.now(UTC) < deadline:
+        return RuleOutcome(code, "SKIPPED", f"Still missing: {names}. Due by {_when(deadline)} "
+                                            f"({_DELIVERY_DOCUMENTS_DAYS} days after the first delivery document).")
+    return RuleOutcome(code, "FAIL", (
+        f"Delivery documents started on {_when(started)}; still missing {(facts.today - started.date()).days} days "
+        f"later: {names}."
+    ), {"findingTitle": f"Mandatory delivery documents missing: {names}",
+        "documentTypes": [t for m in missing for t in m["templates"]], "missing": [m["label"] for m in missing]})
+
+
 def accessories_fitted_unconfirmed(facts: _Facts) -> RuleOutcome:
     code = "ACCESSORIES_FITTED_UNCONFIRMED"
     docs = facts.documents("gate_pass", "accessory_invoice_dms", "accessory_invoice_tally")
@@ -866,11 +931,97 @@ _DELIVERY_RULES = (
     do_payment_not_received, do_short_payment,
     trade_in_not_resold, trade_in_sold_at_loss, post_delivery_refund,
     ndc_signature_unconfirmed, ndc_not_signed, accessories_fitted_unconfirmed, accessory_fitted_unbilled,
+    delivery_documents_overdue,
 )
 RULE_CODES = {
     "BOOKING": tuple(r.__name__.upper() for r in _BOOKING_RULES),
     "DELIVERY": tuple(r.__name__.upper() for r in _DELIVERY_RULES),
 }
+
+
+# The Findings catalogue entry each check raises under.
+_FINDING_TYPES = {
+    "DEAL_UNDERCHARGED": "PRICING_ANOMALY", "TCS_SHORT": "PRICING_ANOMALY", "EXCESS_DISCOUNT": "DISCOUNT_ANOMALY",
+    "TRADE_IN_NOT_RESOLD": "COMMERCIAL_EXCEPTION", "TRADE_IN_SOLD_AT_LOSS": "COMMERCIAL_EXCEPTION",
+    "DELIVERY_DOCUMENTS_OVERDUE": "DELIVERY_DOCUMENT_MISSING",
+    "NDC_NOT_SIGNED": "PROCESS_NON_COMPLIANCE", "ACCESSORY_FITTED_UNBILLED": "PROCESS_NON_COMPLIANCE",
+}
+_DEFAULT_FINDING_TYPE = "PAYMENT_EXCEPTION"
+
+
+def _sync_finding(connection: Connection, *, tenant_id: str, journey_id: UUID, stage: str, result: RuleOutcome,
+                  correlation_id: str | None) -> UUID | None:
+    """A failing violation check is one open Audit Finding (rule_key = the
+    control code), refreshed while it fails and resolved once it passes; a
+    Team Lead may also close it from Findings. PC questions are tasks, not
+    findings."""
+    from audit_core.uc03_delivery_commands import _set_stage_flag_status
+    from audit_core.uc03_finding_classification import resolve_classification
+    from audit_core.uc03_manual_verification import _resolve_finding
+    from audit_core.uc03_p2_registry import get_registry
+
+    control = get_registry().controls.get(result.code)
+    existing = connection.execute(
+        text(
+            """
+            SELECT audit_finding_id FROM auditcore.audit_findings
+            WHERE tenant_id=:t AND journey_id=:j AND rule_key=:k AND finding_status IN ('OPEN','ACKNOWLEDGED')
+            ORDER BY created_at_utc DESC LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "k": result.code},
+    ).scalar_one_or_none()
+    failing = result.outcome == "FAIL" and control is not None and control.finding_class == "VIOLATION"
+    if not failing:
+        if existing is not None and result.outcome in {"PASS", "SKIPPED"}:
+            _resolve_finding(connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage,
+                             finding_id=UUID(str(existing)), actor_id=None, correlation_id=correlation_id or "",
+                             note=result.reason or "The check passes now.")
+        return None
+    title = str(result.details.get("findingTitle") or result.code.replace("_", " ").capitalize())[:300]
+    severity = str(control.severity or "MEDIUM")
+    if existing is not None:
+        connection.execute(
+            text("UPDATE auditcore.audit_findings SET title=:title, description=:description, severity=:severity "
+                 "WHERE tenant_id=:t AND audit_finding_id=:f"),
+            {"t": tenant_id, "f": existing, "title": title, "description": result.reason, "severity": severity},
+        )
+        return UUID(str(existing))
+    routing = resolve_classification(connection, tenant_id=tenant_id, journey_id=journey_id, rule_key=result.code,
+                                     finding_type_code=_FINDING_TYPES.get(result.code, _DEFAULT_FINDING_TYPE),
+                                     severity=severity)
+    finding_id = connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.audit_findings (
+                tenant_id, journey_id, finding_type_code, severity, finding_status, title, description,
+                created_by_actor_id, correlation_id, stage_code, origin_kind, origin_actor_id, origin_role_snapshot,
+                rule_key, blocking_completion, finding_class, owner_role_code, sla_due_at_utc
+            ) VALUES (
+                :t, :j, :finding_type, :severity, 'OPEN', :title, :description,
+                NULL, :correlation_id, :stage, 'MACHINE', NULL, 'SYSTEM',
+                :rule_key, FALSE, :finding_class, :owner_role_code, :sla_due_at_utc
+            ) RETURNING audit_finding_id
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "finding_type": _FINDING_TYPES.get(result.code, _DEFAULT_FINDING_TYPE),
+         "severity": severity, "title": title, "description": result.reason, "correlation_id": correlation_id,
+         "stage": stage, "rule_key": result.code, **routing},
+    ).scalar_one()
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.audit_finding_events (
+                tenant_id, audit_finding_id, journey_id, stage_code, event_type, actor_id, actor_role_snapshot,
+                safe_payload, correlation_id
+            ) VALUES (:t, :f, :j, :stage, 'RAISED', NULL, 'SYSTEM', CAST(:payload AS jsonb), :correlation_id)
+            """
+        ),
+        {"t": tenant_id, "f": finding_id, "j": journey_id, "stage": stage, "correlation_id": correlation_id,
+         "payload": json.dumps({"originKind": "MACHINE", "ruleKey": result.code, **result.details}, default=str)},
+    )
+    _set_stage_flag_status(connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage)
+    return UUID(str(finding_id))
 
 
 def run_p2_audit_rules(
@@ -888,51 +1039,84 @@ def run_p2_audit_rules(
         except Exception:
             logger.warning("p2_audit_rule_failed", rule=code, journey_id=str(journey_id), exc_info=True)
             result = RuleOutcome(code, "ERROR", "The check could not run; it will be retried.")
+        finding_id = _sync_finding(connection, tenant_id=tenant_id, journey_id=journey_id, stage=stage,
+                                   result=result, correlation_id=correlation_id)
         record_execution(
             connection, tenant_id=tenant_id, journey_id=journey_id, rule_code=code,
             triggering_event=triggering_event, outcome=result.outcome, reason=result.reason,
-            correlation_id=correlation_id,
+            audit_finding_id=finding_id, correlation_id=correlation_id,
         )
         outcomes.append(result)
     return outcomes
 
 
-def schedule_post_delivery_checks(
+def schedule_delivery_documents_check(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str | None = None,
-) -> list[str]:
-    """Queue the Delivery checks to run again the morning after each window
-    closes, as soon as the delivery date is known (the gate pass is read or
-    the delivery recorded): the settlement and financier windows for every
-    delivery, the resale window only when an exchange vehicle was taken.
-    Each window is queued once; the windows are the P2_*_DAYS settings."""
+) -> str | None:
+    """The 7th-day event: once the first delivery document is in, queue the
+    Delivery checks to run exactly P2_DELIVERY_DOCUMENTS_DAYS later, when
+    DELIVERY_DOCUMENTS_OVERDUE raises its High task to the Team Lead if a
+    mandatory document is still missing. Queued once per Journey."""
     facts = _Facts(connection, tenant_id, journey_id)
-    delivered = facts.delivery_date
-    if delivered is None:
-        return []
-    windows = {"settlement": _SETTLEMENT_DAYS, "finance": _FINANCE_DAYS}
-    if facts.trade_in is not None:
-        windows["tradeIn"] = _TRADE_IN_RESALE_DAYS
-    queued = set(connection.execute(
-        text("SELECT work_key FROM auditcore.p2_work_queue WHERE tenant_id=:t AND journey_id=:j "
-             "AND work_type='CONTROL_EVALUATE' AND work_key LIKE :prefix"),
-        {"t": tenant_id, "j": journey_id, "prefix": f"unit:{journey_id}:NATIVE:DELIVERY:%"},
-    ).scalars().all())
-    now = datetime.now(UTC)
-    keys = []
-    for name, days in windows.items():
-        key = f"unit:{journey_id}:NATIVE:DELIVERY:{name}"
-        if key in queued:
-            continue
-        # The morning after the window closes, so "more than N days" holds.
-        fire_at = datetime.combine(delivered + timedelta(days=days + 1), time(0, 30), tzinfo=UTC)
+    started = facts.delivery_started
+    if started is None:
+        return None
+    key = f"unit:{journey_id}:NATIVE:DELIVERY:documents-window"
+    exists = connection.execute(
+        text("SELECT 1 FROM auditcore.p2_work_queue WHERE tenant_id=:t AND work_type='CONTROL_EVALUATE' "
+             "AND work_key=:k"),
+        {"t": tenant_id, "k": key},
+    ).scalar_one_or_none()
+    if exists:
+        return None
+    fire_at = started + timedelta(days=_DELIVERY_DOCUMENTS_DAYS)
+    enqueue_work(
+        connection, tenant_id=tenant_id, journey_id=journey_id, work_type="CONTROL_EVALUATE", work_key=key,
+        payload={"unit": "NATIVE:DELIVERY", "force": True,
+                 "reason": f"{_DELIVERY_DOCUMENTS_DAYS} days after the first delivery document"},
+        correlation_id=correlation_id,
+        delay_seconds=max(0, int((fire_at - datetime.now(UTC)).total_seconds())),
+    )
+    return key
+
+
+def queue_nightly_review(connection: Connection, *, tenant_id: str, today: date | None = None) -> int:
+    """Every night, re-run the Delivery checks for each Journey whose
+    delivery has started and is not yet reviewed, so the time-based checks
+    (settlement, financier, resale, documents overdue) fire without a
+    document event. One work item per Journey per night; safe to call more
+    than once. Returns how many were queued."""
+    today = today or datetime.now(UTC).date()
+    rows = connection.execute(
+        text(
+            """
+            SELECT j.journey_id FROM auditcore.journeys j
+            WHERE j.tenant_id=:t AND j.review_completed_at_utc IS NULL
+              AND NOT EXISTS (SELECT 1 FROM auditcore.journey_stage_states s
+                               WHERE s.tenant_id=j.tenant_id AND s.journey_id=j.journey_id AND s.stage_code='BOOKING'
+                                 AND s.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING'))
+              AND (EXISTS (SELECT 1 FROM auditcore.evidence e
+                            WHERE e.tenant_id=j.tenant_id AND e.journey_id=j.journey_id
+                              AND e.association_status='ACTIVE' AND upper(COALESCE(e.process_area,''))='DELIVERY')
+                   OR EXISTS (SELECT 1 FROM auditcore.p2_journey_runtime r
+                               WHERE r.tenant_id=j.tenant_id AND r.journey_id=j.journey_id
+                                 AND r.current_stage LIKE 'DELIVERY_%'))
+              AND NOT EXISTS (SELECT 1 FROM auditcore.p2_work_queue w
+                               WHERE w.tenant_id=j.tenant_id AND w.journey_id=j.journey_id
+                                 AND w.work_type='CONTROL_EVALUATE' AND w.work_key=:key_prefix || j.journey_id::text)
+            """
+        ),
+        {"t": tenant_id, "key_prefix": f"nightly:{today.isoformat()}:"},
+    ).scalars().all()
+    for journey_id in rows:
         enqueue_work(
-            connection, tenant_id=tenant_id, journey_id=journey_id, work_type="CONTROL_EVALUATE", work_key=key,
-            payload={"unit": "NATIVE:DELIVERY", "force": True, "reason": f"{days} days after delivery ({name})"},
-            correlation_id=correlation_id, delay_seconds=max(0, int((fire_at - now).total_seconds())),
+            connection, tenant_id=tenant_id, journey_id=journey_id, work_type="CONTROL_EVALUATE",
+            work_key=f"nightly:{today.isoformat()}:{journey_id}",
+            payload={"unit": "NATIVE:DELIVERY", "force": True, "reason": f"nightly review {today.isoformat()}"},
+            correlation_id=None,
         )
-        keys.append(key)
-    return keys
+    return len(rows)
 
 
-__all__ = ["RULE_CODES", "RuleOutcome", "run_p2_audit_rules",
-           "schedule_post_delivery_checks"]
+__all__ = ["RULE_CODES", "RuleOutcome", "queue_nightly_review", "run_p2_audit_rules",
+           "schedule_delivery_documents_check"]
