@@ -209,23 +209,54 @@ def test_sync_booking_document_fetches_both_di_calls_before_any_database_write()
     # confirmed live: the blocking connection's last statement was this
     # exact evidence UPDATE, sitting idle-in-transaction. Both DI calls must
     # now happen before the first database write in this function.
+    #
+    # Since 2026-09-28 both DI calls live in _fetch_document_for_sync, a
+    # pure function with no database access at all, which the background
+    # task runs BEFORE the sync transaction even opens (_prefetch_document_
+    # for_sync) and which _sync_booking_document calls, for a direct caller
+    # without a prefetch, before its first write. Same guarantee, checked at
+    # both places it now depends on.
     source_file = inspect.getsourcefile(confidence_policy)
     assert source_file is not None
     with open(source_file) as f:
         module_source = f.read()
-    start = module_source.index("\ndef _sync_booking_document(")
-    end = module_source.index("\ndef ", start + 1)
-    function_source = module_source[start:end]
 
+    def function_source_of(name: str) -> str:
+        marker = f"\ndef {name}("
+        if marker not in module_source:
+            marker = f"\nasync def {name}("
+        start = module_source.index(marker)
+        end = min(
+            index for index in (module_source.find("\ndef ", start + 1), module_source.find("\nasync def ", start + 1))
+            if index != -1
+        )
+        return module_source[start:end]
+
+    fetch_source = function_source_of("_fetch_document_for_sync")
+    assert "get_audit_document(" in fetch_source
+    assert "get_audit_document_facts(" in fetch_source
+    # No database work while waiting on DI: the helper takes no connection
+    # and opens none.
+    assert "connection.execute(" not in fetch_source
+    assert "engine.begin(" not in fetch_source
+    assert "connection: Connection" not in fetch_source
+
+    function_source = function_source_of("_sync_booking_document")
     # Searches for the cache-write specifically (processing_status_cache is
     # unique to it), not a bare "UPDATE auditcore.evidence" substring --
     # since 2026-09-26 the function also has an earlier, different evidence
     # UPDATE (voiding on a confirmed DI 404), which returns immediately
-    # after the first DI call and never reaches the second at all, so it's
-    # not the write this regression test is protecting against.
+    # after the DI status call and never reaches the facts call at all, so
+    # it's not the write this regression test is protecting against.
     evidence_cache_write = function_source.index("processing_status_cache=:processing")
-    assert function_source.index("get_audit_document(") < evidence_cache_write
-    assert function_source.index("get_audit_document_facts(") < evidence_cache_write
+    assert function_source.index("_fetch_document_for_sync(") < evidence_cache_write
+    assert "get_audit_document" not in function_source  # DI is only ever reached via the fetch helper
+
+    # The background task must fetch before the transaction: the prefetch
+    # runs first, and the sync attempt receives its result.
+    task_source = function_source_of("_run_sync_booking_document_task")
+    assert task_source.index("_prefetch_document_for_sync") < task_source.index("_sync_booking_document_once")
+    assert "prefetched=fetched" in task_source
 
 
 def test_confirm_calls_attribute_resolution_directly_not_via_review_v2() -> None:
