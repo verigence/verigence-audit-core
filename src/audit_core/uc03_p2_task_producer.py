@@ -652,15 +652,42 @@ def sync_name_consistency_tasks(
         )
         counts[outcome] = counts.get(outcome, 0) + 1
 
-    # -- the customer, as the KYC names them
+    # -- the customer, as the KYC names them: the verified legal name on the
+    # customer record (the first KYC read) is the reference; before one is
+    # verified, the latest KYC document is. Every other document naming the
+    # customer, a second KYC document included, must be the same person.
     references = _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
                                   pairs=rules.customer_name_reference)
-    by_pair = {doc["pair"]: doc for doc in reversed(references)}  # latest document of each kind
-    kyc = next((by_pair[pair] for pair in rules.customer_name_reference if pair in by_pair), None)
+    verified = connection.execute(
+        text(
+            """
+            SELECT c.legal_name, e.di_document_id, e.document_type_key, e.process_area
+            FROM auditcore.journeys j
+            JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+            LEFT JOIN auditcore.evidence e
+              ON e.tenant_id=c.tenant_id AND e.evidence_id=c.legal_name_source_evidence_id
+            WHERE j.tenant_id=:t AND j.journey_id=:j AND c.legal_name_status='VERIFIED'
+              AND c.legal_name IS NOT NULL AND btrim(c.legal_name) <> ''
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().first()
+    if verified is not None:
+        kyc = {
+            "name": verified["legal_name"],
+            "documentId": str(verified["di_document_id"]) if verified["di_document_id"] else None,
+            "diType": str(verified["document_type_key"] or "pan_card"),
+            "stage": str(verified["process_area"] or "BOOKING").upper(),
+        }
+    else:
+        by_pair = {doc["pair"]: doc for doc in reversed(references)}  # latest document of each kind
+        kyc = next((by_pair[pair] for pair in rules.customer_name_reference if pair in by_pair), None)
     if kyc is not None:
         kyc_template = registry.template_for_di_type(kyc["diType"], stage=kyc["stage"])
-        for document in _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
-                                         pairs=rules.customer_name_checked):
+        checked = _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                   pairs=rules.customer_name_checked)
+        checked += [doc for doc in references if doc["documentId"] != kyc["documentId"]]
+        for document in checked:
             if same_person(document["name"], kyc["name"]):
                 continue
             template = registry.template_for_di_type(document["diType"], stage=document["stage"])

@@ -15,6 +15,7 @@ from p2_support import (
 from sqlalchemy import text
 
 from audit_core.db import set_tenant_context
+from audit_core.uc03_p2_customer import sync_customer_name
 from audit_core.uc03_p2_names import same_organisation, same_person
 from audit_core.uc03_p2_task_producer import sync_name_consistency_tasks
 
@@ -150,3 +151,21 @@ def test_dealer_documents_must_name_the_booking_forms_dealership(journey):
     assert "Booking Docket names Sarthak Motors Pvt Ltd" in task["description"]
     assert task["reference"]["documentId"] == str(other)
     assert task["reference"]["sourceCode"] == "WRONG_DEALER_NAME"
+
+
+def test_the_verified_kyc_name_stays_the_reference_when_another_persons_kyc_arrives(journey):
+    """Customer A's PAN named the customer; a PAN of customer B uploaded later
+    is the wrong document, and A's documents are not."""
+    pan_a = add_ready_document(journey, "pan_card", pan_number="ABCDE1234F", pan_name="BISWABHANU BISWAL")
+    add_ready_document(journey, "booking_form", customer_name="Biswabhanu Biswal", dealer_name="Sarthak Motors")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert sync_customer_name(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id) == "VERIFIED"
+    assert _sync(journey) == {}
+    pan_b = add_ready_document(journey, "pan_card", pan_number="FGHIJ5678K", pan_name="ANITA SAHOO")
+    assert _sync(journey) == {"RAISED": 1}
+    (task,) = _tasks(journey)
+    assert task["reference"]["documentId"] == str(pan_b)
+    assert task["reference"]["referenceDocumentId"] == str(pan_a)
+    assert task["title"] == "Replace the PAN Card: it is not in the customer's name"
+    assert "customer per the PAN Card is BISWABHANU BISWAL" in task["description"]
