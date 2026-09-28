@@ -143,7 +143,12 @@ jobs:
           PY
           )"
           echo "P2_WORKER_PREVIOUS_DEPLOYMENT_ID=$previous_id" >> "$GITHUB_ENV"
-          railway up . --path-as-root --service "$WORKER_SERVICE" --detach --yes             --message "P2 Worker DEV ${DEPLOY_SHA}" >/dev/null
+          # Deploy the worker with its own config: the repository-root
+          # railway.toml is the API's (uvicorn, /health check, migrations).
+          stage="$(mktemp -d)"
+          git archive --format=tar HEAD | tar -x -C "$stage"
+          cp railway.p2-worker.toml "$stage/railway.toml"
+          railway up "$stage" --path-as-root --service "$WORKER_SERVICE" --detach --yes             --message "P2 Worker DEV ${DEPLOY_SHA}" >/dev/null
 
       - name: Verify fresh P2 worker deployment
         shell: bash
@@ -170,11 +175,16 @@ jobs:
               SUCCESS)
                 echo "P2_WORKER_DEPLOYMENT=PASS"
                 echo "P2_WORKER_DEPLOYMENT_ID=$deployment_id"
-                railway logs --service "$WORKER_SERVICE" --latest --deployment --lines 80 || true
+                railway logs --service "$WORKER_SERVICE" --deployment --lines 80 "$deployment_id" || true
                 exit 0
                 ;;
               FAILED|CRASHED|REMOVED)
-                railway logs --service "$WORKER_SERVICE" --latest --deployment --lines 220 || true
+                echo "::group::P2 worker build log"
+                railway logs --service "$WORKER_SERVICE" --build --lines 220 "$deployment_id" || true
+                echo "::endgroup::"
+                echo "::group::P2 worker deploy log"
+                railway logs --service "$WORKER_SERVICE" --deployment --lines 220 "$deployment_id" || true
+                echo "::endgroup::"
                 echo "::error::P2 worker deployment $deployment_id failed: $status"
                 exit 1
                 ;;
