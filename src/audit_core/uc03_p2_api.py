@@ -37,6 +37,7 @@ from audit_core.uc03_p2_access import (
     resolve_p2_scope,
 )
 from audit_core.uc03_p2_controls import control_statistics
+from audit_core.uc03_p2_dates import parse_extracted_date
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_runtime import enqueue_work
 from audit_core.uc03_p2_stage import (
@@ -367,7 +368,7 @@ def list_p2_journeys(
             )
             SELECT p.journey_id, p.journey_reference, p.customer_name, p.mobile_last4,
                    p.dealer_name, p.outlet_name, p.vehicle, p.created_at_utc, p.updated_at_utc,
-                   p.pc_name, pv.price_variance,
+                   p.pc_name, pv.price_variance, gp.gate_pass_date,
                    COALESCE(pr.current_stage,
                      CASE
                        WHEN ds.business_completed_at_utc IS NOT NULL OR dl.actual_delivered_at IS NOT NULL
@@ -448,28 +449,51 @@ def list_p2_journeys(
                 AND finding_status IN ('OPEN','ACKNOWLEDGED')
             ) fd ON true
             LEFT JOIN LATERAL (
-              -- Actual net minus standard net across the deal, the same sum
-              -- the deal reconciliation raises a finding on; NULL until
-              -- every priced line has an actual (a half-reviewed deal would
-              -- always look like a shortfall).
-              SELECT CASE
-                WHEN EXISTS (SELECT 1 FROM auditcore.commercial_lines cl
-                             WHERE cl.tenant_id=p.tenant_id AND cl.journey_id=p.journey_id
-                               AND cl.standard_amount IS NOT NULL AND cl.actual_amount IS NULL)
-                  OR NOT EXISTS (SELECT 1 FROM auditcore.commercial_lines cl
-                                 WHERE cl.tenant_id=p.tenant_id AND cl.journey_id=p.journey_id
-                                   AND cl.actual_amount IS NOT NULL)
-                THEN NULL
-                ELSE (COALESCE((SELECT SUM(actual_amount) FROM auditcore.commercial_lines
-                                WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id), 0)
-                      - COALESCE((SELECT SUM(actual_discount_amount) FROM auditcore.discount_applications
-                                  WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id), 0))
-                   - (COALESCE((SELECT SUM(standard_amount) FROM auditcore.commercial_lines
-                                WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id), 0)
-                      - COALESCE((SELECT SUM(standard_eligible_amount) FROM auditcore.discount_applications
-                                  WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id), 0))
-              END AS price_variance
+              -- Journey 360's "current vs standard": for every priced line the
+              -- figure a document now carries (the invoice, else the booking
+              -- form, else the line's own actual) against the price list, less
+              -- the same difference on the discounts, over the lines both sides
+              -- know. Nothing priced or nothing different is 0, never blank.
+              SELECT COALESCE((
+                SELECT SUM(cur.current - cl.standard_amount)
+                FROM auditcore.commercial_lines cl
+                LEFT JOIN LATERAL (
+                  SELECT COALESCE(
+                    (SELECT s.amount FROM auditcore.commercial_line_source_values s
+                      WHERE s.tenant_id=cl.tenant_id AND s.journey_id=cl.journey_id
+                        AND s.line_kind='COMMERCIAL' AND s.component_key=cl.component_key
+                        AND s.source_document_type NOT IN ('booking_form','booking_docket','order_taking_form',
+                                                           'customer_ledger','cost_sheet')
+                      ORDER BY s.updated_at_utc DESC LIMIT 1),
+                    (SELECT s.amount FROM auditcore.commercial_line_source_values s
+                      WHERE s.tenant_id=cl.tenant_id AND s.journey_id=cl.journey_id
+                        AND s.line_kind='COMMERCIAL' AND s.component_key=cl.component_key
+                        AND s.source_document_type IN ('booking_form','booking_docket','order_taking_form')
+                      ORDER BY s.updated_at_utc DESC LIMIT 1),
+                    cl.actual_amount) AS current
+                ) cur ON true
+                WHERE cl.tenant_id=p.tenant_id AND cl.journey_id=p.journey_id
+                  AND cl.standard_amount IS NOT NULL AND cur.current IS NOT NULL
+              ), 0)
+              - COALESCE((
+                SELECT SUM(da.actual_discount_amount - da.standard_eligible_amount)
+                FROM auditcore.discount_applications da
+                WHERE da.tenant_id=p.tenant_id AND da.journey_id=p.journey_id
+                  AND da.actual_discount_amount IS NOT NULL AND da.standard_eligible_amount IS NOT NULL
+              ), 0) AS price_variance
             ) pv ON true
+            LEFT JOIN LATERAL (
+              -- The delivery date is the one printed on the gate pass.
+              SELECT f.effective_value AS gate_pass_date
+              FROM auditcore.evidence e
+              JOIN auditcore.journey_document_extracted_fields f
+                ON f.tenant_id=e.tenant_id AND f.journey_id=e.journey_id AND f.di_document_id=e.di_document_id
+              WHERE e.tenant_id=p.tenant_id AND e.journey_id=p.journey_id AND e.association_status='ACTIVE'
+                AND e.document_type_key='gate_pass' AND f.field_key='delivery_date'
+                AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
+                AND f.effective_value <> '""'::jsonb
+              ORDER BY e.linked_at_utc DESC LIMIT 1
+            ) gp ON true
             ORDER BY p.updated_at_utc DESC, p.journey_id DESC
             """
         ),
@@ -492,6 +516,10 @@ def list_p2_journeys(
         for key in ("booking_receipt_total", "booking_minimum_amount", "price_variance"):
             if item.get(key) is not None:
                 item[key] = str(item[key])
+        item["price_variance"] = item.get("price_variance") or "0"
+        gate_pass = parse_extracted_date(item.pop("gate_pass_date", None))
+        if gate_pass is not None:
+            item["delivered_at"] = gate_pass.isoformat()
         items.append(item)
     return {"items": items}
 

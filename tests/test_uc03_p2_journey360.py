@@ -161,6 +161,12 @@ def test_summary_etag_and_sections(journey):
     assert all(m["atUtc"] for m in audit["milestones"])
     assert {"opened", "closed", "open", "avgHoursToClose"} <= set(audit["tasks"]["summary"])
     assert audit["events"] == sorted(audit["events"], key=lambda e: e["atUtc"])
+    # How each stage completed: the gates with their outcome, the rules fired.
+    booking = audit["completion"]["booking"]
+    assert [g["key"] for g in booking["gates"]] == ["BOOKING_FORM_EXTRACTED", "KYC_EXTRACTED", "MINIMUM_BOOKING_PAYMENT"]
+    assert all(g["status"] in ("WAITING", "PASS", "FAIL") and g["label"] for g in booking["gates"])
+    assert set(booking["counts"]) == {"fired", "passed", "failed", "waiting"}
+    assert audit["completion"]["delivery"]["gates"]
     assert all({"atUtc", "kind", "type", "who"} <= set(e) for e in audit["events"])
 
     # Trade-in / Scrappage and the Vehicle panel as Phase 1 lays them out.
