@@ -22,6 +22,8 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_p2_registry import get_registry
+
 _OPEN_BOOKING = ("BOOKING_STARTED", "BOOKING_IN_PROGRESS")
 CANCELLED_BOOKING = ("BOOKING_CANCELLED", "DUPLICATE_BOOKING")
 
@@ -264,3 +266,126 @@ def timeline(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
         ],
         "workflowEvents": [dict(e) for e in events],
     }
+
+
+def cancel_stuck_journey(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, actor_id: str, actor_role: str | None,
+    reason: str | None = None, correlation_id: str | None = None,
+) -> str:
+    """A PC deletes a booking that a failed document upload left stuck.
+
+    The booking closes as cancelled (its documents and history stay in the
+    audit record), its open tasks and queued work are cancelled, and the
+    Team Lead gets a notice. Allowed only while the booking is not complete
+    and something really failed: a page or upload whose retries are spent.
+    Returns CANCELLED, COMPLETED (booking already complete), ALREADY_CLOSED
+    or NOT_STUCK.
+    """
+    from audit_core.uc03_p2_runtime import record_activity
+    from audit_core.uc03_p2_task_producer import raise_or_refresh
+
+    state = connection.execute(
+        text(
+            """
+            SELECT business_status, version_no FROM auditcore.journey_stage_states
+            WHERE tenant_id=:t AND journey_id=:j AND stage_code='BOOKING' FOR UPDATE
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().first()
+    status = str(state["business_status"]) if state else "BOOKING_STARTED"
+    if status == "BOOKING_CLOSED":
+        return "COMPLETED"
+    if status in CANCELLED_BOOKING:
+        return "ALREADY_CLOSED"
+    failed = connection.execute(
+        text(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM auditcore.p2_document_queue
+                WHERE tenant_id=:t AND journey_id=:j AND queue_status IN ('FAILED','DEAD_LETTER')) AS pages,
+              (SELECT COUNT(*) FROM auditcore.p2_upload_batches
+                WHERE tenant_id=:t AND journey_id=:j AND batch_status='FAILED') AS uploads
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one()
+    if not (failed["pages"] or failed["uploads"]):
+        return "NOT_STUCK"
+    remarks = " ".join((reason or "").split()) or None
+    version = int(state["version_no"]) + 1 if state else 1
+    if state:
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.journey_stage_states
+                SET business_status='BOOKING_CANCELLED', closure_disposition=NULL,
+                    close_reason_code='DOCUMENT_UPLOAD_FAILED', closure_remarks=:remarks,
+                    closed_by_actor_id=:actor, closed_at_utc=now(), business_completed_at_utc=now(),
+                    latest_activity_at_utc=now(), updated_at_utc=now(), version_no=:version
+                WHERE tenant_id=:t AND journey_id=:j AND stage_code='BOOKING'
+                """
+            ),
+            {"t": tenant_id, "j": journey_id, "remarks": remarks, "actor": actor_id, "version": version},
+        )
+    else:
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.journey_stage_states (
+                    tenant_id, journey_id, stage_code, business_status, audit_state, audit_status,
+                    first_started_at_utc, latest_activity_at_utc, version_no, close_reason_code, closure_remarks,
+                    closed_by_actor_id, closed_at_utc, business_completed_at_utc
+                ) VALUES (:t, :j, 'BOOKING', 'BOOKING_CANCELLED', 'NOT_STARTED', 'NOT_EVALUATED', now(), now(), 1,
+                          'DOCUMENT_UPLOAD_FAILED', :remarks, :actor, now(), now())
+                """
+            ),
+            {"t": tenant_id, "j": journey_id, "remarks": remarks, "actor": actor_id},
+        )
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_tasks SET task_status='CANCELLED', updated_at_utc=now()
+            WHERE tenant_id=:t AND journey_id=:j
+              AND task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    )
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_work_queue SET work_status='CANCELLED', next_attempt_at_utc=NULL, updated_at_utc=now()
+            WHERE tenant_id=:t AND journey_id=:j AND work_status IN ('PENDING','RETRY_WAIT')
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    )
+    append_workflow_event(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage="BOOKING", event_type="P2_BOOKING_CANCELLED",
+        source_kind="HUMAN", actor_id=actor_id, actor_role=actor_role,
+        payload={"closeReasonCode": "DOCUMENT_UPLOAD_FAILED", "failedPages": int(failed["pages"]),
+                 "failedUploads": int(failed["uploads"])},
+        aggregate_version=version, correlation_id=correlation_id,
+    )
+    record_activity(
+        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="JOURNEY_CANCELLED",
+        subject_type="JOURNEY", subject_id=str(journey_id),
+        details={"actorRole": actor_role or "PC", "reason": remarks, "closeReasonCode": "DOCUMENT_UPLOAD_FAILED",
+                 "failedPages": int(failed["pages"]), "failedUploads": int(failed["uploads"])},
+        correlation_id=correlation_id,
+    )
+    raise_or_refresh(
+        connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=f"journey-cancelled:{journey_id}",
+        task_type="JOURNEY_CANCELLED_NOTICE", source_type="DOCUMENT", source_code="DOCUMENT_UPLOAD_FAILED",
+        title="Booking deleted by the PC after a document upload failed",
+        description=(
+            f"The PC closed this booking because {int(failed['pages'])} page(s) and {int(failed['uploads'])} upload(s) "
+            f"could not be processed after the retries. Its documents and history stay in the audit record."
+            + (f" PC's note: {remarks}" if remarks else "")
+        ),
+        reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": "DOCUMENT_UPLOAD_FAILED",
+                   "failedPages": int(failed["pages"]), "failedUploads": int(failed["uploads"]), "reason": remarks},
+        severity="INFO", registry=get_registry(),
+    )
+    return "CANCELLED"

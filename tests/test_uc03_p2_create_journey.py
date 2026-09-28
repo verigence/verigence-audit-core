@@ -4,7 +4,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi.testclient import TestClient
-from p2_support import P2Journey, add_ready_document
+from p2_support import P2Journey, add_page, add_ready_document
 from sqlalchemy import text
 from test_uc03_create_booking import uc03_create_booking_setup  # noqa: F401  (fixture)
 
@@ -103,3 +103,41 @@ def test_new_booking_needs_no_customer_name_the_documents_name_the_customer(uc03
     add_ready_document(journey, "aadhaar", aadhaar_number="1234", aadhaar_name="ANITA SAHOO")
     assert _sync(journey) == "UNCHANGED"
     assert _customer(setup, customer_id)["legal_name"] == "BISWABHANU BISWAL"
+
+
+def test_a_pc_can_delete_a_booking_a_failed_upload_left_stuck(uc03_create_booking_setup):  # noqa: F811
+    setup = uc03_create_booking_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    url = f"/p2/v1/tenants/{setup['tenant_id']}/journeys"
+    created = client.post(url, headers={"Idempotency-Key": "p2-new-journey-003"},
+                          json={"outletId": str(setup["outlet_id"])}).json()
+    journey = _journey(setup, created["journeyId"], created["customerId"])
+    cancel = f"{url}/{created['journeyId']}:cancel"
+
+    # Nothing has failed: the booking cannot be deleted.
+    assert client.post(cancel, json={}).status_code == 409
+    add_page(journey, status="FAILED")
+    listed = next(i for i in client.get(url, params={"state": "open"}).json()["items"] if i["journey_id"] == created["journeyId"])
+    assert listed["failed_pages"] == 1 and listed["retrying_pages"] == 0
+
+    response = client.post(cancel, json={"reason": "Scanner output was corrupt"})
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "BOOKING_CANCELLED"
+    closed = next(i for i in client.get(url, params={"state": "closed"}).json()["items"] if i["journey_id"] == created["journeyId"])
+    assert closed["cancelled"] is True and closed["closed"] is True
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        notice = connection.execute(
+            text("SELECT task_type, assigned_role_code, task_status, description FROM auditcore.p2_tasks "
+                 "WHERE tenant_id=:t AND journey_id=:j AND task_type='JOURNEY_CANCELLED_NOTICE'"),
+            {"t": setup["tenant_id"], "j": created["journeyId"]},
+        ).mappings().one()
+        stage = connection.execute(
+            text("SELECT business_status, close_reason_code FROM auditcore.journey_stage_states "
+                 "WHERE tenant_id=:t AND journey_id=:j AND stage_code='BOOKING'"),
+            {"t": setup["tenant_id"], "j": created["journeyId"]},
+        ).mappings().one()
+    assert notice["assigned_role_code"] == "TL" and notice["task_status"] == "READY"
+    assert "Scanner output was corrupt" in notice["description"]
+    assert stage["business_status"] == "BOOKING_CANCELLED" and stage["close_reason_code"] == "DOCUMENT_UPLOAD_FAILED"
+    assert client.post(cancel, json={}).status_code == 409  # already closed

@@ -521,6 +521,66 @@ def _resolve_prefix_except(connection: Connection, *, tenant_id: str, journey_id
     return closed
 
 
+def sync_processing_failure_tasks(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    registry: Registry | None = None,
+    evaluation_started_at: datetime | None = None,
+) -> dict[str, int]:
+    """One High task (PC) per page, or whole upload, that could not be
+    processed: the retries are spent or the document service refused it.
+    The task carries the plain reason and closes itself when the page is
+    processed after a retry, or the upload is removed."""
+    registry = registry or get_registry()
+    wanted: set[str] = set()
+    counts: dict[str, int] = {}
+    failed = connection.execute(
+        text(
+            """
+            SELECT q.queue_id AS key, b.batch_id, b.original_filename, q.page_numbers, q.status_reason
+            FROM auditcore.p2_document_queue q
+            JOIN auditcore.p2_upload_batches b ON b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
+            WHERE q.tenant_id=:t AND q.journey_id=:j AND q.queue_status IN ('FAILED','DEAD_LETTER')
+            UNION ALL
+            SELECT b.batch_id AS key, b.batch_id, b.original_filename, NULL, NULL
+            FROM auditcore.p2_upload_batches b
+            WHERE b.tenant_id=:t AND b.journey_id=:j AND b.batch_status='FAILED' AND b.page_count=0
+            ORDER BY 2
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()
+    for row in failed:
+        key = f"processing-failed:{journey_id}:{row['key']}"
+        wanted.add(key)
+        pages = list(row["page_numbers"] or [])
+        where = (f"Page {pages[0]}" if len(pages) == 1 else f"Pages {'-'.join(str(p) for p in pages)}"
+                 if pages else "The upload")
+        reason = row["status_reason"] or "The file could not be split into pages."
+        _, outcome = raise_or_refresh(
+            connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+            task_type="PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE", source_type="DOCUMENT",
+            source_code="DOCUMENT_PROCESSING_FAILED",
+            title=f"{where} of {row['original_filename']} could not be processed",
+            description=f"{reason} Retry the page from the document list, remove the upload and add the file "
+                        f"again, or delete this booking if nothing on it can be used.",
+            reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": "DOCUMENT_PROCESSING_FAILED",
+                       "batchId": str(row["batch_id"]), "queueId": str(row["key"]), "filename": row["original_filename"],
+                       "pageNumbers": pages},
+            severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
+        )
+        counts[outcome] = counts.get(outcome, 0) + 1
+    closed = _resolve_prefix_except(
+        connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"processing-failed:{journey_id}:",
+        keep=wanted, evidence={"reason": "The page was processed or the upload removed."},
+    )
+    if closed:
+        counts["VERIFIED"] = counts.get("VERIFIED", 0) + closed
+    return counts
+
+
 def sync_document_missing_tasks(
     connection: Connection,
     *,

@@ -149,6 +149,16 @@ def test_failures_back_off_then_dead_letter_and_fail_the_page(journey, monkeypat
     row = queue_row(journey, "DOCUMENT_INGEST", str(queue_id))
     assert row["work_status"] == "RETRY_WAIT" and row["attempt_count"] == 1
     assert row["next_attempt_at_utc"] is not None
+    # The PC sees the page waiting for its retry, and why.
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        waiting = connection.execute(
+            text("SELECT queue_status, status_reason FROM auditcore.p2_document_queue WHERE queue_id=:q"),
+            {"q": queue_id},
+        ).mappings().one()
+    assert waiting["queue_status"] == "RETRY_WAIT"
+    assert "Retrying automatically in 1 minute" in waiting["status_reason"]
+    assert "check back later" in waiting["status_reason"]
 
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
@@ -166,6 +176,57 @@ def test_failures_back_off_then_dead_letter_and_fail_the_page(journey, monkeypat
             {"q": queue_id},
         ).mappings().one()
     assert page["queue_status"] == "FAILED" and "Retry" in page["status_reason"]
+    assert "Not processed after 2 attempts" in page["status_reason"]
+    # ...and a task for the PC that carries the same reason.
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        task = connection.execute(
+            text("SELECT task_type, assigned_role_code, severity, title, task_status FROM auditcore.p2_tasks "
+                 "WHERE tenant_id=:t AND dedupe_key=:k"),
+            {"t": journey.tenant_id, "k": f"processing-failed:{journey.journey_id}:{queue_id}"},
+        ).mappings().one()
+    assert task["task_type"] == "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE" and task["assigned_role_code"] == "PC"
+    assert task["severity"] == "HIGH" and task["task_status"] == "READY"
+    assert "could not be processed" in task["title"]
+
+
+def test_retries_are_staggered_over_an_hour():
+    delays = [worker._RETRY_DELAYS_SECONDS[min(n, len(worker._RETRY_DELAYS_SECONDS)) - 1] for n in (1, 2, 3, 4)]
+    assert delays == [60, 240, 1800, 3600]  # two quick, two spaced, then the PC is told
+    assert worker._MAX_ATTEMPTS == 5
+
+
+def test_a_request_the_document_service_refuses_fails_at_once(journey, monkeypatch):
+    """No retry for an error that cannot recover: the page fails on the first
+    attempt with the reason, and the PC's task is raised."""
+    from audit_core.di_capture_v2_client import DiCaptureV2Error
+
+    _, queue_id, _ = add_page(journey, status="DI_UPLOAD_PREPARING")
+    _enqueue(journey, work_type="DOCUMENT_INGEST", key=str(queue_id))
+    [item] = worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)
+    refused = DiCaptureV2Error(status_code=400, detail=(
+        '{"code":"INVALID_REQUEST","title":"Request syntax/parameters/body are invalid.","status":400,'
+        '"retryable":false,"detail":"Request validation failed for body.files.0.sizeBytes."}'))
+    assert worker._is_retryable(refused) is False
+    assert worker._is_retryable(DiCaptureV2Error(status_code=503, detail="down")) is True
+    assert worker._is_retryable(ValueError("Encrypted PDF is not supported")) is False
+    worker._fail(journey.engine, item, refused)
+    assert queue_row(journey, "DOCUMENT_INGEST", str(queue_id))["work_status"] == "DEAD_LETTER"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        page = connection.execute(
+            text("SELECT queue_status, status_reason FROM auditcore.p2_document_queue WHERE queue_id=:q"),
+            {"q": queue_id},
+        ).mappings().one()
+        tasks = connection.execute(
+            text("SELECT COUNT(*) FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
+                 "AND task_type='PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE' AND task_status='READY'"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        ).scalar_one()
+    assert page["queue_status"] == "FAILED"
+    assert page["status_reason"].startswith("The document service could not accept this page: Request validation failed")
+    assert "Not processed after" not in page["status_reason"]
+    assert tasks == 1
 
 
 def test_per_journey_concurrency_cap(journey, monkeypatch):
