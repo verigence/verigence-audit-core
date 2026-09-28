@@ -141,6 +141,17 @@ def test_summary_etag_and_sections(journey):
     for section in ("deal", "addons", "payments", "vehicle", "registration", "delivery", "compliance", "activity", "timeline"):
         response = client.get(f"{base}/{section}")
         assert response.status_code == 200, (section, response.text)
+
+    # The Customer tab: what was entered, what the KYC says, contact masked.
+    customer = client.get(f"{base}/customer").json()
+    by_key = {f["key"]: f for f in customer["fields"]}
+    assert [f["label"] for f in customer["fields"]][:3] == ["Entered name", "Legal / KYC name", "PAN"]
+    assert by_key["enteredName"]["value"] == "P2 Customer"
+    assert by_key["legalName"]["value"] == "P2 CUSTOMER" and by_key["legalName"]["source"] == "pan_card"
+    assert by_key["pan"]["value"] == "ABCDE1234F"
+    assert by_key["customerType"]["value"] == "INDIVIDUAL"
+    assert customer["identityStatus"] == "DOCUMENT_VERIFIED" and by_key["identityStatus"]["value"] == "DOCUMENT_VERIFIED"
+    assert customer["kycDocuments"] == ["pan_card"]
     assert client.get(f"{base}/nope").status_code == 404
 
     # The audit trail: milestones in order with the hours between them, the

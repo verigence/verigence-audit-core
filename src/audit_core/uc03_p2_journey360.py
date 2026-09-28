@@ -33,7 +33,7 @@ from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_stage import read_booking_stage
 
 SECTIONS = (
-    "deal", "addons", "documents", "payments", "vehicle", "registration",
+    "deal", "addons", "documents", "payments", "vehicle", "customer", "registration",
     "delivery", "compliance", "activity", "timeline", "audit",
 )
 
@@ -891,6 +891,103 @@ def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
     return {"product": _plain(product) if product else None, "units": units, "photoCount": int(photo_count)}
 
 
+_CUSTOMER_FIELDS = (
+    # (key, label, semantic key of the KYC-reviewed value, or None for a
+    # value that only the customer record holds)
+    ("enteredName", "Entered name", None),
+    ("legalName", "Legal / KYC name", "customer_name"),
+    ("pan", "PAN", "pan"),
+    ("aadhaar", "Aadhaar", "aadhaar_number"),
+    ("dateOfBirth", "Date of birth", "customer_date_of_birth"),
+    ("gender", "Gender", "customer_gender"),
+    ("mobile", "Mobile", "customer_phone"),
+    ("email", "Email", "customer_email"),
+    ("address", "Address", "customer_address"),
+    ("pincode", "Pincode", "pincode"),
+    ("state", "State", "kyc_state"),
+    ("district", "District", "kyc_district"),
+    ("relationship", "Relationship", "customer_relationship_type"),
+    ("relationshipName", "Relationship name", "customer_relationship_name"),
+    ("customerType", "Customer type", None),
+    ("identityStatus", "Identity status", None),
+)
+
+
+def _masked_phone(value: Any) -> str | None:
+    digits = "".join(c for c in str(value or "") if c.isdigit())
+    return f"******{digits[-4:]}" if len(digits) >= 4 else None
+
+
+def customer(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """The customer as the KYC documents establish them, in Phase 1's
+    Customer panel layout: what was entered at booking, what the PAN and
+    Aadhaar say (the source of truth once reviewed), and how to reach them.
+    Phone numbers are masked to their last four digits, as everywhere else."""
+    from audit_core.uc03_journey_reviewed_details import (
+        KYC_DOCUMENT_TYPES,
+        annotate_and_resolve_reviewed_fields,
+        load_reviewed_field_details,
+        mask_contact_fields,
+    )
+
+    record = connection.execute(
+        text(
+            """
+            SELECT c.display_name, c.legal_name, c.legal_name_status, c.mobile_number, c.mobile_last4,
+                   c.email_reference, c.customer_type_code, c.relationship_type, c.relationship_name
+            FROM auditcore.journeys j
+            JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+            WHERE j.tenant_id=:t AND j.journey_id=:j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().first()
+    rows = load_reviewed_field_details(connection, tenant_id=tenant_id, journey_id=journey_id)
+    fields, resolved = annotate_and_resolve_reviewed_fields(rows)
+    mask_contact_fields(fields, resolved, full_contact=False)
+
+    def resolved_value(semantic: str) -> tuple[Any, str | None]:
+        item = resolved.get(semantic) or {}
+        value = item.get("value")
+        return (None, None) if value in (None, "") else (value, item.get("documentTypeKey"))
+
+    values: dict[str, Any] = {}
+    sources: dict[str, str] = {}
+    for key, _, semantic in _CUSTOMER_FIELDS:
+        if semantic is None:
+            continue
+        value, source = resolved_value(semantic)
+        if value is not None:
+            values[key] = value
+            if source:
+                sources[key] = str(source)
+    kyc_named = str(sources.get("legalName") or "").casefold() in KYC_DOCUMENT_TYPES
+    if record is not None:
+        values["enteredName"] = record["display_name"]
+        if not kyc_named and record["legal_name"]:
+            values["legalName"] = record["legal_name"]
+        values.setdefault("mobile", _masked_phone(record["mobile_number"] or record["mobile_last4"]))
+        values.setdefault("email", record["email_reference"])
+        values.setdefault("relationship", record["relationship_type"])
+        values.setdefault("relationshipName", record["relationship_name"])
+        values["customerType"] = record["customer_type_code"]
+    identity = (
+        "DOCUMENT_VERIFIED" if kyc_named
+        else "VERIFIED" if record is not None and record["legal_name_status"] == "VERIFIED"
+        else "CONFLICT" if record is not None and record["legal_name_status"] == "CONFLICT"
+        else "PENDING"
+    )
+    values["identityStatus"] = identity
+    return {
+        "fields": [
+            {"key": key, "label": label, "value": values.get(key), "source": sources.get(key)}
+            for key, label, _ in _CUSTOMER_FIELDS
+        ],
+        "identityStatus": identity,
+        "kycDocuments": sorted({str(v) for v in sources.values() if str(v).casefold() in KYC_DOCUMENT_TYPES}),
+    }
+
+
 def registration(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     records = _rows(connection, """
         SELECT registration_number, registration_state, registration_territory,
@@ -1331,6 +1428,7 @@ BUILDERS = {
     "documents": documents,
     "payments": payments,
     "vehicle": vehicle,
+    "customer": customer,
     "registration": registration,
     "delivery": delivery,
     "compliance": compliance,
