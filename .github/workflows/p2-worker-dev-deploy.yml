@@ -62,22 +62,30 @@ jobs:
         run: |
           set -euo pipefail
           railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          railway variable list --service "$WORKER_SERVICE" --json >/tmp/current-worker-vars.json
+          # Only what differs, in ONE call, without a deploy per variable
+          # (one call per variable triggered a deploy each and hit Railway's
+          # rate limit). The deploy step below deploys once.
           python - <<'PY' >/tmp/worker-vars.bin
           import json
           from pathlib import Path
           variables=json.loads(Path('/tmp/audit-vars.json').read_text())
+          current=json.loads(Path('/tmp/current-worker-vars.json').read_text())
           excluded={'PORT'}
           for key, value in sorted(variables.items()):
-              if key.startswith('RAILWAY_') or key in excluded:
+              if key.startswith('RAILWAY_') or key in excluded or value is None:
                   continue
-              if value is None:
+              if str(current.get(key, '')) == str(value):
                   continue
               print(f"{key}={value}\0", end='')
           PY
-          while IFS= read -r -d '' pair; do
-            railway variable set --service "$WORKER_SERVICE" "$pair" >/dev/null
-          done </tmp/worker-vars.bin
-          rm -f /tmp/worker-vars.bin /tmp/audit-vars.json
+          if [ -s /tmp/worker-vars.bin ]; then
+            xargs -0 railway variable set --service "$WORKER_SERVICE" --skip-deploys </tmp/worker-vars.bin >/dev/null
+            echo "P2 worker variables updated: $(tr -cd '\0' </tmp/worker-vars.bin | wc -c)"
+          else
+            echo "P2 worker variables already current"
+          fi
+          rm -f /tmp/worker-vars.bin /tmp/audit-vars.json /tmp/current-worker-vars.json
 
       - name: Configure P2 worker process
         shell: bash
