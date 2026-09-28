@@ -1,4 +1,4 @@
-# Phase 2 control catalog: 25 active Audit Core controls, 21 deal-audit Audit Core
+# Phase 2 control catalog: 25 active Audit Core controls, 22 deal-audit Audit Core
 # checks (uc03_p2_audit_rules.py; the "Manual Observations" ones are answered by a
 # PC, TL or PM rather than read from documents) and 41 enabled Rule Engine rules
 # (blueprint v2.2 sections 9-10; six master-total rules retired on 28 Sep 2026 in favour of
@@ -1512,6 +1512,23 @@ controls:
     triggers:
     - DOCUMENT_SYNCED
     - DELIVERY_COMPLETED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  DELIVERY_DOCUMENTS_OVERDUE:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - DELIVERY
+    category: Document Extraction & Completeness
+    triggers:
+    - DOCUMENT_SYNCED
+    - SCHEDULED
     rerun: RERUNNABLE
     finding_class: VIOLATION
     severity: HIGH

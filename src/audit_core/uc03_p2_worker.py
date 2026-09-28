@@ -112,6 +112,8 @@ _PAGE_DEADLINE_SECONDS = int(os.environ.get("P2_PAGE_DEADLINE_SECONDS", str(30 *
 _SYNC_GRACE_SECONDS = int(os.environ.get("P2_SYNC_GRACE_SECONDS", "180"))
 _FACT_SWEEP_SECONDS = float(os.environ.get("P2_FACT_SWEEP_SECONDS", "30"))
 _FACT_SWEEP_WINDOW_MINUTES = int(os.environ.get("P2_FACT_SWEEP_WINDOW_MINUTES", "10"))
+# When (UTC, HH:MM) the nightly review of deliveries in progress is queued.
+_NIGHTLY_REVIEW_UTC = os.environ.get("P2_NIGHTLY_REVIEW_UTC", "20:30")
 _WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 # Page states that still need DI/Audit Core progress.
@@ -1902,12 +1904,11 @@ def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
     if "DELIVERY_COMPLETED" in settled.get("transitions", ()):
         sync_delivery_review_task(connection, tenant_id=tenant_id, journey_id=journey_id,
                                   evaluation_started_at=started_at)
-    # As soon as the delivery date is known (gate pass read, delivery
-    # recorded), queue the settlement, financier and resale windows once: a
-    # car that left before its paperwork closed is exactly the one to watch.
-    from audit_core.uc03_p2_audit_rules import schedule_post_delivery_checks
+    # The 7th-day event for the mandatory delivery documents, queued once the
+    # first delivery document is in (no-op until then, and after).
+    from audit_core.uc03_p2_audit_rules import schedule_delivery_documents_check
 
-    schedule_post_delivery_checks(connection, tenant_id=tenant_id, journey_id=journey_id)
+    schedule_delivery_documents_check(connection, tenant_id=tenant_id, journey_id=journey_id)
     transitions = list(dict.fromkeys([*first.get("transitions", ()), *settled.get("transitions", ())]))
     return {**settled, "transitions": transitions}
 
@@ -2108,6 +2109,19 @@ def _fact_sweep(engine: Engine, tenant_id: str) -> int:
 
 
 _last_sweep_at: dict[str, float] = {}
+_last_nightly_review: dict[str, str] = {}
+
+
+def _nightly_review_due(tenant_id: str, now: datetime | None = None) -> str | None:
+    """The date whose nightly review this worker still owes, once the
+    configured UTC time has passed; None otherwise."""
+    now = now or datetime.now(UTC)
+    hour, _, minute = _NIGHTLY_REVIEW_UTC.partition(":")
+    due_at = now.replace(hour=int(hour), minute=int(minute or 0), second=0, microsecond=0)
+    if now < due_at:
+        return None
+    today = now.date().isoformat()
+    return None if _last_nightly_review.get(tenant_id) == today else today
 
 
 def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
@@ -2121,6 +2135,21 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
             logger.info("p2_fact_sweep_changes", tenant_id=tenant_id, journeys=changed)
     except Exception:
         logger.warning("p2_fact_sweep_failed", tenant_id=tenant_id, exc_info=True)
+    due = _nightly_review_due(tenant_id)
+    if due is None:
+        return
+    # Re-run the Delivery checks for every delivery in progress: the
+    # time-based checks fire without a document event. Idempotent per night.
+    from audit_core.uc03_p2_audit_rules import queue_nightly_review
+
+    try:
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            queued = queue_nightly_review(connection, tenant_id=tenant_id)
+        _last_nightly_review[tenant_id] = due
+        logger.info("p2_nightly_review_queued", tenant_id=tenant_id, night=due, journeys=queued)
+    except Exception:
+        logger.warning("p2_nightly_review_failed", tenant_id=tenant_id, exc_info=True)
 
 
 def _settle(engine: Engine, work: WorkItem, action, *args) -> None:

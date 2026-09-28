@@ -10,6 +10,7 @@ from uuid import uuid4
 import pytest
 from conftest import delete_tenant_data
 from p2_support import (
+    add_evidence,
     add_ready_document,
     add_receipt_payment,
     create_p2_journey,
@@ -20,8 +21,9 @@ from sqlalchemy import text
 from audit_core import uc03_p2_controls as controls
 from audit_core.db import set_tenant_context
 from audit_core.uc03_p2_audit_rules import (
+    queue_nightly_review,
     run_p2_audit_rules,
-    schedule_post_delivery_checks,
+    schedule_delivery_documents_check,
 )
 from audit_core.uc03_p2_task_producer import apply_control_transitions
 from audit_core.uc03_p2_tasks import submit_action
@@ -104,6 +106,13 @@ def _task(journey, code: str) -> dict | None:
     return dict(row) if row else None
 
 
+def _finding(journey, code: str) -> tuple:
+    row = _sql(journey, "SELECT finding_status, severity, title FROM auditcore.audit_findings "
+                        "WHERE tenant_id=:t AND journey_id=:j AND rule_key=:k ORDER BY created_at_utc DESC LIMIT 1",
+               k=code).one_or_none()
+    return tuple(row) if row else (None, None, None)
+
+
 def _evaluate(journey, unit: str) -> None:
     started = datetime.now(UTC)
     transitions = controls.evaluate_unit(journey.engine, tenant_id=journey.tenant_id,
@@ -145,6 +154,9 @@ def test_deal_undercharged_and_excess_discount_name_each_line(journey):
     excess = result["EXCESS_DISCOUNT"]
     assert excess.outcome == "FAIL"
     assert "Consumer / cash discount: ₹40,000 given against an entitlement of ₹25,000 (₹15,000 extra)" in excess.reason
+    # A failing check is one open Audit Finding in the check's own words.
+    assert _finding(journey, "DEAL_UNDERCHARGED") == ("OPEN", "HIGH", "Deal charged below the standard price")
+    assert _finding(journey, "EXCESS_DISCOUNT")[0] == "OPEN"
 
     _sql(journey, "UPDATE auditcore.commercial_line_source_values SET amount=1000000 WHERE tenant_id=:t "
                   "AND component_key='ex_showroom_price'")
@@ -153,6 +165,7 @@ def test_deal_undercharged_and_excess_discount_name_each_line(journey):
     result = _run(journey, "BOOKING")
     assert result["DEAL_UNDERCHARGED"].outcome == "PASS"
     assert result["EXCESS_DISCOUNT"].outcome == "PASS"
+    assert _finding(journey, "DEAL_UNDERCHARGED")[0] == "RESOLVED"
 
 
 def test_deal_checks_wait_for_the_standard_prices(journey):
@@ -354,35 +367,59 @@ def test_cash_limit_tcs_and_payment_before_booking(journey):
     assert "TCS ₹5,000 charged against ₹15,000 due (1% of the ex-showroom price ₹15,00,000; ₹10,000 short)" in result["TCS_SHORT"].reason
 
 
-# ---------------------------------------------------------- the timers
+# ------------------------------------ the documents window and the night
 
 
-def test_post_delivery_checks_are_queued_per_window(journey):
-    delivered = TODAY - timedelta(days=1)
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        assert schedule_post_delivery_checks(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id) == []
-    _deliver(journey, delivered)
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        keys = schedule_post_delivery_checks(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
-        # Queued once: a second settle adds nothing.
-        assert schedule_post_delivery_checks(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id) == []
-    assert [k.rsplit(":", 1)[1] for k in keys] == ["settlement", "finance"]
-    rows = _sql(journey, "SELECT work_key, payload, next_attempt_at_utc FROM auditcore.p2_work_queue "
-                         "WHERE tenant_id=:t AND work_type='CONTROL_EVALUATE' ORDER BY work_key").mappings().all()
-    by_key = {r["work_key"].rsplit(":", 1)[1]: r for r in rows}
-    assert by_key["settlement"]["payload"] == {"unit": "NATIVE:DELIVERY", "force": True,
-                                               "reason": "7 days after delivery (settlement)"}
-    assert by_key["settlement"]["next_attempt_at_utc"].date() == delivered + timedelta(days=8)
-    assert by_key["finance"]["next_attempt_at_utc"].date() == delivered + timedelta(days=13)
+def test_mandatory_delivery_documents_overdue_raises_a_high_finding_to_the_tl(journey):
+    assert _run(journey, "DELIVERY")["DELIVERY_DOCUMENTS_OVERDUE"].outcome == "PASS"
+    add_ready_document(journey, "customer_invoice_dms", invoice_number="INV-1")
+    waiting = _run(journey, "DELIVERY")["DELIVERY_DOCUMENTS_OVERDUE"]
+    assert waiting.outcome == "SKIPPED" and "Customer Ledger" in waiting.reason and "Due by" in waiting.reason
 
-    _sql(journey, "INSERT INTO auditcore.trade_in_cases (tenant_id, journey_id, old_vehicle_registration) "
-                  "VALUES (:t, :j, 'KA01AB1234')")
+    _sql(journey, "UPDATE auditcore.evidence SET linked_at_utc=now() - interval '8 days' WHERE tenant_id=:t")
+    _evaluate(journey, "NATIVE:DELIVERY")
+    state = _states(journey)["DELIVERY_DOCUMENTS_OVERDUE"]
+    assert state["control_status"] == "FAIL"
+    assert "still missing 8 days later" in state["status_reason"] and "Tax Invoice (Tally)" in state["status_reason"]
+    status, severity, title = _finding(journey, "DELIVERY_DOCUMENTS_OVERDUE")
+    assert (status, severity) == ("OPEN", "HIGH") and title.startswith("Mandatory delivery documents missing: ")
+    task = _task(journey, "DELIVERY_DOCUMENTS_OVERDUE")
+    assert task["task_type"] == "FINDING_REVIEW" and task["assigned_role_code"] == "TL"
+    assert task["reference"]["findingId"]
+
+
+def test_the_seventh_day_event_is_queued_once_the_first_delivery_document_arrives(journey):
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
-        keys = schedule_post_delivery_checks(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
-    assert [k.rsplit(":", 1)[1] for k in keys] == ["tradeIn"]
-    row = _sql(journey, "SELECT next_attempt_at_utc FROM auditcore.p2_work_queue WHERE tenant_id=:t "
-                        "AND work_key=:k", k=keys[-1]).scalar_one()
-    assert row.date() == delivered + timedelta(days=91)
+        assert schedule_delivery_documents_check(connection, tenant_id=journey.tenant_id,
+                                                 journey_id=journey.journey_id) is None
+    add_evidence(journey, di_document_id=uuid4(), document_type_key="gate_pass", process_area="DELIVERY")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        key = schedule_delivery_documents_check(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        # Queued once: the next settle adds nothing.
+        assert schedule_delivery_documents_check(connection, tenant_id=journey.tenant_id,
+                                                 journey_id=journey.journey_id) is None
+    row = _sql(journey, "SELECT payload, next_attempt_at_utc FROM auditcore.p2_work_queue WHERE tenant_id=:t "
+                        "AND work_type='CONTROL_EVALUATE' AND work_key=:k", k=key).mappings().one()
+    assert row["payload"]["unit"] == "NATIVE:DELIVERY" and row["payload"]["force"] is True
+    assert abs((row["next_attempt_at_utc"] - (datetime.now(UTC) + timedelta(days=7))).total_seconds()) < 120
+
+
+def test_nightly_review_queues_each_delivery_in_progress_once(journey):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert queue_nightly_review(connection, tenant_id=journey.tenant_id) == 0  # delivery not started
+    add_evidence(journey, di_document_id=uuid4(), document_type_key="gate_pass", process_area="DELIVERY")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert queue_nightly_review(connection, tenant_id=journey.tenant_id) == 1
+        assert queue_nightly_review(connection, tenant_id=journey.tenant_id) == 0
+    key = f"nightly:{TODAY.isoformat()}:{journey.journey_id}"
+    assert _sql(journey, "SELECT payload FROM auditcore.p2_work_queue WHERE tenant_id=:t AND work_key=:k",
+                k=key).scalar_one()["unit"] == "NATIVE:DELIVERY"
+    # A reviewed delivery is no longer in progress.
+    _sql(journey, "UPDATE auditcore.journeys SET review_completed_at_utc=now() WHERE tenant_id=:t AND journey_id=:j")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert queue_nightly_review(connection, tenant_id=journey.tenant_id, today=TODAY + timedelta(days=1)) == 0
