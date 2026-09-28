@@ -205,7 +205,10 @@ def list_templates(
 
 class P2CreateJourneyCommand(BaseModel):
     outletId: UUID
-    customerName: str = Field(min_length=1, max_length=200)
+    # Optional: the customer is named from the documents (PAN, Aadhaar,
+    # booking form) as they are read. A name given here is only the
+    # entered name until then.
+    customerName: str | None = Field(default=None, max_length=200)
     # The name the PC's app shows for the signed-in user, kept on the
     # journey so a Team Lead sees whose booking it is (Audit Core only
     # knows the actor id; the display name lives in Security).
@@ -235,9 +238,12 @@ def create_p2_journey(
     )
 
     _authorize_security(authorization_client, human_principal=human_principal, tenant_id=tenant_id)
-    customer_name = " ".join(command.customerName.split())
-    if not customer_name:
-        raise HTTPException(status_code=422, detail="Enter the customer's name.")
+    customer_name = " ".join((command.customerName or "").split())
+    # No name yet: the Journey id stands as the entered name until a
+    # document names the customer (the placeholder migration 0058 defined).
+    chosen_journey_id = uuid4() if not customer_name else None
+    if chosen_journey_id is not None:
+        customer_name = str(chosen_journey_id)
     set_tenant_context(connection, tenant_id)
     context = _create_context(
         connection, tenant_id=tenant_id, actor_id=human_principal.subject, outlet_id=command.outletId,
@@ -249,7 +255,9 @@ def create_p2_journey(
         customer_name=customer_name,
         actor_id=human_principal.subject,
         idempotency_key=idempotency_key,
-        request_payload={"outletId": str(command.outletId), "customerName": customer_name},
+        request_payload={"outletId": str(command.outletId),
+                         "customerName": "" if chosen_journey_id is not None else customer_name},
+        journey_id=chosen_journey_id,
     )
     journey_id = UUID(str(body["journeyId"]))
     created_by_name = " ".join((command.createdByName or "").split()) or None
@@ -266,7 +274,8 @@ def create_p2_journey(
         )
     _activity(
         connection, tenant_id=tenant_id, journey_id=journey_id, event_type="JOURNEY_STARTED",
-        subject_type="JOURNEY", subject_id=str(journey_id), details={"customerName": customer_name},
+        subject_type="JOURNEY", subject_id=str(journey_id),
+        details={"customerName": None if chosen_journey_id is not None else customer_name},
         correlation_id=None,
     )
     return {"journeyId": str(journey_id), "customerId": str(body["customerId"]), "outletId": str(body["outletId"])}
