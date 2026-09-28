@@ -249,6 +249,18 @@ def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[s
 
 
 # ── summary ──────────────────────────────────────────────────────────────────
+def gate_pass_date(connection: Connection, *, tenant_id: str, journey_id: UUID) -> str | None:
+    """The delivery date as the gate pass prints it (ISO), or None when no
+    gate pass has been read."""
+    from audit_core.uc03_p2_dates import parse_extracted_date
+
+    for doc in _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id, di_types=("gate_pass",)):
+        parsed = parse_extracted_date(doc["fields"].get("delivery_date"))
+        if parsed is not None:
+            return parsed.isoformat()
+    return None
+
+
 def summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     head = connection.execute(
         text(
@@ -327,7 +339,7 @@ def summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
             "financier": head["financier"],
             "insurer": head["insurer"],
             "createdAtUtc": head["created_at_utc"],
-            "deliveredAtUtc": head["delivered_at"],
+            "deliveredAtUtc": gate_pass_date(connection, tenant_id=tenant_id, journey_id=journey_id) or head["delivered_at"],
         },
         "stage": stage,
         "money": {
@@ -1741,6 +1753,74 @@ def audit(connection: Connection, *, tenant_id: str, journey_id: UUID, limit: in
             "details": {},
         })
     events.sort(key=lambda e: e["atUtc"])
+
+    # How each stage completed: the gates the stage engine evaluated, with
+    # their outcome and when, and every rule (Audit Core control or Rule
+    # Engine control) that ran for the stage with what it found.
+    registry = get_registry()
+    gate_rows = connection.execute(
+        text(
+            """
+            SELECT stage_code, gate_key, gate_status, details, evaluated_at_utc
+            FROM auditcore.p2_stage_gate_state WHERE tenant_id=:t AND journey_id=:j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()
+    gate_state = {(str(r["stage_code"]), str(r["gate_key"])): r for r in gate_rows}
+    control_rows = connection.execute(
+        text(
+            """
+            SELECT control_code, control_status, status_reason, details, last_evaluated_at_utc,
+                   evaluation_count, executor_type, stage_code
+            FROM auditcore.p2_control_state WHERE tenant_id=:t AND journey_id=:j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()
+    control_state = {str(r["control_code"]): r for r in control_rows}
+    labels = control_labels(connection)
+    completion: dict[str, Any] = {}
+    for stage_code in ("BOOKING", "DELIVERY"):
+        stage_template = registry.stages.get(stage_code)
+        stage_row = stages.get(stage_code) or {}
+        gates = []
+        for gate in (stage_template.gates if stage_template else ()):
+            row = gate_state.get((stage_code, gate.key))
+            gates.append({
+                "key": gate.key, "label": gate.label, "kind": gate.kind,
+                "status": str(row["gate_status"]) if row else "WAITING",
+                "evaluatedAtUtc": row["evaluated_at_utc"] if row else None,
+                "details": dict(row["details"] or {}) if row else {},
+            })
+        controls = []
+        for control in registry.controls.values():
+            if not control.applies_to_stage(stage_code):
+                continue
+            row = control_state.get(control.code)
+            if row is None:
+                continue
+            details = dict(row["details"] or {})
+            controls.append({
+                "code": control.code, "label": labels.get(control.code, control.code),
+                "executor": str(row["executor_type"] or control.executor),
+                "status": str(row["control_status"]), "reason": row["status_reason"],
+                "evaluatedAtUtc": row["last_evaluated_at_utc"], "evaluations": int(row["evaluation_count"] or 0),
+                "leftValue": details.get("leftValue"), "rightValue": details.get("rightValue"),
+            })
+        controls.sort(key=lambda c: (_STATUS_ORDER.get(c["status"], 9), c["label"]))
+        completion[stage_code.lower()] = {
+            "completedAtUtc": stage_row.get("business_completed_at_utc"),
+            "status": stage_row.get("business_status"),
+            "gates": gates,
+            "controls": controls,
+            "counts": {
+                "fired": len(controls),
+                "passed": sum(1 for c in controls if c["status"] == "PASS"),
+                "failed": sum(1 for c in controls if c["status"] == "FAIL"),
+                "waiting": sum(1 for c in controls if c["status"] not in ("PASS", "FAIL")),
+            },
+        }
     if len(events) > limit:
         events = events[-limit:]
 
@@ -1750,6 +1830,7 @@ def audit(connection: Connection, *, tenant_id: str, journey_id: UUID, limit: in
         "pending": pending,
         "tasks": {"summary": task_summary, "items": tasks},
         "events": [_plain(e) for e in events],
+        "completion": completion,
     }
 
 

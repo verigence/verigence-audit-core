@@ -34,7 +34,7 @@ def test_new_booking_starts_a_journey_idempotently(uc03_create_booking_setup):  
     listed = client.get(url, params={"state": "open"}).json()["items"]
     mine = next(item for item in listed if item["journey_id"] == first.json()["journeyId"])
     assert mine["pc_name"] == "Asha Rao" and mine["outlet_name"] and mine["dealer_name"]
-    assert mine["price_variance"] is None  # nothing priced yet
+    assert mine["price_variance"] == "0"  # nothing priced yet
 
 
 def test_new_booking_requires_a_customer_name(uc03_create_booking_setup):  # noqa: F811
