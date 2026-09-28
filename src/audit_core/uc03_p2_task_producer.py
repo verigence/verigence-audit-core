@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_p2_names import display_name, same_organisation, same_person
 from audit_core.uc03_p2_registry import ControlTemplate, Registry, get_registry
 from audit_core.uc03_p2_stage import unreviewed_fields
 from audit_core.uc03_p2_tasks import record_task_event
@@ -397,6 +398,16 @@ def _field_with_confidence(field: dict[str, Any]) -> str:
     return f"{_label(field['fieldKey'])} ({shown})"
 
 
+def _date_problem(field: dict[str, Any], floor: date | None) -> str:
+    """"Receipt date read as 12/03/2019, before June 2026": what the PC
+    checks on the page and why it is almost certainly misread."""
+    shown = format_value(field["fieldKey"], field.get("value"))
+    if "DATE_UNREADABLE" in field.get("reasons", ()):
+        return f"{_label(field['fieldKey'])} read as {shown!r}, which is not a date"
+    when = f", before {floor.strftime('%B %Y')}" if floor else ""
+    return f"{_label(field['fieldKey'])} read as {shown}{when}"
+
+
 def sync_field_review_tasks(
     connection: Connection,
     *,
@@ -413,30 +424,49 @@ def sync_field_review_tasks(
     for item in pending:
         by_document.setdefault(item["documentId"], []).append(item)
     counts: dict[str, int] = {}
+    floor = registry.extraction_rules.date_floor
     for document_id, fields in by_document.items():
         name = fields[0]["documentName"]
-        fields.sort(key=lambda f: (f["confidence"] is not None, f["confidence"] or 0))
-        listed = ", ".join(_field_with_confidence(f) for f in fields[:6])
-        more = f" and {len(fields) - 6} more" if len(fields) > 6 else ""
+        # Misread dates first (they are wrong, not merely uncertain), then the
+        # least certain reading first.
+        fields.sort(key=lambda f: (f["severity"] != "HIGH", f["confidence"] is not None, f["confidence"] or 0))
+        dated = [f for f in fields if f["severity"] == "HIGH"]
+        uncertain = [f for f in fields if f["severity"] != "HIGH"]
+        sentences = []
+        if dated:
+            sentences.append(
+                f"These dates on the {name} cannot be right as read: "
+                + "; ".join(_date_problem(f, floor) for f in dated[:4])
+                + (f" and {len(dated) - 4} more" if len(dated) > 4 else "") + "."
+            )
+        if uncertain:
+            listed = ", ".join(_field_with_confidence(f) for f in uncertain[:6])
+            more = f" and {len(uncertain) - 6} more" if len(uncertain) > 6 else ""
+            sentences.append(f"These values on the {name} were read with low confidence: {listed}{more}.")
+        sentences.append("Open the document, compare each value with the page and confirm or correct it.")
+        severity = "HIGH" if dated else "MEDIUM"
+        count = len(fields)
+        title = (
+            f"Check {count} date{'s' if count != 1 else ''} on {name}" if dated and not uncertain
+            else f"Verify {count} field{'s' if count != 1 else ''} on {name}"
+        )
         reference = {
             "generatedBy": "SYSTEM", "sourceType": "DOCUMENT_FIELD", "sourceCode": "MANUAL_VERIFICATION",
             "documentId": document_id, "documentIds": [document_id], "templateKey": fields[0]["templateKey"],
             "fields": [{"fieldKey": f["fieldKey"], "canonicalFieldId": f["canonicalFieldId"],
                         "sourceFactVersion": f["sourceFactVersion"], "confidence": f["confidence"],
-                        "threshold": f["threshold"]} for f in fields],
+                        "threshold": f["threshold"], "reasons": f["reasons"],
+                        "value": f.get("value") if f["severity"] == "HIGH" else None} for f in fields],
             "fieldKeys": [f["fieldKey"] for f in fields],
+            "dateFloor": floor.isoformat() if floor and dated else None,
         }
         _, outcome = raise_or_refresh(
             connection, tenant_id=tenant_id, journey_id=journey_id,
             dedupe_key=f"field-review:{journey_id}:{document_id}",
             task_type="MANUAL_VERIFICATION_REVIEW", source_type="DOCUMENT_FIELD",
             source_code="MANUAL_VERIFICATION",
-            title=f"Verify {len(fields)} field{'s' if len(fields) != 1 else ''} on {name}",
-            description=(
-                f"These values on the {name} were read with low confidence: {listed}{more}. "
-                "Open the document, compare each value with the page and confirm or correct it."
-            ),
-            reference=reference, severity="MEDIUM", registry=registry,
+            title=title, description=" ".join(sentences),
+            reference=reference, severity=severity, registry=registry,
             evaluation_started_at=evaluation_started_at,
         )
         counts[outcome] = counts.get(outcome, 0) + 1
@@ -534,6 +564,144 @@ def sync_document_missing_tasks(
     closed = _resolve_prefix_except(
         connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"document-missing:{journey_id}:",
         keep=wanted, evidence={"documentReceivedOrNotRequired": True, "verifiedAt": datetime.now(UTC).isoformat()},
+    )
+    if closed:
+        counts["VERIFIED"] = counts.get("VERIFIED", 0) + closed
+    return counts
+
+
+def _named_documents(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                     pairs: tuple[str, ...]) -> list[dict[str, Any]]:
+    """Every ACTIVE document whose ``<di type>.<field>`` is one of ``pairs``,
+    with the name it carries (as corrected by the PC, if it was)."""
+    from audit_core.uc03_p2_stage import _LEGACY_TYPE_ALIASES
+
+    wanted: dict[str, str] = {}
+    for pair in pairs:
+        di_type, _, field_key = pair.partition(".")
+        wanted[pair] = pair
+        for alias in _LEGACY_TYPE_ALIASES.get(di_type, ()):
+            wanted[f"{alias}.{field_key}"] = pair
+    if not wanted:
+        return []
+    rows = connection.execute(
+        text(
+            """
+            SELECT e.di_document_id, e.document_type_key, e.process_area, e.linked_at_utc,
+                   f.field_key, f.effective_value
+            FROM auditcore.evidence e
+            JOIN auditcore.journey_document_extracted_fields f
+              ON f.tenant_id=e.tenant_id AND f.journey_id=e.journey_id AND f.di_document_id=e.di_document_id
+            WHERE e.tenant_id=:t AND e.journey_id=:j AND e.association_status='ACTIVE'
+              AND (e.document_type_key || '.' || f.field_key) = ANY(:pairs)
+              AND f.effective_value IS NOT NULL
+              AND f.effective_value <> 'null'::jsonb AND f.effective_value <> '""'::jsonb
+            ORDER BY e.linked_at_utc ASC, e.di_document_id ASC
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "pairs": list(wanted)},
+    ).mappings().all()
+    return [
+        {
+            "documentId": str(row["di_document_id"]), "diType": str(row["document_type_key"]),
+            "stage": str(row["process_area"] or "").upper() or None, "fieldKey": str(row["field_key"]),
+            "pair": wanted[f"{row['document_type_key']}.{row['field_key']}"], "name": row["effective_value"],
+        }
+        for row in rows
+        if isinstance(row["effective_value"], str) and row["effective_value"].strip()
+    ]
+
+
+def sync_name_consistency_tasks(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    registry: Registry | None = None,
+    evaluation_started_at: datetime | None = None,
+) -> dict[str, int]:
+    """One customer and one dealership per Journey.
+
+    Every customer document (booking form, invoices, receipts, insurance
+    cover...) must carry the customer's name as the KYC gives it, and every
+    dealer document must carry the dealership the booking form names. A
+    document in another name is the wrong document: a High severity Document
+    Missing task (PC) says which document, whose name it carries and whose it
+    should, and asks for it to be deleted and the right one uploaded. The
+    task closes itself when that document goes, or when a corrected name
+    matches after all."""
+    registry = registry or get_registry()
+    rules = registry.extraction_rules
+    wanted: set[str] = set()
+    counts: dict[str, int] = {}
+
+    def raise_task(document: dict[str, Any], *, kind: str, title: str, description: str,
+                   reference: dict[str, Any]) -> None:
+        key = f"wrong-document:{journey_id}:{kind}:{document['documentId']}"
+        wanted.add(key)
+        template = registry.template_for_di_type(document["diType"], stage=document["stage"])
+        _, outcome = raise_or_refresh(
+            connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+            task_type="DOCUMENT_MISSING", source_type="DOCUMENT", source_code=f"WRONG_{kind.upper()}_NAME",
+            title=title, description=description,
+            reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": f"WRONG_{kind.upper()}_NAME",
+                       "documentId": document["documentId"], "documentIds": [document["documentId"]],
+                       "templateKey": template.key, "fieldKey": document["fieldKey"],
+                       "fieldKeys": [document["fieldKey"]], "stage": document["stage"], **reference},
+            severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
+        )
+        counts[outcome] = counts.get(outcome, 0) + 1
+
+    # -- the customer, as the KYC names them
+    references = _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                  pairs=rules.customer_name_reference)
+    by_pair = {doc["pair"]: doc for doc in reversed(references)}  # latest document of each kind
+    kyc = next((by_pair[pair] for pair in rules.customer_name_reference if pair in by_pair), None)
+    if kyc is not None:
+        kyc_template = registry.template_for_di_type(kyc["diType"], stage=kyc["stage"])
+        for document in _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                         pairs=rules.customer_name_checked):
+            if same_person(document["name"], kyc["name"]):
+                continue
+            template = registry.template_for_di_type(document["diType"], stage=document["stage"])
+            raise_task(
+                document, kind="customer",
+                title=f"Replace the {template.display_name}: it is not in the customer's name",
+                description=(
+                    f"The {template.display_name} is in the name of {display_name(document['name'])}, but the "
+                    f"customer per the {kyc_template.display_name} is {display_name(kyc['name'])}. Wrong document "
+                    f"uploaded: please delete it and upload the {template.display_name} in the customer's name as "
+                    f"per PAN/Aadhaar. If the name was only misread, correct it on the document instead."
+                ),
+                reference={"documentName": display_name(document["name"]), "customerName": display_name(kyc["name"]),
+                           "referenceDocumentId": kyc["documentId"], "referenceTemplateKey": kyc_template.key},
+            )
+
+    # -- the dealership, as the booking form names it
+    dealers = _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
+                               pairs=rules.dealer_name_checked)
+    anchor = next((d for d in reversed(dealers) if d["pair"].startswith("booking_form.")), None)
+    if anchor is not None:
+        for document in dealers:
+            if document["documentId"] == anchor["documentId"] or same_organisation(document["name"], anchor["name"]):
+                continue
+            template = registry.template_for_di_type(document["diType"], stage=document["stage"])
+            raise_task(
+                document, kind="dealer",
+                title=f"Replace the {template.display_name}: it names another dealership",
+                description=(
+                    f"The {template.display_name} names the dealership {display_name(document['name'])}, but the "
+                    f"Booking Docket names {display_name(anchor['name'])}. Wrong document uploaded: please delete "
+                    f"it and upload the {template.display_name} issued by this dealership. If the name was only "
+                    f"misread, correct it on the document instead."
+                ),
+                reference={"documentName": display_name(document["name"]), "dealerName": display_name(anchor["name"]),
+                           "referenceDocumentId": anchor["documentId"], "referenceTemplateKey": "booking_docket"},
+            )
+
+    closed = _resolve_prefix_except(
+        connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"wrong-document:{journey_id}:",
+        keep=wanted, evidence={"namesConsistent": True, "verifiedAt": datetime.now(UTC).isoformat()},
     )
     if closed:
         counts["VERIFIED"] = counts.get("VERIFIED", 0) + closed

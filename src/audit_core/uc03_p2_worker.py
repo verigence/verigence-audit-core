@@ -71,6 +71,7 @@ from audit_core.uc03_p2_task_producer import (
     sync_delivery_review_task,
     sync_document_missing_tasks,
     sync_field_review_tasks,
+    sync_name_consistency_tasks,
     sync_vehicle_photo_task,
 )
 from audit_core.uc03_p2_workflow import mark_delivery_reviewed
@@ -1683,11 +1684,27 @@ def _refresh_batch_status(connection, tenant_id: str, batch_id: UUID) -> None:
 
 
 def _sync_rule_tasks(connection, *, tenant_id: str, journey_id: UUID, started_at: datetime | None = None) -> None:
-    """Every task the document rules raise or close by themselves."""
-    sync_field_review_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at)
-    sync_document_missing_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at)
-    sync_vehicle_photo_task(connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at)
-    sync_delivery_review_task(connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at)
+    """Every task the document rules raise or close by themselves. One log
+    line per rule that changed something, so a task's origin can be traced
+    from the journey's log without opening the database."""
+    outcomes = {
+        "field_review": sync_field_review_tasks(
+            connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
+        "document_missing": sync_document_missing_tasks(
+            connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
+        "name_consistency": sync_name_consistency_tasks(
+            connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
+        "vehicle_photo": sync_vehicle_photo_task(
+            connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
+        "delivery_review": sync_delivery_review_task(
+            connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
+    }
+    for rule, counts in outcomes.items():
+        # The single-task rules answer with what happened to their one task.
+        as_counts = {counts: 1} if isinstance(counts, str) else (counts or {})
+        changed = {k: v for k, v in as_counts.items() if k != "UNCHANGED" and v}
+        if changed:
+            logger.info("p2_rule_tasks", tenant_id=tenant_id, journey_id=str(journey_id), rule=rule, **changed)
 
 
 def settle_journey(connection, *, tenant_id: str, journey_id: UUID,

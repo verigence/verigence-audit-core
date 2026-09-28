@@ -18,6 +18,56 @@ source:
   blueprint: Verigence Phase 2 Design Blueprint v2.2 (27 Sep 2026)
   di_schema_snapshot: di_schema_snapshot.json
   requirements: 'Document1: Booking / Delivery mandatory and conditional documents (28 Sep 2026)'
+# Checks every extracted value gets besides its confidence (see
+# uc03_p2_registry.ExtractionRules). A date read before date_floor cannot
+# belong to a Journey of this programme: the extractor misread a digit or the
+# year, so the field goes to the PC as a High severity manual verification
+# whatever its confidence. past_dates_expected lists the date fields that
+# legitimately lie in the past and are never held against the floor.
+extraction_rules:
+  date_floor: 2026-06-01
+  past_dates_expected:
+  - date_of_birth
+  - corporate_id.date_of_joining
+  - corporate_id.document_date
+  - valuation_report.registration_date
+  - gst_certificate.date_of_liability
+  - gst_certificate.date_of_issue
+  # One customer per Journey: every document below must carry the name the
+  # KYC gives (PAN first, then Aadhaar). One in another name is the wrong
+  # document: a High severity Document Missing task asks the PC to delete it
+  # and upload the one in the customer's name (or to correct a misread name).
+  customer_name:
+    reference:
+    - pan_card.pan_name
+    - aadhaar.aadhaar_name
+    - customer_kyc.customer_name
+    checked:
+    - booking_form.customer_name
+    - customer_invoice_dms.buyer_name
+    - tax_invoice_tally.buyer_name
+    - dealer_receipt.customer_name
+    - payment_receipt.customer_name
+    - insurance_cover.insured_name
+    - accessory_invoice_dms.buyer_name
+    - ew_invoice.buyer_name
+    - rsa_invoice.buyer_name
+    - customer_ledger.customer_name
+    - delivery_order_cover.customer_name
+  # One dealership per Journey: the booking form names it and every dealer
+  # document below must name the same one.
+  dealer_name:
+    checked:
+    - booking_form.dealer_name
+    - dealer_receipt.dealer_name
+    - payment_receipt.dealer_name
+    - customer_invoice_dms.seller_name
+    - tax_invoice_tally.seller_name
+    - accessory_invoice_dms.seller_name
+    - ew_invoice.seller_name
+    - rsa_invoice.seller_name
+    - customer_ledger.dealer_name
+    - delivery_order_cover.dealer_name
 stages:
   BOOKING:
     order: 1

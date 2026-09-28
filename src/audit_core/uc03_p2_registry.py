@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -163,6 +164,38 @@ class TaskTemplate:
 
 
 @dataclass(frozen=True)
+class ExtractionRules:
+    """Checks every extracted value gets besides its confidence.
+
+    ``date_floor``: a date read earlier than this cannot belong to a Journey
+    of this programme, so it is a misread whatever its confidence and goes
+    to the PC as a High severity manual verification. ``past_dates_expected``
+    names the date fields that legitimately lie in the past (a date of
+    birth, an old vehicle's registration): a bare field key, or
+    ``<di type>.<field key>`` for one document only.
+    """
+
+    date_floor: date | None = None
+    past_dates_expected: frozenset[str] = frozenset()
+    # ``<di type>.<field key>`` pairs. The customer's name as the KYC gives
+    # it (first with a value wins), the documents that must carry that
+    # name, and the documents that must all carry one dealership name.
+    customer_name_reference: tuple[str, ...] = ()
+    customer_name_checked: tuple[str, ...] = ()
+    dealer_name_checked: tuple[str, ...] = ()
+
+    def date_floor_applies(self, di_type: str | None, field_key: str) -> bool:
+        if self.date_floor is None:
+            return False
+        if field_key in self.past_dates_expected:
+            return False
+        return f"{di_type}.{field_key}" not in self.past_dates_expected
+
+
+_DATE_KEY_HINTS = ("_date", "date_", "_datetime", "period_from", "period_to", "valid_until")
+
+
+@dataclass(frozen=True)
 class Registry:
     documents: dict[str, DocumentTemplate]
     stages: dict[str, StageTemplate]
@@ -171,6 +204,7 @@ class Registry:
     actions: frozenset[str]
     di_schemas: dict[str, dict[str, Any]]
     di_source: dict[str, Any]
+    extraction_rules: ExtractionRules = field(default_factory=ExtractionRules)
 
     # ------------------------------------------------------------- lookups
     def document(self, key: str) -> DocumentTemplate:
@@ -235,6 +269,23 @@ class Registry:
 
     def di_fields(self, di_type: str) -> list[dict[str, Any]]:
         return list((self.di_schemas.get(di_type) or {}).get("fields") or [])
+
+    def is_date_field(self, di_type: str | None, field_key: str) -> bool:
+        """A field the extractor fills with a date: typed so in the DI
+        schema, or named like one when the schema calls it a string."""
+        for meta in self.di_fields(di_type or ""):
+            if meta.get("key") == field_key:
+                if meta.get("type") in ("date", "datetime"):
+                    return True
+                break
+        key = field_key.lower()
+        return any(hint in key for hint in _DATE_KEY_HINTS)
+
+    def date_check_applies(self, di_type: str | None, field_key: str) -> bool:
+        """Whether this field's value is held against the date floor."""
+        return self.is_date_field(di_type, field_key) and self.extraction_rules.date_floor_applies(
+            di_type, field_key,
+        )
 
 
 def _load_yaml(name: str) -> dict[str, Any]:
@@ -350,6 +401,27 @@ def build_registry(
         for task_type, raw in (tasks_doc.get("task_types") or {}).items()
     }
 
+    rules_raw = dict(documents_doc.get("extraction_rules") or {})
+    floor_raw = rules_raw.get("date_floor")
+    if isinstance(floor_raw, date):
+        floor: date | None = floor_raw
+    elif floor_raw is None or str(floor_raw).strip() == "":
+        floor = None
+    else:
+        try:
+            floor = date.fromisoformat(str(floor_raw).strip())
+        except ValueError as exc:
+            raise RegistryError(f"extraction_rules.date_floor is not a date: {floor_raw!r}") from exc
+    customer_raw = dict(rules_raw.get("customer_name") or {})
+    dealer_raw = dict(rules_raw.get("dealer_name") or {})
+    extraction_rules = ExtractionRules(
+        date_floor=floor,
+        past_dates_expected=frozenset(_tuple(rules_raw.get("past_dates_expected"))),
+        customer_name_reference=_tuple(customer_raw.get("reference")),
+        customer_name_checked=_tuple(customer_raw.get("checked")),
+        dealer_name_checked=_tuple(dealer_raw.get("checked")),
+    )
+
     return Registry(
         documents=documents,
         stages=stages,
@@ -358,6 +430,7 @@ def build_registry(
         actions=frozenset(_tuple(tasks_doc.get("actions"))),
         di_schemas=dict(di_snapshot.get("schemas") or {}),
         di_source=dict(di_snapshot.get("source") or {}),
+        extraction_rules=extraction_rules,
     )
 
 
@@ -437,6 +510,31 @@ def validate_registry(registry: Registry) -> list[str]:
         for document in control.depends_on_documents:
             if document not in registry.documents and document not in EXTERNAL_ONLY_OPERAND_DOCUMENTS:
                 problems.append(f"{where}: depends on unknown document {document}")
+
+    known_field_keys = {
+        str(meta.get("key")) for schema in registry.di_schemas.values() for meta in (schema.get("fields") or [])
+    }
+    for entry in sorted(registry.extraction_rules.past_dates_expected):
+        di_type, dot, field_key = entry.rpartition(".")
+        if dot and di_type not in known_di:
+            problems.append(f"extraction_rules.past_dates_expected: unknown DI type in {entry}")
+        elif dot and field_key not in {str(m.get("key")) for m in registry.di_fields(di_type)}:
+            problems.append(f"extraction_rules.past_dates_expected: {di_type} has no field {field_key}")
+        elif not dot and field_key not in known_field_keys:
+            problems.append(f"extraction_rules.past_dates_expected: unknown field {entry}")
+
+    rules = registry.extraction_rules
+    for setting, entries in (
+        ("customer_name.reference", rules.customer_name_reference),
+        ("customer_name.checked", rules.customer_name_checked),
+        ("dealer_name.checked", rules.dealer_name_checked),
+    ):
+        for entry in entries:
+            di_type, dot, field_key = entry.partition(".")
+            if not dot or di_type not in known_di:
+                problems.append(f"extraction_rules.{setting}: {entry} is not <di type>.<field>")
+            elif field_key not in {str(m.get("key")) for m in registry.di_fields(di_type)}:
+                problems.append(f"extraction_rules.{setting}: {di_type} has no field {field_key}")
 
     for task_type, task in registry.tasks.items():
         for action in task.actions:

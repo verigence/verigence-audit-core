@@ -38,7 +38,9 @@ from audit_core.uc03_p2_access import (
     check_p2_permission,
     resolve_p2_scope,
 )
+from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_runtime import note_facts_changed, record_activity
+from audit_core.uc03_p2_stage import field_review_reasons
 from audit_core.uc03_p2_tasks import create_p2_task
 from audit_core.uc03_review_confidence import requires_pc_review
 
@@ -355,6 +357,21 @@ def get_p2_document_review(
                 "pageNo": None,
                 "evidenceRegion": None,
             }
+        )
+
+    # Why each value needs a look, decided here so the editor and the Task
+    # Queue flag the same fields for the same reasons.
+    registry = get_registry()
+    di_type = context["document_type_key"]
+    template = registry.template_for_di_type(di_type, stage=str(context["stage_code"] or "").upper() or None)
+    for item in fields:
+        reviewed = bool(item.get("reviewedAtUtc")) or bool(item.get("isModified"))
+        value = item.get("effectiveValue")
+        blank = value is None or value == "" or value == "null"
+        confidence = item.get("confidenceScore")
+        item["reviewReasons"] = [] if reviewed or blank else field_review_reasons(
+            registry, template, di_type=di_type, field_key=str(item["fieldKey"]), value=value,
+            confidence=float(confidence) if confidence is not None else None,
         )
 
     correction_history = [

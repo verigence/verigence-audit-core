@@ -35,6 +35,7 @@ from audit_core.uc03_duplicate_receipt_detection import (
     normalize_receipt_date,
     normalize_receipt_number,
 )
+from audit_core.uc03_p2_dates import date_floor_verdict
 from audit_core.uc03_p2_registry import DocumentTemplate, Gate, Registry, get_registry
 from audit_core.uc03_p2_runtime import record_activity
 
@@ -98,6 +99,46 @@ def ready_document_count(
 
 
 _RECEIPT_TYPE = "dealer_receipt"
+
+
+def ready_document_counts(
+    connection: Connection, registry: Registry, *, tenant_id: str, journey_id: UUID,
+) -> dict[str, int]:
+    """``ready_document_count`` for every template in two statements instead
+    of one per template: the documents screen asks for all of them at once,
+    and a Railway database answers each round trip slowly."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT e.document_type_key, COUNT(DISTINCT e.di_document_id) AS ready
+            FROM auditcore.evidence e
+            WHERE e.tenant_id=:tenant_id
+              AND e.journey_id=:journey_id
+              AND e.association_status='ACTIVE'
+              AND EXISTS (
+                SELECT 1
+                FROM auditcore.journey_document_extracted_fields f
+                WHERE f.tenant_id=e.tenant_id
+                  AND f.journey_id=e.journey_id
+                  AND f.di_document_id=e.di_document_id
+                  AND f.effective_value IS NOT NULL
+              )
+            GROUP BY e.document_type_key
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    by_type = {str(row["document_type_key"]): int(row["ready"] or 0) for row in rows}
+    split: dict[str, Any] | None = None
+    counts: dict[str, int] = {}
+    for template in registry.documents.values():
+        if _RECEIPT_TYPE in template.di_types:
+            if split is None:
+                split = receipt_split(connection, tenant_id=tenant_id, journey_id=journey_id)
+            counts[template.key] = len(split["DELIVERY" if str(template.stage).upper() == "DELIVERY" else "BOOKING"])
+        else:
+            counts[template.key] = sum(by_type.get(key, 0) for key in _evidence_types(template))
+    return counts
 
 
 def receipt_split(connection: Connection, *, tenant_id: str, journey_id: UUID,
@@ -206,6 +247,37 @@ def open_task_count(connection: Connection, *, tenant_id: str, journey_id: UUID,
     return int(row or 0)
 
 
+REVIEW_REASON_LABELS = {
+    "LOW_CONFIDENCE": "read with low confidence",
+    "DATE_BEFORE_FLOOR": "a date before the programme started",
+    "DATE_UNREADABLE": "not a readable date",
+}
+# Reasons that make the verification High severity: the value is wrong as
+# read, not merely uncertain.
+HIGH_SEVERITY_REASONS = frozenset({"DATE_BEFORE_FLOOR", "DATE_UNREADABLE"})
+
+
+def field_review_reasons(
+    registry: Registry, template: DocumentTemplate, *, di_type: str | None, field_key: str,
+    value: Any, confidence: float | None,
+) -> list[str]:
+    """Why a PC has to look at this value: low confidence, a date before the
+    programme's floor, or a date the extractor could not read. Empty means
+    the value stands as extracted."""
+    reasons: list[str] = []
+    if template.needs_review(field_key, confidence):
+        reasons.append("LOW_CONFIDENCE")
+    if registry.date_check_applies(di_type, field_key):
+        verdict = date_floor_verdict(value, registry.extraction_rules.date_floor)
+        if verdict:
+            reasons.append(verdict)
+    return reasons
+
+
+def review_severity(reasons: list[str]) -> str:
+    return "HIGH" if HIGH_SEVERITY_REASONS.intersection(reasons) else "MEDIUM"
+
+
 def unreviewed_fields(
     connection: Connection,
     registry: Registry,
@@ -215,11 +287,13 @@ def unreviewed_fields(
     stage: str | None = None,
     document_id: UUID | None = None,
 ) -> list[dict[str, Any]]:
-    """Low-confidence fields on ACTIVE documents that nobody has reviewed.
+    """Fields on ACTIVE documents that a PC has to look at and nobody has.
 
     A field needs review when its confidence is below its template threshold
-    (strict fields use the stricter bar; missing confidence is never trusted),
-    it has a value, and it has not been confirmed or corrected."""
+    (missing confidence is never trusted) or its date lies before the
+    programme's date floor, it has a value, and it has not been confirmed or
+    corrected. Each item carries its ``reasons`` and the ``severity`` of the
+    task they warrant."""
     rows = connection.execute(
         text(
             """
@@ -250,18 +324,26 @@ def unreviewed_fields(
         if stage is not None and template.stage not in (stage, "ANY"):
             continue
         confidence = float(row["confidence_score"]) if row["confidence_score"] is not None else None
-        if not template.needs_review(str(row["field_key"]), confidence):
+        field_key = str(row["field_key"])
+        reasons = field_review_reasons(
+            registry, template, di_type=row["document_type_key"], field_key=field_key,
+            value=row["effective_value"], confidence=confidence,
+        )
+        if not reasons:
             continue
         pending.append(
             {
                 "documentId": str(row["di_document_id"]),
                 "templateKey": template.key,
                 "documentName": template.display_name,
-                "fieldKey": str(row["field_key"]),
+                "fieldKey": field_key,
                 "canonicalFieldId": row["source_canonical_field_id"],
                 "sourceFactVersion": int(row["source_fact_version"] or 1),
                 "confidence": confidence,
-                "threshold": template.review_threshold_for(str(row["field_key"])),
+                "threshold": template.review_threshold_for(field_key),
+                "value": row["effective_value"],
+                "reasons": reasons,
+                "severity": review_severity(reasons),
             }
         )
     return pending
@@ -417,7 +499,7 @@ def active_conditions(connection: Connection, *, tenant_id: str, journey_id: UUI
 
 def requirement_items(
     connection: Connection, registry: Registry, *, tenant_id: str, journey_id: UUID, stage: str,
-    reasons: dict[str, str],
+    reasons: dict[str, str], ready_counts: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     """The stage's checklist: mandatory documents, conditional documents
     made mandatory by evidence, and optional ones. Templates sharing a
@@ -430,7 +512,10 @@ def requirement_items(
         if template.requirement == "CONDITIONAL" and not triggered:
             continue
         required = template.requirement in {"REQUIRED", "CONDITIONAL"}
-        ready = ready_document_count(connection, tenant_id=tenant_id, journey_id=journey_id, template=template)
+        ready = (
+            ready_counts[template.key] if ready_counts is not None
+            else ready_document_count(connection, tenant_id=tenant_id, journey_id=journey_id, template=template)
+        )
         key = template.group or template.key
         item = items.setdefault(key, {
             "key": key, "templates": [], "labels": [], "required": required,
