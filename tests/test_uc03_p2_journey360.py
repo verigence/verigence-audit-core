@@ -138,10 +138,19 @@ def test_summary_etag_and_sections(journey):
     assert pan["label"] == "PAN Card" or pan["templateKey"] == "pan_card"
     assert {f["key"] for f in pan["fields"]} == {"pan_number", "pan_name"}
 
-    for section in ("deal", "addons", "payments", "vehicle", "registration", "delivery", "compliance", "activity"):
+    for section in ("deal", "addons", "payments", "vehicle", "registration", "delivery", "compliance", "activity", "timeline"):
         response = client.get(f"{base}/{section}")
         assert response.status_code == 200, (section, response.text)
     assert client.get(f"{base}/nope").status_code == 404
+
+    # The audit trail: milestones in order with the hours between them, the
+    # tasks with when they opened and closed, and one ordered event stream.
+    audit = client.get(f"{base}/audit").json()
+    assert audit["milestones"][0]["key"] == "JOURNEY_STARTED" and audit["milestones"][0]["hoursSincePrevious"] is None
+    assert all(m["atUtc"] for m in audit["milestones"])
+    assert {"opened", "closed", "open", "avgHoursToClose"} <= set(audit["tasks"]["summary"])
+    assert audit["events"] == sorted(audit["events"], key=lambda e: e["atUtc"])
+    assert all({"atUtc", "kind", "type", "who"} <= set(e) for e in audit["events"])
 
     # A new fact changes the ETag.
     add_ready_document(journey, "aadhaar", aadhaar_number="123412341234")

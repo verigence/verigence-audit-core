@@ -34,7 +34,7 @@ from audit_core.uc03_p2_stage import read_booking_stage
 
 SECTIONS = (
     "deal", "addons", "documents", "payments", "vehicle", "registration",
-    "delivery", "compliance", "activity",
+    "delivery", "compliance", "activity", "timeline", "audit",
 )
 
 _OPEN_TASK_EXCLUDED = "('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')"
@@ -1142,6 +1142,189 @@ def _timeline(connection: Connection, *, tenant_id: str, journey_id: UUID) -> di
     return timeline(connection, tenant_id=tenant_id, journey_id=journey_id)
 
 
+# ── audit trail: what happened, who did it, how long each step took ─────────
+_ACTIVITY_KIND = {
+    "JOURNEY_STARTED": "journey",
+    "UPLOAD_INITIALIZED": "document", "UPLOAD_ACCEPTED": "document", "UPLOAD_SPLIT_COMPLETE": "document",
+    "DOCUMENTS_GROUPED": "document", "DOCUMENT_READY": "document", "DOCUMENT_SETTLED": "document",
+    "DOCUMENT_REPLACEMENT_INITIALIZED": "document", "DOCUMENT_REPLACED": "document",
+    "DOCUMENT_REMOVED": "document", "DOCUMENT_VOIDED": "document",
+    "PAGE_RETRY_REQUESTED": "document", "PAGE_RETYPED": "document",
+    "VEHICLE_PHOTO_ADDED": "document", "VEHICLE_PHOTO_REMOVED": "document",
+    "FIELD_CORRECTED": "review", "FIELD_CONFIRMED": "review", "RECHECK_REQUESTED": "review",
+    "PRICING_DATE_CHANGED": "review",
+    "STAGE_CHANGED": "stage",
+    "CONTROL_CHANGED": "check",
+    "TASK_RAISED": "task", "TASK_VERIFIED": "task",
+}
+
+_TASK_CLOSED = ("VERIFIED_COMPLETE", "CANCELLED", "FAILED", "DEAD_LETTER")
+
+
+def audit(connection: Connection, *, tenant_id: str, journey_id: UUID, limit: int = 300) -> dict[str, Any]:
+    """The journey's complete history for a reviewer: the milestones with the
+    time between them, every task with when it opened and closed, and one
+    ordered stream of everything that happened (uploads, reads, reviews,
+    stage changes, task events, checks) with who did it."""
+    journey = connection.execute(
+        text(
+            """
+            SELECT j.created_at_utc, j.created_by_display_name, j.review_completed_at_utc,
+                   dl.actual_delivered_at,
+                   (SELECT MIN(b.created_at_utc) FROM auditcore.p2_upload_batches b
+                     WHERE b.tenant_id=j.tenant_id AND b.journey_id=j.journey_id) AS first_upload_at,
+                   (SELECT MIN(e.created_at_utc) FROM auditcore.p2_activity_events e
+                     WHERE e.tenant_id=j.tenant_id AND e.journey_id=j.journey_id
+                       AND e.event_type='DOCUMENT_READY') AS first_document_read_at
+            FROM auditcore.journeys j
+            LEFT JOIN auditcore.deliveries dl ON dl.tenant_id=j.tenant_id AND dl.journey_id=j.journey_id
+            WHERE j.tenant_id=:t AND j.journey_id=:j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one()
+    stages = {
+        str(r["stage_code"]): dict(r)
+        for r in connection.execute(
+            text(
+                """
+                SELECT stage_code, business_status, closure_disposition, first_started_at_utc,
+                       capture_completed_at_utc, business_completed_at_utc, booking_confirmed_at_utc
+                FROM auditcore.journey_stage_states WHERE tenant_id=:t AND journey_id=:j
+                """
+            ),
+            {"t": tenant_id, "j": journey_id},
+        ).mappings().all()
+    }
+    booking = stages.get("BOOKING") or {}
+    delivery = stages.get("DELIVERY") or {}
+    cancelled = booking.get("business_status") in ("BOOKING_CANCELLED", "DUPLICATE_BOOKING") \
+        or booking.get("closure_disposition") == "NO_DELIVERY"
+
+    pc = journey["created_by_display_name"]
+    candidates: list[tuple[str, str, Any, str | None]] = [
+        ("JOURNEY_STARTED", "Journey started", journey["created_at_utc"], f"PC {pc}" if pc else "PC"),
+        ("FIRST_UPLOAD", "First document uploaded", journey["first_upload_at"], "PC"),
+        ("FIRST_DOCUMENT_READ", "First document read", journey["first_document_read_at"], "Automatic"),
+        ("BOOKING_SUBMITTED", "Booking documents submitted", booking.get("capture_completed_at_utc"), "PC"),
+        ("BOOKING_CONFIRMED", "Booking confirmed", booking.get("booking_confirmed_at_utc"), None),
+        ("BOOKING_CLOSED", "Booking cancelled" if cancelled else "Booking complete",
+         booking.get("business_completed_at_utc"), None),
+        ("DELIVERY_STARTED", "Delivery started", delivery.get("first_started_at_utc"), "PC"),
+        ("DELIVERY_SUBMITTED", "Delivery documents submitted", delivery.get("capture_completed_at_utc"), "PC"),
+        ("GATE_PASS", "Gate pass: vehicle delivered", journey["actual_delivered_at"], None),
+        ("DELIVERY_CLOSED", "Delivery complete", delivery.get("business_completed_at_utc"), None),
+        ("TL_REVIEWED", "Reviewed by Team Lead", journey["review_completed_at_utc"], "TL"),
+    ]
+    reached = sorted((c for c in candidates if c[2] is not None), key=lambda c: c[2])
+    milestones = []
+    previous = None
+    for key, label, at, who in reached:
+        hours = round((at - previous).total_seconds() / 3600, 1) if previous is not None else None
+        milestones.append({"key": key, "label": label, "atUtc": at, "who": who, "hoursSincePrevious": hours})
+        previous = at
+    pending = [{"key": key, "label": label} for key, label, at, _ in candidates if at is None
+               and not (cancelled and key in ("DELIVERY_STARTED", "DELIVERY_SUBMITTED", "GATE_PASS",
+                                              "DELIVERY_CLOSED", "TL_REVIEWED"))]
+
+    task_rows = connection.execute(
+        text(
+            """
+            SELECT task_id, title, category, task_type, assigned_role_code, raised_by_role_code, origin_kind,
+                   severity, task_status, created_at_utc, verified_at_utc, updated_at_utc,
+                   CASE WHEN task_status IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')
+                        THEN COALESCE(verified_at_utc, updated_at_utc) END AS closed_at_utc
+            FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j
+            ORDER BY created_at_utc
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()
+    tasks = []
+    closed_hours: list[float] = []
+    for r in task_rows:
+        hours = round((r["closed_at_utc"] - r["created_at_utc"]).total_seconds() / 3600, 1) \
+            if r["closed_at_utc"] is not None else None
+        if hours is not None:
+            closed_hours.append(hours)
+        tasks.append({
+            "taskId": str(r["task_id"]), "title": r["title"], "category": r["category"], "taskType": r["task_type"],
+            "role": r["assigned_role_code"], "raisedBy": r["raised_by_role_code"] or ("System" if r["origin_kind"] == "SYSTEM" else None),
+            "severity": r["severity"], "status": r["task_status"],
+            "openedAtUtc": r["created_at_utc"], "closedAtUtc": r["closed_at_utc"], "hoursOpen": hours,
+        })
+    task_summary = {
+        "opened": len(tasks),
+        "closed": len(closed_hours),
+        "open": len(tasks) - len(closed_hours),
+        "avgHoursToClose": round(sum(closed_hours) / len(closed_hours), 1) if closed_hours else None,
+    }
+
+    events: list[dict[str, Any]] = []
+    for r in connection.execute(
+        text(
+            """
+            SELECT event_type, subject_type, subject_id, details, created_at_utc
+            FROM auditcore.p2_activity_events
+            WHERE tenant_id=:t AND journey_id=:j AND event_type <> 'FACTS_CHANGED'
+            ORDER BY event_id DESC LIMIT :limit
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "limit": limit},
+    ).mappings().all():
+        details = r["details"] or {}
+        events.append({
+            "atUtc": r["created_at_utc"], "kind": _ACTIVITY_KIND.get(str(r["event_type"]), "other"),
+            "type": r["event_type"], "subject": r["subject_id"] if r["subject_type"] != "JOURNEY" else None,
+            "who": details.get("actorRole") or details.get("actor_role") or ("PC" if str(r["event_type"]) in ("UPLOAD_ACCEPTED", "UPLOAD_INITIALIZED", "JOURNEY_STARTED", "PAGE_RETRY_REQUESTED", "PAGE_RETYPED") else "Automatic"),
+            "details": details,
+        })
+    for r in connection.execute(
+        text(
+            """
+            SELECT e.event_type, e.actor_role_code, e.comment, e.details, e.created_at_utc, t.title, t.assigned_role_code
+            FROM auditcore.p2_task_events e
+            JOIN auditcore.p2_tasks t ON t.tenant_id=e.tenant_id AND t.task_id=e.task_id
+            WHERE e.tenant_id=:t AND e.journey_id=:j
+            ORDER BY e.task_event_id DESC LIMIT :limit
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "limit": limit},
+    ).mappings().all():
+        events.append({
+            "atUtc": r["created_at_utc"], "kind": "task", "type": f"TASK_{r['event_type']}",
+            "subject": r["title"], "who": r["actor_role_code"] or "System",
+            "details": {**(r["details"] or {}), **({"comment": r["comment"]} if r["comment"] else {}),
+                        "assignedTo": r["assigned_role_code"]},
+        })
+    for r in connection.execute(
+        text(
+            """
+            SELECT stage_code, event_type, source_kind, actor_role_snapshot, occurred_at_utc
+            FROM auditcore.journey_workflow_events WHERE tenant_id=:t AND journey_id=:j
+            ORDER BY occurred_at_utc DESC LIMIT :limit
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "limit": limit},
+    ).mappings().all():
+        events.append({
+            "atUtc": r["occurred_at_utc"], "kind": "stage", "type": str(r["event_type"]).removeprefix("P2_"),
+            "subject": r["stage_code"], "who": r["actor_role_snapshot"] or ("Automatic" if r["source_kind"] == "MACHINE" else None),
+            "details": {},
+        })
+    events.sort(key=lambda e: e["atUtc"])
+    if len(events) > limit:
+        events = events[-limit:]
+
+    return {
+        "pc": pc,
+        "milestones": milestones,
+        "pending": pending,
+        "tasks": {"summary": task_summary, "items": tasks},
+        "events": [_plain(e) for e in events],
+    }
+
+
 BUILDERS = {
     "deal": deal,
     "addons": addons,
@@ -1155,4 +1338,5 @@ BUILDERS = {
     "duplicates": duplicates,
     "compliance-report": compliance_report,
     "timeline": _timeline,
+    "audit": audit,
 }
