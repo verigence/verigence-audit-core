@@ -205,6 +205,10 @@ def list_templates(
 class P2CreateJourneyCommand(BaseModel):
     outletId: UUID
     customerName: str = Field(min_length=1, max_length=200)
+    # The name the PC's app shows for the signed-in user, kept on the
+    # journey so a Team Lead sees whose booking it is (Audit Core only
+    # knows the actor id; the display name lives in Security).
+    createdByName: str | None = Field(default=None, max_length=200)
 
 
 @router.post("/journeys", status_code=201)
@@ -247,6 +251,18 @@ def create_p2_journey(
         request_payload={"outletId": str(command.outletId), "customerName": customer_name},
     )
     journey_id = UUID(str(body["journeyId"]))
+    created_by_name = " ".join((command.createdByName or "").split()) or None
+    if created_by_name:
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.journeys SET created_by_display_name=:name
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND created_by_display_name IS NULL
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "name": created_by_name},
+        )
     _activity(
         connection, tenant_id=tenant_id, journey_id=journey_id, event_type="JOURNEY_STARTED",
         subject_type="JOURNEY", subject_id=str(journey_id), details={"customerName": customer_name},
@@ -294,7 +310,8 @@ def list_p2_journeys(
                          NULLIF(jp.model_name_snapshot,''),
                          NULLIF(jp.variant_name_snapshot,''),
                          NULLIF(jp.colour_name_snapshot,'')
-                       ), '') AS vehicle
+                       ), '') AS vehicle,
+                       j.created_by_display_name AS pc_name
                 FROM auditcore.journeys j
                 JOIN auditcore.customers c
                   ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
@@ -350,6 +367,7 @@ def list_p2_journeys(
             )
             SELECT p.journey_id, p.journey_reference, p.customer_name, p.mobile_last4,
                    p.dealer_name, p.outlet_name, p.vehicle, p.created_at_utc, p.updated_at_utc,
+                   p.pc_name, pv.price_variance,
                    COALESCE(pr.current_stage,
                      CASE
                        WHEN ds.business_completed_at_utc IS NOT NULL OR dl.actual_delivered_at IS NOT NULL
@@ -429,6 +447,29 @@ def list_p2_journeys(
               WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id
                 AND finding_status IN ('OPEN','ACKNOWLEDGED')
             ) fd ON true
+            LEFT JOIN LATERAL (
+              -- Actual net minus standard net across the deal, the same sum
+              -- the deal reconciliation raises a finding on; NULL until
+              -- every priced line has an actual (a half-reviewed deal would
+              -- always look like a shortfall).
+              SELECT CASE
+                WHEN EXISTS (SELECT 1 FROM auditcore.commercial_lines cl
+                             WHERE cl.tenant_id=p.tenant_id AND cl.journey_id=p.journey_id
+                               AND cl.standard_amount IS NOT NULL AND cl.actual_amount IS NULL)
+                  OR NOT EXISTS (SELECT 1 FROM auditcore.commercial_lines cl
+                                 WHERE cl.tenant_id=p.tenant_id AND cl.journey_id=p.journey_id
+                                   AND cl.actual_amount IS NOT NULL)
+                THEN NULL
+                ELSE (COALESCE((SELECT SUM(actual_amount) FROM auditcore.commercial_lines
+                                WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id), 0)
+                      - COALESCE((SELECT SUM(actual_discount_amount) FROM auditcore.discount_applications
+                                  WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id), 0))
+                   - (COALESCE((SELECT SUM(standard_amount) FROM auditcore.commercial_lines
+                                WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id), 0)
+                      - COALESCE((SELECT SUM(standard_eligible_amount) FROM auditcore.discount_applications
+                                  WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id), 0))
+              END AS price_variance
+            ) pv ON true
             ORDER BY p.updated_at_utc DESC, p.journey_id DESC
             """
         ),
@@ -448,7 +489,7 @@ def list_p2_journeys(
         for key in ("documents", "total_tasks", "open_tasks", "overdue_tasks", "open_findings",
                     "pc_open_tasks", "tl_open_tasks"):
             item[key] = int(item.get(key) or 0)
-        for key in ("booking_receipt_total", "booking_minimum_amount"):
+        for key in ("booking_receipt_total", "booking_minimum_amount", "price_variance"):
             if item.get(key) is not None:
                 item[key] = str(item[key])
         items.append(item)
