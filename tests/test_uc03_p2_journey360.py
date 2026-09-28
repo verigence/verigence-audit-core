@@ -141,6 +141,7 @@ def test_summary_etag_and_sections(journey):
     for section in ("deal", "addons", "payments", "vehicle", "registration", "delivery", "compliance", "activity", "timeline"):
         response = client.get(f"{base}/{section}")
         assert response.status_code == 200, (section, response.text)
+    assert "timeline" not in body["sections"] and "activity" not in body["sections"] and "delivery" not in body["sections"]
 
     # The Customer tab: what was entered, what the KYC says, contact masked.
     customer = client.get(f"{base}/customer").json()
@@ -168,6 +169,7 @@ def test_summary_etag_and_sections(journey):
     assert set(booking["counts"]) == {"fired", "passed", "failed", "waiting"}
     assert audit["completion"]["delivery"]["gates"]
     assert all({"atUtc", "kind", "type", "who"} <= set(e) for e in audit["events"])
+    assert set(audit["stages"]) == {"BOOKING", "DELIVERY"} and isinstance(audit["roles"], list)
 
     # Trade-in / Scrappage and the Vehicle panel as Phase 1 lays them out.
     add_ready_document(journey, "booking_form", customer_name="P2 CUSTOMER", exchange_applicable=True,
@@ -199,8 +201,18 @@ def test_summary_etag_and_sections(journey):
     assert [(i["name"], i["amount"]) for i in vehicle["addons"]["accessories"]["items"]] == [
         ("Roof Rail Set - Scorpio", "4917"), ("Dual USB Car Charger", "647.01"),
     ]
-    assert vehicle["addons"]["warranty"] == {"taken": False, "amount": None, "provider": None, "items": [], "details": {}}
+    assert vehicle["addons"]["warranty"] == {"taken": False, "amount": None, "amountSource": None, "provider": None,
+                                             "items": [], "details": {}, "documentIds": []}
     assert vehicle["addons"]["accessories"]["details"] == {"invoiceNumbers": ["ACC-1"]}
+    # The accessory invoice is the billed value: the same answer in the Deal,
+    # the Add-ons tab and the Vehicle tab.
+    assert vehicle["addons"]["accessories"]["amount"] == "61308.02"
+    assert vehicle["addons"]["accessories"]["amountSource"] == "billed"
+    deal_view = client.get(f"{base}/deal").json()
+    accessories = next(r for g in deal_view["categories"] for r in g["components"] if r["key"] == "accessories_cost")
+    assert accessories["billed"] == "61308.02" and accessories["booking"] == "61308.02"
+    assert [i["label"] for i in deal_view["invoices"]] and deal_view["invoices"][0]["number"] == "ACC-1"
+    assert client.get(f"{base}/addons").json()["taken"]["accessories"]["taken"] is True
 
     # Every invoice with its header, totals and line items as printed.
     listing = client.get(f"{base}/invoices").json()
@@ -285,3 +297,94 @@ def test_discount_without_entitlement_is_an_over_grant(journey):
         [row] = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)["discounts"]
     assert Decimal(row["entitled"]) == 0 and Decimal(row["variance"]) == 5000
     assert "OVER_ENTITLEMENT" in row["flags"]
+
+
+def test_insurance_taken_reads_the_cover_note_not_the_bookings_zero(journey):
+    """The booking form prices insurance at 0 (customer to arrange), then a
+    cover note arrives: the policy exists, the premium is what the cover
+    bills, and every tab says so."""
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        _source(connection, journey, "COMMERCIAL", "insurance_amount", "booking_form", "0")
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, standard_amount,
+                    actual_amount, actual_source_kind, source_reference)
+                VALUES (:t, :j, 'insurance_amount', 71809, 0, 'EVIDENCE', 'booking_form:x')
+                """
+            ),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+    cover = add_ready_document(journey, "insurance_cover", insurer_name="Zurich Kotak", policy_number="MKG/P30598174",
+                               premium_amount="62,029", add_ons=["CONSUMABLES COVER", "ENGINE PROTECT"])
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}/360"
+    vehicle = client.get(f"{base}/vehicle").json()
+    insurance = vehicle["addons"]["insurance"]
+    assert insurance["taken"] is True and insurance["amount"] == "62029" and insurance["amountSource"] == "billed"
+    assert insurance["provider"] == "Zurich Kotak" and insurance["documentIds"] == [str(cover)]
+    assert insurance["details"]["policyNumber"] == "MKG/P30598174"
+    assert client.get(f"{base}/addons").json()["taken"]["insurance"]["taken"] is True
+    row = next(r for g in client.get(f"{base}/deal").json()["categories"] for r in g["components"]
+               if r["key"] == "insurance_amount")
+    assert Decimal(row["booking"]) == 0 and row["billed"] == "62029" and Decimal(row["variance"]) == -9780
+
+
+def test_duplicate_receipts_count_once_and_receipts_meet_the_bank_statement(journey):
+    add_receipt_payment(journey, amount="84308", receipt_number="AMP-B/04824/26-27", receipt_date="2026-09-11")
+    add_receipt_payment(journey, amount="84308", receipt_number="AMP-B/04824/26-27", receipt_date="2026-09-11")
+    add_receipt_payment(journey, amount="21000", receipt_number="AMP-B/04001/26-27", receipt_date="2026-09-01")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.payments SET payment_reference='UTR526612345678', payment_method_code='NEFT' "
+                 "WHERE tenant_id=:t AND receipt_number='AMP-B/04824/26-27'"),
+            {"t": journey.tenant_id},
+        )
+    statement = add_ready_document(journey, "bank_statement_extract", bank_name="HDFC Bank", transaction_date="12/09/2026",
+                                   transaction_description="NEFT CR UTR526612345678 BISWABHANU", reference_no="526612345678",
+                                   credit_amount="84,308.00", running_balance="1,20,000")
+    add_ready_document(journey, "bank_statement_extract", bank_name="HDFC Bank", transaction_date="2026-09-20",
+                       transaction_description="CASH DEP", credit_amount="5000")
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}/360"
+    view = client.get(f"{base}/payments").json()
+    by_number = {}
+    for item in view["items"]:
+        by_number.setdefault(item["receiptNumber"], []).append(item)
+    first, second = by_number["AMP-B/04824/26-27"]
+    assert first["counted"] is True and second["counted"] is False
+    assert second["duplicateOf"] == first["paymentId"]
+    assert "same receipt number, amount and date" in second["notCountedReason"]
+    assert view["duplicates"] == 1
+    assert Decimal(view["receiptsTotal"]) == 105308  # 84308 once, plus 21000
+    assert Decimal(client.get(base).json()["money"]["paid"]["receipts"]) == 105308
+    # The counted receipt meets its statement credit by UTR; the duplicate gets nothing.
+    assert first["bankStatement"]["status"] == "MATCHED" and first["bankStatement"]["method"] == "UTR"
+    assert first["bankStatement"]["documentId"] == str(statement)
+    assert second["bankStatement"] is None
+    (other,) = by_number["AMP-B/04001/26-27"]
+    assert other["bankStatement"]["status"] == "UNMATCHED"
+    bank = view["bankStatement"]
+    assert Decimal(bank["creditsTotal"]) == 89308 and Decimal(bank["matchedTotal"]) == 84308
+    assert bank["matched"] == 1 and bank["unmatchedCredits"] == 1 and bank["receiptsWithoutCredit"] == 1
+    matched = next(line for line in bank["lines"] if line["matchedPaymentId"])
+    assert matched["matchedReceipt"] == "AMP-B/04824/26-27" and matched["date"] == "2026-09-12"
+
+
+def test_one_certificate_however_many_times_it_was_read(journey):
+    full = add_ready_document(journey, "scrappage_certificate_of_deposit", certificate_number="COD2026091HR26AW8810",
+                              trade_number="33080926232094421528", old_vehicle_registration_number="HR26AW8810",
+                              old_vehicle_model="SANTRO", current_holder_name="P2 CUSTOMER", trade_date="2026-09-08")
+    partial = add_ready_document(journey, "scrappage_certificate_of_deposit", trade_number="33080926232094421528",
+                                 current_holder_name="P2 CUSTOMER", state_of_scrapping="Haryana")
+    add_ready_document(journey, "scrappage_certificate_of_deposit", certificate_number="COD-OTHER", old_vehicle_model="ALTO")
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}/360"
+    certificates = client.get(f"{base}/tradein").json()["certificates"]
+    assert len(certificates) == 2
+    merged = next(c for c in certificates if c["tradeNumber"] == "33080926232094421528")
+    assert set(merged["documentIds"]) == {str(full), str(partial)}
+    assert merged["certificateNumber"] == "COD2026091HR26AW8810" and merged["oldVehicleModel"] == "SANTRO"
+    assert merged["stateOfScrapping"] == "Haryana"  # from the partial reading

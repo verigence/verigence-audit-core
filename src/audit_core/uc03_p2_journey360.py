@@ -24,18 +24,28 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from audit_core.uc03_duplicate_booking_detection import _BASIS_LABEL
+from audit_core.uc03_duplicate_receipt_detection import (
+    ReceiptRecord,
+    compute_duplicate_groups,
+    normalize_receipt_date,
+    normalize_receipt_number,
+)
 from audit_core.uc03_masters_alignment import (
     CONDITIONAL_DISCOUNT_EVIDENCE_DOCUMENT,
     DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY,
     canonical_discount_key,
 )
 from audit_core.uc03_p2_controls import control_statistics
+from audit_core.uc03_p2_dates import parse_extracted_date
 from audit_core.uc03_p2_registry import get_registry
-from audit_core.uc03_p2_stage import read_booking_stage
+from audit_core.uc03_p2_stage import read_booking_stage, receipt_split
 
+# The tabs Journey 360 shows. "delivery", "activity" and "timeline" stay
+# servable for older clients but are no longer advertised: the Vehicle tab
+# carries the delivery, the Audit trail carries every event and duration.
 SECTIONS = (
     "deal", "invoices", "addons", "documents", "payments", "vehicle", "tradein", "customer", "registration",
-    "delivery", "compliance", "activity", "timeline", "audit",
+    "compliance", "audit",
 )
 
 _OPEN_TASK_EXCLUDED = "('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')"
@@ -116,18 +126,34 @@ def _benefit_key(key: str) -> str | None:
     return None
 
 
-def _money(value: Any) -> str | None:
-    return None if value is None else str(Decimal(str(value)))
-
-
 def _dec(value: Any) -> Decimal | None:
-    return None if value is None else Decimal(str(value))
+    """A number as a document prints it (\"₹ 61,308.02\") or as the database
+    holds it; None when there is no number in it."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, float)):
+        return Decimal(str(value))
+    text_value = str(value).replace(",", "").replace("₹", "").replace("Rs.", "").replace("Rs", "").strip()
+    if not text_value:
+        return None
+    try:
+        return Decimal(text_value)
+    except (ArithmeticError, ValueError):
+        return None
+
+
+def _money(value: Any) -> str | None:
+    parsed = _dec(value)
+    return None if parsed is None else str(parsed)
 
 
 def _minus(a: Any, b: Any) -> str | None:
-    if a is None or b is None:
+    left, right = _dec(a), _dec(b)
+    if left is None or right is None:
         return None
-    return str(Decimal(str(a)) - Decimal(str(b)))
+    return str(left - right)
 
 
 def _plain(row: Any) -> dict[str, Any]:
@@ -221,20 +247,15 @@ def journey_etag(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
 
 # ── money helpers ────────────────────────────────────────────────────────────
 def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Decimal]:
-    """Money actually received: evidenced receipts on ACTIVE documents plus
+    """Money actually received: evidenced receipts on ACTIVE documents, the
+    same receipt uploaded twice counted once (the stage engine's rule), plus
     loan disbursements not already booked as a receipt (a disbursement
     matched to a payment row is counted once, as that payment)."""
+    split = receipt_split(connection, tenant_id=tenant_id, journey_id=journey_id)
     row = connection.execute(
         text(
             """
             SELECT
-              COALESCE((SELECT SUM(p.amount) FROM auditcore.payments p
-                 WHERE p.tenant_id=:t AND p.journey_id=:j AND p.amount > 0
-                   AND p.status_source='EVIDENCE'
-                   AND EXISTS (SELECT 1 FROM auditcore.evidence e
-                     WHERE e.tenant_id=p.tenant_id AND e.journey_id=p.journey_id
-                       AND e.di_document_id=p.source_di_document_id
-                       AND e.association_status='ACTIVE')), 0) AS receipts,
               COALESCE((SELECT SUM(f.loan_disbursement_amount) FROM auditcore.finance_records f
                  WHERE f.tenant_id=:t AND f.journey_id=:j
                    AND f.loan_disbursement_amount IS NOT NULL
@@ -243,7 +264,7 @@ def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[s
         ),
         {"t": tenant_id, "j": journey_id},
     ).mappings().one()
-    receipts = Decimal(row["receipts"] or 0)
+    receipts = Decimal(split["total"] or 0)
     loan = Decimal(row["loan"] or 0)
     return {"receipts": receipts, "loan": loan, "total": receipts + loan}
 
@@ -361,19 +382,107 @@ def summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
 
 
 # ── deal ─────────────────────────────────────────────────────────────────────
+def _column_for(document_type: Any) -> str:
+    """Which column a document's value belongs in: the booking form is the
+    offer, the ledger and cost sheet are what they are, and every invoice,
+    cover note or challan is a billed (actual) value."""
+    return (
+        "booking" if document_type in _BOOKING_SOURCES
+        else "ledger" if document_type in _LEDGER_SOURCES
+        else "quote" if document_type in _QUOTE_SOURCES
+        else "billed"
+    )
+
+
 def _columns(per_source: list[Any]) -> dict[str, Any]:
     """Booking / billed / ledger / quote value for one component. Sources are
     ordered oldest first, so the newest document of each kind wins."""
     out: dict[str, Any] = {"booking": None, "billed": None, "ledger": None, "quote": None}
     for source in per_source:
-        document_type = source["source_document_type"]
-        column = (
-            "booking" if document_type in _BOOKING_SOURCES
-            else "ledger" if document_type in _LEDGER_SOURCES
-            else "quote" if document_type in _QUOTE_SOURCES
-            else "billed"
-        )
-        out[column] = source["amount"]
+        out[_column_for(source["source_document_type"])] = source["amount"]
+    return out
+
+
+def _billed_disagree(per_source: list[Any]) -> bool:
+    """Two invoices (say the DMS retail invoice and the Tally tax invoice)
+    printing different amounts for the same component."""
+    amounts = {
+        _dec(s["amount"]) for s in per_source
+        if _column_for(s["source_document_type"]) == "billed" and _dec(s["amount"]) is not None
+    }
+    return len(amounts) > 1
+
+
+# A whole invoice of one purpose bills one component; a categorised line
+# item inside any invoice bills its own (kept in step with
+# uc03_invoice_materialization).
+_WHOLE_DOCUMENT_COMPONENT = {
+    "accessory_invoice_dms": "accessories_cost", "accessory_invoice_tally": "accessories_cost",
+    "ew_invoice": "additional_warranty_amount", "rsa_invoice": "rsa_amount",
+}
+_LINE_COMPONENT = {
+    "ACCESSORY_GENUINE": "accessories_cost", "ACCESSORY_NON_GENUINE": "accessories_cost",
+    "EXTENDED_WARRANTY": "additional_warranty_amount", "RSA": "rsa_amount", "INSURANCE": "insurance_amount",
+    "FASTAG": "fastag_amount", "TCS": "tcs_amount",
+}
+
+
+def _line_entries(fields: dict[str, Any]) -> list[dict[str, Any]]:
+    """The line items of an invoice as extracted, whatever shape they were stored in."""
+    raw = fields.get("line_items")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    return [entry for entry in (raw if isinstance(raw, list) else []) if isinstance(entry, dict)]
+
+
+def _document_billed(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """What the documents themselves say, component by component: the booking
+    form's own prices, the whole of an accessory, extended warranty or RSA
+    invoice, the premium on the insurance cover note, and the categorised
+    line items of any invoice. The invoice is the source of truth for the
+    deal, so these values stand in their column whenever the materialised
+    source table has no row yet for that (component, document)."""
+    out: list[dict[str, Any]] = []
+    documents = _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                di_types=_ITEM_SOURCES + ("insurance_cover",) + tuple(_BOOKING_SOURCES))
+    for doc in documents:
+        kind, fields = doc["documentType"], doc["fields"]
+        totals: dict[str, Decimal] = {}
+        whole = _WHOLE_DOCUMENT_COMPONENT.get(kind)
+        if kind in _BOOKING_SOURCES:
+            # The booking form prices each component and discount by name.
+            for key, value in fields.items():
+                amount = _dec(value)
+                if amount is not None and (key in _COMPONENT_LABELS or _benefit_key(key)):
+                    totals[key] = amount
+        elif whole:
+            amount = _dec(fields.get("grand_total_amount"))
+            if amount is None:
+                amount = _dec(fields.get("taxable_amount"))
+            if amount is not None:
+                totals[whole] = amount
+        elif kind == "insurance_cover":
+            amount = _dec(fields.get("premium_amount"))
+            if amount is not None:
+                totals["insurance_amount"] = amount
+        else:
+            for entry in _line_entries(fields):
+                component = _LINE_COMPONENT.get(str(entry.get("line_category") or "").upper())
+                amount = _dec(entry.get("net_amount"))
+                if amount is None:
+                    amount = _dec(entry.get("gross_amount"))
+                if component and amount is not None:
+                    totals[component] = totals.get(component, Decimal(0)) + amount
+        for component, amount in totals.items():
+            out.append({
+                "line_kind": "COMMERCIAL", "component_key": component, "source_document_type": kind,
+                "amount": amount, "source_document_id": doc["documentId"],
+            })
+    # oldest document first, as the materialised rows are ordered
+    out.reverse()
     return out
 
 
@@ -487,6 +596,14 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         ).all()
     }
 
+    # The documents' own billed values fill in where the materialised source
+    # table has no row yet for that (component, document type).
+    present = {(str(s["component_key"]), str(s["source_document_type"])) for s in sources}
+    sources = list(sources) + [
+        s for s in _document_billed(connection, tenant_id=tenant_id, journey_id=journey_id)
+        if (s["component_key"], s["source_document_type"]) not in present
+    ]
+
     # Normalise every source row onto (kind, key): discount-like commercial
     # fields fold onto their scheme benefit, declared totals are set apart.
     declared: dict[str, list[Any]] = {}
@@ -518,10 +635,19 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         per_source = [s for s in sources if s["line_kind"] == "COMMERCIAL" and s["component_key"] == key]
         cols = _columns(per_source)
         standard = line["standard_amount"] if line else None
-        reference = cols["billed"] if cols["billed"] is not None else cols["booking"]
         effective_source = None
         if line and line["source_reference"]:
-            effective_source = _document_label(str(line["source_reference"]).split(":")[0])
+            effective_type = str(line["source_reference"]).split(":")[0]
+            effective_source = _document_label(effective_type)
+            # The canonical line already knows which document set its value;
+            # a source table written before that document was recorded
+            # still shows it in the right column.
+            if line["actual_amount"] is not None and cols[_column_for(effective_type)] is None:
+                cols[_column_for(effective_type)] = line["actual_amount"]
+        reference = cols["billed"] if cols["billed"] is not None else cols["booking"]
+        flags = _flags("COMMERCIAL", standard, cols["booking"], cols["billed"], cols["ledger"])
+        if _billed_disagree(per_source):
+            flags.append("INVOICES_DISAGREE")
         categories[component_category(key)].append({
             "key": key,
             "label": component_label(key),
@@ -534,7 +660,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             "effectiveSource": effective_source,
             "variance": _minus(reference, standard),
             "bookingVsBilled": _minus(cols["billed"], cols["booking"]),
-            "flags": _flags("COMMERCIAL", standard, cols["booking"], cols["billed"], cols["ledger"]),
+            "flags": flags,
             "sources": _source_list(per_source),
         })
 
@@ -632,6 +758,17 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     paid = _paid(connection, tenant_id=tenant_id, journey_id=journey_id)
     payable = net_cur or net_std
     invoiced = sum(1 for r in all_rows if r["billed"] is not None)
+    registry = get_registry()
+    invoices = [
+        {
+            "documentId": doc["documentId"], "documentType": doc["documentType"],
+            "label": registry.template_for_di_type(doc["documentType"], stage=None).display_name,
+            "number": doc["fields"].get("invoice_number") or doc["fields"].get("debit_note_number"),
+            "date": doc["fields"].get("invoice_date") or doc["fields"].get("debit_note_date"),
+            "total": _money(doc["fields"].get("grand_total_amount") or doc["fields"].get("total_amount")),
+        }
+        for doc in _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id, di_types=_INVOICE_TYPES)
+    ]
     return {
         "sku": {
             "skuCode": sku["sku_code"] if sku else None,
@@ -646,6 +783,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         },
         "categories": groups,
         "discounts": discount_rows,
+        # The invoices consolidated into this sheet, retail and tax alike.
+        "invoices": invoices,
         "declared": [
             {"key": key, "label": label,
              **{c: _money(v) for c, v in _columns(declared[key]).items()},
@@ -721,6 +860,7 @@ def addons(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[
     discounts = {d["key"]: d for d in deal_view["discounts"]}
     is_accessory = lambda p: "ACCESS" in str(p["addon_type_code"]).upper()
     return {
+        "taken": _taken_addons(connection, tenant_id=tenant_id, journey_id=journey_id, deal_view=deal_view),
         "insurance": {"records": insurance, "charges": lines.get("INSURANCE"),
                       "discount": discounts.get("INSURANCE")},
         "accessories": {"records": [p for p in plans if is_accessory(p)], "charges": lines.get("ACCESSORIES"),
@@ -814,59 +954,243 @@ def documents(connection: Connection, *, tenant_id: str, journey_id: UUID) -> di
 
 
 # ── payments ─────────────────────────────────────────────────────────────────
+_BANK_DATE_WINDOW_DAYS = 3
+_MIN_UTR_LEN = 6
+_BANK_METHOD_LABEL = {"REFERENCE_EXACT": "REFERENCE", "UTR_SUFFIX": "UTR", "AMOUNT_DATE": "AMOUNT_DATE"}
+
+
+def _normalize_ref(value: Any) -> str:
+    return "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+
+
+def _utr_suffix_match(left: str, right: str) -> bool:
+    stripped = left.lstrip("0")
+    return len(stripped) >= _MIN_UTR_LEN and right.endswith(stripped)
+
+
+def _is_cash(mode: Any) -> bool:
+    return _normalize_ref(mode).startswith("CASH")
+
+
+def _iso_day(value: Any) -> str | None:
+    parsed = parse_extracted_date(value)
+    return parsed.isoformat() if parsed else None
+
+
+def _bank_lines(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """Every bank statement entry read on the Journey, as the statement prints
+    it (one extracted entry per statement document)."""
+    lines = []
+    for doc in _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
+                               di_types=("bank_statement_extract",)):
+        f = doc["fields"]
+        credit, debit = _dec(f.get("credit_amount")), _dec(f.get("debit_amount"))
+        if credit is None and debit is None:
+            continue
+        lines.append({
+            "documentId": doc["documentId"],
+            "bank": f.get("bank_name"), "accountHolder": f.get("account_holder_name"),
+            "accountNumber": f.get("account_number"),
+            "date": _iso_day(f.get("transaction_date") or f.get("value_date")),
+            "description": f.get("transaction_description"), "reference": f.get("reference_no"),
+            "counterparty": f.get("counterparty_name"),
+            "credit": _money(credit), "debit": _money(debit), "balance": _money(f.get("running_balance")),
+            "matchedPaymentId": None, "matchedReceipt": None, "matchMethod": None,
+        })
+    lines.sort(key=lambda line: (line["date"] or "9999", line["documentId"]))
+    return lines
+
+
+def _match_bank_line(payment: dict[str, Any], lines: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, str]:
+    """The statement credit a receipt stands for: the same amount within a few
+    days of the receipt date, tied by the payment reference (UTR) when both
+    sides print one, else the one credit of that amount in the window."""
+    amount = _dec(payment["amount"])
+    receipt_date = parse_extracted_date(payment["receiptDate"])
+    reference = _normalize_ref(payment["reference"])
+    candidates = []
+    for line in lines:
+        if line["matchedPaymentId"] or amount is None or _dec(line["credit"]) != amount:
+            continue
+        line_date = parse_extracted_date(line["date"])
+        if receipt_date and line_date and abs((line_date - receipt_date).days) > _BANK_DATE_WINDOW_DAYS:
+            continue
+        candidates.append(line)
+    if not candidates:
+        return None, "NONE"
+    if reference:
+        exact = [line for line in candidates if _normalize_ref(line["reference"]) == reference]
+        if len(exact) == 1:
+            return exact[0], "REFERENCE"
+        suffix = [line for line in candidates if _normalize_ref(line["reference"]) and (
+            _utr_suffix_match(reference, _normalize_ref(line["reference"]))
+            or _utr_suffix_match(_normalize_ref(line["reference"]), reference))]
+        if not exact and len(suffix) == 1:
+            return suffix[0], "UTR"
+    if len(candidates) == 1:
+        return candidates[0], "AMOUNT_DATE"
+    return None, "AMBIGUOUS"
+
+
 def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """Every receipt on the Journey and what it is worth: the same receipt
+    uploaded twice (same number, amount and date) counts once, a receipt
+    whose document was removed counts nothing, and each counted receipt is
+    tied to the bank statement credit it stands for when a statement is on
+    file."""
     rows = connection.execute(
         text(
             """
             SELECT p.payment_id, p.amount, p.receipt_number, p.receipt_date, p.payment_at_utc,
                    COALESCE(p.payment_mode_code, p.payment_method_code) AS mode,
                    p.payment_stage, p.source_di_document_id, p.receipt_bank_name,
-                   p.payment_reference, p.status_source,
-                   e.association_status, e.document_type_key,
-                   (SELECT m.match_status FROM auditcore.payment_bank_matches m
-                     WHERE m.tenant_id=p.tenant_id AND m.payment_id=p.payment_id
-                     ORDER BY m.updated_at_utc DESC LIMIT 1) AS bank_match
+                   p.payment_reference, p.status_source, p.created_at_utc,
+                   e.association_status, e.document_type_key
             FROM auditcore.payments p
             LEFT JOIN auditcore.evidence e
               ON e.tenant_id=p.tenant_id AND e.journey_id=p.journey_id
              AND e.di_document_id=p.source_di_document_id
             WHERE p.tenant_id=:t AND p.journey_id=:j AND p.amount > 0
-            ORDER BY COALESCE(p.receipt_date, p.payment_at_utc::date) NULLS LAST, p.created_at_utc
+            ORDER BY COALESCE(p.receipt_date, p.payment_at_utc::date) NULLS LAST, p.created_at_utc, p.payment_id
             """
         ),
         {"t": tenant_id, "j": journey_id},
     ).mappings().all()
+    stored = {
+        str(r["payment_id"]): dict(r) for r in connection.execute(
+            text(
+                """
+                SELECT m.payment_id, m.match_status, m.match_method, bl.source_di_document_id
+                FROM auditcore.payment_bank_matches m
+                LEFT JOIN auditcore.bank_statement_lines bl
+                  ON bl.tenant_id=m.tenant_id AND bl.bank_statement_line_id=m.bank_statement_line_id
+                WHERE m.tenant_id=:t AND m.journey_id=:j
+                """
+            ),
+            {"t": tenant_id, "j": journey_id},
+        ).mappings().all()
+    }
+
+    # The same receipt again: same number, amount and date as an earlier one
+    # (same amount and date when neither prints a number).
+    eligible = [r for r in rows if r["status_source"] == "EVIDENCE" and r["association_status"] == "ACTIVE"]
+    records = [
+        ReceiptRecord(
+            document_id=r["payment_id"], stage_code="BOOKING", document_type_key="receipt",
+            receipt_number=normalize_receipt_number(r["receipt_number"]), amount=Decimal(str(r["amount"])),
+            receipt_date=normalize_receipt_date(r["receipt_date"]),
+        )
+        for r in eligible
+    ]
+    duplicate_of: dict[Any, Any] = {}
+    for group in compute_duplicate_groups(records):
+        if group.dates_match:
+            for later in group.documents[1:]:
+                duplicate_of[later.document_id] = group.documents[0].document_id
+    number_of = {r["payment_id"]: r["receipt_number"] for r in rows}
+    split = receipt_split(connection, tenant_id=tenant_id, journey_id=journey_id)
+    stage_of = {e["paymentId"]: "BOOKING" for e in split["BOOKING"]}
+    stage_of.update({e["paymentId"]: "DELIVERY" for e in split["DELIVERY"]})
+
+    lines = _bank_lines(connection, tenant_id=tenant_id, journey_id=journey_id)
+    by_document = {line["documentId"]: line for line in lines}
     items = []
     by_stage: dict[str, Decimal] = {}
     for r in rows:
-        counted = r["status_source"] == "EVIDENCE" and r["association_status"] == "ACTIVE"
+        payment_id = str(r["payment_id"])
+        evidenced = r["status_source"] == "EVIDENCE" and r["association_status"] == "ACTIVE"
+        original = duplicate_of.get(r["payment_id"])
+        counted = evidenced and original is None
         if counted:
-            stage = str(r["payment_stage"] or "BOOKING")
+            stage = stage_of.get(payment_id) or str(r["payment_stage"] or "BOOKING")
             by_stage[stage] = by_stage.get(stage, Decimal(0)) + Decimal(r["amount"])
-        items.append({
-            "paymentId": str(r["payment_id"]),
+        else:
+            stage = str(r["payment_stage"] or "BOOKING")
+        if original is not None:
+            reason = "Duplicate: the same receipt number, amount and date as " + (
+                f"receipt {number_of.get(original)}" if number_of.get(original) else "an earlier receipt")
+        elif not evidenced:
+            reason = "Document removed or replaced" if r["association_status"] else "No supporting document"
+        else:
+            reason = None
+        item = {
+            "paymentId": payment_id,
             "amount": _money(r["amount"]),
             "receiptNumber": r["receipt_number"],
             "receiptDate": r["receipt_date"] or r["payment_at_utc"],
             "mode": r["mode"],
-            "stage": r["payment_stage"],
+            "stage": stage,
             "bank": r["receipt_bank_name"],
             "reference": r["payment_reference"],
             "documentId": str(r["source_di_document_id"]) if r["source_di_document_id"] else None,
             "document": _document_label(r["document_type_key"]) if r["document_type_key"] else None,
             "counted": counted,
-            "notCountedReason": None if counted else (
-                "Document removed or replaced" if r["association_status"] else "No supporting document"
-            ),
-            "bankMatch": r["bank_match"],
-        })
+            "notCountedReason": reason,
+            "duplicateOf": str(original) if original is not None else None,
+            "bankMatch": None,
+            "bank_": None,
+        }
+        items.append(item)
+
+    # Tie each counted receipt to its statement credit: a match the
+    # reconciliation already recorded first, else read straight off the
+    # statement entries on file.
+    for item in items:
+        if not item["counted"]:
+            item["bankStatement"] = None
+            continue
+        if _is_cash(item["mode"]):
+            item["bankStatement"] = {"status": "NOT_APPLICABLE", "method": None, "documentId": None,
+                                     "date": None, "reference": None, "recorded": False}
+            item["bankMatch"] = "NOT_APPLICABLE"
+            continue
+        if not lines:
+            item["bankStatement"] = {"status": "NO_STATEMENT", "method": None, "documentId": None,
+                                     "date": None, "reference": None, "recorded": False}
+            item["bankMatch"] = "NO_STATEMENT"
+            continue
+        line, method, recorded = None, "NONE", False
+        known = stored.get(item["paymentId"])
+        if known and known["match_status"] == "MATCHED" and known["source_di_document_id"] is not None:
+            candidate = by_document.get(str(known["source_di_document_id"]))
+            if candidate is not None and not candidate["matchedPaymentId"]:
+                line, method, recorded = candidate, _BANK_METHOD_LABEL.get(str(known["match_method"]), "REFERENCE"), True
+        if line is None:
+            line, method = _match_bank_line(item, lines)
+        if line is not None:
+            line["matchedPaymentId"] = item["paymentId"]
+            line["matchedReceipt"] = item["receiptNumber"]
+            line["matchMethod"] = method
+            status = "MATCHED"
+        else:
+            status = "AMBIGUOUS" if method == "AMBIGUOUS" else "UNMATCHED"
+        item["bankStatement"] = {
+            "status": status, "method": method if line is not None else None,
+            "documentId": line["documentId"] if line else None, "date": line["date"] if line else None,
+            "reference": line["reference"] if line else None, "recorded": recorded,
+        }
+        item["bankMatch"] = status
+    for item in items:
+        item.pop("bank_", None)
+
     paid = _paid(connection, tenant_id=tenant_id, journey_id=journey_id)
+    credits = [_dec(line["credit"]) for line in lines if _dec(line["credit"]) is not None]
+    matched_credit = [_dec(line["credit"]) for line in lines if line["matchedPaymentId"] and _dec(line["credit"]) is not None]
     return {
         "items": items,
         "receiptsTotal": str(paid["receipts"]),
         "loanDisbursed": str(paid["loan"]),
         "paidTotal": str(paid["total"]),
         "byStage": {k: str(v) for k, v in by_stage.items()},
+        "duplicates": len(duplicate_of),
+        "bankStatement": {
+            "lines": lines,
+            "creditsTotal": str(sum(credits, Decimal(0))),
+            "matchedTotal": str(sum(matched_credit, Decimal(0))),
+            "matched": sum(1 for line in lines if line["matchedPaymentId"]),
+            "unmatchedCredits": sum(1 for line in lines if _dec(line["credit"]) and not line["matchedPaymentId"]),
+            "receiptsWithoutCredit": sum(1 for i in items if (i.get("bankStatement") or {}).get("status") in ("UNMATCHED", "AMBIGUOUS")),
+        },
     }
 
 
@@ -924,10 +1248,48 @@ _VALUATION_KEYS = (
 )
 
 
+def _identity(fields: dict[str, Any], keys: tuple[str, ...]) -> set[str]:
+    """Every number that identifies the document (certificate number, trade
+    number, registration...), so two readings that each caught a different
+    one still meet on any they share."""
+    tokens = set()
+    for key in keys:
+        token = "".join(c for c in str(fields.get(key) or "").upper() if c.isalnum())
+        if token:
+            tokens.add(f"{key}:{token}")
+    return tokens
+
+
+def _one_per_document(
+    documents: list[dict[str, Any]], *, keys: tuple[str, ...], identity: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """One record per real-world document. The same certificate read from two
+    uploads (or from two pages of one upload) carries the same number, so
+    the readings merge: every field takes the first value any reading
+    gave it, and the record names every document it came from."""
+    merged: list[dict[str, Any]] = []
+    for doc in documents:
+        ident = _identity(doc["fields"], identity)
+        picked = _pick(doc["fields"], keys)
+        target = next((m for m in merged if ident & m["identity"]), None)
+        if target is None:
+            merged.append({"identity": ident, "documentId": doc["documentId"], "documentIds": [doc["documentId"]], **picked})
+            continue
+        target["identity"] |= ident
+        target["documentIds"].append(doc["documentId"])
+        for key, value in picked.items():
+            if target.get(key) in (None, "") and value not in (None, ""):
+                target[key] = value
+    for record in merged:
+        record.pop("identity", None)
+    return merged
+
+
 def tradein(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     """Trade-in / Scrappage as Phase 1 lays it out: the booking form's
     exchange fields, the trade-in case, every Scrappage Certificate of
-    Deposit read on the Journey and any old-vehicle valuation report."""
+    Deposit read on the Journey (once each, however many times it was
+    uploaded) and any old-vehicle valuation report."""
     params = {"t": tenant_id, "j": journey_id}
     booking = next(iter(_document_facts(
         connection, tenant_id=tenant_id, journey_id=journey_id, di_types=("booking_form", "booking_docket"),
@@ -941,16 +1303,17 @@ def tradein(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
     trade_in = case[0] if case else None
     if trade_in:
         trade_in["variance"] = _minus(trade_in["actual_value"], trade_in["quoted_value"])
-    certificates = [
-        {"documentId": doc["documentId"], **_pick(doc["fields"], _CERTIFICATE_KEYS)}
-        for doc in _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
-                                   di_types=("scrappage_certificate_of_deposit",))
-    ]
-    valuations = [
-        {"documentId": doc["documentId"], **_pick(doc["fields"], _VALUATION_KEYS)}
-        for doc in _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
-                                   di_types=("valuation_report",))
-    ]
+    certificates = _one_per_document(
+        _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
+                        di_types=("scrappage_certificate_of_deposit",)),
+        keys=_CERTIFICATE_KEYS,
+        identity=("certificate_number", "trade_number", "old_vehicle_registration_number"),
+    )
+    valuations = _one_per_document(
+        _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id, di_types=("valuation_report",)),
+        keys=_VALUATION_KEYS,
+        identity=("report_number", "registration_number"),
+    )
     applicable = booking_fields.get("exchange_applicable")
     if isinstance(applicable, str):
         applicable = applicable.strip().lower() in ("yes", "true", "y", "1")
@@ -971,6 +1334,13 @@ _ADDON_COMPONENTS = {
     "warranty": ("additional_warranty_amount", "extended_warranty_amount"),
     "insurance": ("insurance_amount",),
 }
+# The document that proves each add-on was taken.
+_ADDON_DOCUMENTS = {
+    "accessories": ("accessory_invoice_dms", "accessory_invoice_tally"),
+    "warranty": ("ew_invoice",),
+    "insurance": ("insurance_cover",),
+}
+_ADDON_HINTS = {"accessories": ("ACCESS",), "warranty": ("WARRANTY",), "insurance": ("INSUR",)}
 _LINE_CATEGORIES = {
     "accessories": ("ACCESSORY_GENUINE", "ACCESSORY_NON_GENUINE"),
     "warranty": ("EXTENDED_WARRANTY",),
@@ -985,15 +1355,7 @@ def _line_items(documents: list[dict[str, Any]], categories: tuple[str, ...]) ->
     items: list[dict[str, Any]] = []
     seen: set[tuple[str, str | None]] = set()
     for doc in documents:
-        raw = doc["fields"].get("line_items")
-        if isinstance(raw, str):
-            try:
-                raw = json.loads(raw)
-            except ValueError:
-                raw = None
-        for entry in raw if isinstance(raw, list) else []:
-            if not isinstance(entry, dict):
-                continue
+        for entry in _line_entries(doc["fields"]):
             if str(entry.get("line_category") or "").upper() not in categories:
                 continue
             name = str(entry.get("description_raw") or entry.get("description") or entry.get("item_code") or "").strip()
@@ -1005,6 +1367,107 @@ def _line_items(documents: list[dict[str, Any]], categories: tuple[str, ...]) ->
             items.append({"name": name, "amount": amount, "quantity": entry.get("quantity"),
                           "itemCode": entry.get("item_code"), "documentId": doc["documentId"]})
     return items
+
+
+def _taken_addons(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, deal_view: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Whether accessories, an extended warranty and insurance were taken with
+    the car, for how much, from whom, and the items bought.
+
+    One answer for every tab: an add-on is taken when a document proves it
+    (the accessory invoice, the warranty invoice, the cover note), when an
+    invoice lists items of its kind, or when any source prices it above
+    zero. The amount is what was billed for it; the booking form's figure
+    stands only until an invoice or cover note is read, and its zero never
+    hides a policy that exists.
+    """
+    params = {"t": tenant_id, "j": journey_id}
+    by_key = {r["key"]: r for g in deal_view["categories"] for r in g["components"]}
+    invoices = _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id, di_types=_ITEM_SOURCES)
+    plans = {str(r["addon_type_code"]).upper(): r for r in _rows(connection, """
+        SELECT addon_type_code, provider_name, actual_amount, reference_number FROM auditcore.journey_addons
+        WHERE tenant_id=:t AND journey_id=:j""", params)}
+    insurer = _rows(connection, """
+        SELECT insurer_name, policy_reference, cover_note_reference, insurance_by, agent_intermediary_name,
+               agent_intermediary_code, misp_code, standard_premium_amount, actual_premium_amount, add_ons
+        FROM auditcore.insurance_records
+        WHERE tenant_id=:t AND journey_id=:j ORDER BY updated_at_utc DESC LIMIT 1""", params)
+    cover = next(iter(_document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                      di_types=("insurance_cover",))), None)
+    cover_fields = cover["fields"] if cover else {}
+    insurance_row = insurer[0] if insurer else {}
+    ew = next(iter(d for d in invoices if d["documentType"] == "ew_invoice"), None)
+    ew_fields = ew["fields"] if ew else {}
+    details: dict[str, dict[str, Any]] = {
+        "accessories": {
+            "invoiceNumbers": sorted({str(d["fields"].get("invoice_number")) for d in invoices
+                                      if d["documentType"].startswith("accessory_invoice") and d["fields"].get("invoice_number")}),
+        },
+        "insurance": {
+            "insurerName": insurance_row.get("insurer_name") or cover_fields.get("insurer_name"),
+            "policyNumber": insurance_row.get("policy_reference") or cover_fields.get("policy_number"),
+            "policyType": cover_fields.get("policy_type"),
+            "coverNoteReference": insurance_row.get("cover_note_reference"),
+            "insuranceBy": insurance_row.get("insurance_by"),
+            "policyStartDate": cover_fields.get("policy_start_date"),
+            "policyEndDate": cover_fields.get("policy_end_date"),
+            "issueDate": cover_fields.get("issue_date"),
+            "idvAmount": _money(cover_fields.get("idv_amount")),
+            "standardPremium": _money(insurance_row.get("standard_premium_amount")),
+            "actualPremium": _money(cover_fields.get("premium_amount") or insurance_row.get("actual_premium_amount")),
+            "addOns": cover_fields.get("add_ons") or insurance_row.get("add_ons"),
+            "agentName": insurance_row.get("agent_intermediary_name") or cover_fields.get("agent_intermediary_name"),
+            "agentCode": insurance_row.get("agent_intermediary_code") or cover_fields.get("agent_intermediary_code"),
+            "mispCode": insurance_row.get("misp_code") or cover_fields.get("misp_code"),
+        },
+        "warranty": {
+            "planName": ew_fields.get("plan_name"),
+            "providerName": ew_fields.get("seller_name"),
+            "invoiceNumber": ew_fields.get("invoice_number"),
+            "invoiceDate": ew_fields.get("invoice_date"),
+            "coverageStartDate": ew_fields.get("coverage_start_date"),
+            "coverageEndDate": ew_fields.get("coverage_end_date"),
+            "tenureMonths": ew_fields.get("tenure_months"),
+        },
+    }
+    out: dict[str, dict[str, Any]] = {}
+    for kind, components in _ADDON_COMPONENTS.items():
+        rows = [by_key[c] for c in components if c in by_key]
+        billed = [_dec(r["billed"]) for r in rows if r["billed"] is not None]
+        booking = [_dec(r["booking"]) for r in rows if r["booking"] is not None]
+        proof = [d for d in invoices if d["documentType"] in _ADDON_DOCUMENTS[kind]]
+        if kind == "insurance" and cover:
+            proof = [cover]
+        items = _line_items(invoices, _LINE_CATEGORIES[kind])
+        plan = next((plans[code] for code in plans if any(hint in code for hint in _ADDON_HINTS[kind])), None)
+        amount: Decimal | None
+        source: str | None
+        if billed:
+            amount, source = sum(billed, Decimal(0)), "billed"
+        elif kind == "insurance" and _dec(insurance_row.get("actual_premium_amount")) is not None:
+            amount, source = _dec(insurance_row.get("actual_premium_amount")), "billed"
+        elif plan is not None and _dec(plan["actual_amount"]) is not None:
+            amount, source = _dec(plan["actual_amount"]), "record"
+        elif booking and sum(booking, Decimal(0)) > 0:
+            amount, source = sum(booking, Decimal(0)), "booking"
+        else:
+            amount, source = None, None
+        provider = (plan or {}).get("provider_name")
+        if kind == "insurance":
+            provider = provider or details["insurance"]["insurerName"]
+        if kind == "warranty":
+            provider = provider or details["warranty"]["providerName"]
+        out[kind] = {
+            "taken": bool(proof or items or (amount is not None and amount > 0) or (kind == "insurance" and insurer)),
+            "amount": str(amount) if amount is not None else None,
+            "amountSource": source,
+            "provider": provider,
+            "items": items,
+            "details": {k: v for k, v in details[kind].items() if v not in (None, "", [])},
+            "documentIds": [d["documentId"] for d in proof],
+        }
+    return out
 
 
 def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
@@ -1039,82 +1502,10 @@ def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
     ).scalar_one()
 
     # Phase 1's Vehicle panel: what was taken with the car (accessories,
-    # extended warranty, insurance) with the items bought, the booking facts
-    # and how the delivery went.
-    lines = _rows(connection, """
-        SELECT component_key, actual_amount FROM auditcore.commercial_lines
-        WHERE tenant_id=:t AND journey_id=:j""", params)
-    by_component = {str(r["component_key"]): _dec(r["actual_amount"]) for r in lines}
-    invoices = _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id, di_types=_ITEM_SOURCES)
-    plans = {str(r["addon_type_code"]).upper(): r for r in _rows(connection, """
-        SELECT addon_type_code, provider_name, actual_amount FROM auditcore.journey_addons
-        WHERE tenant_id=:t AND journey_id=:j""", params)}
-    insurer = _rows(connection, """
-        SELECT insurer_name, policy_reference, cover_note_reference, insurance_by, agent_intermediary_name,
-               agent_intermediary_code, misp_code, standard_premium_amount, actual_premium_amount, add_ons
-        FROM auditcore.insurance_records
-        WHERE tenant_id=:t AND journey_id=:j ORDER BY updated_at_utc DESC LIMIT 1""", params)
-    cover = next(iter(_document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
-                                      di_types=("insurance_cover",))), None)
-    cover_fields = cover["fields"] if cover else {}
-    insurance_row = insurer[0] if insurer else {}
-    ew = next(iter(d for d in invoices if d["documentType"] == "ew_invoice"), None)
-    ew_fields = ew["fields"] if ew else {}
-    details: dict[str, dict[str, Any]] = {
-        "accessories": {
-            "invoiceNumbers": sorted({str(d["fields"].get("invoice_number")) for d in invoices
-                                      if d["documentType"].startswith("accessory_invoice") and d["fields"].get("invoice_number")}),
-        },
-        "insurance": {
-            "insurerName": insurance_row.get("insurer_name") or cover_fields.get("insurer_name"),
-            "policyNumber": insurance_row.get("policy_reference") or cover_fields.get("policy_number"),
-            "policyType": cover_fields.get("policy_type"),
-            "coverNoteReference": insurance_row.get("cover_note_reference"),
-            "insuranceBy": insurance_row.get("insurance_by"),
-            "policyStartDate": cover_fields.get("policy_start_date"),
-            "policyEndDate": cover_fields.get("policy_end_date"),
-            "issueDate": cover_fields.get("issue_date"),
-            "idvAmount": _money(cover_fields.get("idv_amount")),
-            "standardPremium": _money(insurance_row.get("standard_premium_amount")),
-            "actualPremium": _money(insurance_row.get("actual_premium_amount") or cover_fields.get("premium_amount")),
-            "addOns": insurance_row.get("add_ons") or cover_fields.get("add_ons"),
-            "agentName": insurance_row.get("agent_intermediary_name") or cover_fields.get("agent_intermediary_name"),
-            "agentCode": insurance_row.get("agent_intermediary_code") or cover_fields.get("agent_intermediary_code"),
-            "mispCode": insurance_row.get("misp_code") or cover_fields.get("misp_code"),
-        },
-        "warranty": {
-            "planName": ew_fields.get("plan_name"),
-            "providerName": ew_fields.get("seller_name"),
-            "invoiceNumber": ew_fields.get("invoice_number"),
-            "invoiceDate": ew_fields.get("invoice_date"),
-            "coverageStartDate": ew_fields.get("coverage_start_date"),
-            "coverageEndDate": ew_fields.get("coverage_end_date"),
-            "tenureMonths": ew_fields.get("tenure_months"),
-        },
-    }
-    addons: dict[str, Any] = {}
-    for kind, components in _ADDON_COMPONENTS.items():
-        amounts = [by_component[c] for c in components if by_component.get(c) is not None]
-        total = sum(amounts, Decimal(0)) if amounts else None
-        plan = next((plans[code] for code in plans if any(hint in code for hint in
-                     {"accessories": ("ACCESS",), "warranty": ("WARRANTY",), "insurance": ("INSUR",)}[kind])), None)
-        if total is None and plan is not None:
-            total = _dec(plan["actual_amount"])
-        if kind == "insurance" and total is None and insurer:
-            total = _dec(insurer[0]["actual_premium_amount"])
-        provider = (plan or {}).get("provider_name") or (insurer[0]["insurer_name"] if kind == "insurance" and insurer else None)
-        if kind == "warranty" and not provider:
-            provider = details["warranty"]["providerName"]
-        if kind == "warranty" and plan is not None:
-            details["warranty"].setdefault("referenceNumber", None)
-        items = _line_items(invoices, _LINE_CATEGORIES[kind])
-        addons[kind] = {
-            "taken": bool((total is not None and total > 0) or items),
-            "amount": str(total) if total is not None else None,
-            "provider": provider,
-            "items": items,
-            "details": {k: v for k, v in details[kind].items() if v not in (None, "", [])},
-        }
+    # extended warranty, insurance) with the items bought -- the same answer
+    # the Add-ons tab gives -- the booking facts and how the delivery went.
+    deal_view = deal(connection, tenant_id=tenant_id, journey_id=journey_id)
+    addons = _taken_addons(connection, tenant_id=tenant_id, journey_id=journey_id, deal_view=deal_view)
 
     booking_doc = next(iter(_document_facts(
         connection, tenant_id=tenant_id, journey_id=journey_id, di_types=("booking_form", "booking_docket"),
@@ -1824,10 +2215,16 @@ def audit(connection: Connection, *, tenant_id: str, journey_id: UUID, limit: in
     if len(events) > limit:
         events = events[-limit:]
 
+    # The stage durations and the time each role spent, so one tab holds
+    # everything the separate Timeline used to.
+    flow = _timeline(connection, tenant_id=tenant_id, journey_id=journey_id)
+
     return {
         "pc": pc,
         "milestones": milestones,
         "pending": pending,
+        "stages": flow["stages"],
+        "roles": flow["roles"],
         "tasks": {"summary": task_summary, "items": tasks},
         "events": [_plain(e) for e in events],
         "completion": completion,
