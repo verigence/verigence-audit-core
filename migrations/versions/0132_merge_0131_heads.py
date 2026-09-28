@@ -7,13 +7,13 @@ two heads and stopped every deployment at ``alembic upgrade head``. This
 empty merge revision gives the chain one head again; each database gets
 whichever of the two it is still missing.
 
-Revision ID: 0132_merge_p2_pc_name_and_onboarding
+Revision ID: 0132_merge_0131_heads
 Revises: 0131_uc03_p2_journey_pc_name, 0131_onboarding_workbook
 """
 
 from __future__ import annotations
 
-revision = "0132_merge_p2_pc_name_and_onboarding"
+revision = "0132_merge_0131_heads"
 down_revision = ("0131_uc03_p2_journey_pc_name", "0131_onboarding_workbook")
 branch_labels = None
 depends_on = None
