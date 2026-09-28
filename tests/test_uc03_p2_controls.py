@@ -248,6 +248,47 @@ def test_rule_engine_pass_resolves_the_stale_finding(journey, monkeypatch):
     assert status == "RESOLVED"
 
 
+class RetiredRuleEngine(FakeRuleEngine):
+    """Still evaluates a rule the catalogue retired in favour of a native check."""
+
+    def evaluate_phase(self, *, token, tenant_id, subject_id, phase):
+        result = super().evaluate_phase(token=token, tenant_id=tenant_id, subject_id=subject_id, phase=phase)
+        retired = SimpleNamespace(rule_code="DISCOUNT_BOOKING_EXCEEDS_APPROVAL", severity="CRITICAL",
+                                  category="DISCOUNT", detail="Booking promised discount exceeds approved amount",
+                                  left_value="40000", right_value="25000")
+        return SimpleNamespace(audit_run_id=result.audit_run_id, verdict=result.verdict,
+                               anomalies=(*result.anomalies, retired))
+
+    def list_rules(self, *, token, tenant_id):
+        return (*super().list_rules(token=token, tenant_id=tenant_id),
+                SimpleNamespace(rule_code="DISCOUNT_BOOKING_EXCEEDS_APPROVAL", phases=("BOOKING",)))
+
+
+def test_a_retired_rule_engine_rule_raises_nothing_and_closes_its_old_finding(journey, monkeypatch):
+    from audit_core.uc03_delivery_commands import _machine_flag
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        stale = _machine_flag(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id, stage_code="BOOKING",
+            rule_key="RE_DISCOUNT_BOOKING_EXCEEDS_APPROVAL", finding_type="DISCOUNT_ANOMALY", severity="HIGH",
+            title="Discount exceeds approval", description="old anomaly", correlation_id="t", safe_payload={},
+            blocking_completion=False,
+        )
+    _wire_rule_engine(monkeypatch, RetiredRuleEngine())
+    _evaluate(journey, "RULE_ENGINE:BOOKING")
+    state = _states(journey)
+    assert "DISCOUNT_BOOKING_EXCEEDS_APPROVAL" not in state  # not a control any more
+    assert state["PRICE_BOOKING_VS_INVOICE"]["control_status"] == "FAIL"  # the catalogued anomaly still lands
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        status = connection.execute(
+            text("SELECT finding_status FROM auditcore.audit_findings WHERE tenant_id=:t AND audit_finding_id=:f"),
+            {"t": journey.tenant_id, "f": stale},
+        ).scalar_one()
+    assert status == "RESOLVED"
+
+
 def _second_journey(journey):
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
