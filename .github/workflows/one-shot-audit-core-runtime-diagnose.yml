@@ -120,6 +120,78 @@ jobs:
               a = row.get("attributes") or row
               print(row.get("timestamp") or a.get("timestamp"), a.get("httpStatus"), a.get("totalDuration"), a.get("upstreamRspDuration"), a.get("method"), a.get("path"))
           ' | tail -120 || true
+      - name: Service settings (sleeping, replicas) and container restarts
+        shell: bash
+        run: |
+          set -uo pipefail
+          railway status --json >/tmp/status.json 2>/dev/null || true
+          python - <<'PY'
+          import json, os, urllib.request
+          from pathlib import Path
+          status = {}
+          try:
+              status = json.loads(Path("/tmp/status.json").read_text())
+          except Exception as exc:
+              print("railway status unavailable:", exc)
+          def find_env(node):
+              # the linked environment id, wherever the CLI puts it
+              if isinstance(node, dict):
+                  for key in ("environmentId", "environment_id"):
+                      if key in node: return node[key]
+                  env = node.get("environment")
+                  if isinstance(env, dict) and env.get("id"): return env["id"]
+                  for value in node.values():
+                      found = find_env(value)
+                      if found: return found
+              if isinstance(node, list):
+                  for value in node:
+                      found = find_env(value)
+                      if found: return found
+              return None
+          env_id = find_env(status)
+          print("environment id:", env_id)
+          if not env_id:
+              print(json.dumps(status)[:1500]); raise SystemExit(0)
+          query = """
+          query($env: String!) {
+            environment(id: $env) {
+              name
+              serviceInstances { edges { node {
+                serviceName sleepApplication numReplicas region restartPolicyType
+                healthcheckPath healthcheckTimeout startCommand
+              } } }
+            }
+          }"""
+          body = json.dumps({"query": query, "variables": {"env": env_id}}).encode()
+          req = urllib.request.Request("https://backboard.railway.com/graphql/v2", data=body, headers={
+              "Authorization": f"Bearer {os.environ['RAILWAY_API_TOKEN']}", "Content-Type": "application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  data = json.load(resp)
+          except Exception as exc:
+              print("GraphQL failed:", exc); raise SystemExit(0)
+          if data.get("errors"):
+              print("GraphQL errors:", data["errors"])
+          env = (data.get("data") or {}).get("environment") or {}
+          print("===== service settings in", env.get("name"))
+          for edge in (env.get("serviceInstances") or {}).get("edges") or []:
+              node = edge["node"]
+              print(f"{node['serviceName']:28s} sleepApplication={node.get('sleepApplication')}  replicas={node.get('numReplicas')}  region={node.get('region')}  restart={node.get('restartPolicyType')}  healthcheck={node.get('healthcheckPath')}")
+          PY
+          echo "===== $AUDIT_SERVICE: container start / stop lines in the last 6 hours"
+          railway logs --service "$AUDIT_SERVICE" --since 6h --lines 3000 2>/dev/null \
+            | grep -iE "startup|started server|uvicorn running|shutting down|shutdown|finished server|waiting for application|sleep|stopping|container" | tail -60 || true
+          echo "===== security: HTTP requests in the last 90 minutes over 1500 ms"
+          railway logs --service security --http --since 90m --lines 400 --json --filter "@totalDuration:>=1500" 2>/dev/null \
+            | python -c '
+          import json, sys
+          for line in sys.stdin:
+              line = line.strip()
+              if not line.startswith("{"): continue
+              try: row = json.loads(line)
+              except Exception: continue
+              print(row.get("timestamp"), row.get("httpStatus"), row.get("totalDuration"), row.get("upstreamRqDuration"), row.get("method"), row.get("path"))
+          ' | tail -40 || true
       - name: Direct timings from this runner
         shell: bash
         run: |
