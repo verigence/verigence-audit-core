@@ -1,12 +1,16 @@
 """P2 New Booking: one idempotent way to start a Journey."""
 from __future__ import annotations
 
+from uuid import UUID
+
 from fastapi.testclient import TestClient
+from p2_support import P2Journey, add_ready_document
 from sqlalchemy import text
 from test_uc03_create_booking import uc03_create_booking_setup  # noqa: F401  (fixture)
 
 from audit_core.db import set_tenant_context
 from audit_core.main import app
+from audit_core.uc03_p2_customer import sync_customer_name
 
 
 def test_new_booking_starts_a_journey_idempotently(uc03_create_booking_setup):  # noqa: F811
@@ -37,12 +41,65 @@ def test_new_booking_starts_a_journey_idempotently(uc03_create_booking_setup):  
     assert mine["price_variance"] == "0"  # nothing priced yet
 
 
-def test_new_booking_requires_a_customer_name(uc03_create_booking_setup):  # noqa: F811
+def _journey(setup, journey_id: str, customer_id: str) -> P2Journey:
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        dealer_id = connection.execute(
+            text("SELECT dealer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": setup["tenant_id"], "j": journey_id},
+        ).scalar_one()
+    return P2Journey(engine=setup["engine"], tenant_id=setup["tenant_id"], journey_id=UUID(journey_id),
+                     actor_id=setup["actor_id"], dealer_id=UUID(str(dealer_id)), outlet_id=UUID(str(setup["outlet_id"])),
+                     customer_id=UUID(customer_id))
+
+
+def _customer(setup, customer_id: str) -> dict:
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        return dict(connection.execute(
+            text("SELECT display_name, legal_name, legal_name_status FROM auditcore.customers "
+                 "WHERE tenant_id=:t AND customer_id=:c"),
+            {"t": setup["tenant_id"], "c": customer_id},
+        ).mappings().one())
+
+
+def _sync(journey: P2Journey) -> str:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return sync_customer_name(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+
+def test_new_booking_needs_no_customer_name_the_documents_name_the_customer(uc03_create_booking_setup):  # noqa: F811
+    """No name is typed: the Journey starts at once with its id as the
+    placeholder name, and the PAN card names the customer."""
     setup = uc03_create_booking_setup
     client = TestClient(app, raise_server_exceptions=False)
-    response = client.post(
-        f"/p2/v1/tenants/{setup['tenant_id']}/journeys",
-        headers={"Idempotency-Key": "p2-new-journey-002"},
-        json={"outletId": str(setup["outlet_id"]), "customerName": "   "},
-    )
-    assert response.status_code == 422
+    url = f"/p2/v1/tenants/{setup['tenant_id']}/journeys"
+    response = client.post(url, headers={"Idempotency-Key": "p2-new-journey-002"},
+                           json={"outletId": str(setup["outlet_id"])})
+    assert response.status_code == 201, response.text
+    journey_id, customer_id = response.json()["journeyId"], response.json()["customerId"]
+    assert _customer(setup, customer_id)["display_name"] == journey_id  # the placeholder the database knows
+    listed = client.get(url, params={"state": "open"}).json()["items"]
+    assert next(i for i in listed if i["journey_id"] == journey_id)["customer_name"] == journey_id
+    # Blank counts as no name too, and the same key replays the same Journey.
+    again = client.post(url, headers={"Idempotency-Key": "p2-new-journey-002"},
+                        json={"outletId": str(setup["outlet_id"]), "customerName": "   "})
+    assert again.status_code == 201 and again.json()["journeyId"] == journey_id
+
+    journey = _journey(setup, journey_id, customer_id)
+    add_ready_document(journey, "booking_form", customer_name="Mr. Biswabhanu Biswal", dealer_name="Sarthak Motors")
+    assert _sync(journey) == "NO_NAME"  # only the KYC names the customer
+
+    add_ready_document(journey, "pan_card", pan_number="ABCDE1234F", pan_name="BISWABHANU BISWAL")
+    assert _sync(journey) == "VERIFIED"
+    verified = _customer(setup, customer_id)
+    assert verified["legal_name"] == "BISWABHANU BISWAL" and verified["legal_name_status"] == "VERIFIED"
+    assert verified["display_name"] == "BISWABHANU BISWAL"  # the placeholder gave way to the KYC name
+    listed = client.get(url, params={"state": "open"}).json()["items"]
+    assert next(i for i in listed if i["journey_id"] == journey_id)["customer_name"] == "BISWABHANU BISWAL"
+    assert _sync(journey) == "UNCHANGED"
+    # Another KYC reading naming a different person never overwrites a verified name.
+    add_ready_document(journey, "aadhaar", aadhaar_number="1234", aadhaar_name="ANITA SAHOO")
+    assert _sync(journey) == "UNCHANGED"
+    assert _customer(setup, customer_id)["legal_name"] == "BISWABHANU BISWAL"

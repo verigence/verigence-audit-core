@@ -299,8 +299,13 @@ def _execute_create_booking_atomic(
     actor_id: str,
     idempotency_key: str,
     request_payload: dict[str, Any],
+    journey_id: UUID | None = None,
 ) -> dict[str, Any]:
-    """Create/replay the Booking in one PostgreSQL round trip."""
+    """Create/replay the Booking in one PostgreSQL round trip.
+
+    ``journey_id`` lets a caller choose the id up front, so a Journey that
+    starts without a customer name can carry that id as the placeholder
+    entered name the database recognises (migration 0058)."""
 
     request_hash = stable_request_hash(request_payload)
     lock_key = f"{tenant_id}:{_OPERATION_KEY}:{idempotency_key}"
@@ -339,12 +344,13 @@ def _execute_create_booking_atomic(
             ),
             new_journey AS (
                 INSERT INTO auditcore.journeys (
-                    tenant_id, dealer_id, outlet_id, customer_id,
+                    journey_id, tenant_id, dealer_id, outlet_id, customer_id,
                     document_requirement_profile_version_id,
                     policy_version_id, price_list_version_id,
                     created_by_actor_id
                 )
                 SELECT
+                    COALESCE(CAST(:journey_id AS uuid), gen_random_uuid()),
                     :tenant_id, :dealer_id, :outlet_id, c.customer_id,
                     :document_profile_version_id,
                     :policy_version_id, :price_list_version_id,
@@ -425,6 +431,7 @@ def _execute_create_booking_atomic(
             "dealer_id": context["dealer_id"],
             "outlet_id": context["outlet_id"],
             "customer_name": customer_name,
+            "journey_id": str(journey_id) if journey_id else None,
             "actor_id": actor_id,
             "document_profile_version_id": context["document_profile_version_id"],
             "policy_version_id": context["policy_version_id"],
