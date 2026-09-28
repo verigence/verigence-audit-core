@@ -5,20 +5,24 @@ Deal sheet, the receipts, the finance and trade-in records, the documents)
 and answer the questions a manual deal audit asks:
 
   Deal undercharged        DEAL_UNDERCHARGED           per price component + net
+                           TCS_SHORT                   statutory rate above the threshold
   Excess discount          EXCESS_DISCOUNT             per discount + total
-  Short payment            DELIVERED_ON_SHORT_PAYMENT, PAYMENT_AFTER_DELIVERY_WITHIN_7D,
-                           PAYMENT_AFTER_DELIVERY_BEYOND_7D
-  Financier (DO)           DO_PAYMENT_NOT_RECEIVED_12D, DO_SHORT_PAYMENT
-  Trade-in                 TRADE_IN_NOT_SOLD_90D, TRADE_IN_SOLD_AT_LOSS
+  Short payment            DELIVERED_ON_SHORT_PAYMENT, PAYMENT_AFTER_DELIVERY_WITHIN_GRACE,
+                           PAYMENT_AFTER_DELIVERY_BEYOND_GRACE
+  Financier (DO)           DO_PAYMENT_NOT_RECEIVED, DO_SHORT_PAYMENT
+  Trade-in                 TRADE_IN_NOT_RESOLD, TRADE_IN_SOLD_AT_LOSS
   Refund                   POST_DELIVERY_REFUND
+  Receipts                 CASH_ABOVE_LIMIT, PAYMENT_BEFORE_BOOKING
   Third-party payer        THIRD_PARTY_PAYMENT_UNCONFIRMED (PC question),
                            THIRD_PARTY_PAYMENT_UNDECLARED (TL violation)
   Cash intimation          CASH_INTIMATION_UNCONFIRMED (PC question), CASH_NOT_INTIMATED
   NDC signature            NDC_SIGNATURE_UNCONFIRMED (PC question), NDC_NOT_SIGNED
+  Accessories fitted       ACCESSORIES_FITTED_UNCONFIRMED (PC question), ACCESSORY_FITTED_UNBILLED
 
-A "PC question" control fails until the PC answers its task (the answer is
-the task's completion result); the paired violation control fails when the
-answer is No. Time-based checks are re-run by the worker when each window
+A "Manual Observations" control cannot be read from a document: its task
+asks a question and fails until a PC, TL or PM answers it (the answer and
+their remark are the task's completion result); the paired violation
+control fails when the answer is No and carries the remark. Time-based checks are re-run by the worker when each window
 closes (``schedule_post_delivery_checks``): the settlement window
 (P2_SETTLEMENT_GRACE_DAYS, 7) and the financier window
 (P2_FINANCE_DISBURSEMENT_DAYS, 12) for every delivery, the resale window
@@ -59,6 +63,11 @@ _LINE_TOLERANCE = Decimal(100)
 _SETTLEMENT_DAYS = int(os.environ.get("P2_SETTLEMENT_GRACE_DAYS", "7"))       # balance due after delivery
 _FINANCE_DAYS = int(os.environ.get("P2_FINANCE_DISBURSEMENT_DAYS", "12"))    # financier pays the delivery order
 _TRADE_IN_RESALE_DAYS = int(os.environ.get("P2_TRADE_IN_RESALE_DAYS", "90"))  # exchange vehicle resold
+# Statutory limits, set per deployment: a single cash receipt above the
+# limit (Income-tax Act s.269ST), TCS on a vehicle priced above the threshold.
+_CASH_RECEIPT_LIMIT = Decimal(os.environ.get("P2_CASH_RECEIPT_LIMIT", "200000"))
+_TCS_THRESHOLD = Decimal(os.environ.get("P2_TCS_THRESHOLD", "1000000"))
+_TCS_RATE_PERCENT = Decimal(os.environ.get("P2_TCS_RATE_PERCENT", "1"))
 
 _YES = {"value": "YES", "label": "Yes"}
 _NO = {"value": "NO", "label": "No", "requiresComment": True}
@@ -252,6 +261,17 @@ class _Facts:
         return None
 
     @cached_property
+    def booking_date(self) -> date | None:
+        booking = self.documents("booking_form", "booking_docket")
+        printed = _day((booking[0]["fields"] if booking else {}).get("booking_date"))
+        if printed:
+            return printed
+        return _day(self.connection.execute(
+            text("SELECT booking_confirmation_date FROM auditcore.bookings WHERE tenant_id=:t AND journey_id=:j"),
+            self._params,
+        ).scalar_one_or_none())
+
+    @cached_property
     def customer_name(self) -> str | None:
         row = self.connection.execute(
             text(
@@ -291,6 +311,14 @@ def _standards_known(facts: _Facts) -> bool:
     return any(c["standard"] is not None for g in facts.sheet["categories"] for c in g["components"])
 
 
+def _charged(row: dict[str, Any] | None) -> Decimal | None:
+    """What the customer is charged for a component: the invoice, else the
+    booking form, else the reconciled actual."""
+    if row is None:
+        return None
+    return next((_dec(row[c]) for c in ("billed", "booking", "effective") if row[c] is not None), None)
+
+
 _NO_STANDARD = "No standard price on record yet: the model must be resolved against a published price list first."
 
 
@@ -302,7 +330,7 @@ def deal_undercharged(facts: _Facts) -> RuleOutcome:
     for group in facts.sheet["categories"]:
         for row in group["components"]:
             standard = _dec(row["standard"])
-            charged = _dec(row["billed"]) if row["billed"] is not None else _dec(row["booking"])
+            charged = _charged(row)
             if standard is None or charged is None:
                 continue
             gap = standard - charged
@@ -371,6 +399,51 @@ def excess_discount(facts: _Facts) -> RuleOutcome:
     })
 
 
+def cash_above_limit(facts: _Facts) -> RuleOutcome:
+    code = "CASH_ABOVE_LIMIT"
+    over = [r for r in _cash(facts) if r["amount"] > _CASH_RECEIPT_LIMIT]
+    if not over:
+        return RuleOutcome(code, "PASS", f"No cash receipt above {_rupees(_CASH_RECEIPT_LIMIT)}.")
+    return RuleOutcome(code, "FAIL", (
+        f"{_cash_lines(over)}: above the {_rupees(_CASH_RECEIPT_LIMIT)} limit for a single cash receipt."
+    ), {"findingTitle": "Cash receipt above the statutory limit", "paymentIds": [r["paymentId"] for r in over]})
+
+
+def payment_before_booking(facts: _Facts) -> RuleOutcome:
+    code = "PAYMENT_BEFORE_BOOKING"
+    if not facts.receipts:
+        return RuleOutcome(code, "PASS", "No payment on this deal yet.")
+    booked = facts.booking_date
+    if booked is None:
+        return RuleOutcome(code, "SKIPPED", "The booking date has not been read yet.")
+    early = [r for r in facts.receipts if r["date"] and r["date"] < booked]
+    if not early:
+        return RuleOutcome(code, "PASS", f"Every payment is dated on or after the booking on {_when(booked)}.")
+    lines = "; ".join(f"{_rupees(r['amount'])} on {_when(r['date'])}"
+                      + (f" (receipt {r['receiptNumber']})" if r["receiptNumber"] else "") for r in early)
+    return RuleOutcome(code, "FAIL", f"{lines}: dated before the booking on {_when(booked)}.",
+                       {"findingTitle": "Payment dated before the booking", "paymentIds": [r["paymentId"] for r in early]})
+
+
+def tcs_short(facts: _Facts) -> RuleOutcome:
+    code = "TCS_SHORT"
+    rows = {c["key"]: c for g in facts.sheet["categories"] for c in g["components"]}
+    price = _charged(rows.get("ex_showroom_price"))
+    if price is None:
+        return RuleOutcome(code, "SKIPPED", "The ex-showroom price has not been read yet.")
+    if price <= _TCS_THRESHOLD:
+        return RuleOutcome(code, "PASS", f"Ex-showroom price {_rupees(price)} is within the TCS threshold of "
+                                         f"{_rupees(_TCS_THRESHOLD)}.")
+    expected = (price * _TCS_RATE_PERCENT / 100).quantize(Decimal("0.01"))
+    charged = _charged(rows.get("tcs_amount")) or Decimal(0)
+    if expected - charged > _LINE_TOLERANCE:
+        return RuleOutcome(code, "FAIL", (
+            f"TCS {_rupees(charged)} charged against {_rupees(expected)} due ({_TCS_RATE_PERCENT}% of the "
+            f"ex-showroom price {_rupees(price)}; {_rupees(expected - charged)} short)."
+        ), {"findingTitle": "TCS undercharged", "expected": str(expected), "observed": str(charged)})
+    return RuleOutcome(code, "PASS", f"TCS {_rupees(charged)} charged against {_rupees(expected)} due.")
+
+
 # ----------------------------------------------- bucket 2: after delivery
 
 
@@ -429,8 +502,8 @@ def _receipt_lines(rows: list[dict[str, Any]], delivered: date) -> str:
     )
 
 
-def payment_after_delivery_within_7d(facts: _Facts) -> RuleOutcome:
-    code = "PAYMENT_AFTER_DELIVERY_WITHIN_7D"
+def payment_after_delivery_within_grace(facts: _Facts) -> RuleOutcome:
+    code = "PAYMENT_AFTER_DELIVERY_WITHIN_GRACE"
     state = _at_delivery(facts)
     if isinstance(state, RuleOutcome):
         return RuleOutcome(code, state.outcome, state.reason)
@@ -446,8 +519,8 @@ def payment_after_delivery_within_7d(facts: _Facts) -> RuleOutcome:
         "paymentIds": [r["paymentId"] for r in late], "shortAtDelivery": str(state["short"])})
 
 
-def payment_after_delivery_beyond_7d(facts: _Facts) -> RuleOutcome:
-    code = "PAYMENT_AFTER_DELIVERY_BEYOND_7D"
+def payment_after_delivery_beyond_grace(facts: _Facts) -> RuleOutcome:
+    code = "PAYMENT_AFTER_DELIVERY_BEYOND_GRACE"
     state = _at_delivery(facts)
     if isinstance(state, RuleOutcome):
         return RuleOutcome(code, state.outcome, state.reason)
@@ -475,8 +548,8 @@ def payment_after_delivery_beyond_7d(facts: _Facts) -> RuleOutcome:
         "outstanding": str(outstanding), "deliveredOn": state["delivered"].isoformat()})
 
 
-def do_payment_not_received_12d(facts: _Facts) -> RuleOutcome:
-    code = "DO_PAYMENT_NOT_RECEIVED_12D"
+def do_payment_not_received(facts: _Facts) -> RuleOutcome:
+    code = "DO_PAYMENT_NOT_RECEIVED"
     finance = facts.finance
     if finance is None or finance["financed"] <= 0:
         return RuleOutcome(code, "PASS", "The deal is not financed.")
@@ -514,8 +587,8 @@ def do_short_payment(facts: _Facts) -> RuleOutcome:
                                      f"a sanction of {_rupees(finance['financed'])}.")
 
 
-def trade_in_not_sold_90d(facts: _Facts) -> RuleOutcome:
-    code = "TRADE_IN_NOT_SOLD_90D"
+def trade_in_not_resold(facts: _Facts) -> RuleOutcome:
+    code = "TRADE_IN_NOT_RESOLD"
     trade_in = facts.trade_in
     if trade_in is None:
         return RuleOutcome(code, "PASS", "No exchange vehicle on this deal.")
@@ -591,7 +664,7 @@ def _question(facts: _Facts, code: str, *, subjects: list[datetime], none: str, 
     answer = facts.answer(code)
     if answer and answer["at"] >= latest:
         label = next((a["label"] for a in answers if a["value"] == answer["value"]), answer["value"])
-        return RuleOutcome(code, "PASS", f"Answered by the PC on {_when(answer['at'])}: {label}.")
+        return RuleOutcome(code, "PASS", f"Answered on {_when(answer['at'])}: {label}{_remark(answer)}.")
     return RuleOutcome(code, "FAIL", question, {"findingTitle": title, "question": question, "answers": answers,
                                                  **details})
 
@@ -601,6 +674,12 @@ def _answered(facts: _Facts, code: str, subjects: list[datetime]) -> dict[str, A
         return None
     answer = facts.answer(code)
     return answer if answer and answer["at"] >= max(subjects) else None
+
+
+def _remark(answer: dict[str, Any]) -> str:
+    """The observer's own words, when they left any."""
+    comment = str(answer.get("comment") or "").strip()
+    return f': "{comment}"' if comment else ""
 
 
 def _third_party(facts: _Facts) -> list[dict[str, Any]]:
@@ -647,7 +726,7 @@ def third_party_payment_undeclared(facts: _Facts) -> RuleOutcome:
     if answer and answer["value"] == "NO":
         return RuleOutcome(code, "FAIL", (
             f"{_third_party_lines(rows)}, not by the customer {facts.customer_name}, with no third-party "
-            f"declaration or payer KYC on file (confirmed by the PC on {_when(answer['at'])})."
+            f"declaration or payer KYC on file (confirmed on {_when(answer['at'])}){_remark(answer)}."
         ), {"findingTitle": "Third-party payment without a declaration or KYC",
             "paymentIds": [r["paymentId"] for r in rows]})
     return RuleOutcome(code, "PASS", "No third-party payment without a declaration."
@@ -685,7 +764,7 @@ def cash_not_intimated(facts: _Facts) -> RuleOutcome:
     if answer and answer["value"] == "NO":
         return RuleOutcome(code, "FAIL", (
             f"{_cash_lines(rows)}, collected without intimation to the auditor "
-            f"(confirmed by the PC on {_when(answer['at'])})."
+            f"(confirmed on {_when(answer['at'])}){_remark(answer)}."
         ), {"findingTitle": "Cash collected without intimation", "paymentIds": [r["paymentId"] for r in rows]})
     return RuleOutcome(code, "PASS", "Cash collections were intimated." if rows else "No cash received on this deal.")
 
@@ -730,16 +809,47 @@ def ndc_not_signed(facts: _Facts) -> RuleOutcome:
                                          "document).", {"findingTitle": "No Dues Certificate not signed", **details})
     answer = _answered(facts, "NDC_SIGNATURE_UNCONFIRMED", [d["linkedAtUtc"] for d in docs])
     if answer and answer["value"] == "NO":
-        return RuleOutcome(code, "FAIL", f"The No Dues Certificate was not signed by the customer (confirmed by the "
-                                         f"PC on {_when(answer['at'])}).",
+        return RuleOutcome(code, "FAIL", f"The No Dues Certificate was not signed by the customer (confirmed on "
+                                         f"{_when(answer['at'])}){_remark(answer)}.",
                            {"findingTitle": "No Dues Certificate not signed", **details})
     if answer and answer["value"] == "NOT_WITNESSED":
-        return RuleOutcome(code, "FAIL", f"The No Dues Certificate was signed, but not in the PC's presence "
-                                         f"(confirmed by the PC on {_when(answer['at'])}).",
+        return RuleOutcome(code, "FAIL", f"The No Dues Certificate was signed, but not in the auditor's presence "
+                                         f"(confirmed on {_when(answer['at'])}){_remark(answer)}.",
                            {"findingTitle": "No Dues Certificate not signed in the auditor's presence", **details})
     if answer is None:
         return RuleOutcome(code, "SKIPPED", "Waiting for the PC to confirm how the No Dues Certificate was signed.")
-    return RuleOutcome(code, "PASS", f"Signed by the customer in the PC's presence (confirmed on {_when(answer['at'])}).")
+    return RuleOutcome(code, "PASS", f"Signed by the customer in the auditor's presence (confirmed on {_when(answer['at'])}){_remark(answer)}.")
+
+
+def accessories_fitted_unconfirmed(facts: _Facts) -> RuleOutcome:
+    code = "ACCESSORIES_FITTED_UNCONFIRMED"
+    docs = facts.documents("gate_pass", "accessory_invoice_dms", "accessory_invoice_tally")
+    if not docs:
+        return RuleOutcome(code, "SKIPPED", "Waiting for the delivery documents (gate pass or accessory invoice).")
+    return _question(
+        facts, code, subjects=[d["linkedAtUtc"] for d in docs], none="",
+        title="Confirm the accessories fitted on the car are billed",
+        question="Is every accessory fitted on the delivered car billed on an accessory invoice (DMS or Tally)?",
+        answers=[{"value": "YES", "label": "Yes, every fitted accessory is billed"},
+                 {"value": "NO", "label": "No, an accessory is fitted but not billed", "requiresComment": True}],
+        details={"documentIds": [d["documentId"] for d in docs]},
+    )
+
+
+def accessory_fitted_unbilled(facts: _Facts) -> RuleOutcome:
+    code = "ACCESSORY_FITTED_UNBILLED"
+    docs = facts.documents("gate_pass", "accessory_invoice_dms", "accessory_invoice_tally")
+    if not docs:
+        return RuleOutcome(code, "SKIPPED", "Waiting for the delivery documents (gate pass or accessory invoice).")
+    answer = _answered(facts, "ACCESSORIES_FITTED_UNCONFIRMED", [d["linkedAtUtc"] for d in docs])
+    if answer and answer["value"] == "NO":
+        return RuleOutcome(code, "FAIL", f"An accessory fitted on the car is not billed (confirmed on "
+                                         f"{_when(answer['at'])}){_remark(answer)}.",
+                           {"findingTitle": "Accessory fitted but not billed",
+                            "documentIds": [d["documentId"] for d in docs]})
+    if answer is None:
+        return RuleOutcome(code, "SKIPPED", "Waiting for the PC to confirm the accessories fitted are billed.")
+    return RuleOutcome(code, "PASS", f"Every fitted accessory is billed (confirmed on {_when(answer['at'])}){_remark(answer)}.")
 
 
 # ------------------------------------------------------------------ runner
@@ -747,15 +857,15 @@ def ndc_not_signed(facts: _Facts) -> RuleOutcome:
 # Journey-wide checks run with the Booking unit (always evaluated); checks
 # that need a delivery run with the Delivery unit.
 _BOOKING_RULES = (
-    deal_undercharged, excess_discount,
+    deal_undercharged, excess_discount, tcs_short,
     third_party_payment_unconfirmed, third_party_payment_undeclared,
-    cash_intimation_unconfirmed, cash_not_intimated,
+    cash_intimation_unconfirmed, cash_not_intimated, cash_above_limit, payment_before_booking,
 )
 _DELIVERY_RULES = (
-    delivered_on_short_payment, payment_after_delivery_within_7d, payment_after_delivery_beyond_7d,
-    do_payment_not_received_12d, do_short_payment,
-    trade_in_not_sold_90d, trade_in_sold_at_loss, post_delivery_refund,
-    ndc_signature_unconfirmed, ndc_not_signed,
+    delivered_on_short_payment, payment_after_delivery_within_grace, payment_after_delivery_beyond_grace,
+    do_payment_not_received, do_short_payment,
+    trade_in_not_resold, trade_in_sold_at_loss, post_delivery_refund,
+    ndc_signature_unconfirmed, ndc_not_signed, accessories_fitted_unconfirmed, accessory_fitted_unbilled,
 )
 RULE_CODES = {
     "BOOKING": tuple(r.__name__.upper() for r in _BOOKING_RULES),
@@ -791,20 +901,30 @@ def schedule_post_delivery_checks(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str | None = None,
 ) -> list[str]:
     """Queue the Delivery checks to run again the morning after each window
-    closes: the settlement and financier windows for every delivery, the
-    resale window only when an exchange vehicle was taken. Idempotent per
-    window; the windows are the P2_*_DAYS settings."""
+    closes, as soon as the delivery date is known (the gate pass is read or
+    the delivery recorded): the settlement and financier windows for every
+    delivery, the resale window only when an exchange vehicle was taken.
+    Each window is queued once; the windows are the P2_*_DAYS settings."""
     facts = _Facts(connection, tenant_id, journey_id)
-    delivered = facts.delivery_date or datetime.now(UTC).date()
-    now = datetime.now(UTC)
+    delivered = facts.delivery_date
+    if delivered is None:
+        return []
     windows = {"settlement": _SETTLEMENT_DAYS, "finance": _FINANCE_DAYS}
     if facts.trade_in is not None:
         windows["tradeIn"] = _TRADE_IN_RESALE_DAYS
+    queued = set(connection.execute(
+        text("SELECT work_key FROM auditcore.p2_work_queue WHERE tenant_id=:t AND journey_id=:j "
+             "AND work_type='CONTROL_EVALUATE' AND work_key LIKE :prefix"),
+        {"t": tenant_id, "j": journey_id, "prefix": f"unit:{journey_id}:NATIVE:DELIVERY:%"},
+    ).scalars().all())
+    now = datetime.now(UTC)
     keys = []
     for name, days in windows.items():
+        key = f"unit:{journey_id}:NATIVE:DELIVERY:{name}"
+        if key in queued:
+            continue
         # The morning after the window closes, so "more than N days" holds.
         fire_at = datetime.combine(delivered + timedelta(days=days + 1), time(0, 30), tzinfo=UTC)
-        key = f"unit:{journey_id}:NATIVE:DELIVERY:{name}"
         enqueue_work(
             connection, tenant_id=tenant_id, journey_id=journey_id, work_type="CONTROL_EVALUATE", work_key=key,
             payload={"unit": "NATIVE:DELIVERY", "force": True, "reason": f"{days} days after delivery ({name})"},

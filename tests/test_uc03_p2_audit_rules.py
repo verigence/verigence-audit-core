@@ -114,13 +114,14 @@ def _evaluate(journey, unit: str) -> None:
                                   transitions=transitions, evaluation_started_at=started)
 
 
-def _answer(journey, code: str, answer: str, comment: str = "noted") -> None:
+def _answer(journey, code: str, answer: str, comment: str = "noted", *, role: str = "PC") -> None:
     task = _task(journey, code)
     assert task is not None
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         submit_action(connection, tenant_id=journey.tenant_id, task_id=task["task_id"], action="COMPLETE_ACTION",
-                      actor_id=journey.actor_id, actor_role_code="PC", comment=comment, details={"answer": answer})
+                      actor_id=journey.actor_id if role == "PC" else f"{role.lower()}-1", actor_role_code=role,
+                      comment=comment, details={"answer": answer})
 
 
 # ------------------------------------------------------------ the deal
@@ -181,6 +182,7 @@ def test_cash_intimation_is_asked_answered_and_asked_again(journey):
     assert state["CASH_INTIMATION_UNCONFIRMED"]["control_status"] == "PASS"
     assert state["CASH_NOT_INTIMATED"]["control_status"] == "FAIL"
     assert "without intimation" in state["CASH_NOT_INTIMATED"]["status_reason"]
+    assert "Collected at the customer's home" in state["CASH_NOT_INTIMATED"]["status_reason"]
     violation = _task(journey, "CASH_NOT_INTIMATED")
     assert violation["task_type"] == "FINDING_REVIEW" and violation["assigned_role_code"] == "TL"
 
@@ -230,14 +232,14 @@ def test_short_payment_at_delivery_and_the_seven_day_windows(journey):
     short = result["DELIVERED_ON_SHORT_PAYMENT"]
     assert short.outcome == "FAIL"
     assert "₹6,00,000 received against ₹10,00,000 payable (₹4,00,000 short)" in short.reason
-    within = result["PAYMENT_AFTER_DELIVERY_WITHIN_7D"]
+    within = result["PAYMENT_AFTER_DELIVERY_WITHIN_GRACE"]
     assert within.outcome == "FAIL" and "₹3,00,000 on" in within.reason and "3 days after delivery" in within.reason
-    beyond = result["PAYMENT_AFTER_DELIVERY_BEYOND_7D"]
+    beyond = result["PAYMENT_AFTER_DELIVERY_BEYOND_GRACE"]
     assert beyond.outcome == "FAIL" and "₹50,000 on" in beyond.reason and "10 days after delivery" in beyond.reason
     assert result["POST_DELIVERY_REFUND"].outcome == "FAIL"
     assert "refund of ₹20,000" in result["POST_DELIVERY_REFUND"].reason
-    assert result["DO_PAYMENT_NOT_RECEIVED_12D"].outcome == "PASS"  # not financed
-    assert result["TRADE_IN_NOT_SOLD_90D"].outcome == "PASS"  # no exchange
+    assert result["DO_PAYMENT_NOT_RECEIVED"].outcome == "PASS"  # not financed
+    assert result["TRADE_IN_NOT_RESOLD"].outcome == "PASS"  # no exchange
 
 
 def test_balance_still_outstanding_waits_for_the_window_then_fails(journey):
@@ -246,15 +248,15 @@ def test_balance_still_outstanding_waits_for_the_window_then_fails(journey):
     _receipt(journey, "900000", TODAY - timedelta(days=3), "R-1")
     result = _run(journey, "DELIVERY")
     assert result["DELIVERED_ON_SHORT_PAYMENT"].outcome == "FAIL"
-    assert result["PAYMENT_AFTER_DELIVERY_BEYOND_7D"].outcome == "SKIPPED"
-    assert "₹1,00,000 is still outstanding" in result["PAYMENT_AFTER_DELIVERY_BEYOND_7D"].reason
+    assert result["PAYMENT_AFTER_DELIVERY_BEYOND_GRACE"].outcome == "SKIPPED"
+    assert "₹1,00,000 is still outstanding" in result["PAYMENT_AFTER_DELIVERY_BEYOND_GRACE"].reason
 
     _sql(journey, "UPDATE auditcore.journey_document_extracted_fields SET effective_value=CAST(:v AS jsonb) "
                   "WHERE tenant_id=:t AND field_key='delivery_date'",
          v=json.dumps((TODAY - timedelta(days=9)).isoformat()))
     result = _run(journey, "DELIVERY")
-    assert result["PAYMENT_AFTER_DELIVERY_BEYOND_7D"].outcome == "FAIL"
-    assert "9 days after delivery" in result["PAYMENT_AFTER_DELIVERY_BEYOND_7D"].reason
+    assert result["PAYMENT_AFTER_DELIVERY_BEYOND_GRACE"].outcome == "FAIL"
+    assert "9 days after delivery" in result["PAYMENT_AFTER_DELIVERY_BEYOND_GRACE"].reason
 
 
 def test_financier_windows(journey):
@@ -266,13 +268,13 @@ def test_financier_windows(journey):
     result = _run(journey, "DELIVERY")
     # The sanction counts as committed at delivery: not a short payment.
     assert result["DELIVERED_ON_SHORT_PAYMENT"].outcome == "PASS"
-    assert result["DO_PAYMENT_NOT_RECEIVED_12D"].outcome == "FAIL"
-    assert "No loan disbursement from HDFC Bank recorded 20 days after delivery" in result["DO_PAYMENT_NOT_RECEIVED_12D"].reason
+    assert result["DO_PAYMENT_NOT_RECEIVED"].outcome == "FAIL"
+    assert "No loan disbursement from HDFC Bank recorded 20 days after delivery" in result["DO_PAYMENT_NOT_RECEIVED"].reason
     assert result["DO_SHORT_PAYMENT"].outcome == "SKIPPED"
 
     _sql(journey, "UPDATE auditcore.finance_records SET loan_disbursement_amount=450000 WHERE tenant_id=:t")
     result = _run(journey, "DELIVERY")
-    assert result["DO_PAYMENT_NOT_RECEIVED_12D"].outcome == "PASS"
+    assert result["DO_PAYMENT_NOT_RECEIVED"].outcome == "PASS"
     assert result["DO_SHORT_PAYMENT"].outcome == "FAIL"
     assert "₹4,50,000 against a sanction of ₹5,00,000 (₹50,000 short)" in result["DO_SHORT_PAYMENT"].reason
 
@@ -284,14 +286,14 @@ def test_trade_in_resale_window_and_loss(journey):
     _sql(journey, "INSERT INTO auditcore.trade_in_cases (tenant_id, journey_id, old_vehicle_registration, "
                   "actual_value, handover_at_utc) VALUES (:t, :j, 'KA01AB1234', 300000, now() - interval '100 days')")
     result = _run(journey, "DELIVERY")
-    assert result["TRADE_IN_NOT_SOLD_90D"].outcome == "FAIL"
-    assert "KA01AB1234" in result["TRADE_IN_NOT_SOLD_90D"].reason and "100 days" in result["TRADE_IN_NOT_SOLD_90D"].reason
+    assert result["TRADE_IN_NOT_RESOLD"].outcome == "FAIL"
+    assert "KA01AB1234" in result["TRADE_IN_NOT_RESOLD"].reason and "100 days" in result["TRADE_IN_NOT_RESOLD"].reason
     assert result["TRADE_IN_SOLD_AT_LOSS"].outcome == "SKIPPED"
 
     _sql(journey, "UPDATE auditcore.trade_in_cases SET resale_at_utc=now(), details=CAST(:d AS jsonb) "
                   "WHERE tenant_id=:t", d=json.dumps({"resaleValue": 250000}))
     result = _run(journey, "DELIVERY")
-    assert result["TRADE_IN_NOT_SOLD_90D"].outcome == "PASS"
+    assert result["TRADE_IN_NOT_RESOLD"].outcome == "PASS"
     assert result["TRADE_IN_SOLD_AT_LOSS"].outcome == "FAIL"
     assert "resold for ₹2,50,000 against ₹3,00,000 allowed to the customer (₹50,000 loss)" in result["TRADE_IN_SOLD_AT_LOSS"].reason
 
@@ -312,12 +314,14 @@ def test_ndc_signature_is_confirmed_by_the_pc_or_read_from_the_document(journey)
     question = _task(journey, "NDC_SIGNATURE_UNCONFIRMED")
     assert [a["value"] for a in question["reference"]["answers"]] == ["YES", "NOT_WITNESSED", "NO"]
 
-    _answer(journey, "NDC_SIGNATURE_UNCONFIRMED", "NOT_WITNESSED", "Signed at the showroom before I arrived")
+    # An observation may be keyed in by the Team Lead as well as the PC.
+    _answer(journey, "NDC_SIGNATURE_UNCONFIRMED", "NOT_WITNESSED", "Signed at the showroom before I arrived", role="TL")
     _evaluate(journey, "NATIVE:DELIVERY")
     state = _states(journey)
     assert state["NDC_SIGNATURE_UNCONFIRMED"]["control_status"] == "PASS"
     assert state["NDC_NOT_SIGNED"]["control_status"] == "FAIL"
-    assert "not in the PC's presence" in state["NDC_NOT_SIGNED"]["status_reason"]
+    assert "not in the auditor's presence" in state["NDC_NOT_SIGNED"]["status_reason"]
+    assert 'Signed at the showroom before I arrived' in state["NDC_NOT_SIGNED"]["status_reason"]
     assert _task(journey, "NDC_NOT_SIGNED")["assigned_role_code"] == "TL"
 
 
@@ -328,15 +332,42 @@ def test_ndc_without_a_customer_signature_fails_from_the_reading(journey):
     assert "no customer signature" in result["NDC_NOT_SIGNED"].reason
 
 
+def test_accessories_fitted_is_asked_once_the_car_is_delivered(journey):
+    assert _run(journey, "DELIVERY")["ACCESSORIES_FITTED_UNCONFIRMED"].outcome == "SKIPPED"
+    _deliver(journey, TODAY - timedelta(days=1))
+    asked = _run(journey, "DELIVERY")["ACCESSORIES_FITTED_UNCONFIRMED"]
+    assert asked.outcome == "FAIL" and [a["value"] for a in asked.details["answers"]] == ["YES", "NO"]
+
+
+def test_cash_limit_tcs_and_payment_before_booking(journey):
+    add_ready_document(journey, "booking_form", booking_date="2026-09-10")
+    _receipt(journey, "250000", date(2026, 9, 12), "R-1", mode="CASH")
+    _receipt(journey, "10000", date(2026, 9, 1), "R-0")
+    _line(journey, "ex_showroom_price", "1500000", "1500000")
+    _line(journey, "tcs_amount", "15000", "5000")
+    _source(journey, "COMMERCIAL", "tcs_amount", "tax_invoice_tally", "5000")
+    result = _run(journey, "BOOKING")
+    assert result["CASH_ABOVE_LIMIT"].outcome == "FAIL" and "₹2,50,000 in cash" in result["CASH_ABOVE_LIMIT"].reason
+    assert result["PAYMENT_BEFORE_BOOKING"].outcome == "FAIL"
+    assert "₹10,000 on 01 Sep 2026 (receipt R-0): dated before the booking on 10 Sep 2026" in result["PAYMENT_BEFORE_BOOKING"].reason
+    assert result["TCS_SHORT"].outcome == "FAIL"
+    assert "TCS ₹5,000 charged against ₹15,000 due (1% of the ex-showroom price ₹15,00,000; ₹10,000 short)" in result["TCS_SHORT"].reason
+
+
 # ---------------------------------------------------------- the timers
 
 
 def test_post_delivery_checks_are_queued_per_window(journey):
     delivered = TODAY - timedelta(days=1)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert schedule_post_delivery_checks(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id) == []
     _deliver(journey, delivered)
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         keys = schedule_post_delivery_checks(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        # Queued once: a second settle adds nothing.
+        assert schedule_post_delivery_checks(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id) == []
     assert [k.rsplit(":", 1)[1] for k in keys] == ["settlement", "finance"]
     rows = _sql(journey, "SELECT work_key, payload, next_attempt_at_utc FROM auditcore.p2_work_queue "
                          "WHERE tenant_id=:t AND work_type='CONTROL_EVALUATE' ORDER BY work_key").mappings().all()
@@ -351,7 +382,7 @@ def test_post_delivery_checks_are_queued_per_window(journey):
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         keys = schedule_post_delivery_checks(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
-    assert keys[-1].endswith(":tradeIn")
+    assert [k.rsplit(":", 1)[1] for k in keys] == ["tradeIn"]
     row = _sql(journey, "SELECT next_attempt_at_utc FROM auditcore.p2_work_queue WHERE tenant_id=:t "
                         "AND work_key=:k", k=keys[-1]).scalar_one()
     assert row.date() == delivered + timedelta(days=91)

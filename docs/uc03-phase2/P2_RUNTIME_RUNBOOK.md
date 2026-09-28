@@ -49,10 +49,20 @@ checks the morning after each window closes):
 - `P2_SETTLEMENT_GRACE_DAYS` default 7 — balance received after delivery within /
   beyond this many days (`PAYMENT_AFTER_DELIVERY_*`)
 - `P2_FINANCE_DISBURSEMENT_DAYS` default 12 — financier must pay the delivery
-  order within this many days (`DO_PAYMENT_NOT_RECEIVED_12D`)
+  order within this many days (`DO_PAYMENT_NOT_RECEIVED`)
 - `P2_TRADE_IN_RESALE_DAYS` default 90 — an exchange vehicle must be resold within
-  this many days (`TRADE_IN_NOT_SOLD_90D`); this window is scheduled only for a
+  this many days (`TRADE_IN_NOT_RESOLD`); this window is scheduled only for a
   deal with an exchange vehicle
+
+The windows are queued as soon as the delivery date is known (gate pass read or
+delivery recorded), not only when P2 marks the delivery complete.
+
+Statutory limits:
+
+- `P2_CASH_RECEIPT_LIMIT` default 200000 — a single cash receipt above this
+  (`CASH_ABOVE_LIMIT`)
+- `P2_TCS_THRESHOLD` default 1000000 and `P2_TCS_RATE_PERCENT` default 1 — TCS due
+  on an ex-showroom price above the threshold (`TCS_SHORT`)
 
 Start conservatively. Increase concurrency only after observing DB pool, DI and
 object-storage latency.

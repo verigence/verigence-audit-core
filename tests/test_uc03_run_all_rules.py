@@ -85,7 +85,8 @@ def test_run_all_rules_for_a_fresh_booking_journey_returns_all_expected_rule_cod
         # The deal-audit checks that run with the Booking stage.
         "DEAL_UNDERCHARGED", "EXCESS_DISCOUNT",
         "THIRD_PARTY_PAYMENT_UNCONFIRMED", "THIRD_PARTY_PAYMENT_UNDECLARED",
-        "CASH_INTIMATION_UNCONFIRMED", "CASH_NOT_INTIMATED",
+        "CASH_INTIMATION_UNCONFIRMED", "CASH_NOT_INTIMATED", "CASH_ABOVE_LIMIT", "PAYMENT_BEFORE_BOOKING",
+        "TCS_SHORT",
     }
     # Nothing has been extracted yet -- every one of these is a clean SKIPPED,
     # except AUTOMATED_SYNC_FAILURE, which has no SKIPPED state of its own
@@ -94,7 +95,8 @@ def test_run_all_rules_for_a_fresh_booking_journey_returns_all_expected_rule_cod
     by_code = {r.ruleCode: r.outcome for r in results}
     assert by_code["AUTOMATED_SYNC_FAILURE"] == "PASS"
     passes = {"AUTOMATED_SYNC_FAILURE", "THIRD_PARTY_PAYMENT_UNCONFIRMED", "THIRD_PARTY_PAYMENT_UNDECLARED",
-              "CASH_INTIMATION_UNCONFIRMED", "CASH_NOT_INTIMATED", "EXCESS_DISCOUNT"}  # nothing paid or given yet
+              "CASH_INTIMATION_UNCONFIRMED", "CASH_NOT_INTIMATED", "EXCESS_DISCOUNT", "CASH_ABOVE_LIMIT",
+              "PAYMENT_BEFORE_BOOKING"}  # nothing paid or given yet
     assert all(outcome == ("PASS" if code in passes else "SKIPPED") for code, outcome in by_code.items())
     assert all(r.stage == "BOOKING" for r in results)
 
@@ -113,7 +115,7 @@ def test_run_all_rules_writes_execution_log_rows(run_all_rules_setup) -> None:
         ),
         {"t": tenant_id, "j": journey_id},
     ).mappings().all()
-    assert len(rows) == 14  # 8 sync rules + 6 deal-audit checks
+    assert len(rows) == 17  # 8 sync rules + 9 deal-audit checks
     assert all(row["triggering_event"] == "MANUAL_RUN_ALL_RULES" for row in rows)
 
 
@@ -134,8 +136,9 @@ def test_run_all_rules_for_delivery_stage_only_runs_delivery_scoped_rules(
     assert rule_codes == {
         "MODEL_NOT_IDENTIFIED", "MANUAL_VERIFICATION", "PAYMENT_BANK_UNMATCHED", "AUTOMATED_SYNC_FAILURE",
         # The deal-audit checks that need a delivery.
-        "DELIVERED_ON_SHORT_PAYMENT", "PAYMENT_AFTER_DELIVERY_WITHIN_7D", "PAYMENT_AFTER_DELIVERY_BEYOND_7D",
-        "DO_PAYMENT_NOT_RECEIVED_12D", "DO_SHORT_PAYMENT", "TRADE_IN_NOT_SOLD_90D", "TRADE_IN_SOLD_AT_LOSS",
+        "DELIVERED_ON_SHORT_PAYMENT", "PAYMENT_AFTER_DELIVERY_WITHIN_GRACE", "PAYMENT_AFTER_DELIVERY_BEYOND_GRACE",
+        "DO_PAYMENT_NOT_RECEIVED", "DO_SHORT_PAYMENT", "TRADE_IN_NOT_RESOLD", "TRADE_IN_SOLD_AT_LOSS",
         "POST_DELIVERY_REFUND", "NDC_SIGNATURE_UNCONFIRMED", "NDC_NOT_SIGNED",
+        "ACCESSORIES_FITTED_UNCONFIRMED", "ACCESSORY_FITTED_UNBILLED",
     }
     assert all(r.stage == "DELIVERY" for r in results)
