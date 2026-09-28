@@ -14,6 +14,8 @@ from __future__ import annotations
 import functools
 import json
 import random
+import time
+from dataclasses import dataclass, field
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -615,6 +617,160 @@ def _refresh_stage_audit_status(
     )
 
 
+@dataclass(frozen=True)
+class _FetchedDocument:
+    """DI's view of one document, fetched with no database transaction open.
+
+    ``not_found`` means DI said this exact document does not exist
+    (``DOCUMENT_NOT_FOUND``); the sync then voids the evidence link instead
+    of retrying forever (see _fetch_document_for_sync)."""
+
+    document: Any
+    facts: list[Any] = field(default_factory=list)
+    not_found: bool = False
+
+
+def _fetch_document_for_sync(
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    customer_id: Any,
+    document_id: UUID,
+    security_client: SecurityOAuthClient,
+    di_client: DiClient,
+) -> _FetchedDocument:
+    """The sync's only network work: a Security service token, DI's document
+    status and, once confirmed, its facts. Pure -- touches no database.
+
+    Kept apart from _sync_booking_document so the background task can run
+    it BEFORE opening the sync transaction. Confirmed live (2026-09-26 DEV
+    log, and again in the 2026-09-28 timeouts across unrelated screens):
+    each of these calls may wait up to 15s, and doing them inside the
+    transaction held that transaction -- its pooled connection, its
+    per-journey advisory lock and the locks its reads had taken -- open for
+    the whole wait, on every stuck document the 5-minute recovery sweep
+    re-tried, while foreground requests queued for the same rows and
+    connections. With the fetch outside, the transaction only ever does
+    database work and is measured in milliseconds, not network round trips.
+    """
+    context_ref = _external_context_ref(journey_id=journey_id, customer_id=customer_id)
+    try:
+        token = security_client.get_service_token(audience=_DI_AUDIENCE)
+        document = di_client.get_audit_document(
+            token=token,
+            tenant_id=tenant_id,
+            external_context_ref=context_ref,
+            document_id=str(document_id),
+        )
+    except DiClientError as exc:
+        # DI has authoritatively said this exact document does not exist --
+        # narrowly scoped to that specific code, not the broader
+        # `not exc.retryable` (which could also cover a different,
+        # genuinely audit-core-side bug, e.g. a malformed request, that
+        # shouldn't be silently voided). Every other DiClientError still
+        # falls through to the existing DependencyUnavailableError below,
+        # unchanged. Root-caused live (2026-09-26): this except block used
+        # to wrap EVERY DiClientError identically as "temporarily
+        # unavailable", discarding DI's own retryable/code classification
+        # -- so a document that will never exist got retried forever, once
+        # per sweep cycle (uc03_document_sync_recovery.py), indefinitely.
+        # The caller voids the evidence row (the same convention
+        # delete_unified_document uses for a document that's gone for a
+        # different reason, uc03_unified_document_capture.py) --
+        # _sync_booking_document's own early-return guard
+        # (association_status != 'ACTIVE') and _find_stale_document_syncs's
+        # own WHERE clause both already exclude a voided row, so this alone
+        # stops it being picked up again, for every caller of this sync
+        # path (the DI webhook, resync, and the sweep), not just the sweep.
+        if exc.code == "DOCUMENT_NOT_FOUND":
+            logger.warning(
+                "uc03_document_sync_permanently_failed_voided",
+                tenant_id=tenant_id,
+                journey_id=str(journey_id),
+                document_id=str(document_id),
+                di_error_code=exc.code,
+                di_status_code=exc.status_code,
+            )
+            return _FetchedDocument(document=None, not_found=True)
+        raise DependencyUnavailableError(
+            detail="Document extraction synchronization is temporarily unavailable."
+        ) from exc
+    except SecurityTokenError as exc:
+        raise DependencyUnavailableError(
+            detail="Document extraction synchronization is temporarily unavailable."
+        ) from exc
+
+    # Both slow, external DI calls happen here, before any database write --
+    # a write to auditcore.evidence (even though it looks unrelated) takes an
+    # implicit foreign-key lock on this document's journey_document_
+    # requirements row, and holding that lock across a *second* unbounded
+    # network call afterward is exactly what caused a live incident:
+    # concurrent DI document-link callbacks for that same requirement queued
+    # behind this connection and were cancelled on statement_timeout once it
+    # ran long (confirmed live: the blocking connection's last statement was
+    # this evidence UPDATE, sitting idle-in-transaction while a later step
+    # in this same function was still waiting on DI). Fetching facts here,
+    # ahead of the write, means every database statement in the sync from
+    # this point on is DB-only -- nothing left to hold a row lock open
+    # across.
+    confirmed = str(document.confirmation_status or "").upper() == "CONFIRMED"
+    facts: list[Any] = []
+    if confirmed:
+        try:
+            facts = di_client.get_audit_document_facts(
+                token=token,
+                tenant_id=tenant_id,
+                external_context_ref=context_ref,
+                document_id=str(document_id),
+            )
+        except DiClientError as exc:
+            raise DependencyUnavailableError(
+                detail="Document extraction facts are temporarily unavailable."
+            ) from exc
+    return _FetchedDocument(document=document, facts=list(facts))
+
+
+def _prefetch_document_for_sync(
+    engine: Engine,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    document_id: UUID,
+    security_client: SecurityOAuthClient,
+    di_client: DiClient,
+) -> _FetchedDocument | None:
+    """Background-task front half of the sync: a millisecond read of the
+    evidence link (its own short transaction, released before any network
+    call), then DI with nothing open. Returns None when the link is no
+    longer ACTIVE -- nothing to sync, the same early return
+    _sync_booking_document makes itself."""
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        link = connection.execute(
+            text(
+                """
+                SELECT e.association_status, j.customer_id
+                FROM auditcore.evidence e
+                JOIN auditcore.journeys j
+                  ON j.tenant_id=e.tenant_id AND j.journey_id=e.journey_id
+                WHERE e.tenant_id=:tenant_id AND e.journey_id=:journey_id
+                  AND e.di_document_id=:document_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "document_id": document_id},
+        ).mappings().one_or_none()
+    if link is None or str(link["association_status"]) != "ACTIVE":
+        return None
+    return _fetch_document_for_sync(
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        customer_id=link["customer_id"],
+        document_id=document_id,
+        security_client=security_client,
+        di_client=di_client,
+    )
+
+
 def _sync_booking_document(
     connection: Connection,
     *,
@@ -626,6 +782,7 @@ def _sync_booking_document(
     di_client: DiClient,
     bump_version: bool,
     stage_code: str = "BOOKING",
+    prefetched: _FetchedDocument | None = None,
 ) -> int:
     """The one per-document sync pipeline: DI status -> DOCUMENT_MISSING ->
     durable fact copy -> MANUAL_VERIFICATION -> stage-specific rules/triggers
@@ -692,102 +849,43 @@ def _sync_booking_document(
     if link is None or str(link["association_status"]) != "ACTIVE":
         return 0
 
-    try:
-        token = security_client.get_service_token(audience=_DI_AUDIENCE)
-        context_ref = _external_context_ref(
-            journey_id=journey_id,
-            customer_id=link["customer_id"],
+    # The background task (_run_sync_booking_document_task) fetches from DI
+    # before this transaction exists and passes the result in, so no network
+    # wait ever happens while this transaction, its connection and its
+    # locks are held. A direct caller without a prefetch (tests, any
+    # foreground path) still gets the same fetch inline, unchanged.
+    fetched = prefetched or _fetch_document_for_sync(
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        customer_id=link["customer_id"],
+        document_id=document_id,
+        security_client=security_client,
+        di_client=di_client,
+    )
+    if fetched.not_found:
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.evidence
+                SET association_status='VOIDED',
+                    void_reason='DI_DOCUMENT_NOT_FOUND',
+                    voided_by_actor_id=:actor_id,
+                    voided_at_utc=now()
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND di_document_id=:document_id AND association_status='ACTIVE'
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "journey_id": journey_id,
+                "document_id": document_id,
+                "actor_id": service_id,
+            },
         )
-        document = di_client.get_audit_document(
-            token=token,
-            tenant_id=tenant_id,
-            external_context_ref=context_ref,
-            document_id=str(document_id),
-        )
-    except DiClientError as exc:
-        # DI has authoritatively said this exact document does not exist --
-        # narrowly scoped to that specific code, not the broader
-        # `not exc.retryable` (which could also cover a different,
-        # genuinely audit-core-side bug, e.g. a malformed request, that
-        # shouldn't be silently voided). Every other DiClientError still
-        # falls through to the existing DependencyUnavailableError below,
-        # unchanged. Root-caused live (2026-09-26): this except block used
-        # to wrap EVERY DiClientError identically as "temporarily
-        # unavailable", discarding DI's own retryable/code classification
-        # -- so a document that will never exist got retried forever, once
-        # per sweep cycle (uc03_document_sync_recovery.py), indefinitely.
-        # Voiding it here uses the exact same convention
-        # delete_unified_document already uses for a document that's gone
-        # for a different reason (uc03_unified_document_capture.py) --
-        # _sync_booking_document's own early-return guard above
-        # (association_status != 'ACTIVE') and _find_stale_document_syncs's
-        # own WHERE clause both already exclude a voided row, so this alone
-        # stops it being picked up again, for every caller of this sync
-        # path (the DI webhook, resync, and the sweep), not just the sweep.
-        if exc.code == "DOCUMENT_NOT_FOUND":
-            logger.warning(
-                "uc03_document_sync_permanently_failed_voided",
-                tenant_id=tenant_id,
-                journey_id=str(journey_id),
-                document_id=str(document_id),
-                di_error_code=exc.code,
-                di_status_code=exc.status_code,
-            )
-            connection.execute(
-                text(
-                    """
-                    UPDATE auditcore.evidence
-                    SET association_status='VOIDED',
-                        void_reason='DI_DOCUMENT_NOT_FOUND',
-                        voided_by_actor_id=:actor_id,
-                        voided_at_utc=now()
-                    WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                      AND di_document_id=:document_id AND association_status='ACTIVE'
-                    """
-                ),
-                {
-                    "tenant_id": tenant_id,
-                    "journey_id": journey_id,
-                    "document_id": document_id,
-                    "actor_id": service_id,
-                },
-            )
-            return 0
-        raise DependencyUnavailableError(
-            detail="Document extraction synchronization is temporarily unavailable."
-        ) from exc
-    except SecurityTokenError as exc:
-        raise DependencyUnavailableError(
-            detail="Document extraction synchronization is temporarily unavailable."
-        ) from exc
-
-    # Both slow, external DI calls happen here, before any database write --
-    # a write to auditcore.evidence (even though it looks unrelated) takes an
-    # implicit foreign-key lock on this document's journey_document_
-    # requirements row, and holding that lock across a *second* unbounded
-    # network call afterward is exactly what caused a live incident:
-    # concurrent DI document-link callbacks for that same requirement queued
-    # behind this connection and were cancelled on statement_timeout once it
-    # ran long (confirmed live: the blocking connection's last statement was
-    # this evidence UPDATE, sitting idle-in-transaction while a later step
-    # in this same function was still waiting on DI). Fetching facts here,
-    # ahead of the write, means every database statement in this function
-    # from this point on is DB-only -- nothing left to hold a row lock open
-    # across.
+        return 0
+    document = fetched.document
+    facts = fetched.facts
     confirmed = str(document.confirmation_status or "").upper() == "CONFIRMED"
-    facts: list[Any] = []
-    if confirmed:
-        try:
-            facts = di_client.get_audit_document_facts(
-                token=token,
-                tenant_id=tenant_id,
-                external_context_ref=context_ref,
-                document_id=str(document_id),
-            )
-        except DiClientError as exc:
-            raise DependencyUnavailableError(
-                detail="Document extraction facts are temporarily unavailable."
-            ) from exc
 
     # Root-caused live (2026-09-27): this UPDATE takes an implicit foreign-
     # key lock on this document's journey_document_requirements row (the
@@ -1281,12 +1379,16 @@ def _sync_booking_document_once(
     stage_code: str,
     security_client: SecurityOAuthClient,
     di_client: DiClient,
+    prefetched: _FetchedDocument | None = None,
 ) -> None:
     """One attempt of the actual sync transaction. Kept as a plain sync
     function so _run_sync_booking_document_task can dispatch it onto a
     worker thread with anyio.to_thread.run_sync only for the duration of its
-    own blocking DB/HTTP work -- never for that function's between-attempts
-    sleep, which must not hold a thread (see its docstring)."""
+    own blocking DB work -- never for that function's between-attempts
+    sleep, which must not hold a thread (see its docstring). ``prefetched``
+    is DI's answer fetched by that task before this transaction opened
+    (_prefetch_document_for_sync), so the transaction below is database
+    work only."""
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
         # This transaction's own work (a DI facts fetch, durable
@@ -1321,6 +1423,7 @@ def _sync_booking_document_once(
             di_client=di_client,
             bump_version=True,
             stage_code=stage_code,
+            prefetched=prefetched,
         )
 
 
@@ -1450,10 +1553,34 @@ async def _run_sync_booking_document_task(
     # outlasts a large batch's realistic worst-case serialized time.
     max_attempts = 13
     retry_delay_seconds = (2.0, 4.0, 8.0, 15.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0)
+    # DI is asked BEFORE the sync transaction opens (see
+    # _fetch_document_for_sync for the live incidents this ends), and the
+    # answer is reused across lock-busy retries so a document queued behind
+    # a large batch does not re-fetch on each of its attempts. It is
+    # refreshed once it is older than this, so an attempt that finally gets
+    # the lock minutes later still applies DI's current view.
+    prefetch_max_age_seconds = 30.0
+    fetched: _FetchedDocument | None = None
+    fetched_at = 0.0
     try:
         security_client = next(security_provider)
         di_client = next(di_provider)
         for attempt in range(max_attempts):
+            if fetched is None or time.monotonic() - fetched_at > prefetch_max_age_seconds:
+                fetched = await anyio.to_thread.run_sync(
+                    functools.partial(
+                        _prefetch_document_for_sync,
+                        engine,
+                        tenant_id=tenant_id,
+                        journey_id=journey_id,
+                        document_id=document_id,
+                        security_client=security_client,
+                        di_client=di_client,
+                    )
+                )
+                fetched_at = time.monotonic()
+                if fetched is None:
+                    return  # the evidence link is no longer ACTIVE: nothing to sync
             try:
                 await anyio.to_thread.run_sync(
                     functools.partial(
@@ -1466,6 +1593,7 @@ async def _run_sync_booking_document_task(
                         stage_code=stage_code,
                         security_client=security_client,
                         di_client=di_client,
+                        prefetched=fetched,
                     )
                 )
                 break
