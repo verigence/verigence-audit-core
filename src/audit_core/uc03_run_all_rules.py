@@ -27,7 +27,7 @@ automatic one in the same audit trail.
 """
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
@@ -95,6 +95,8 @@ class RunAllRulesRuleResult(BaseModel):
     ruleCode: str
     stage: str
     outcome: str  # PASS | FAIL | SKIPPED | ERROR
+    reason: str | None = None
+    details: dict[str, Any] = {}
 
 
 class RunAllRulesResponse(BaseModel):
@@ -258,6 +260,20 @@ def _run_audit_core_rules_for_stage(
                 rule_code="PAYMENT_BANK_UNMATCHED", triggering_event=_TRIGGERING_EVENT, outcome=outcome,
             )
             _record("PAYMENT_BANK_UNMATCHED", outcome)
+
+    # The deal-audit checks (price, discounts, settlement, financier, trade-in,
+    # third-party payer, cash intimation, NDC): journey-wide ones run with
+    # BOOKING, delivery-dependent ones with DELIVERY.
+    from audit_core.uc03_p2_audit_rules import run_p2_audit_rules
+
+    for audit_result in run_p2_audit_rules(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage=stage,
+        correlation_id=correlation_id, triggering_event=_TRIGGERING_EVENT,
+    ):
+        results.append(RunAllRulesRuleResult(
+            ruleCode=audit_result.code, stage=stage, outcome=audit_result.outcome,
+            reason=audit_result.reason, details=audit_result.details,
+        ))
 
     return results
 
