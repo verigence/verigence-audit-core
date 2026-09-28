@@ -1136,6 +1136,12 @@ def compliance_report(connection: Connection, *, tenant_id: str, journey_id: UUI
     }
 
 
+def _timeline(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    from audit_core.uc03_p2_workflow import timeline
+
+    return timeline(connection, tenant_id=tenant_id, journey_id=journey_id)
+
+
 BUILDERS = {
     "deal": deal,
     "addons": addons,
@@ -1148,4 +1154,5 @@ BUILDERS = {
     "activity": activity,
     "duplicates": duplicates,
     "compliance-report": compliance_report,
+    "timeline": _timeline,
 }

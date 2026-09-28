@@ -1042,8 +1042,8 @@ document_types:
     di_types:
     - scrappage_certificate_of_deposit
     stage: DELIVERY
-    requirement: OPTIONAL
-    condition: scrappage discount support when claimed
+    requirement: CONDITIONAL
+    condition: SCRAPPAGE_CLAIMED
     accepted_early: true
     pages:
       shape: MULTI_PAGE

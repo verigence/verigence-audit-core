@@ -225,9 +225,25 @@ def unreviewed_fields(
     return pending
 
 
-def active_conditions(connection: Connection, *, tenant_id: str, journey_id: UUID) -> set[str]:
-    """Conditional requirements that apply: PC declaration or observed facts."""
-    active: set[str] = set()
+# Discounts whose claim requires a proof document (same keys as the deal
+# reconciliation's conditional-evidence check).
+_CLAIM_CONDITIONS = {
+    "CORPORATE_CUSTOMER": ("CORPORATE_PRIVILEGE", "CORPORATE", "corporate_discount_amount", "corporate_offer_amount"),
+    "EXCHANGE_TAKEN": ("EXCHANGE_BONUS", "EXCHANGE", "exchange_discount_amount", "exchange_claim_amount", "bonus_amount"),
+    "SCRAPPAGE_CLAIMED": ("SCRAPPAGE_BONUS_DEALER", "SCRAPPAGE_BONUS_COD", "scrappage_discount_amount"),
+}
+_CLAIM_REASONS = {
+    "CORPORATE_CUSTOMER": "The deal claims a corporate discount.",
+    "EXCHANGE_TAKEN": "The deal claims an exchange bonus.",
+    "SCRAPPAGE_CLAIMED": "The deal claims a scrappage bonus.",
+}
+
+
+def condition_reasons(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, str]:
+    """Conditional requirements that apply and why: a PC declaration, an
+    observed fact (corporate customer, trade-in on file) or a discount the
+    booking form / invoice claims -- a claimed corporate discount makes the
+    Corporate ID a required document even for an individual customer."""
     declared = connection.execute(
         text(
             """
@@ -252,16 +268,40 @@ def active_conditions(connection: Connection, *, tenant_id: str, journey_id: UUI
               EXISTS (
                 SELECT 1 FROM auditcore.trade_in_cases t
                 WHERE t.tenant_id=:tenant_id AND t.journey_id=:journey_id
-              ) AS exchange
+              ) AS exchange,
+              ARRAY(
+                SELECT DISTINCT discount_key FROM auditcore.discount_applications
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND COALESCE(actual_discount_amount, 0) > 0
+                UNION
+                SELECT DISTINCT component_key FROM auditcore.commercial_line_source_values
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND COALESCE(amount, 0) > 0
+              ) AS claimed
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().one()
-    if declared_map.get("corporateCustomer", bool(facts["corporate"])):
-        active.add("CORPORATE_CUSTOMER")
-    if declared_map.get("exchangeTaken", bool(facts["exchange"])):
-        active.add("EXCHANGE_TAKEN")
-    return active
+    claimed = {str(k) for k in (facts["claimed"] or [])}
+    reasons: dict[str, str] = {}
+    for condition, keys in _CLAIM_CONDITIONS.items():
+        if claimed.intersection(keys):
+            reasons[condition] = _CLAIM_REASONS[condition]
+    if facts["corporate"]:
+        reasons.setdefault("CORPORATE_CUSTOMER", "The customer is a company.")
+    if facts["exchange"]:
+        reasons.setdefault("EXCHANGE_TAKEN", "An exchange vehicle is on file.")
+    # A PC declaration decides either way when present.
+    for declaration, condition in (("corporateCustomer", "CORPORATE_CUSTOMER"), ("exchangeTaken", "EXCHANGE_TAKEN")):
+        if declaration in declared_map:
+            if declared_map[declaration]:
+                reasons.setdefault(condition, "Declared on the booking.")
+            elif condition in reasons and not claimed.intersection(_CLAIM_CONDITIONS[condition]):
+                reasons.pop(condition)
+    return reasons
+
+
+def active_conditions(connection: Connection, *, tenant_id: str, journey_id: UUID) -> set[str]:
+    """Conditional requirements that apply (see condition_reasons)."""
+    return set(condition_reasons(connection, tenant_id=tenant_id, journey_id=journey_id))
 
 
 def _evaluate_gate(
@@ -513,6 +553,11 @@ def recompute_journey_stage(
         "delivery": delivery,
         "conditions": sorted(conditions),
     }
+    if booking_state == "COMPLETE":
+        # Recorded on the existing journey workflow (idempotent).
+        from audit_core.uc03_p2_workflow import mark_booking_completed
+
+        mark_booking_completed(connection, tenant_id=tenant_id, journey_id=journey_id)
     if previous is None or previous["current_stage"] != stage or previous["booking_completion_state"] != booking_state:
         record_activity(
             connection,

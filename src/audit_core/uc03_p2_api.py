@@ -40,7 +40,7 @@ from audit_core.uc03_p2_controls import control_statistics
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_runtime import enqueue_work
 from audit_core.uc03_p2_stage import (
-    active_conditions,
+    condition_reasons,
     read_booking_stage,
     ready_document_count,
 )
@@ -48,6 +48,7 @@ from audit_core.uc03_p2_storage import (
     P2DocumentStorageError,
     get_p2_document_storage,
 )
+from audit_core.uc03_p2_submission import upload_status
 from audit_core.uc03_p2_tasks import create_p2_task, submit_action
 from audit_core.uc03_requirement_satisfaction import (
     linked_documents_for_journey,
@@ -263,7 +264,10 @@ def list_p2_journeys(
     connection: Annotated[Connection, Depends(get_connection)],
     q: str | None = None,
     limit: int = 100,
+    state: str = "all",
 ) -> dict[str, Any]:
+    """Bookings / Journey 360 list. ``state``: open (not yet delivered),
+    closed (delivered or cancelled) or all."""
     _authorize(
         connection,
         tenant_id=tenant_id,
@@ -317,6 +321,20 @@ def list_p2_journeys(
                       )
                   )
                   AND (
+                    CAST(:state AS varchar) = 'all'
+                    OR (CAST(:state AS varchar) = 'closed') = (
+                      EXISTS (SELECT 1 FROM auditcore.journey_stage_states st
+                              WHERE st.tenant_id=j.tenant_id AND st.journey_id=j.journey_id
+                                AND ((st.stage_code='DELIVERY' AND st.business_completed_at_utc IS NOT NULL)
+                                     OR (st.stage_code='BOOKING'
+                                         AND (st.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING')
+                                              OR st.closure_disposition='NO_DELIVERY'))))
+                      OR EXISTS (SELECT 1 FROM auditcore.deliveries dv
+                                 WHERE dv.tenant_id=j.tenant_id AND dv.journey_id=j.journey_id
+                                   AND dv.actual_delivered_at IS NOT NULL)
+                    )
+                  )
+                  AND (
                     :search = ''
                     OR c.display_name ILIKE '%' || :search || '%'
                     OR COALESCE(c.legal_name,'') ILIKE '%' || :search || '%'
@@ -337,7 +355,7 @@ def list_p2_journeys(
                          THEN 'DELIVERY_COMPLETE'
                        WHEN ds.journey_id IS NOT NULL OR dl.journey_id IS NOT NULL
                          THEN 'DELIVERY_DOCUMENT_UPLOAD'
-                       WHEN bs.business_completed_at_utc IS NOT NULL OR bs.booking_confirm_date IS NOT NULL
+                       WHEN bs.business_status='BOOKING_CLOSED' OR bs.booking_confirm_date IS NOT NULL
                          THEN 'BOOKING_COMPLETE'
                        ELSE 'BOOKING_DOCUMENT_UPLOAD'
                      END) AS current_stage,
@@ -350,8 +368,19 @@ def list_p2_journeys(
                    dl.actual_delivered_at AS delivered_at,
                    dl.planned_delivery_at AS planned_delivery_at,
                    (pr.journey_id IS NOT NULL) AS phase2,
+                   (ds.business_completed_at_utc IS NOT NULL OR dl.actual_delivered_at IS NOT NULL
+                    OR bs.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING')
+                    OR bs.closure_disposition='NO_DELIVERY') AS closed,
+                   (bs.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING')
+                    OR bs.closure_disposition='NO_DELIVERY') AS cancelled,
+                   bs.business_status AS booking_status,
+                   CASE WHEN bs.business_status='BOOKING_CLOSED' THEN bs.business_completed_at_utc END
+                     AS booking_completed_at,
+                   COALESCE(ds.business_completed_at_utc, dl.actual_delivered_at) AS delivery_completed_at,
+                   bs.capture_completed_at_utc AS booking_submitted_at,
+                   ds.capture_completed_at_utc AS delivery_submitted_at,
                    ev.documents,
-                   tk.total_tasks, tk.open_tasks, tk.overdue_tasks,
+                   tk.total_tasks, tk.open_tasks, tk.overdue_tasks, tk.pc_open_tasks, tk.tl_open_tasks,
                    fd.open_findings
             FROM page p
             LEFT JOIN auditcore.p2_journey_runtime pr
@@ -375,13 +404,17 @@ def list_p2_journeys(
             LEFT JOIN LATERAL (
               SELECT COUNT(*) AS total_tasks,
                      COUNT(*) FILTER (WHERE is_open) AS open_tasks,
-                     COUNT(*) FILTER (WHERE is_open AND due_at_utc < now()) AS overdue_tasks
+                     COUNT(*) FILTER (WHERE is_open AND due_at_utc < now()) AS overdue_tasks,
+                     COUNT(*) FILTER (WHERE is_open AND role='PC') AS pc_open_tasks,
+                     COUNT(*) FILTER (WHERE is_open AND role IN ('TL','PM')) AS tl_open_tasks
               FROM (
-                SELECT due_at_utc, task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER') AS is_open
+                SELECT due_at_utc, assigned_role_code AS role,
+                       task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER') AS is_open
                 FROM auditcore.p2_tasks
                 WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id
                 UNION ALL
-                SELECT due_at_utc, task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT') AS is_open
+                SELECT due_at_utc, assigned_role_code AS role,
+                       task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT') AS is_open
                 FROM auditcore.workflow_tasks
                 WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id
                   AND assigned_role_code IN ('PC','TL','PM','EXECUTIVE')
@@ -401,6 +434,7 @@ def list_p2_journeys(
             "actor_id": human_principal.subject,
             "search": search,
             "limit": min(max(limit, 1), 250),
+            "state": state if state in {"open", "closed", "all"} else "all",
         },
     ).mappings().all()
 
@@ -408,13 +442,104 @@ def list_p2_journeys(
     for row in rows:
         item = dict(row)
         item["journey_id"] = str(item["journey_id"])
-        for key in ("documents", "total_tasks", "open_tasks", "overdue_tasks", "open_findings"):
+        for key in ("documents", "total_tasks", "open_tasks", "overdue_tasks", "open_findings",
+                    "pc_open_tasks", "tl_open_tasks"):
             item[key] = int(item.get(key) or 0)
         for key in ("booking_receipt_total", "booking_minimum_amount"):
             if item.get(key) is not None:
                 item[key] = str(item[key])
         items.append(item)
     return {"items": items}
+
+
+@router.get("/journeys:summary")
+def journeys_summary(
+    tenant_id: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """What matters on the Bookings screen: what is open now, and what was
+    started and completed this week and this month (India time), with the
+    average time a booking and a delivery took to complete."""
+    _authorize(
+        connection, tenant_id=tenant_id, journey_id=None, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_READ_PERMISSION,
+    )
+    row = connection.execute(
+        text(
+            """
+            WITH scoped AS (
+              SELECT j.tenant_id, j.journey_id, j.created_at_utc,
+                     COALESCE(bs.first_started_at_utc, j.created_at_utc) AS booking_started,
+                     CASE WHEN bs.business_status='BOOKING_CLOSED' THEN bs.business_completed_at_utc END
+                       AS booking_completed,
+                     ds.first_started_at_utc AS delivery_started,
+                     COALESCE(ds.business_completed_at_utc, dl.actual_delivered_at) AS delivery_completed,
+                     COALESCE(bs.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING')
+                              OR bs.closure_disposition='NO_DELIVERY', false) AS cancelled,
+                     (pr.current_stage LIKE 'DELIVERY%' OR ds.journey_id IS NOT NULL OR dl.journey_id IS NOT NULL)
+                       AS in_delivery
+              FROM auditcore.journeys j
+              LEFT JOIN auditcore.p2_journey_runtime pr ON pr.tenant_id=j.tenant_id AND pr.journey_id=j.journey_id
+              LEFT JOIN auditcore.journey_stage_states bs
+                ON bs.tenant_id=j.tenant_id AND bs.journey_id=j.journey_id AND bs.stage_code='BOOKING'
+              LEFT JOIN auditcore.journey_stage_states ds
+                ON ds.tenant_id=j.tenant_id AND ds.journey_id=j.journey_id AND ds.stage_code='DELIVERY'
+              LEFT JOIN auditcore.deliveries dl ON dl.tenant_id=j.tenant_id AND dl.journey_id=j.journey_id
+              WHERE j.tenant_id=:tenant_id
+                AND EXISTS (
+                  SELECT 1 FROM auditcore.business_assignments ba
+                  WHERE ba.tenant_id=j.tenant_id AND ba.security_actor_id=:actor_id
+                    AND ba.assignment_status='ACTIVE' AND ba.effective_from <= now()
+                    AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+                    AND (ba.dealer_id IS NULL OR (ba.dealer_id=j.dealer_id
+                         AND (ba.outlet_id IS NULL OR ba.outlet_id=j.outlet_id)))
+                )
+            ),
+            bounds AS (
+              SELECT (date_trunc('week', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata') AS week_start,
+                     (date_trunc('month', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata') AS month_start
+            )
+            SELECT
+              COUNT(*) FILTER (WHERE booking_completed IS NULL AND NOT cancelled) AS open_bookings,
+              COUNT(*) FILTER (WHERE in_delivery AND delivery_completed IS NULL AND NOT cancelled) AS open_deliveries,
+              COUNT(*) FILTER (WHERE booking_started >= b.week_start) AS week_started,
+              COUNT(*) FILTER (WHERE booking_completed >= b.week_start) AS week_bookings_completed,
+              COUNT(*) FILTER (WHERE delivery_completed >= b.week_start) AS week_deliveries_completed,
+              COUNT(*) FILTER (WHERE booking_started >= b.month_start) AS month_started,
+              COUNT(*) FILTER (WHERE booking_completed >= b.month_start) AS month_bookings_completed,
+              COUNT(*) FILTER (WHERE delivery_completed >= b.month_start) AS month_deliveries_completed,
+              AVG(EXTRACT(EPOCH FROM booking_completed - booking_started) / 3600.0)
+                FILTER (WHERE booking_completed >= b.month_start) AS month_booking_hours,
+              AVG(EXTRACT(EPOCH FROM delivery_completed - COALESCE(delivery_started, booking_completed)) / 3600.0)
+                FILTER (WHERE delivery_completed >= b.month_start) AS month_delivery_hours
+            FROM scoped, bounds b
+            """
+        ),
+        {"tenant_id": tenant_id, "actor_id": human_principal.subject},
+    ).mappings().one()
+
+    def hours(value: Any) -> float | None:
+        return round(float(value), 1) if value is not None else None
+
+    return {
+        "open": {"bookings": int(row["open_bookings"] or 0), "deliveries": int(row["open_deliveries"] or 0)},
+        "week": {
+            "bookingsStarted": int(row["week_started"] or 0),
+            "bookingsCompleted": int(row["week_bookings_completed"] or 0),
+            "deliveriesCompleted": int(row["week_deliveries_completed"] or 0),
+        },
+        "month": {
+            "bookingsStarted": int(row["month_started"] or 0),
+            "bookingsCompleted": int(row["month_bookings_completed"] or 0),
+            "deliveriesCompleted": int(row["month_deliveries_completed"] or 0),
+            "avgBookingHours": hours(row["month_booking_hours"]),
+            "avgDeliveryHours": hours(row["month_delivery_hours"]),
+        },
+    }
 
 
 class UploadInitFile(BaseModel):
@@ -1106,7 +1231,8 @@ def list_documents(
             doc["supersedesEvidenceId"] = None
         documents.append(doc)
 
-    conditions = active_conditions(connection, tenant_id=tenant_id, journey_id=journey_id)
+    reasons = condition_reasons(connection, tenant_id=tenant_id, journey_id=journey_id)
+    conditions = set(reasons)
     checklist = []
     for stage_code in ("BOOKING", "DELIVERY"):
         for template in registry.stage_documents(stage_code, conditions=conditions):
@@ -1119,6 +1245,7 @@ def list_documents(
                     "displayName": template.display_name,
                     "stage": stage_code,
                     "requirement": template.requirement,
+                    "reason": reasons.get(template.condition) if template.condition else None,
                     "status": "RECEIVED" if ready else "MISSING",
                     "readyCount": ready,
                     "documentIds": [
@@ -1133,6 +1260,7 @@ def list_documents(
         "documents": documents,
         "checklist": checklist,
         "conditions": sorted(conditions),
+        **upload_status(connection, tenant_id=tenant_id, journey_id=journey_id),
     }
 
 
