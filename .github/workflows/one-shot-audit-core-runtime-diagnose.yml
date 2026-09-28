@@ -1,0 +1,123 @@
+name: One-shot Audit Core runtime diagnose
+
+# Read-only: prints recent Railway DEV logs of the Audit Core API and the
+# P2 worker, summarised by slow / failed request, so a reported timeout
+# (WEB-AC-TIMEOUT on the Phase 2 lists) can be traced to the endpoint and
+# the duration Audit Core itself measured. Manual trigger only.
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/one-shot-audit-core-runtime-diagnose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      WORKER_SERVICE: verigence-p2-worker
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: npm install --global @railway/cli
+      - name: Collect recent logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN secret is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway deployment list --service "$AUDIT_SERVICE" --limit 3 --json >/tmp/audit-deployments.json || true
+          railway deployment list --service "$WORKER_SERVICE" --limit 3 --json >/tmp/worker-deployments.json || true
+          railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 4000 >/tmp/audit.log 2>/tmp/audit.err || true
+          railway logs --service "$WORKER_SERVICE" --latest --deployment --lines 1500 >/tmp/worker.log 2>/tmp/worker.err || true
+          wc -l /tmp/audit.log /tmp/worker.log
+          cat /tmp/audit.err /tmp/worker.err || true
+      - name: Summarise
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, re, collections
+          from pathlib import Path
+
+          def show(title, path):
+              print(f"\n===== {title}")
+              try:
+                  rows = json.loads(Path(path).read_text())
+              except Exception as exc:
+                  print("unavailable:", exc); return
+              for row in rows:
+                  print(row.get("id"), row.get("status"), row.get("createdAt"), (row.get("meta") or {}).get("commitHash", "")[:8])
+          show("Audit Core deployments", "/tmp/audit-deployments.json")
+          show("P2 worker deployments", "/tmp/worker-deployments.json")
+
+          def parse(line):
+              i = line.find("{")
+              if i < 0: return None
+              try: return json.loads(line[i:])
+              except Exception: return None
+
+          audit = Path("/tmp/audit.log").read_text(errors="replace").splitlines()
+          print(f"\n===== Audit Core: {len(audit)} log lines")
+          slow = collections.defaultdict(list)
+          failed = collections.Counter()
+          other = collections.Counter()
+          raw_interest = []
+          for line in audit:
+              ev = parse(line)
+              if ev is None:
+                  low = line.lower()
+                  if any(k in low for k in ("timeout", "queuepool", "canceling statement", "traceback", "error", "exception", "listen", "notify")):
+                      raw_interest.append(line[:400])
+                  continue
+              name = ev.get("event") or ev.get("event_name") or ""
+              if name == "http_request_slow":
+                  slow[(ev.get("method"), re.sub(r"[0-9a-f]{8}-[0-9a-f-]{27}", "{id}", str(ev.get("path"))))].append(float(ev.get("duration_ms") or 0))
+              elif name == "http_request_failed":
+                  failed[(ev.get("method"), re.sub(r"[0-9a-f]{8}-[0-9a-f-]{27}", "{id}", str(ev.get("path"))), ev.get("status_code"))] += 1
+              elif ev.get("level") in ("warning", "error", "critical"):
+                  other[name] += 1
+          print("\n--- slow requests (>threshold), by route: count / max ms / avg ms")
+          for key, durations in sorted(slow.items(), key=lambda kv: -max(kv[1])):
+              print(f"{len(durations):4d}  max {max(durations):9.0f}  avg {sum(durations)/len(durations):9.0f}  {key[0]} {key[1]}")
+          print("\n--- failed requests, by route and status")
+          for key, n in failed.most_common(40):
+              print(f"{n:4d}  {key[0]} {key[1]} -> {key[2]}")
+          print("\n--- other warnings / errors, by event")
+          for key, n in other.most_common(40):
+              print(f"{n:4d}  {key}")
+          print("\n--- raw lines of interest (last 80)")
+          for line in raw_interest[-80:]:
+              print(line)
+          print("\n--- last 60 warning/error events in full")
+          shown = 0
+          for line in reversed(audit):
+              ev = parse(line)
+              if ev and ev.get("level") in ("warning", "error", "critical"):
+                  print(json.dumps({k: v for k, v in ev.items() if k not in ("exc_info",)})[:700])
+                  shown += 1
+                  if shown >= 60: break
+
+          worker = Path("/tmp/worker.log").read_text(errors="replace").splitlines()
+          print(f"\n===== P2 worker: {len(worker)} log lines")
+          wcount = collections.Counter()
+          for line in worker:
+              ev = parse(line)
+              wcount[(ev.get("event") if ev else "raw", ev.get("level") if ev else "")] += 1
+          for key, n in wcount.most_common(40):
+              print(f"{n:5d}  {key}")
+          print("\n--- worker: last 40 warning/error lines")
+          shown = 0
+          for line in reversed(worker):
+              ev = parse(line)
+              if (ev and ev.get("level") in ("warning", "error", "critical")) or (not ev and ("error" in line.lower() or "traceback" in line.lower())):
+                  print(line[:700]); shown += 1
+                  if shown >= 40: break
+          PY
