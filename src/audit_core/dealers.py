@@ -19,17 +19,24 @@ from audit_core.errors import (
     ValidationError,
 )
 from audit_core.idempotency import execute_idempotent_json_command
+from audit_core.onboarding_workbook import derive_dealer_code
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["dealers"])
+
+
+_CODE = r"^[A-Za-z0-9][A-Za-z0-9_.-]*$"
 
 
 class DealerCreate(BaseModel):
     dealerName: str = Field(min_length=1, max_length=240)
     legalName: str | None = Field(default=None, max_length=240)
+    # Blank: the dealership's initials + the Project OEM (Aditya Motors -> AM-MAH).
+    dealerCode: str | None = Field(default=None, max_length=60, pattern=_CODE)
 
 
 class DealerPatch(BaseModel):
     dealerName: str | None = Field(default=None, min_length=1, max_length=240)
+    dealerCode: str | None = Field(default=None, min_length=1, max_length=60, pattern=_CODE)
     legalName: str | None = Field(default=None, max_length=240)
     status: Literal["ACTIVE", "INACTIVE"] | None = None
 
@@ -45,6 +52,7 @@ class DealerResponse(BaseModel):
 
 class OutletCreate(BaseModel):
     outletName: str = Field(min_length=1, max_length=240)
+    outletCode: str | None = Field(default=None, max_length=80, pattern=_CODE)
     outletClassification: Literal["ONSITE", "SATELLITE"] = "ONSITE"
     addressText: str | None = None
     city: str | None = Field(default=None, max_length=160)
@@ -58,6 +66,7 @@ class OutletCreate(BaseModel):
 
 class OutletPatch(BaseModel):
     outletName: str | None = Field(default=None, min_length=1, max_length=240)
+    outletCode: str | None = Field(default=None, min_length=1, max_length=80, pattern=_CODE)
     outletClassification: Literal["ONSITE", "SATELLITE"] | None = None
     addressText: str | None = None
     city: str | None = Field(default=None, max_length=160)
@@ -275,6 +284,36 @@ def _can_delete(dependencies: dict[str, int]) -> bool:
     return not any(dependencies.values())
 
 
+def _default_dealer_code(connection: Connection, tenant_id: str, dealer_name: str) -> str:
+    oem_code = connection.execute(
+        text(
+            "SELECT o.oem_code FROM auditcore.projects p JOIN auditcore.oems o ON o.oem_id=p.oem_id "
+            "WHERE p.tenant_id=:tenant_id"
+        ),
+        {"tenant_id": tenant_id},
+    ).scalar_one_or_none()
+    return derive_dealer_code(dealer_name, str(oem_code or ""))
+
+
+def _require_free_code(connection: Connection, table: str, column: str, tenant_id: str, code: str,
+                       label: str, *, except_id: UUID | None = None) -> None:
+    """Codes are unique within the Project, whatever their case."""
+    id_column = "dealer_id" if table == "dealers" else "outlet_id"
+    taken = connection.execute(
+        text(
+            f"SELECT 1 FROM auditcore.{table} WHERE tenant_id=:tenant_id AND upper({column})=upper(:code) "
+            f"AND (CAST(:except_id AS uuid) IS NULL OR {id_column} <> CAST(:except_id AS uuid)) LIMIT 1"
+        ),
+        {"tenant_id": tenant_id, "code": code, "except_id": except_id},
+    ).scalar_one_or_none()
+    if taken:
+        raise ConflictError(
+            error_code="VAC-CONFLICT-002",
+            title=f"{label} code already used",
+            detail=f"{label} code {code} is already used in this Project. Choose another code.",
+        )
+
+
 @router.post("/dealers", response_model=DealerResponse, status_code=status.HTTP_201_CREATED)
 def create_dealer(
     tenant_id: str,
@@ -285,6 +324,8 @@ def create_dealer(
 ) -> DealerResponse:
     set_tenant_context(connection, tenant_id)
     dealer_id = uuid4()
+    dealer_code = payload.dealerCode or _default_dealer_code(connection, tenant_id, payload.dealerName)
+    _require_free_code(connection, "dealers", "dealer_code", tenant_id, dealer_code, "Dealer")
     row = connection.execute(
         text(
             """
@@ -301,7 +342,7 @@ def create_dealer(
         {
             "tenant_id": tenant_id,
             "dealer_id": dealer_id,
-            "dealer_code": dealer_id.hex,
+            "dealer_code": dealer_code,
             "dealer_name": payload.dealerName,
             "legal_name": payload.legalName,
             "actor_id": admin_request.user_id,
@@ -375,10 +416,16 @@ def patch_dealer(
         raise ValidationError(detail="Dealer Name cannot be set to null.")
     if "status" in supplied and payload.status is None:
         raise ValidationError(detail="Dealer status cannot be set to null.")
+    if "dealerCode" in supplied:
+        if payload.dealerCode is None:
+            raise ValidationError(detail="Dealer Code cannot be set to null.")
+        _require_free_code(connection, "dealers", "dealer_code", tenant_id, payload.dealerCode, "Dealer",
+                           except_id=dealer_id)
 
     expected_version = _parse_if_match(if_match)
     columns = {
         "dealerName": ("dealer_name", payload.dealerName),
+        "dealerCode": ("dealer_code", payload.dealerCode),
         "legalName": ("legal_name", payload.legalName),
         "status": ("status", payload.status),
     }
@@ -508,6 +555,8 @@ def create_outlet(
         raise _not_found("Dealer")
 
     outlet_id = uuid4()
+    outlet_code = payload.outletCode or outlet_id.hex
+    _require_free_code(connection, "dealer_outlets", "outlet_code", tenant_id, outlet_code, "Outlet")
     row = connection.execute(
         text(
             """
@@ -532,7 +581,7 @@ def create_outlet(
             "tenant_id": tenant_id,
             "dealer_id": dealer_id,
             "outlet_id": outlet_id,
-            "outlet_code": outlet_id.hex,
+            "outlet_code": outlet_code,
             "outlet_name": payload.outletName,
             "classification": payload.outletClassification,
             "address_text": payload.addressText,
@@ -626,10 +675,16 @@ def patch_outlet(
         raise ValidationError(detail="Outlet classification cannot be set to null.")
     if "status" in supplied and payload.status is None:
         raise ValidationError(detail="Outlet status cannot be set to null.")
+    if "outletCode" in supplied:
+        if payload.outletCode is None:
+            raise ValidationError(detail="Outlet Code cannot be set to null.")
+        _require_free_code(connection, "dealer_outlets", "outlet_code", tenant_id, payload.outletCode, "Outlet",
+                           except_id=outlet_id)
 
     expected_version = _parse_if_match(if_match)
     columns = {
         "outletName": ("outlet_name", payload.outletName),
+        "outletCode": ("outlet_code", payload.outletCode),
         "outletClassification": ("outlet_classification", payload.outletClassification),
         "addressText": ("address_text", payload.addressText),
         "city": ("city", payload.city),

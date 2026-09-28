@@ -38,6 +38,8 @@ _COMPENSATION_TIMEOUT_SECONDS = 20.0
 
 class ProjectCreateRequest(BaseModel):
     projectName: str = Field(min_length=1, max_length=240)
+    # The Project Code people use (e.g. JBR-01); unique across Projects.
+    businessCode: str | None = Field(default=None, max_length=40, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     oemId: UUID
     segmentIds: list[UUID] = Field(default_factory=list)
     # Legacy compatibility only. Product Category is no longer a Project-onboarding input.
@@ -98,6 +100,21 @@ def _validate_request(engine: Engine, request: ProjectCreateRequest) -> None:
             text("SELECT 1 FROM auditcore.oems WHERE oem_id=:oem_id AND is_active=true"),
             {"oem_id": request.oemId},
         ).scalar_one_or_none()
+        if request.businessCode:
+            # Checked before the Security tenant exists, so a taken code never
+            # leaves a half-created Project to compensate.
+            set_platform_super_admin_context(connection)
+            taken = connection.execute(
+                text("SELECT 1 FROM auditcore.projects WHERE upper(business_code)=upper(:code) LIMIT 1"),
+                {"code": request.businessCode},
+            ).scalar_one_or_none()
+            if taken:
+                raise ConflictError(
+                    error_code="VAC-CONFLICT-002",
+                    title="Project Code already used",
+                    detail=f"Project Code {request.businessCode} is already used by another Project. "
+                           "Choose another code.",
+                )
         if oem_exists is None:
             raise BusinessValidationError(detail="OEM does not reference an active approved value.")
 
@@ -202,11 +219,11 @@ def _ensure_project_projection(
             text(
                 """
                 INSERT INTO auditcore.projects (
-                    tenant_id, project_code, project_name, oem_id, product_category_id,
+                    tenant_id, project_code, business_code, project_name, oem_id, product_category_id,
                     effective_start_date, effective_end_date, timezone_name, region_code,
                     project_status, created_by_actor_id, updated_by_actor_id
                 ) VALUES (
-                    :tenant_id, :project_code, :project_name, :oem_id, NULL,
+                    :tenant_id, :project_code, :business_code, :project_name, :oem_id, NULL,
                     :effective_start, :effective_end, :timezone_name, :region_code,
                     'CONFIGURING', :actor_id, :actor_id
                 )
@@ -218,6 +235,7 @@ def _ensure_project_projection(
             {
                 "tenant_id": tenant.tenant_id,
                 "project_code": tenant.tenant_code,
+                "business_code": request.businessCode,
                 "project_name": request.projectName.strip(),
                 "oem_id": request.oemId,
                 "effective_start": request.effectiveStartDate,

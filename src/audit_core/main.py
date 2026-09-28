@@ -43,6 +43,7 @@ from audit_core.mahindra_native_workbooks import install_native_workbook_parser
 from audit_core.mahindra_upload_state import router as mahindra_upload_state_router
 from audit_core.observability import install_observability
 from audit_core.oem_price_masters import router as oem_price_masters_router
+from audit_core.onboarding_imports import router as onboarding_router
 from audit_core.otel import configure_otlp
 from audit_core.payments_finance import router as payments_finance_router
 from audit_core.pricing import router as pricing_router
@@ -298,6 +299,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_documents_router)
     application.include_router(uc03_p2_journey360_router)
     application.include_router(uc03_p2_live_router)
+    application.include_router(onboarding_router)
     application.include_router(uc03_p2_deal_router)
     application.include_router(uc03_p2_vehicle_photos_router)
     application.include_router(uc03_document_capture_v2_router)

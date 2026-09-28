@@ -90,13 +90,14 @@ def test_dealer_and_outlet_create_read_update_inactivate(dealer_setup) -> None:
 
     dealer = client.post(
         f"/v1/tenants/{tenant_id}/dealers",
-        json={"dealerCode": "CALLER-MUST-NOT-CONTROL", "dealerName": "Dealer One"},
+        json={"dealerCode": "D1-OEM", "dealerName": "Dealer One"},
     )
     assert dealer.status_code == 201
     assert dealer.headers["etag"] == '"1"'
     dealer_payload = dealer.json()
     dealer_id = dealer_payload["dealerId"]
-    assert dealer_payload["dealerCode"] != "CALLER-MUST-NOT-CONTROL"
+    # Codes are the onboarding codes people use (Excel onboarding); a supplied one is kept.
+    assert dealer_payload["dealerCode"] == "D1-OEM"
     assert dealer_payload["versionNo"] == 1
 
     detail = client.get(f"/v1/tenants/{tenant_id}/dealers/{dealer_id}")
@@ -126,7 +127,7 @@ def test_dealer_and_outlet_create_read_update_inactivate(dealer_setup) -> None:
     outlet = client.post(
         f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets",
         json={
-            "outletCode": "CALLER-MUST-NOT-CONTROL",
+            "outletCode": "D1-OEM-PUNE",
             "outletName": "Outlet One",
             "outletClassification": "ONSITE",
             "addressText": "Baner Road",
@@ -143,7 +144,7 @@ def test_dealer_and_outlet_create_read_update_inactivate(dealer_setup) -> None:
     assert outlet.headers["etag"] == '"1"'
     outlet_payload = outlet.json()
     outlet_id = outlet_payload["outletId"]
-    assert outlet_payload["outletCode"] != "CALLER-MUST-NOT-CONTROL"
+    assert outlet_payload["outletCode"] == "D1-OEM-PUNE"
     assert outlet_payload["googlePlaceId"] == "place-123"
     assert outlet_payload["addressText"] == "Baner Road"
     assert outlet_payload["monthlyVehicleVolume"] == 250
@@ -353,3 +354,22 @@ def test_dealer_hard_delete_rejects_outlet_then_deletes_when_empty(dealer_setup)
     assert client.delete(dealer_path, headers=headers).status_code == 204
     assert client.delete(dealer_path, headers=headers).status_code == 204
     assert client.get(dealer_path).status_code == 404
+
+
+def test_dealer_code_defaults_to_initials_and_codes_are_unique(dealer_setup) -> None:
+    tenant_id = dealer_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    first = client.post(f"/v1/tenants/{tenant_id}/dealers", json={"dealerName": "Aditya Motors"})
+    assert first.status_code == 201
+    assert first.json()["dealerCode"].startswith("AM-")  # initials + the Project OEM abbreviation
+    duplicate = client.post(f"/v1/tenants/{tenant_id}/dealers",
+                            json={"dealerName": "Another", "dealerCode": first.json()["dealerCode"].lower()})
+    assert duplicate.status_code == 409
+    assert duplicate.json()["errorCode"] == "VAC-CONFLICT-002"
+    dealer_id = first.json()["dealerId"]
+    outlet = client.post(f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets",
+                         json={"outletName": "Cube", "outletCode": "AM-X-CUBE"})
+    assert outlet.status_code == 201
+    again = client.post(f"/v1/tenants/{tenant_id}/dealers/{dealer_id}/outlets",
+                        json={"outletName": "Cube 2", "outletCode": "am-x-cube"})
+    assert again.status_code == 409

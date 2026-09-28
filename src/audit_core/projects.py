@@ -5,6 +5,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
+from sqlalchemy.exc import IntegrityError
 
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import (
@@ -31,6 +32,8 @@ class ProjectSegmentResponse(BaseModel):
 class ProjectResponse(BaseModel):
     tenantId: str
     projectCode: str
+    # The Project Code people use (e.g. JBR-01); projectCode is the Security tenant code.
+    businessCode: str | None = None
     projectName: str
     oemId: UUID
     # Legacy compatibility only; new Project onboarding starts at OEM + Segment.
@@ -48,6 +51,7 @@ class ProjectResponse(BaseModel):
 
 class ProjectPatch(BaseModel):
     projectName: str | None = Field(default=None, min_length=1, max_length=240)
+    businessCode: str | None = Field(default=None, max_length=40, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     oemId: UUID | None = None
     segmentIds: list[UUID] | None = None
     effectiveStartDate: date | None = None
@@ -64,11 +68,19 @@ def _not_found() -> NotFoundError:
     )
 
 
+def business_code_conflict(code: str) -> ConflictError:
+    return ConflictError(
+        error_code="VAC-CONFLICT-002",
+        title="Project Code already used",
+        detail=f"Project Code {code} is already used by another Project. Choose another code.",
+    )
+
+
 def _project_row(connection: Connection, tenant_id: str):
     row = connection.execute(
         text(
             """
-            SELECT tenant_id, project_code, project_name, oem_id, product_category_id,
+            SELECT tenant_id, project_code, business_code, project_name, oem_id, product_category_id,
                    effective_start_date, effective_end_date, timezone_name, region_code,
                    project_status, version_no, created_at_utc, updated_at_utc
             FROM auditcore.projects
@@ -101,6 +113,7 @@ def _project_response(connection: Connection, row) -> ProjectResponse:
     return ProjectResponse(
         tenantId=row["tenant_id"],
         projectCode=row["project_code"],
+        businessCode=row.get("business_code"),
         projectName=row["project_name"],
         oemId=row["oem_id"],
         productCategoryId=row["product_category_id"],
@@ -359,6 +372,7 @@ def patch_project(
 
     columns = {
         "projectName": ("project_name", patch.projectName),
+        "businessCode": ("business_code", patch.businessCode),
         "oemId": ("oem_id", patch.oemId),
         "effectiveStartDate": ("effective_start_date", patch.effectiveStartDate),
         "effectiveEndDate": ("effective_end_date", patch.effectiveEndDate),
@@ -386,19 +400,27 @@ def patch_project(
             "version_no = version_no + 1",
         ]
     )
-    row = connection.execute(
-        text(
-            f"""
-            UPDATE auditcore.projects
-            SET {', '.join(assignments)}
-            WHERE tenant_id = :tenant_id AND version_no = :expected_version
-            RETURNING tenant_id, project_code, project_name, oem_id, product_category_id,
-                      effective_start_date, effective_end_date, timezone_name, region_code,
-                      project_status, version_no, created_at_utc, updated_at_utc
-            """
-        ),
-        parameters,
-    ).mappings().one_or_none()
+    # Project Codes are unique across Projects (ux_projects_business_code);
+    # other Projects are outside this tenant's view, so the index decides.
+    try:
+        with connection.begin_nested():
+            row = connection.execute(
+                text(
+                    f"""
+                    UPDATE auditcore.projects
+                    SET {', '.join(assignments)}
+                    WHERE tenant_id = :tenant_id AND version_no = :expected_version
+                    RETURNING tenant_id, project_code, business_code, project_name, oem_id, product_category_id,
+                              effective_start_date, effective_end_date, timezone_name, region_code,
+                              project_status, version_no, created_at_utc, updated_at_utc
+                    """
+                ),
+                parameters,
+            ).mappings().one_or_none()
+    except IntegrityError as exc:
+        if "ux_projects_business_code" in str(exc.orig):
+            raise business_code_conflict(str(patch.businessCode)) from exc
+        raise
     if row is None:
         raise ConflictError(
             error_code="VAC-CONFLICT-001",
