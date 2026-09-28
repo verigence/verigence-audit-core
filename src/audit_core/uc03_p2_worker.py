@@ -879,11 +879,12 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
             {k: v for k, v in requirement_refs.items() if k in override} if override else requirement_refs
         ),
         classification_mode=classification_mode,
+        # DI's capture contract takes the file's identity only; it measures
+        # the bytes itself on upload and rejects any other field.
         files=[{
             "clientUploadId": str(row["client_upload_id"]),
             "filename": filename,
             "contentType": content_type,
-            "sizeBytes": len(page_payload),
         }],
     )
     uploads = intent.get("uploads") or []
