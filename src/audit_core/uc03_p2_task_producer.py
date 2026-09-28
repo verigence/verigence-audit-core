@@ -186,6 +186,10 @@ def describe_failure(
 
     # Native / sync / event findings carry their own business wording.
     reference["findingTitle"] = details.get("findingTitle")
+    # A question for the PC (its answers), and what the check looked at.
+    for key in ("question", "answers", "paymentIds", "documentIds", "components", "discounts"):
+        if details.get(key):
+            reference[key] = details[key]
     title = str(details.get("findingTitle") or _label(control.code.lower()))[:300]
     parts = [str(p) for p in (details.get("findingDescription"), reason) if p]
     expected, observed = details.get("expected"), details.get("observed")

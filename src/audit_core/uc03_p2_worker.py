@@ -1902,6 +1902,11 @@ def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
     if "DELIVERY_COMPLETED" in settled.get("transitions", ()):
         sync_delivery_review_task(connection, tenant_id=tenant_id, journey_id=journey_id,
                                   evaluation_started_at=started_at)
+        # The settlement, financier and trade-in resale windows: the Delivery
+        # checks run again when each closes.
+        from audit_core.uc03_p2_audit_rules import schedule_post_delivery_checks
+
+        schedule_post_delivery_checks(connection, tenant_id=tenant_id, journey_id=journey_id)
     transitions = list(dict.fromkeys([*first.get("transitions", ()), *settled.get("transitions", ())]))
     return {**settled, "transitions": transitions}
 

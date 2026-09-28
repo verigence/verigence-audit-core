@@ -1,5 +1,6 @@
-# Phase 2 control catalog: 25 active Audit Core controls + 47 enabled Rule Engine
-# rules (blueprint v2.2 sections 9-10). Audit Core owns execution state for both.
+# Phase 2 control catalog: 25 active Audit Core controls, 16 deal-audit Audit Core
+# checks (uc03_p2_audit_rules.py) and 47 enabled Rule Engine rules (blueprint v2.2
+# sections 9-10). Audit Core owns execution state for both.
 # mode: RERUN (native runner) | EXTERNAL (Rule Engine) | GATE (P2 stage gates)
 #       | PAGES (P2 page outcomes) | SYNC (existing document sync) | EVENT (process event)
 version: 1
@@ -1253,3 +1254,282 @@ controls:
     task:
       type: RULE_DISCREPANCY_REVIEW
       owner: PC
+  # ---- Deal-audit checks (uc03_p2_audit_rules.py): what a manual deal audit asks ----
+  DEAL_UNDERCHARGED:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
+    category: Pricing & Commercial Anomalies
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  EXCESS_DISCOUNT:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
+    category: Pricing & Commercial Anomalies
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  DELIVERED_ON_SHORT_PAYMENT:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - DELIVERY
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    - DELIVERY_COMPLETED
+    - SCHEDULED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  PAYMENT_AFTER_DELIVERY_WITHIN_7D:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - DELIVERY
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    - DELIVERY_COMPLETED
+    - SCHEDULED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: LOW
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  PAYMENT_AFTER_DELIVERY_BEYOND_7D:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - DELIVERY
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    - DELIVERY_COMPLETED
+    - SCHEDULED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  DO_PAYMENT_NOT_RECEIVED_12D:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - DELIVERY
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    - DELIVERY_COMPLETED
+    - SCHEDULED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  DO_SHORT_PAYMENT:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - DELIVERY
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    - DELIVERY_COMPLETED
+    - SCHEDULED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  TRADE_IN_NOT_SOLD_90D:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - DELIVERY
+    category: Trade-in & Corporate Claims
+    triggers:
+    - DOCUMENT_SYNCED
+    - DELIVERY_COMPLETED
+    - SCHEDULED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: MEDIUM
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  TRADE_IN_SOLD_AT_LOSS:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - DELIVERY
+    category: Trade-in & Corporate Claims
+    triggers:
+    - DOCUMENT_SYNCED
+    - DELIVERY_COMPLETED
+    - SCHEDULED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  POST_DELIVERY_REFUND:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - DELIVERY
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    - DELIVERY_COMPLETED
+    - SCHEDULED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  THIRD_PARTY_PAYMENT_UNCONFIRMED:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: DATA_GAP
+    severity: MEDIUM
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: PC_CONFIRMATION
+      owner: PC
+  THIRD_PARTY_PAYMENT_UNDECLARED:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  CASH_INTIMATION_UNCONFIRMED:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: DATA_GAP
+    severity: MEDIUM
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: PC_CONFIRMATION
+      owner: PC
+  CASH_NOT_INTIMATED:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  NDC_SIGNATURE_UNCONFIRMED:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - DELIVERY
+    category: Delivery Process
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: DATA_GAP
+    severity: MEDIUM
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: PC_CONFIRMATION
+      owner: PC
+  NDC_NOT_SIGNED:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - DELIVERY
+    category: Delivery Process
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL

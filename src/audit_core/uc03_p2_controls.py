@@ -354,24 +354,24 @@ def _evaluate_native(engine: Engine, *, tenant_id: str, journey_id: UUID, stage:
             connection, tenant_id=tenant_id, journey_id=journey_id, stage=stage,
             correlation_id=correlation_id,
         )
-        outcomes = {r.ruleCode: r.outcome for r in results}
+        by_code = {r.ruleCode: r for r in results}
         executions = _latest_executions(
             connection, tenant_id=tenant_id, journey_id=journey_id, codes=[c.code for c in controls],
         )
         version = _fact_version(connection, tenant_id=tenant_id, journey_id=journey_id)
         for control in controls:
-            outcome = outcomes.get(control.code)
-            if outcome is None:
+            result = by_code.get(control.code)
+            if result is None:
                 # The runner evaluates some controls once per Journey (BOOKING).
                 continue
-            status = _OUTCOME_TO_STATE.get(outcome, "RETRY_PENDING")
+            status = _OUTCOME_TO_STATE.get(result.outcome, "RETRY_PENDING")
             execution = executions.get(control.code) or {}
             finding_id = execution.get("audit_finding_id") if status == "FAIL" else None
             if status == "FAIL" and finding_id is None:
                 finding_id = _open_finding_for(
                     connection, tenant_id=tenant_id, journey_id=journey_id, code=control.code,
                 )
-            reason = execution.get("reason")
+            reason = execution.get("reason") or getattr(result, "reason", None)
             if status == "RETRY_PENDING":
                 errors.append(control.code)
                 reason = reason or "The Audit Core check could not complete; it will be retried."
@@ -383,6 +383,7 @@ def _evaluate_native(engine: Engine, *, tenant_id: str, journey_id: UUID, stage:
                         **_finding_summary(connection, tenant_id=tenant_id, finding_id=finding_id),
                         **_native_details(connection, tenant_id=tenant_id, control=control,
                                           finding_id=finding_id),
+                        **(getattr(result, "details", None) or {}),
                     },
                     fact_version=version,
                 )

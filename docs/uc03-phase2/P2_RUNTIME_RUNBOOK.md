@@ -43,6 +43,17 @@ Operational tuning:
 - `P2_MAX_UPLOAD_BYTES` default 50 MiB
 - `P2_MAX_PDF_PAGES` default 100
 
+Deal-audit time windows (days after delivery; the worker re-runs the Delivery
+checks the morning after each window closes):
+
+- `P2_SETTLEMENT_GRACE_DAYS` default 7 — balance received after delivery within /
+  beyond this many days (`PAYMENT_AFTER_DELIVERY_*`)
+- `P2_FINANCE_DISBURSEMENT_DAYS` default 12 — financier must pay the delivery
+  order within this many days (`DO_PAYMENT_NOT_RECEIVED_12D`)
+- `P2_TRADE_IN_RESALE_DAYS` default 90 — an exchange vehicle must be resold within
+  this many days (`TRADE_IN_NOT_SOLD_90D`); this window is scheduled only for a
+  deal with an exchange vehicle
+
 Start conservatively. Increase concurrency only after observing DB pool, DI and
 object-storage latency.
 
