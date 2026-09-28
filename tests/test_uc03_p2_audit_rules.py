@@ -510,3 +510,15 @@ def test_nightly_review_queues_each_delivery_in_progress_once(journey):
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         assert queue_nightly_review(connection, tenant_id=journey.tenant_id, today=TODAY + timedelta(days=1)) == 0
+
+
+def test_a_broken_rule_is_reported_and_the_other_rules_still_run(journey, monkeypatch):
+    from audit_core import uc03_p2_audit_rules as rules
+
+    def broken_rule(facts):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(rules, "_BOOKING_RULES", (broken_rule, *rules._BOOKING_RULES))
+    outcomes = _run(journey, "BOOKING")
+    assert outcomes["BROKEN_RULE"].outcome == "ERROR"
+    assert len(outcomes) == len(rules._BOOKING_RULES)  # every other rule produced its outcome

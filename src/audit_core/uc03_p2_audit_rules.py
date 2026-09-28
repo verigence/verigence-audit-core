@@ -48,7 +48,6 @@ delivery from being recorded.
 from __future__ import annotations
 
 import json
-import logging
 import os
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
@@ -57,6 +56,7 @@ from functools import cached_property
 from typing import Any
 from uuid import UUID
 
+import structlog
 from sqlalchemy import Connection, text
 
 from audit_core.uc03_p2_dates import parse_extracted_date
@@ -65,7 +65,7 @@ from audit_core.uc03_p2_runtime import enqueue_work
 from audit_core.uc03_p2_task_producer import format_value
 from audit_core.uc03_rule_execution_log import record_execution
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # A gap below this is rounding, not a finding (the Rule Engine uses the same).
 _TOLERANCE = Decimal(1000)
@@ -1091,7 +1091,9 @@ def run_p2_audit_rules(
         try:
             result = rule(facts)
         except Exception:
-            logger.warning("p2_audit_rule_failed", rule=code, journey_id=str(journey_id), exc_info=True)
+            # A broken rule is our defect, not a finding: log it with its location, keep going.
+            logger.exception("p2_audit_rule_failed", rule=code, tenant_id=tenant_id, journey_id=str(journey_id),
+                         stage_code=stage, error_category="TECHNICAL")
             result = RuleOutcome(code, "ERROR", "The check could not run; it will be retried.")
         finding_id = _sync_finding(connection, tenant_id=tenant_id, journey_id=journey_id, stage=stage,
                                    result=result, correlation_id=correlation_id)

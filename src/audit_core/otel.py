@@ -6,6 +6,7 @@ import sys
 from collections.abc import Mapping
 from typing import Any
 
+import httpx
 import structlog
 from fastapi import FastAPI
 from opentelemetry import metrics, trace
@@ -59,6 +60,14 @@ _SAFE_LOG_ATTRIBUTES = {
     "attempt",
     "downstream_http_status",
     "exc_type",
+    "pgcode",
+    "stage_code",
+    "task_id",
+    "work_id",
+    "work_type",
+    "rule",
+    "reason_code",
+    "http_status",
 }
 
 _SEVERITY = {
@@ -161,6 +170,39 @@ def _httpx_request_hook(span: Any, request: Any) -> None:
 
 async def _httpx_async_request_hook(span: Any, request: Any) -> None:
     _httpx_request_hook(span, request)
+
+
+_PROPAGATION_INSTALLED = False
+
+
+def _with_correlation(request: httpx.Request) -> None:
+    correlation_id = _current_correlation_id()
+    # Presigned object-storage URLs are signed for exact headers; leave them untouched.
+    if correlation_id and "X-Amz-Signature" not in str(request.url.query):
+        request.headers.setdefault("X-Correlation-ID", correlation_id)
+
+
+def install_correlation_propagation() -> None:
+    """Send the current X-Correlation-ID on every outbound httpx call (DI, Security, Rule Engine,
+    ...), whether or not OTLP export is configured, so one id follows a request or P2 work item
+    across services."""
+    global _PROPAGATION_INSTALLED
+    if _PROPAGATION_INSTALLED:
+        return
+    sync_send = httpx.Client.send
+    async_send = httpx.AsyncClient.send
+
+    def send(self: httpx.Client, request: httpx.Request, *args: Any, **kwargs: Any) -> httpx.Response:
+        _with_correlation(request)
+        return sync_send(self, request, *args, **kwargs)
+
+    async def asend(self: httpx.AsyncClient, request: httpx.Request, *args: Any, **kwargs: Any) -> httpx.Response:
+        _with_correlation(request)
+        return await async_send(self, request, *args, **kwargs)
+
+    httpx.Client.send = send  # type: ignore[method-assign]
+    httpx.AsyncClient.send = asend  # type: ignore[method-assign]
+    _PROPAGATION_INSTALLED = True
 
 
 def configure_otlp(app: FastAPI, settings: Settings) -> bool:

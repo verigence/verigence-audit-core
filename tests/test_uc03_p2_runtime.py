@@ -452,3 +452,56 @@ def test_submitted_task_cannot_be_actioned_again_but_accepts_comments(journey):
     with pytest.raises(TaskStateError):
         act("REVIEW_DOCUMENT")
     assert act("ADD_COMMENT", "checked with dealer")["taskId"] == str(task_id)
+
+
+def test_claim_time_dead_letter_fails_the_page_and_raises_the_pc_task(journey, monkeypatch):
+    monkeypatch.setattr(worker, "_MAX_ATTEMPTS", 2)
+    _, queue_id, _ = add_page(journey, status="DI_UPLOAD_PREPARING")
+    _enqueue(journey, work_type="DOCUMENT_INGEST", key=str(queue_id))
+    for _ in range(2):
+        items = worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)
+        if not items:
+            break
+        _expire_lease(journey, items[0].work_id)
+    worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)
+    assert queue_row(journey, "DOCUMENT_INGEST", str(queue_id))["work_status"] == "DEAD_LETTER"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        page = connection.execute(
+            text("SELECT queue_status, status_reason FROM auditcore.p2_document_queue WHERE queue_id=:q"),
+            {"q": queue_id},
+        ).mappings().one()
+        task = connection.execute(
+            text("SELECT task_status FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k"),
+            {"t": journey.tenant_id, "k": f"processing-failed:{journey.journey_id}:{queue_id}"},
+        ).mappings().one_or_none()
+    # Before: the page stayed "in progress" forever with no task.
+    assert page["queue_status"] == "FAILED" and "interrupted repeatedly" in page["status_reason"]
+    assert task is not None and task["task_status"] == "READY"
+
+
+def test_stored_and_shown_errors_never_carry_raw_exception_text(journey, monkeypatch):
+    monkeypatch.setattr(worker, "_MAX_ATTEMPTS", 1)
+    _, queue_id, _ = add_page(journey, status="DI_UPLOAD_PREPARING")
+    _enqueue(journey, work_type="DOCUMENT_INGEST", key=str(queue_id))
+    [item] = worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)
+    raw = "PUT https://bucket/k?X-Amz-Signature=deadbeef for customer Ravi Kumar"
+    try:
+        raise RuntimeError(raw)
+    except RuntimeError as exc:
+        worker._fail(journey.engine, item, exc)
+    row = queue_row(journey, "DOCUMENT_INGEST", str(queue_id))
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        page = connection.execute(
+            text("SELECT status_reason FROM auditcore.p2_document_queue WHERE queue_id=:q"), {"q": queue_id},
+        ).mappings().one()
+        activity = connection.execute(
+            text("SELECT details::text AS d FROM auditcore.p2_activity_events WHERE tenant_id=:t "
+                 "AND event_type='P2_WORK_DEAD_LETTER'"),
+            {"t": journey.tenant_id},
+        ).mappings().all()
+    stored = " ".join([row["last_error"], page["status_reason"], *(a["d"] for a in activity)])
+    assert "deadbeef" not in stored and "Ravi" not in stored
+    assert row["last_error"].startswith("RuntimeError (at ") and "test_uc03_p2_runtime.py" in row["last_error"]
+    assert "system problem" in page["status_reason"]

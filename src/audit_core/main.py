@@ -44,7 +44,7 @@ from audit_core.mahindra_upload_state import router as mahindra_upload_state_rou
 from audit_core.observability import install_observability
 from audit_core.oem_price_masters import router as oem_price_masters_router
 from audit_core.onboarding_imports import router as onboarding_router
-from audit_core.otel import configure_otlp
+from audit_core.otel import configure_otlp, install_correlation_propagation
 from audit_core.payments_finance import router as payments_finance_router
 from audit_core.pricing import router as pricing_router
 from audit_core.project_activation import router as project_activation_router
@@ -259,6 +259,7 @@ def create_app() -> FastAPI:
     )
     configure_otlp(application, settings)
     configure_logging(settings)
+    install_correlation_propagation()
     install_error_handlers(application)
     install_observability(application)
     install_contract_guards(application)
