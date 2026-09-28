@@ -34,7 +34,7 @@ from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_stage import read_booking_stage
 
 SECTIONS = (
-    "deal", "addons", "documents", "payments", "vehicle", "tradein", "customer", "registration",
+    "deal", "invoices", "addons", "documents", "payments", "vehicle", "tradein", "customer", "registration",
     "delivery", "compliance", "activity", "timeline", "audit",
 )
 
@@ -1038,8 +1038,48 @@ def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
         SELECT addon_type_code, provider_name, actual_amount FROM auditcore.journey_addons
         WHERE tenant_id=:t AND journey_id=:j""", params)}
     insurer = _rows(connection, """
-        SELECT insurer_name, actual_premium_amount FROM auditcore.insurance_records
+        SELECT insurer_name, policy_reference, cover_note_reference, insurance_by, agent_intermediary_name,
+               agent_intermediary_code, misp_code, standard_premium_amount, actual_premium_amount, add_ons
+        FROM auditcore.insurance_records
         WHERE tenant_id=:t AND journey_id=:j ORDER BY updated_at_utc DESC LIMIT 1""", params)
+    cover = next(iter(_document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                      di_types=("insurance_cover",))), None)
+    cover_fields = cover["fields"] if cover else {}
+    insurance_row = insurer[0] if insurer else {}
+    ew = next(iter(d for d in invoices if d["documentType"] == "ew_invoice"), None)
+    ew_fields = ew["fields"] if ew else {}
+    details: dict[str, dict[str, Any]] = {
+        "accessories": {
+            "invoiceNumbers": sorted({str(d["fields"].get("invoice_number")) for d in invoices
+                                      if d["documentType"].startswith("accessory_invoice") and d["fields"].get("invoice_number")}),
+        },
+        "insurance": {
+            "insurerName": insurance_row.get("insurer_name") or cover_fields.get("insurer_name"),
+            "policyNumber": insurance_row.get("policy_reference") or cover_fields.get("policy_number"),
+            "policyType": cover_fields.get("policy_type"),
+            "coverNoteReference": insurance_row.get("cover_note_reference"),
+            "insuranceBy": insurance_row.get("insurance_by"),
+            "policyStartDate": cover_fields.get("policy_start_date"),
+            "policyEndDate": cover_fields.get("policy_end_date"),
+            "issueDate": cover_fields.get("issue_date"),
+            "idvAmount": _money(cover_fields.get("idv_amount")),
+            "standardPremium": _money(insurance_row.get("standard_premium_amount")),
+            "actualPremium": _money(insurance_row.get("actual_premium_amount") or cover_fields.get("premium_amount")),
+            "addOns": insurance_row.get("add_ons") or cover_fields.get("add_ons"),
+            "agentName": insurance_row.get("agent_intermediary_name") or cover_fields.get("agent_intermediary_name"),
+            "agentCode": insurance_row.get("agent_intermediary_code") or cover_fields.get("agent_intermediary_code"),
+            "mispCode": insurance_row.get("misp_code") or cover_fields.get("misp_code"),
+        },
+        "warranty": {
+            "planName": ew_fields.get("plan_name"),
+            "providerName": ew_fields.get("seller_name"),
+            "invoiceNumber": ew_fields.get("invoice_number"),
+            "invoiceDate": ew_fields.get("invoice_date"),
+            "coverageStartDate": ew_fields.get("coverage_start_date"),
+            "coverageEndDate": ew_fields.get("coverage_end_date"),
+            "tenureMonths": ew_fields.get("tenure_months"),
+        },
+    }
     addons: dict[str, Any] = {}
     for kind, components in _ADDON_COMPONENTS.items():
         amounts = [by_component[c] for c in components if by_component.get(c) is not None]
@@ -1051,12 +1091,17 @@ def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
         if kind == "insurance" and total is None and insurer:
             total = _dec(insurer[0]["actual_premium_amount"])
         provider = (plan or {}).get("provider_name") or (insurer[0]["insurer_name"] if kind == "insurance" and insurer else None)
+        if kind == "warranty" and not provider:
+            provider = details["warranty"]["providerName"]
+        if kind == "warranty" and plan is not None:
+            details["warranty"].setdefault("referenceNumber", None)
         items = _line_items(invoices, _LINE_CATEGORIES[kind])
         addons[kind] = {
             "taken": bool((total is not None and total > 0) or items),
             "amount": str(total) if total is not None else None,
             "provider": provider,
             "items": items,
+            "details": {k: v for k, v in details[kind].items() if v not in (None, "", [])},
         }
 
     booking_doc = next(iter(_document_facts(
@@ -1200,6 +1245,78 @@ def customer(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
         "identityStatus": identity,
         "kycDocuments": sorted({str(v) for v in sources.values() if str(v).casefold() in KYC_DOCUMENT_TYPES}),
     }
+
+
+_INVOICE_TYPES = (
+    "customer_invoice_dms", "tax_invoice_tally", "accessory_invoice_dms", "accessory_invoice_tally",
+    "ew_invoice", "rsa_invoice", "wholesale_invoice", "invoice_generic", "credit_note", "debit_note",
+)
+_INVOICE_HEADER_KEYS = (
+    "invoice_number", "invoice_date", "invoice_nature", "invoice_purpose", "source_system", "seller_name",
+    "seller_gstin", "buyer_name", "buyer_gstin", "financed_by", "model_name_raw", "variant_raw", "vin_number",
+    "chassis_number", "engine_number", "vehicle_registration_number", "plan_name", "coverage_start_date",
+    "coverage_end_date", "tenure_months", "narration",
+)
+_INVOICE_TOTAL_KEYS = (
+    "gross_amount_before_discount", "invoice_discount_amount", "taxable_amount", "cgst_amount", "sgst_amount",
+    "igst_amount", "cess_amount", "tcs_amount", "round_off_amount", "grand_total_amount",
+)
+# A debit note prints its own field names; read them as an invoice's.
+_DEBIT_NOTE_ALIASES = {
+    "debit_note_number": "invoice_number", "debit_note_date": "invoice_date", "dealer_name": "seller_name",
+    "customer_name": "buyer_name", "total_amount": "grand_total_amount",
+}
+
+
+def invoices(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """Every invoice read on the Journey (vehicle, accessories, extended
+    warranty, RSA, wholesale, credit and debit notes) with its header, its
+    totals and every line item as printed."""
+    registry = get_registry()
+    documents = []
+    for doc in _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id, di_types=_INVOICE_TYPES):
+        fields = {**doc["fields"]}
+        for source, target in _DEBIT_NOTE_ALIASES.items():
+            if source in fields and target not in fields:
+                fields[target] = fields[source]
+        template = registry.template_for_di_type(doc["documentType"], stage=None)
+        raw = fields.get("line_items")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                raw = None
+        lines = []
+        for entry in raw if isinstance(raw, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            lines.append({
+                "description": entry.get("description_raw") or entry.get("description"),
+                "category": entry.get("line_category"),
+                "itemCode": entry.get("item_code"),
+                "hsnSac": entry.get("hsn_sac"),
+                "quantity": entry.get("quantity"),
+                "unitRate": _money(entry.get("unit_rate")),
+                "grossAmount": _money(entry.get("gross_amount")),
+                "discountAmount": _money(entry.get("discount_amount")),
+                "taxableAmount": _money(entry.get("taxable_amount")),
+                "taxRate": entry.get("tax_rate"),
+                "taxAmount": _money(entry.get("tax_amount")),
+                "netAmount": _money(entry.get("net_amount")),
+            })
+        documents.append({
+            "documentId": doc["documentId"],
+            "documentType": doc["documentType"],
+            "label": template.display_name,
+            "linkedAtUtc": doc["linkedAtUtc"],
+            "header": {_camel(k): fields.get(k) for k in _INVOICE_HEADER_KEYS if fields.get(k) not in (None, "")},
+            "totals": {_camel(k): _money(fields.get(k)) for k in _INVOICE_TOTAL_KEYS if fields.get(k) not in (None, "")},
+            "particulars": fields.get("particulars"),
+            "lineItems": lines,
+        })
+    order = {t: i for i, t in enumerate(_INVOICE_TYPES)}
+    documents.sort(key=lambda d: (order.get(d["documentType"], 99), str(d["linkedAtUtc"] or "")))
+    return {"documents": documents, "count": len(documents)}
 
 
 def registration(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
@@ -1638,6 +1755,7 @@ def audit(connection: Connection, *, tenant_id: str, journey_id: UUID, limit: in
 
 BUILDERS = {
     "deal": deal,
+    "invoices": invoices,
     "addons": addons,
     "documents": documents,
     "payments": payments,
