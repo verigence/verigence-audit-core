@@ -42,7 +42,7 @@ from audit_core.uc03_p2_runtime import enqueue_work
 from audit_core.uc03_p2_stage import (
     condition_reasons,
     read_booking_stage,
-    ready_document_count,
+    ready_document_counts,
     requirement_items,
 )
 from audit_core.uc03_p2_storage import (
@@ -1289,14 +1289,13 @@ def list_documents(
     reasons = condition_reasons(connection, tenant_id=tenant_id, journey_id=journey_id)
     conditions = set(reasons)
     checklist = []
+    ready_counts = ready_document_counts(connection, registry, tenant_id=tenant_id, journey_id=journey_id)
     for stage_code in ("BOOKING", "DELIVERY"):
         for item in requirement_items(connection, registry, tenant_id=tenant_id, journey_id=journey_id,
-                                      stage=stage_code, reasons=reasons):
+                                      stage=stage_code, reasons=reasons, ready_counts=ready_counts):
             for template_key in item["templates"]:
                 template = registry.documents[template_key]
-                ready = ready_document_count(
-                    connection, tenant_id=tenant_id, journey_id=journey_id, template=template,
-                )
+                ready = ready_counts[template_key]
                 status = "RECEIVED" if ready else ("COVERED" if item["received"] else "MISSING")
                 checklist.append(
                     {

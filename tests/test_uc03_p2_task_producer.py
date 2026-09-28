@@ -174,3 +174,57 @@ def test_low_confidence_fields_raise_a_review_task_that_closes_after_confirmatio
         assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
                                        journey_id=journey.journey_id) == {"VERIFIED": 1}
     assert _task(journey, f"field-review:{di_document_id}")["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_a_date_before_the_floor_is_a_high_verification_whatever_its_confidence(journey):
+    receipt = add_ready_document(journey, "dealer_receipt", confidence=99.0, amount_paid="21000",
+                                 receipt_date="12/03/2019")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {"RAISED": 1}
+    task = _task(journey, f"field-review:{receipt}")
+    assert task["title"] == "Check 1 date on Booking Payment Receipt"
+    assert task["severity"] == "HIGH" and task["priority"] == "HIGH"
+    assert task["assigned_role_code"] == "PC"
+    assert "Receipt date read as 12/03/2019, before June 2026" in task["description"]
+    (field,) = task["reference"]["fields"]
+    assert field["fieldKey"] == "receipt_date" and field["reasons"] == ["DATE_BEFORE_FLOOR"]
+    assert task["reference"]["dateFloor"] == "2026-06-01"
+
+    # the PC corrects the date on the document: the task closes itself
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("""UPDATE auditcore.journey_document_extracted_fields
+                    SET effective_value='"12/03/2026"'::jsonb, is_modified=true
+                    WHERE tenant_id=:t AND di_document_id=:d AND field_key='receipt_date'"""),
+            {"t": journey.tenant_id, "d": receipt},
+        )
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {"VERIFIED": 1}
+    assert _task(journey, f"field-review:{receipt}")["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_a_birth_date_is_never_held_against_the_floor(journey):
+    add_ready_document(journey, "aadhaar", confidence=99.0, aadhaar_number="1234", date_of_birth="15/08/1990")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {}
+
+
+def test_a_misread_date_and_a_low_confidence_value_share_one_task(journey):
+    receipt = add_ready_document(journey, "dealer_receipt", confidence=99.0, amount_paid="21000",
+                                 receipt_date="not a date")
+    add_extracted_field(journey, di_document_id=receipt, field_key="receipt_number", value="R-7",
+                        confidence=60.0, document_type="dealer_receipt")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {"RAISED": 1}
+    task = _task(journey, f"field-review:{receipt}")
+    assert task["title"] == "Verify 2 fields on Booking Payment Receipt"
+    assert task["severity"] == "HIGH"
+    assert "Receipt date read as 'not a date', which is not a date" in task["description"]
+    assert "Receipt number (60%)" in task["description"]
