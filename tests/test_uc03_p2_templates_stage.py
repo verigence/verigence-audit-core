@@ -77,7 +77,8 @@ def test_receipts_resolve_by_stage_and_unknown_types_are_supporting():
 
 def test_strict_fields_raise_the_review_bar():
     receipt = get_registry().document("dealer_receipt")
-    assert receipt.needs_review("amount_paid", 95.0) is True  # strict: < 97
+    assert receipt.needs_review("amount_paid", 95.0) is False  # one bar for every field: < 90
+    assert receipt.needs_review("amount_paid", 89.0) is True
     assert receipt.needs_review("receipt_date", 95.0) is False
     assert receipt.needs_review("receipt_date", None) is True  # missing confidence is never trusted
 
@@ -200,14 +201,22 @@ def test_low_confidence_fields_raise_tasks_but_do_not_hold_the_booking(journey):
     assert [p["fieldKey"] for p in pending] == ["aadhaar_name"]
 
 
-def test_strict_money_fields_need_higher_confidence(journey):
-    receipt = add_ready_document(journey, "dealer_receipt", confidence=95.0, amount_paid="21000")
+def test_money_fields_share_the_ninety_percent_bar(journey):
+    # One bar everywhere: a value at or above 90 needs no check, one below does.
+    add_ready_document(journey, "dealer_receipt", confidence=95.0, amount_paid="21000")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        pending = unreviewed_fields(connection, get_registry(), tenant_id=journey.tenant_id,
+                                    journey_id=journey.journey_id)
+    assert pending == []
+
+    receipt = add_ready_document(journey, "dealer_receipt", confidence=89.0, amount_paid="21000")
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         pending = unreviewed_fields(connection, get_registry(), tenant_id=journey.tenant_id,
                                     journey_id=journey.journey_id)
     assert [(p["documentId"], p["fieldKey"], p["threshold"]) for p in pending] == [
-        (str(receipt), "amount_paid", 97.0)
+        (str(receipt), "amount_paid", 90.0)
     ]
 
 

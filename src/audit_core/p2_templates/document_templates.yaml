@@ -7,6 +7,9 @@
 # pages.shape: SINGLE | PARTS | MULTI_PAGE   pages.group: ADJACENT | BATCH
 # extraction.review_threshold: fields below this confidence need PC review
 # extraction.strict_fields: money/identity fields reviewed below strict_review_threshold
+#   (one bar for every field, 90, by decision 2026-09-28: a PAN number read at
+#   92% must not raise a verification task; the strict list stays so the bar
+#   can be raised again per template)
 # condition: evidence key(s), 'a|b' = any; derived from the documents by
 # uc03_p2_stage.condition_reasons (conditional becomes mandatory on evidence).
 # group: templates sharing a group satisfy the requirement with any one of them.
@@ -93,7 +96,7 @@ document_types:
       - total_price
       - booking_amount_paid
       - discount_amount
-      strict_review_threshold: 97
+      strict_review_threshold: 90
     persistence:
       typed: booking_form_review_values
       canonical:
@@ -147,7 +150,7 @@ document_types:
       review_threshold: 90
       strict_fields:
       - pan_number
-      strict_review_threshold: 97
+      strict_review_threshold: 90
     persistence:
       typed: customer_identity_review_values
       canonical:
@@ -186,7 +189,7 @@ document_types:
       review_threshold: 90
       strict_fields:
       - aadhaar_number
-      strict_review_threshold: 97
+      strict_review_threshold: 90
     persistence:
       typed: customer_identity_review_values
       canonical:
@@ -226,7 +229,7 @@ document_types:
       strict_fields:
       - amount_paid
       - receipt_number
-      strict_review_threshold: 97
+      strict_review_threshold: 90
     persistence:
       typed: dealer_receipt_review_values
       canonical:
@@ -500,7 +503,7 @@ document_types:
       strict_fields:
       - grand_total_amount
       - chassis_number
-      strict_review_threshold: 97
+      strict_review_threshold: 90
     persistence:
       typed: invoice_review_values
       canonical:
@@ -551,7 +554,7 @@ document_types:
       review_threshold: 90
       strict_fields:
       - grand_total_amount
-      strict_review_threshold: 97
+      strict_review_threshold: 90
     persistence:
       typed: invoice_review_values
       canonical:
@@ -939,7 +942,7 @@ document_types:
       strict_fields:
       - amount_paid
       - receipt_number
-      strict_review_threshold: 97
+      strict_review_threshold: 90
     persistence:
       typed: dealer_receipt_review_values
       canonical:
