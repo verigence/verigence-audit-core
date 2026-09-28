@@ -1221,12 +1221,23 @@ def list_documents(
     batches = connection.execute(
         text(
             """
-            SELECT batch_id, original_filename, content_type, size_bytes,
-                   sha256, page_count, batch_status, grouping_status,
-                   created_at_utc, updated_at_utc
-            FROM auditcore.p2_upload_batches
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-            ORDER BY created_at_utc DESC
+            SELECT b.batch_id, b.original_filename, b.content_type, b.size_bytes,
+                   b.sha256, b.page_count, b.batch_status, b.grouping_status,
+                   b.created_at_utc, b.updated_at_utc,
+                   d.batch_id AS duplicate_of_batch_id, d.original_filename AS duplicate_of_filename,
+                   d.created_at_utc AS duplicate_of_at
+            FROM auditcore.p2_upload_batches b
+            -- a refused upload: the same file as an earlier batch of this Journey
+            LEFT JOIN LATERAL (
+              SELECT o.batch_id, o.original_filename, o.created_at_utc
+              FROM auditcore.p2_upload_batches o
+              WHERE b.batch_status='CANCELLED' AND b.page_count=0 AND b.sha256 IS NOT NULL
+                AND o.tenant_id=b.tenant_id AND o.journey_id=b.journey_id AND o.sha256=b.sha256
+                AND o.batch_id<>b.batch_id AND o.batch_status NOT IN ('FAILED','CANCELLED')
+              ORDER BY o.created_at_utc ASC LIMIT 1
+            ) d ON true
+            WHERE b.tenant_id=:tenant_id AND b.journey_id=:journey_id
+            ORDER BY b.created_at_utc DESC
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
@@ -1275,6 +1286,13 @@ def list_documents(
         item = dict(batch)
         batch_key = str(item.pop("batch_id"))
         item["batchId"] = batch_key
+        duplicate_of = item.pop("duplicate_of_batch_id")
+        item["duplicateOf"] = {
+            "batchId": str(duplicate_of), "filename": item.pop("duplicate_of_filename"),
+            "uploadedAtUtc": item.pop("duplicate_of_at"),
+        } if duplicate_of else None
+        item.pop("duplicate_of_filename", None)
+        item.pop("duplicate_of_at", None)
         units = by_batch.get(batch_key, [])
         # Documents first (grouped units and ungrouped pages); merged pages are
         # listed under their document for page-level detail on demand.

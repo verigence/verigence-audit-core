@@ -490,6 +490,52 @@ def _single_page_pdf(page) -> bytes:
     return output.getvalue()
 
 
+def _refuse_duplicate_upload(engine: Engine, work: WorkItem, *, batch_id: UUID, digest: str) -> bool:
+    """The same file uploaded again (byte for byte) is refused: the batch is
+    cancelled before any page is queued, and the Journey's history says
+    which earlier upload it repeats. True when refused."""
+    with engine.begin() as connection:
+        set_tenant_context(connection, work.tenant_id)
+        earlier = connection.execute(
+            text(
+                """
+                SELECT batch_id, original_filename, created_at_utc
+                FROM auditcore.p2_upload_batches
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND sha256=:sha256
+                  AND batch_id<>:batch_id AND batch_status NOT IN ('FAILED','CANCELLED')
+                ORDER BY created_at_utc ASC LIMIT 1
+                """
+            ),
+            {"tenant_id": work.tenant_id, "journey_id": work.journey_id, "sha256": digest, "batch_id": batch_id},
+        ).mappings().first()
+        if earlier is None:
+            return False
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_upload_batches
+                SET sha256=:sha256, batch_status='CANCELLED', updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND batch_id=:batch_id
+                """
+            ),
+            {"tenant_id": work.tenant_id, "batch_id": batch_id, "sha256": digest},
+        )
+        record_activity(
+            connection,
+            tenant_id=work.tenant_id,
+            journey_id=work.journey_id,
+            event_type="UPLOAD_DUPLICATE",
+            subject_type="UPLOAD_BATCH",
+            subject_id=str(batch_id),
+            details={"duplicateOf": str(earlier["batch_id"]), "filename": earlier["original_filename"],
+                     "uploadedAtUtc": earlier["created_at_utc"].isoformat(), "sha256": digest},
+            correlation_id=work.correlation_id,
+        )
+        logger.info("p2_upload_duplicate_refused", tenant_id=work.tenant_id, journey_id=str(work.journey_id),
+                    batch_id=str(batch_id), duplicate_of=str(earlier["batch_id"]))
+        return True
+
+
 def _split_batch(engine: Engine, work: WorkItem) -> None:
     storage = get_p2_document_storage()
     with engine.begin() as connection:
@@ -521,6 +567,8 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
     # cannot create duplicate queue identities and no DB connection is held idle.
     payload = storage.get_object(str(batch["original_object_key"]))
     digest = hashlib.sha256(payload).hexdigest()
+    if _refuse_duplicate_upload(engine, work, batch_id=UUID(str(batch["batch_id"])), digest=digest):
+        return
     content_type = str(batch["content_type"] or "")
     filename = str(batch["original_filename"])
     is_pdf = content_type.lower() == "application/pdf" or filename.lower().endswith(".pdf")
