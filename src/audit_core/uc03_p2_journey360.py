@@ -16,6 +16,7 @@ a single document.
 from __future__ import annotations
 
 import hashlib
+import json
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -33,7 +34,7 @@ from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_stage import read_booking_stage
 
 SECTIONS = (
-    "deal", "addons", "documents", "payments", "vehicle", "customer", "registration",
+    "deal", "addons", "documents", "payments", "vehicle", "tradein", "customer", "registration",
     "delivery", "compliance", "activity", "timeline", "audit",
 )
 
@@ -858,6 +859,142 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
 
 
 # ── vehicle, registration, delivery ──────────────────────────────────────────
+def _document_facts(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, di_types: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """Every ACTIVE document of the given types, newest first, with its
+    fields as the PC left them (corrected values win over extracted ones)."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT e.di_document_id, e.document_type_key, e.linked_at_utc, f.field_key, f.effective_value
+            FROM auditcore.evidence e
+            JOIN auditcore.journey_document_extracted_fields f
+              ON f.tenant_id=e.tenant_id AND f.journey_id=e.journey_id AND f.di_document_id=e.di_document_id
+            WHERE e.tenant_id=:t AND e.journey_id=:j AND e.association_status='ACTIVE'
+              AND e.document_type_key = ANY(:types)
+            ORDER BY e.linked_at_utc DESC, e.di_document_id, f.field_key
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "types": list(di_types)},
+    ).mappings().all()
+    documents: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        doc = documents.setdefault(str(row["di_document_id"]), {
+            "documentId": str(row["di_document_id"]), "documentType": str(row["document_type_key"]),
+            "linkedAtUtc": row["linked_at_utc"], "fields": {},
+        })
+        value = row["effective_value"]
+        if value not in (None, "", "null"):
+            doc["fields"][str(row["field_key"])] = value
+    return list(documents.values())
+
+
+def _camel(key: str) -> str:
+    head, *rest = key.split("_")
+    return head + "".join(part.capitalize() for part in rest)
+
+
+def _pick(fields: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    return {_camel(key): fields.get(key) for key in keys}
+
+
+_CERTIFICATE_KEYS = (
+    "certificate_variant", "certificate_number", "certificate_issue_date", "certificate_valid_until_date",
+    "old_vehicle_registration_number", "old_vehicle_make", "old_vehicle_model", "old_vehicle_type",
+    "old_vehicle_fuel_type", "old_vehicle_year_of_manufacturing", "original_owner_name", "current_holder_name",
+    "trade_number", "trade_date", "scrapping_facility_name", "rvsf_registration_number", "state_of_scrapping",
+)
+_VALUATION_KEYS = (
+    "report_number", "valuation_date", "valuation_valid_until", "evaluator_name", "registration_number",
+    "make", "model", "variant", "fuel_type", "manufacture_month_year", "odometer_km", "number_of_owners",
+    "overall_grade", "base_market_value", "final_offer_value", "loan_outstanding_on_vehicle",
+)
+
+
+def tradein(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """Trade-in / Scrappage as Phase 1 lays it out: the booking form's
+    exchange fields, the trade-in case, every Scrappage Certificate of
+    Deposit read on the Journey and any old-vehicle valuation report."""
+    params = {"t": tenant_id, "j": journey_id}
+    booking = next(iter(_document_facts(
+        connection, tenant_id=tenant_id, journey_id=journey_id, di_types=("booking_form", "booking_docket"),
+    )), None)
+    booking_fields = booking["fields"] if booking else {}
+    case = _rows(connection, """
+        SELECT old_vehicle_registration, old_vehicle_make_model, quoted_value, actual_value,
+               actual_status_code, handover_at_utc, payment_at_utc, resale_at_utc, source_kind
+        FROM auditcore.trade_in_cases WHERE tenant_id=:t AND journey_id=:j
+        ORDER BY updated_at_utc DESC LIMIT 1""", params)
+    trade_in = case[0] if case else None
+    if trade_in:
+        trade_in["variance"] = _minus(trade_in["actual_value"], trade_in["quoted_value"])
+    certificates = [
+        {"documentId": doc["documentId"], **_pick(doc["fields"], _CERTIFICATE_KEYS)}
+        for doc in _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                   di_types=("scrappage_certificate_of_deposit",))
+    ]
+    valuations = [
+        {"documentId": doc["documentId"], **_pick(doc["fields"], _VALUATION_KEYS)}
+        for doc in _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                   di_types=("valuation_report",))
+    ]
+    applicable = booking_fields.get("exchange_applicable")
+    if isinstance(applicable, str):
+        applicable = applicable.strip().lower() in ("yes", "true", "y", "1")
+    return {
+        "exchange": {
+            "applicable": applicable if isinstance(applicable, bool) else None,
+            "value": _money(booking_fields.get("exchange_value")),
+        },
+        "tradeIn": trade_in,
+        "certificates": certificates,
+        "valuations": valuations,
+    }
+
+
+_ADDON_COMPONENTS = {
+    "accessories": ("accessories_cost", "essential_kit_amount", "genuine_accessories_amount",
+                    "non_genuine_accessories_amount"),
+    "warranty": ("additional_warranty_amount", "extended_warranty_amount"),
+    "insurance": ("insurance_amount",),
+}
+_LINE_CATEGORIES = {
+    "accessories": ("ACCESSORY_GENUINE", "ACCESSORY_NON_GENUINE"),
+    "warranty": ("EXTENDED_WARRANTY",),
+    "insurance": ("INSURANCE",),
+}
+_ITEM_SOURCES = ("accessory_invoice_dms", "accessory_invoice_tally", "customer_invoice_dms", "tax_invoice_tally",
+                 "ew_invoice", "rsa_invoice", "invoice_generic")
+
+
+def _line_items(documents: list[dict[str, Any]], categories: tuple[str, ...]) -> list[dict[str, Any]]:
+    """Invoice line items of the given categories, as printed, one per line."""
+    items: list[dict[str, Any]] = []
+    seen: set[tuple[str, str | None]] = set()
+    for doc in documents:
+        raw = doc["fields"].get("line_items")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                raw = None
+        for entry in raw if isinstance(raw, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("line_category") or "").upper() not in categories:
+                continue
+            name = str(entry.get("description_raw") or entry.get("description") or entry.get("item_code") or "").strip()
+            amount = _money(entry.get("net_amount") if entry.get("net_amount") is not None else entry.get("gross_amount"))
+            key = (name, amount)
+            if not name or key in seen:
+                continue
+            seen.add(key)
+            items.append({"name": name, "amount": amount, "quantity": entry.get("quantity"),
+                          "itemCode": entry.get("item_code"), "documentId": doc["documentId"]})
+    return items
+
+
 def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     params = {"t": tenant_id, "j": journey_id}
     product = connection.execute(
@@ -888,7 +1025,84 @@ def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
         ),
         params,
     ).scalar_one()
-    return {"product": _plain(product) if product else None, "units": units, "photoCount": int(photo_count)}
+
+    # Phase 1's Vehicle panel: what was taken with the car (accessories,
+    # extended warranty, insurance) with the items bought, the booking facts
+    # and how the delivery went.
+    lines = _rows(connection, """
+        SELECT component_key, actual_amount FROM auditcore.commercial_lines
+        WHERE tenant_id=:t AND journey_id=:j""", params)
+    by_component = {str(r["component_key"]): _dec(r["actual_amount"]) for r in lines}
+    invoices = _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id, di_types=_ITEM_SOURCES)
+    plans = {str(r["addon_type_code"]).upper(): r for r in _rows(connection, """
+        SELECT addon_type_code, provider_name, actual_amount FROM auditcore.journey_addons
+        WHERE tenant_id=:t AND journey_id=:j""", params)}
+    insurer = _rows(connection, """
+        SELECT insurer_name, actual_premium_amount FROM auditcore.insurance_records
+        WHERE tenant_id=:t AND journey_id=:j ORDER BY updated_at_utc DESC LIMIT 1""", params)
+    addons: dict[str, Any] = {}
+    for kind, components in _ADDON_COMPONENTS.items():
+        amounts = [by_component[c] for c in components if by_component.get(c) is not None]
+        total = sum(amounts, Decimal(0)) if amounts else None
+        plan = next((plans[code] for code in plans if any(hint in code for hint in
+                     {"accessories": ("ACCESS",), "warranty": ("WARRANTY",), "insurance": ("INSUR",)}[kind])), None)
+        if total is None and plan is not None:
+            total = _dec(plan["actual_amount"])
+        if kind == "insurance" and total is None and insurer:
+            total = _dec(insurer[0]["actual_premium_amount"])
+        provider = (plan or {}).get("provider_name") or (insurer[0]["insurer_name"] if kind == "insurance" and insurer else None)
+        items = _line_items(invoices, _LINE_CATEGORIES[kind])
+        addons[kind] = {
+            "taken": bool((total is not None and total > 0) or items),
+            "amount": str(total) if total is not None else None,
+            "provider": provider,
+            "items": items,
+        }
+
+    booking_doc = next(iter(_document_facts(
+        connection, tenant_id=tenant_id, journey_id=journey_id, di_types=("booking_form", "booking_docket"),
+    )), None)
+    form = booking_doc["fields"] if booking_doc else {}
+    booking_row = connection.execute(
+        text(
+            """
+            SELECT b.booking_reference, b.booking_confirmation_date, b.deal_type_code, b.deal_source_code,
+                   b.lead_source_code, b.expected_delivery_text, b.expected_delivery_date,
+                   st.display_name AS sales_staff_name, o.outlet_name, o.address_text AS outlet_address
+            FROM auditcore.bookings b
+            LEFT JOIN auditcore.dealership_staff st
+              ON st.tenant_id=b.tenant_id AND st.dealership_staff_id=b.sales_staff_id
+            LEFT JOIN auditcore.journeys jn ON jn.tenant_id=b.tenant_id AND jn.journey_id=b.journey_id
+            LEFT JOIN auditcore.dealer_outlets o
+              ON o.tenant_id=jn.tenant_id AND o.outlet_id=jn.outlet_id
+            WHERE b.tenant_id=:t AND b.journey_id=:j
+            ORDER BY b.updated_at_utc DESC LIMIT 1
+            """
+        ),
+        params,
+    ).mappings().first()
+    b = dict(booking_row) if booking_row else {}
+    booking = {
+        "bookingReference": form.get("booking_reference_number") or b.get("booking_reference"),
+        "bookingDate": form.get("booking_date") or (b["booking_confirmation_date"].isoformat() if b.get("booking_confirmation_date") else None),
+        "salesConsultant": form.get("sales_person") or b.get("sales_staff_name"),
+        "dealerBranch": form.get("dealer_branch") or b.get("outlet_address") or b.get("outlet_name"),
+        "dealType": b.get("deal_type_code"),
+        "dealSource": b.get("deal_source_code"),
+        "leadSource": b.get("lead_source_code"),
+        "expectedDelivery": form.get("expected_delivery_date") or form.get("expected_delivery")
+        or (b["expected_delivery_date"].isoformat() if b.get("expected_delivery_date") else None)
+        or b.get("expected_delivery_text"),
+    }
+    delivered = _rows(connection, """
+        SELECT actual_delivery_status_code, status_label_snapshot, planned_delivery_at, delivery_intimated_at,
+               actual_delivered_at
+        FROM auditcore.deliveries WHERE tenant_id=:t AND journey_id=:j ORDER BY updated_at_utc DESC LIMIT 1""",
+        params)
+    return {
+        "product": _plain(product) if product else None, "units": units, "photoCount": int(photo_count),
+        "addons": addons, "booking": booking, "delivery": delivered[0] if delivered else None,
+    }
 
 
 _CUSTOMER_FIELDS = (
@@ -1428,6 +1642,7 @@ BUILDERS = {
     "documents": documents,
     "payments": payments,
     "vehicle": vehicle,
+    "tradein": tradein,
     "customer": customer,
     "registration": registration,
     "delivery": delivery,

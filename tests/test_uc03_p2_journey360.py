@@ -163,6 +163,43 @@ def test_summary_etag_and_sections(journey):
     assert audit["events"] == sorted(audit["events"], key=lambda e: e["atUtc"])
     assert all({"atUtc", "kind", "type", "who"} <= set(e) for e in audit["events"])
 
+    # Trade-in / Scrappage and the Vehicle panel as Phase 1 lays them out.
+    add_ready_document(journey, "booking_form", customer_name="P2 CUSTOMER", exchange_applicable=True,
+                       exchange_value="150000", sales_person="K K SATHAPATHI", dealer_branch="Jajpur",
+                       booking_date="2026-08-31", expected_delivery_date="2026-09-30", accessories_cost="61308.02")
+    cod = add_ready_document(journey, "scrappage_certificate_of_deposit", certificate_number="COD2026091HR26AW8810",
+                             certificate_variant="Transfer Certificate of Deposit", old_vehicle_registration_number="HR26AW8810",
+                             old_vehicle_make="HYUNDAI MOTOR INDIA LTD", old_vehicle_model="SANTRO",
+                             current_holder_name="P2 CUSTOMER", trade_date="2026-09-08")
+    add_ready_document(journey, "accessory_invoice_dms", invoice_number="ACC-1", buyer_name="P2 CUSTOMER",
+                       grand_total_amount="61308.02", line_items=[
+                           {"description_raw": "Roof Rail Set - Scorpio", "line_category": "ACCESSORY_GENUINE",
+                            "quantity": 1, "net_amount": 4917},
+                           {"description_raw": "Dual USB Car Charger", "line_category": "ACCESSORY_NON_GENUINE",
+                            "net_amount": "647.01"},
+                           {"description_raw": "CGST", "line_category": "TAX_LINE", "net_amount": 100},
+                       ])
+    trade = client.get(f"{base}/tradein").json()
+    assert trade["exchange"] == {"applicable": True, "value": "150000"}
+    assert trade["tradeIn"] is None
+    [certificate] = trade["certificates"]
+    assert certificate["documentId"] == str(cod)
+    assert certificate["certificateNumber"] == "COD2026091HR26AW8810"
+    assert certificate["oldVehicleModel"] == "SANTRO" and certificate["currentHolderName"] == "P2 CUSTOMER"
+    assert certificate["tradeDate"] == "2026-09-08" and certificate["scrappingFacilityName"] is None
+
+    vehicle = client.get(f"{base}/vehicle").json()
+    assert vehicle["addons"]["accessories"]["taken"] is True
+    assert [(i["name"], i["amount"]) for i in vehicle["addons"]["accessories"]["items"]] == [
+        ("Roof Rail Set - Scorpio", "4917"), ("Dual USB Car Charger", "647.01"),
+    ]
+    assert vehicle["addons"]["warranty"] == {"taken": False, "amount": None, "provider": None, "items": []}
+    assert vehicle["booking"]["salesConsultant"] == "K K SATHAPATHI"
+    assert vehicle["booking"]["dealerBranch"] == "Jajpur"
+    assert vehicle["booking"]["bookingDate"] == "2026-08-31"
+    assert vehicle["booking"]["expectedDelivery"] == "2026-09-30"
+    assert vehicle["delivery"] is None
+
     # A new fact changes the ETag.
     add_ready_document(journey, "aadhaar", aadhaar_number="123412341234")
     with journey.engine.begin() as connection:
