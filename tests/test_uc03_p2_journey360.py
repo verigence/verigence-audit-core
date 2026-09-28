@@ -193,7 +193,20 @@ def test_summary_etag_and_sections(journey):
     assert [(i["name"], i["amount"]) for i in vehicle["addons"]["accessories"]["items"]] == [
         ("Roof Rail Set - Scorpio", "4917"), ("Dual USB Car Charger", "647.01"),
     ]
-    assert vehicle["addons"]["warranty"] == {"taken": False, "amount": None, "provider": None, "items": []}
+    assert vehicle["addons"]["warranty"] == {"taken": False, "amount": None, "provider": None, "items": [], "details": {}}
+    assert vehicle["addons"]["accessories"]["details"] == {"invoiceNumbers": ["ACC-1"]}
+
+    # Every invoice with its header, totals and line items as printed.
+    listing = client.get(f"{base}/invoices").json()
+    assert listing["count"] == 1
+    [accessory] = listing["documents"]
+    assert accessory["documentType"] == "accessory_invoice_dms" and accessory["label"]
+    assert accessory["header"]["invoiceNumber"] == "ACC-1" and accessory["header"]["buyerName"] == "P2 CUSTOMER"
+    assert accessory["totals"]["grandTotalAmount"] == "61308.02"
+    assert [(l["description"], l["category"], l["netAmount"]) for l in accessory["lineItems"]] == [
+        ("Roof Rail Set - Scorpio", "ACCESSORY_GENUINE", "4917"), ("Dual USB Car Charger", "ACCESSORY_NON_GENUINE", "647.01"),
+        ("CGST", "TAX_LINE", "100"),
+    ]
     assert vehicle["booking"]["salesConsultant"] == "K K SATHAPATHI"
     assert vehicle["booking"]["dealerBranch"] == "Jajpur"
     assert vehicle["booking"]["bookingDate"] == "2026-08-31"
