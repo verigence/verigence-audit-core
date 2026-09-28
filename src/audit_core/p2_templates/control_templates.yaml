@@ -1,7 +1,8 @@
 # Phase 2 control catalog: 25 active Audit Core controls, 21 deal-audit Audit Core
 # checks (uc03_p2_audit_rules.py; the "Manual Observations" ones are answered by a
-# PC, TL or PM rather than read from documents) and 47 enabled Rule Engine rules
-# (blueprint v2.2 sections 9-10). Audit Core owns execution state for both.
+# PC, TL or PM rather than read from documents) and 41 enabled Rule Engine rules
+# (blueprint v2.2 sections 9-10; six master-total rules retired on 28 Sep 2026 in favour of
+# the per-line DEAL_UNDERCHARGED / EXCESS_DISCOUNT and DELIVERED_ON_SHORT_PAYMENT checks). Audit Core owns execution state for both.
 # mode: RERUN (native runner) | EXTERNAL (Rule Engine) | GATE (P2 stage gates)
 #       | PAGES (P2 page outcomes) | SYNC (existing document sync) | EVENT (process event)
 version: 1
@@ -527,22 +528,6 @@ controls:
     task:
       type: RULE_DISCREPANCY_REVIEW
       owner: PC
-  ACCESSORY_VS_COST_SHEET:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
-    category: ACCESSORY
-    phases:
-    - DELIVERY
-    rule_engine_phases:
-    - DELIVERY
-    operands:
-      left: accessory_invoice_dms.grand_total_amount
-      right: _reconciliation.addon:ACCESSORIES_TOTAL:standard
-    depends_on_documents:
-    - accessory_invoice_dms
-    task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
   BOOKING_AMOUNT_ZERO:
     executor: EXTERNAL_RULE_ENGINE
     mode: EXTERNAL
@@ -751,40 +736,6 @@ controls:
     task:
       type: RULE_DISCREPANCY_REVIEW
       owner: PC
-  DELIVERY_RECEIPT_SUM_VS_INVOICE:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
-    category: PRICE
-    phases:
-    - DELIVERY
-    rule_engine_phases:
-    - DELIVERY
-    - FINANCE
-    operands:
-      left: payment_receipt.amount_paid
-      right: customer_invoice_dms.grand_total_amount
-    depends_on_documents:
-    - payment_receipt
-    - customer_invoice_dms
-    task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
-  DISCOUNT_BOOKING_EXCEEDS_APPROVAL:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
-    category: DISCOUNT
-    phases:
-    - BOOKING
-    rule_engine_phases:
-    - BOOKING
-    operands:
-      left: booking_form.discount_amount
-      right: _reconciliation.discount:TOTAL:standard
-    depends_on_documents:
-    - booking_docket
-    task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
   DISCOUNT_EXCEEDS_POLICY:
     executor: EXTERNAL_RULE_ENGINE
     mode: EXTERNAL
@@ -798,23 +749,6 @@ controls:
       right: '-'
     depends_on_documents:
     - discount_approval_form
-    task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
-  DISCOUNT_HIDDEN_IN_EXCHANGE:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
-    category: DISCOUNT
-    phases:
-    - BOOKING
-    rule_engine_phases:
-    - BOOKING
-    - EXCHANGE
-    operands:
-      left: customer_invoice_dms.invoice_discount_amount
-      right: _reconciliation.discount:TOTAL:standard
-    depends_on_documents:
-    - customer_invoice_dms
     task:
       type: RULE_DISCREPANCY_REVIEW
       owner: PC
@@ -868,23 +802,6 @@ controls:
     depends_on_documents:
     - delivery_order_cover
     - gate_pass
-    task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
-  EXCHANGE_VALUE_VS_COST_SHEET:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
-    category: EXCHANGE
-    phases:
-    - DELIVERY
-    rule_engine_phases:
-    - DELIVERY
-    - EXCHANGE
-    operands:
-      left: valuation_report.final_offer_value
-      right: _reconciliation.discount:EXCHANGE:standard
-    depends_on_documents:
-    - valuation_report
     task:
       type: RULE_DISCREPANCY_REVIEW
       owner: PC
@@ -965,22 +882,6 @@ controls:
       left: '-'
       right: '-'
     depends_on_documents: []
-    task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
-  INSURANCE_PREMIUM_COVER_VS_COST_SHEET:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
-    category: INSURANCE
-    phases:
-    - DELIVERY
-    rule_engine_phases:
-    - DELIVERY
-    operands:
-      left: insurance_cover.premium_amount
-      right: _reconciliation.commercial:insurance_amount:standard
-    depends_on_documents:
-    - insurance_cover
     task:
       type: RULE_DISCREPANCY_REVIEW
       owner: PC

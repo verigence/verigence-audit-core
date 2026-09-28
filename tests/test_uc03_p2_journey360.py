@@ -249,6 +249,8 @@ def test_compliance_report_extends_legacy_with_ledger_and_verdict(journey):
     body = report.json()
     assert body["header"]["journeyId"] == str(journey.journey_id)
     assert body["verdict"]["code"] in {"INCOMPLETE", "NON_COMPLIANT"}
+    # Printable by anyone who can open the Journey, but a draft until the TL reviews the delivery.
+    assert body["review"]["status"] == "DRAFT" and body["review"]["label"].startswith("Draft")
     assert "BOOKING" in body["controls"] and body["controls"]["BOOKING"]
     labels = {line["label"] for line in body["deal"]["flaggedLines"]}
     assert "Ex-showroom price" in labels

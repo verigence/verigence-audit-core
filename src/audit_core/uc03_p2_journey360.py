@@ -1975,8 +1975,33 @@ def compliance_report(connection: Connection, *, tenant_id: str, journey_id: UUI
          "billed": d["billed"], "ledger": d["ledger"], "variance": d["variance"], "flags": d["flags"]}
         for d in deal_view["discounts"] if d["flags"]
     ]
+    # Anyone who can open the Journey may print the report; until the Team
+    # Lead has reviewed the completed delivery it is a draft and says so.
+    reviewed = connection.execute(
+        text(
+            """
+            SELECT j.review_completed_at_utc,
+                   (SELECT e.actor_role_code FROM auditcore.p2_task_events e
+                      JOIN auditcore.p2_tasks t ON t.tenant_id=e.tenant_id AND t.task_id=e.task_id
+                     WHERE e.tenant_id=j.tenant_id AND e.journey_id=j.journey_id
+                       AND t.task_type='DELIVERY_REVIEW' AND e.event_type='COMPLETE_ACTION'
+                     ORDER BY e.created_at_utc DESC LIMIT 1) AS reviewer_role
+            FROM auditcore.journeys j WHERE j.tenant_id=:t AND j.journey_id=:j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one_or_none()
+    reviewed_at = reviewed["review_completed_at_utc"] if reviewed else None
+    review = {
+        "status": "REVIEWED" if reviewed_at else "DRAFT",
+        "reviewedAtUtc": reviewed_at,
+        "reviewerRole": (reviewed["reviewer_role"] if reviewed else None) or ("TL" if reviewed_at else None),
+        "label": (f"Reviewed by the {'Team Lead' if (reviewed or {}).get('reviewer_role') in (None, 'TL') else 'Project Manager'}"
+                  if reviewed_at else "Draft: the audit is in progress and the delivery has not been reviewed"),
+    }
     return {
         **legacy,
+        "review": review,
         "verdict": {"code": verdict, "label": verdict_label,
                     "failedControls": len(failed), "incompleteControls": len(incomplete),
                     "openTasks": len(tasks), "duplicatePairs": len(dupes["pairs"]),

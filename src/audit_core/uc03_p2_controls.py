@@ -449,13 +449,18 @@ def _evaluate_external(engine: Engine, *, tenant_id: str, journey_id: UUID, stag
     anomalies = {a.rule_code: a for a in result.anomalies}
     ready = set(readiness.ready)
     not_ready = {n.rule_code: n.reason for n in readiness.not_ready}
+    # A rule the Rule Engine still evaluates but the catalogue no longer
+    # carries (superseded by a native check) raises nothing here.
+    catalogued = {c.code for c in registry.controls_by_mode("EXTERNAL")}
+    retired = sorted((relevant | set(anomalies)) - catalogued)
 
     transitions: list[Transition] = []
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
         flagged = _materialize_anomalies(
             connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage,
-            anomalies=result.anomalies, correlation_id=correlation_id, audit_run_id=result.audit_run_id,
+            anomalies=[a for a in result.anomalies if a.rule_code in catalogued],
+            correlation_id=correlation_id, audit_run_id=result.audit_run_id,
         )
         # Keep the existing Execution Log history complete.
         record_executions_bulk(
@@ -492,7 +497,7 @@ def _evaluate_external(engine: Engine, *, tenant_id: str, journey_id: UUID, stag
             )
         _resolve_stale_rule_engine_findings(
             connection, tenant_id=tenant_id, journey_id=journey_id, stage=stage,
-            codes=[t.control_code for t in transitions if t.current in {"PASS", "NOT_APPLICABLE"}],
+            codes=[t.control_code for t in transitions if t.current in {"PASS", "NOT_APPLICABLE"}] + retired,
             correlation_id=correlation_id,
         )
     return transitions
