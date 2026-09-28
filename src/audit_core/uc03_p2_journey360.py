@@ -38,7 +38,7 @@ from audit_core.uc03_masters_alignment import (
 from audit_core.uc03_p2_controls import control_statistics
 from audit_core.uc03_p2_dates import parse_extracted_date
 from audit_core.uc03_p2_registry import get_registry
-from audit_core.uc03_p2_stage import read_booking_stage, receipt_split
+from audit_core.uc03_p2_stage import read_booking_stage
 
 # The tabs Journey 360 shows. "delivery", "activity" and "timeline" stay
 # servable for older clients but are no longer advertised: the Vehicle tab
@@ -246,26 +246,61 @@ def journey_etag(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
 
 
 # ── money helpers ────────────────────────────────────────────────────────────
-def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Decimal]:
-    """Money actually received: evidenced receipts on ACTIVE documents, the
-    same receipt uploaded twice counted once (the stage engine's rule), plus
-    loan disbursements not already booked as a receipt (a disbursement
+def _duplicate_receipts(rows: list[Any]) -> dict[Any, Any]:
+    """payment_id -> the earlier payment it repeats (same receipt number,
+    amount and date), by the stage engine's own rule."""
+    records = [
+        ReceiptRecord(
+            document_id=r["payment_id"], stage_code="BOOKING", document_type_key="receipt",
+            receipt_number=normalize_receipt_number(r["receipt_number"]), amount=Decimal(str(r["amount"])),
+            receipt_date=normalize_receipt_date(r["receipt_date"]),
+        )
+        for r in rows
+    ]
+    out: dict[Any, Any] = {}
+    for group in compute_duplicate_groups(records):
+        if group.dates_match:
+            for later in group.documents[1:]:
+                out[later.document_id] = group.documents[0].document_id
+    return out
+
+
+def _loan_received(connection: Connection, *, tenant_id: str, journey_id: UUID) -> Decimal:
+    """Loan disbursements not already booked as a receipt (a disbursement
     matched to a payment row is counted once, as that payment)."""
-    split = receipt_split(connection, tenant_id=tenant_id, journey_id=journey_id)
-    row = connection.execute(
+    value = connection.execute(
         text(
             """
-            SELECT
-              COALESCE((SELECT SUM(f.loan_disbursement_amount) FROM auditcore.finance_records f
-                 WHERE f.tenant_id=:t AND f.journey_id=:j
-                   AND f.loan_disbursement_amount IS NOT NULL
-                   AND f.loan_disbursement_payment_id IS NULL), 0) AS loan
+            SELECT COALESCE(SUM(f.loan_disbursement_amount), 0) FROM auditcore.finance_records f
+            WHERE f.tenant_id=:t AND f.journey_id=:j
+              AND f.loan_disbursement_amount IS NOT NULL AND f.loan_disbursement_payment_id IS NULL
             """
         ),
         {"t": tenant_id, "j": journey_id},
-    ).mappings().one()
-    receipts = Decimal(split["total"] or 0)
-    loan = Decimal(row["loan"] or 0)
+    ).scalar_one()
+    return Decimal(value or 0)
+
+
+def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Decimal]:
+    """Money actually received: evidenced receipts on ACTIVE documents, the
+    same receipt uploaded twice counted once, plus the loan received."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT p.payment_id, p.amount, p.receipt_number, p.receipt_date
+            FROM auditcore.payments p
+            JOIN auditcore.evidence e
+              ON e.tenant_id=p.tenant_id AND e.journey_id=p.journey_id AND e.di_document_id=p.source_di_document_id
+            WHERE p.tenant_id=:t AND p.journey_id=:j AND p.amount > 0
+              AND p.status_source='EVIDENCE' AND e.association_status='ACTIVE'
+            ORDER BY p.receipt_date ASC NULLS LAST, p.created_at_utc ASC, p.payment_id ASC
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()
+    duplicates = _duplicate_receipts(rows)
+    receipts = sum((Decimal(r["amount"]) for r in rows if r["payment_id"] not in duplicates), Decimal(0))
+    loan = _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)
     return {"receipts": receipts, "loan": loan, "total": receipts + loan}
 
 
@@ -438,7 +473,7 @@ def _line_entries(fields: dict[str, Any]) -> list[dict[str, Any]]:
     return [entry for entry in (raw if isinstance(raw, list) else []) if isinstance(entry, dict)]
 
 
-def _document_billed(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+def _document_billed(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """What the documents themselves say, component by component: the booking
     form's own prices, the whole of an accessory, extended warranty or RSA
     invoice, the premium on the insurance cover note, and the categorised
@@ -446,10 +481,10 @@ def _document_billed(connection: Connection, *, tenant_id: str, journey_id: UUID
     deal, so these values stand in their column whenever the materialised
     source table has no row yet for that (component, document)."""
     out: list[dict[str, Any]] = []
-    documents = _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
-                                di_types=_ITEM_SOURCES + ("insurance_cover",) + tuple(_BOOKING_SOURCES))
     for doc in documents:
         kind, fields = doc["documentType"], doc["fields"]
+        if kind not in _ITEM_SOURCES and kind != "insurance_cover" and kind not in _BOOKING_SOURCES:
+            continue
         totals: dict[str, Decimal] = {}
         whole = _WHOLE_DOCUMENT_COMPONENT.get(kind)
         if kind in _BOOKING_SOURCES:
@@ -598,10 +633,13 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
 
     # The documents' own billed values fill in where the materialised source
     # table has no row yet for that (component, document type).
+    documents = _document_facts(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+        di_types=tuple(dict.fromkeys(_INVOICE_TYPES + _ITEM_SOURCES + ("insurance_cover",) + tuple(_BOOKING_SOURCES))),
+    )
     present = {(str(s["component_key"]), str(s["source_document_type"])) for s in sources}
     sources = list(sources) + [
-        s for s in _document_billed(connection, tenant_id=tenant_id, journey_id=journey_id)
-        if (s["component_key"], s["source_document_type"]) not in present
+        s for s in _document_billed(documents) if (s["component_key"], s["source_document_type"]) not in present
     ]
 
     # Normalise every source row onto (kind, key): discount-like commercial
@@ -767,7 +805,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             "date": doc["fields"].get("invoice_date") or doc["fields"].get("debit_note_date"),
             "total": _money(doc["fields"].get("grand_total_amount") or doc["fields"].get("total_amount")),
         }
-        for doc in _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id, di_types=_INVOICE_TYPES)
+        for doc in documents if doc["documentType"] in _INVOICE_TYPES
     ]
     return {
         "sku": {
@@ -1074,23 +1112,8 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     # The same receipt again: same number, amount and date as an earlier one
     # (same amount and date when neither prints a number).
     eligible = [r for r in rows if r["status_source"] == "EVIDENCE" and r["association_status"] == "ACTIVE"]
-    records = [
-        ReceiptRecord(
-            document_id=r["payment_id"], stage_code="BOOKING", document_type_key="receipt",
-            receipt_number=normalize_receipt_number(r["receipt_number"]), amount=Decimal(str(r["amount"])),
-            receipt_date=normalize_receipt_date(r["receipt_date"]),
-        )
-        for r in eligible
-    ]
-    duplicate_of: dict[Any, Any] = {}
-    for group in compute_duplicate_groups(records):
-        if group.dates_match:
-            for later in group.documents[1:]:
-                duplicate_of[later.document_id] = group.documents[0].document_id
+    duplicate_of = _duplicate_receipts(eligible)
     number_of = {r["payment_id"]: r["receipt_number"] for r in rows}
-    split = receipt_split(connection, tenant_id=tenant_id, journey_id=journey_id)
-    stage_of = {e["paymentId"]: "BOOKING" for e in split["BOOKING"]}
-    stage_of.update({e["paymentId"]: "DELIVERY" for e in split["DELIVERY"]})
 
     lines = _bank_lines(connection, tenant_id=tenant_id, journey_id=journey_id)
     by_document = {line["documentId"]: line for line in lines}
@@ -1101,11 +1124,9 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
         evidenced = r["status_source"] == "EVIDENCE" and r["association_status"] == "ACTIVE"
         original = duplicate_of.get(r["payment_id"])
         counted = evidenced and original is None
+        stage = str(r["payment_stage"] or "BOOKING")
         if counted:
-            stage = stage_of.get(payment_id) or str(r["payment_stage"] or "BOOKING")
             by_stage[stage] = by_stage.get(stage, Decimal(0)) + Decimal(r["amount"])
-        else:
-            stage = str(r["payment_stage"] or "BOOKING")
         if original is not None:
             reason = "Duplicate: the same receipt number, amount and date as " + (
                 f"receipt {number_of.get(original)}" if number_of.get(original) else "an earlier receipt")
@@ -1173,14 +1194,15 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     for item in items:
         item.pop("bank_", None)
 
-    paid = _paid(connection, tenant_id=tenant_id, journey_id=journey_id)
+    receipts = sum((Decimal(i["amount"]) for i in items if i["counted"]), Decimal(0))
+    loan = _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)
     credits = [_dec(line["credit"]) for line in lines if _dec(line["credit"]) is not None]
     matched_credit = [_dec(line["credit"]) for line in lines if line["matchedPaymentId"] and _dec(line["credit"]) is not None]
     return {
         "items": items,
-        "receiptsTotal": str(paid["receipts"]),
-        "loanDisbursed": str(paid["loan"]),
-        "paidTotal": str(paid["total"]),
+        "receiptsTotal": str(receipts),
+        "loanDisbursed": str(loan),
+        "paidTotal": str(receipts + loan),
         "byStage": {k: str(v) for k, v in by_stage.items()},
         "duplicates": len(duplicate_of),
         "bankStatement": {
@@ -1384,7 +1406,9 @@ def _taken_addons(
     """
     params = {"t": tenant_id, "j": journey_id}
     by_key = {r["key"]: r for g in deal_view["categories"] for r in g["components"]}
-    invoices = _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id, di_types=_ITEM_SOURCES)
+    documents = _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                di_types=_ITEM_SOURCES + ("insurance_cover",))
+    invoices = [d for d in documents if d["documentType"] != "insurance_cover"]
     plans = {str(r["addon_type_code"]).upper(): r for r in _rows(connection, """
         SELECT addon_type_code, provider_name, actual_amount, reference_number FROM auditcore.journey_addons
         WHERE tenant_id=:t AND journey_id=:j""", params)}
@@ -1393,8 +1417,7 @@ def _taken_addons(
                agent_intermediary_code, misp_code, standard_premium_amount, actual_premium_amount, add_ons
         FROM auditcore.insurance_records
         WHERE tenant_id=:t AND journey_id=:j ORDER BY updated_at_utc DESC LIMIT 1""", params)
-    cover = next(iter(_document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
-                                      di_types=("insurance_cover",))), None)
+    cover = next((d for d in documents if d["documentType"] == "insurance_cover"), None)
     cover_fields = cover["fields"] if cover else {}
     insurance_row = insurer[0] if insurer else {}
     ew = next(iter(d for d in invoices if d["documentType"] == "ew_invoice"), None)
@@ -2216,15 +2239,54 @@ def audit(connection: Connection, *, tenant_id: str, journey_id: UUID, limit: in
         events = events[-limit:]
 
     # The stage durations and the time each role spent, so one tab holds
-    # everything the separate Timeline used to.
-    flow = _timeline(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # everything the separate Timeline used to; one query, the rest is known.
+    def hours(start: Any, end: Any) -> float | None:
+        return round((end - start).total_seconds() / 3600, 1) if start and end else None
+
+    stage_times = {}
+    for code in ("BOOKING", "DELIVERY"):
+        row = stages.get(code) or {}
+        started = row.get("first_started_at_utc") or (journey["created_at_utc"] if code == "BOOKING" else None)
+        completed = row.get("business_completed_at_utc") or (journey["actual_delivered_at"] if code == "DELIVERY" else None)
+        stage_cancelled = code == "BOOKING" and cancelled
+        stage_times[code] = {
+            "status": row.get("business_status"), "startedAtUtc": started,
+            "submittedAtUtc": row.get("capture_completed_at_utc"),
+            "completedAtUtc": None if stage_cancelled else completed, "cancelled": stage_cancelled,
+            "hoursToSubmit": hours(started, row.get("capture_completed_at_utc")),
+            "hoursToComplete": None if stage_cancelled else hours(started, completed),
+            "bookingConfirmDate": row.get("booking_confirmed_at_utc") if code == "BOOKING" else None,
+        }
+    roles = [
+        {"role": r["role"], "tasks": int(r["tasks"]), "open": int(r["open"]),
+         "avgHoursToClose": round(float(r["avg_hours"]), 1) if r["avg_hours"] is not None else None,
+         "totalHours": round(float(r["total_hours"] or 0), 1)}
+        for r in connection.execute(
+            text(
+                """
+                SELECT assigned_role_code AS role, COUNT(*) AS tasks,
+                       COUNT(*) FILTER (WHERE closed_at IS NULL) AS open,
+                       AVG(EXTRACT(EPOCH FROM closed_at - created_at_utc) / 3600.0) FILTER (WHERE closed_at IS NOT NULL)
+                         AS avg_hours,
+                       SUM(EXTRACT(EPOCH FROM COALESCE(closed_at, now()) - created_at_utc) / 3600.0) AS total_hours
+                FROM (
+                  SELECT assigned_role_code, created_at_utc,
+                         CASE WHEN task_status IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')
+                              THEN COALESCE(verified_at_utc, updated_at_utc) END AS closed_at
+                  FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j
+                ) t GROUP BY assigned_role_code ORDER BY assigned_role_code
+                """
+            ),
+            {"t": tenant_id, "j": journey_id},
+        ).mappings().all()
+    ]
 
     return {
         "pc": pc,
         "milestones": milestones,
         "pending": pending,
-        "stages": flow["stages"],
-        "roles": flow["roles"],
+        "stages": stage_times,
+        "roles": roles,
         "tasks": {"summary": task_summary, "items": tasks},
         "events": [_plain(e) for e in events],
         "completion": completion,
