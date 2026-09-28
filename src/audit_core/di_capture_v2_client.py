@@ -49,20 +49,27 @@ class DiCaptureV2Client:
         candidate_document_type_keys: list[str],
         files: list[dict[str, Any]],
         requirement_refs_by_document_type_key: dict[str, str] | None = None,
+        classification_mode: str | None = None,
     ) -> dict[str, Any]:
+        """``classification_mode="TRUST_SINGLE_CANDIDATE"`` (exactly one
+        candidate): the type is already known, DI skips its paid
+        classification call."""
+        body: dict[str, Any] = {
+            "phase": phase,
+            "candidateDocumentTypeKeys": candidate_document_type_keys,
+            "requirementRefsByDocumentTypeKey": (
+                requirement_refs_by_document_type_key or {}
+            ),
+            "files": files,
+        }
+        if classification_mode:
+            body["classificationMode"] = classification_mode
         return self._request(
             "POST",
             f"/v2/tenants/{tenant_id}/audit-storage-contexts/"
             f"{external_context_ref}/capture-documents:init",
             token=token,
-            json={
-                "phase": phase,
-                "candidateDocumentTypeKeys": candidate_document_type_keys,
-                "requirementRefsByDocumentTypeKey": (
-                    requirement_refs_by_document_type_key or {}
-                ),
-                "files": files,
-            },
+            json=body,
         )
 
     def finalize_document(

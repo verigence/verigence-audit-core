@@ -258,3 +258,27 @@ def test_receipts_after_the_minimum_booking_amount_are_delivery_receipts(journey
         ("R3", "2026-09-25"), ("R3", "2026-09-26")]
     missing = {i["key"] for i in result["delivery"]["gates"]["REQUIRED_DOCUMENTS"]["missing"]}
     assert "payment_receipt" not in missing and "dealer_receipt" not in missing
+
+
+def test_conditional_documents_have_a_requirement_row_so_di_reads_them(journey):
+    from audit_core.uc03_document_capture_v2 import (
+        _requirement_refs_by_document_type_key,
+    )
+    from audit_core.uc03_unified_document_capture import _merged_candidate_requirements
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        for _ in range(2):  # idempotent
+            worker._ensure_p2_requirement_rows(connection, tenant_id=journey.tenant_id,
+                                               journey_id=journey.journey_id)
+        rows = connection.execute(
+            text("SELECT document_type_key, requirement_level, process_area FROM auditcore.journey_document_requirements "
+                 "WHERE tenant_id=:t AND journey_id=:j AND requirement_key LIKE 'p2\\_%'"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        ).all()
+        _, delivery = _merged_candidate_requirements(connection, tenant_id=journey.tenant_id,
+                                                     journey_id=journey.journey_id)
+    assert sorted(r[0] for r in rows) == ["bank_approval_letter", "debit_note", "purchase_order", "valuation_report"]
+    assert {(r[1], r[2]) for r in rows} == {("OPTIONAL", "DELIVERY")}
+    refs = _requirement_refs_by_document_type_key(delivery)
+    assert {"bank_approval_letter", "debit_note", "purchase_order", "valuation_report"} <= set(refs)

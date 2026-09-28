@@ -56,7 +56,13 @@ from audit_core.uc03_p2_controls import (
     mark_unit_controls,
     request_control_evaluation,
 )
-from audit_core.uc03_p2_grouping import PageFact, merge_pdf_pages, plan_documents
+from audit_core.uc03_p2_grouping import (
+    PageFact,
+    merge_pdf_pages,
+    needs_document_upload,
+    plan_documents,
+    read_once_di_types,
+)
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_runtime import (
     enqueue_work,
@@ -457,6 +463,7 @@ def _settle_page(
                 last_error=COALESCE(:last_error, last_error),
                 updated_at_utc=now()
             WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+              AND queue_status <> 'MERGED'
             RETURNING batch_id
             """
         ),
@@ -649,6 +656,43 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
         )
 
 
+# Conditional documents Phase 2 makes mandatory from the deal's evidence that
+# the Phase 1 requirement catalog never had. DI reads a document, and links
+# its facts back, only against a requirement row -- so each gets an OPTIONAL
+# Delivery row (idempotent, like seed_delivery_document_requirements' own
+# fixed rows). Whether it is required is decided by the P2 templates.
+_P2_ONLY_REQUIREMENTS = (
+    ("p2_bank_approval_letter", "bank_approval_letter"),
+    ("p2_purchase_order", "purchase_order"),
+    ("p2_debit_note", "debit_note"),
+    ("p2_valuation_report", "valuation_report"),
+)
+
+
+def _ensure_p2_requirement_rows(connection, *, tenant_id: str, journey_id: UUID) -> None:
+    for requirement_key, document_type_key in _P2_ONLY_REQUIREMENTS:
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.journey_document_requirements (
+                    tenant_id, journey_id, document_requirement_item_id,
+                    requirement_key, document_type_key, process_area,
+                    requirement_level, requirement_status, condition_snapshot
+                )
+                SELECT CAST(:t AS varchar), CAST(:j AS uuid), NULL, CAST(:rk AS varchar),
+                       CAST(:dt AS varchar), 'DELIVERY', 'OPTIONAL', 'PENDING', '{}'::jsonb
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM auditcore.journey_document_requirements
+                    WHERE tenant_id=CAST(:t AS varchar) AND journey_id=CAST(:j AS uuid)
+                      AND document_type_key=CAST(:dt AS varchar)
+                )
+                ON CONFLICT (tenant_id, journey_id, requirement_key) DO NOTHING
+                """
+            ),
+            {"t": tenant_id, "j": journey_id, "rk": requirement_key, "dt": document_type_key},
+        )
+
+
 def _di_context_and_requirements(engine: Engine, work: WorkItem) -> tuple[str, str, list[str], dict[str, str]]:
     security_client = get_security_oauth_client()
     di_client = get_di_client()
@@ -657,6 +701,7 @@ def _di_context_and_requirements(engine: Engine, work: WorkItem) -> tuple[str, s
     security_client.get_service_token(audience=_DI_AUDIENCE)
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
+        _ensure_p2_requirement_rows(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
         booking, delivery = _merged_candidate_requirements(
             connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
         )
@@ -711,7 +756,7 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
                        q.client_upload_id, q.di_document_id, q.queue_status,
                        q.unit_kind, q.page_numbers, q.candidate_override,
                        b.original_filename, b.content_type AS original_content_type,
-                       b.uploaded_by_actor_id
+                       b.uploaded_by_actor_id, b.page_count, b.grouping_status
                 FROM auditcore.p2_document_queue q
                 JOIN auditcore.p2_upload_batches b
                   ON b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
@@ -740,8 +785,22 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
     page_payload = storage.get_object(str(row["page_object_key"]))
     context_ref, token, candidates, requirement_refs = _di_context_and_requirements(engine, work)
     # A grouped document was already classified page by page: submit it with
-    # exactly that type so DI extracts the whole document as one.
+    # exactly that type so DI extracts the whole document as one -- and, the
+    # type being known, without paying for a second classification.
     override = [str(key) for key in (row["candidate_override"] or [])]
+    classification_mode = "TRUST_SINGLE_CANDIDATE" if len(override) == 1 else None
+    if (
+        not override
+        and row["unit_kind"] == "PAGE"
+        and int(row["page_count"] or 1) > 1
+        and row["grouping_status"] in ("PENDING", "GROUPING")
+    ):
+        # A page of a multi-page upload whose type is always merged is only
+        # classified here (no requirement ref: DI does not extract it); the
+        # merged document is extracted once (_group_batch). A page retried
+        # after grouping stands alone and is read in full.
+        read_once = read_once_di_types(get_registry())
+        requirement_refs = {k: v for k, v in requirement_refs.items() if k not in read_once}
     v2_client = get_di_capture_v2_client()
     content_type = "application/pdf" if str(row["page_object_key"]).endswith(".pdf") else str(row["original_content_type"] or "application/octet-stream")
     filename = (
@@ -769,6 +828,7 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
         requirement_refs_by_document_type_key=(
             {k: v for k, v in requirement_refs.items() if k in override} if override else requirement_refs
         ),
+        classification_mode=classification_mode,
         files=[{
             "clientUploadId": str(row["client_upload_id"]),
             "filename": filename,
@@ -1223,7 +1283,10 @@ def _group_batch(engine: Engine, work: WorkItem) -> None:
         ],
         registry,
     )
-    grouped = [document for document in plan if document.is_multi_page]
+    # Multi-page documents, and single pages of an always-merged type (only
+    # classified at page level), get one upload each: one extraction.
+    read_once = read_once_di_types(registry)
+    grouped = [document for document in plan if needs_document_upload(document, read_once)]
 
     storage = get_p2_document_storage()
     merged_keys: dict[tuple[int, ...], tuple[str, str]] = {}
@@ -1449,6 +1512,9 @@ def _reconcile_page(
                 di_processed_seen_at_utc=:processed_seen_at,
                 updated_at_utc=now()
             WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+              -- grouping may merge the page while this reconcile runs: a
+              -- merged page is final and never gets a stale DI state back
+              AND queue_status <> 'MERGED'
               AND (
                 queue_status IS DISTINCT FROM :status
                 OR status_reason IS DISTINCT FROM :reason

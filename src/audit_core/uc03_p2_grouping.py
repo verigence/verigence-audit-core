@@ -51,6 +51,33 @@ class PlannedDocument:
         return len(self.page_numbers) > 1
 
 
+def read_once_di_types(registry: Registry) -> frozenset[str]:
+    """DI types whose pages are always merged into one document (PARTS or
+    MULTI_PAGE in every template that uses them).
+
+    Gemini cost: a page of such a type is only *classified*; the merged
+    document is extracted once. Extracting each page first and the merged
+    document again paid for every page twice. Types also used by a SINGLE
+    template (e.g. receipts) keep page-level extraction."""
+    shapes: dict[str, set[str]] = {}
+    for template in registry.documents.values():
+        if template.is_supporting:
+            continue
+        for di_type in template.di_types:
+            shapes.setdefault(di_type, set()).add(template.pages.shape)
+    return frozenset(t for t, s in shapes.items() if "SINGLE" not in s)
+
+
+def needs_document_upload(document: PlannedDocument, read_once: frozenset[str]) -> bool:
+    """A planned document gets its own DI upload (extracted once) when it
+    spans pages, or when its page was only classified (read_once)."""
+    return document.is_multi_page or (
+        document.template_key != SUPPORTING_TEMPLATE
+        and document.di_type is not None
+        and document.di_type in read_once
+    )
+
+
 def plan_documents(pages: list[PageFact], registry: Registry) -> list[PlannedDocument]:
     ordered = sorted(pages, key=lambda page: page.page_number)
     template_of = {

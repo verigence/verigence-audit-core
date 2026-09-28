@@ -65,3 +65,25 @@ def test_a_normal_di_http_error_response_is_still_wrapped_as_before() -> None:
         )
     assert excinfo.value.status_code == 422
     assert "non-candidate document type" in excinfo.value.detail
+
+
+def _capture(sent: list) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json={"uploads": []})
+
+    return httpx.MockTransport(handler)
+
+
+def test_classification_mode_is_sent_only_when_trusted() -> None:
+    sent: list = []
+    client = DiCaptureV2Client(base_url="http://di.test", transport=_capture(sent))
+    common = {"token": "t", "tenant_id": "tenant-1", "external_context_ref": "ctx-1", "phase": "BOOKING",
+              "files": [{"clientUploadId": "c", "filename": "a.pdf"}]}
+    client.create_upload_intents(candidate_document_type_keys=["booking_form", "pan_card"], **common)
+    client.create_upload_intents(candidate_document_type_keys=["booking_form"],
+                                 classification_mode="TRUST_SINGLE_CANDIDATE", **common)
+    assert "classificationMode" not in sent[0]
+    assert sent[1]["classificationMode"] == "TRUST_SINGLE_CANDIDATE"

@@ -6,7 +6,14 @@ import io
 
 from pypdf import PdfReader, PdfWriter
 
-from audit_core.uc03_p2_grouping import PageFact, merge_pdf_pages, plan_documents
+from audit_core.uc03_p2_grouping import (
+    PageFact,
+    PlannedDocument,
+    merge_pdf_pages,
+    needs_document_upload,
+    plan_documents,
+    read_once_di_types,
+)
 from audit_core.uc03_p2_registry import get_registry
 
 BF, RC, AA, PAN, UPI = "booking_form", "dealer_receipt", "aadhaar", "pan_card", "upi_screenshot"
@@ -100,3 +107,18 @@ def test_merge_keeps_page_order():
     merged = merge_pdf_pages([_one_page_pdf(100), _one_page_pdf(200), _one_page_pdf(300)])
     widths = [float(page.mediabox.width) for page in PdfReader(io.BytesIO(merged)).pages]
     assert widths == [100.0, 200.0, 300.0]
+
+
+def test_only_always_merged_types_are_read_once():
+    read_once = read_once_di_types(get_registry())
+    assert {BF, AA, "customer_invoice_dms", "vehicle_rc"} <= read_once
+    # receipts and PAN are single-page documents: read page by page
+    assert RC not in read_once and PAN not in read_once
+
+
+def test_a_single_page_of_an_always_merged_type_still_gets_one_upload():
+    read_once = read_once_di_types(get_registry())
+    assert needs_document_upload(PlannedDocument("booking_docket", BF, (1,)), read_once)
+    assert needs_document_upload(PlannedDocument("dealer_receipt", RC, (2, 3)), read_once)
+    assert not needs_document_upload(PlannedDocument("dealer_receipt", RC, (2,)), read_once)
+    assert not needs_document_upload(PlannedDocument("supporting_document", None, (4,)), read_once)
