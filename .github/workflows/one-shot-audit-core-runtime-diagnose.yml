@@ -55,6 +55,157 @@ jobs:
           done
           wc -l /tmp/audit.log /tmp/worker.log
           cat /tmp/audit.err /tmp/worker.err || true
+      - name: Edge timings (what the caller waited for, per request)
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Railway's HTTP (edge) log records the total time a request took
+          # including any wait in front of the app -- a sleeping or
+          # restarting container, the edge itself -- which the app's own
+          # log cannot see. Slow requests first, then the whole window.
+          for service in "$AUDIT_SERVICE" security; do
+            echo "===== $service: HTTP requests over 1500 ms in the last 6 hours"
+            railway logs --service "$service" --http --since 6h --lines 400 --json \
+              --filter "@totalDuration:>=1500" 2>/dev/null >"/tmp/${service}-slow.json" || true
+            python - "$service" <<'PY'
+          import json, sys, collections
+          from pathlib import Path
+          service = sys.argv[1]
+          text = Path(f"/tmp/{service}-slow.json").read_text(errors="replace")
+          rows = []
+          for line in text.splitlines():
+              line = line.strip()
+              if not line.startswith("{"):
+                  continue
+              try:
+                  rows.append(json.loads(line))
+              except Exception:
+                  pass
+          if not rows:
+              print("(none, or the log could not be read)"); print(text[:800]); sys.exit(0)
+          def attr(row, *names):
+              for name in names:
+                  if name in row: return row[name]
+                  for holder in ("attributes", "httpRequest", "details"):
+                      if isinstance(row.get(holder), dict) and name in row[holder]:
+                          return row[holder][name]
+              return None
+          print("sample row keys:", sorted(rows[0].keys())[:30])
+          by_path = collections.defaultdict(list)
+          for row in rows:
+              path = str(attr(row, "path", "@path") or "?")
+              dur = attr(row, "totalDuration", "@totalDuration")
+              up = attr(row, "upstreamRspDuration", "@upstreamRspDuration")
+              status = attr(row, "httpStatus", "@httpStatus")
+              ts = attr(row, "timestamp", "ts", "time")
+              try: dur = float(dur)
+              except Exception: dur = 0.0
+              by_path[path].append((dur, up, status, ts))
+          for path, items in sorted(by_path.items(), key=lambda kv: -max(i[0] for i in kv[1])):
+              durs = [i[0] for i in items]
+              print(f"{len(items):4d}  max {max(durs):8.0f}  avg {sum(durs)/len(durs):8.0f}  {path}")
+              for dur, up, status, ts in sorted(items, key=lambda i: -i[0])[:3]:
+                  print(f"        {ts}  total {dur:.0f} ms  upstream {up}  status {status}")
+          PY
+          done
+          echo "===== $AUDIT_SERVICE: every HTTP request in the last 90 minutes (status / total ms)"
+          railway logs --service "$AUDIT_SERVICE" --http --since 90m --lines 400 --json 2>/dev/null \
+            | python -c '
+          import json, sys
+          for line in sys.stdin:
+              line = line.strip()
+              if not line.startswith("{"): continue
+              try: row = json.loads(line)
+              except Exception: continue
+              a = row.get("attributes") or row
+              print(row.get("timestamp") or a.get("timestamp"), a.get("httpStatus"), a.get("totalDuration"), a.get("upstreamRspDuration"), a.get("method"), a.get("path"))
+          ' | tail -120 || true
+      - name: Service settings (sleeping, replicas) and container restarts
+        shell: bash
+        run: |
+          set -uo pipefail
+          railway status --json >/tmp/status.json 2>/dev/null || true
+          python - <<'PY'
+          import json, os, urllib.request
+          from pathlib import Path
+          status = {}
+          try:
+              status = json.loads(Path("/tmp/status.json").read_text())
+          except Exception as exc:
+              print("railway status unavailable:", exc)
+          def find_env(node):
+              # the linked environment id, wherever the CLI puts it
+              if isinstance(node, dict):
+                  for key in ("environmentId", "environment_id"):
+                      if key in node: return node[key]
+                  env = node.get("environment")
+                  if isinstance(env, dict) and env.get("id"): return env["id"]
+                  for value in node.values():
+                      found = find_env(value)
+                      if found: return found
+              if isinstance(node, list):
+                  for value in node:
+                      found = find_env(value)
+                      if found: return found
+              return None
+          env_id = find_env(status)
+          print("environment id:", env_id)
+          if not env_id:
+              print(json.dumps(status)[:1500]); raise SystemExit(0)
+          query = """
+          query($env: String!) {
+            environment(id: $env) {
+              name
+              serviceInstances { edges { node {
+                serviceName sleepApplication numReplicas region restartPolicyType
+                healthcheckPath healthcheckTimeout startCommand
+              } } }
+            }
+          }"""
+          body = json.dumps({"query": query, "variables": {"env": env_id}}).encode()
+          req = urllib.request.Request("https://backboard.railway.com/graphql/v2", data=body, headers={
+              "Authorization": f"Bearer {os.environ['RAILWAY_API_TOKEN']}", "Content-Type": "application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  data = json.load(resp)
+          except Exception as exc:
+              print("GraphQL failed:", exc); raise SystemExit(0)
+          if data.get("errors"):
+              print("GraphQL errors:", data["errors"])
+          env = (data.get("data") or {}).get("environment") or {}
+          print("===== service settings in", env.get("name"))
+          for edge in (env.get("serviceInstances") or {}).get("edges") or []:
+              node = edge["node"]
+              print(f"{node['serviceName']:28s} sleepApplication={node.get('sleepApplication')}  replicas={node.get('numReplicas')}  region={node.get('region')}  restart={node.get('restartPolicyType')}  healthcheck={node.get('healthcheckPath')}")
+          PY
+          echo "===== $AUDIT_SERVICE: container start / stop lines in the last 6 hours"
+          railway logs --service "$AUDIT_SERVICE" --since 6h --lines 3000 2>/dev/null \
+            | grep -iE "startup|started server|uvicorn running|shutting down|shutdown|finished server|waiting for application|sleep|stopping|container" | tail -60 || true
+          echo "===== security: HTTP requests in the last 90 minutes over 1500 ms"
+          railway logs --service security --http --since 90m --lines 400 --json --filter "@totalDuration:>=1500" 2>/dev/null \
+            | python -c '
+          import json, sys
+          for line in sys.stdin:
+              line = line.strip()
+              if not line.startswith("{"): continue
+              try: row = json.loads(line)
+              except Exception: continue
+              print(row.get("timestamp"), row.get("httpStatus"), row.get("totalDuration"), row.get("upstreamRqDuration"), row.get("method"), row.get("path"))
+          ' | tail -40 || true
+      - name: Direct timings from this runner
+        shell: bash
+        run: |
+          set -uo pipefail
+          domain=$(railway variable list --service "$AUDIT_SERVICE" --json 2>/dev/null | python -c 'import json,sys; d=json.load(sys.stdin); print(d.get("RAILWAY_PUBLIC_DOMAIN") or "")') || true
+          [ -n "$domain" ] || { echo "no public domain found"; exit 0; }
+          echo "Audit Core DEV: https://$domain"
+          for i in 1 2 3 4 5; do
+            curl -s -o /dev/null -w "attempt $i  /health  status %{http_code}  connect %{time_connect}s  first byte %{time_starttransfer}s  total %{time_total}s\n" \
+              --max-time 40 "https://$domain/health" || echo "attempt $i failed"
+            curl -s -o /dev/null -w "attempt $i  /v1/me/projects (no token)  status %{http_code}  first byte %{time_starttransfer}s  total %{time_total}s\n" \
+              --max-time 40 "https://$domain/v1/me/projects" || echo "attempt $i failed"
+            sleep 2
+          done
       - name: Summarise
         shell: bash
         run: |

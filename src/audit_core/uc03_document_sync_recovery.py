@@ -131,6 +131,29 @@ async def _recover_document_sync(
     return True
 
 
+def _find_stale_for_tenants(
+    engine: Engine, tenant_ids: list[str],
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    """The stale document syncs of every tenant, found in one worker
+    thread. A tenant whose query fails is logged and skipped."""
+    found: list[tuple[str, list[dict[str, Any]]]] = []
+    for tenant_id in tenant_ids:
+        try:
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                stale = _find_stale_document_syncs(connection, tenant_id=tenant_id)
+        except Exception:
+            logger.warning(
+                "uc03_document_sync_recovery_sweep_tenant_query_failed",
+                tenant_id=tenant_id,
+                exc_info=True,
+            )
+            continue
+        if stale:
+            found.append((tenant_id, stale))
+    return found
+
+
 async def recover_stale_document_syncs_for_all_tenants(engine: Engine) -> int:
     """Run one sweep across every active tenant. Never raises -- a single
     tenant's failure (a lock timeout, a transient connection error) is
@@ -145,18 +168,18 @@ async def recover_stale_document_syncs_for_all_tenants(engine: Engine) -> int:
         return 0
 
     recovered_total = 0
-    for tenant_id in tenant_ids:
-        try:
-            with engine.begin() as connection:
-                set_tenant_context(connection, tenant_id)
-                stale = _find_stale_document_syncs(connection, tenant_id=tenant_id)
-        except Exception:
-            logger.warning(
-                "uc03_document_sync_recovery_sweep_tenant_query_failed",
-                tenant_id=tenant_id,
-                exc_info=True,
-            )
-            continue
+    # Confirmed live (2026-09-28): this loop used to open the connection and
+    # run the per-tenant query right here, on the event loop. With one
+    # uvicorn process, every HTTP request (every screen of the web app)
+    # froze for as long as the sweep took -- tens of seconds once the tenant
+    # list grew -- every five minutes, while the app's own request log
+    # showed nothing slow because the timer only starts once the loop is
+    # free again. Railway's edge log showed the truth: requests accepted,
+    # then no answer for 40-110 s, then everything served at once. The
+    # blocking database work now runs in a worker thread, like the other
+    # sweep's, so the loop stays free to serve requests.
+    stale_by_tenant = await asyncio.to_thread(_find_stale_for_tenants, engine, tenant_ids)
+    for tenant_id, stale in stale_by_tenant:
         for row in stale:
             if await _recover_document_sync(
                 engine, tenant_id=tenant_id, row=row, trigger_source="SWEEP",
