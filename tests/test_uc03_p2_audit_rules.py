@@ -23,7 +23,7 @@ from audit_core.db import set_tenant_context
 from audit_core.uc03_p2_audit_rules import (
     queue_nightly_review,
     run_p2_audit_rules,
-    schedule_delivery_documents_check,
+    schedule_delivery_completion_check,
 )
 from audit_core.uc03_p2_task_producer import apply_control_transitions
 from audit_core.uc03_p2_tasks import submit_action
@@ -111,6 +111,14 @@ def _finding(journey, code: str) -> tuple:
                         "WHERE tenant_id=:t AND journey_id=:j AND rule_key=:k ORDER BY created_at_utc DESC LIMIT 1",
                k=code).one_or_none()
     return tuple(row) if row else (None, None, None)
+
+
+def _recompute(journey) -> None:
+    from audit_core.uc03_p2_stage import recompute_journey_stage
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        recompute_journey_stage(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
 
 
 def _evaluate(journey, unit: str) -> None:
@@ -370,40 +378,51 @@ def test_cash_limit_tcs_and_payment_before_booking(journey):
 # ------------------------------------ the documents window and the night
 
 
-def test_mandatory_delivery_documents_overdue_raises_a_high_finding_to_the_tl(journey):
-    assert _run(journey, "DELIVERY")["DELIVERY_DOCUMENTS_OVERDUE"].outcome == "PASS"
-    add_ready_document(journey, "customer_invoice_dms", invoice_number="INV-1")
-    waiting = _run(journey, "DELIVERY")["DELIVERY_DOCUMENTS_OVERDUE"]
-    assert waiting.outcome == "SKIPPED" and "Customer Ledger" in waiting.reason and "Due by" in waiting.reason
+def test_delivery_not_completed_in_time_lists_everything_pending_for_the_tl(journey):
+    assert _run(journey, "DELIVERY")["DELIVERY_NOT_COMPLETED_IN_TIME"].outcome == "PASS"
+    add_ready_document(journey, "insurance_cover", policy_start_date=(TODAY - timedelta(days=3)).isoformat())
+    add_ready_document(journey, "customer_invoice_dms", invoice_date=(TODAY - timedelta(days=2)).isoformat())
+    _recompute(journey)
+    waiting = _run(journey, "DELIVERY")["DELIVERY_NOT_COMPLETED_IN_TIME"]
+    assert waiting.outcome == "SKIPPED"
+    assert f"Delivery due by {(TODAY + timedelta(days=4)).strftime('%d %b %Y')}" in waiting.reason  # from the cover note
+    assert "insurance cover dated" in waiting.reason and "Customer Ledger" in waiting.reason
 
-    _sql(journey, "UPDATE auditcore.evidence SET linked_at_utc=now() - interval '8 days' WHERE tenant_id=:t")
+    # An earlier-dated gate pass moves the clock: 8 days ago, so the window has closed.
+    add_ready_document(journey, "gate_pass", delivery_date=(TODAY - timedelta(days=8)).isoformat())
     _evaluate(journey, "NATIVE:DELIVERY")
-    state = _states(journey)["DELIVERY_DOCUMENTS_OVERDUE"]
+    state = _states(journey)["DELIVERY_NOT_COMPLETED_IN_TIME"]
     assert state["control_status"] == "FAIL"
-    assert "still missing 8 days later" in state["status_reason"] and "Tax Invoice (Tally)" in state["status_reason"]
-    status, severity, title = _finding(journey, "DELIVERY_DOCUMENTS_OVERDUE")
-    assert (status, severity) == ("OPEN", "HIGH") and title.startswith("Mandatory delivery documents missing: ")
-    task = _task(journey, "DELIVERY_DOCUMENTS_OVERDUE")
-    assert task["task_type"] == "FINDING_REVIEW" and task["assigned_role_code"] == "TL"
-    assert task["reference"]["findingId"]
+    assert "8 days after the gate pass dated" in state["status_reason"]
+    assert "documents missing: " in state["status_reason"] and "Tax Invoice (Tally)" in state["status_reason"]
+    assert "Vehicle photos" in state["status_reason"] or "VIN" in state["status_reason"]
+    status, severity, title = _finding(journey, "DELIVERY_NOT_COMPLETED_IN_TIME")
+    assert (status, severity) == ("OPEN", "HIGH") and title.startswith("Delivery not completed in time: ")
+    task = _task(journey, "DELIVERY_NOT_COMPLETED_IN_TIME")
+    assert task["task_type"] == "FINDING_REVIEW" and task["assigned_role_code"] == "TL" and task["reference"]["findingId"]
 
 
-def test_the_seventh_day_event_is_queued_once_the_first_delivery_document_arrives(journey):
+def test_the_seventh_day_event_follows_the_earliest_printed_date(journey):
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
-        assert schedule_delivery_documents_check(connection, tenant_id=journey.tenant_id,
-                                                 journey_id=journey.journey_id) is None
-    add_evidence(journey, di_document_id=uuid4(), document_type_key="gate_pass", process_area="DELIVERY")
+        assert schedule_delivery_completion_check(connection, tenant_id=journey.tenant_id,
+                                                  journey_id=journey.journey_id) is None
+    add_ready_document(journey, "customer_invoice_dms", invoice_date=TODAY.isoformat())
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
-        key = schedule_delivery_documents_check(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
-        # Queued once: the next settle adds nothing.
-        assert schedule_delivery_documents_check(connection, tenant_id=journey.tenant_id,
-                                                 journey_id=journey.journey_id) is None
-    row = _sql(journey, "SELECT payload, next_attempt_at_utc FROM auditcore.p2_work_queue WHERE tenant_id=:t "
-                        "AND work_type='CONTROL_EVALUATE' AND work_key=:k", k=key).mappings().one()
-    assert row["payload"]["unit"] == "NATIVE:DELIVERY" and row["payload"]["force"] is True
-    assert abs((row["next_attempt_at_utc"] - (datetime.now(UTC) + timedelta(days=7))).total_seconds()) < 120
+        key = schedule_delivery_completion_check(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        assert schedule_delivery_completion_check(connection, tenant_id=journey.tenant_id,
+                                                  journey_id=journey.journey_id) is None  # queued once
+    fired_at = lambda: _sql(journey, "SELECT next_attempt_at_utc FROM auditcore.p2_work_queue WHERE tenant_id=:t "
+                            "AND work_type='CONTROL_EVALUATE' AND work_key=:k", k=key).scalar_one()
+    assert fired_at().date() == TODAY + timedelta(days=7)
+    # A cover note dated two days earlier pulls the event forward.
+    add_ready_document(journey, "insurance_cover", issue_date=(TODAY - timedelta(days=2)).isoformat())
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert schedule_delivery_completion_check(connection, tenant_id=journey.tenant_id,
+                                                  journey_id=journey.journey_id) == key
+    assert fired_at().date() == TODAY + timedelta(days=5)
 
 
 def test_nightly_review_queues_each_delivery_in_progress_once(journey):

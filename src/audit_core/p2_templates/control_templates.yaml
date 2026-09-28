@@ -1520,12 +1520,12 @@ controls:
     task:
       type: FINDING_REVIEW
       owner: TL
-  DELIVERY_DOCUMENTS_OVERDUE:
+  DELIVERY_NOT_COMPLETED_IN_TIME:
     executor: NATIVE
     mode: RERUN
     phases:
     - DELIVERY
-    category: Document Extraction & Completeness
+    category: Delivery Process
     triggers:
     - DOCUMENT_SYNCED
     - SCHEDULED

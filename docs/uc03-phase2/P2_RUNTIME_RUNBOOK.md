@@ -53,11 +53,12 @@ progress (`P2_NIGHTLY_REVIEW_UTC`, default `20:30` UTC = 02:00 IST; one
   order within this many days (`DO_PAYMENT_NOT_RECEIVED`)
 - `P2_TRADE_IN_RESALE_DAYS` default 90 — an exchange vehicle must be resold within
   this many days (`TRADE_IN_NOT_RESOLD`); only a deal with an exchange vehicle
-- `P2_DELIVERY_DOCUMENTS_DAYS` default 7 — once the first delivery document is in,
-  every mandatory delivery document within this many days
-  (`DELIVERY_DOCUMENTS_OVERDUE`, a High finding to the TL naming the documents);
-  this one also has its own event, queued when the first delivery document
-  arrives and fired exactly that many days later
+- `P2_DELIVERY_COMPLETION_DAYS` default 7 — the Delivery must be complete within
+  this many days of the date printed on the earliest of the invoice, insurance
+  cover note and gate pass (`DELIVERY_NOT_COMPLETED_IN_TIME`: a High finding and
+  Team Lead task listing everything still pending — documents missing, vehicle
+  proof, open PC tasks); this one also has its own event, queued when the first
+  of those documents is read and fired the morning the window closes
 
 Statutory limits:
 
