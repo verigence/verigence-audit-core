@@ -70,7 +70,30 @@ def _json(value: Any) -> Any:
     raise TypeError(f"not JSON serialisable: {type(value).__name__}")
 
 
-def load_state(connection: Connection) -> ExistingState:
+def workbook_tenants(parsed: ParsedWorkbook, projects: list[dict[str, Any]]) -> set[str]:
+    """The Projects a workbook refers to (by Project ID or Project Code): only
+    their dealers and outlets are needed to plan it."""
+    by_code = {str(p["business_code"]).upper(): p["tenant_id"] for p in projects if p.get("business_code")}
+    known = {p["tenant_id"] for p in projects}
+    tenants: set[str] = set()
+    for row in parsed.projects.rows:
+        project_id = str(row.get("Project ID") or "").strip()
+        if project_id in known:
+            tenants.add(project_id)
+        code = str(row.get("Code") or "").strip().upper()
+        if code in by_code:
+            tenants.add(by_code[code])
+    for row in parsed.dealerships.rows:
+        code = str(row.get("Project Code") or "").strip().upper()
+        if code in by_code:
+            tenants.add(by_code[code])
+    return tenants
+
+
+def load_state(connection: Connection, parsed: ParsedWorkbook | None = None) -> ExistingState:
+    """Current data. With a parsed workbook, per-Project detail (dealers,
+    outlets, segments) is read only for the Projects it refers to -- reading
+    every Project one by one made a preview time out once DEV held many."""
     connection.execute(text("SET LOCAL ROLE audit_core_runtime"))
     set_platform_super_admin_context(connection)
     oems = [dict(r) for r in connection.execute(text(
@@ -91,8 +114,11 @@ def load_state(connection: Connection) -> ExistingState:
     )).mappings()]
     dealers: dict[str, list[dict[str, Any]]] = {}
     outlets: dict[str, list[dict[str, Any]]] = {}
+    wanted = workbook_tenants(parsed, projects) if parsed is not None else None
     for project in projects:
         tenant_id = project["tenant_id"]
+        if wanted is not None and tenant_id not in wanted:
+            continue
         set_tenant_context(connection, tenant_id)
         project["segment_codes"] = list(connection.execute(text(
             """
@@ -190,7 +216,7 @@ async def upload_workbook(
         raise ValidationError(detail=str(exc)) from exc
     import_id = uuid4()
     with engine.begin() as connection:
-        plan = plan_import(parsed, load_state(connection))
+        plan = plan_import(parsed, load_state(connection, parsed))
         plan["input"] = {"projects": parsed.projects.rows, "dealerships": parsed.dealerships.rows}
         status = "VALIDATION_FAILED" if plan["summary"]["errors"] else "PREVIEW_READY"
         _store(connection, import_id=import_id, actor_id=admin_request.user_id,
@@ -384,7 +410,7 @@ def apply_import(
             )
         parsed = ParsedWorkbook(projects=ParsedSheet(rows=stored["input"]["projects"]),
                                 dealerships=ParsedSheet(rows=stored["input"]["dealerships"]))
-        state = load_state(connection)
+        state = load_state(connection, parsed)
         plan = plan_import(parsed, state)
         if plan["summary"]["errors"]:
             connection.execute(
