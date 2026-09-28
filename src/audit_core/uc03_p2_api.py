@@ -378,6 +378,8 @@ def list_p2_journeys(
                    CASE WHEN bs.business_status='BOOKING_CLOSED' THEN bs.business_completed_at_utc END
                      AS booking_completed_at,
                    COALESCE(ds.business_completed_at_utc, dl.actual_delivered_at) AS delivery_completed_at,
+                   (SELECT jr.review_completed_at_utc FROM auditcore.journeys jr
+                     WHERE jr.tenant_id=p.tenant_id AND jr.journey_id=p.journey_id) AS delivery_reviewed_at,
                    bs.capture_completed_at_utc AS booking_submitted_at,
                    ds.capture_completed_at_utc AS delivery_submitted_at,
                    ev.documents,

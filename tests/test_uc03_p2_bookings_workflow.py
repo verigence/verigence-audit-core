@@ -82,7 +82,7 @@ def test_booking_completion_closes_the_existing_stage_and_lists_split(journey):
     base = f"/p2/v1/tenants/{journey.tenant_id}"
     [row] = client.get(f"{base}/journeys", params={"state": "open"}).json()["items"]
     assert row["current_stage"] == "BOOKING_COMPLETE" and row["closed"] is False
-    assert row["booking_completed_at"] is not None
+    assert row["booking_completed_at"] is not None and row["delivery_reviewed_at"] is None
     assert client.get(f"{base}/journeys", params={"state": "closed"}).json()["items"] == []
     summary = client.get(f"{base}/journeys:summary").json()
     assert summary["week"]["bookingsCompleted"] == 1 and summary["open"]["bookings"] == 0
