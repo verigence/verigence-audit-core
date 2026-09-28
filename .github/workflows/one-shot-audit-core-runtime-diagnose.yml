@@ -36,8 +36,10 @@ jobs:
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
           railway deployment list --service "$AUDIT_SERVICE" --limit 3 --json >/tmp/audit-deployments.json || true
           railway deployment list --service "$WORKER_SERVICE" --limit 3 --json >/tmp/worker-deployments.json || true
-          railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 4000 >/tmp/audit.log 2>/tmp/audit.err || true
-          railway logs --service "$WORKER_SERVICE" --latest --deployment --lines 1500 >/tmp/worker.log 2>/tmp/worker.err || true
+          # Runtime logs of the live deployment. (`--deployment` returns the
+          # build / pre-deploy log instead -- confirmed on the first run.)
+          railway logs --service "$AUDIT_SERVICE" --lines 4000 >/tmp/audit.log 2>/tmp/audit.err || true
+          railway logs --service "$WORKER_SERVICE" --lines 1500 >/tmp/worker.log 2>/tmp/worker.err || true
           wc -l /tmp/audit.log /tmp/worker.log
           cat /tmp/audit.err /tmp/worker.err || true
       - name: Summarise
