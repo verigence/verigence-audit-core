@@ -24,7 +24,11 @@ router = APIRouter(
 
 HousekeepingScope = Literal["TENANT", "OUTLET", "JOURNEY"]
 _CONFIRMATION = "PURGE_JOURNEY_DATA"
-_DI_BATCH_SIZE = 1000
+# DI deletes stored files one at a time (about half a second per document on
+# DEV) and each request has a 30 second limit, so a request carries few
+# documents. A retry after a partial purge is safe: DI ignores documents
+# that are already gone.
+_DI_BATCH_SIZE = 20
 
 
 class JourneyHousekeepingPreview(BaseModel):
