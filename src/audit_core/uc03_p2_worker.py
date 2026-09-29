@@ -545,6 +545,26 @@ def _settle_page(
     return UUID(str(batch_id)) if batch_id is not None else None
 
 
+def _page_content_sha(payload: bytes, content_type: str) -> str:
+    """A page's identity for duplicate detection: the scan image inside a
+    PDF page when it holds exactly one, else the bytes as uploaded. The same
+    photo combined into two different PDFs then hashes the same."""
+    if content_type == "application/pdf":
+        try:
+            page = PdfReader(io.BytesIO(payload)).pages[0]
+            resources = page.get("/Resources")
+            resources = resources.get_object() if hasattr(resources, "get_object") else resources
+            xobjects = (resources or {}).get("/XObject")
+            xobjects = xobjects.get_object() if hasattr(xobjects, "get_object") else xobjects
+            images = [x.get_object() for x in (xobjects or {}).values()]
+            images = [x for x in images if x.get("/Subtype") == "/Image"]
+            if len(images) == 1:
+                return hashlib.sha256(images[0].get_data()).hexdigest()
+        except Exception:  # noqa: BLE001, S110 - an odd PDF page is hashed as uploaded
+            pass
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _single_page_pdf(page) -> bytes:
     writer = PdfWriter()
     writer.add_page(page)
@@ -652,7 +672,7 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
 
     page_records: list[dict[str, Any]] = []
     for page_number, (page_payload, page_content_type) in enumerate(pages, start=1):
-        page_sha = hashlib.sha256(page_payload).hexdigest()
+        page_sha = _page_content_sha(page_payload, page_content_type)
         object_key = (
             f"p2-documents/{work.tenant_id}/{work.journey_id}/"
             f"{batch['batch_id']}/pages/{page_number:04d}-{page_sha[:12]}.pdf"
@@ -675,19 +695,43 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
         _owned(connection, work)
+        # The same scan already on this Journey (an earlier upload, or an
+        # earlier page of this file) is recorded, shown, and not sent again.
+        already = {
+            str(r["page_sha256"]): (int(r["page_number"]), str(r["original_filename"]))
+            for r in connection.execute(
+                text(
+                    """
+                    SELECT DISTINCT ON (q.page_sha256) q.page_sha256, q.page_number, b.original_filename
+                    FROM auditcore.p2_document_queue q
+                    JOIN auditcore.p2_upload_batches b ON b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
+                    WHERE q.tenant_id=:tenant_id AND q.journey_id=:journey_id AND q.batch_id<>:batch_id
+                      AND q.unit_kind='PAGE' AND q.page_sha256 = ANY(:shas)
+                      AND q.queue_status NOT IN ('FAILED','DEAD_LETTER','CANCELLED')
+                    ORDER BY q.page_sha256, q.created_at_utc
+                    """
+                ),
+                {"tenant_id": work.tenant_id, "journey_id": work.journey_id, "batch_id": batch["batch_id"],
+                 "shas": [r["pageSha"] for r in page_records]},
+            ).mappings().all()
+        }
+        queued = 0
         for record in page_records:
             queue_id = uuid4()
+            duplicate_of = already.get(record["pageSha"])
+            if duplicate_of is None:
+                already[record["pageSha"]] = (record["pageNumber"], str(batch["original_filename"]))
             connection.execute(
                 text(
                     """
                     INSERT INTO auditcore.p2_document_queue (
                         tenant_id, queue_id, batch_id, journey_id, page_number,
                         page_sha256, page_object_key, client_upload_id,
-                        queue_status, correlation_id, unit_kind, page_numbers
+                        queue_status, status_reason, last_error, correlation_id, unit_kind, page_numbers
                     ) VALUES (
                         :tenant_id, :queue_id, :batch_id, :journey_id, :page_number,
                         :page_sha, :object_key, :client_upload_id,
-                        'QUEUED', :correlation_id, 'PAGE', ARRAY[:page_number]
+                        :queue_status, :status_reason, :last_error, :correlation_id, 'PAGE', ARRAY[:page_number]
                     )
                     ON CONFLICT (tenant_id, batch_id, page_number) WHERE unit_kind='PAGE'
                     DO UPDATE SET page_sha256=EXCLUDED.page_sha256,
@@ -705,9 +749,18 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                     "page_sha": record["pageSha"],
                     "object_key": record["objectKey"],
                     "client_upload_id": record["clientUploadId"],
+                    "queue_status": "CANCELLED" if duplicate_of else "QUEUED",
+                    "status_reason": (
+                        f"Same as page {duplicate_of[0]} of {duplicate_of[1]}; already uploaded, not sent again."
+                        if duplicate_of else None
+                    ),
+                    "last_error": "DUPLICATE_PAGE" if duplicate_of else None,
                     "correlation_id": work.correlation_id,
                 },
             )
+            if duplicate_of:
+                continue
+            queued += 1
             actual_queue_id = connection.execute(
                 text(
                     """
@@ -757,6 +810,9 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                 "page_count": len(page_records),
             },
         )
+        if queued == 0:
+            # Every page was already on the Journey: nothing to process.
+            _refresh_batch_status(connection, work.tenant_id, UUID(str(batch["batch_id"])))
         record_activity(
             connection,
             tenant_id=work.tenant_id,
@@ -1047,6 +1103,23 @@ class PageOutcome:
     reason: str | None
 
 
+_QUALITY_FAILURE_PREFIX = "DI_QUALITY_"
+_UNREADABLE_FAILURE_CODES = frozenset({"FILE_EMPTY", "INVALID_FILE_CONTENT", "CORRUPT", "UPLOAD_FAILED"})
+
+
+def _di_failure_reason(di_item: dict[str, Any] | None) -> str:
+    """Why the document service failed a page, as the PC should read it: a
+    scan-quality rejection is final and needs a re-scan, not a retry."""
+    code = str((di_item or {}).get("failureCode") or "").upper()
+    detail = str((di_item or {}).get("failureDetail") or "").strip().rstrip(".")
+    if code.startswith(_QUALITY_FAILURE_PREFIX):
+        return (f"Page rejected: {detail or 'it did not pass the scan quality check'}. "
+                "Re-scan this page and upload it again; retrying will not help.")
+    if code in _UNREADABLE_FAILURE_CODES:
+        return f"The file could not be read{': ' + detail if detail else ''}. Upload it again."
+    return "Document Intelligence could not read this page. Retry or re-upload it." + (f" ({detail})" if detail else "")
+
+
 def classify_page_outcome(
     *,
     di_item: dict[str, Any] | None,
@@ -1075,7 +1148,7 @@ def classify_page_outcome(
     if state == "DELETED":
         return PageOutcome("CANCELLED", "The page was removed from Document Intelligence.")
     if state == "FAILED" or processing == "FAILED":
-        return PageOutcome("FAILED", "Document Intelligence could not read this page. Retry or re-upload it.")
+        return PageOutcome("FAILED", _di_failure_reason(di_item))
     if state == "UNKNOWN":
         # Docket covers, letters, e-mails, printouts: evidence, never a blocker.
         return PageOutcome(
@@ -1624,6 +1697,7 @@ def _reconcile_page(
                 di_state=:di_state,
                 di_processing_status=:di_processing_status,
                 di_processed_seen_at_utc=:processed_seen_at,
+                last_error=COALESCE(:failure_code, last_error),
                 updated_at_utc=now()
             WHERE tenant_id=:tenant_id AND queue_id=:queue_id
               -- grouping may merge the page while this reconcile runs: a
@@ -1654,6 +1728,7 @@ def _reconcile_page(
             "di_state": (di_item or {}).get("state"),
             "di_processing_status": (di_item or {}).get("processingStatus"),
             "processed_seen_at": processed_seen_at,
+            "failure_code": (di_item or {}).get("failureCode") if outcome.status == "FAILED" else None,
         },
     )
 

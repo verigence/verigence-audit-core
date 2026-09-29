@@ -1439,7 +1439,7 @@ def _page_unit(connection: Connection, *, tenant_id: str, journey_id: UUID, queu
     row = connection.execute(
         text(
             """
-            SELECT queue_id, batch_id, page_number, page_numbers, unit_kind, queue_status,
+            SELECT queue_id, batch_id, page_number, page_numbers, unit_kind, queue_status, last_error,
                    client_upload_id, di_document_id, page_object_key, page_sha256, business_stage
             FROM auditcore.p2_document_queue
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND queue_id=:queue_id
@@ -1473,6 +1473,11 @@ def retry_page(
     unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id)
     if unit["queue_status"] not in _RETRYABLE_PAGE_STATES:
         raise HTTPException(status_code=409, detail="Only failed pages can be retried.")
+    if str(unit.get("last_error") or "").startswith("DI_QUALITY_"):
+        raise HTTPException(
+            status_code=409,
+            detail="This page was rejected for scan quality; retrying will not help. Re-scan it and upload it again.",
+        )
     base = str(unit["client_upload_id"]).split("~r", 1)[0]
     attempt = connection.execute(
         text("SELECT COUNT(*) FROM auditcore.p2_document_queue WHERE tenant_id=:t AND client_upload_id LIKE :p"),
