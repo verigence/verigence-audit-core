@@ -1,8 +1,10 @@
+from typing import Self
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
 
+from audit_core import journey_housekeeping
 from audit_core.journey_housekeeping import _scope_id
 
 
@@ -63,3 +65,42 @@ def test_scope_rejects_ambiguous_identifiers(scope, outlet_id, journey_id) -> No
             outlet_id=outlet_id,
             journey_id=journey_id,
         )
+
+
+def test_di_purge_sends_documents_in_small_batches(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """One request per few documents, so DI finishes each inside the 30 second
+    limit; the totals are the sum over every batch."""
+    sent: list[int] = []
+
+    class _Response:
+        is_success = True
+
+        def __init__(self, count: int) -> None:
+            self._count = count
+
+        def json(self) -> dict:  # type: ignore[type-arg]
+            return {"errorCode": "000", "data": {"deletedDocuments": self._count, "deletedStorageObjects": self._count}}
+
+    class _Client:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def post(self, _url: str, *, json: dict, **_: object) -> _Response:  # type: ignore[type-arg]
+            sent.append(len(json["documentIds"]))
+            return _Response(len(json["documentIds"]))
+
+    monkeypatch.setenv("DI_BASE_URL", "http://di.test")
+    monkeypatch.setattr(journey_housekeeping.httpx, "Client", _Client)
+
+    documents, storage = journey_housekeeping._purge_di_documents(
+        tenant_id="t1", document_ids=[uuid4() for _ in range(45)], human_token="token",
+    )
+
+    assert sent == [20, 20, 5]
+    assert (documents, storage) == (45, 45)
