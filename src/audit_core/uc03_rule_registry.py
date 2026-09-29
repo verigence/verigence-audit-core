@@ -28,6 +28,7 @@ from __future__ import annotations
 import time
 from typing import Annotated, Any
 
+import structlog
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import Connection, text
@@ -48,6 +49,8 @@ from audit_core.uc03_rule_engine_findings import (
     _SEVERITY_MAP,
     _build_security_oauth_client,
 )
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/uc03", tags=["uc03-rule-registry"])
 
@@ -211,7 +214,9 @@ def _rule_engine_rows(tenant_id: str) -> tuple[list[RuleCatalogEntry], bool]:
 
         token = security_client.get_service_token(audience=RULE_ENGINE_AUDIENCE)
         engine_rules = client.list_rules(token=token, tenant_id=tenant_id)
-    except Exception:  # noqa: BLE001 - never break the whole catalog over one dependency
+    except Exception:
+        logger.warning("rule_engine_catalog_unavailable", tenant_id=tenant_id, dependency="rule_engine",
+                       exc_info=True)
         return [], False
     finally:
         if client is not None:

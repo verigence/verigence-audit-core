@@ -153,3 +153,55 @@ def test_error_logs_carry_code_category_and_level_by_category() -> None:
     assert technical["exc_type"] == "RuntimeError"
     assert any("test_errors.py" in frame for frame in technical["exc_stack"])
     assert "sensitive" not in repr(logs)
+
+
+@pytest.mark.parametrize(
+    ("http_status", "status", "error_code", "category"),
+    [
+        (401, 401, "VAC-AUTH-001", "SECURITY"),
+        (403, 403, "VAC-AUTH-002", "SECURITY"),
+        (404, 404, "VAC-NF-000", "BUSINESS"),
+        (409, 409, "VAC-CONFLICT-000", "BUSINESS"),
+        (422, 422, "VAC-VAL-002", "BUSINESS"),
+        (502, 503, "VAC-SYS-002", "DEPENDENCY"),
+        (None, 503, "VAC-SYS-002", "DEPENDENCY"),
+    ],
+)
+def test_security_admin_failures_keep_what_security_answered(http_status, status, error_code, category) -> None:
+    from audit_core.security_integration import SecurityAdminError
+
+    app = FastAPI()
+    install_error_handlers(app)
+
+    @app.get("/admin")
+    def admin() -> None:
+        raise SecurityAdminError("Security administrative request failed", http_status=http_status)
+
+    response = TestClient(app, raise_server_exceptions=False).get("/admin")
+    assert response.status_code == status
+    assert (response.json()["errorCode"], response.json()["errorCategory"]) == (error_code, category)
+
+
+def test_signing_keys_outage_is_503_not_401() -> None:
+    from jwt import PyJWKClientConnectionError
+
+    from audit_core.security import SecurityKeysUnavailableError, SecurityTokenValidator
+
+    class _DownJwks:
+        def get_signing_key_from_jwt(self, token: str):
+            raise PyJWKClientConnectionError("Fail to fetch data from the url")
+
+    validator = SecurityTokenValidator(jwks_url="https://security/jwks", issuer="i", audience="a",
+                                       jwks_client=_DownJwks())
+    with pytest.raises(SecurityKeysUnavailableError):
+        validator.validate("header.payload.signature")
+
+    app = FastAPI()
+    install_error_handlers(app)
+
+    @app.get("/secure")
+    def secure() -> None:
+        validator.validate("header.payload.signature")
+
+    response = TestClient(app, raise_server_exceptions=False).get("/secure")
+    assert response.status_code == 503 and response.json()["errorCategory"] == "DEPENDENCY"

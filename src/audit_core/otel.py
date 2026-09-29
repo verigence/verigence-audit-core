@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -80,12 +81,9 @@ _SEVERITY = {
 
 
 def _service_version() -> str:
-    return (
-        os.getenv("VERIGENCE_GIT_SHA")
-        or os.getenv("RAILWAY_GIT_COMMIT_SHA")
-        or os.getenv("VERIGENCE_RELEASE")
-        or "unknown"
-    )
+    from audit_core.logging_config import release_version
+
+    return os.getenv("VERIGENCE_RELEASE") or release_version()
 
 
 def _otlp_endpoints_configured() -> bool:
@@ -192,13 +190,23 @@ def install_correlation_propagation() -> None:
     sync_send = httpx.Client.send
     async_send = httpx.AsyncClient.send
 
+    from audit_core.observability import add_timing
+
     def send(self: httpx.Client, request: httpx.Request, *args: Any, **kwargs: Any) -> httpx.Response:
         _with_correlation(request)
-        return sync_send(self, request, *args, **kwargs)
+        started = time.perf_counter()
+        try:
+            return sync_send(self, request, *args, **kwargs)
+        finally:
+            add_timing("outbound_ms", (time.perf_counter() - started) * 1000.0, count_key="outbound_calls")
 
     async def asend(self: httpx.AsyncClient, request: httpx.Request, *args: Any, **kwargs: Any) -> httpx.Response:
         _with_correlation(request)
-        return await async_send(self, request, *args, **kwargs)
+        started = time.perf_counter()
+        try:
+            return await async_send(self, request, *args, **kwargs)
+        finally:
+            add_timing("outbound_ms", (time.perf_counter() - started) * 1000.0, count_key="outbound_calls")
 
     httpx.Client.send = send  # type: ignore[method-assign]
     httpx.AsyncClient.send = asend  # type: ignore[method-assign]

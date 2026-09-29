@@ -4,6 +4,7 @@ from datetime import date, datetime
 from typing import Annotated, Any
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, Header, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Connection, text
@@ -34,6 +35,8 @@ from audit_core.uc03_pc_generic_review import (
     _validate_unique_fields,
 )
 from audit_core.workflow import create_workflow_task
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/uc03/tl", tags=["uc03-tl-supervisory"])
 
@@ -655,6 +658,8 @@ def submit_tl_document_review(
                     projected_count += 1
             except Exception:
                 projection_failure_count += 1
+                logger.warning("tl_review_field_projection_failed", tenant_id=tenant_id,
+                               journey_id=str(journey_id), field_index=index, exc_info=True)
 
             _append_workflow_event(
                 connection,

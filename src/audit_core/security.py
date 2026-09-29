@@ -1,12 +1,17 @@
 from dataclasses import dataclass
 
 import jwt
-from jwt import PyJWKClient
+from jwt import PyJWKClient, PyJWKClientConnectionError
 from jwt.exceptions import PyJWTError
 
 
 class SecurityTokenError(RuntimeError):
     """Raised when a Security token cannot be trusted."""
+
+
+class SecurityKeysUnavailableError(RuntimeError):
+    """Security's signing keys could not be fetched: the token was not judged, so this is an
+    outage (503), not an authentication failure (401)."""
 
 
 @dataclass(frozen=True)
@@ -148,5 +153,7 @@ class SecurityTokenValidator:
                 audience=self._audience,
                 options={"require": required_claims},
             )
+        except PyJWKClientConnectionError as exc:
+            raise SecurityKeysUnavailableError("Security signing keys are unavailable") from exc
         except (PyJWTError, ValueError, TypeError) as exc:
             raise SecurityTokenError("Invalid Security token") from exc

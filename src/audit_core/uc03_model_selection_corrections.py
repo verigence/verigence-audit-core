@@ -100,7 +100,7 @@ def _current_effective_rows(
         plan = _price_plan_for_journey(
             connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on
         )
-    except Exception as exc:
+    except AuditCoreError as exc:
         raise AuditCoreError(
             error_code="VAC-SKU-003",
             status_code=422,

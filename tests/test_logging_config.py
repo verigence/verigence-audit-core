@@ -105,3 +105,21 @@ def test_outbound_calls_carry_the_correlation_id() -> None:
     assert seen[0].headers["X-Correlation-ID"] == "c-out"
     assert "X-Correlation-ID" not in seen[1].headers  # presigned storage URL left untouched
     assert seen[2].headers["X-Correlation-ID"] == "explicit"
+
+
+def test_uvicorn_access_lines_are_structured_without_query_or_health(json_stream: io.StringIO) -> None:
+    access = logging.getLogger("uvicorn.access")
+    access.info('%s - "%s %s HTTP/%s" %d', "1.2.3.4:5", "GET", "/health", "1.1", 200)
+    access.info('%s - "%s %s HTTP/%s" %d', "1.2.3.4:5", "GET", "/v1/projects?token=abc", "1.1", 200)
+    [line] = _lines(json_stream)
+    assert (line["event"], line["method"], line["path"], line["status_code"]) == ("http_access", "GET", "/v1/projects", 200)
+    assert "abc" not in json_stream.getvalue()
+
+
+def test_release_version_comes_from_the_build_file(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.delenv("VERIGENCE_GIT_SHA", raising=False)
+    monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "BUILD_SHA").write_text("0123456789abcdef\n")
+    monkeypatch.setattr(logging_config, "__file__", str(tmp_path / "x" / "y" / "z.py"))
+    assert logging_config.release_version() == "0123456789ab"

@@ -143,3 +143,24 @@ def test_existing_phase1_tasks_show_until_the_journey_runs_on_p2(journey):
     body = client.get(f"/p2/v1/tenants/{journey.tenant_id}/tasks").json()
     assert not [i for i in body["items"] if i["source_system"] == "LEGACY"]
     assert client.get(f"/p2/v1/tenants/{journey.tenant_id}/tasks", params={"includeLegacy": True}).json()["sources"]["legacy"] == 1
+
+
+def test_acting_on_someone_elses_task_is_403_not_422(journey):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        task_id = create_p2_task(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+            task_type="MANUAL_VERIFICATION_REVIEW", category="DOCUMENT_VERIFICATION", origin_kind="SYSTEM",
+            source_type="DOCUMENT_FIELD", source_code="MANUAL_VERIFICATION", dedupe_key=f"t:{uuid4()}",
+            title="Someone else's task", description="", reference={}, severity="MEDIUM", priority="NORMAL",
+            assigned_role_code="PC", assigned_actor_id="another-actor", raised_by_actor_id=None,
+            raised_by_role_code=None, allowed_actions=["REVIEW_DOCUMENT", "ADD_COMMENT"],
+            completion_protocol="MACHINE_VERIFIED",
+        )
+    response = TestClient(app).post(
+        f"/p2/v1/tenants/{journey.tenant_id}/tasks/{task_id}/actions", json={"action": "REVIEW_DOCUMENT"},
+    )
+    assert response.status_code == 403, response.text
+    body = response.json()
+    assert body["errorCode"] == "VAC-AUTH-002" and body["errorCategory"] == "SECURITY"
+    assert "assigned to a different actor" in body["detail"]

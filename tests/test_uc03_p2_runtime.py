@@ -505,3 +505,36 @@ def test_stored_and_shown_errors_never_carry_raw_exception_text(journey, monkeyp
     assert "deadbeef" not in stored and "Ravi" not in stored
     assert row["last_error"].startswith("RuntimeError (at ") and "test_uc03_p2_runtime.py" in row["last_error"]
     assert "system problem" in page["status_reason"]
+
+
+def test_running_items_keep_their_lease_until_they_settle(journey, monkeypatch):
+    import threading
+    import time as time_module
+
+    monkeypatch.setattr(worker, "_LEASE_RENEW_SECONDS", 0.2)
+    _enqueue(journey, key="long-running")
+    [item] = worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)
+    _expire_lease(journey, item.work_id)  # as if the item had been running for the whole lease
+    worker._started_at[item.work_id] = time_module.perf_counter()
+    done = threading.Event()
+    renewer = threading.Thread(target=worker._keep_leases, args=(journey.engine, [item], done))
+    renewer.start()
+    time_module.sleep(0.6)
+    done.set()
+    renewer.join()
+    worker._started_at.pop(item.work_id, None)
+    # Renewed: another worker cannot reclaim it while it is still running.
+    assert worker._claim_for_tenant(journey.engine, journey.tenant_id, 10) == []
+
+
+@pytest.mark.parametrize(
+    ("exc", "retryable"),
+    [
+        (RuntimeError("connection reset"), True),
+        (ValueError("Encrypted PDF is not supported"), False),
+        (KeyError("pages"), False),
+        (TypeError("unsupported operand"), False),
+    ],
+)
+def test_programming_errors_are_not_retried(exc, retryable):
+    assert worker._is_retryable(exc) is retryable

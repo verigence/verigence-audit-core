@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import traceback
+from pathlib import Path
 from typing import Any, ClassVar
 
 import structlog
@@ -47,6 +48,21 @@ _REDACTIONS = (
     (re.compile(r"(?<!\d)(\+?91[\s-]?)?[6-9]\d{9}(?!\d)"), "<mobile>"),
     (re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"), "<email>"),
 )
+
+
+def release_version() -> str:
+    """The deployed commit: from the environment, else the BUILD_SHA file CI writes into the
+    upload (Railway builds from an upload without git metadata)."""
+    value = os.getenv("VERIGENCE_GIT_SHA") or os.getenv("RAILWAY_GIT_COMMIT_SHA") or ""
+    if not value:
+        for candidate in (Path(__file__).resolve().parents[2] / "BUILD_SHA", Path.cwd() / "BUILD_SHA"):
+            try:
+                value = candidate.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if value:
+                break
+    return value[:12] or "unknown"
 
 
 def redact_text(value: str, limit: int = _MAX_EXC_MESSAGE) -> str:
@@ -123,9 +139,7 @@ class _ServiceFields:
         self._fields = {
             "service": settings.service_name,
             "environment": settings.environment,
-            "version": (
-                os.getenv("VERIGENCE_GIT_SHA") or os.getenv("RAILWAY_GIT_COMMIT_SHA") or "unknown"
-            )[:12],
+            "version": release_version(),
             "process": process,
         }
 
@@ -161,6 +175,26 @@ class _OtelLogQueue:
     ) -> EventDict:
         emit_otel_log(event_dict)
         return event_dict
+
+
+_HEALTH_PATHS = ("/health", "/healthz", "/ready")
+
+
+class _AccessLogFields(logging.Filter):
+    """uvicorn access lines as fields (method, path without query string, status); health
+    probes dropped. The query string can carry identifiers or signatures."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not isinstance(args, tuple) or len(args) < 5:
+            return True
+        _client, method, full_path, _http_version, status = args[:5]
+        path = str(full_path).split("?", 1)[0]
+        if path in _HEALTH_PATHS:
+            return False
+        record.msg, record.args = "http_access", ()
+        record.method, record.path, record.status_code = method, path, status
+        return True
 
 
 def _use_console(settings: Settings) -> bool:
@@ -215,3 +249,12 @@ def configure_logging(settings: Settings, *, process: str = "api") -> None:
     root.setLevel(settings.log_level)
     for name in _QUIET_LIBRARIES + _QUIET_AUDIT_CORE_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
+    # uvicorn installs its own plain-text handlers before the app is imported; send its lines
+    # through this pipeline instead.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        server_logger = logging.getLogger(name)
+        server_logger.handlers = []
+        server_logger.propagate = True
+    access = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, _AccessLogFields) for f in access.filters):
+        access.addFilter(_AccessLogFields())

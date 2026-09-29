@@ -90,3 +90,69 @@ def test_dependency_success_is_metrics_only_and_failure_is_logged() -> None:
     assert record["dependency"] == "DI"
     assert record["operation"] == "status"
     assert record["result"] == "UNAVAILABLE"
+
+
+def test_slow_requests_report_where_the_time_went(monkeypatch) -> None:
+    from audit_core import observability
+    from audit_core.observability import add_timing
+
+    monkeypatch.setattr(observability, "_slow_request_threshold_ms", lambda: 0.0)
+    app = FastAPI()
+    install_error_handlers(app)
+    install_observability(app)
+
+    @app.get("/work")
+    def work() -> dict[str, str]:
+        add_timing("db_ms", 12.5, count_key="db_queries")
+        add_timing("db_ms", 7.5, count_key="db_queries")
+        add_timing("outbound_ms", 30.0, count_key="outbound_calls")
+        return {"status": "ok"}
+
+    with capture_logs() as logs:
+        TestClient(app).get("/work")
+    [slow] = [event for event in logs if event["event"] == "http_request_slow"]
+    assert (slow["db_ms"], slow["db_queries"]) == (20.0, 2)
+    assert (slow["outbound_ms"], slow["outbound_calls"]) == (30.0, 1)
+    assert slow["route"] == "/work"
+
+
+def test_parallel_admin_requests_ask_security_once(monkeypatch) -> None:
+    import threading
+    import time
+
+    from audit_core import dependencies
+    from audit_core.security import HumanPrincipal
+    from audit_core.security_integration import SecurityAdminContext
+
+    calls: list[str] = []
+
+    class _Client:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def get_admin_context(self, *, human_bearer_token: str) -> SecurityAdminContext:
+            calls.append(human_bearer_token)
+            time.sleep(0.2)
+            return SecurityAdminContext(user_id="u-parallel", is_super_admin=True, admin_scopes=())
+
+    monkeypatch.setenv("SECURITY_BASE_URL", "https://security.example")
+    monkeypatch.setattr(dependencies, "SecurityAdminClient", _Client)
+    dependencies._admin_context_cache.pop("u-parallel", None)
+    principal = HumanPrincipal(subject="u-parallel")
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(
+            dependencies._security_admin_context(bearer_token="t", human_principal=principal)))
+        for _ in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(results) == 4 and len(calls) == 1

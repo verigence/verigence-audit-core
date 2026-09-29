@@ -38,6 +38,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core.errors import AuditCoreError
 from audit_core.uc03_booking_confirmation_rules import _has_active_document
 from audit_core.uc03_delivery_commands import _machine_flag
 from audit_core.uc03_manual_verification import _resolve_finding
@@ -811,7 +812,7 @@ def sync_deal_reconciliation(
             plan = _price_plan_for_journey(
                 connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on
             )
-        except Exception:  # noqa: BLE001 - no effective price list yet
+        except AuditCoreError:  # no effective price list yet
             return {"skipped": True, "reason": "no_effective_price_list"}
 
         price_lines = _materialize_price_standards(

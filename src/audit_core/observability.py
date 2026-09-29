@@ -1,6 +1,8 @@
 import re
 import time
+from contextvars import ContextVar
 from functools import lru_cache
+from typing import Any
 from uuid import uuid4
 
 import structlog
@@ -30,6 +32,22 @@ _BUSINESS_PATH_KEYS = {
 
 # Accept a caller's id only if it is a plain token: it is echoed in headers and every log line.
 _CORRELATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+# Where a request's time went: filled by the DB and outbound-HTTP hooks, reported on slow or
+# failed requests. The dict is shared with the endpoint's task/thread (context copies keep the
+# same object).
+_request_timings: ContextVar[dict[str, Any] | None] = ContextVar("audit_core_request_timings", default=None)
+
+
+def add_timing(key: str, milliseconds: float | None = None, *, count_key: str | None = None) -> None:
+    timings = _request_timings.get()
+    if timings is None:
+        return
+    if milliseconds is not None:
+        timings[key] = round(timings.get(key, 0.0) + milliseconds, 1)
+    if count_key:
+        timings[count_key] = timings.get(count_key, 0) + 1
 
 
 def accepted_correlation_id(value: str | None) -> str:
@@ -72,6 +90,8 @@ def install_observability(app: FastAPI) -> None:
         incoming_trace_id = request.headers.get(TRACE_HEADER)
         request.state.correlation_id = correlation_id
         structlog.contextvars.bind_contextvars(correlation_id=correlation_id)
+        timings: dict[str, Any] = {}
+        timings_token = _request_timings.set(timings)
         status_code = 500
         started = time.perf_counter()
         with trace_span(
@@ -127,6 +147,7 @@ def install_observability(app: FastAPI) -> None:
                         route=route,
                         status_code=status_code,
                         duration_ms=round(duration_ms, 2),
+                        **timings,
                         **business_context,
                     )
                 elif duration_ms > _slow_request_threshold_ms():
@@ -137,8 +158,10 @@ def install_observability(app: FastAPI) -> None:
                         status_code=status_code,
                         duration_ms=round(duration_ms, 2),
                         threshold_ms=_slow_request_threshold_ms(),
+                        **timings,
                         **business_context,
                     )
+                _request_timings.reset(timings_token)
 
 
 def log_dependency(

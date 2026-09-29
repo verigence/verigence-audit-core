@@ -44,10 +44,13 @@ import json
 from typing import Any, Literal
 from uuid import UUID
 
+import structlog
 from sqlalchemy import Connection, text
 
 from audit_core.uc03_review_confidence import REVIEW_THRESHOLD_PERCENT
 from audit_core.workflow import complete_workflow_task, create_workflow_task
+
+logger = structlog.get_logger(__name__)
 
 TASK_TYPE = "MANUAL_VERIFICATION_REVIEW"
 _WORKFLOW_TYPE = "UC03_MANUAL_VERIFICATION"
@@ -200,7 +203,9 @@ def sync_manual_verification_findings(
                 connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage_code
             )
         )
-    except Exception:  # noqa: BLE001 - producer must never break the caller
+    except Exception:
+        logger.warning("uc03_manual_verification_producer_failed", tenant_id=tenant_id,
+                       journey_id=str(journey_id), exc_info=True)
         return {"raised": 0, "resolved": 0, "error": True}
 
     # raised counts every currently-outstanding pending document, not just

@@ -24,7 +24,12 @@ from audit_core.dependencies import (
     get_engine,
     require_project_admin_request,
 )
-from audit_core.errors import AuditCoreError, BusinessValidationError, NotFoundError
+from audit_core.errors import (
+    AuditCoreError,
+    BusinessValidationError,
+    NotFoundError,
+    security_admin_failure,
+)
 from audit_core.observability import get_correlation_id
 from audit_core.security_integration import SecurityAdminClient, SecurityAdminError
 
@@ -491,7 +496,7 @@ def list_role_mapping_candidates(
                 limit=limit,
             )
     except SecurityAdminError as exc:
-        raise _dependency_unavailable() from exc
+        raise security_admin_failure(exc, action="list users for role mapping") from exc
     return [
         RoleMappingCandidateResponse(
             userId=user.user_id,

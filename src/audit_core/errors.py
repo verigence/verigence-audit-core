@@ -18,8 +18,11 @@ from audit_core.observability import (
     request_business_context,
 )
 from audit_core.otel import attach_business_context
-from audit_core.security import SecurityTokenError
-from audit_core.security_integration import SecurityTokenUnavailableError
+from audit_core.security import SecurityKeysUnavailableError, SecurityTokenError
+from audit_core.security_integration import (
+    SecurityAdminError,
+    SecurityTokenUnavailableError,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -115,6 +118,27 @@ class DependencyUnavailableError(AuditCoreError):
             "Service temporarily unavailable",
             detail,
         )
+
+
+def security_admin_failure(exc: SecurityAdminError, *, action: str) -> AuditCoreError:
+    """Translate a Security administrative failure by what Security answered: the caller's
+    authentication/permission (401/403) or a business refusal (4xx) is not an outage."""
+    status = exc.http_status
+    if status == 401:
+        return AuditCoreError("VAC-AUTH-001", 401, "Authentication required",
+                              "Authentication is required for this administrative operation.")
+    if status == 403:
+        return AuditCoreError("VAC-AUTH-002", 403, "Permission denied",
+                              f"Security did not allow you to {action}.")
+    if status == 404:
+        return NotFoundError(error_code="VAC-NF-000", title="Not found",
+                             detail=f"Security could not find what is needed to {action}.")
+    if status == 409:
+        return ConflictError(error_code="VAC-CONFLICT-000", title="Conflict",
+                             detail=f"Security reported a conflict; could not {action}. Refresh and try again.")
+    if status is not None and 400 <= status < 500:
+        return BusinessValidationError(detail=f"Security rejected the request to {action}.")
+    return DependencyUnavailableError(detail=f"Could not {action}: Security is temporarily unavailable. Please try again.")
 
 
 def _problem(
@@ -229,6 +253,29 @@ def install_error_handlers(app: FastAPI) -> None:
             status_code=401,
             title="Authentication required",
             detail="A valid Security access token is required.",
+        )
+
+    @app.exception_handler(SecurityKeysUnavailableError)
+    async def signing_keys_unavailable(request: Request, exc: SecurityKeysUnavailableError) -> JSONResponse:
+        return _problem(
+            request,
+            error_code="VAC-SYS-002",
+            status_code=503,
+            title="Service temporarily unavailable",
+            detail="Sign-in verification is temporarily unavailable. Please try again.",
+            exc=exc,
+        )
+
+    @app.exception_handler(SecurityAdminError)
+    async def security_admin_error(request: Request, exc: SecurityAdminError) -> JSONResponse:
+        failure = security_admin_failure(exc, action="complete this administrative action")
+        return _problem(
+            request,
+            error_code=failure.error_code,
+            status_code=failure.status_code,
+            title=failure.title,
+            detail=failure.detail,
+            exc=exc,
         )
 
     @app.exception_handler(SecurityTokenUnavailableError)
