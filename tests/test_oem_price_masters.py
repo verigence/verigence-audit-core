@@ -435,7 +435,8 @@ def test_a_partial_upload_makes_a_complete_version_and_dates_each_price(connecti
         parsed=parse_price_list(_price_bytes(("THAR ROXX", "MX1 PMT 2WD", 1_050_000))),
         actor_id="admin", stats=stats,
     )
-    assert stats == {"uploaded": 1, "changed": 1, "unchanged": 0, "carriedForward": 1, "standingVersionId": str(v1)}
+    assert stats == {"uploaded": 1, "changed": 1, "unchanged": 0, "carriedForward": 1, "standingVersionId": str(v1),
+                     "laterVersionsRederived": 0}
     first, second = _items(connection, tenant_id, v1), _items(connection, tenant_id, v2)
     assert len(second) == len(first) == 20  # both SKUs, all ten components, in both versions
     assert second[("THAR_ROXX::MX1 PMT 2WD", "EX_SHOWROOM")] == (Decimal(1_050_000), date(2026, 9, 19))
@@ -453,6 +454,49 @@ def test_a_partial_upload_makes_a_complete_version_and_dates_each_price(connecti
     )
     assert again["changed"] == 0 and again["unchanged"] == 1 and again["carriedForward"] == 1
     assert _items(connection, tenant_id, v3)[("THAR_ROXX::MX1 PMT 2WD", "EX_SHOWROOM")] == (Decimal(1_050_000), date(2026, 9, 19))
+
+
+def test_an_earlier_dated_upload_reaches_the_versions_already_published_after_it(connection) -> None:
+    """The EV sheet dated the 1st arrives after the consolidated list dated
+    the 3rd (2026-09-30, DEV): the 3rd's version was built without the EV
+    SKUs, so from the 3rd on the EV was "not priced". The upload re-derives
+    the later version on its own date with the missing SKUs carried
+    forward; published versions stay immutable and are superseded."""
+    tenant_id = connection.tenant_id
+    project = _project_oem(connection, tenant_id)
+    consolidated, _ = ingest_price_list(
+        connection, tenant_id=tenant_id, oem_id=project["oem_id"], effective_from=date(2026, 9, 3),
+        parsed=parse_price_list(_price_bytes(("XUV 3XO", "MX1", 800_000))), actor_id="admin",
+    )
+    stats: dict = {}
+    ev, _ = ingest_price_list(
+        connection, tenant_id=tenant_id, oem_id=project["oem_id"], effective_from=date(2026, 9, 1),
+        parsed=parse_price_list(_price_bytes(("BE6", "PACK ONE", 1_900_000))), actor_id="admin", stats=stats,
+    )
+    assert stats["carriedForward"] == 0 and stats["laterVersionsRederived"] == 1
+    on_the_2nd = find_effective_price_plan(connection, tenant_id=tenant_id, effective_on=date(2026, 9, 2))
+    assert on_the_2nd["price_list_version_id"] == ev
+    on_the_5th = find_effective_price_plan(connection, tenant_id=tenant_id, effective_on=date(2026, 9, 5))
+    assert on_the_5th["price_list_version_id"] not in {ev, consolidated} and on_the_5th["effective_from"] == date(2026, 9, 3)
+    items = _items(connection, tenant_id, on_the_5th["price_list_version_id"])
+    assert items[("XUV_3XO::MX1", "EX_SHOWROOM")] == (Decimal(800_000), date(2026, 9, 3))
+    assert items[("BE6::PACK ONE", "EX_SHOWROOM")] == (Decimal(1_900_000), date(2026, 9, 1))
+    assert len(_items(connection, tenant_id, consolidated)) == 10  # the old version is untouched
+
+    # A third date already published after both: it is re-derived too, once.
+    later, _ = ingest_price_list(
+        connection, tenant_id=tenant_id, oem_id=project["oem_id"], effective_from=date(2026, 9, 7),
+        parsed=parse_price_list(_price_bytes(("XUV 3XO", "MX1", 810_000))), actor_id="admin",
+    )
+    assert len(_items(connection, tenant_id, later)) == 20  # carried BE6 from the re-derived 3rd
+    again: dict = {}
+    ingest_price_list(
+        connection, tenant_id=tenant_id, oem_id=project["oem_id"], effective_from=date(2026, 8, 20),
+        parsed=parse_price_list(_price_bytes(("THAR ROXX", "MX1 PMT 2WD", 1_000_000))), actor_id="admin", stats=again,
+    )
+    assert again["laterVersionsRederived"] == 3  # the 1st, the 3rd and the 7th each gain THAR ROXX
+    assert len(_items(connection, tenant_id, find_effective_price_plan(
+        connection, tenant_id=tenant_id, effective_on=date(2026, 9, 9))["price_list_version_id"])) == 30
 
 
 def test_discount_grid_ingests_per_model_and_reports_unknown_models(connection) -> None:

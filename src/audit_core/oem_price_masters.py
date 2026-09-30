@@ -23,7 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 from uuid import UUID
@@ -603,7 +603,93 @@ def ingest_price_list(
     publish_price_list_version(
         connection, tenant_id=tenant_id, price_list_version_id=version_id, actor_id=actor_id
     )
+    rederived = _carry_into_later_versions(
+        connection, tenant_id=tenant_id, price_list_id=price_list_id, effective_from=effective_from, actor_id=actor_id,
+    )
+    if stats is not None:
+        stats["laterVersionsRederived"] = len(rederived)
     return version_id, sku_id_by_code
+
+
+def _carry_into_later_versions(
+    connection: Connection, *, tenant_id: str, price_list_id: UUID, effective_from: date, actor_id: str,
+) -> list[UUID]:
+    """Uploads arrive in any order (the EV sheet dated the 1st after the
+    consolidated list dated the 3rd): a version published for a LATER date
+    was built before this file existed, so it lacks every SKU only this
+    file prices, and from its date on those vehicles would be "not priced".
+    For each later date whose standing version misses a SKU the version
+    standing just before it prices, publish a re-derived version on that
+    same date: its own rows, plus the missing SKUs carried forward. The
+    old version stays (published versions are immutable) and is superseded
+    by the higher version number. Returns the re-derived version ids."""
+    later_dates = connection.execute(
+        text(
+            """
+            SELECT DISTINCT effective_from FROM auditcore.price_list_versions
+            WHERE tenant_id = :tenant_id AND price_list_id = :price_list_id
+              AND lifecycle_status IN ('PUBLISHED', 'RETIRED') AND effective_from > :effective_from
+            ORDER BY effective_from
+            """
+        ),
+        {"tenant_id": tenant_id, "price_list_id": price_list_id, "effective_from": effective_from},
+    ).scalars().all()
+    rederived: list[UUID] = []
+    for later_on in later_dates:
+        later_version, own = _standing_items(
+            connection, tenant_id=tenant_id, price_list_id=price_list_id, effective_from=later_on,
+        )
+        before_version, before = _standing_items(
+            connection, tenant_id=tenant_id, price_list_id=price_list_id,
+            effective_from=later_on - timedelta(days=1),
+        )
+        if later_version is None or before_version is None:
+            continue
+        priced = {sku for sku, _ in own}
+        missing = [(key, row) for key, row in before.items() if key[0] not in priced]
+        if not missing:
+            continue
+        new_version = create_price_list_version(
+            connection,
+            tenant_id=tenant_id,
+            price_list_id=price_list_id,
+            version_no=_next_version_no(
+                connection, "price_list_versions", "price_list_id", tenant_id, price_list_id
+            ),
+            effective_from=later_on,
+            actor_id=actor_id,
+        )
+        item_rows = [
+            {
+                "tenant_id": tenant_id,
+                "price_list_version_id": new_version,
+                "product_sku_id": key[0],
+                "component_key": key[1],
+                "standard_amount": row["standard_amount"],
+                "price_since": row["price_since"],
+                "metadata": json.dumps(
+                    {**(row["metadata"] or {}), "rederivedFrom": str(later_version)} if key not in dict(missing)
+                    else {**(row["metadata"] or {}), "carriedForwardFrom": str(before_version)}
+                ),
+            }
+            for key, row in [*own.items(), *missing]
+        ]
+        _chunked_insert_returning(
+            connection,
+            table="price_list_items",
+            columns=[
+                "tenant_id", "price_list_version_id", "product_sku_id",
+                "component_key", "standard_amount", "price_since", "metadata",
+            ],
+            rows=item_rows,
+            returning=[],
+            jsonb_columns=frozenset({"metadata"}),
+        )
+        publish_price_list_version(
+            connection, tenant_id=tenant_id, price_list_version_id=new_version, actor_id=actor_id
+        )
+        rederived.append(new_version)
+    return rederived
 
 
 # ── discount ingestion ──────────────────────────────────────────────────────────
