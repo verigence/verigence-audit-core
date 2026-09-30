@@ -45,14 +45,38 @@ def test_pricing_summary_and_validation(journey):
     summary = client.get(base).json()
     assert summary["bookingDate"] == "2026-09-01" and summary["appliedDate"] == "2026-09-01"
     assert summary["basis"] == "BOOKING_DATE" and summary["modelChange"] == "CONFIRM_SKU"
-    # no invoice yet / no reason / no price list on that date
+    assert summary["bookingDateMissing"] is False
+    # no invoice yet; any other date is not a choice (decision 2026-09-30)
     assert client.put(base, json={"basis": "INVOICE_DATE", "reason": "late invoice"}).status_code == 422
-    assert client.put(base, json={"basis": "CUSTOM", "onDate": "2026-09-20"}).status_code == 422
-    assert client.put(base, json={"basis": "CUSTOM", "onDate": "2026-09-20", "reason": "price revision"}).status_code == 422
+    assert client.put(base, json={"basis": "CUSTOM", "onDate": "2026-09-20", "reason": "price revision"}).status_code == 400
     # resetting to the booking date needs no reason
     reset = client.put(base, json={"basis": "BOOKING_DATE"})
     assert reset.status_code == 200, reset.text
     assert reset.json()["appliedDate"] == "2026-09-01"
+
+
+def test_the_booking_form_date_prices_the_deal_and_is_never_guessed(journey):
+    """#38 (2026-09-30): the booking date on the booking form is the pricing
+    date; without one the deal is not priced (no fallback to today) and the
+    booking-date basis cannot be applied."""
+    from p2_support import add_ready_document
+
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}/pricing"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.bookings SET booking_date=NULL WHERE journey_id=:j"),
+                           {"j": journey.journey_id})
+    summary = client.get(base).json()
+    assert summary["bookingDateMissing"] is True and summary["appliedDate"] is None
+    assert summary["appliedPriceList"] is None and summary["options"] == []
+    assert client.put(base, json={"basis": "BOOKING_DATE"}).status_code == 422
+
+    add_ready_document(journey, "booking_form", booking_date="05/09/2026", customer_name="A")
+    summary = client.get(base).json()
+    assert summary["bookingDate"] == "2026-09-05" and summary["appliedDate"] == "2026-09-05"
+    assert summary["bookingDateMissing"] is False
+    assert [o["basis"] for o in summary["options"]] == ["BOOKING_DATE"]
 
 
 def test_recheck_requests_reconcile_stage_and_checks(journey):

@@ -84,6 +84,7 @@ from audit_core.uc03_p2_stage import recompute_journey_stage
 from audit_core.uc03_p2_storage import get_p2_document_storage
 from audit_core.uc03_p2_task_producer import (
     apply_control_transitions,
+    sync_booking_date_task,
     sync_delivery_review_task,
     sync_document_missing_tasks,
     sync_field_review_tasks,
@@ -2287,6 +2288,8 @@ def _sync_rule_tasks(connection, *, tenant_id: str, journey_id: UUID, started_at
     outcomes = {
         "field_review": sync_field_review_tasks(
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
+        "booking_date": sync_booking_date_task(
+            connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
         "document_missing": sync_document_missing_tasks(
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
         "name_consistency": sync_name_consistency_tasks(
@@ -2467,6 +2470,10 @@ def _task_verify(engine: Engine, work: WorkItem) -> None:
         source_type = str(task["source_type"] or "")
         if source_type == "DOCUMENT_FIELD":
             sync_field_review_tasks(
+                connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+                evaluation_started_at=datetime.now(UTC),
+            )
+            sync_booking_date_task(
                 connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
                 evaluation_started_at=datetime.now(UTC),
             )

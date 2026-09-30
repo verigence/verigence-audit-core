@@ -758,6 +758,48 @@ def sync_unclassified_page_tasks(
     return counts
 
 
+def sync_booking_date_task(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    registry: Registry | None = None,
+    evaluation_started_at: datetime | None = None,
+) -> dict[str, int]:
+    """One Medium task (PC) while the booking form on file carries no
+    booking date: the deal is priced on that date, and it is never guessed
+    (decision 2026-09-30). The task opens the booking form on its booking
+    date field and closes itself once a date is in. A date that was read
+    but cannot be right (before the floor, unreadable) is the field review
+    task's business, not this one's."""
+    from audit_core.uc03_p2_dates import booking_form_date
+
+    registry = registry or get_registry()
+    key = f"booking-date:{journey_id}"
+    form = booking_form_date(connection, tenant_id=tenant_id, journey_id=journey_id)
+    counts: dict[str, int] = {}
+    if form is not None and form["raw"] in (None, ""):
+        name = "Booking Form" if form["documentType"] == "booking_form" else "Booking Docket"
+        _, outcome = raise_or_refresh(
+            connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+            task_type="PC_BOOKING_DATE_MISSING", source_type="DOCUMENT_FIELD", source_code="BOOKING_DATE_MISSING",
+            title=f"Enter the booking date on the {name}",
+            description=(f"The {name} was read, but no booking date was found on it. The deal is priced on the "
+                         "booking date, so nothing is priced until it is in. Open the document, enter the booking "
+                         "date printed on it and save. This task closes itself once the date is in."),
+            reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT_FIELD", "sourceCode": "BOOKING_DATE_MISSING",
+                       "documentId": form["documentId"], "documentIds": [form["documentId"]],
+                       "templateKey": form["documentType"], "fieldKey": "booking_date", "fieldKeys": ["booking_date"]},
+            severity="MEDIUM", registry=registry, evaluation_started_at=evaluation_started_at,
+        )
+        counts[outcome] = counts.get(outcome, 0) + 1
+    elif resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                         evidence={"bookingDate": (form or {}).get("raw"),
+                                   "verifiedAt": datetime.now(UTC).isoformat()}):
+        counts["VERIFIED"] = 1
+    return counts
+
+
 def sync_document_missing_tasks(
     connection: Connection,
     *,

@@ -44,6 +44,17 @@ task_types:
     - REVIEW_DOCUMENT
     - CORRECT_EXTRACTED_FIELD
     - ADD_COMMENT
+  # The booking form on file carries no booking date; the deal is priced on
+  # it, so the PC enters it on the form (Medium, closes itself).
+  PC_BOOKING_DATE_MISSING:
+    category: DOCUMENT_VERIFICATION
+    owner: PC
+    origin: SYSTEM
+    source: DOCUMENT_FIELD
+    completion: MACHINE_VERIFIED
+    actions:
+    - CORRECT_EXTRACTED_FIELD
+    - ADD_COMMENT
   WRONG_DOCUMENT_REVIEW:
     category: DOCUMENT_VERIFICATION
     owner: PC

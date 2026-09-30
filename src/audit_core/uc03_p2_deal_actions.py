@@ -33,6 +33,7 @@ from audit_core.security_authorization import (
 )
 from audit_core.uc03_p2_access import authorize_p2
 from audit_core.uc03_p2_controls import request_control_evaluation
+from audit_core.uc03_p2_dates import booking_form_date
 from audit_core.uc03_p2_runtime import enqueue_work, note_facts_changed, record_activity
 
 logger = structlog.get_logger(__name__)
@@ -117,13 +118,27 @@ def _pricing_row(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
     return dict(row)
 
 
+def booking_date_for_pricing(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                             row: dict[str, Any] | None = None) -> date | None:
+    """The date the deal is priced on by default: the booking date on the
+    booking form (as read, or as the PC corrected it), else the booking
+    date entered by hand on the booking. Never today."""
+    form = booking_form_date(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if form and form["date"]:
+        return form["date"]
+    row = row or _pricing_row(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return row["booking_date"]
+
+
 def pricing_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     from audit_core.uc03_journey_overview_projection import _primary_invoice_date
 
     row = _pricing_row(connection, tenant_id=tenant_id, journey_id=journey_id)
     invoice_date = _primary_invoice_date(connection, tenant_id=tenant_id, journey_id=journey_id)
-    booking_date = row["booking_date"]
-    applied = row["pricing_effective_on"] or booking_date or _today()
+    booking_date = booking_date_for_pricing(connection, tenant_id=tenant_id, journey_id=journey_id, row=row)
+    # No booking date means no price until the PC enters it on the booking
+    # form (a Medium task asks); the deal is never silently priced on today.
+    applied = row["pricing_effective_on"] or booking_date
     options = []
     for basis, on in (("BOOKING_DATE", booking_date), ("INVOICE_DATE", invoice_date)):
         if on is None:
@@ -133,8 +148,8 @@ def pricing_summary(connection: Connection, *, tenant_id: str, journey_id: UUID)
             "priceList": _plan(connection, tenant_id=tenant_id, journey_id=journey_id, on=on),
             "schemeVersions": _schemes(connection, tenant_id=tenant_id, row=row, on=on),
         })
-    applied_plan = _plan(connection, tenant_id=tenant_id, journey_id=journey_id, on=applied)
-    applied_schemes = _schemes(connection, tenant_id=tenant_id, row=row, on=applied)
+    applied_plan = _plan(connection, tenant_id=tenant_id, journey_id=journey_id, on=applied) if applied else None
+    applied_schemes = _schemes(connection, tenant_id=tenant_id, row=row, on=applied) if applied else []
     for option in options:
         option["differsFromApplied"] = (
             (option["priceList"] or {}).get("priceListVersionId") != (applied_plan or {}).get("priceListVersionId")
@@ -142,9 +157,10 @@ def pricing_summary(connection: Connection, *, tenant_id: str, journey_id: UUID)
         )
     return {
         "bookingDate": booking_date,
+        "bookingDateMissing": booking_date is None,
         "invoiceDate": invoice_date,
         "appliedDate": applied,
-        "basis": row["pricing_basis"] or ("CUSTOM" if row["pricing_effective_on"] else "BOOKING_DATE"),
+        "basis": row["pricing_basis"] or "BOOKING_DATE",
         "reason": row["pricing_reason"],
         "setByActorId": row["pricing_set_by_actor_id"],
         "setAtUtc": row["pricing_set_at_utc"],
@@ -191,7 +207,10 @@ def get_pricing_catalog(
 
     _auth(connection, tenant_id, journey_id, human_principal, authorization_client, _READ)
     row = _pricing_row(connection, tenant_id=tenant_id, journey_id=journey_id)
-    on = onDate or row["pricing_effective_on"] or row["booking_date"] or _today()
+    # The catalogue is for picking the model; with no pricing date yet it
+    # shows today's masters (the deal itself is not priced on today).
+    on = (onDate or row["pricing_effective_on"]
+          or booking_date_for_pricing(connection, tenant_id=tenant_id, journey_id=journey_id, row=row) or _today())
     try:
         catalog = get_model_catalog(connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=on)
     except AuditCoreError as exc:
@@ -204,8 +223,10 @@ def get_pricing_catalog(
 
 
 class PricingCommand(BaseModel):
-    basis: Literal["BOOKING_DATE", "INVOICE_DATE", "CUSTOM"]
-    onDate: date | None = None
+    """Two choices only (decision 2026-09-30): the booking date or the
+    invoice date. Any other date is not offered."""
+
+    basis: Literal["BOOKING_DATE", "INVOICE_DATE"]
     reason: str | None = Field(default=None, max_length=1000)
 
 
@@ -226,18 +247,19 @@ def set_pricing(
     reason = (command.reason or "").strip()
     if command.basis == "BOOKING_DATE":
         on = None
-    elif command.basis == "INVOICE_DATE":
+        if booking_date_for_pricing(connection, tenant_id=tenant_id, journey_id=journey_id) is None:
+            raise HTTPException(
+                status_code=422,
+                detail="The booking form has no booking date yet. Enter it on the booking form first.",
+            )
+    else:
         on = _primary_invoice_date(connection, tenant_id=tenant_id, journey_id=journey_id)
         if on is None:
             raise HTTPException(status_code=422, detail="No reviewed vehicle invoice date is on file yet.")
-    else:
-        if command.onDate is None:
-            raise HTTPException(status_code=422, detail="Choose the pricing date.")
-        on = command.onDate
-    if on is not None and len(reason) < 5:
-        raise HTTPException(status_code=422, detail="Give a short reason for pricing this deal on another date.")
-    if _plan(connection, tenant_id=tenant_id, journey_id=journey_id, on=on or _today()) is None and on is not None:
-        raise HTTPException(status_code=422, detail=f"No price list is effective on {on.isoformat()}.")
+        if len(reason) < 5:
+            raise HTTPException(status_code=422, detail="Give a short reason for pricing this deal on the invoice date.")
+        if _plan(connection, tenant_id=tenant_id, journey_id=journey_id, on=on) is None:
+            raise HTTPException(status_code=422, detail=f"No price list is effective on {on.isoformat()}.")
 
     previous = _pricing_row(connection, tenant_id=tenant_id, journey_id=journey_id)
     connection.execute(

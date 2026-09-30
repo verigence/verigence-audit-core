@@ -89,3 +89,27 @@ def date_floor_verdict(value: Any, floor: date | None) -> str | None:
     if parsed < floor:
         return "DATE_BEFORE_FLOOR"
     return None
+
+
+def booking_form_date(connection: Any, *, tenant_id: str, journey_id: Any) -> dict[str, Any] | None:
+    """The booking date as the booking form (or docket) carries it, the
+    PC's correction winning over the reading: {"documentId", "documentType",
+    "raw", "date"}, ``date`` None when the form has no readable booking
+    date; None when no booking form is on file. The deal is priced on this
+    date, so it is never guessed (decision 2026-09-30: no fallback to
+    today; a Medium task asks the PC to enter a missing one)."""
+    from audit_core.uc03_p2_journey360 import _document_facts
+
+    documents = _document_facts(
+        connection, tenant_id=tenant_id, journey_id=journey_id, di_types=("booking_form", "booking_docket"),
+    )
+    if not documents:
+        return None
+    form = next((d for d in documents if d["documentType"] == "booking_form"), documents[0])
+    raw = form["fields"].get("booking_date")
+    return {
+        "documentId": form["documentId"],
+        "documentType": form["documentType"],
+        "raw": raw,
+        "date": parse_extracted_date(raw),
+    }

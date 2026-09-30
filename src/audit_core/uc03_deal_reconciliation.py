@@ -50,6 +50,7 @@ from audit_core.uc03_masters_alignment import (
     commercial_key_for_price_component,
     registration_basis,
 )
+from audit_core.uc03_p2_dates import booking_form_date
 from audit_core.uc03_sku_candidates import _price_plan_for_journey
 from audit_core.workflow import create_workflow_task
 
@@ -85,7 +86,8 @@ def _context(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
             SELECT jp.product_sku_id,
                    s.model_id,
                    s.variant_id,
-                   COALESCE(b.pricing_effective_on, b.booking_date, CURRENT_DATE)   AS effective_on,
+                   b.pricing_effective_on,
+                   b.booking_date AS manual_booking_date,
                    cu.customer_type_code,
                    rr.registration_type_code
             FROM auditcore.journey_products jp
@@ -107,6 +109,14 @@ def _context(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     if row is None:
         return None
     data = dict(row)
+    # The pricing date: the date applied by hand, else the booking date on
+    # the booking form, else the booking date entered by hand. Never today
+    # (decision 2026-09-30): with none of them the deal is not priced yet.
+    form = booking_form_date(connection, tenant_id=tenant_id, journey_id=journey_id)
+    data["effective_on"] = (
+        data.pop("pricing_effective_on") or (form["date"] if form else None) or data.pop("manual_booking_date")
+    )
+    data.pop("manual_booking_date", None)
     data["basis"] = registration_basis(
         customer_type_code=data["customer_type_code"],
         registration_type_code=data["registration_type_code"],
@@ -805,6 +815,8 @@ def sync_deal_reconciliation(
             return {"skipped": True, "reason": "no_resolved_sku"}
 
         effective_on = ctx["effective_on"]
+        if effective_on is None:
+            return {"skipped": True, "reason": "no_booking_date"}
         if not isinstance(effective_on, date):
             effective_on = date.fromisoformat(str(effective_on))
 

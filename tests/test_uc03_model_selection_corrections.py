@@ -112,6 +112,11 @@ def correction_setup():
                 VALUES (:t, :d, :o, :cu, :r) RETURNING journey_id"""),
             {"t": tenant_id, "d": dealer_id, "o": outlet_id, "cu": customer_id, "r": f"SKUCORR-J-{suffix}"},
         ).scalar_one()
+        # The deal is priced on the booking date, never on today (2026-09-30).
+        c.execute(
+            text("INSERT INTO auditcore.bookings (tenant_id, journey_id, booking_date) VALUES (:t, :j, CURRENT_DATE)"),
+            {"t": tenant_id, "j": journey_id},
+        )
 
         wrong_sku = _create_sku(c, oem_id=oem_id, suffix=f"wrong-{suffix}", sku_code=f"SKU-WRONG-{suffix}")
         right_sku = _create_sku(c, oem_id=oem_id, suffix=f"right-{suffix}", sku_code=f"SKU-RIGHT-{suffix}")

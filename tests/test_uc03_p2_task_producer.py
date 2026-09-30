@@ -26,6 +26,7 @@ from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_task_producer import (
     apply_control_transitions,
     format_value,
+    sync_booking_date_task,
     sync_field_review_tasks,
 )
 from audit_core.uc03_p2_tasks import submit_action
@@ -228,3 +229,44 @@ def test_a_misread_date_and_a_low_confidence_value_share_one_task(journey):
     assert task["severity"] == "HIGH"
     assert "Receipt date read as 'not a date', which is not a date" in task["description"]
     assert "Receipt number (60%)" in task["description"]
+
+
+def test_a_booking_form_without_a_booking_date_raises_a_medium_task_that_opens_the_field(journey):
+    """#38 (2026-09-30): the deal is priced on the booking date, so a form
+    read without one gets a Medium task pointing the PC at that field; the
+    task closes itself once a date is in."""
+    def run():
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            return sync_booking_date_task(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+    def task():
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            return connection.execute(
+                text("SELECT task_type, severity, task_status, reference FROM auditcore.p2_tasks "
+                     "WHERE tenant_id=:t AND dedupe_key=:k"),
+                {"t": journey.tenant_id, "k": f"booking-date:{journey.journey_id}"},
+            ).mappings().one_or_none()
+
+    assert run() == {} and task() is None  # no booking form yet: nothing to ask
+    document_id = add_ready_document(journey, "booking_form", customer_name="A")
+    add_extracted_field(journey, di_document_id=document_id, field_key="booking_date", value=None)
+    assert run() == {"RAISED": 1}
+    raised = task()
+    assert (raised["task_type"], raised["severity"], raised["task_status"]) == ("PC_BOOKING_DATE_MISSING", "MEDIUM", "READY")
+    assert raised["reference"]["documentId"] == str(document_id) and raised["reference"]["fieldKey"] == "booking_date"
+    run()
+    assert task()["task_status"] == "READY"
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.journey_document_extracted_fields SET effective_value=to_jsonb('03/09/2026'::text), "
+                 "modified_value=to_jsonb('03/09/2026'::text), is_modified=true, "
+                 "modified_by_actor_id='pc-1', modified_at_utc=now(), reviewed_by_actor_id='pc-1', reviewed_at_utc=now() "
+                 "WHERE di_document_id=:d AND field_key='booking_date'"),
+            {"d": document_id},
+        )
+    assert run() == {"VERIFIED": 1}
+    assert task()["task_status"] == "VERIFIED_COMPLETE"

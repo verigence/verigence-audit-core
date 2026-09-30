@@ -55,7 +55,7 @@ def _delivery_document(journey, document_type_key, **fields):
 
 
 def _complete_booking(journey):
-    add_ready_document(journey, "booking_form", customer_name="A")
+    add_ready_document(journey, "booking_form", customer_name="A", booking_date="2026-09-01")
     add_ready_document(journey, "pan_card", pan_number="ABCDE1234F")
     add_receipt_payment(journey, amount="21000", receipt_number="R1", receipt_date="2026-09-01")
 

@@ -446,6 +446,18 @@ def test_the_delivery_review_waits_for_every_verdict(journey):
 # ------------------------------------ the documents window and the night
 
 
+def test_a_date_before_the_floor_never_starts_the_delivery_clock(journey):
+    """#19 (2026-09-30): a gate pass read as 2019 is a misreading the PC is
+    asked to fix; the delivery window is not counted from it."""
+    add_ready_document(journey, "gate_pass", delivery_date="12/03/2019")
+    _recompute(journey)
+    assert _run(journey, "DELIVERY")["DELIVERY_NOT_COMPLETED_IN_TIME"].outcome == "PASS"
+    add_ready_document(journey, "customer_invoice_dms", invoice_date=(TODAY - timedelta(days=2)).isoformat())
+    _recompute(journey)
+    waiting = _run(journey, "DELIVERY")["DELIVERY_NOT_COMPLETED_IN_TIME"]
+    assert waiting.outcome == "SKIPPED" and "customer invoice dms dated" in waiting.reason
+
+
 def test_delivery_not_completed_in_time_lists_everything_pending_for_the_tl(journey):
     assert _run(journey, "DELIVERY")["DELIVERY_NOT_COMPLETED_IN_TIME"].outcome == "PASS"
     add_ready_document(journey, "insurance_cover", policy_start_date=(TODAY - timedelta(days=3)).isoformat())

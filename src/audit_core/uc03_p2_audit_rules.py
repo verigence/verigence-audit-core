@@ -278,13 +278,18 @@ class _Facts:
     @cached_property
     def delivery_clock(self) -> dict[str, Any] | None:
         """The earliest date printed on an invoice, the insurance cover note or
-        the gate pass: {"date", "document"}; None until one is read."""
+        the gate pass: {"date", "document"}; None until one is read. A date
+        before the programme's floor is a misreading the PC has been asked
+        to fix (task #19, 2026-09-30): it never starts the clock."""
+        from audit_core.uc03_p2_registry import get_registry
+
+        floor = get_registry().extraction_rules.date_floor
         found: list[tuple[date, str]] = []
         for doc in self.documents("customer_invoice_dms", "tax_invoice_tally", "insurance_cover", "gate_pass"):
             fields = doc["fields"]
             for key in ("invoice_date", "issue_date", "policy_start_date", "delivery_date"):
                 printed = _day(fields.get(key))
-                if printed:
+                if printed and not (floor and printed < floor):
                     found.append((printed, doc["documentType"]))
         if not found:
             return None
