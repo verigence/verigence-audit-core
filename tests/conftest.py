@@ -2,6 +2,28 @@ import os
 
 os.environ.setdefault("APP_ENV", "test")
 
+
+def _refuse_non_local_database() -> None:
+    """The DB-backed tests create real projects, OEMs and masters. Run
+    against DEV once (2026-09-23), they left 165 projects and 215 OEMs behind
+    that had to be purged by hand (2026-09-28). Only a local database (or
+    CI's own service container) is allowed unless explicitly overridden."""
+    url = os.environ.get("DATABASE_URL", "")
+    if not url or os.environ.get("AUDIT_CORE_TESTS_ALLOW_REMOTE_DB") == "1":
+        return
+    from sqlalchemy.engine import make_url
+
+    host = (make_url(url).host or "").lower()
+    if host not in {"", "localhost", "127.0.0.1", "::1", "postgres"}:
+        raise SystemExit(
+            f"Refusing to run the Audit Core tests against database host {host!r}: they write test "
+            "projects and masters. Point DATABASE_URL at a local database, or set "
+            "AUDIT_CORE_TESTS_ALLOW_REMOTE_DB=1 if this really is a disposable database."
+        )
+
+
+_refuse_non_local_database()
+
 # Direct user correction (2026-09-23): DB-backed integration test fixtures
 # across this suite (unified_capture_setup, evidence_backfill_setup, the
 # `journey` fixtures in test_uc03_deal_reconciliation.py and

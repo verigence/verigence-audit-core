@@ -27,6 +27,7 @@ import json
 import os
 import random
 import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -36,12 +37,17 @@ from uuid import UUID, uuid4
 
 import httpx
 import structlog
+from httpx import HTTPStatusError, TransportError
 from pypdf import PdfReader, PdfWriter
+from pypdf.errors import PdfReadError
 from sqlalchemy import Engine, text
 
+from audit_core.config import SettingsError, load_settings
 from audit_core.db import set_platform_super_admin_context, set_tenant_context
 from audit_core.dependencies import get_engine
 from audit_core.di_capture_v2_client import DiCaptureV2Error
+from audit_core.logging_config import configure_logging, exception_summary, redact_text
+from audit_core.otel import install_correlation_propagation
 from audit_core.uc03_document_capture_v2 import (
     _DI_AUDIENCE,
     _candidate_type_keys,
@@ -106,6 +112,7 @@ _MAX_PDF_PAGES = int(os.environ.get("P2_MAX_PDF_PAGES", "100"))
 _WORKER_CONCURRENCY = max(1, int(os.environ.get("P2_WORKER_CONCURRENCY", "6")))
 _PER_JOURNEY_CONCURRENCY = max(1, int(os.environ.get("P2_PER_JOURNEY_CONCURRENCY", "3")))
 _LEASE_SECONDS = int(os.environ.get("P2_WORKER_LEASE_SECONDS", "600"))
+_LEASE_RENEW_SECONDS = max(5, _LEASE_SECONDS // 3)
 # A page that DI has not settled within this window is failed visibly (with a
 # Retry action in the UI) instead of being polled forever.
 # One hour: Document Intelligence spaces its own retries of a quota hit or
@@ -235,6 +242,7 @@ def _claim_for_tenant(engine: Engine, tenant_id: str, limit: int) -> list[WorkIt
             # holding the item: that counts as a failed attempt, so a crash-
             # looping item eventually dead-letters instead of cycling forever.
             attempts = int(row["attempt_count"] or 0) + (1 if row["reclaimed"] else 0)
+            item = _work_item(row, attempts=attempts, token=token)
             if row["reclaimed"] and attempts >= _MAX_ATTEMPTS:
                 connection.execute(
                     text(
@@ -248,6 +256,17 @@ def _claim_for_tenant(engine: Engine, tenant_id: str, limit: int) -> list[WorkIt
                         """
                     ),
                     {"tenant_id": tenant_id, "work_id": row["work_id"], "attempts": attempts},
+                )
+                logger.error(
+                    "p2_work_dead_lettered",
+                    reason_code="LEASE_EXPIRED_REPEATEDLY",
+                    error_category="TECHNICAL",
+                    **_work_fields(item),
+                )
+                _mark_dead(
+                    connection, item, attempts=attempts, retryable=True,
+                    cause="Processing of this item was interrupted repeatedly.",
+                    error="LeaseExpired: Worker lease expired repeatedly while processing.",
                 )
                 continue
             connection.execute(
@@ -271,25 +290,45 @@ def _claim_for_tenant(engine: Engine, tenant_id: str, limit: int) -> list[WorkIt
                     "lease_seconds": _LEASE_SECONDS,
                 },
             )
-            claimed.append(
-                WorkItem(
-                    tenant_id=str(row["tenant_id"]),
-                    work_id=UUID(str(row["work_id"])),
-                    journey_id=UUID(str(row["journey_id"])),
-                    work_type=str(row["work_type"]),
-                    work_key=str(row["work_key"]),
-                    payload=dict(row["payload"] or {}),
-                    attempt_count=attempts,
-                    requested_version=(
-                        int(row["requested_version"])
-                        if row["requested_version"] is not None
-                        else None
-                    ),
-                    correlation_id=row["correlation_id"],
-                    lease_token=token,
-                )
-            )
+            claimed.append(item)
     return claimed
+
+
+def _work_item(row: Any, *, attempts: int, token: UUID) -> WorkItem:
+    return WorkItem(
+        tenant_id=str(row["tenant_id"]),
+        work_id=UUID(str(row["work_id"])),
+        journey_id=UUID(str(row["journey_id"])),
+        work_type=str(row["work_type"]),
+        work_key=str(row["work_key"]),
+        payload=dict(row["payload"] or {}),
+        attempt_count=attempts,
+        requested_version=(
+            int(row["requested_version"])
+            if row["requested_version"] is not None
+            else None
+        ),
+        correlation_id=row["correlation_id"],
+        lease_token=token,
+    )
+
+
+def _work_correlation_id(work: WorkItem) -> str:
+    # System-queued work (sweeps, recomputes) has no originating request; give it a stable id.
+    return work.correlation_id or f"p2w-{work.work_id}"
+
+
+def _work_fields(work: WorkItem) -> dict[str, Any]:
+    """The identifiers every work log line carries."""
+    return {
+        "correlation_id": _work_correlation_id(work),
+        "tenant_id": work.tenant_id,
+        "journey_id": str(work.journey_id),
+        "work_id": str(work.work_id),
+        "work_type": work.work_type,
+        "work_key": work.work_key,
+        "attempt": work.attempt_count + 1,  # the attempt being made (1-based)
+    }
 
 
 def _owned(connection, work: WorkItem, *, lock: bool = True) -> dict[str, Any]:
@@ -396,19 +435,26 @@ def _is_retryable(exc: Exception) -> bool:
         if isinstance(flag, bool):
             return flag
         return exc.status_code in (408, 425, 429) or exc.status_code >= 500
-    return not isinstance(exc, ValueError)
+    # A programming error fails the same way every time; retrying for an hour and a half only
+    # delays the PC's task. It is logged as TECHNICAL with its location.
+    return not isinstance(exc, (ValueError, *_PROGRAMMING_ERRORS))
+
+
+_PROGRAMMING_ERRORS = (TypeError, AttributeError, NameError, KeyError, IndexError, AssertionError, NotImplementedError)
 
 
 def _plain_cause(exc: Exception) -> str:
     """Why the step failed, in words a PC can act on."""
     if isinstance(exc, DiCaptureV2Error):
         body = _di_error_body(exc)
-        what = body.get("detail") or body.get("title") or str(exc.detail)[:200]
-        return f"The document service could not accept this page: {what}"
+        what = body.get("detail") or body.get("title")
+        if isinstance(what, str) and what.strip():
+            return f"The document service could not accept this page: {redact_text(what, 200)}"
+        return "The document service could not accept this page."
     if isinstance(exc, ValueError):
-        return str(exc)[:300] or "The file could not be read."
-    text_ = str(exc)[:200]
-    return f"The page could not be processed ({exc.__class__.__name__}{': ' + text_ if text_ else ''})."
+        # Our own ValueErrors describe the file ("Encrypted PDF is not supported", ...).
+        return redact_text(str(exc)) or "The file could not be read."
+    return "The page could not be processed because of a system problem."
 
 
 def _delay_text(seconds: int) -> str:
@@ -423,7 +469,18 @@ def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
     terminal = (not retryable) or attempts >= _MAX_ATTEMPTS
     delay = _RETRY_DELAYS_SECONDS[min(attempts, len(_RETRY_DELAYS_SECONDS)) - 1]
     cause = _plain_cause(exc)
-    error = f"{exc.__class__.__name__}: {str(exc)[:1800]}"
+    summary = exception_summary(exc)
+    # Stored and shown in the batch view: class + redacted message + where it failed.
+    error = summary["exc_type"] + (f": {summary['exc_message']}" if "exc_message" in summary else "")
+    error = error[:900]
+    if summary["exc_stack"]:
+        error += f" (at {summary['exc_stack'][-1]})"
+    fields = {**_work_fields(work), "retryable": retryable, **summary}
+    if terminal:
+        logger.error("p2_work_dead_lettered", error_category=_failure_category(exc), **fields)
+    else:
+        logger.warning("p2_work_retry_scheduled", error_category=_failure_category(exc),
+                       retry_in_seconds=delay, **fields)
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
         _owned(connection, work)
@@ -470,54 +527,71 @@ def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
                 # retries run out, and closes itself if one succeeds.
                 sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
             return
+        _mark_dead(connection, work, attempts=attempts, retryable=retryable, cause=cause, error=error)
 
-        if work.work_type == "DOCUMENT_INGEST":
-            _settle_page(
-                connection,
-                tenant_id=work.tenant_id,
-                queue_id=UUID(work.work_key),
-                status="FAILED",
-                reason=(f"{cause} " + (f"Not processed after {attempts} attempts. " if retryable else "")
-                        + "Retry the page, remove the upload, or delete this booking."),
-                last_error=error,
-            )
-            sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
-        elif work.work_type == "CONTROL_EVALUATE" and work.payload.get("unit"):
-            mark_unit_controls(
-                connection,
-                tenant_id=work.tenant_id,
-                journey_id=work.journey_id,
-                unit=str(work.payload["unit"]),
-                status="ERROR_TERMINAL",
-                reason="The control could not be evaluated after repeated attempts.",
-            )
-        elif work.work_type == "SPLIT_BATCH":
-            connection.execute(
-                text(
-                    """
-                    UPDATE auditcore.p2_upload_batches
-                    SET batch_status='FAILED', updated_at_utc=now()
-                    WHERE tenant_id=:tenant_id AND batch_id=:batch_id
-                    """
-                ),
-                {"tenant_id": work.tenant_id, "batch_id": UUID(work.work_key)},
-            )
-            sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
-        record_activity(
+
+def _failure_category(exc: Exception) -> str:
+    """BUSINESS: the input itself can't be processed (bad/encrypted file, DI rejected it).
+    DEPENDENCY: DI or storage unavailable. TECHNICAL: our own failure."""
+    if isinstance(exc, DiCaptureV2Error):
+        return "DEPENDENCY" if _is_retryable(exc) else "BUSINESS"
+    if isinstance(exc, ValueError):
+        return "BUSINESS"
+    if isinstance(exc, (TransportError, HTTPStatusError)):
+        return "DEPENDENCY"
+    return "TECHNICAL"
+
+
+def _mark_dead(connection, work: WorkItem, *, attempts: int, retryable: bool, cause: str, error: str) -> None:
+    """Terminal outcome for a work item: settle what it was working on, raise the PC's
+    processing-failure task and record the activity."""
+    if work.work_type == "DOCUMENT_INGEST":
+        _settle_page(
+            connection,
+            tenant_id=work.tenant_id,
+            queue_id=UUID(work.work_key),
+            status="FAILED",
+            reason=(f"{cause} " + (f"Not processed after {attempts} attempts. " if retryable else "")
+                    + "Retry the page, remove the upload, or delete this booking."),
+            last_error=error,
+        )
+        sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
+    elif work.work_type == "CONTROL_EVALUATE" and work.payload.get("unit"):
+        mark_unit_controls(
             connection,
             tenant_id=work.tenant_id,
             journey_id=work.journey_id,
-            event_type="P2_WORK_DEAD_LETTER",
-            subject_type="WORK_ITEM",
-            subject_id=str(work.work_id),
-            details={
-                "workType": work.work_type,
-                "workKey": work.work_key,
-                "attempts": attempts,
-                "error": str(exc)[:1800],
-            },
-            correlation_id=work.correlation_id,
+            unit=str(work.payload["unit"]),
+            status="ERROR_TERMINAL",
+            reason="The control could not be evaluated after repeated attempts.",
         )
+    elif work.work_type == "SPLIT_BATCH":
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_upload_batches
+                SET batch_status='FAILED', updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND batch_id=:batch_id
+                """
+            ),
+            {"tenant_id": work.tenant_id, "batch_id": UUID(work.work_key)},
+        )
+        sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
+    record_activity(
+        connection,
+        tenant_id=work.tenant_id,
+        journey_id=work.journey_id,
+        event_type="P2_WORK_DEAD_LETTER",
+        subject_type="WORK_ITEM",
+        subject_id=str(work.work_id),
+        details={
+            "workType": work.work_type,
+            "workKey": work.work_key,
+            "attempts": attempts,
+            "error": error,
+        },
+        correlation_id=work.correlation_id,
+    )
 
 
 _enqueue = enqueue_work
@@ -671,12 +745,20 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
 
     pages: list[tuple[bytes, str]] = []
     if is_pdf:
-        reader = PdfReader(io.BytesIO(payload))
+        try:
+            reader = PdfReader(io.BytesIO(payload))
+        except PdfReadError as exc:
+            raise ValueError("The PDF could not be read; it may be damaged. Upload it again.") from exc
         if reader.is_encrypted:
+            # An empty user password opens "protected but not locked" PDFs; anything else is the
+            # file, not the platform. (A missing crypto library would raise DependencyError and
+            # stay a technical failure.)
             try:
-                reader.decrypt("")
-            except Exception as exc:
+                opened = reader.decrypt("")
+            except (PdfReadError, NotImplementedError) as exc:
                 raise ValueError("Encrypted PDF is not supported") from exc
+            if not opened:
+                raise ValueError("Encrypted PDF is not supported")
         if not 1 <= len(reader.pages) <= _MAX_PDF_PAGES:
             raise ValueError(f"PDF page count {len(reader.pages)} is outside allowed range")
         pages = [(_single_page_pdf(page), "application/pdf") for page in reader.pages]
@@ -2347,38 +2429,133 @@ def run_once(engine: Engine | None = None) -> int:
     if not claimed:
         return 0
 
-    with ThreadPoolExecutor(max_workers=_WORKER_CONCURRENCY) as pool:
-        futures = {pool.submit(process_work, engine, item): item for item in claimed}
-        for future in as_completed(futures):
-            work = futures[future]
-            try:
-                future.result()
-            except RescheduleWork as exc:
-                _settle(engine, work, _reschedule, exc)
-            except LeaseLost:
-                logger.warning(
-                    "p2_work_lease_lost",
-                    tenant_id=work.tenant_id,
-                    work_type=work.work_type,
-                    work_key=work.work_key,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "p2_work_failed",
-                    tenant_id=work.tenant_id,
-                    journey_id=str(work.journey_id),
-                    work_type=work.work_type,
-                    work_key=work.work_key,
-                    attempt=work.attempt_count + 1,
-                    exc_info=True,
-                )
-                _settle(engine, work, _fail, exc)
-            else:
-                _settle(engine, work, _complete)
+    renewing = threading.Event()
+    renewer = threading.Thread(target=_keep_leases, args=(engine, claimed, renewing), daemon=True)
+    renewer.start()
+    try:
+        _run_claimed(engine, claimed)
+    finally:
+        renewing.set()
+        renewer.join(timeout=5)
+    _stats["processed"] += len(claimed)
     return len(claimed)
 
 
+def _keep_leases(engine: Engine, items: list[WorkItem], done: threading.Event) -> None:
+    """Extend the lease of items still running, so a long split or a slow DI call is not
+    reclaimed (and processed twice) by another worker. Stops when the batch settles."""
+    while not done.wait(_LEASE_RENEW_SECONDS):
+        running = [item for item in items if item.work_id in _started_at]
+        for tenant_id in {item.tenant_id for item in running}:
+            try:
+                with engine.begin() as connection:
+                    set_tenant_context(connection, tenant_id)
+                    for item in (i for i in running if i.tenant_id == tenant_id):
+                        connection.execute(
+                            text(
+                                """
+                                UPDATE auditcore.p2_work_queue
+                                SET lease_expires_at_utc=now() + (:lease_seconds * interval '1 second')
+                                WHERE tenant_id=:tenant_id AND work_id=:work_id AND lease_token=:token
+                                """
+                            ),
+                            {"tenant_id": tenant_id, "work_id": item.work_id, "token": item.lease_token,
+                             "lease_seconds": _LEASE_SECONDS},
+                        )
+            except Exception as exc:  # noqa: BLE001 - renewal is best effort; expiry is the fallback
+                logger.warning("p2_work_lease_renewal_failed", tenant_id=tenant_id, **exception_summary(exc))
+
+
+def _run_claimed(engine: Engine, claimed: list[WorkItem]) -> None:
+    with ThreadPoolExecutor(max_workers=_WORKER_CONCURRENCY) as pool:
+        futures = {pool.submit(_process_in_context, engine, item): item for item in claimed}
+        for future in as_completed(futures):
+            work = futures[future]
+            started = _started_at.pop(work.work_id, None)
+            duration_ms = round((time.perf_counter() - started) * 1000.0, 1) if started else None
+            try:
+                future.result()
+            except RescheduleWork as exc:
+                logger.info("p2_work_rescheduled", retry_in_seconds=exc.delay_seconds,
+                            reason=redact_text(str(exc), 200), duration_ms=duration_ms, **_work_fields(work))
+                _settle(engine, work, _reschedule, exc)
+            except LeaseLost:
+                logger.warning("p2_work_lease_lost", duration_ms=duration_ms, **_work_fields(work))
+            except Exception as exc:  # noqa: BLE001 - every failure is settled (retry/dead-letter)
+                # _fail logs p2_work_retry_scheduled / p2_work_dead_lettered with the summary.
+                _settle(engine, work, _fail, exc)
+            else:
+                logger.info("p2_work_completed", duration_ms=duration_ms, **_work_fields(work))
+                _settle(engine, work, _complete)
+
+
+_started_at: dict[UUID, float] = {}
+_stats = {"processed": 0}
+
+
+def _process_in_context(engine: Engine, work: WorkItem) -> None:
+    """Run one item with its identifiers bound to every log line it produces (pool threads do
+    not inherit context) and its correlation id sent on every outbound call."""
+    _started_at[work.work_id] = time.perf_counter()
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(**_work_fields(work))
+    try:
+        process_work(engine, work)
+    finally:
+        structlog.contextvars.clear_contextvars()
+
+
+_HEARTBEAT_SECONDS = 300
+
+
+def _queue_depth(engine: Engine) -> dict[str, Any]:
+    """Waiting / running / dead-lettered items and the oldest waiting item's age, across
+    tenants: a growing backlog or an old waiting item means the worker is not keeping up."""
+    totals = {"queue_waiting": 0, "queue_running": 0, "queue_dead_letter_24h": 0}
+    oldest: float | None = None
+    try:
+        for tenant_id in _active_tenants(engine):
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                row = connection.execute(
+                    text(
+                        """
+                        SELECT
+                          count(*) FILTER (WHERE work_status IN ('PENDING','RETRY_WAIT')) AS waiting,
+                          count(*) FILTER (WHERE work_status IN ('CLAIMED','PROCESSING')) AS running,
+                          count(*) FILTER (WHERE work_status='DEAD_LETTER'
+                                             AND updated_at_utc > now() - interval '24 hours') AS dead,
+                          EXTRACT(EPOCH FROM now() - min(created_at_utc)
+                                  FILTER (WHERE work_status IN ('PENDING','RETRY_WAIT')
+                                          AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc <= now())))
+                            AS oldest_seconds
+                        FROM auditcore.p2_work_queue
+                        WHERE tenant_id=:tenant_id
+                        """
+                    ),
+                    {"tenant_id": tenant_id},
+                ).mappings().one()
+            totals["queue_waiting"] += int(row["waiting"])
+            totals["queue_running"] += int(row["running"])
+            totals["queue_dead_letter_24h"] += int(row["dead"])
+            if row["oldest_seconds"] is not None:
+                oldest = max(oldest or 0.0, float(row["oldest_seconds"]))
+    except Exception as exc:  # noqa: BLE001 - the heartbeat must never stop the worker
+        return {"queue_depth_error": exception_summary(exc)["exc_type"]}
+    return {**totals, "queue_oldest_ready_seconds": round(oldest) if oldest is not None else None}
+
+
+def _configure_worker_observability() -> None:
+    try:
+        configure_logging(load_settings(), process="p2-worker")
+    except SettingsError:
+        # Never let logging configuration stop the worker; structlog defaults still print.
+        logger.warning("p2_worker_logging_not_configured", reason_code="SETTINGS_INCOMPLETE")
+    install_correlation_propagation()
+
+
 def main() -> None:
+    _configure_worker_observability()
     engine = get_engine()
     logger.info(
         "p2_worker_started",
@@ -2386,13 +2563,24 @@ def main() -> None:
         concurrency=_WORKER_CONCURRENCY,
         per_journey_concurrency=_PER_JOURNEY_CONCURRENCY,
     )
+    last_heartbeat = time.monotonic()
+    cycles = failed_cycles = 0
     while True:
+        cycles += 1
         try:
             processed = run_once(engine)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - logged; the loop must survive
             # A database blip must not kill the worker process.
-            logger.warning("p2_worker_cycle_failed", exc_info=True)
+            failed_cycles += 1
+            logger.error("p2_worker_cycle_failed", error_category="TECHNICAL", **exception_summary(exc))
             processed = 0
+        if time.monotonic() - last_heartbeat >= _HEARTBEAT_SECONDS:
+            # Proof of life for a quiet worker; a missing heartbeat means it is stuck or down.
+            logger.info("p2_worker_heartbeat", worker_id=_WORKER_ID, cycles=cycles,
+                        failed_cycles=failed_cycles, processed=_stats["processed"], **_queue_depth(engine))
+            last_heartbeat = time.monotonic()
+            cycles = failed_cycles = 0
+            _stats["processed"] = 0
         if processed == 0:
             time.sleep(_POLL_SECONDS)
 

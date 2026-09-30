@@ -18,11 +18,13 @@ from datetime import UTC, date, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
 from audit_core.dependencies import get_connection, get_human_principal
+from audit_core.errors import AuditCoreError
 from audit_core.observability import get_correlation_id
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
@@ -32,6 +34,8 @@ from audit_core.security_authorization import (
 from audit_core.uc03_p2_access import authorize_p2
 from audit_core.uc03_p2_controls import request_control_evaluation
 from audit_core.uc03_p2_runtime import enqueue_work, note_facts_changed, record_activity
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-deal"])
 
@@ -55,7 +59,7 @@ def _plan(connection: Connection, *, tenant_id: str, journey_id: UUID, on: date)
 
     try:
         plan = _price_plan_for_journey(connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=on)
-    except Exception:  # noqa: BLE001 - no price list effective on that date
+    except AuditCoreError:  # no price list effective on that date
         return None
     return {
         "priceListVersionId": str(plan["price_list_version_id"]),
@@ -76,11 +80,15 @@ def _schemes(connection: Connection, *, tenant_id: str, row: dict[str, Any], on:
         customer_type_code=row.get("customer_type_code"), registration_type_code=row.get("registration_type_code"),
     )
     try:
-        benefits = _applicable_benefits(
-            connection, tenant_id=tenant_id, model_id=row["model_id"], variant_id=row.get("variant_id"),
-            effective_on=on, basis=basis,
-        )
-    except Exception:  # noqa: BLE001
+        # Savepoint: a failed lookup must not abort the caller's transaction.
+        with connection.begin_nested():
+            benefits = _applicable_benefits(
+                connection, tenant_id=tenant_id, model_id=row["model_id"], variant_id=row.get("variant_id"),
+                effective_on=on, basis=basis,
+            )
+    except Exception:
+        logger.warning("p2_pricing_schemes_unavailable", tenant_id=tenant_id, model_id=str(row["model_id"]),
+                       exc_info=True)
         return []
     return sorted({str(b["discount_scheme_version_id"]) for b in benefits})
 

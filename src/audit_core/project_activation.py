@@ -78,7 +78,7 @@ def _restore_security_configuring(*, base_url: str, token: str, tenant_id: str) 
 
 def _activation_error(detail: str) -> AuditCoreError:
     return AuditCoreError(
-        error_code="VAC-SYS-001",
+        error_code="VAC-SYS-002",
         status_code=503,
         title="Project activation unavailable",
         detail=detail,

@@ -13,7 +13,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import Connection, Engine, create_engine
 
 from audit_core.authorization import AuthorizationError
-from audit_core.errors import DependencyUnavailableError
+from audit_core.errors import DependencyUnavailableError, security_admin_failure
 from audit_core.otel import attach_trusted_user_id
 from audit_core.security import (
     HumanPrincipal,
@@ -51,6 +51,9 @@ _LIGHTWEIGHT_AUTHENTICATED_READS = (
 _ADMIN_CONTEXT_TTL_SECONDS = 30.0
 _admin_context_cache: dict[str, tuple[float, SecurityAdminContext]] = {}
 _admin_context_cache_lock = Lock()
+# One Security call per user at a time: a page fires several admin requests together, and
+# without this each one missed the cache and asked Security in parallel.
+_admin_context_user_locks: dict[str, Lock] = {}
 
 
 @dataclass(frozen=True)
@@ -127,7 +130,34 @@ def _engine() -> Engine:
                 ),
             },
         )
-    return create_engine(database_url, **engine_options)
+    engine = create_engine(database_url, **engine_options)
+    if isinstance(engine, Engine):
+        _time_database_calls(engine)
+    return engine
+
+
+def _time_database_calls(engine: Engine) -> None:
+    """Feed the request timing breakdown: statement time/count and new-connection time."""
+    from sqlalchemy import event
+
+    from audit_core.observability import add_timing
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _before(conn, cursor, statement, parameters, context, executemany):  # type: ignore[no-untyped-def]
+        conn.info.setdefault("_audit_core_started", []).append(time.perf_counter())
+
+    @event.listens_for(engine, "after_cursor_execute")
+    def _after(conn, cursor, statement, parameters, context, executemany):  # type: ignore[no-untyped-def]
+        started = conn.info.get("_audit_core_started")
+        if started:
+            add_timing("db_ms", (time.perf_counter() - started.pop()) * 1000.0, count_key="db_queries")
+
+    @event.listens_for(engine, "do_connect")
+    def _connect(dialect, conn_rec, cargs, cparams):  # type: ignore[no-untyped-def]
+        started = time.perf_counter()
+        connection = dialect.loaded_dbapi.connect(*cargs, **cparams)
+        add_timing("db_connect_ms", (time.perf_counter() - started) * 1000.0, count_key="db_connects")
+        return connection
 
 
 def get_engine() -> Engine:
@@ -223,7 +253,21 @@ def _security_admin_context(
             bearer_token=bearer_token,
             admin_context=cached,
         )
+    with _admin_context_cache_lock:
+        user_lock = _admin_context_user_locks.setdefault(human_principal.subject, Lock())
+    with user_lock:
+        # Another request for this user may have just fetched it.
+        cached = _cached_admin_context(human_principal.subject)
+        if cached is not None:
+            return HumanAdminRequest(
+                user_id=human_principal.subject,
+                bearer_token=bearer_token,
+                admin_context=cached,
+            )
+        return _fetch_admin_context(bearer_token=bearer_token, human_principal=human_principal)
 
+
+def _fetch_admin_context(*, bearer_token: str, human_principal: HumanPrincipal) -> HumanAdminRequest:
     security_base_url = os.environ.get("SECURITY_BASE_URL", "").strip()
     if not security_base_url:
         logger.error("security_admin_context_failed", reason="security_base_url_missing")
@@ -231,27 +275,24 @@ def _security_admin_context(
             detail="Project administration is temporarily unavailable. Please try again."
         )
 
-    last_error: SecurityAdminError | None = None
+    context: SecurityAdminContext | None = None
     for attempt in range(2):
         try:
             with SecurityAdminClient(base_url=security_base_url) as client:
                 context = client.get_admin_context(human_bearer_token=bearer_token)
             break
         except SecurityAdminError as exc:
-            last_error = exc
             logger.warning(
                 "security_admin_context_failed",
                 reason=str(exc),
                 downstream_http_status=exc.http_status,
                 attempt=attempt + 1,
             )
-            if attempt == 0:
-                time.sleep(0.15)
-    else:
-        assert last_error is not None
-        raise DependencyUnavailableError(
-            detail="Project administration is temporarily unavailable. Please try again."
-        ) from last_error
+            # Security answered (401/403/4xx), or this was the last try: asking again won't help.
+            if (exc.http_status is not None and exc.http_status < 500) or attempt == 1:
+                raise security_admin_failure(exc, action="open project administration") from exc
+            time.sleep(0.15)
+    assert context is not None
 
     if context.user_id != human_principal.subject:
         raise SecurityTokenError("Security administrative USER does not match authenticated USER")

@@ -37,6 +37,10 @@ class TaskStateError(ValueError):
     """The task's current status does not allow this action."""
 
 
+class TaskPermissionError(ValueError):
+    """The actor may not take this action on this task (role or assignment)."""
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, default=str, separators=(",", ":"))
 
@@ -316,13 +320,13 @@ def submit_action(
     observation = task["task_type"] == _OBSERVATION_TASK and actor_role_code in _EXCEPTION_ROLES
     if supervisory:
         if actor_role_code not in _EXCEPTION_ROLES:
-            raise ValueError("Only a Team Lead or Project Manager can accept an exception")
+            raise TaskPermissionError("Only a Team Lead or Project Manager can accept an exception")
     elif observation:
         pass
     elif assigned_actor_id is not None and str(assigned_actor_id) != actor_id:
-        raise ValueError("This task is assigned to a different actor")
+        raise TaskPermissionError("This task is assigned to a different actor")
     elif assigned_actor_id is None and assigned_role_code and assigned_role_code != actor_role_code:
-        raise ValueError(
+        raise TaskPermissionError(
             f"This task is assigned to role {assigned_role_code}, not {actor_role_code}"
         )
 

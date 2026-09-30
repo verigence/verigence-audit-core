@@ -1,4 +1,8 @@
+import re
 import time
+from contextvars import ContextVar
+from functools import lru_cache
+from typing import Any
 from uuid import uuid4
 
 import structlog
@@ -26,6 +30,37 @@ _BUSINESS_PATH_KEYS = {
 }
 
 
+# Accept a caller's id only if it is a plain token: it is echoed in headers and every log line.
+_CORRELATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+# Where a request's time went: filled by the DB and outbound-HTTP hooks, reported on slow or
+# failed requests. The dict is shared with the endpoint's task/thread (context copies keep the
+# same object).
+_request_timings: ContextVar[dict[str, Any] | None] = ContextVar("audit_core_request_timings", default=None)
+
+
+def add_timing(key: str, milliseconds: float | None = None, *, count_key: str | None = None) -> None:
+    timings = _request_timings.get()
+    if timings is None:
+        return
+    if milliseconds is not None:
+        timings[key] = round(timings.get(key, 0.0) + milliseconds, 1)
+    if count_key:
+        timings[count_key] = timings.get(count_key, 0) + 1
+
+
+def accepted_correlation_id(value: str | None) -> str:
+    return value if value and _CORRELATION_ID.match(value) else str(uuid4())
+
+
+@lru_cache(maxsize=1)
+def _slow_request_threshold_ms() -> float:
+    from audit_core.config import load_settings
+
+    return float(load_settings().slow_request_threshold_ms)
+
+
 def get_correlation_id(request: Request) -> str:
     return getattr(request.state, "correlation_id", None) or request.headers.get(
         CORRELATION_HEADER,
@@ -51,10 +86,12 @@ def install_observability(app: FastAPI) -> None:
     @app.middleware("http")
     async def correlation_and_request_metrics(request: Request, call_next) -> Response:
         structlog.contextvars.clear_contextvars()
-        correlation_id = request.headers.get(CORRELATION_HEADER) or str(uuid4())
+        correlation_id = accepted_correlation_id(request.headers.get(CORRELATION_HEADER))
         incoming_trace_id = request.headers.get(TRACE_HEADER)
         request.state.correlation_id = correlation_id
         structlog.contextvars.bind_contextvars(correlation_id=correlation_id)
+        timings: dict[str, Any] = {}
+        timings_token = _request_timings.set(timings)
         status_code = 500
         started = time.perf_counter()
         with trace_span(
@@ -69,19 +106,19 @@ def install_observability(app: FastAPI) -> None:
             if active_span.is_recording():
                 active_span.set_attribute("verigence.correlation_id", correlation_id)
             try:
-                response = await call_next(request)
+                try:
+                    response = await call_next(request)
+                except Exception as exc:  # noqa: BLE001 - answered as a logged 500 below
+                    # Answer here: re-raising would let the server print the raw traceback, whose
+                    # messages can contain request/document values. The handler logs a redacted
+                    # summary once.
+                    from audit_core.errors import system_error_response
+
+                    response = system_error_response(request, exc)
                 status_code = response.status_code
                 response.headers[CORRELATION_HEADER] = correlation_id
                 response.headers[TRACE_HEADER] = trace_id
                 return response
-            except Exception:
-                # Exception messages can contain request/document values; classification is enough.
-                logger.error(
-                    "unhandled_exception",
-                    method=request.method,
-                    path=request.url.path,
-                )
-                raise
             finally:
                 business_context = request_business_context(request)
                 if business_context:
@@ -99,27 +136,32 @@ def install_observability(app: FastAPI) -> None:
                     kind="histogram",
                     labels=labels,
                 )
+                route = getattr(request.scope.get("route"), "path", None) or request.url.path
                 if status_code >= 400:
                     record_metric("audit_core.http.errors", labels=labels)
-                    logger.warning(
+                    # One line per failed request: the error handler already logged api_error
+                    # (code, category, detail); this adds the timing to it.
+                    getattr(logger, "error" if status_code >= 500 else "info")(
                         "http_request_failed",
                         method=request.method,
-                        path=request.url.path,
+                        route=route,
                         status_code=status_code,
                         duration_ms=round(duration_ms, 2),
+                        **timings,
+                        **business_context,
                     )
-                if status_code < 400:
-                    from audit_core.config import load_settings as _load_settings
-                    _threshold = _load_settings().slow_request_threshold_ms
-                    if duration_ms > _threshold:
-                        logger.warning(
-                            "http_request_slow",
-                            method=request.method,
-                            path=request.url.path,
-                            status_code=status_code,
-                            duration_ms=round(duration_ms, 2),
-                            threshold_ms=_threshold,
-                        )
+                elif duration_ms > _slow_request_threshold_ms():
+                    logger.warning(
+                        "http_request_slow",
+                        method=request.method,
+                        route=route,
+                        status_code=status_code,
+                        duration_ms=round(duration_ms, 2),
+                        threshold_ms=_slow_request_threshold_ms(),
+                        **timings,
+                        **business_context,
+                    )
+                _request_timings.reset(timings_token)
 
 
 def log_dependency(

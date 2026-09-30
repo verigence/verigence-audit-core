@@ -651,7 +651,9 @@ def check_invoice_field_discrepancies(
                 "invoice_types": list(_CUSTOMER_FACING_INVOICE_TYPES),
             },
         ).mappings().all()
-    except Exception:  # noqa: BLE001 - producer must never break the caller
+    except Exception:
+        logger.warning("uc03_invoice_producer_failed", exc_info=True,
+                       extra={"tenant_id": tenant_id, "journey_id": str(journey_id)})
         return {"raised": 0, "resolved": 0, "error": 1}
 
     grouped: dict[tuple[str, str], dict[str, Decimal]] = {}

@@ -33,9 +33,12 @@ from __future__ import annotations
 from typing import Any, Literal
 from uuid import UUID
 
+import structlog
 from sqlalchemy import Connection, text
 
 from audit_core.workflow import cancel_workflow_task, create_workflow_task
+
+logger = structlog.get_logger(__name__)
 
 TASK_TYPE = "PC_VERIFY_UNRECOGNIZED_DOCUMENT"
 _WORKFLOW_TYPE = "UC03_DOCUMENT_VERIFICATION"
@@ -74,7 +77,9 @@ def sync_document_unrecognized_findings(
             item for item in di_documents
             if str(item.get("state") or "").upper() == "UNKNOWN"
         ]
-    except Exception:  # noqa: BLE001 - producer must never break the caller
+    except Exception:
+        logger.warning("uc03_unrecognized_document_producer_failed", tenant_id=tenant_id,
+                       journey_id=str(journey_id), exc_info=True)
         return {"raised": 0, "resolved": 0, "error": True}
 
     raised = 0

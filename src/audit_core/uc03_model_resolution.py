@@ -1056,7 +1056,7 @@ def sync_model_resolution_from_invoice(
             plan = _price_plan_for_journey(
                 connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on
             )
-        except Exception:  # noqa: BLE001 - no effective price list yet
+        except AuditCoreError:  # no effective price list yet
             return {"skipped": True, "reason": "no_effective_price_list"}
 
         rows = _sku_rows_for_version(
@@ -1156,7 +1156,7 @@ def _current_match(
         plan = _price_plan_for_journey(
             connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on
         )
-    except Exception:  # noqa: BLE001 - no effective price list yet
+    except AuditCoreError:  # no effective price list yet
         return {"skipped": True, "reason": "no_effective_price_list"}
 
     rows = _sku_rows_for_version(
@@ -1399,7 +1399,7 @@ def get_model_catalog(
         plan = _price_plan_for_journey(
             connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on
         )
-    except Exception as exc:
+    except AuditCoreError as exc:
         raise AuditCoreError(
             error_code="VAC-SKU-003",
             status_code=422,
@@ -1502,7 +1502,7 @@ def confirm_model_resolution_sku(
         plan = _price_plan_for_journey(
             connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on
         )
-    except Exception as exc:
+    except AuditCoreError as exc:
         raise AuditCoreError(
             error_code="VAC-SKU-003",
             status_code=422,

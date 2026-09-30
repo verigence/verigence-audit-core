@@ -235,7 +235,9 @@ def _sync_delivery_date_sanity_finding(
             ),
             {"tenant_id": tenant_id, "journey_id": journey_id},
         ).scalar_one_or_none()
-    except Exception:  # noqa: BLE001 - producer must never break the caller
+    except Exception:
+        logger.warning("uc03_delivery_review_producer_failed", exc_info=True,
+                       extra={"tenant_id": tenant_id, "journey_id": str(journey_id)})
         return {"raised": 0, "resolved": 0, "error": 1}
 
     if booking_date is None:
@@ -831,7 +833,9 @@ def sync_finance_hypothecation_findings(
             ),
             {"tenant_id": tenant_id, "journey_id": journey_id},
         ).mappings().one_or_none()
-    except Exception:  # noqa: BLE001 - producer must never break the caller
+    except Exception:
+        logger.warning("uc03_delivery_review_producer_failed", exc_info=True,
+                       extra={"tenant_id": tenant_id, "journey_id": str(journey_id)})
         return {"raised": 0, "resolved": 0, "error": 1}
 
     is_financed = finance is not None and bool(str(finance["finance_type_code"] or "").strip())

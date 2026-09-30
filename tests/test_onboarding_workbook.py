@@ -179,3 +179,13 @@ def test_missing_required_columns_and_unreadable_files_are_reported():
         assert "readable Excel workbook" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_a_preview_only_needs_the_projects_the_workbook_mentions():
+    from audit_core.onboarding_imports import workbook_tenants
+
+    projects = [{"tenant_id": "t1", "business_code": "JBR-01"}, {"tenant_id": "t2", "business_code": "JBR-02"},
+                {"tenant_id": "t3", "business_code": None}]
+    parsed = parse_workbook(_book([["JBR-01", "M", "Mahindra", "Yes", date(2026, 9, 4), None]],
+                                  [["UH-HYU-1", "Hyundai", "JBR-02", "Utkal Hyundai", "One", "x", "Odisha", "B", "Yes", "Onsite", 1]]))
+    assert workbook_tenants(parsed, projects) == {"t1", "t2"}

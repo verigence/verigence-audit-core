@@ -156,6 +156,7 @@ jobs:
           stage="$(mktemp -d)"
           git archive --format=tar HEAD | tar -x -C "$stage"
           cp railway.p2-worker.toml "$stage/railway.toml"
+          printf '%s\n' "$DEPLOY_SHA" > "$stage/BUILD_SHA"
           # Railpack decides the image's start command at build time; the
           # worker is not a web app it can detect, so name it explicitly.
           printf '%s\n' '{"$schema": "https://schema.railpack.com", "deploy": {"startCommand": "PYTHONPATH=src python -m audit_core.uc03_p2_worker"}}' > "$stage/railpack.json"

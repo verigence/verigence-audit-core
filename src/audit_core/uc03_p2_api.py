@@ -52,7 +52,13 @@ from audit_core.uc03_p2_storage import (
 )
 from audit_core.uc03_p2_submission import upload_status
 from audit_core.uc03_p2_task_producer import sync_unclassified_page_tasks
-from audit_core.uc03_p2_tasks import create_p2_task, submit_action, task_queue_tab
+from audit_core.uc03_p2_tasks import (
+    TaskPermissionError,
+    TaskStateError,
+    create_p2_task,
+    submit_action,
+    task_queue_tab,
+)
 from audit_core.uc03_requirement_satisfaction import (
     linked_documents_for_journey,
     requirements_for_journey,
@@ -2669,5 +2675,9 @@ def task_action(
             comment=command.comment,
             details=command.details,
         )
+    except TaskPermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except TaskStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

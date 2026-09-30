@@ -150,6 +150,8 @@ jobs:
           )"
           echo "AUDIT_PREVIOUS_DEPLOYMENT_ID=$previous_id" >> "$GITHUB_ENV"
           echo "AUDIT_CORE_PREVIOUS_DEPLOYMENT_ID=${previous_id:-NONE}"
+          # The upload has no git metadata: record the release so every log line names it.
+          printf '%s\n' "$DEPLOY_SHA" > BUILD_SHA
           railway up . --path-as-root --service "$AUDIT_SERVICE" --detach --yes \
             --message "Audit Core DEV ${DEPLOY_SHA}" >/dev/null
 

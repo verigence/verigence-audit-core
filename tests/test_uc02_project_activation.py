@@ -250,7 +250,7 @@ def test_security_activation_failure_compensates_and_leaves_audit_core_configuri
     )
 
     assert response.status_code == 503
-    assert response.json()["errorCode"] == "VAC-SYS-001"
+    assert response.json()["errorCode"] == "VAC-SYS-002"
     assert setup["security"].calls == [
         ("same-human-superadmin-token", setup["tenant_id"])
     ]

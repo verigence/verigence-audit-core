@@ -41,9 +41,28 @@ All public API errors use these stable codes. Internal DI/Security/database/prov
 | VAC-SYS-001 | 500 | Internal error | Unexpected Audit Core failure; correlationId required for support. |
 | VAC-SYS-002 | 503 | Dependency unavailable | Non-DI downstream dependency temporarily unavailable. |
 | VAC-SYS-003 | 429 | Too many requests | Rate/concurrency protection triggered. |
+| VAC-NF-000 | 404 | Not found | Generic: a record or route without a specific catalogue code. |
+| VAC-CONFLICT-000 | 409 | Conflict | Generic: unique/foreign-key violation (concurrent change) or plain 409. |
+| VAC-VAL-010 | 405/413/415 | Unsupported request | Method, payload size or content type not accepted. |
+
+## Error category
+
+Every problem body carries `errorCategory` and `retryable`, and the `api_error` log line carries the same fields (`error_category`, `retryable`) so business outcomes and platform faults can be told apart and alerted on separately.
+
+| Category | HTTP | Meaning | Log level | Stack in log |
+|---|---|---|---|---|
+| VALIDATION | 400 | Request shape/field problem — the caller fixes the request. | INFO | No |
+| BUSINESS | 404, 409, 422, other 4xx | Domain rule, missing record or conflict — the user acts. | INFO | No |
+| SECURITY | 401, 403 | Authentication, permission or scope. | WARNING | No |
+| DEPENDENCY | 502, 503, 504 | DI, Security, storage or Rule Engine unavailable. `retryable=true`. | ERROR | Yes |
+| TECHNICAL | 500 | Unexpected Audit Core failure. | ERROR | Yes |
+
+Plain `HTTPException`s and framework 404/405s are rendered in the same problem shape with a generic code by status. `LookupError` from services maps to VAC-NF-000; `KeyError`/`IndexError` stay TECHNICAL.
 
 ## Error logging rules
 
 Every mapped error log includes `errorCode`, `correlation_id`, tenant/project and safe resource identifiers where applicable. Sensitive payloads, access tokens, raw documents and raw personal identifiers are excluded.
 
 Expected client/domain errors (4xx) are not logged with full stack traces by default. Unexpected 5xx errors include internal exception class/stack trace in protected server logs only and are correlated by `correlation_id`.
+
+Stack traces are logged as `exc_type` + `exc_stack` (the innermost frames as `file:line in function`) + `exc_chain`, and `pgcode` for database errors. The exception message itself is logged only for database errors, with SQL and bound parameters removed; other messages can name people or quote document values and are never logged or stored. Lines are JSON on every Railway environment (console only for `APP_ENV=local` or `AUDIT_CORE_LOG_FORMAT=console`) and carry `service`, `environment`, `version` and `process` (`api` / `p2-worker`). The P2 worker binds `correlation_id` (the originating request's, or `p2w-<workId>` for system work), `tenant_id`, `journey_id`, `work_id`, `work_type` and `attempt` to every line of a work item, and every outbound HTTP call carries `X-Correlation-ID`.
