@@ -180,33 +180,78 @@ def _with_correlation(request: httpx.Request) -> None:
         request.headers.setdefault("X-Correlation-ID", correlation_id)
 
 
+_outbound_logger = structlog.get_logger("audit_core.outbound")
+
+
+def _dependency_name(host: str) -> str:
+    """Which service an outbound call went to, from its host: enough to read
+    the log per dependency without knowing the deployment's host names."""
+    lowered = host.lower()
+    if "security" in lowered:
+        return "SECURITY"
+    if "rule" in lowered:
+        return "RULE_ENGINE"
+    if "amazonaws" in lowered or "r2.cloudflarestorage" in lowered or "storage" in lowered:
+        return "STORAGE"
+    if lowered.startswith(("verigence-di", "di.")) or "-di-" in lowered:
+        return "DI"
+    return host
+
+
+def _log_outbound(request: httpx.Request, *, started: float, response: httpx.Response | None, error: BaseException | None) -> None:
+    """One line per outbound API call (decision 2026-09-30): where it went, how
+    long it took, what came back. Path only: a query string can carry a
+    presigned signature or an identifier; headers are never logged."""
+    duration_ms = (time.perf_counter() - started) * 1000.0
+    from audit_core.observability import add_timing
+
+    add_timing("outbound_ms", duration_ms, count_key="outbound_calls")
+    fields = {
+        "dependency": _dependency_name(request.url.host),
+        "method": request.method,
+        "host": request.url.host,
+        "path": request.url.path,
+        "duration_ms": round(duration_ms, 1),
+    }
+    if error is not None:
+        _outbound_logger.warning("outbound_request_failed", error_type=type(error).__name__, **fields)
+    elif response.status_code >= 400:
+        _outbound_logger.warning("outbound_request", status_code=response.status_code, **fields)
+    else:
+        _outbound_logger.info("outbound_request", status_code=response.status_code, **fields)
+
+
 def install_correlation_propagation() -> None:
     """Send the current X-Correlation-ID on every outbound httpx call (DI, Security, Rule Engine,
     ...), whether or not OTLP export is configured, so one id follows a request or P2 work item
-    across services."""
+    across services; and log every outbound call once with its response time."""
     global _PROPAGATION_INSTALLED
     if _PROPAGATION_INSTALLED:
         return
     sync_send = httpx.Client.send
     async_send = httpx.AsyncClient.send
 
-    from audit_core.observability import add_timing
-
     def send(self: httpx.Client, request: httpx.Request, *args: Any, **kwargs: Any) -> httpx.Response:
         _with_correlation(request)
         started = time.perf_counter()
         try:
-            return sync_send(self, request, *args, **kwargs)
-        finally:
-            add_timing("outbound_ms", (time.perf_counter() - started) * 1000.0, count_key="outbound_calls")
+            response = sync_send(self, request, *args, **kwargs)
+        except BaseException as exc:
+            _log_outbound(request, started=started, response=None, error=exc)
+            raise
+        _log_outbound(request, started=started, response=response, error=None)
+        return response
 
     async def asend(self: httpx.AsyncClient, request: httpx.Request, *args: Any, **kwargs: Any) -> httpx.Response:
         _with_correlation(request)
         started = time.perf_counter()
         try:
-            return await async_send(self, request, *args, **kwargs)
-        finally:
-            add_timing("outbound_ms", (time.perf_counter() - started) * 1000.0, count_key="outbound_calls")
+            response = await async_send(self, request, *args, **kwargs)
+        except BaseException as exc:
+            _log_outbound(request, started=started, response=None, error=exc)
+            raise
+        _log_outbound(request, started=started, response=response, error=None)
+        return response
 
     httpx.Client.send = send  # type: ignore[method-assign]
     httpx.AsyncClient.send = asend  # type: ignore[method-assign]

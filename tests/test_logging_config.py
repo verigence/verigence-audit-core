@@ -90,21 +90,33 @@ def test_redact_text_hides_secrets_and_identifiers(raw: str, hidden: str) -> Non
     assert hidden not in redact_text(raw)
 
 
-def test_outbound_calls_carry_the_correlation_id() -> None:
+def test_outbound_calls_carry_the_correlation_id_and_are_logged_once() -> None:
+    """Every outbound call is logged once with its response time (2026-09-30),
+    path only: a presigned signature in the query never reaches the log."""
+    from structlog.testing import capture_logs
+
     install_correlation_propagation()
     seen: list[httpx.Request] = []
-    transport = httpx.MockTransport(lambda request: seen.append(request) or httpx.Response(200))
+    transport = httpx.MockTransport(
+        lambda request: seen.append(request) or httpx.Response(503 if request.url.path == "/v2/y" else 200)
+    )
     structlog.contextvars.bind_contextvars(correlation_id="c-out")
     try:
-        with httpx.Client(transport=transport) as client:
-            client.get("https://di.example/v2/x")
-            client.put("https://bucket.example/k?X-Amz-Signature=abc", content=b"x")
-            client.get("https://di.example/v2/y", headers={"X-Correlation-ID": "explicit"})
+        with capture_logs() as logs, httpx.Client(transport=transport) as client:
+            client.get("https://verigence-di-dev.example/v2/x")
+            client.put("https://bucket.storage.example/k?X-Amz-Signature=abc", content=b"x")
+            client.get("https://verigence-di-dev.example/v2/y", headers={"X-Correlation-ID": "explicit"})
     finally:
         structlog.contextvars.clear_contextvars()
     assert seen[0].headers["X-Correlation-ID"] == "c-out"
     assert "X-Correlation-ID" not in seen[1].headers  # presigned storage URL left untouched
     assert seen[2].headers["X-Correlation-ID"] == "explicit"
+    lines = [line for line in logs if line["event"] == "outbound_request"]
+    assert [(line["dependency"], line["method"], line["path"], line["status_code"], line["log_level"]) for line in lines] == [
+        ("DI", "GET", "/v2/x", 200, "info"), ("STORAGE", "PUT", "/k", 200, "info"), ("DI", "GET", "/v2/y", 503, "warning"),
+    ]
+    assert all(line["duration_ms"] >= 0 for line in lines)
+    assert "abc" not in repr(logs)
 
 
 def test_uvicorn_access_lines_are_dropped_in_favour_of_the_request_line(json_stream: io.StringIO) -> None:

@@ -152,6 +152,11 @@ def test_error_logs_carry_code_category_and_level_by_category() -> None:
     assert (technical["log_level"], technical["error_category"]) == ("error", "TECHNICAL")
     assert technical["exc_type"] == "RuntimeError"
     assert any("test_errors.py" in frame for frame in technical["exc_stack"])
+    # 2026-09-30: the line names the module (innermost frame), the route, the
+    # error code and the caller-safe detail, next to the correlation id.
+    assert technical["module"] == technical["exc_stack"][-1] and "test_errors.py" in technical["module"]
+    assert technical["route"] == "/system" and technical["error_code"] and technical["detail"]
+    assert technical["correlation_id"] == "c-2"
     assert "sensitive" not in repr(logs)
 
 

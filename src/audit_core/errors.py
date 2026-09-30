@@ -170,7 +170,12 @@ def _problem(
         **business_context,
     }
     if exc is not None and category in ("TECHNICAL", "DEPENDENCY"):
-        fields.update(exception_summary(exc))
+        summary = exception_summary(exc)
+        fields.update(summary)
+        # The innermost frame names the module the error came from.
+        frames = summary.get("exc_stack")
+        if isinstance(frames, list) and frames:
+            fields["module"] = frames[-1]
     getattr(logger, _LOG_LEVEL_BY_CATEGORY[category])("api_error", **fields)
     request.state.problem_logged = True
     return JSONResponse(
