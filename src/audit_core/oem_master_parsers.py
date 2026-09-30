@@ -2,7 +2,9 @@
 
 Four inputs, each in the OEM's own layout (not a Verigence template):
 
-  PRICE_LIST       .xlsx  consolidated price list  -> one row per sellable SKU
+  PRICE_LIST       .xlsx  consolidated price list  -> one row per sellable SKU,
+                          or the dealer's per-model price sheets (one sheet per
+                          model, PV/CV and EV layouts; decision 2026-09-30)
   CONSUMER_SCHEME  .pdf   monthly consumer scheme bulletin
   EXCHANGE_SCHEME  .pdf   Xmart exchange / scrappage / welcome ready reckoner
   CORPORATE_POLICY .xlsx  Corporate Privilege Policy (matrix + company list)
@@ -117,6 +119,23 @@ class CorporateCompany:
 
 
 @dataclass
+class GridRow:
+    """One model line of the dealer's discount grid (decision 2026-09-30):
+    booking protection, the agreed buffer, the insurance OD percentage
+    (shown as a maximum for now) and the out-of-territory addition."""
+
+    row_no: int
+    model_alias: str
+    model_aliases: list[str]
+    in_scope: bool
+    booking_protection_days: int | None
+    agreed_buffer_amount: Decimal | None
+    insurance_od_percent: Decimal | None
+    out_of_territory_amount: Decimal | None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ParseResult:
     kind: str
     effective_from_hint: date | None = None
@@ -124,6 +143,8 @@ class ParseResult:
     discount_rows: list[DiscountRow] = field(default_factory=list)
     corporate_benefits: list[CorporateBenefitRow] = field(default_factory=list)
     corporate_companies: list[CorporateCompany] = field(default_factory=list)
+    grid_rows: list[GridRow] = field(default_factory=list)
+    grid_parameters: list[dict[str, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     meta: dict[str, Any] = field(default_factory=dict)
@@ -193,7 +214,7 @@ def _slug_model(name: str) -> str:
 
 
 _WEF_RE = re.compile(
-    r"(?:w\.?e\.?f\.?|valid\s*from|from)\s*:?\s*(\d{1,2})\s*(?:st|nd|rd|th)?\s*"
+    r"(?:w\.?e\.?f\.?|valid\s*from|from)\s*:?\s*(?:dt\.?\s*)?(\d{1,2})\s*(?:st|nd|rd|th)?\s*"
     r"[.\-/ ]*\s*(\d{1,2}|[A-Za-z]{3,9})\.?\s*[.\-/ '’;]*\s*(\d{2,4})",
     re.IGNORECASE,
 )
@@ -241,6 +262,29 @@ def _date_hint(blob: str) -> date | None:
         return None
 
 
+_LOOSE_DATE_RE = re.compile(
+    r"(?<!\d)(\d{1,2})\s*(?:st|nd|rd|th)?[\s_.\-]*([A-Za-z]{3,9})[\s_.\-]*'?(\d{2,4})(?!\d)"
+)
+
+
+def _loose_date_hint(blob: str) -> date | None:
+    """A date written the way a file is named: "03Sep2026", "01th_Sept26",
+    "1_Aug_2026". Month by name only, so a version number never reads as one."""
+    for match in _LOOSE_DATE_RE.finditer(blob or ""):
+        day_raw, month_raw, year_raw = match.groups()
+        month = _MONTHS.get(month_raw[:3].lower())
+        if not month:
+            continue
+        year = int(year_raw)
+        if year < 100:
+            year += 2000
+        try:
+            return date(year, month, int(day_raw))
+        except ValueError:
+            continue
+    return None
+
+
 # ── 1. price list ───────────────────────────────────────────────────────────────
 _PRICE_HEADER = (
     "Sl. No.",
@@ -281,8 +325,9 @@ _ONROAD_CORPORATE_PARTS = [
 ]
 
 
-def parse_price_list(content: bytes) -> ParseResult:
-    result = ParseResult(kind="PRICE_LIST")
+def parse_price_list(content: bytes, *, filename: str | None = None) -> ParseResult:
+    """The OEM's consolidated list, or the dealer's per-model sheets: the
+    layout is recognised from the workbook, never declared."""
     workbook = load_workbook(BytesIO(content), data_only=True, read_only=True)
     sheet = None
     for name in workbook.sheetnames:
@@ -297,10 +342,25 @@ def parse_price_list(content: bytes) -> ParseResult:
         raise MasterParseError("Price list sheet is empty.")
     header = [_header_text(c) for c in rows[0][: len(_PRICE_HEADER)]]
     if header != list(_PRICE_HEADER):
-        raise MasterParseError(
-            "Price list header does not match the expected consolidated layout: "
-            f"got {header}"
-        )
+        result = _parse_dealer_sheets(workbook, header_seen=header)
+    else:
+        result = _parse_consolidated(rows)
+    from_name = _loose_date_hint(filename or "")
+    if result.effective_from_hint is None and from_name is not None:
+        result.effective_from_hint = from_name
+        result.meta["effectiveFromSource"] = "FILENAME"
+    elif result.effective_from_hint is not None:
+        result.meta["effectiveFromSource"] = "SHEET"
+        if from_name is not None and from_name != result.effective_from_hint:
+            result.warnings.append(
+                f"The sheet says effective {result.effective_from_hint.isoformat()} but the file name says "
+                f"{from_name.isoformat()}; enter the date to be sure."
+            )
+    return result
+
+
+def _parse_consolidated(rows: list[Any]) -> ParseResult:
+    result = ParseResult(kind="PRICE_LIST", meta={"layout": "OEM_CONSOLIDATED"})
 
     hint_blob = " ".join(
         str(c)
@@ -432,6 +492,248 @@ def _counts(values: Any) -> dict[str, int]:
     for value in values:
         out[value] = out.get(value, 0) + 1
     return out
+
+
+# ── 1b. the dealer's per-model price sheets ─────────────────────────────────────
+# One worksheet per model. A "MODEL NAME" cell names it, a "Model & Variant"
+# header row starts the table, a row of column letters "(A) (B) ... (I)=(A+B+
+# C+D+E+F+G+H)" carries the sheet's own on-road formula, and the data rows
+# follow. Component columns are recognised by their label; the registration
+# and on-road columns come in pairs, the first pair individual (without
+# hypothecation), the second corporate (with). Every row must reconcile
+# against the sheet's own formula or it is not ingested.
+_LETTER_RE = re.compile(r"^\(([A-Z])\)\s*(?:=\s*\(?\s*([A-Z+\s]+?)\s*\)?\s*)?$")
+_TRANSMISSION_TOKENS = {"MT", "AT", "AMT", "CVT", "DCT", "IVT"}
+_DRIVE_TOKENS = {"2WD", "4WD", "AWD", "4X4", "4X2"}
+_FUEL_TOKENS = {"PETROL": "PETROL", "DIESEL": "DIESEL", "CNG": "CNG", "ELECTRIC": "ELECTRIC", "EV": "ELECTRIC"}
+_SEATER_RE = re.compile(r"\b(\d{1,2})\s*(?:STR|SEATER|SEAT)\b", re.IGNORECASE)
+
+
+def _component_for_label(label: str) -> str | None:
+    up = label.upper()
+    if "EX-SHOWROOM" in up or "EX SHOWROOM" in up or "EXSHOWROOM" in up:
+        return "EX_SHOWROOM"
+    if "TAX COLLECTION" in up or re.search(r"\bTCS\b", up):
+        return "TCS"
+    if "INSURANCE" in up:
+        return "INSURANCE"
+    if "WARRANTY" in up:
+        return "EXT_WARRANTY_4TH_5TH_YR" if re.search(r"5\s*TH", up) else "EXT_WARRANTY_4TH_YR"
+    if "ACCESSOR" in up:
+        return "ACCESSORIES_KIT"
+    if re.search(r"\bRSA\b", up) or "ROAD SIDE" in up or "ROADSIDE" in up:
+        return "RSA_1YR"
+    if "FASTAG" in up or "FAST TAG" in up:
+        return "FASTAG"
+    return None
+
+
+def _variant_attributes(variant: str, *, fuel_hint: str | None, electric: bool) -> dict[str, str | None]:
+    tokens = [t for t in re.split(r"[\s\-/,()]+", variant.upper()) if t]
+    fuel = "ELECTRIC" if electric else (fuel_hint or None)
+    if fuel is None:
+        fuel = next((_FUEL_TOKENS[t] for t in tokens if t in _FUEL_TOKENS), None)
+    transmission = next((t for t in tokens if t in _TRANSMISSION_TOKENS), None)
+    drive = next((t for t in tokens if t in _DRIVE_TOKENS), None)
+    seater_match = _SEATER_RE.search(variant)
+    return {
+        "fuel": fuel,
+        "transmission": transmission,
+        "drive": drive,
+        "seater": seater_match.group(1) if seater_match else None,
+    }
+
+
+def _cell_reader(raw: list[Any]) -> Any:
+    def cell(col: int) -> Any:
+        return raw[col] if col < len(raw) else None
+    return cell
+
+
+def _labelled_cell_after(rows: list[Any], label: str) -> str | None:
+    """The first non-empty cell to the right of a cell that reads ``label``."""
+    for raw in rows:
+        for col, cell in enumerate(raw):
+            if _text(cell) and _text(cell).upper().rstrip(":") == label:
+                for value in raw[col + 1:]:
+                    if _text(value):
+                        return _text(value)
+    return None
+
+
+def _dealer_sheet_layout(rows: list[Any]) -> dict[str, Any] | None:
+    letter_row = next(
+        (i for i, raw in enumerate(rows)
+         if sum(1 for c in raw if _text(c) and _LETTER_RE.match(_text(c).replace(" ", "").upper())) >= 3),
+        None,
+    )
+    if letter_row is None:
+        return None
+    header_row = next(
+        (i for i in range(letter_row - 1, -1, -1)
+         if any(_text(c) and "VARIANT" in _text(c).upper() for c in rows[i])),
+        None,
+    )
+    if header_row is None:
+        return None
+    letter_by_col: dict[int, str] = {}
+    formula_by_letter: dict[str, list[str]] = {}
+    for col, cell in enumerate(rows[letter_row]):
+        match = _LETTER_RE.match((_text(cell) or "").replace(" ", "").upper())
+        if not match:
+            continue
+        letter_by_col[col] = match.group(1)
+        if match.group(2):
+            formula_by_letter[match.group(1)] = [x for x in match.group(2).replace(" ", "").split("+") if x]
+    col_by_letter = {letter: col for col, letter in letter_by_col.items()}
+
+    def label(col: int) -> str:
+        return " ".join(
+            _text(rows[i][col]) or "" for i in range(header_row, letter_row) if col < len(rows[i]) and _text(rows[i][col])
+        )
+
+    variant_col = next(col for col, c in enumerate(rows[header_row]) if _text(c) and "VARIANT" in _text(c).upper())
+    components: dict[str, int] = {}
+    registration_cols: list[int] = []
+    onroad_cols: list[int] = []
+    for col in sorted(letter_by_col):
+        text_label = label(col).upper()
+        if "REGISTRATION" in text_label:
+            registration_cols.append(col)
+        elif "ON ROAD" in text_label or "ON-ROAD" in text_label or "ONROAD" in text_label:
+            onroad_cols.append(col)
+        else:
+            key = _component_for_label(text_label)
+            if key and key not in components:
+                components[key] = col
+    if "EX_SHOWROOM" not in components or not registration_cols or not onroad_cols:
+        return None
+    return {
+        "letter_row": letter_row,
+        "variant_col": variant_col,
+        "components": components,
+        "registration_cols": registration_cols,
+        "onroad_cols": onroad_cols,
+        "letter_by_col": letter_by_col,
+        "col_by_letter": col_by_letter,
+        "formula_by_letter": formula_by_letter,
+    }
+
+
+def _parse_dealer_sheets(workbook: Any, *, header_seen: list[str]) -> ParseResult:
+    result = ParseResult(kind="PRICE_LIST", meta={"layout": "DEALER_PER_MODEL"})
+    seen: dict[tuple[str, ...], Any] = {}
+    sheets_read = 0
+    for sheet in workbook.worksheets:
+        rows = [list(r) for r in sheet.iter_rows(values_only=True)]
+        layout = _dealer_sheet_layout(rows)
+        if layout is None:
+            continue
+        sheets_read += 1
+        model_name = _labelled_cell_after(rows[: layout["letter_row"]], "MODEL NAME") or _text(sheet.title)
+        if not model_name:
+            result.errors.append(f"sheet '{sheet.title}': no model name")
+            continue
+        fuel_hint = _labelled_cell_after(rows[: layout["letter_row"]], "FUEL TYPE")
+        fuel_hint = fuel_hint.upper() if fuel_hint else None
+        electric = bool(re.search(r"\bEV\b|ELECTRIC|\bBEV\b", f"{model_name} {sheet.title} {fuel_hint or ''}".upper()))
+        if result.effective_from_hint is None:
+            blob = " ".join(str(c) for raw in rows[: layout["letter_row"]] for c in raw if isinstance(c, str))
+            result.effective_from_hint = _date_hint(blob)
+        pairs = list(zip(layout["registration_cols"], layout["onroad_cols"]))
+        if len(pairs) == 1:
+            result.warnings.append(
+                f"sheet '{sheet.title}': one registration / on-road pair; the corporate basis takes the same figures"
+            )
+        comp_cols: dict[str, int] = layout["components"]
+
+        for idx, raw in enumerate(rows[layout["letter_row"] + 1:], start=layout["letter_row"] + 2):
+            cell = _cell_reader(raw)
+            variant_name = _text(cell(layout["variant_col"]))
+            ex_showroom = _money(cell(comp_cols["EX_SHOWROOM"]))
+            if not variant_name or ex_showroom is None or ex_showroom <= 0:
+                continue
+            components: dict[str, Decimal] = {}
+            bad = False
+            for key, col in comp_cols.items():
+                value = _money(cell(col))
+                if value is None:
+                    result.errors.append(f"sheet '{sheet.title}' row {idx}: non-numeric {key} '{cell(col)}'")
+                    bad = True
+                    break
+                components[key] = value
+            if bad:
+                continue
+            basis_values: list[tuple[Decimal, Decimal]] = []
+            for reg_col, onroad_col in pairs:
+                registration = _money(cell(reg_col))
+                onroad = _money(cell(onroad_col))
+                if registration is None or onroad is None:
+                    result.errors.append(f"sheet '{sheet.title}' row {idx} ({variant_name}): missing registration or on-road price")
+                    bad = True
+                    break
+                letters = layout["formula_by_letter"].get(layout["letter_by_col"].get(onroad_col, ""))
+                if letters:
+                    calc = sum((_money(cell(layout["col_by_letter"][x])) or Decimal(0) for x in letters
+                                if x in layout["col_by_letter"]), Decimal(0))
+                else:
+                    calc = sum(components.values(), Decimal(0)) + registration
+                if abs(calc - onroad) > _MONEY_TOLERANCE:
+                    result.errors.append(
+                        f"sheet '{sheet.title}' row {idx} ({model_name} / {variant_name}): components sum to "
+                        f"{_q2(calc)} but on-road is {_q2(onroad)}"
+                    )
+                    bad = True
+                    break
+                basis_values.append((registration, onroad))
+            if bad:
+                continue
+            (reg_ind, onroad_ind) = basis_values[0]
+            (reg_corp, onroad_corp) = basis_values[1] if len(basis_values) > 1 else basis_values[0]
+            components["REGISTRATION_INDIVIDUAL"] = reg_ind
+            components["REGISTRATION_CORPORATE"] = reg_corp
+            attrs = _variant_attributes(variant_name, fuel_hint=fuel_hint, electric=electric)
+            signature = (_q2(onroad_ind), _q2(onroad_corp), tuple(sorted((k, _q2(v)) for k, v in components.items())))
+            key = (_slug_model(model_name), variant_name.upper(), attrs["fuel"] or "", attrs["transmission"] or "",
+                   attrs["drive"] or "", attrs["seater"] or "", "STANDARD")
+            if key in seen:
+                if seen[key] != signature:
+                    result.errors.append(
+                        f"sheet '{sheet.title}' row {idx} ({model_name} / {variant_name}): conflicting prices for the same variant"
+                    )
+                else:
+                    result.meta["duplicateRowsCollapsed"] = result.meta.get("duplicateRowsCollapsed", 0) + 1
+                continue
+            seen[key] = signature
+            result.price_rows.append(
+                PriceRow(
+                    row_no=idx,
+                    category="BEV" if attrs["fuel"] == "ELECTRIC" else "ICE" if attrs["fuel"] else "UNSPECIFIED",
+                    model_name=model_name,
+                    variant_name=variant_name,
+                    trim=None,
+                    fuel=attrs["fuel"],
+                    transmission=attrs["transmission"],
+                    drive=attrs["drive"],
+                    seater=attrs["seater"],
+                    components={k: _q2(v) for k, v in components.items()},
+                    onroad_individual=_q2(onroad_ind),
+                    onroad_corporate=_q2(onroad_corp),
+                    registration_basis="STANDARD",
+                    source_sheet=sheet.title,
+                )
+            )
+    if not sheets_read:
+        raise MasterParseError(
+            "Price list not recognised: neither the consolidated layout (header got "
+            f"{header_seen}) nor a dealer per-model sheet (Model & Variant header with column letters)."
+        )
+    result.meta["sheets"] = sheets_read
+    result.meta["models"] = sorted({r.model_name for r in result.price_rows})
+    result.meta["categoryCounts"] = _counts(r.category for r in result.price_rows)
+    if not result.price_rows and not result.errors:
+        raise MasterParseError("Price sheets contained no recognisable vehicle rows.")
+    return result
 
 
 # ── 2. consumer scheme (PDF) ────────────────────────────────────────────────────
@@ -805,17 +1107,168 @@ def _parse_company_list(sheet: Any, result: ParseResult) -> None:
             )
 
 
+# ── 5. the dealer's discount grid (xlsx) ────────────────────────────────────────
+# One sheet: an "Effective ..." line, a header (Model | Booking Protection |
+# Agreed Buffer | Insurance OD % | Out of Territory), one row per model (a cell
+# may name several models: "PICKUP, MAXX, MAXX HD"), then a Parameter | Notes
+# block with the policy wording. Values as written: "30 days", "Nil", "Out of
+# scope", 0.6, "Additional 3K".
+_GRID_HEADER = {
+    "model": ("MODEL",),
+    "booking_protection": ("BOOKING PROTECTION",),
+    "agreed_buffer": ("AGREED BUFFER", "BUFFER"),
+    "insurance_od": ("INSURANCE OD", "OD %"),
+    "out_of_territory": ("OUT OF TERRITORY",),
+}
+_OUT_OF_SCOPE = {"OUT OF SCOPE", "NOT APPLICABLE", "N/A", "NA"}
+_NIL = {"NIL", "NONE", "-", "0", "ZERO"}
+
+
+def _grid_days(value: Any) -> tuple[int | None, str | None]:
+    text = (_text(value) or "").upper()
+    if not text or text in _OUT_OF_SCOPE:
+        return None, None
+    if text in _NIL:
+        return 0, None
+    match = re.search(r"(\d+)", text)
+    if match:
+        return int(match.group(1)), None
+    return None, f"unreadable days '{_text(value)}'"
+
+
+def _grid_amount(value: Any) -> tuple[Decimal | None, str | None]:
+    if isinstance(value, (int, float, Decimal)):
+        return _q2(Decimal(str(value))), None
+    text = (_text(value) or "").upper()
+    if not text or text in _OUT_OF_SCOPE:
+        return None, None
+    if text in _NIL:
+        return Decimal("0.00"), None
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(K|L|LAKH|LAC)?", text.replace(",", ""))
+    if not match:
+        return None, f"unreadable amount '{_text(value)}'"
+    amount = Decimal(match.group(1))
+    unit = match.group(2) or ""
+    if unit == "K":
+        amount *= 1000
+    elif unit:
+        amount *= 100000
+    return _q2(amount), None
+
+
+def _grid_percent(value: Any) -> tuple[Decimal | None, str | None]:
+    if isinstance(value, (int, float, Decimal)):
+        number = Decimal(str(value))
+        return _q2(number * 100 if number <= 1 else number), None
+    text = (_text(value) or "").upper()
+    if not text or text in _OUT_OF_SCOPE:
+        return None, None
+    if text in _NIL:
+        return Decimal("0.00"), None
+    match = re.search(r"(\d+(?:\.\d+)?)", text)
+    if not match:
+        return None, f"unreadable percentage '{_text(value)}'"
+    number = Decimal(match.group(1))
+    return _q2(number * 100 if number <= 1 and "%" not in text else number), None
+
+
+def parse_discount_grid(content: bytes, *, filename: str | None = None) -> ParseResult:
+    result = ParseResult(kind="DISCOUNT_GRID", meta={"layout": "DEALER_DISCOUNT_GRID"})
+    workbook = load_workbook(BytesIO(content), data_only=True, read_only=True)
+    sheet = workbook[workbook.sheetnames[0]]
+    rows = [list(r) for r in sheet.iter_rows(values_only=True)]
+    header_row = next(
+        (i for i, raw in enumerate(rows)
+         if any(_text(c) and _text(c).upper() == "MODEL" for c in raw)
+         and any(_text(c) and "BOOKING PROTECTION" in _text(c).upper() for c in raw)),
+        None,
+    )
+    if header_row is None:
+        raise MasterParseError(
+            "Discount grid not recognised: no 'Model | Booking Protection | ...' header row."
+        )
+    columns: dict[str, int] = {}
+    for col, cell in enumerate(rows[header_row]):
+        label = (_text(cell) or "").upper()
+        for key, needles in _GRID_HEADER.items():
+            if key not in columns and label and any(n in label for n in needles):
+                columns[key] = col
+    for key in ("model", "booking_protection", "agreed_buffer", "insurance_od", "out_of_territory"):
+        if key not in columns:
+            raise MasterParseError(f"Discount grid header lacks the {key.replace('_', ' ')} column.")
+
+    blob = " ".join(str(c) for raw in rows[:header_row] for c in raw if isinstance(c, str))
+    result.effective_from_hint = _loose_date_hint(blob)
+    if result.effective_from_hint is not None:
+        result.meta["effectiveFromSource"] = "SHEET"
+    elif filename and _loose_date_hint(filename):
+        result.effective_from_hint = _loose_date_hint(filename)
+        result.meta["effectiveFromSource"] = "FILENAME"
+
+    in_parameters = False
+    for idx, raw in enumerate(rows[header_row + 1:], start=header_row + 2):
+        cell = _cell_reader(raw)
+        first = _text(cell(columns["model"]))
+        if not first:
+            continue
+        if first.upper() == "PARAMETER":
+            in_parameters = True
+            continue
+        if in_parameters:
+            note = next((_text(v) for v in raw[columns["model"] + 1:] if _text(v)), None)
+            result.grid_parameters.append({"parameter": first, "note": note or ""})
+            continue
+        values = [cell(columns[k]) for k in ("booking_protection", "agreed_buffer", "insurance_od", "out_of_territory")]
+        in_scope = not all((_text(v) or "").upper() in _OUT_OF_SCOPE for v in values)
+        days, e1 = _grid_days(values[0])
+        buffer, e2 = _grid_amount(values[1])
+        od, e3 = _grid_percent(values[2])
+        territory, e4 = _grid_amount(values[3])
+        problems = [e for e in (e1, e2, e3, e4) if e]
+        if problems:
+            result.errors.append(f"grid row {idx} ({first}): " + "; ".join(problems))
+            continue
+        aliases = [a.strip() for a in re.split(r"[,&/|]|\band\b", first, flags=re.IGNORECASE) if a.strip()]
+        result.grid_rows.append(
+            GridRow(
+                row_no=idx,
+                model_alias=first,
+                model_aliases=aliases or [first],
+                in_scope=in_scope,
+                booking_protection_days=days,
+                agreed_buffer_amount=buffer,
+                insurance_od_percent=od,
+                out_of_territory_amount=territory,
+                raw={
+                    "bookingProtection": _text(values[0]),
+                    "agreedBuffer": _text(values[1]),
+                    "insuranceOd": _text(values[2]),
+                    "outOfTerritory": _text(values[3]),
+                },
+            )
+        )
+    if not result.grid_rows and not result.errors:
+        raise MasterParseError("Discount grid contained no model rows.")
+    result.meta["gridRows"] = len(result.grid_rows)
+    result.meta["parameters"] = len(result.grid_parameters)
+    result.meta["models"] = [r.model_alias for r in result.grid_rows]
+    return result
+
+
 # ── dispatch ────────────────────────────────────────────────────────────────────
 _PARSERS = {
     "PRICE_LIST": parse_price_list,
     "CONSUMER_SCHEME": parse_consumer_scheme,
     "EXCHANGE_SCHEME": parse_exchange_scheme,
     "CORPORATE_POLICY": parse_corporate_policy,
+    "DISCOUNT_GRID": parse_discount_grid,
 }
 
 
-def parse_master(kind: str, content: bytes) -> ParseResult:
+def parse_master(kind: str, content: bytes, *, filename: str | None = None) -> ParseResult:
     parser = _PARSERS.get(kind)
     if parser is None:
         raise MasterParseError(f"Unknown master kind '{kind}'.")
+    if kind in ("PRICE_LIST", "DISCOUNT_GRID"):
+        return parser(content, filename=filename)
     return parser(content)

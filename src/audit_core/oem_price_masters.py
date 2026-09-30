@@ -24,6 +24,7 @@ import hashlib
 import json
 import re
 from datetime import date
+from decimal import Decimal
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -59,7 +60,7 @@ from audit_core.price_lists import (
 
 router = APIRouter(prefix="/v1/admin/oem-masters", tags=["admin-oem-masters"])
 
-MasterKind = Literal["PRICE_LIST", "CONSUMER_SCHEME", "EXCHANGE_SCHEME", "CORPORATE_POLICY"]
+MasterKind = Literal["PRICE_LIST", "CONSUMER_SCHEME", "EXCHANGE_SCHEME", "CORPORATE_POLICY", "DISCOUNT_GRID"]
 _MAX_BYTES = 25 * 1024 * 1024
 _PRICE_LIST_CODE = "OEM_NATIVE_PRICE_LIST"
 _SCHEME_CATEGORY_BY_KIND = {
@@ -76,6 +77,8 @@ class MasterUploadPreview(BaseModel):
     oemCode: str
     masterKind: str
     effectiveFrom: date
+    """Where the applied date came from: ADMIN, SHEET or FILENAME."""
+    effectiveFromSource: str = "ADMIN"
     sourceFilename: str
     sourceSha256: str
     status: str
@@ -310,18 +313,22 @@ def _bulk_ensure_variants(
         id_by_key[(row["model_id"], row["variant_code"])] = row["variant_id"]
 
     for key, row in to_update.items():
+        # A re-upload refreshes what it knows and never blanks what an
+        # earlier, richer file (the consolidated list) recorded: the
+        # dealer's per-model sheets carry no trim / drive / seater columns.
+        known = {k: v for k, v in json.loads(row["attributes"]).items() if v not in (None, "")}
         connection.execute(
             text(
                 """
                 UPDATE auditcore.product_variants
-                SET fuel_powertrain = :fuel_powertrain,
-                    transmission = :transmission,
-                    body_type = :body_type,
-                    attributes = CAST(:attributes AS jsonb)
+                SET fuel_powertrain = COALESCE(:fuel_powertrain, fuel_powertrain),
+                    transmission = COALESCE(:transmission, transmission),
+                    body_type = COALESCE(:body_type, body_type),
+                    attributes = attributes || CAST(:attributes AS jsonb)
                 WHERE variant_id = :variant_id
                 """
             ),
-            {**row, "variant_id": id_by_key[key]},
+            {**row, "attributes": json.dumps(known), "variant_id": id_by_key[key]},
         )
 
     return id_by_key
@@ -397,6 +404,37 @@ def _next_version_no(connection: Connection, table: str, id_col: str, tenant_id:
     )
 
 
+def _standing_items(
+    connection: Connection, *, tenant_id: str, price_list_id: UUID, effective_from: date,
+) -> tuple[UUID | None, dict[tuple[UUID, str], dict[str, Any]]]:
+    """The version standing on the new effective date (the latest published
+    or retired one on or before it) and its items by (sku, component)."""
+    version_id = connection.execute(
+        text(
+            """
+            SELECT price_list_version_id FROM auditcore.price_list_versions
+            WHERE tenant_id = :tenant_id AND price_list_id = :price_list_id
+              AND lifecycle_status IN ('PUBLISHED', 'RETIRED') AND effective_from <= :effective_from
+            ORDER BY effective_from DESC, version_no DESC LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "price_list_id": price_list_id, "effective_from": effective_from},
+    ).scalar_one_or_none()
+    if version_id is None:
+        return None, {}
+    rows = connection.execute(
+        text(
+            """
+            SELECT product_sku_id, component_key, standard_amount, tax_inclusive, metadata, price_since
+            FROM auditcore.price_list_items
+            WHERE tenant_id = :tenant_id AND price_list_version_id = :version_id
+            """
+        ),
+        {"tenant_id": tenant_id, "version_id": version_id},
+    ).mappings().all()
+    return version_id, {(r["product_sku_id"], str(r["component_key"])): dict(r) for r in rows}
+
+
 def ingest_price_list(
     connection: Connection,
     *,
@@ -405,8 +443,16 @@ def ingest_price_list(
     effective_from: date,
     parsed: ParseResult,
     actor_id: str,
+    stats: dict[str, Any] | None = None,
 ) -> tuple[UUID, dict[str, UUID]]:
-    """Load a parsed price list; returns (price_list_version_id, {sku_code: sku_id})."""
+    """Load a parsed price list; returns (price_list_version_id, {sku_code: sku_id}).
+
+    The new version is always complete (decision 2026-09-30): a file that
+    carries only the changed models is merged over the version standing on
+    the effective date, every other SKU carried forward at its standing
+    price. Each row keeps ``price_since``: the effective date when its
+    figure changed, else the date it already held. ``stats`` (when given)
+    receives the counts: uploaded, changed, unchanged, carriedForward."""
     price_list_id = connection.execute(
         text(
             "SELECT price_list_id FROM auditcore.price_lists "
@@ -484,37 +530,75 @@ def ingest_price_list(
     ]
     sku_id_by_code = _bulk_ensure_skus(connection, oem_id=oem_id, entries=sku_entries)
 
-    # 4) price_list_items — every component of every row in one batched insert.
-    item_rows = [
-        {
+    # 4) price_list_items — every component of every uploaded row, each
+    # dated from when its figure last changed; then every SKU the standing
+    # version priced that this file does not mention, carried forward.
+    standing_version, standing = _standing_items(
+        connection, tenant_id=tenant_id, price_list_id=price_list_id, effective_from=effective_from,
+    )
+    uploaded_skus = {sku_id_by_code[code] for code in sku_codes}
+    changed_skus: set[UUID] = set()
+    item_rows: list[dict[str, Any]] = []
+    for row, sku_code in zip(rows, sku_codes):
+        sku_id = sku_id_by_code[sku_code]
+        for component_key, amount in row.components.items():
+            before = standing.get((sku_id, component_key))
+            unchanged = before is not None and Decimal(str(before["standard_amount"])) == amount
+            if not unchanged:
+                changed_skus.add(sku_id)
+            item_rows.append({
+                "tenant_id": tenant_id,
+                "price_list_version_id": version_id,
+                "product_sku_id": sku_id,
+                "component_key": component_key,
+                "standard_amount": amount,
+                "price_since": (before["price_since"] or effective_from) if unchanged else effective_from,
+                "metadata": json.dumps(
+                    {
+                        "source": "OEM_NATIVE_PRICE_LIST",
+                        "layout": parsed.meta.get("layout"),
+                        "category": row.category,
+                        "onRoadIndividual": str(row.onroad_individual),
+                        "onRoadCorporate": str(row.onroad_corporate),
+                    }
+                ),
+            })
+        # a component the standing version priced but this file no longer
+        # carries for the SKU is dropped for that SKU: the file is the SKU's
+        # whole line
+    carried_skus: set[UUID] = set()
+    for (sku_id, component_key), before in standing.items():
+        if sku_id in uploaded_skus:
+            continue
+        carried_skus.add(sku_id)
+        item_rows.append({
             "tenant_id": tenant_id,
             "price_list_version_id": version_id,
-            "product_sku_id": sku_id_by_code[sku_code],
+            "product_sku_id": sku_id,
             "component_key": component_key,
-            "standard_amount": amount,
-            "metadata": json.dumps(
-                {
-                    "source": "OEM_NATIVE_PRICE_LIST",
-                    "category": row.category,
-                    "onRoadIndividual": str(row.onroad_individual),
-                    "onRoadCorporate": str(row.onroad_corporate),
-                }
-            ),
-        }
-        for row, sku_code in zip(rows, sku_codes)
-        for component_key, amount in row.components.items()
-    ]
+            "standard_amount": before["standard_amount"],
+            "price_since": before["price_since"],
+            "metadata": json.dumps({**(before["metadata"] or {}), "carriedForwardFrom": str(standing_version)}),
+        })
     _chunked_insert_returning(
         connection,
         table="price_list_items",
         columns=[
             "tenant_id", "price_list_version_id", "product_sku_id",
-            "component_key", "standard_amount", "metadata",
+            "component_key", "standard_amount", "price_since", "metadata",
         ],
         rows=item_rows,
         returning=[],
         jsonb_columns=frozenset({"metadata"}),
     )
+    if stats is not None:
+        stats.update({
+            "uploaded": len(uploaded_skus),
+            "changed": len(changed_skus),
+            "unchanged": len(uploaded_skus - changed_skus),
+            "carriedForward": len(carried_skus),
+            "standingVersionId": str(standing_version) if standing_version else None,
+        })
 
     publish_price_list_version(
         connection, tenant_id=tenant_id, price_list_version_id=version_id, actor_id=actor_id
@@ -991,6 +1075,101 @@ _PRICE_COMPONENT_PREVIEW_LABELS: dict[str, str] = {
 }
 
 
+# ── the dealer's discount grid (fifth master) ───────────────────────────────────
+def ingest_discount_grid(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    oem_id: UUID,
+    oem_code: str,
+    effective_from: date,
+    parsed: ParseResult,
+    upload_id: UUID | None,
+    actor_id: str,
+) -> dict[str, Any]:
+    """One published grid version per upload, effective-dated; every row keeps
+    the model text as written and, where the alias map or the catalogue
+    knows it, the model it names. A cell naming several models ("PICKUP,
+    MAXX, MAXX HD") becomes one row per model."""
+    alias_map = _alias_map(connection, oem_code)
+    models = _model_lookup(connection, oem_id)
+    summary: dict[str, Any] = {"published": 0, "resolved": 0, "unresolved": [], "warnings": [], "parameters": len(parsed.grid_parameters)}
+    version_no = int(connection.execute(
+        text("SELECT COALESCE(MAX(version_no), 0) + 1 FROM auditcore.dealer_discount_grid_versions WHERE tenant_id = :t"),
+        {"t": tenant_id},
+    ).scalar_one())
+    version_id = connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.dealer_discount_grid_versions (
+                tenant_id, version_no, effective_from, source_upload_id, parameters, created_by_actor_id
+            ) VALUES (:t, :no, :eff, :upload, CAST(:params AS jsonb), :actor)
+            RETURNING grid_version_id
+            """
+        ),
+        {"t": tenant_id, "no": version_no, "eff": effective_from, "upload": upload_id,
+         "params": json.dumps(parsed.grid_parameters), "actor": actor_id},
+    ).scalar_one()
+    rows: list[dict[str, Any]] = []
+    for grow in parsed.grid_rows:
+        for alias in grow.model_aliases:
+            resolved, _ = _resolve_models(alias_map, alias)
+            model_id = None
+            for name in resolved or [alias]:
+                entry = models.get(name.upper())
+                if entry is not None:
+                    model_id = entry[0]
+                    break
+            if model_id is None:
+                summary["unresolved"].append(f"grid row {grow.row_no}: model '{alias}' is not in the catalogue yet")
+            else:
+                summary["resolved"] += 1
+            rows.append({
+                "tenant_id": tenant_id, "grid_version_id": version_id, "model_alias": alias[:240], "model_id": model_id,
+                "in_scope": grow.in_scope, "booking_protection_days": grow.booking_protection_days,
+                "agreed_buffer_amount": grow.agreed_buffer_amount, "insurance_od_percent": grow.insurance_od_percent,
+                "out_of_territory_amount": grow.out_of_territory_amount,
+                "raw": json.dumps({**grow.raw, "modelCell": grow.model_alias}),
+            })
+    _chunked_insert_returning(
+        connection,
+        table="dealer_discount_grid_rows",
+        columns=["tenant_id", "grid_version_id", "model_alias", "model_id", "in_scope", "booking_protection_days",
+                 "agreed_buffer_amount", "insurance_od_percent", "out_of_territory_amount", "raw"],
+        rows=rows,
+        returning=[],
+        jsonb_columns=frozenset({"raw"}),
+    )
+    summary["published"] = len(rows)
+    summary["gridVersionId"] = str(version_id)
+    return summary
+
+
+def grid_row_for_model(
+    connection: Connection, *, tenant_id: str, model_id: UUID, effective_on: date,
+) -> dict[str, Any] | None:
+    """The grid line for a model from the version standing on a date."""
+    row = connection.execute(
+        text(
+            """
+            SELECT v.grid_version_id, v.version_no, v.effective_from, v.effective_to, v.parameters,
+                   r.model_alias, r.in_scope, r.booking_protection_days, r.agreed_buffer_amount,
+                   r.insurance_od_percent, r.out_of_territory_amount
+            FROM auditcore.dealer_discount_grid_versions v
+            JOIN auditcore.dealer_discount_grid_rows r
+              ON r.tenant_id = v.tenant_id AND r.grid_version_id = v.grid_version_id
+            WHERE v.tenant_id = :t AND v.lifecycle_status IN ('PUBLISHED', 'RETIRED')
+              AND v.effective_from <= :on AND (v.effective_to IS NULL OR v.effective_to >= :on)
+              AND r.model_id = :model_id
+            ORDER BY v.effective_from DESC, v.version_no DESC
+            LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "on": effective_on, "model_id": model_id},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
 def _build_preview(parsed: ParseResult, kind: str) -> dict[str, Any]:
     row_counts: dict[str, Any] = dict(parsed.meta)
     sample: list[dict[str, Any]] = []
@@ -1011,13 +1190,25 @@ def _build_preview(parsed: ParseResult, kind: str) -> dict[str, Any]:
                 "category": r.category,
                 "registrationBasis": r.registration_basis,
                 **{
-                    _PRICE_COMPONENT_PREVIEW_LABELS[key]: str(r.components[key])
+                    _PRICE_COMPONENT_PREVIEW_LABELS[key]: (str(r.components[key]) if key in r.components else None)
                     for key in PRICE_COMPONENT_KEYS
                 },
                 "onRoadIndividual": str(r.onroad_individual),
                 "onRoadCorporate": str(r.onroad_corporate),
             }
             for r in parsed.price_rows[:25]
+        ]
+    elif kind == "DISCOUNT_GRID":
+        sample = [
+            {
+                "model": g.model_alias,
+                "inScope": g.in_scope,
+                "bookingProtectionDays": g.booking_protection_days,
+                "agreedBuffer": str(g.agreed_buffer_amount) if g.agreed_buffer_amount is not None else None,
+                "insuranceOdPercent": str(g.insurance_od_percent) if g.insurance_od_percent is not None else None,
+                "outOfTerritory": str(g.out_of_territory_amount) if g.out_of_territory_amount is not None else None,
+            }
+            for g in parsed.grid_rows[:25]
         ]
     elif kind == "CORPORATE_POLICY":
         row_counts["benefitRows"] = len(parsed.corporate_benefits)
@@ -1057,10 +1248,12 @@ async def upload_oem_master(
     connection: Annotated[Connection, Depends(get_connection)],
     tenant_id: Annotated[str, Form(alias="tenantId")],
     master_kind: Annotated[MasterKind, Form(alias="masterKind")],
-    effective_from: Annotated[date, Form(alias="effectiveFrom")],
     file: Annotated[UploadFile, File()],
+    effective_from: Annotated[date | None, Form(alias="effectiveFrom")] = None,
     dry_run: Annotated[bool, Query(alias="dryRun")] = True,
 ) -> MasterUploadPreview:
+    """Effective date: the file's own (its sheet, else its name) unless the
+    admin enters one, which wins (decision 2026-09-30)."""
     content = await file.read()
     if not content:
         raise ValidationError(detail="Uploaded file is empty.")
@@ -1073,11 +1266,22 @@ async def upload_oem_master(
     project = _project_oem(connection, tenant_id)
 
     try:
-        parsed = parse_master(master_kind, content)
+        parsed = parse_master(master_kind, content, filename=file.filename)
     except MasterParseError as exc:
         raise ValidationError(detail=str(exc)) from exc
 
     preview = _build_preview(parsed, master_kind)
+    date_source = "ADMIN"
+    if effective_from is None:
+        if parsed.effective_from_hint is None:
+            raise ValidationError(detail="The file carries no effective date; enter one.")
+        effective_from = parsed.effective_from_hint
+        date_source = str(parsed.meta.get("effectiveFromSource") or "SHEET")
+    elif parsed.effective_from_hint is not None and parsed.effective_from_hint != effective_from:
+        preview["warnings"].append(
+            f"Applied {effective_from.isoformat()} as entered; the file says {parsed.effective_from_hint.isoformat()}."
+        )
+    price_stats: dict[str, Any] = {}
     unresolved: list[str] = []
     actor_id = admin_request.user_id
 
@@ -1125,6 +1329,19 @@ async def upload_oem_master(
                 oem_id=project["oem_id"],
                 effective_from=effective_from,
                 parsed=parsed,
+                actor_id=actor_id,
+                stats=price_stats,
+            )
+            preview["rowCounts"].update(price_stats)
+        elif master_kind == "DISCOUNT_GRID":
+            discount_summary = ingest_discount_grid(
+                connection,
+                tenant_id=tenant_id,
+                oem_id=project["oem_id"],
+                oem_code=project["oem_code"],
+                effective_from=effective_from,
+                parsed=parsed,
+                upload_id=upload_id,
                 actor_id=actor_id,
             )
         elif master_kind == "CORPORATE_POLICY":
@@ -1175,6 +1392,7 @@ async def upload_oem_master(
         oemCode=project["oem_code"],
         masterKind=master_kind,
         effectiveFrom=effective_from,
+        effectiveFromSource=date_source,
         sourceFilename=file.filename or "upload",
         sourceSha256=sha256,
         status=status,

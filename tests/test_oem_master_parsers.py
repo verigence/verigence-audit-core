@@ -8,6 +8,7 @@ Sept'26 source documents; a regression test over those runs only when
 from __future__ import annotations
 
 import os
+from datetime import date
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
@@ -227,3 +228,190 @@ def test_pdf_schemes_against_source_documents(glob, kind, min_rows) -> None:
     assert len(result.discount_rows) >= min_rows
     for row in result.discount_rows:
         assert row.total_customer_offer >= 0
+
+
+# ── the dealer's per-model price sheets (decision 2026-09-30) ──────────────────
+def _dealer_pv_workbook(rows, *, model="VEERO", fuel="Diesel", wef="Price list w.e.f. Dt.03.09.2026") -> bytes:
+    """Mirrors the PV/CV layout: one sheet, a MODEL NAME row, a Model & Variant
+    header with two registration / on-road pairs (individual, corporate) and
+    the sheet's own column-letter formulas."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = model
+    ws.append(["ADITYA MOTORS"])
+    ws.append([wef])
+    ws.append(["MODEL NAME", None, model, None, "FUEL TYPE", fuel, None, None, None, None, "STATE", "ODISHA"])
+    ws.append(["Model & Variant", None, "Ex-showroom Price", "Tax Collection at Source (TCS)", "Insurance",
+               "Extended Warranty (4th & 5th Year)", "Accessories Kit", "RSA (1 year)", "Fastag", None,
+               "On Road Price - Individual", None, "On Road Price - Corporate", None])
+    ws.append([None] * 10 + ["Registration\n without Hypoth", "On Road Price\nwithout\nHypoth",
+                             "Registration\n without Hypoth", "On Road Price\nwithout\nHypoth"])
+    ws.append([None, None, "(A)", "(B)", "(C)", "(D)", "(E)", "(F)", "(G)", None,
+               "(H)", "(I)=(A+B+C+D+E+F+G+H)", "(J)", "(K)=(A+B+C+D+E+F+G+J)"])
+    for row in rows:
+        ws.append(row)
+    ws.append(["NOTE-"])
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _pv_row(variant, ex, reg_ind, reg_corp, *, ins=34000, tamper=None):
+    tcs, ew, acc, rsa, fastag = 0, 0, 5000, 1520, 500
+    onroad_ind = ex + tcs + ins + ew + acc + rsa + fastag + reg_ind
+    onroad_corp = ex + tcs + ins + ew + acc + rsa + fastag + reg_corp
+    row = [variant, None, ex, tcs, ins, ew, acc, rsa, fastag, None, reg_ind, onroad_ind, reg_corp, onroad_corp]
+    if tamper is not None:
+        row[11] = tamper
+    return row
+
+
+def _dealer_ev_workbook(sheets: dict[str, list[list]]) -> bytes:
+    """Mirrors the EV layout: one sheet per model, Essential Accessories in
+    place of the kit, no RSA / warranty, registration without and with
+    hypothecation."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    for title, rows in sheets.items():
+        ws = wb.create_sheet(title)
+        ws.append([None, "ADITYA MOTORS"])
+        ws.append([None, "MODEL NAME", title, "ODISHA", "STATE", "CUTTACK"])
+        ws.append([None, "MODEL & VARIANT", "Ex-showroom Price with Charger", "Tax Collection at Source (TCS)",
+                   "Insurance", "Essential Accessories", "Fastag", "On Road Price - Individual"])
+        ws.append([None] * 7 + ["Registration without Hypothecation", "On Road Price without Hypothecation",
+                                "Registration with Hypothecation", "On Road Price with Hypothecation"])
+        ws.append([None, None, "(A)", "(B)", "(C)", "(D)", "(E)", "(F)", "(G)=(A+B+C+D+E+F)", "(H)", "(I)=(A+B+C+D+E+H)"])
+        for row in rows:
+            ws.append(row)
+        ws.append([None, "N:B-"])
+        ws.append([None, 1, "The buyer is free to insure elsewhere"])
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _ev_row(variant, ex):
+    tcs, ins, acc, fastag, reg_without, reg_with = round(ex * 0.01), 80000, 25000, 500, 140, 1640
+    base = ex + tcs + ins + acc + fastag
+    return [None, variant, ex, tcs, ins, acc, fastag, reg_without, base + reg_without, reg_with, base + reg_with]
+
+
+def test_dealer_pv_sheet_parses_reconciles_and_dates_from_the_sheet() -> None:
+    content = _dealer_pv_workbook([
+        _pv_row("1.6XXL HD V2", 859_501, 3_632, 3_632),
+        _pv_row("1.5XXL SD V2", 839_500, 51_110, 51_110),
+        _pv_row("1.5XXL SD V2", 839_500, 51_110, 51_110),  # the sheet repeats a row verbatim
+    ])
+    result = parse_price_list(content, filename="veero_LNT_Price.xlsx")
+    assert not result.errors, result.errors
+    assert result.meta["layout"] == "DEALER_PER_MODEL" and result.meta["sheets"] == 1
+    assert result.meta["duplicateRowsCollapsed"] == 1
+    assert result.effective_from_hint == date(2026, 9, 3) and result.meta["effectiveFromSource"] == "SHEET"
+    first, second = result.price_rows
+    assert first.model_name == "VEERO" and first.variant_name == "1.6XXL HD V2" and first.fuel == "DIESEL"
+    assert first.category == "ICE" and first.registration_basis == "STANDARD" and first.source_sheet == "VEERO"
+    assert first.components["EX_SHOWROOM"] == Decimal("859501.00")
+    assert first.components["REGISTRATION_INDIVIDUAL"] == Decimal("3632.00")
+    assert "EXT_WARRANTY_4TH_YR" not in first.components  # the sheet has no such column
+    assert first.onroad_individual == Decimal("904153.00") == first.onroad_corporate
+    assert second.components["REGISTRATION_INDIVIDUAL"] == Decimal("51110.00")
+
+
+def test_dealer_pv_sheet_rejects_a_row_off_its_own_formula() -> None:
+    content = _dealer_pv_workbook([
+        _pv_row("1.6XXL HD V2", 859_501, 3_632, 3_632),
+        _pv_row("1.6XXL SD V2", 839_501, 3_632, 3_632, tamper=999),
+    ])
+    result = parse_price_list(content)
+    assert len(result.price_rows) == 1
+    assert any("1.6XXL SD V2" in e and "on-road is 999" in e for e in result.errors)
+
+
+def test_dealer_ev_workbook_reads_every_model_sheet_and_the_file_name_date() -> None:
+    content = _dealer_ev_workbook({
+        "BE6": [_ev_row("BE 6 One B59 R18 NCH", 1_890_000), _ev_row("BE 6 Two B59 R19 C7", 2_240_000)],
+        "xuv3XO EV": [_ev_row("XUV3XO EV - AX5 FH", 1_389_000)],
+    })
+    result = parse_price_list(content, filename="EV_PRICE_-01th_Sept26.xlsx")
+    assert not result.errors, result.errors
+    assert result.meta["sheets"] == 2 and result.meta["models"] == ["BE6", "xuv3XO EV"]
+    assert result.effective_from_hint == date(2026, 9, 1) and result.meta["effectiveFromSource"] == "FILENAME"
+    by_variant = {r.variant_name: r for r in result.price_rows}
+    be6 = by_variant["BE 6 One B59 R18 NCH"]
+    assert be6.components["REGISTRATION_INDIVIDUAL"] == Decimal("140.00")
+    assert be6.components["REGISTRATION_CORPORATE"] == Decimal("1640.00")
+    assert be6.onroad_corporate - be6.onroad_individual == Decimal("1500.00")
+    assert be6.category == "UNSPECIFIED"  # nothing on the sheet says electric
+    assert "RSA_1YR" not in be6.components and "ACCESSORIES_KIT" in be6.components
+    ev = by_variant["XUV3XO EV - AX5 FH"]
+    assert ev.fuel == "ELECTRIC" and ev.category == "BEV"
+
+
+def test_dealer_sheet_and_file_name_dates_disagree_is_a_warning() -> None:
+    content = _dealer_pv_workbook([_pv_row("1.6XXL HD V2", 859_501, 3_632, 3_632)])
+    result = parse_price_list(content, filename="02_Nos_Added_PRICE_-07th__Sept26.xlsx")
+    assert result.effective_from_hint == date(2026, 9, 3)
+    assert any("file name says 2026-09-07" in w for w in result.warnings)
+
+
+def test_dealer_sheet_preview_shows_absent_components_as_blank() -> None:
+    result = parse_price_list(_dealer_pv_workbook([_pv_row("1.6XXL HD V2", 859_501, 3_632, 3_632)]))
+    sample = _build_preview(result, "PRICE_LIST")["sample"][0]
+    assert sample["exShowroom"] == "859501.00" and sample["extWarranty4thYr"] is None
+
+
+# ── the dealer's discount grid (fifth master, decision 2026-09-30) ─────────────
+def _grid_workbook(rows, parameters=(), *, title="Effective 1st Sep 2026") -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Grid for Aug"
+    ws.append([None, title])
+    ws.append([None, "Model", "Booking Protection", "Agreed Buffer", "Insurance OD %", "Out of Territory"])
+    for row in rows:
+        ws.append([None, *row])
+    ws.append([None, "Parameter", "Notes"])
+    for parameter, note in parameters:
+        ws.append([None, parameter, note])
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_discount_grid_reads_models_values_and_parameters() -> None:
+    from audit_core.oem_master_parsers import parse_discount_grid
+
+    result = parse_discount_grid(_grid_workbook(
+        [
+            ["3XO", "30 days", 7000, 0.6, "Additional 3K"],
+            ["SCORPIO N Old", "Out of scope", "Out of scope", "Out of scope", "Out of scope"],
+            ["7XO", "60 days", "Nil", 0.5, "Nil"],
+            ["PICKUP, MAXX, MAXX HD", "30 days", 7000, 0.5, "Additional 3K"],
+        ],
+        [("Penalty Amount", "₹30,000 per case for any policy breach"), ("Price List", "All dealerships follow it")],
+    ), filename="Odisha_PV__CV_Discount_Grid-1_Aug_2026.xlsx")
+    assert not result.errors, result.errors
+    assert result.effective_from_hint == date(2026, 9, 1) and result.meta["effectiveFromSource"] == "SHEET"
+    rows = {r.model_alias: r for r in result.grid_rows}
+    xo = rows["3XO"]
+    assert (xo.booking_protection_days, xo.agreed_buffer_amount, xo.insurance_od_percent, xo.out_of_territory_amount) == (
+        30, Decimal("7000.00"), Decimal("60.00"), Decimal("3000.00"))
+    old = rows["SCORPIO N Old"]
+    assert old.in_scope is False and old.booking_protection_days is None and old.agreed_buffer_amount is None
+    seven = rows["7XO"]
+    assert seven.agreed_buffer_amount == Decimal("0.00") and seven.out_of_territory_amount == Decimal("0.00")
+    assert rows["PICKUP, MAXX, MAXX HD"].model_aliases == ["PICKUP", "MAXX", "MAXX HD"]
+    assert result.grid_parameters[0] == {"parameter": "Penalty Amount", "note": "₹30,000 per case for any policy breach"}
+    assert _build_preview(result, "DISCOUNT_GRID")["sample"][0]["insuranceOdPercent"] == "60.00"
+
+
+def test_discount_grid_rejects_an_unreadable_cell_and_a_foreign_workbook() -> None:
+    from audit_core.oem_master_parsers import parse_discount_grid
+
+    result = parse_discount_grid(_grid_workbook([["3XO", "thirty", 7000, 0.6, "Additional 3K"]]))
+    assert result.grid_rows == [] and any("unreadable days" in e for e in result.errors)
+    wb = Workbook()
+    wb.active.append(["something", "else"])
+    buf = BytesIO()
+    wb.save(buf)
+    with pytest.raises(MasterParseError):
+        parse_discount_grid(buf.getvalue())
