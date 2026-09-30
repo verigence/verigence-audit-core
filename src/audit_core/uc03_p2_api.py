@@ -2222,6 +2222,12 @@ def overview_summary(
     }
 
 
+# Task types a Team Lead or PMO raises by hand (the System task enables MR).
+_SUPERVISOR_RAISED_TASKS = frozenset({
+    "TL_DOCUMENT_UPLOAD", "TL_MANUAL_VERIFICATION", "TL_DATA_VIOLATION", "TL_MANAGEMENT_REFERRAL",
+})
+
+
 class HumanTaskCreate(BaseModel):
     taskType: str = Field(min_length=1, max_length=160)
     category: str = Field(min_length=1, max_length=120)
@@ -2266,17 +2272,28 @@ def create_human_task(
         authorization_client=authorization_client,
         permission_key=_UPDATE_PERMISSION,
     )
-    if command.taskType == "TL_MANAGEMENT_REFERRAL":
+    template = get_registry().tasks.get(command.taskType)
+    category, assigned_role, allowed = command.category, command.assignedRoleCode, command.allowedActions
+    if command.taskType in _SUPERVISOR_RAISED_TASKS:
+        # Raised by hand from the Task Queue (decision 2026-09-30): only a
+        # Team Lead or PMO, and the template decides the tab, the owner and
+        # what the assignee can do with it.
         roles = {str(r or "").upper() for r in (access.operating_role, access.functional_role)}
         if not roles & {"TL", "PM"}:
-            raise HTTPException(status_code=403, detail="Only a Team Lead can raise the Management Referral task.")
+            raise HTTPException(status_code=403, detail="Only a Team Lead or PMO can raise this task.")
+        assert template is not None
+        category, assigned_role, allowed = template.category, template.owner, list(template.actions)
+        if command.assignedActorId:
+            people = _journey_assignees(connection, tenant_id=tenant_id, journey_id=journey_id, role_code=assigned_role)
+            if command.assignedActorId not in {person["actorId"] for person in people}:
+                raise HTTPException(status_code=422, detail=f"That person is not a {assigned_role} on this journey's outlet.")
     unique = uuid4()
     created = create_p2_task(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
         task_type=command.taskType,
-        category=command.category,
+        category=category,
         origin_kind="HUMAN",
         source_type="HUMAN_ACTION",
         source_code=None,
@@ -2286,15 +2303,81 @@ def create_human_task(
         reference=command.reference,
         severity=command.severity,
         priority=command.priority,
-        assigned_role_code=command.assignedRoleCode,
+        assigned_role_code=assigned_role,
         assigned_actor_id=command.assignedActorId,
         raised_by_actor_id=human_principal.subject,
         raised_by_role_code=access.operating_role or access.functional_role or "USER",
-        allowed_actions=command.allowedActions,
+        allowed_actions=allowed,
         completion_protocol="REQUESTER_CONFIRMED",
         due_at_utc=command.dueAtUtc,
     )
     return {"taskId": str(created), "status": "READY"}
+
+
+@router.get("/journeys/{journey_id}/assignees")
+def list_journey_assignees(
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+    role: str = "PC",
+) -> dict[str, Any]:
+    """The people a task on this journey can be assigned to: everyone with
+    an active business assignment in that role covering the journey's
+    dealer and outlet. The journey's own PC (who started it) comes first."""
+    _authorize(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_READ_PERMISSION,
+    )
+    role_code = role.strip().upper()
+    if role_code not in {"PC", "TL", "PM"}:
+        raise HTTPException(status_code=422, detail="role must be PC, TL or PM.")
+    return {"items": _journey_assignees(connection, tenant_id=tenant_id, journey_id=journey_id, role_code=role_code)}
+
+
+def _journey_assignees(connection: Connection, *, tenant_id: str, journey_id: UUID, role_code: str) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        text(
+            """
+            SELECT ba.security_actor_id AS actor_id,
+                   ba.outlet_id IS NOT NULL AS outlet_scoped,
+                   ba.security_actor_id = j.created_by_actor_id AS journey_pc,
+                   (SELECT jn.created_by_display_name FROM auditcore.journeys jn
+                     WHERE jn.tenant_id=ba.tenant_id AND jn.created_by_actor_id=ba.security_actor_id
+                       AND jn.created_by_display_name IS NOT NULL
+                     ORDER BY jn.created_at_utc DESC LIMIT 1) AS display_name
+            FROM auditcore.journeys j
+            JOIN auditcore.business_assignments ba
+              ON ba.tenant_id=j.tenant_id
+             AND ba.business_role_code=:role
+             AND ba.assignment_status='ACTIVE'
+             AND ba.effective_from <= now()
+             AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+             AND (ba.dealer_id IS NULL
+                  OR (ba.dealer_id=j.dealer_id AND (ba.outlet_id IS NULL OR ba.outlet_id=j.outlet_id)))
+            WHERE j.tenant_id=:tenant_id AND j.journey_id=:journey_id
+            ORDER BY journey_pc DESC, outlet_scoped DESC, display_name NULLS LAST, ba.security_actor_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "role": role_code},
+    ).mappings().all()
+    seen: set[str] = set()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        actor = str(row["actor_id"])
+        if actor in seen:
+            continue
+        seen.add(actor)
+        items.append({
+            "actorId": actor,
+            "displayName": row["display_name"],
+            "roleCode": role_code,
+            "journeyPc": bool(row["journey_pc"]),
+        })
+    return items
 
 
 @router.get("/tasks")
@@ -2319,7 +2402,9 @@ def list_tasks(
     has not processed (existing data), so a P2 Journey never shows the same
     issue twice; ``includeLegacy=true`` shows every legacy task, ``false``
     none. ``tab`` narrows to DOCUMENTS or MANUAL_VERIFICATION; counts for
-    every tab are always returned."""
+    every tab are always returned. Under a ``role`` filter the tasks the
+    caller raised by hand stay visible, so a raised task is on the queue of
+    both the requester and the assignee."""
     _authorize(
         connection,
         tenant_id=tenant_id,
@@ -2360,7 +2445,8 @@ def list_tasks(
             LEFT JOIN auditcore.journey_products jp ON jp.tenant_id=t.tenant_id AND jp.journey_id=t.journey_id
             WHERE t.tenant_id=:tenant_id
               AND (CAST(:journey_id AS uuid) IS NULL OR t.journey_id=CAST(:journey_id AS uuid))
-              AND (CAST(:role AS varchar) IS NULL OR t.assigned_role_code=CAST(:role AS varchar))
+              AND (CAST(:role AS varchar) IS NULL OR t.assigned_role_code=CAST(:role AS varchar)
+                   OR (t.origin_kind='HUMAN' AND t.raised_by_actor_id=:actor_id))
               AND (
                 (CAST(:status AS varchar) IS NOT NULL AND t.task_status=CAST(:status AS varchar))
                 OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='open'

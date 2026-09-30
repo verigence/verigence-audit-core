@@ -229,6 +229,40 @@ task_types:
     actions:
     - COMPLETE_ACTION
     - ADD_COMMENT
+  # Tasks a Team Lead or PMO raises by hand on a journey for its PC
+  # (decision 2026-09-30): a document to upload, something to verify by
+  # hand, or a data violation to correct. The PC marks it done and the
+  # requester accepts or sends it back.
+  TL_DOCUMENT_UPLOAD:
+    category: DOCUMENT_REUPLOAD
+    owner: PC
+    origin: HUMAN
+    source: HUMAN_ACTION
+    completion: REQUESTER_CONFIRMED
+    actions:
+    - UPLOAD_DOCUMENT
+    - COMPLETE_ACTION
+    - ADD_COMMENT
+  TL_MANUAL_VERIFICATION:
+    category: DOCUMENT_VERIFICATION
+    owner: PC
+    origin: HUMAN
+    source: HUMAN_ACTION
+    completion: REQUESTER_CONFIRMED
+    actions:
+    - REVIEW_DOCUMENT
+    - COMPLETE_ACTION
+    - ADD_COMMENT
+  TL_DATA_VIOLATION:
+    category: FINDING_REMEDIATION
+    owner: PC
+    origin: HUMAN
+    source: HUMAN_ACTION
+    completion: REQUESTER_CONFIRMED
+    actions:
+    - CORRECT_EXTRACTED_FIELD
+    - COMPLETE_ACTION
+    - ADD_COMMENT
   TL_TAKE_ACTION:
     category: FINDING_REMEDIATION
     owner: PC
