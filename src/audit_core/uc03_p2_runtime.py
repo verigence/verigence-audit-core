@@ -222,3 +222,46 @@ def enqueue_work(
             "correlation_id": correlation_id,
         },
     )
+
+
+def requeue_page_for_ingest(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    queue_id: UUID,
+    client_upload_id: str,
+    marker: str,
+    requested_by: str,
+    correlation_id: str | None,
+) -> str:
+    """Send a page to Document Intelligence again as a fresh document: the
+    queue row is reset and its ingest work re-queued. ``marker`` tells the
+    attempts apart in the client upload id: ``r`` for a PC's Retry, ``n``
+    for the nightly sweep (which re-drives a page once). Returns the new
+    client upload id."""
+    base = client_upload_id.split("~", 1)[0]
+    attempt = connection.execute(
+        text("SELECT COUNT(*) FROM auditcore.p2_document_queue WHERE tenant_id=:t AND client_upload_id LIKE :p"),
+        {"t": tenant_id, "p": f"{base}~{marker}%"},
+    ).scalar_one()
+    new_id = f"{base}~{marker}{int(attempt) + 1}"
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue
+            SET queue_status='QUEUED', client_upload_id=:client_upload_id, di_document_id=NULL,
+                di_state=NULL, di_processing_status=NULL, di_submitted_at_utc=NULL,
+                di_processed_seen_at_utc=NULL, status_reason=NULL, last_error=NULL,
+                attempt_count=0, extracted_field_count=0, updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+            """
+        ),
+        {"tenant_id": tenant_id, "queue_id": queue_id, "client_upload_id": new_id},
+    )
+    enqueue_work(
+        connection, tenant_id=tenant_id, journey_id=journey_id, work_type="DOCUMENT_INGEST",
+        work_key=str(queue_id), payload={"queueId": str(queue_id), "uploadedBy": requested_by},
+        correlation_id=correlation_id,
+    )
+    return new_id
