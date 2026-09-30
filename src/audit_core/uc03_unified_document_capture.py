@@ -1420,6 +1420,27 @@ def delete_unified_document(
         )
 
 
+def _phase2_page_ids(connection: Connection, *, tenant_id: str, document_ids: list[Any]) -> set[str]:
+    """The documents among `document_ids` that are Phase 2 pages. Their values
+    are copied by the Phase 2 worker itself (uc03_p2_worker._copy_page_facts,
+    driven by the Journey's reconcile that Recheck enqueues), so a resync
+    must not also dispatch the Phase 1 background copy for them: two copies
+    of the same page racing for one journey lock, one of them lost on a
+    restart. Same rule as the DI webhook."""
+    if not document_ids:
+        return set()
+    rows = connection.execute(
+        text(
+            """
+            SELECT DISTINCT di_document_id::text FROM auditcore.p2_document_queue
+            WHERE tenant_id=:tenant_id AND di_document_id::text = ANY(:document_ids)
+            """
+        ),
+        {"tenant_id": tenant_id, "document_ids": [str(value) for value in document_ids]},
+    ).scalars().all()
+    return set(rows)
+
+
 class UnifiedResyncResponse(BaseModel):
     documentsFound: int
     documentsResynced: int
@@ -1537,8 +1558,13 @@ def resync_unified_documents(
         service_id=f"manual-resync:{human_principal.subject}",
     )
 
+    phase2_pages = _phase2_page_ids(
+        connection, tenant_id=tenant_id, document_ids=[*booking_ids, *delivery_ids],
+    )
     index = 0
     for document_id in booking_ids:
+        if str(document_id) in phase2_pages:
+            continue
         background_tasks.add_task(
             _run_sync_booking_document_task,
             engine,
@@ -1551,6 +1577,8 @@ def resync_unified_documents(
         )
         index += 1
     for document_id in delivery_ids:
+        if str(document_id) in phase2_pages:
+            continue
         background_tasks.add_task(
             _run_sync_booking_document_task,
             engine,
@@ -1564,10 +1592,10 @@ def resync_unified_documents(
         index += 1
 
     total_documents = len(booking_documents) + len(delivery_documents)
-    total_resynced = len(booking_ids) + len(delivery_ids)
+    total_classified = len(booking_ids) + len(delivery_ids)
     return UnifiedResyncResponse(
         documentsFound=total_documents,
-        documentsResynced=total_resynced,
-        documentsNotYetExtracted=total_documents - total_resynced,
-        queuedDocumentCount=total_resynced,
+        documentsResynced=total_classified,
+        documentsNotYetExtracted=total_documents - total_classified,
+        queuedDocumentCount=index,
     )

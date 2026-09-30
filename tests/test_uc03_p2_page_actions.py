@@ -155,3 +155,20 @@ def test_others_is_only_for_a_page_that_could_not_be_classified(journey):
                       human_principal=principal(journey), authorization_client=AllowAllAuthorization(),
                       connection=connection)
     assert raised.value.status_code == 409
+
+
+def test_resync_leaves_phase2_pages_to_the_worker(journey):
+    """Recheck (2026-09-30): a Phase 2 page's values are copied by the
+    worker; the Phase 1 resync must not dispatch its background copy for it."""
+    from uuid import uuid4
+
+    from audit_core.uc03_unified_document_capture import _phase2_page_ids
+
+    _, [page] = add_batch_pages(journey, [("pan_card", "READY")], grouping_status="NOT_NEEDED")
+    phase1_document = uuid4()
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        found = _phase2_page_ids(connection, tenant_id=journey.tenant_id,
+                                 document_ids=[page["di_document_id"], phase1_document])
+        assert _phase2_page_ids(connection, tenant_id=journey.tenant_id, document_ids=[]) == set()
+    assert found == {str(page["di_document_id"])}
