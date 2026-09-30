@@ -1688,11 +1688,14 @@ def _journey_reconcile(engine: Engine, work: WorkItem) -> None:
             # A page DI could not classify needs the PC now, not at the
             # next stage recompute (which a supporting page never triggers).
             sync_unclassified_page_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
-        if still_waiting:
-            # The file's status task ("check back after 1 hour") is raised
-            # and refreshed from here: this loop is what keeps ticking while
-            # pages wait on Document Intelligence.
-            sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
+        # The file's status task ("check back after 1 hour", then "upload
+        # page 2 on its own") is raised and refreshed from here: this loop
+        # is what keeps ticking while pages wait on Document Intelligence.
+        # It runs on the last round too: a page rejected for scan quality
+        # while its siblings were still being read only becomes the High
+        # task once the file is otherwise done, which is this round
+        # (2026-09-30: the banner promised a task that was never raised).
+        sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
 
     if still_waiting:
         raise RescheduleWork(
