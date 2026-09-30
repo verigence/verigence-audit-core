@@ -224,6 +224,54 @@ def enqueue_work(
     )
 
 
+def request_page_recovery(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    queue_id: UUID,
+    marker: str,
+    requested_by: str,
+    correlation_id: str | None,
+) -> str:
+    """Ask the worker to recover a FAILED page: it looks at what Document
+    Intelligence already holds for the page first and uploads it again only
+    if DI gave it up (uc03_p2_worker._recover_page). A page DI never
+    received is sent straight away. ``marker`` is ``r`` for a PC's Retry,
+    ``n`` for the nightly sweep. Returns the client upload id in force."""
+    row = connection.execute(
+        text(
+            """
+            SELECT di_document_id, client_upload_id FROM auditcore.p2_document_queue
+            WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+            """
+        ),
+        {"tenant_id": tenant_id, "queue_id": queue_id},
+    ).mappings().one()
+    if row["di_document_id"] is None:
+        return requeue_page_for_ingest(
+            connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id,
+            client_upload_id=str(row["client_upload_id"]), marker=marker, requested_by=requested_by,
+            correlation_id=correlation_id,
+        )
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue
+            SET queue_status='QUEUED', status_reason=NULL, last_error=NULL, updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+            """
+        ),
+        {"tenant_id": tenant_id, "queue_id": queue_id},
+    )
+    enqueue_work(
+        connection, tenant_id=tenant_id, journey_id=journey_id, work_type="DOCUMENT_INGEST",
+        work_key=str(queue_id), payload={"queueId": str(queue_id), "uploadedBy": requested_by, "recover": marker},
+        correlation_id=correlation_id,
+    )
+    return str(row["client_upload_id"])
+
+
 def requeue_page_for_ingest(
     connection: Connection,
     *,

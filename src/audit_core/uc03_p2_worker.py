@@ -77,6 +77,7 @@ from audit_core.uc03_p2_runtime import (
     fact_fingerprint,
     note_facts_changed,
     record_activity,
+    request_page_recovery,
     requeue_page_for_ingest,
 )
 from audit_core.uc03_p2_stage import recompute_journey_stage
@@ -113,13 +114,16 @@ _WORKER_CONCURRENCY = max(1, int(os.environ.get("P2_WORKER_CONCURRENCY", "6")))
 _PER_JOURNEY_CONCURRENCY = max(1, int(os.environ.get("P2_PER_JOURNEY_CONCURRENCY", "3")))
 _LEASE_SECONDS = int(os.environ.get("P2_WORKER_LEASE_SECONDS", "600"))
 _LEASE_RENEW_SECONDS = max(5, _LEASE_SECONDS // 3)
-# A page that DI has not settled within this window is failed visibly (with a
-# Retry action in the UI) instead of being polled forever.
-# One hour: Document Intelligence spaces its own retries of a quota hit or
-# outage over about 34 minutes before it gives a page up, and the PC is told
-# to come back after an hour; giving up sooner here would fail a page DI
-# was still going to read.
-_PAGE_DEADLINE_SECONDS = int(os.environ.get("P2_PAGE_DEADLINE_SECONDS", str(60 * 60)))
+# A page is never failed for taking long (decision 2026-09-30: load is
+# never a failure). While Document Intelligence still has it in hand it is
+# polled, ever more slowly (_reconcile_delay); the file's status task tells
+# the PC after an hour, and the nightly sweep looks again after a day. Only
+# DI's own verdict, or DI no longer knowing the page, fails it.
+# A page the PC or the nightly sweep asked to recover from FAILED is looked
+# up at DI first (_recover_page); a technical extraction failure is left to
+# DI's own nightly reprocessing for this long before the page is uploaded
+# once more.
+_RECOVERY_REUPLOAD_AFTER_SECONDS = 4 * 24 * 3600
 # DI reports PROCESSED before the document-link sync has copied facts into
 # Audit Core. Allow the sync this long before treating "no facts" as a result.
 _FACT_SWEEP_SECONDS = float(os.environ.get("P2_FACT_SWEEP_SECONDS", "30"))
@@ -1017,6 +1021,7 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
                 """
                 SELECT q.queue_id, q.batch_id, q.page_number, q.page_object_key,
                        q.client_upload_id, q.di_document_id, q.queue_status,
+                       q.di_submitted_at_utc,
                        q.unit_kind, q.page_numbers, q.candidate_override,
                        b.original_filename, b.content_type AS original_content_type,
                        b.uploaded_by_actor_id, b.page_count, b.grouping_status
@@ -1030,9 +1035,18 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
         ).mappings().one()
         if row["queue_status"] in _PAGE_SETTLED_STATES:
             return
-        if row["di_document_id"] is not None:
+        if work.payload.get("recover") and row["di_document_id"] is not None:
+            recover = dict(row)
+        elif row["di_document_id"] is not None:
             _enqueue_journey_reconcile(connection, work=work)
             return
+        else:
+            recover = None
+    if recover is not None:
+        _recover_page(engine, work, recover)
+        return
+    with engine.begin() as connection:
+        set_tenant_context(connection, work.tenant_id)
         connection.execute(
             text(
                 """
@@ -1201,6 +1215,98 @@ _QUALITY_FAILURE_PREFIX = "DI_QUALITY_"
 _UNREADABLE_FAILURE_CODES = frozenset({"FILE_EMPTY", "INVALID_FILE_CONTENT", "CORRUPT", "UPLOAD_FAILED"})
 
 
+def recovery_decision(
+    *,
+    di_item: dict[str, Any] | None,
+    marker: str,
+    submitted_at: datetime | None,
+    now: datetime,
+) -> str:
+    """What to do with a page the PC (marker "r") or the nightly sweep
+    (marker "n") asked to recover, given what Document Intelligence holds
+    for it: a page state to poll from ("SYNCING_TO_AUDIT_CORE" when DI has
+    read it, so the worker copies; "EXTRACTING" or "CLASSIFYING" while DI
+    still has it in hand), "REUPLOAD" when DI has given it up or no longer
+    knows it, or "LEAVE" for the nightly sweep meeting a technical
+    extraction failure DI's own nightly reprocessing is still going to
+    retry (for _RECOVERY_REUPLOAD_AFTER_SECONDS after submission)."""
+    if di_item is None:
+        return "REUPLOAD"
+    state = str(di_item.get("state") or "")
+    processing = str(di_item.get("processingStatus") or "")
+    if state in ("FAILED", "DELETED"):
+        return "REUPLOAD"
+    if state == "CLASSIFIED":
+        if processing == "PROCESSED":
+            return "SYNCING_TO_AUDIT_CORE"
+        if processing == "FAILED":
+            code = str(di_item.get("failureCode") or "").upper()
+            final = code.startswith(_QUALITY_FAILURE_PREFIX) or code in _UNREADABLE_FAILURE_CODES
+            if final or marker != "n":
+                return "REUPLOAD"
+            age = (now - submitted_at).total_seconds() if submitted_at else float("inf")
+            return "REUPLOAD" if age > _RECOVERY_REUPLOAD_AFTER_SECONDS else "LEAVE"
+        return "EXTRACTING"
+    return "CLASSIFYING"
+
+
+def _recover_page(engine: Engine, work: WorkItem, row: dict[str, Any]) -> None:
+    """A FAILED page the PC or the nightly sweep asked to recover: look at
+    what Document Intelligence already holds for it before ever uploading
+    it again (decision 2026-09-30: never re-read what DI already read)."""
+    marker = str(work.payload.get("recover"))
+    queue_id = UUID(work.work_key)
+    context_ref, token, _, _ = _di_context_and_requirements(engine, work)
+    v2_client = get_di_capture_v2_client()
+    di_item: dict[str, Any] | None = None
+    for phase in ("BOOKING", "DELIVERY"):
+        listing = v2_client.list_documents(
+            token=token, tenant_id=work.tenant_id, external_context_ref=context_ref, phase=phase,
+        )
+        for item in listing.get("documents") or []:
+            if str(item.get("documentId")) == str(row["di_document_id"]):
+                di_item = item
+    decision = recovery_decision(
+        di_item=di_item, marker=marker, submitted_at=row.get("di_submitted_at_utc"), now=datetime.now(UTC),
+    )
+    logger.info(
+        "p2_page_recovery",
+        tenant_id=work.tenant_id,
+        journey_id=str(work.journey_id),
+        queue_id=str(queue_id),
+        di_document_id=str(row["di_document_id"]),
+        marker=marker,
+        di_state=(di_item or {}).get("state"),
+        di_processing_status=(di_item or {}).get("processingStatus"),
+        decision=decision,
+    )
+    with engine.begin() as connection:
+        set_tenant_context(connection, work.tenant_id)
+        if decision == "REUPLOAD":
+            requeue_page_for_ingest(
+                connection, tenant_id=work.tenant_id, journey_id=work.journey_id, queue_id=queue_id,
+                client_upload_id=str(row["client_upload_id"]), marker=marker,
+                requested_by=str(work.payload.get("uploadedBy") or "SYSTEM"), correlation_id=work.correlation_id,
+            )
+        elif decision == "LEAVE":
+            _settle_page(
+                connection, tenant_id=work.tenant_id, queue_id=queue_id, status="FAILED",
+                reason=_di_failure_reason(di_item),
+            )
+        else:
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.p2_document_queue
+                    SET queue_status=:status, status_reason=NULL, updated_at_utc=now()
+                    WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+                    """
+                ),
+                {"tenant_id": work.tenant_id, "queue_id": queue_id, "status": decision},
+            )
+            _enqueue_journey_reconcile(connection, work=work)
+
+
 def _di_failure_reason(di_item: dict[str, Any] | None) -> str:
     """Why the document service failed a page, as the PC should read it: a
     scan-quality rejection is final and needs a re-scan, not a retry."""
@@ -1265,11 +1371,7 @@ def classify_page_outcome(
             return PageOutcome("NEEDS_REVIEW", _NOTHING_READ_REASON)
         if facts_copy == "UNLINKED":
             return PageOutcome("SUPPORTING", _EXTRA_COPY_REASON)
-        if age > _PAGE_DEADLINE_SECONDS:
-            return PageOutcome("FAILED", "The values could not be copied in time. Retry the page.")
         return PageOutcome("SYNCING_TO_AUDIT_CORE", None)
-    if age > _PAGE_DEADLINE_SECONDS:
-        return PageOutcome("FAILED", "Processing did not finish in time. Retry the page.")
     if state == "CLASSIFIED":
         return PageOutcome("EXTRACTING", None)
     return PageOutcome("CLASSIFYING", None)
@@ -1380,8 +1482,11 @@ def _reconcile_delay(oldest_submitted: datetime | None, now: datetime) -> int:
         return 15
     # Past a quarter of an hour the page is in DI's own retry ladder; one
     # look every half minute per journey is plenty and keeps a burst of
-    # uploads from turning into a burst of DI listing calls.
-    return 30
+    # uploads from turning into a burst of DI listing calls. Past an hour
+    # the page is queued behind a burst or waiting out a quota: five minutes.
+    if age < 3600:
+        return 30
+    return 300
 
 
 # Pages that have not yet been classified by DI; grouping waits for them.
@@ -2237,9 +2342,10 @@ def queue_nightly_upload_sweep(connection, *, tenant_id: str, now: datetime | No
     """Every night, give every page that has been stuck for a day one more
     go, then refresh the file's status task so the PC sees the morning
     state: a failed page (other than a scan-quality rejection, which a
-    retry cannot fix) is sent to Document Intelligence again, once; a page
-    still in flight after a day is reconciled so it settles one way or the
-    other. Safe to call more than once."""
+    retry cannot fix) is recovered through what Document Intelligence
+    already holds for it (_recover_page), and sent again only if DI gave it
+    up, once; a page still in flight after a day is reconciled so it settles
+    one way or the other. Safe to call more than once."""
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(seconds=_NIGHTLY_SWEEP_AFTER_SECONDS)
     failed = connection.execute(
@@ -2258,10 +2364,9 @@ def queue_nightly_upload_sweep(connection, *, tenant_id: str, now: datetime | No
     journeys: set[UUID] = set()
     for row in failed:
         journey_id = UUID(str(row["journey_id"]))
-        requeue_page_for_ingest(
+        request_page_recovery(
             connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=UUID(str(row["queue_id"])),
-            client_upload_id=str(row["client_upload_id"]), marker="n", requested_by="SYSTEM",
-            correlation_id=None,
+            marker="n", requested_by="SYSTEM", correlation_id=None,
         )
         record_activity(
             connection, tenant_id=tenant_id, journey_id=journey_id, event_type="PAGE_RETRY_REQUESTED",

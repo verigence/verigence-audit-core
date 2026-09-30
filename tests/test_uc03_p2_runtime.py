@@ -85,15 +85,16 @@ NOW = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
         ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, 0, 2, "COPIED", "NEEDS_REVIEW"),
         ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, 0, 2, "UNLINKED", "SUPPORTING"),
         ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, 3, 2, "COPIED", "READY"),
-        ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, 0, 61, None, "FAILED"),
+        # Load is never a failure: a page DI still has in hand is waited for.
+        ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, 0, 61, None, "SYNCING_TO_AUDIT_CORE"),
         ({"state": "CLASSIFIED", "processingStatus": "PROCESSING"}, 0, 45, None, "EXTRACTING"),
-        ({"state": "CLASSIFIED", "processingStatus": "PROCESSING"}, 0, 61, None, "FAILED"),
-        ({"state": "STORED"}, 0, 59, None, "CLASSIFYING"),  # inside DI's own retry ladder
+        ({"state": "CLASSIFIED", "processingStatus": "PROCESSING"}, 0, 601, None, "EXTRACTING"),
+        ({"state": "STORED"}, 0, 601, None, "CLASSIFYING"),
         (None, 0, 1, None, "CLASSIFYING"),
         (None, 0, 10, None, "FAILED"),
     ],
 )
-def test_page_outcome_never_waits_forever(di_item, fields, submitted_ago, facts_copy, expected):
+def test_page_outcome_follows_di_never_a_timer(di_item, fields, submitted_ago, facts_copy, expected):
     outcome = worker.classify_page_outcome(
         di_item=di_item,
         extracted_count=fields,
@@ -622,7 +623,29 @@ def _set_page_age(journey, queue_id, *, hours: int) -> None:
         )
 
 
-def test_nightly_sweep_re_drives_a_page_stuck_for_a_day_once(journey):
+def _upload_id(journey, queue_id) -> str:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return connection.execute(
+            text("SELECT client_upload_id FROM auditcore.p2_document_queue WHERE queue_id=:q"), {"q": queue_id},
+        ).scalar_one()
+
+
+def _recover(journey, monkeypatch, documents):
+    """Run every DOCUMENT_INGEST work item due (the recovery requests),
+    against a DI listing of ``documents``."""
+    client = FakeCaptureClient(documents)
+    monkeypatch.setattr(worker, "_di_context_and_requirements", lambda engine, work: ("ctx", "tok", [], {}))
+    monkeypatch.setattr(worker, "get_di_capture_v2_client", lambda: client)
+    items = [i for i in worker._claim_for_tenant(journey.engine, journey.tenant_id, 10) if i.work_type == "DOCUMENT_INGEST"]
+    assert items, "no recovery work was queued"
+    for item in items:
+        worker._ingest_document(journey.engine, item)
+        worker._complete(journey.engine, item)
+    return client
+
+
+def test_nightly_sweep_re_drives_a_page_stuck_for_a_day_once(journey, monkeypatch):
     """Task #41 (2026-09-30): a page failed for a day is sent to DI again,
     once; a page still in flight after a day is reconciled; a scan-quality
     rejection is left alone (a retry cannot fix it); a page that failed
@@ -643,16 +666,16 @@ def test_nightly_sweep_re_drives_a_page_stuck_for_a_day_once(journey):
         swept = worker.queue_nightly_upload_sweep(connection, tenant_id=journey.tenant_id)
     assert swept == {"retried": 1, "reconciled": 1, "journeys": 1}
     assert _page_status(journey, old_failed) == "QUEUED"
-    assert queue_row(journey, "DOCUMENT_INGEST", str(old_failed))["work_status"] == "PENDING"
+    ingest = queue_row(journey, "DOCUMENT_INGEST", str(old_failed))
+    assert ingest["work_status"] == "PENDING" and ingest["payload"]["recover"] == "n"
     assert _page_status(journey, fresh_failed) == "FAILED"
     assert _page_status(journey, quality) == "FAILED"
     assert queue_row(journey, "JOURNEY_RECONCILE", str(journey.journey_id))["work_status"] == "PENDING"
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        upload_id = connection.execute(
-            text("SELECT client_upload_id FROM auditcore.p2_document_queue WHERE queue_id=:q"), {"q": old_failed},
-        ).scalar_one()
-    assert upload_id.endswith("~n1")
+    # DI no longer knows the page: the worker uploads it once more.
+    _recover(journey, monkeypatch, documents=[])
+    assert _page_status(journey, old_failed) == "QUEUED"
+    assert _upload_id(journey, old_failed).endswith("~n1")
+    assert queue_row(journey, "DOCUMENT_INGEST", str(old_failed))["work_status"] == "PENDING"
 
     # The next night, the same page (failed again, a day old) is not re-driven a second time.
     with journey.engine.begin() as connection:
@@ -665,6 +688,66 @@ def test_nightly_sweep_re_drives_a_page_stuck_for_a_day_once(journey):
         swept = worker.queue_nightly_upload_sweep(connection, tenant_id=journey.tenant_id)
     assert swept["retried"] == 0
     assert _page_status(journey, old_failed) == "FAILED"
+
+
+# ------------------------------------------------- recovery looks at DI first
+
+@pytest.mark.parametrize(
+    ("di_item", "marker", "submitted_ago_hours", "expected"),
+    [
+        (None, "r", 1, "REUPLOAD"),
+        ({"state": "FAILED"}, "n", 1, "REUPLOAD"),
+        ({"state": "DELETED"}, "r", 1, "REUPLOAD"),
+        ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, "r", 1, "SYNCING_TO_AUDIT_CORE"),
+        ({"state": "CLASSIFIED", "processingStatus": "PROCESSING"}, "n", 1, "EXTRACTING"),
+        ({"state": "CLASSIFIED", "processingStatus": "RETRY_PENDING"}, "r", 1, "EXTRACTING"),
+        ({"state": "STORED"}, "r", 1, "CLASSIFYING"),
+        ({"state": "CLASSIFYING"}, "n", 1, "CLASSIFYING"),
+        # A technical extraction failure: DI's own nightly reprocessing retries it
+        # for a few nights, so the sweep leaves it; the PC's Retry acts at once.
+        ({"state": "CLASSIFIED", "processingStatus": "FAILED", "failureCode": "DOCUMENT_AI_UNAVAILABLE"}, "n", 30, "LEAVE"),
+        ({"state": "CLASSIFIED", "processingStatus": "FAILED", "failureCode": "DOCUMENT_AI_UNAVAILABLE"}, "n", 100, "REUPLOAD"),
+        ({"state": "CLASSIFIED", "processingStatus": "FAILED", "failureCode": "DOCUMENT_AI_UNAVAILABLE"}, "r", 30, "REUPLOAD"),
+        ({"state": "CLASSIFIED", "processingStatus": "FAILED", "failureCode": "CORRUPT"}, "n", 30, "REUPLOAD"),
+    ],
+)
+def test_recovery_decision_reads_di_before_uploading_again(di_item, marker, submitted_ago_hours, expected):
+    decision = worker.recovery_decision(
+        di_item=di_item, marker=marker, submitted_at=NOW - timedelta(hours=submitted_ago_hours), now=NOW,
+    )
+    assert decision == expected
+
+
+def test_recovery_copies_a_page_di_already_read_instead_of_uploading_it_again(journey, monkeypatch):
+    """Never re-read what DI already read (2026-09-30): a FAILED page whose
+    DI document is PROCESSED goes back for a copy, no upload; one DI still
+    has in hand is waited for; one DI's nightly will retry is left alone."""
+    _, read_q, read_d = add_page(journey, page_number=1, status="FAILED")
+    _, busy_q, busy_d = add_page(journey, page_number=2, status="FAILED")
+    _, waiting_q, waiting_d = add_page(journey, page_number=3, status="FAILED")
+    listing = [
+        {"documentId": str(read_d), "state": "CLASSIFIED", "processingStatus": "PROCESSED"},
+        {"documentId": str(busy_d), "state": "CLASSIFIED", "processingStatus": "PROCESSING"},
+        {"documentId": str(waiting_d), "state": "CLASSIFIED", "processingStatus": "FAILED",
+         "failureCode": "DOCUMENT_AI_UNAVAILABLE"},
+    ]
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        for queue_id, marker in ((read_q, "r"), (busy_q, "r"), (waiting_q, "n")):
+            worker.request_page_recovery(
+                connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=queue_id,
+                marker=marker, requested_by="pc", correlation_id=None,
+            )
+    for queue_id in (read_q, busy_q, waiting_q):
+        assert _page_status(journey, queue_id) == "QUEUED"
+    _recover(journey, monkeypatch, documents=listing)
+    assert _page_status(journey, read_q) == "SYNCING_TO_AUDIT_CORE"
+    assert _page_status(journey, busy_q) == "EXTRACTING"
+    assert _page_status(journey, waiting_q) == "FAILED"
+    for queue_id in (read_q, busy_q, waiting_q):
+        assert not _upload_id(journey, queue_id).count("~"), "no page was uploaded again"
+        assert queue_row(journey, "DOCUMENT_INGEST", str(queue_id))["work_status"] == "COMPLETED"
+    assert queue_row(journey, "JOURNEY_RECONCILE", str(journey.journey_id))["work_status"] == "PENDING"
 
 
 # ------------------------------------------------- the worker copies the values

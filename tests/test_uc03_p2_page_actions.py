@@ -42,7 +42,10 @@ def _unit(journey, queue_id):
         ).mappings().one())
 
 
-def test_failed_page_is_resubmitted_as_a_fresh_document(journey):
+def test_retry_asks_the_worker_to_look_at_di_before_uploading_again(journey):
+    """Never re-read what DI already read (2026-09-30): Retry keeps the DI
+    document and queues a recovery; the worker uploads again only if DI
+    gave the page up."""
     _, [page] = add_batch_pages(journey, [("pan_card", "FAILED")], grouping_status="NOT_NEEDED")
     with journey.engine.begin() as connection:
         result = retry_page(tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=page["queue_id"],
@@ -50,8 +53,26 @@ def test_failed_page_is_resubmitted_as_a_fresh_document(journey):
                             authorization_client=AllowAllAuthorization(), connection=connection)
     assert result["status"] == "QUEUED"
     unit = _unit(journey, page["queue_id"])
-    assert unit["di_document_id"] is None and unit["client_upload_id"].endswith("~r1")
-    assert queue_row(journey, "DOCUMENT_INGEST", str(page["queue_id"]))["work_status"] == "PENDING"
+    assert unit["queue_status"] == "QUEUED" and unit["di_document_id"] == page["di_document_id"]
+    assert "~" not in unit["client_upload_id"]
+    work = queue_row(journey, "DOCUMENT_INGEST", str(page["queue_id"]))
+    assert work["work_status"] == "PENDING" and work["payload"]["recover"] == "r"
+
+
+def test_retry_of_a_page_di_never_received_is_sent_straight_away(journey):
+    _, [page] = add_batch_pages(journey, [("pan_card", "DEAD_LETTER")], grouping_status="NOT_NEEDED")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_document_queue SET di_document_id=NULL WHERE queue_id=:q"),
+                           {"q": page["queue_id"]})
+    with journey.engine.begin() as connection:
+        retry_page(tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=page["queue_id"],
+                   request=_request(), human_principal=principal(journey),
+                   authorization_client=AllowAllAuthorization(), connection=connection)
+    unit = _unit(journey, page["queue_id"])
+    assert unit["queue_status"] == "QUEUED" and unit["client_upload_id"].endswith("~r1")
+    work = queue_row(journey, "DOCUMENT_INGEST", str(page["queue_id"]))
+    assert work["work_status"] == "PENDING" and "recover" not in work["payload"]
 
 
 def test_only_failed_pages_can_be_retried(journey):

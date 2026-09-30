@@ -571,9 +571,9 @@ def _resolve_prefix_except(connection: Connection, *, tenant_id: str, journey_id
 
 
 # A file still being worked on this long after upload gets a status task:
-# "check back after 1 hour". Pages in Document Intelligence's own retry ladder
-# (about 34 minutes) and Audit Core's (up to 95 minutes) are usually through
-# by then or about to be given up on.
+# "check back after 1 hour". A page is never failed for taking long (a burst
+# or a quota is waited out); after an hour the PC is simply told how far the
+# file is, and the task updates itself until the file is done.
 _UPLOAD_STATUS_AFTER_SECONDS = int(os.environ.get("P2_UPLOAD_STATUS_AFTER_SECONDS", str(60 * 60)))
 _SETTLED_PAGE_STATES = ("READY", "SUPPORTING", "NEEDS_REVIEW", "CANCELLED", "MERGED")
 _FAILED_PAGE_STATES = ("FAILED", "DEAD_LETTER")

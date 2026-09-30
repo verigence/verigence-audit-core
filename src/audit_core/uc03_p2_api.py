@@ -39,7 +39,7 @@ from audit_core.uc03_p2_access import (
 from audit_core.uc03_p2_controls import control_statistics
 from audit_core.uc03_p2_dates import parse_extracted_date
 from audit_core.uc03_p2_registry import get_registry
-from audit_core.uc03_p2_runtime import enqueue_work, requeue_page_for_ingest
+from audit_core.uc03_p2_runtime import enqueue_work, request_page_recovery
 from audit_core.uc03_p2_stage import (
     condition_reasons,
     read_booking_stage,
@@ -1476,7 +1476,8 @@ def retry_page(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
-    """Send a failed page to document intelligence again as a fresh document."""
+    """Recover a failed page: the worker copies what Document Intelligence
+    already holds for it, and sends it again only if DI gave it up."""
     _authorize(
         connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
         authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
@@ -1489,14 +1490,13 @@ def retry_page(
             status_code=409,
             detail="This page was rejected for scan quality; retrying will not help. Re-scan it and upload it again.",
         )
-    new_id = requeue_page_for_ingest(
+    request_page_recovery(
         connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id,
-        client_upload_id=str(unit["client_upload_id"]), marker="r", requested_by=human_principal.subject,
-        correlation_id=get_correlation_id(request),
+        marker="r", requested_by=human_principal.subject, correlation_id=get_correlation_id(request),
     )
     _activity(
         connection, tenant_id=tenant_id, journey_id=journey_id, event_type="PAGE_RETRY_REQUESTED",
-        subject_type="DOCUMENT_PAGE", subject_id=str(queue_id), details={"attempt": int(new_id.rsplit("~r", 1)[1])},
+        subject_type="DOCUMENT_PAGE", subject_id=str(queue_id), details={"by": human_principal.subject},
         correlation_id=get_correlation_id(request),
     )
     return {"queueId": str(queue_id), "status": "QUEUED"}
