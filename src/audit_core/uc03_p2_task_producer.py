@@ -984,11 +984,24 @@ def sync_name_consistency_tasks(
                            "referenceDocumentId": kyc["documentId"], "referenceTemplateKey": kyc_template.key},
             )
 
-    # -- the dealership, as the booking form names it
-    dealers = _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
-                               pairs=rules.dealer_name_checked)
-    anchor = next((d for d in reversed(dealers) if d["pair"].startswith("booking_form.")), None)
+    # -- the dealership. The booking form is the OEM's form and often names
+    # the OEM (Mahindra), not the dealership (Aditya Motors), so a document
+    # naming the OEM is not compared (2026-09-30). The reference is the
+    # booking form when it names a dealership, else the earliest dealer
+    # document; every other dealer document must name the same dealership.
+    oem = connection.execute(
+        text("SELECT o.oem_code, o.oem_name FROM auditcore.projects p JOIN auditcore.oems o ON o.oem_id=p.oem_id "
+             "WHERE p.tenant_id=:t LIMIT 1"),
+        {"t": tenant_id},
+    ).mappings().first()
+    oem_names = [n for n in ((oem or {}).get("oem_code"), (oem or {}).get("oem_name")) if n]
+    dealers = [
+        d for d in _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id, pairs=rules.dealer_name_checked)
+        if not any(same_organisation(d["name"], name) for name in oem_names)
+    ]
+    anchor = next((d for d in reversed(dealers) if d["pair"].startswith("booking_form.")), dealers[0] if dealers else None)
     if anchor is not None:
+        anchor_template = registry.template_for_di_type(anchor["diType"], stage=anchor["stage"])
         for document in dealers:
             if document["documentId"] == anchor["documentId"] or same_organisation(document["name"], anchor["name"]):
                 continue
@@ -998,12 +1011,12 @@ def sync_name_consistency_tasks(
                 title=f"Replace the {template.display_name}: it names another dealership",
                 description=(
                     f"The {template.display_name} names the dealership {display_name(document['name'])}, but the "
-                    f"Booking Docket names {display_name(anchor['name'])}. Wrong document uploaded: please delete "
-                    f"it and upload the {template.display_name} issued by this dealership. If the name was only "
-                    f"misread, correct it on the document instead."
+                    f"{anchor_template.display_name} names {display_name(anchor['name'])}. Wrong document uploaded: "
+                    f"please delete it and upload the {template.display_name} issued by this dealership. If the name "
+                    f"was only misread, correct it on the document instead."
                 ),
                 reference={"documentName": display_name(document["name"]), "dealerName": display_name(anchor["name"]),
-                           "referenceDocumentId": anchor["documentId"], "referenceTemplateKey": "booking_docket"},
+                           "referenceDocumentId": anchor["documentId"], "referenceTemplateKey": anchor_template.key},
             )
 
     closed = _resolve_prefix_except(

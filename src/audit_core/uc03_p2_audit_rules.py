@@ -242,12 +242,13 @@ class _Facts:
 
     @cached_property
     def trade_in(self) -> dict[str, Any] | None:
+        from audit_core.uc03_p2_stage import EXCHANGE_ON_FILE
+
+        # a row alone is not an exchange (see EXCHANGE_ON_FILE)
         rows = self._rows(
-            """
-            SELECT old_vehicle_registration, quoted_value, actual_value, handover_at_utc, resale_at_utc, details
-            FROM auditcore.trade_in_cases WHERE tenant_id=:t AND journey_id=:j
-            ORDER BY updated_at_utc DESC LIMIT 1
-            """
+            "SELECT old_vehicle_registration, quoted_value, actual_value, handover_at_utc, resale_at_utc, details "
+            "FROM auditcore.trade_in_cases WHERE tenant_id=:t AND journey_id=:j AND " + EXCHANGE_ON_FILE +
+            " ORDER BY updated_at_utc DESC LIMIT 1"
         )
         if rows:
             row = rows[0]
