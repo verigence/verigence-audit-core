@@ -7,6 +7,7 @@ import pytest
 from conftest import delete_tenant_data
 from fastapi.testclient import TestClient
 from p2_support import AllowAllAuthorization, create_p2_journey, database_engine
+from sqlalchemy import text
 
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_human_principal
@@ -87,6 +88,11 @@ def test_task_queue_tab_mapping():
     assert task_queue_tab("PC_DOCUMENT_REUPLOAD", "PC_DOCUMENT_REUPLOAD") == "DOCUMENTS"
     assert task_queue_tab("DELIVERY_VEHICLE_PHOTOS_MISSING", "EVIDENCE_GAP") == "DOCUMENTS"
     assert task_queue_tab("RULE_DISCREPANCY_REVIEW", "CROSS_DOCUMENT_REVIEW") == "OTHER"
+    # raised by hand by a TL / PMO (decision 2026-09-30)
+    assert task_queue_tab("TL_DOCUMENT_UPLOAD", "DOCUMENT_REUPLOAD") == "DOCUMENTS"
+    assert task_queue_tab("TL_MANUAL_VERIFICATION", "DOCUMENT_VERIFICATION") == "MANUAL_VERIFICATION"
+    assert task_queue_tab("TL_DATA_VIOLATION", "FINDING_REMEDIATION") == "OTHER"
+    assert task_queue_tab("TL_MANAGEMENT_REFERRAL", "PROCESS_CONFIRMATION") == "OTHER"
 
 
 def test_journey_list_shows_existing_journeys_with_dates(journey):
@@ -164,3 +170,45 @@ def test_acting_on_someone_elses_task_is_403_not_422(journey):
     body = response.json()
     assert body["errorCode"] == "VAC-AUTH-002" and body["errorCategory"] == "SECURITY"
     assert "assigned to a different actor" in body["detail"]
+
+
+def test_a_team_lead_raises_a_task_for_the_pc_and_both_queues_show_it(journey):
+    """Decision 2026-09-30: a Team Lead or PMO raises a Document Upload,
+    Manual Verification or Data Violation task on a journey for one of its
+    PCs. The template decides the tab and the actions; the task is on the
+    PC's queue as the assignee and stays on the requester's queue."""
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code, dealer_id) "
+                 "SELECT tenant_id, 'tl-9', 'TL', dealer_id FROM auditcore.journeys WHERE journey_id=:j"),
+            {"j": journey.journey_id},
+        )
+        connection.execute(
+            text("UPDATE auditcore.journeys SET created_by_actor_id=:a, created_by_display_name='Asha PC' WHERE journey_id=:j"),
+            {"a": journey.actor_id, "j": journey.journey_id},
+        )
+    body = {"taskType": "TL_DOCUMENT_UPLOAD", "category": "IGNORED", "title": "Upload a document",
+            "description": "Upload the signed Form 22 for this booking.", "severity": "HIGH", "priority": "HIGH",
+            "assignedRoleCode": "TL", "assignedActorId": journey.actor_id, "allowedActions": ["ACCEPT"]}
+    assert client.post(f"{base}/journeys/{journey.journey_id}/tasks", json=body).status_code == 403  # a PC
+
+    app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject="tl-9")
+    people = client.get(f"{base}/journeys/{journey.journey_id}/assignees").json()["items"]
+    assert people == [{"actorId": journey.actor_id, "displayName": "Asha PC", "roleCode": "PC", "journeyPc": True}]
+    refused = client.post(f"{base}/journeys/{journey.journey_id}/tasks", json={**body, "assignedActorId": "nobody"})
+    assert refused.status_code == 422 and "not a PC" in refused.json()["detail"]
+    raised = client.post(f"{base}/journeys/{journey.journey_id}/tasks", json=body)
+    assert raised.status_code == 200, raised.text
+    task_id = raised.json()["taskId"]
+    [row] = [i for i in client.get(f"{base}/tasks", params={"role": "TL"}).json()["items"] if i["task_id"] == task_id]
+    assert row["assigned_role_code"] == "PC" and row["assigned_actor_id"] == journey.actor_id
+    assert row["queue_tab"] == "DOCUMENTS" and row["category"] == "DOCUMENT_REUPLOAD"
+    assert row["allowed_actions"] == ["UPLOAD_DOCUMENT", "COMPLETE_ACTION", "ADD_COMMENT"]
+    assert row["raised_by_actor_id"] == "tl-9" and row["raised_by_role_code"] == "TL"
+
+    app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=journey.actor_id)
+    pc_queue = client.get(f"{base}/tasks", params={"role": "PC"}).json()
+    assert [i["task_id"] for i in pc_queue["items"]] == [task_id] and pc_queue["counts"]["DOCUMENTS"] == 1
