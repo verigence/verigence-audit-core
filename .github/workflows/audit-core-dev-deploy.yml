@@ -111,9 +111,26 @@ jobs:
             exit 1
           fi
           echo 'RAILWAY_ENVIRONMENT=dev'
-          railway status --json >/tmp/status.json
-          railway service list --json >/tmp/services.json
-          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          # The Railway API sometimes answers a --json read with an empty or
+          # HTML body ("error decoding response body"); seen twice in a row on
+          # 2026-09-30 with nothing wrong on our side. Ask again, up to six
+          # times twenty seconds apart, until the answer parses as JSON.
+          rail_json() {
+            local out="$1"; shift
+            local attempt
+            for attempt in $(seq 1 6); do
+              if railway "$@" --json >"$out" 2>/tmp/rail.err && python -c "import json,sys; json.load(open(sys.argv[1]))" "$out" 2>/dev/null; then
+                return 0
+              fi
+              echo "railway $* did not answer JSON (attempt $attempt): $(head -c 200 /tmp/rail.err 2>/dev/null)"
+              sleep 20
+            done
+            echo "::error::railway $* never answered JSON after 6 attempts."
+            return 1
+          }
+          rail_json /tmp/status.json status
+          rail_json /tmp/services.json service list
+          rail_json /tmp/audit-vars.json variable list --service "$AUDIT_SERVICE"
           python - <<'PY'
           import json, os
           from pathlib import Path
@@ -206,7 +223,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          for attempt in $(seq 1 6); do
+            if railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json 2>/dev/null \
+               && python -c "import json; json.load(open('/tmp/audit-vars.json'))" 2>/dev/null; then break; fi
+            echo "railway variable list did not answer JSON (attempt $attempt)"; sleep 20
+          done
           domain="$(python - <<'PY'
           import json
           from pathlib import Path
