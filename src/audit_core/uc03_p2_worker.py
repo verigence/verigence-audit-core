@@ -107,7 +107,11 @@ _PER_JOURNEY_CONCURRENCY = max(1, int(os.environ.get("P2_PER_JOURNEY_CONCURRENCY
 _LEASE_SECONDS = int(os.environ.get("P2_WORKER_LEASE_SECONDS", "600"))
 # A page that DI has not settled within this window is failed visibly (with a
 # Retry action in the UI) instead of being polled forever.
-_PAGE_DEADLINE_SECONDS = int(os.environ.get("P2_PAGE_DEADLINE_SECONDS", str(30 * 60)))
+# One hour: Document Intelligence spaces its own retries of a quota hit or
+# outage over about 34 minutes before it gives a page up, and the PC is told
+# to come back after an hour; giving up sooner here would fail a page DI
+# was still going to read.
+_PAGE_DEADLINE_SECONDS = int(os.environ.get("P2_PAGE_DEADLINE_SECONDS", str(60 * 60)))
 # DI reports PROCESSED before the document-link sync has copied facts into
 # Audit Core. Allow the sync this long before treating "no facts" as a result.
 _SYNC_GRACE_SECONDS = int(os.environ.get("P2_SYNC_GRACE_SECONDS", "180"))
@@ -1181,7 +1185,12 @@ def _reconcile_delay(oldest_submitted: datetime | None, now: datetime) -> int:
         return 2
     if age < 300:
         return 5
-    return 15
+    if age < 900:
+        return 15
+    # Past a quarter of an hour the page is in DI's own retry ladder; one
+    # look every half minute per journey is plenty and keeps a burst of
+    # uploads from turning into a burst of DI listing calls.
+    return 30
 
 
 # Pages that have not yet been classified by DI; grouping waits for them.
