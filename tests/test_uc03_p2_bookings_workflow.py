@@ -71,6 +71,10 @@ def test_documents_show_upload_counts_and_no_submit_step(journey):
     assert status["counts"]["notClassified"] == 1
     assert "submission" not in status
     assert client.post(f"{base}:submit").status_code in (404, 405)  # completion is rule driven
+    # 2026-09-30: the list says when the journey opened for the PC (the first
+    # upload) and names the outlet by its id, for the TL's columns.
+    [row] = client.get(f"/p2/v1/tenants/{journey.tenant_id}/journeys", params={"state": "open"}).json()["items"]
+    assert row["opened_at"] is not None and row["outlet_code"]
 
 
 def test_booking_completion_closes_the_existing_stage_and_lists_split(journey):

@@ -363,7 +363,7 @@ def list_p2_journeys(
                 SELECT j.tenant_id, j.journey_id, j.journey_reference, j.customer_id, j.dealer_id,
                        j.outlet_id, j.created_at_utc, j.updated_at_utc,
                        COALESCE(c.legal_name, c.display_name) AS customer_name, c.mobile_last4,
-                       d.dealer_name, o.outlet_name,
+                       d.dealer_name, o.outlet_name, o.outlet_code,
                        NULLIF(concat_ws(' · ',
                          NULLIF(jp.model_name_snapshot,''),
                          NULLIF(jp.variant_name_snapshot,''),
@@ -424,8 +424,8 @@ def list_p2_journeys(
                 LIMIT :limit
             )
             SELECT p.journey_id, p.journey_reference, p.customer_name, p.mobile_last4,
-                   p.dealer_name, p.outlet_name, p.vehicle, p.created_at_utc, p.updated_at_utc,
-                   p.pc_name, pv.price_variance, gp.gate_pass_date,
+                   p.dealer_name, p.outlet_name, p.outlet_code, p.vehicle, p.created_at_utc, p.updated_at_utc,
+                   p.pc_name, pv.price_variance, gp.gate_pass_date, op.opened_at,
                    COALESCE(pr.current_stage,
                      CASE
                        WHEN ds.business_completed_at_utc IS NOT NULL OR dl.actual_delivered_at IS NOT NULL
@@ -548,6 +548,15 @@ def list_p2_journeys(
                   AND da.actual_discount_amount IS NOT NULL AND da.standard_eligible_amount IS NOT NULL
               ), 0) AS price_variance
             ) pv ON true
+            LEFT JOIN LATERAL (
+              -- The journey opens for the PC with the first document uploaded
+              -- (a Phase 1 journey: the first evidence linked).
+              SELECT COALESCE(
+                (SELECT MIN(b.created_at_utc) FROM auditcore.p2_upload_batches b
+                  WHERE b.tenant_id=p.tenant_id AND b.journey_id=p.journey_id),
+                (SELECT MIN(e.linked_at_utc) FROM auditcore.evidence e
+                  WHERE e.tenant_id=p.tenant_id AND e.journey_id=p.journey_id)) AS opened_at
+            ) op ON true
             LEFT JOIN LATERAL (
               -- The delivery date is the one printed on the gate pass.
               SELECT f.effective_value AS gate_pass_date
