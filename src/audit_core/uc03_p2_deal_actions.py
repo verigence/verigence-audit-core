@@ -299,6 +299,71 @@ def set_pricing(
     return summary
 
 
+class InsuranceSourceCommand(BaseModel):
+    """Inhouse: insurance through the dealership, its premium part of the
+    deal. Self: the customer arranged it, the premium is not (decision
+    2026-09-30). Inhouse is the default."""
+
+    source: Literal["INHOUSE", "SELF"]
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+def set_insurance_source(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, source: str, actor_id: str,
+    reason: str | None, correlation_id: str | None, via: str,
+) -> None:
+    """Record the PC's Inhouse / Self confirmation and let the checks rerun."""
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.insurance_records (
+                tenant_id, journey_id, insurance_source, insurance_source_set_by_actor_id,
+                insurance_source_set_at_utc, source_kind
+            ) VALUES (:t, :j, :source, :actor, now(), 'OPERATIONAL_INPUT')
+            ON CONFLICT (tenant_id, journey_id) DO UPDATE
+               SET insurance_source=EXCLUDED.insurance_source,
+                   insurance_source_set_by_actor_id=EXCLUDED.insurance_source_set_by_actor_id,
+                   insurance_source_set_at_utc=now(),
+                   updated_at_utc=now(),
+                   version_no=auditcore.insurance_records.version_no+1
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "source": source, "actor": actor_id},
+    )
+    record_activity(
+        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="INSURANCE_SOURCE_SET",
+        subject_type="JOURNEY", subject_id=str(journey_id),
+        details={"source": source, "reason": reason or None, "via": via},
+        correlation_id=correlation_id,
+    )
+    note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id,
+                       reason="INSURANCE_SOURCE_SET", correlation_id=correlation_id)
+
+
+@router.put("/journeys/{journey_id}/insurance-source")
+def put_insurance_source(
+    tenant_id: str,
+    journey_id: UUID,
+    command: InsuranceSourceCommand,
+    request: Request,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    from audit_core.uc03_p2_journey360 import deal
+
+    _auth(connection, tenant_id, journey_id, human_principal, authorization_client, _UPDATE)
+    reason = (command.reason or "").strip()
+    if command.source == "SELF" and len(reason) < 5:
+        raise HTTPException(status_code=422, detail="Say briefly how you know the customer arranged their own insurance.")
+    set_insurance_source(
+        connection, tenant_id=tenant_id, journey_id=journey_id, source=command.source,
+        actor_id=human_principal.subject, reason=reason or None, correlation_id=get_correlation_id(request),
+        via="DEAL_TAB",
+    )
+    return deal(connection, tenant_id=tenant_id, journey_id=journey_id)["insurance"]
+
+
 @router.post("/journeys/{journey_id}:recheck", status_code=202)
 def recheck_journey(
     tenant_id: str,

@@ -389,6 +389,17 @@ def submit_action(
         return _apply_verdict(connection, tenant_id=tenant_id, task=task, action=action, actor_id=actor_id,
                               actor_role_code=actor_role_code, comment=comment, details=details)
 
+    if (action == "COMPLETE_ACTION" and str(task.get("dedupe_key") or "").endswith(":INSURANCE_INVOICE_MISSING")
+            and str((details or {}).get("answer") or "").upper() == "SELF"):
+        # The PC admits the customer arranged their own insurance: the deal
+        # drops the premium and the Team Lead gets the flag (its own check).
+        from audit_core.uc03_p2_deal_actions import set_insurance_source
+
+        set_insurance_source(
+            connection, tenant_id=tenant_id, journey_id=journey_id, source="SELF", actor_id=actor_id,
+            reason=(comment or "").strip() or None, correlation_id=None, via="TASK",
+        )
+
     if task["task_type"] == "DELIVERY_REVIEW" and action == "COMPLETE_ACTION":
         # The delivery is reviewed only once every violation has its verdict.
         open_findings = connection.execute(

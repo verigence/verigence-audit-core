@@ -92,3 +92,23 @@ def test_recheck_requests_reconcile_stage_and_checks(journey):
         ).scalar_one()
     assert stage_work == 1
     assert "NATIVE:BOOKING" in response.json()["checks"]
+
+
+def test_insurance_source_is_inhouse_until_the_pc_says_self(journey):
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}"
+    assert client.get(f"{base}/360/deal").json()["insurance"]["source"] == "INHOUSE"
+    refused = client.put(f"{base}/insurance-source", json={"source": "SELF"})
+    assert refused.status_code == 422 and "how you know" in refused.json()["detail"]
+    self_insured = client.put(f"{base}/insurance-source", json={"source": "SELF", "reason": "Own policy shown"})
+    assert self_insured.status_code == 200, self_insured.text
+    assert self_insured.json()["source"] == "SELF" and self_insured.json()["decidedBy"] == "PC"
+    assert client.put(f"{base}/insurance-source", json={"source": "INHOUSE"}).json()["source"] == "INHOUSE"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        events = connection.execute(
+            text("SELECT details->>'source' FROM auditcore.p2_activity_events WHERE tenant_id=:t AND journey_id=:j "
+                 "AND event_type='INSURANCE_SOURCE_SET' ORDER BY created_at_utc"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        ).scalars().all()
+    assert events == ["SELF", "INHOUSE"]

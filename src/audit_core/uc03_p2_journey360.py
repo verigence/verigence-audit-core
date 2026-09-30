@@ -558,6 +558,49 @@ def _net(gross: str | None, disc: str | None) -> str | None:
     return None if gross is None else str(Decimal(gross) - Decimal(disc or 0))
 
 
+# The lines a customer opts in or out of: every discount, the accessories
+# and the extended warranty (decision 2026-09-30). Insurance has its own
+# Inhouse / Self choice.
+_OPTED_COMPONENTS = frozenset({
+    "accessories_cost", "essential_kit_amount", "genuine_accessories_amount", "non_genuine_accessories_amount",
+    "additional_warranty_amount", "extended_warranty_amount",
+})
+_VEHICLE_INVOICE_TYPES = ("customer_invoice_dms", "tax_invoice_tally")
+
+
+def _opted(billed: Any, booking: Any, *, invoiced: bool) -> dict[str, Any]:
+    """Whether the customer took this line, read from the invoice once the
+    deal has one (a line the invoice does not carry is opted out), else
+    from the booking form."""
+    if invoiced:
+        value = _dec(billed)
+        return {"taken": value is not None and value > 0, "source": "invoice"}
+    value = _dec(booking)
+    if value is None:
+        return {"taken": False, "source": None}
+    return {"taken": value > 0, "source": "booking"}
+
+
+def resolve_insurance_source(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """Inhouse (through the dealership; the premium is part of the deal) or
+    Self (the customer arranged it; the premium is not). The PC's
+    confirmation decides; until then Inhouse is assumed. The cover-note
+    rule that reads it from the document slots in here."""
+    row = connection.execute(
+        text(
+            """
+            SELECT insurance_source, insurance_source_set_at_utc, insurance_source_set_by_actor_id
+            FROM auditcore.insurance_records WHERE tenant_id=:t AND journey_id=:j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().first()
+    if row and row["insurance_source"]:
+        return {"source": str(row["insurance_source"]), "decidedBy": "PC",
+                "decidedAt": row["insurance_source_set_at_utc"], "actorId": row["insurance_source_set_by_actor_id"]}
+    return {"source": "INHOUSE", "decidedBy": "DEFAULT", "decidedAt": None, "actorId": None}
+
+
 def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     params = {"t": tenant_id, "j": journey_id}
     lines = connection.execute(
@@ -637,6 +680,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         connection, tenant_id=tenant_id, journey_id=journey_id,
         di_types=tuple(dict.fromkeys(_INVOICE_TYPES + _ITEM_SOURCES + ("insurance_cover",) + tuple(_BOOKING_SOURCES))),
     )
+    invoice_documents = [d for d in documents if d["documentType"] in _INVOICE_TYPES]
+    invoiced_deal = bool(invoice_documents) or any(str(s["source_document_type"]) in _INVOICE_TYPES for s in sources)
     present = {(str(s["component_key"]), str(s["source_document_type"])) for s in sources}
     sources = list(sources) + [
         s for s in _document_billed(documents) if (s["component_key"], s["source_document_type"]) not in present
@@ -689,6 +734,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         categories[component_category(key)].append({
             "key": key,
             "label": component_label(key),
+            "opted": _opted(cols["billed"], cols["booking"], invoiced=invoiced_deal) if key in _OPTED_COMPONENTS else None,
             "standard": _money(standard),
             "booking": _money(cols["booking"]),
             "billed": _money(cols["billed"]),
@@ -738,6 +784,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         discount_rows.append({
             "key": key,
             "label": discount_label(key),
+            "opted": _opted(cols["billed"], cols["booking"], invoiced=invoiced_deal),
             "scheme": {
                 "code": row.get("scheme_code"),
                 "name": row.get("scheme_name"),
@@ -773,8 +820,23 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         row["current"] = next(
             (row[c] for c in ("billed", "booking", "effective") if row[c] is not None), None,
         )
+    # Insurance: Inhouse premium is part of the deal; Self (the customer
+    # arranged it) is shown but kept out of every total.
+    insurance = resolve_insurance_source(connection, tenant_id=tenant_id, journey_id=journey_id)
+    self_insured = insurance["source"] == "SELF"
+    for group in groups:
+        if group["code"] == "INSURANCE":
+            group["excluded"] = self_insured
+            for row in group["components"]:
+                row["excluded"] = self_insured
+    counted_rows = [r for r in all_rows if not r.get("excluded")]
+    insurance["invoiceOnFile"] = any(
+        s["line_kind"] == "COMMERCIAL" and s["component_key"] in _ADDON_COMPONENTS["insurance"]
+        and str(s["source_document_type"]) in _INVOICE_TYPES for s in sources
+    ) or bool(_line_items(invoice_documents, _LINE_CATEGORIES["insurance"]))
+    insurance["vehicleInvoiced"] = any(d["documentType"] in _VEHICLE_INVOICE_TYPES for d in documents)
     std_total, bk_total, cur_total, bl_total, lg_total = (
-        _column_total(all_rows, c) for c in ("standard", "booking", "current", "billed", "ledger")
+        _column_total(counted_rows, c) for c in ("standard", "booking", "current", "billed", "ledger")
     )
     d_std, d_bk, d_cur, d_bl = (_column_total(discount_rows, c) for c in ("entitled", "booking", "current", "billed"))
     net_std, net_bk, net_cur = _net(std_total, d_std), _net(bk_total, d_bk), _net(cur_total, d_cur)
@@ -782,7 +844,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     def matched(left: str, right: str) -> str | None:
         """Charges less discounts, compared only where both sides have a
         value, so a component missing on one side is never a variance."""
-        pairs = [(r[left], r[right]) for r in all_rows if r[left] is not None and r[right] is not None]
+        pairs = [(r[left], r[right]) for r in counted_rows if r[left] is not None and r[right] is not None]
         d_left = "entitled" if left == "standard" else left
         d_right = "entitled" if right == "standard" else right
         d_pairs = [(r[d_left], r[d_right]) for r in discount_rows
@@ -795,7 +857,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
 
     paid = _paid(connection, tenant_id=tenant_id, journey_id=journey_id)
     payable = net_cur or net_std
-    invoiced = sum(1 for r in all_rows if r["billed"] is not None)
+    invoiced = sum(1 for r in counted_rows if r["billed"] is not None)
     registry = get_registry()
     invoices = [
         {
@@ -821,6 +883,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         },
         "categories": groups,
         "discounts": discount_rows,
+        "insurance": insurance,
         # The invoices consolidated into this sheet, retail and tax alike.
         "invoices": invoices,
         "declared": [
@@ -840,12 +903,12 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
                 "billedVsBooking": matched("billed", "booking"),
             },
             "invoicedComponents": invoiced,
-            "components": len(all_rows),
+            "components": len(counted_rows),
             "paid": {"receipts": str(paid["receipts"]), "loan": str(paid["loan"]), "total": str(paid["total"])},
             "payable": payable,
             "balanceDue": _minus(payable, paid["total"]),
         },
-        "flagged": sum(1 for r in all_rows + discount_rows if r["flags"]),
+        "flagged": sum(1 for r in counted_rows + discount_rows if r["flags"]),
     }
 
 

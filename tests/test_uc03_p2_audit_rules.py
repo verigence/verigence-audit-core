@@ -534,3 +534,45 @@ def test_a_broken_rule_is_reported_and_the_other_rules_still_run(journey, monkey
     outcomes = _run(journey, "BOOKING")
     assert outcomes["BROKEN_RULE"].outcome == "ERROR"
     assert len(outcomes) == len(rules._BOOKING_RULES)  # every other rule produced its outcome
+
+
+# ------------------------------------------------------ insurance invoice
+
+
+def test_insurance_invoice_is_asked_for_once_the_vehicle_is_invoiced(journey):
+    """Decision 2026-09-30: an invoiced vehicle with no insurance invoice is
+    a HIGH task for the PC (upload it first; or admit self insurance)."""
+    assert _run(journey, "BOOKING")["INSURANCE_INVOICE_MISSING"].outcome == "PASS"
+    add_ready_document(journey, "tax_invoice_tally", invoice_number="INV-1")
+    _evaluate(journey, "NATIVE:BOOKING")
+    assert _states(journey)["INSURANCE_INVOICE_MISSING"]["control_status"] == "FAIL"
+    task = _task(journey, "INSURANCE_INVOICE_MISSING")
+    assert task["task_type"] == "PC_CONFIRMATION" and task["assigned_role_code"] == "PC"
+    assert task["reference"]["uploadFirst"] is True and task["reference"]["documentTypes"] == ["debit_note"]
+    assert [a["value"] for a in task["reference"]["answers"]] == ["SELF"]
+    priority = _sql(journey, "SELECT priority FROM auditcore.p2_tasks WHERE tenant_id=:t AND task_id=:k",
+                    k=task["task_id"]).scalar_one()
+    assert priority == "HIGH"
+    assert _states(journey)["SELF_INSURANCE_DECLARED"]["control_status"] == "PASS"
+
+    _source(journey, "COMMERCIAL", "insurance_amount", "debit_note", "40000")
+    _evaluate(journey, "NATIVE:BOOKING")
+    assert _states(journey)["INSURANCE_INVOICE_MISSING"]["control_status"] == "PASS"
+    assert _task(journey, "INSURANCE_INVOICE_MISSING")["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_self_insurance_admission_drops_the_premium_and_flags_the_team_lead(journey):
+    add_ready_document(journey, "tax_invoice_tally", invoice_number="INV-1")
+    _evaluate(journey, "NATIVE:BOOKING")
+    _answer(journey, "INSURANCE_INVOICE_MISSING", "SELF", "Customer brought their own policy")
+    _evaluate(journey, "NATIVE:BOOKING")
+    state = _states(journey)
+    assert state["INSURANCE_INVOICE_MISSING"]["control_status"] == "PASS"
+    assert "Self insurance (confirmed by the PC" in state["INSURANCE_INVOICE_MISSING"]["status_reason"]
+    assert state["SELF_INSURANCE_DECLARED"]["control_status"] == "FAIL"
+    flag = _task(journey, "SELF_INSURANCE_DECLARED")
+    assert flag["task_type"] == "FINDING_REVIEW" and flag["assigned_role_code"] == "TL"
+    assert _finding(journey, "SELF_INSURANCE_DECLARED")[:2] == ("OPEN", "MEDIUM")
+    source = _sql(journey, "SELECT insurance_source FROM auditcore.insurance_records WHERE tenant_id=:t AND journey_id=:j"
+                  ).scalar_one()
+    assert source == "SELF"

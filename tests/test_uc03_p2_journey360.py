@@ -440,3 +440,57 @@ def test_vehicle_section_carries_what_the_header_strip_used_to(journey):
     assert view["journey"]["financier"] == "HDFC Bank"
     assert view["journey"]["startedAtUtc"] is not None
     assert view["journey"]["registrationNumber"] is None and view["journey"]["insurer"] is None
+
+
+def test_opted_lines_read_the_invoice_once_one_exists_else_the_booking_form(journey):
+    """Decision 2026-09-30: the Deal tab shows what the customer opted for
+    on the discounts, accessories and extended warranty. Until an invoice
+    is read the booking form says; once one is, the invoice says and a
+    line it does not carry is opted out."""
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        _source(connection, journey, "COMMERCIAL", "essential_kit_amount", "booking_form", "15000")
+        _source(connection, journey, "COMMERCIAL", "additional_warranty_amount", "booking_form", "0")
+        _source(connection, journey, "DISCOUNT", "CASH_DISCOUNT", "booking_form", "20000")
+        view = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    rows = {r["key"]: r for g in view["categories"] for r in g["components"]}
+    assert rows["essential_kit_amount"]["opted"] == {"taken": True, "source": "booking"}
+    assert rows["additional_warranty_amount"]["opted"] == {"taken": False, "source": "booking"}
+    assert view["discounts"][0]["opted"] == {"taken": True, "source": "booking"}
+    assert view["insurance"] == {"source": "INHOUSE", "decidedBy": "DEFAULT", "decidedAt": None, "actorId": None,
+                                 "invoiceOnFile": False, "vehicleInvoiced": False}
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        _source(connection, journey, "COMMERCIAL", "ex_showroom_price", "tax_invoice_tally", "1005000")
+        _source(connection, journey, "COMMERCIAL", "additional_warranty_amount", "ew_invoice", "12000")
+        view = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    rows = {r["key"]: r for g in view["categories"] for r in g["components"]}
+    assert rows["ex_showroom_price"].get("opted") is None  # the vehicle price is never opted out
+    assert rows["essential_kit_amount"]["opted"] == {"taken": False, "source": "invoice"}
+    assert rows["additional_warranty_amount"]["opted"] == {"taken": True, "source": "invoice"}
+    assert view["discounts"][0]["opted"] == {"taken": False, "source": "invoice"}
+
+
+def test_self_insurance_keeps_the_premium_out_of_every_total(journey):
+    from audit_core.uc03_p2_deal_actions import set_insurance_source
+
+    _seed_deal(journey)
+    add_ready_document(journey, "tax_invoice_tally", invoice_number="INV-1")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        before = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        set_insurance_source(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id, source="SELF",
+                             actor_id=journey.actor_id, reason="Customer brought own policy", correlation_id="c",
+                             via="DEAL_TAB")
+        after = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert before["insurance"]["source"] == "INHOUSE" and before["insurance"]["vehicleInvoiced"] is True
+    assert before["insurance"]["invoiceOnFile"] is False  # the cover note is not an invoice
+    assert Decimal(before["summary"]["gross"]["booking"]) == 1055000 and before["summary"]["components"] == 3
+    assert after["insurance"]["source"] == "SELF" and after["insurance"]["decidedBy"] == "PC"
+    insurance = next(g for g in after["categories"] if g["code"] == "INSURANCE")
+    assert insurance["excluded"] is True and insurance["components"][0]["excluded"] is True
+    assert Decimal(insurance["components"][0]["billed"]) == 40000  # still shown
+    assert Decimal(after["summary"]["gross"]["booking"]) == 1015000 and after["summary"]["components"] == 2
+    assert Decimal(after["summary"]["net"]["current"]) == Decimal(before["summary"]["net"]["current"]) - 40000
+    assert Decimal(after["summary"]["payable"]) == Decimal(before["summary"]["payable"]) - 40000
