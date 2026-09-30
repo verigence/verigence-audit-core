@@ -10,7 +10,7 @@ import pytest
 from audit_core.uc03_p2_dates import date_floor_verdict, parse_extracted_date
 from audit_core.uc03_p2_registry import get_registry
 
-FLOOR = date(2026, 6, 1)
+FLOOR = date(2026, 7, 1)
 
 
 @pytest.mark.parametrize(
@@ -42,8 +42,8 @@ def test_parse_extracted_date(value, expected):
 
 def test_date_floor_verdict():
     assert date_floor_verdict("01/09/2026", FLOOR) is None
-    assert date_floor_verdict("2026-06-01", FLOOR) is None
-    assert date_floor_verdict("31/05/2026", FLOOR) == "DATE_BEFORE_FLOOR"
+    assert date_floor_verdict("2026-07-01", FLOOR) is None
+    assert date_floor_verdict("30/06/2026", FLOOR) == "DATE_BEFORE_FLOOR"
     assert date_floor_verdict("12/03/2019", FLOOR) == "DATE_BEFORE_FLOOR"
     assert date_floor_verdict("garbage", FLOOR) == "DATE_UNREADABLE"
     assert date_floor_verdict("", FLOOR) is None

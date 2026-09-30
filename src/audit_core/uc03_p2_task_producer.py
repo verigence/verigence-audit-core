@@ -447,7 +447,7 @@ def _field_with_confidence(field: dict[str, Any]) -> str:
 
 
 def _date_problem(field: dict[str, Any], floor: date | None) -> str:
-    """"Receipt date read as 12/03/2019, before June 2026": what the PC
+    """"Receipt date read as 12/03/2019, before July 2026": what the PC
     checks on the page and why it is almost certainly misread."""
     shown = format_value(field["fieldKey"], field.get("value"))
     if "DATE_UNREADABLE" in field.get("reasons", ()):
