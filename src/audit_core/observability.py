@@ -50,6 +50,13 @@ def add_timing(key: str, milliseconds: float | None = None, *, count_key: str | 
         timings[count_key] = timings.get(count_key, 0) + 1
 
 
+_PROBE_PATHS = ("/health", "/healthz", "/ready")
+
+
+def _is_probe(path: str) -> bool:
+    return any(path == probe or path.startswith(probe + "/") for probe in _PROBE_PATHS)
+
+
 def accepted_correlation_id(value: str | None) -> str:
     return value if value and _CORRELATION_ID.match(value) else str(uuid4())
 
@@ -137,6 +144,21 @@ def install_observability(app: FastAPI) -> None:
                     labels=labels,
                 )
                 route = getattr(request.scope.get("route"), "path", None) or request.url.path
+                # Exactly one timing line per request (decision 2026-09-30): the
+                # response time, where it went (database, outbound calls) and the
+                # business context, as http_request for a normal request,
+                # http_request_slow past the threshold, http_request_failed for
+                # an error. Health probes are left out.
+                if status_code < 400 and duration_ms <= _slow_request_threshold_ms() and not _is_probe(request.url.path):
+                    logger.info(
+                        "http_request",
+                        method=request.method,
+                        route=route,
+                        status_code=status_code,
+                        duration_ms=round(duration_ms, 2),
+                        **timings,
+                        **business_context,
+                    )
                 if status_code >= 400:
                     record_metric("audit_core.http.errors", labels=labels)
                     # One line per failed request: the error handler already logged api_error

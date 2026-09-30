@@ -38,15 +38,33 @@ def test_correlation_id_is_propagated_and_generated() -> None:
     assert generated.json()["correlationId"] == generated_id
 
 
-def test_success_request_does_not_create_application_log_noise() -> None:
-    client = TestClient(_app(), raise_server_exceptions=False)
+def test_every_request_logs_its_response_time_once(monkeypatch) -> None:
+    """Decision 2026-09-30: one timing line per request, with the response
+    time and where it went; health probes excluded."""
+    from audit_core.observability import add_timing
 
+    app = _app()
+
+    @app.get("/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/v1/tenants/{tenant_id}/things")
+    def things(tenant_id: str) -> dict[str, str]:
+        add_timing("db_ms", 4.0, count_key="db_queries")
+        return {"tenant": tenant_id}
+
+    client = TestClient(app, raise_server_exceptions=False)
     with capture_logs() as logs:
-        response = client.get("/ok", headers={CORRELATION_HEADER: "c-success"})
+        assert client.get("/health").status_code == 200
+        assert client.get("/v1/tenants/t-1/things", headers={CORRELATION_HEADER: "c-success"}).status_code == 200
 
-    assert response.status_code == 200
-    assert not any(event.get("event") == "http_request" for event in logs)
-    assert not any(event.get("event") == "http_request_failed" for event in logs)
+    lines = [event for event in logs if str(event.get("event", "")).startswith("http_request")]
+    assert len(lines) == 1
+    [line] = lines
+    assert line["event"] == "http_request" and line["route"] == "/v1/tenants/{tenant_id}/things"
+    assert line["status_code"] == 200 and line["duration_ms"] >= 0
+    assert (line["db_ms"], line["db_queries"], line["tenant_id"]) == (4.0, 1, "t-1")
 
 
 def test_request_and_error_logs_exclude_sensitive_payloads() -> None:

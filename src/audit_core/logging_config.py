@@ -177,24 +177,16 @@ class _OtelLogQueue:
         return event_dict
 
 
-_HEALTH_PATHS = ("/health", "/healthz", "/ready")
-
-
 class _AccessLogFields(logging.Filter):
-    """uvicorn access lines as fields (method, path without query string, status); health
-    probes dropped. The query string can carry identifiers or signatures."""
+    """uvicorn's own access lines are dropped: every request is logged once by the
+    observability middleware (http_request / http_request_slow / http_request_failed)
+    with its response time, route and where the time went. The access line carried
+    nothing more, and its query string can hold identifiers or signatures."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
-        if not isinstance(args, tuple) or len(args) < 5:
-            return True
-        _client, method, full_path, _http_version, status = args[:5]
-        path = str(full_path).split("?", 1)[0]
-        if path in _HEALTH_PATHS:
-            return False
-        record.msg, record.args = "http_access", ()
-        record.method, record.path, record.status_code = method, path, status
-        return True
+        # Anything that is not an access line (uvicorn's own notices) still passes.
+        return not isinstance(args, tuple) or len(args) < 5
 
 
 def _use_console(settings: Settings) -> bool:

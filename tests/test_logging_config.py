@@ -107,12 +107,13 @@ def test_outbound_calls_carry_the_correlation_id() -> None:
     assert seen[2].headers["X-Correlation-ID"] == "explicit"
 
 
-def test_uvicorn_access_lines_are_structured_without_query_or_health(json_stream: io.StringIO) -> None:
+def test_uvicorn_access_lines_are_dropped_in_favour_of_the_request_line(json_stream: io.StringIO) -> None:
+    """The middleware logs every request once with its response time
+    (http_request); uvicorn's access line would only repeat it."""
     access = logging.getLogger("uvicorn.access")
     access.info('%s - "%s %s HTTP/%s" %d', "1.2.3.4:5", "GET", "/health", "1.1", 200)
     access.info('%s - "%s %s HTTP/%s" %d', "1.2.3.4:5", "GET", "/v1/projects?token=abc", "1.1", 200)
-    [line] = _lines(json_stream)
-    assert (line["event"], line["method"], line["path"], line["status_code"]) == ("http_access", "GET", "/v1/projects", 200)
+    assert _lines(json_stream) == []
     assert "abc" not in json_stream.getvalue()
 
 
