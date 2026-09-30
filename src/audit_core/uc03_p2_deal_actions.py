@@ -290,6 +290,18 @@ def recheck_journey(
     every check now. Idempotent: repeated clicks coalesce in the queue."""
     _auth(connection, tenant_id, journey_id, human_principal, authorization_client, _UPDATE)
     correlation_id = get_correlation_id(request)
+    # A page shown as "nothing read" gets its values copied from DI once
+    # more (a read of what DI already holds, never a re-upload or re-read).
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue
+            SET queue_status='SYNCING_TO_AUDIT_CORE', status_reason=NULL, updated_at_utc=now()
+            WHERE tenant_id=:t AND journey_id=:j AND queue_status='NEEDS_REVIEW' AND di_document_id IS NOT NULL
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    )
     enqueue_work(
         connection, tenant_id=tenant_id, journey_id=journey_id, work_type="JOURNEY_RECONCILE",
         work_key=str(journey_id), payload={"reason": "MANUAL_RECHECK"}, correlation_id=correlation_id,
