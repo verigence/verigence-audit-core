@@ -234,6 +234,23 @@ def test_pan_father_name_fallback_never_overrides_an_explicit_relationship() -> 
     assert resolved["customer_relationship_name"]["value"] == "Husband Name"
 
 
+def test_an_empty_value_from_the_preferred_source_never_beats_a_filled_one() -> None:
+    """2026-09-30: the delivery invoice outranks the booking docket for the
+    vehicle, but its variant field read blank; the docket's "AX5 PET MT"
+    must be the journey's variant, not nothing."""
+    invoice = _row(field_key="vehicle_variant", value=None, document_type="customer_invoice_dms", stage="DELIVERY")
+    docket = _row(field_key="vehicle_variant", value="AX5 PET MT", document_type="booking_docket", stage="BOOKING")
+    blank = _row(field_key="vehicle_model", value="  ", document_type="customer_invoice_dms", stage="DELIVERY")
+    model = _row(field_key="vehicle_model", value="XUV 3XO", document_type="booking_docket", stage="BOOKING")
+    _, resolved = annotate_and_resolve_reviewed_fields([invoice, docket, blank, model])
+    assert resolved["variant"]["value"] == "AX5 PET MT" and resolved["variant"]["documentTypeKey"] == "booking_docket"
+    assert resolved["model"]["value"] == "XUV 3XO"
+    # both blank: the usual precedence still names a winner (nothing to show either way)
+    _, only_blank = annotate_and_resolve_reviewed_fields([invoice, _row(
+        field_key="vehicle_variant", value=None, document_type="booking_docket", stage="BOOKING")])
+    assert only_blank["variant"]["documentTypeKey"] == "customer_invoice_dms"
+
+
 def test_booking_is_current_source_when_delivery_has_no_same_semantic_fact() -> None:
     rows = [
         _row(
