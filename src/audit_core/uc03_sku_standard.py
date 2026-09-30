@@ -69,6 +69,7 @@ BENEFIT_LABELS: dict[str, str] = {
     "SCRAPPAGE_BONUS_COD": "Scrappage bonus (certificate of deposit)",
     "WELCOME_BONUS": "Loyalty / welcome bonus",
     "CORPORATE_PRIVILEGE": "Corporate privilege",
+    "MANAGEMENT_REFERRAL": "Management referral (MR)",
 }
 _EXCHANGE_CATEGORIES = ("EXCHANGE", "SCRAPPAGE", "WELCOME")
 ExchangeScenario = Literal["NONE", "EXCHANGE", "SCRAPPAGE_DEALER", "SCRAPPAGE_COD", "WELCOME"]

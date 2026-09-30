@@ -112,3 +112,20 @@ def test_insurance_source_is_inhouse_until_the_pc_says_self(journey):
             {"t": journey.tenant_id, "j": journey.journey_id},
         ).scalars().all()
     assert events == ["SELF", "INHOUSE"]
+
+
+def test_management_referral_is_the_team_leads_call(journey):
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}"
+    body = {"opted": True, "amount": "15000", "reason": "Referred by the dealer principal"}
+    assert client.put(f"{base}/management-referral", json=body).status_code == 403  # a PC
+    app.dependency_overrides[get_security_authorization_client] = lambda: AllowAllAuthorization(role_key="TL")
+    refused = client.put(f"{base}/management-referral", json={"opted": True, "reason": "Referred"})
+    assert refused.status_code == 422 and "amount" in refused.json()["detail"]
+    approved = client.put(f"{base}/management-referral", json=body)
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["opted"] is True and approved.json()["amount"] == "15000.00" and approved.json()["setByRole"] == "TL"
+    row = next(d for d in client.get(f"{base}/360/deal").json()["discounts"] if d["key"] == "MANAGEMENT_REFERRAL")
+    assert row["entitled"] == "15000.00" and row["opted"]["taken"] is True
+    out = client.put(f"{base}/management-referral", json={"opted": False, "reason": "Withdrawn after review"})
+    assert out.status_code == 200 and out.json()["opted"] is False and out.json()["amount"] is None

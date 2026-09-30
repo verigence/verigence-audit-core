@@ -449,7 +449,9 @@ def deal_undercharged(facts: _Facts) -> RuleOutcome:
 
 def excess_discount(facts: _Facts) -> RuleOutcome:
     code = "EXCESS_DISCOUNT"
-    rows = facts.sheet["discounts"]
+    # A line no document gives anything on (the Management Referral line
+    # is always on the sheet, opted out by default) is no discount yet.
+    rows = [r for r in facts.sheet["discounts"] if any(r[c] is not None for c in ("billed", "booking", "effective"))]
     if not rows:
         return RuleOutcome(code, "PASS", "No discount on this deal.")
     if not _standards_known(facts):

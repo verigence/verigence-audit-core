@@ -296,7 +296,8 @@ def test_discount_without_entitlement_is_an_over_grant(journey):
             {"t": journey.tenant_id, "j": journey.journey_id},
         )
         _source(connection, journey, "DISCOUNT", "CORPORATE_PRIVILEGE", "booking_form", "5000")
-        [row] = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)["discounts"]
+        row = next(d for d in deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)["discounts"]
+                   if d["key"] != "MANAGEMENT_REFERRAL")
     assert Decimal(row["entitled"]) == 0 and Decimal(row["variance"]) == 5000
     assert "OVER_ENTITLEMENT" in row["flags"]
 
@@ -496,3 +497,38 @@ def test_self_insurance_keeps_the_premium_out_of_every_total(journey):
     assert Decimal(after["summary"]["gross"]["booking"]) == 1015000 and after["summary"]["components"] == 2
     assert Decimal(after["summary"]["net"]["current"]) == Decimal(before["summary"]["net"]["current"]) - 40000
     assert Decimal(after["summary"]["payable"]) == Decimal(before["summary"]["payable"]) - 40000
+
+
+def test_management_referral_is_a_standard_line_opted_out_until_the_tl_opts_in(journey):
+    """Decision 2026-09-30: MR is in the standard, opted out by default, no
+    document carries it; a Team Lead opts the journey in with an amount."""
+    _seed_deal(journey)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        before = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        connection.execute(
+            text("""INSERT INTO auditcore.p2_management_referrals (tenant_id, journey_id, opted, amount, reason, set_by_role)
+                    VALUES (:t, :j, true, 12000, 'Dealer principal referral', 'TL')"""),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+        after = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    mr = next(d for d in before["discounts"] if d["key"] == "MANAGEMENT_REFERRAL")
+    assert mr["label"] == "Management referral (MR)" and mr["opted"] == {"taken": False, "source": "tl"}
+    assert Decimal(mr["entitled"]) == 0 and mr["billed"] is None and mr["variance"] is None and mr["management"]["opted"] is False
+    mr = next(d for d in after["discounts"] if d["key"] == "MANAGEMENT_REFERRAL")
+    assert mr["opted"] == {"taken": True, "source": "tl"} and mr["entitled"] == "12000.00"
+    assert mr["management"]["amount"] == "12000.00" and mr["management"]["setByRole"] == "TL"
+    assert Decimal(after["summary"]["discounts"]["standard"]) == Decimal(before["summary"]["discounts"]["standard"]) + 12000
+
+
+def test_a_document_reported_under_two_spellings_of_its_type_is_one_source(journey):
+    """2026-09-30: the insurance line listed "Booking Docket" twice, once per
+    spelling of the type. One document, one entry, the booking column once."""
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        _source(connection, journey, "COMMERCIAL", "insurance_amount", "booking_docket", "96082")
+        _source(connection, journey, "COMMERCIAL", "insurance_amount", "Booking Docket", "96082")
+        view = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    row = next(r for g in view["categories"] for r in g["components"] if r["key"] == "insurance_amount")
+    assert Decimal(row["booking"]) == 96082 and row["billed"] is None
+    assert [(s["document"], s["amount"]) for s in row["sources"]] == [("Booking Docket", "96082.00")]
