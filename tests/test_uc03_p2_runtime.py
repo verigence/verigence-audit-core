@@ -726,10 +726,18 @@ def test_recheck_copies_values_for_nothing_read_pages_without_re_uploading(journ
 
 
 def test_nightly_sweep_recopies_pages_the_old_timer_marked_nothing_read(journey):
+    """Task #48 (2026-09-30): the nightly copy safety net. A page DI read
+    but Audit Core holds no values for goes back for one copy: marked
+    "nothing read" by the old timer, or READY with its values gone. A page
+    the worker itself read as empty, and a READY page whose values are
+    held, are left alone."""
     _, legacy_q, _ = add_page(journey, page_number=1, status="NEEDS_REVIEW")
     _, truly_empty_q, _ = add_page(journey, page_number=2, status="NEEDS_REVIEW")
-    _set_page_age(journey, legacy_q, hours=25)
-    _set_page_age(journey, truly_empty_q, hours=25)
+    _, held_q, held_d = add_page(journey, page_number=3, status="READY")
+    _, lost_q, _ = add_page(journey, page_number=4, status="READY")
+    add_extracted_field(journey, di_document_id=held_d, field_key="customer_name", value="A", confidence=0.9)
+    for queue_id in (legacy_q, truly_empty_q, held_q, lost_q):
+        _set_page_age(journey, queue_id, hours=25)
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
@@ -739,4 +747,6 @@ def test_nightly_sweep_recopies_pages_the_old_timer_marked_nothing_read(journey)
         worker.queue_nightly_upload_sweep(connection, tenant_id=journey.tenant_id)
     assert _page_status(journey, legacy_q) == "SYNCING_TO_AUDIT_CORE"
     assert _page_status(journey, truly_empty_q) == "NEEDS_REVIEW"
+    assert _page_status(journey, lost_q) == "SYNCING_TO_AUDIT_CORE"
+    assert _page_status(journey, held_q) == "READY"
     assert queue_row(journey, "JOURNEY_RECONCILE", str(journey.journey_id))["work_status"] == "PENDING"

@@ -2279,19 +2279,28 @@ def queue_nightly_upload_sweep(connection, *, tenant_id: str, now: datetime | No
         ),
         {"t": tenant_id, "states": list(_PAGE_ACTIVE_STATES), "cutoff": cutoff},
     ).scalars().all()
-    # Pages the old timer-based path marked "nothing read" without the
-    # worker ever copying DI's result: put them back in line for one copy
-    # (a read of what DI already holds, not a re-upload). A page the worker
-    # itself read as empty carries _NOTHING_READ_REASON and is left alone.
+    # The copy safety net (2026-09-30): a page DI has read but Audit Core
+    # holds no values for is put back in line for one copy (a read of what
+    # DI already holds, not a re-upload): a page the old timer-based path
+    # marked "nothing read" without the worker ever copying DI's result, or
+    # a page once READY whose values are gone. A page the worker itself
+    # read as empty carries _NOTHING_READ_REASON and is left alone.
     recopy = connection.execute(
         text(
             """
-            UPDATE auditcore.p2_document_queue
+            UPDATE auditcore.p2_document_queue AS q
             SET queue_status='SYNCING_TO_AUDIT_CORE', status_reason=NULL, updated_at_utc=now()
-            WHERE tenant_id=:t AND queue_status='NEEDS_REVIEW' AND di_document_id IS NOT NULL
-              AND updated_at_utc < :cutoff
-              AND status_reason IS DISTINCT FROM :reason
-            RETURNING journey_id
+            WHERE q.tenant_id=:t AND q.di_document_id IS NOT NULL
+              AND q.updated_at_utc < :cutoff
+              AND (
+                (q.queue_status='NEEDS_REVIEW' AND q.status_reason IS DISTINCT FROM :reason)
+                OR (q.queue_status='READY' AND NOT EXISTS (
+                    SELECT 1 FROM auditcore.journey_document_extracted_fields AS f
+                    WHERE f.tenant_id=q.tenant_id AND f.journey_id=q.journey_id
+                      AND f.di_document_id=q.di_document_id
+                ))
+              )
+            RETURNING q.journey_id
             """
         ),
         {"t": tenant_id, "cutoff": cutoff, "reason": _NOTHING_READ_REASON},
