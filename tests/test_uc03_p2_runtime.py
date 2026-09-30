@@ -80,7 +80,9 @@ NOW = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
         ({"state": "DELETED"}, 0, 1, None, "CANCELLED"),
         ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, 0, 2, 1, "SYNCING_TO_AUDIT_CORE"),
         ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, 0, 20, 10, "NEEDS_REVIEW"),
-        ({"state": "CLASSIFIED", "processingStatus": "PROCESSING"}, 0, 45, None, "FAILED"),
+        ({"state": "CLASSIFIED", "processingStatus": "PROCESSING"}, 0, 45, None, "EXTRACTING"),
+        ({"state": "CLASSIFIED", "processingStatus": "PROCESSING"}, 0, 61, None, "FAILED"),
+        ({"state": "STORED"}, 0, 59, None, "CLASSIFYING"),  # inside DI's own retry ladder
         (None, 0, 1, None, "CLASSIFYING"),
         (None, 0, 10, None, "FAILED"),
     ],
