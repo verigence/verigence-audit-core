@@ -294,6 +294,14 @@ def _kyc_rank(item: dict[str, Any], semantic: str) -> int:
     return order.get(document_type, 99)
 
 
+def _has_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
 def _candidate_rank(item: dict[str, Any], semantic: str) -> tuple[Any, ...]:
     document_type = str(item.get("documentTypeKey") or "").strip().casefold()
     stage = str(item.get("stageCode") or "").strip().upper()
@@ -383,7 +391,15 @@ def annotate_and_resolve_reviewed_fields(
 
     resolved: dict[str, dict[str, Any]] = {}
     for semantic, candidates in candidates_by_semantic.items():
-        winner = min(candidates, key=lambda item: _candidate_rank(item, semantic))
+        # A source that outranks the others (the delivery invoice over the
+        # booking docket) but read nothing for this field must not win with
+        # an empty value: the Booking Docket's "AX5 PET MT" stayed off the
+        # journey because the invoice's blank variant outranked it, and the
+        # SKU was never identified (2026-09-30). A filled value from any
+        # eligible source beats an empty one; among filled values the
+        # precedence is unchanged.
+        filled = [item for item in candidates if _has_value(item.get("effectiveValue"))]
+        winner = min(filled or candidates, key=lambda item: _candidate_rank(item, semantic))
         reason = _precedence_reason(winner, candidates, semantic)
         winner["isPreferred"] = True
         winner["precedenceReason"] = reason
