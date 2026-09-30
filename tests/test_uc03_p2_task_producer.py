@@ -187,10 +187,10 @@ def test_a_date_before_the_floor_is_a_high_verification_whatever_its_confidence(
     assert task["title"] == "Check 1 date on Booking Payment Receipt"
     assert task["severity"] == "HIGH" and task["priority"] == "HIGH"
     assert task["assigned_role_code"] == "PC"
-    assert "Receipt date read as 12/03/2019, before June 2026" in task["description"]
+    assert "Receipt date read as 12/03/2019, before July 2026" in task["description"]
     (field,) = task["reference"]["fields"]
     assert field["fieldKey"] == "receipt_date" and field["reasons"] == ["DATE_BEFORE_FLOOR"]
-    assert task["reference"]["dateFloor"] == "2026-06-01"
+    assert task["reference"]["dateFloor"] == "2026-07-01"
 
     # the PC corrects the date on the document: the task closes itself
     with journey.engine.begin() as connection:

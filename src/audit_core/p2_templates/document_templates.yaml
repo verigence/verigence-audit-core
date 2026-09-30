@@ -25,7 +25,7 @@ source:
 # whatever its confidence. past_dates_expected lists the date fields that
 # legitimately lie in the past and are never held against the floor.
 extraction_rules:
-  date_floor: 2026-06-01
+  date_floor: 2026-07-01
   past_dates_expected:
   - date_of_birth
   - corporate_id.date_of_joining
