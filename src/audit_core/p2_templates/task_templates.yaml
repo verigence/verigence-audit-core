@@ -100,6 +100,19 @@ task_types:
     actions:
     - REUPLOAD_DOCUMENT
     - ADD_COMMENT
+  # One task per uploaded file that is taking long or lost pages: Info while
+  # the file is still being worked on an hour after upload ("check back after
+  # 1 hour"), High naming the pages to upload on their own once the retries
+  # are spent. It updates and closes itself.
+  PC_UPLOAD_STATUS:
+    category: DOCUMENT_EXCEPTION
+    owner: PC
+    origin: SYSTEM
+    source: DOCUMENT
+    completion: MACHINE_VERIFIED
+    actions:
+    - REUPLOAD_DOCUMENT
+    - ADD_COMMENT
   # A PC deleted a booking that a failed document upload left stuck: the
   # TL is told.
   JOURNEY_CANCELLED_NOTICE:

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -569,6 +570,21 @@ def _resolve_prefix_except(connection: Connection, *, tenant_id: str, journey_id
     return closed
 
 
+# A file still being worked on this long after upload gets a status task:
+# "check back after 1 hour". Pages in Document Intelligence's own retry ladder
+# (about 34 minutes) and Audit Core's (up to 95 minutes) are usually through
+# by then or about to be given up on.
+_UPLOAD_STATUS_AFTER_SECONDS = int(os.environ.get("P2_UPLOAD_STATUS_AFTER_SECONDS", str(60 * 60)))
+_SETTLED_PAGE_STATES = ("READY", "SUPPORTING", "NEEDS_REVIEW", "CANCELLED", "MERGED")
+_FAILED_PAGE_STATES = ("FAILED", "DEAD_LETTER")
+
+
+def _pages_text(pages: list[int]) -> str:
+    if len(pages) == 1:
+        return f"page {pages[0]}"
+    return "pages " + ", ".join(str(p) for p in pages[:-1]) + f" and {pages[-1]}"
+
+
 def sync_processing_failure_tasks(
     connection: Connection,
     *,
@@ -576,67 +592,107 @@ def sync_processing_failure_tasks(
     journey_id: UUID,
     registry: Registry | None = None,
     evaluation_started_at: datetime | None = None,
+    now: datetime | None = None,
 ) -> dict[str, int]:
-    """One High task (PC) per page, or whole upload, that is not getting
-    processed. While the page is being retried automatically the task tells
-    the PC to check back in an hour; once the retries are spent (or the
-    document service refused the page) the same task says which page to
-    upload on its own. It closes itself when the page is processed, or the
-    upload is removed."""
+    """One task (PC) per uploaded file that is not done, never one per page.
+
+    Info, an hour after upload, while pages are still being identified or
+    waiting for an automatic retry: how far the file is and "check back
+    after 1 hour". High once the retries are spent (or the document service
+    refused a page): which pages to upload on their own. The task refreshes
+    its counts as they change and closes itself when the file is done or
+    removed."""
     registry = registry or get_registry()
+    now = now or datetime.now(UTC)
     wanted: set[str] = set()
     counts: dict[str, int] = {}
-    failed = connection.execute(
+    batches = connection.execute(
         text(
             """
-            SELECT q.queue_id AS key, b.batch_id, b.original_filename,
-                   COALESCE(q.page_numbers, ARRAY[q.page_number]) AS page_numbers, q.status_reason,
-                   q.queue_status
-            FROM auditcore.p2_document_queue q
-            JOIN auditcore.p2_upload_batches b ON b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
-            WHERE q.tenant_id=:t AND q.journey_id=:j AND q.queue_status IN ('FAILED','DEAD_LETTER','RETRY_WAIT')
-            UNION ALL
-            SELECT b.batch_id AS key, b.batch_id, b.original_filename, NULL, NULL, 'FAILED'
+            SELECT b.batch_id, b.original_filename, b.page_count, b.batch_status, b.created_at_utc,
+                   COUNT(q.queue_id) FILTER (WHERE q.queue_status NOT IN ('CANCELLED','MERGED')) AS total,
+                   COUNT(q.queue_id) FILTER (WHERE q.queue_status IN ('READY','SUPPORTING','NEEDS_REVIEW')) AS done,
+                   COUNT(q.queue_id) FILTER (WHERE q.queue_status='RETRY_WAIT') AS retrying,
+                   COUNT(q.queue_id) FILTER (WHERE q.queue_status NOT IN
+                     ('READY','SUPPORTING','NEEDS_REVIEW','CANCELLED','MERGED','RETRY_WAIT','FAILED','DEAD_LETTER'))
+                     AS working,
+                   COALESCE(array_agg(DISTINCT p.page ORDER BY p.page)
+                            FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')), ARRAY[]::int[]) AS failed_pages,
+                   MIN(q.status_reason) FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')) AS failed_reason
             FROM auditcore.p2_upload_batches b
-            WHERE b.tenant_id=:t AND b.journey_id=:j AND b.batch_status='FAILED' AND b.page_count=0
-            ORDER BY 2
+            LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id=b.tenant_id AND q.batch_id=b.batch_id
+            LEFT JOIN LATERAL unnest(COALESCE(q.page_numbers, ARRAY[q.page_number])) AS p(page) ON true
+            WHERE b.tenant_id=:t AND b.journey_id=:j
+              AND b.batch_status NOT IN ('CANCELLED','COMPLETED')
+            GROUP BY b.batch_id, b.original_filename, b.page_count, b.batch_status, b.created_at_utc
+            ORDER BY b.created_at_utc
             """
         ),
         {"t": tenant_id, "j": journey_id},
     ).mappings().all()
-    for row in failed:
-        key = f"processing-failed:{journey_id}:{row['key']}"
-        wanted.add(key)
-        pages = list(row["page_numbers"] or [])
-        where = (f"Page {pages[0]}" if len(pages) == 1 else f"Pages {'-'.join(str(p) for p in pages)}"
-                 if pages else "The upload")
-        reason = row["status_reason"] or "The file could not be split into pages."
-        retrying = row["queue_status"] == "RETRY_WAIT"
-        if retrying:
-            title = f"{where} of {row['original_filename']} is being retried"
-            description = (f"{reason} Nothing to do yet: check back after 60 minutes. If it is still not "
-                           f"processed by then, this task will say so and ask you to upload "
-                           f"{where.lower()} on its own. It closes itself once the page is processed.")
+    for row in batches:
+        filename = row["original_filename"]
+        total, done = int(row["total"] or 0), int(row["done"] or 0)
+        retrying, working = int(row["retrying"] or 0), int(row["working"] or 0)
+        failed_pages = [int(p) for p in (row["failed_pages"] or [])]
+        split_failed = row["batch_status"] == "FAILED" and int(row["page_count"] or 0) == 0
+        in_progress = retrying + working > 0 or row["batch_status"] in ("AWAITING_UPLOAD", "UPLOADED", "SPLITTING")
+        age = (now - row["created_at_utc"]).total_seconds() if row["created_at_utc"] else 0.0
+        if split_failed or (failed_pages and not in_progress):
+            severity = "HIGH"
+            if split_failed:
+                title = f"{filename} could not be processed"
+                description = (f"{row['failed_reason'] or 'The file could not be split into pages.'} Upload the file "
+                               "again from Upload / Edit Documents, or delete this booking if nothing on it can be "
+                               "used. This task closes itself once the file is processed.")
+            else:
+                n = len(failed_pages)
+                title = f"{filename}: {n} page{'' if n == 1 else 's'} could not be processed"
+                reason = (row["failed_reason"] or "").strip()
+                description = ((f"{reason} " if reason else "")
+                               + f"Upload {_pages_text(failed_pages)} of {filename} on "
+                               f"{'its' if n == 1 else 'their'} own as {'a separate file' if n == 1 else 'separate files'} "
+                               "from Upload / Edit Documents (or retry each from its card). This task closes itself "
+                               "once the pages are processed; delete this booking if nothing on it can be used.")
+        elif in_progress and age >= _UPLOAD_STATUS_AFTER_SECONDS:
+            severity = "INFO"
+            title = f"{filename}: {done} of {total} pages read, still working"
+            parts = [f"{done} of {total} pages read"]
+            if working:
+                parts.append(f"{working} being identified or read")
+            if retrying:
+                parts.append(f"{retrying} waiting for an automatic retry")
+            if failed_pages:
+                parts.append(f"{_pages_text(failed_pages)} could not be processed so far")
+            description = (", ".join(parts) + ". Nothing to do yet: check back after 1 hour. This task updates "
+                           "itself, and closes when the file is done or tells you which pages to upload on "
+                           "their own if any cannot be processed.")
         else:
-            title = f"{where} of {row['original_filename']} could not be processed"
-            description = (f"{reason} Upload {where.lower()} on its own as a separate file from Upload / Edit "
-                           f"Documents (or retry the page from its card). This task closes itself once the "
-                           f"page is processed; delete this booking if nothing on it can be used.")
+            continue
+        key = f"upload-status:{journey_id}:{row['batch_id']}"
+        wanted.add(key)
         _, outcome = raise_or_refresh(
             connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
-            task_type="PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE", source_type="DOCUMENT",
-            source_code="DOCUMENT_PROCESSING_RETRYING" if retrying else "DOCUMENT_PROCESSING_FAILED",
+            task_type="PC_UPLOAD_STATUS", source_type="DOCUMENT",
+            source_code="DOCUMENT_PROCESSING_FAILED" if severity == "HIGH" else "DOCUMENT_PROCESSING_SLOW",
             title=title, description=description,
             reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT",
-                       "sourceCode": "DOCUMENT_PROCESSING_RETRYING" if retrying else "DOCUMENT_PROCESSING_FAILED",
-                       "batchId": str(row["batch_id"]), "queueId": str(row["key"]), "filename": row["original_filename"],
-                       "pageNumbers": pages, "retrying": retrying},
-            severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
+                       "sourceCode": "DOCUMENT_PROCESSING_FAILED" if severity == "HIGH" else "DOCUMENT_PROCESSING_SLOW",
+                       "batchId": str(row["batch_id"]), "filename": filename, "pageNumbers": failed_pages,
+                       "pages": {"total": total, "read": done, "working": working, "retrying": retrying,
+                                 "failed": len(failed_pages)},
+                       "retrying": severity != "HIGH"},
+            severity=severity, registry=registry, evaluation_started_at=evaluation_started_at,
         )
         counts[outcome] = counts.get(outcome, 0) + 1
     closed = _resolve_prefix_except(
+        connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"upload-status:{journey_id}:",
+        keep=wanted, evidence={"reason": "The file was processed or removed."},
+    )
+    # The per-page tasks this replaced (one per failed page) close too.
+    closed += _resolve_prefix_except(
         connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"processing-failed:{journey_id}:",
-        keep=wanted, evidence={"reason": "The page was processed or the upload removed."},
+        keep=set(), evidence={"reason": "Replaced by the file's own status task."},
     )
     if closed:
         counts["VERIFIED"] = counts.get("VERIFIED", 0) + closed

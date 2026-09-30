@@ -30,7 +30,7 @@ import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -71,6 +71,7 @@ from audit_core.uc03_p2_runtime import (
     fact_fingerprint,
     note_facts_changed,
     record_activity,
+    requeue_page_for_ingest,
 )
 from audit_core.uc03_p2_stage import recompute_journey_stage
 from audit_core.uc03_p2_storage import get_p2_document_storage
@@ -1345,6 +1346,11 @@ def _journey_reconcile(engine: Engine, work: WorkItem) -> None:
             # A page DI could not classify needs the PC now, not at the
             # next stage recompute (which a supporting page never triggers).
             sync_unclassified_page_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
+        if still_waiting:
+            # The file's status task ("check back after 1 hour") is raised
+            # and refreshed from here: this loop is what keeps ticking while
+            # pages wait on Document Intelligence.
+            sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
 
     if still_waiting:
         raise RescheduleWork(
@@ -2014,6 +2020,70 @@ def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
     return {**settled, "transitions": transitions}
 
 
+# A page still not settled this long after its last change is re-driven
+# once by the nightly sweep; after that only the PC's own Retry moves it.
+_NIGHTLY_SWEEP_AFTER_SECONDS = int(os.environ.get("P2_NIGHTLY_SWEEP_AFTER_SECONDS", str(24 * 60 * 60)))
+
+
+def queue_nightly_upload_sweep(connection, *, tenant_id: str, now: datetime | None = None) -> dict[str, int]:
+    """Every night, give every page that has been stuck for a day one more
+    go, then refresh the file's status task so the PC sees the morning
+    state: a failed page (other than a scan-quality rejection, which a
+    retry cannot fix) is sent to Document Intelligence again, once; a page
+    still in flight after a day is reconciled so it settles one way or the
+    other. Safe to call more than once."""
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(seconds=_NIGHTLY_SWEEP_AFTER_SECONDS)
+    failed = connection.execute(
+        text(
+            """
+            SELECT queue_id, journey_id, client_upload_id
+            FROM auditcore.p2_document_queue
+            WHERE tenant_id=:t AND queue_status IN ('FAILED','DEAD_LETTER')
+              AND updated_at_utc < :cutoff
+              AND COALESCE(last_error, '') NOT LIKE 'DI_QUALITY_%'
+              AND client_upload_id NOT LIKE '%~n%'
+            """
+        ),
+        {"t": tenant_id, "cutoff": cutoff},
+    ).mappings().all()
+    journeys: set[UUID] = set()
+    for row in failed:
+        journey_id = UUID(str(row["journey_id"]))
+        requeue_page_for_ingest(
+            connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=UUID(str(row["queue_id"])),
+            client_upload_id=str(row["client_upload_id"]), marker="n", requested_by="SYSTEM",
+            correlation_id=None,
+        )
+        record_activity(
+            connection, tenant_id=tenant_id, journey_id=journey_id, event_type="PAGE_RETRY_REQUESTED",
+            subject_type="DOCUMENT_PAGE", subject_id=str(row["queue_id"]), details={"by": "nightly sweep"},
+            correlation_id=None,
+        )
+        journeys.add(journey_id)
+    stuck = connection.execute(
+        text(
+            """
+            SELECT DISTINCT journey_id
+            FROM auditcore.p2_document_queue
+            WHERE tenant_id=:t AND queue_status = ANY(:states) AND updated_at_utc < :cutoff
+            """
+        ),
+        {"t": tenant_id, "states": list(_PAGE_ACTIVE_STATES), "cutoff": cutoff},
+    ).scalars().all()
+    for journey_id in stuck:
+        journey_id = UUID(str(journey_id))
+        enqueue_work(
+            connection, tenant_id=tenant_id, journey_id=journey_id, work_type="JOURNEY_RECONCILE",
+            work_key=str(journey_id), payload={"uploadedBy": "SYSTEM", "uploadedByRole": "PC"},
+            correlation_id=None,
+        )
+        journeys.add(journey_id)
+    for journey_id in journeys:
+        sync_processing_failure_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return {"retried": len(failed), "reconciled": len(stuck), "journeys": len(journeys)}
+
+
 def _stage_recompute(engine: Engine, work: WorkItem) -> None:
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
@@ -2247,8 +2317,9 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
         with engine.begin() as connection:
             set_tenant_context(connection, tenant_id)
             queued = queue_nightly_review(connection, tenant_id=tenant_id)
+            swept = queue_nightly_upload_sweep(connection, tenant_id=tenant_id)
         _last_nightly_review[tenant_id] = due
-        logger.info("p2_nightly_review_queued", tenant_id=tenant_id, night=due, journeys=queued)
+        logger.info("p2_nightly_review_queued", tenant_id=tenant_id, night=due, journeys=queued, **swept)
     except Exception:
         logger.warning("p2_nightly_review_failed", tenant_id=tenant_id, exc_info=True)
 

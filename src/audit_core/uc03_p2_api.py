@@ -39,7 +39,7 @@ from audit_core.uc03_p2_access import (
 from audit_core.uc03_p2_controls import control_statistics
 from audit_core.uc03_p2_dates import parse_extracted_date
 from audit_core.uc03_p2_registry import get_registry
-from audit_core.uc03_p2_runtime import enqueue_work
+from audit_core.uc03_p2_runtime import enqueue_work, requeue_page_for_ingest
 from audit_core.uc03_p2_stage import (
     condition_reasons,
     read_booking_stage,
@@ -1483,32 +1483,14 @@ def retry_page(
             status_code=409,
             detail="This page was rejected for scan quality; retrying will not help. Re-scan it and upload it again.",
         )
-    base = str(unit["client_upload_id"]).split("~r", 1)[0]
-    attempt = connection.execute(
-        text("SELECT COUNT(*) FROM auditcore.p2_document_queue WHERE tenant_id=:t AND client_upload_id LIKE :p"),
-        {"t": tenant_id, "p": f"{base}~r%"},
-    ).scalar_one()
-    connection.execute(
-        text(
-            """
-            UPDATE auditcore.p2_document_queue
-            SET queue_status='QUEUED', client_upload_id=:client_upload_id, di_document_id=NULL,
-                di_state=NULL, di_processing_status=NULL, di_submitted_at_utc=NULL,
-                di_processed_seen_at_utc=NULL, status_reason=NULL, last_error=NULL,
-                attempt_count=0, extracted_field_count=0, updated_at_utc=now()
-            WHERE tenant_id=:tenant_id AND queue_id=:queue_id
-            """
-        ),
-        {"tenant_id": tenant_id, "queue_id": queue_id, "client_upload_id": f"{base}~r{int(attempt) + 1}"},
-    )
-    enqueue_work(
-        connection, tenant_id=tenant_id, journey_id=journey_id, work_type="DOCUMENT_INGEST",
-        work_key=str(queue_id), payload={"queueId": str(queue_id), "uploadedBy": human_principal.subject},
+    new_id = requeue_page_for_ingest(
+        connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id,
+        client_upload_id=str(unit["client_upload_id"]), marker="r", requested_by=human_principal.subject,
         correlation_id=get_correlation_id(request),
     )
     _activity(
         connection, tenant_id=tenant_id, journey_id=journey_id, event_type="PAGE_RETRY_REQUESTED",
-        subject_type="DOCUMENT_PAGE", subject_id=str(queue_id), details={"attempt": int(attempt) + 1},
+        subject_type="DOCUMENT_PAGE", subject_id=str(queue_id), details={"attempt": int(new_id.rsplit("~r", 1)[1])},
         correlation_id=get_correlation_id(request),
     )
     return {"queueId": str(queue_id), "status": "QUEUED"}

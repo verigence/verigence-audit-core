@@ -24,6 +24,7 @@ from audit_core.uc03_p2_documents import (
     P2FieldCorrectionCommand,
     correct_p2_document_field,
 )
+from audit_core.uc03_p2_task_producer import sync_processing_failure_tasks
 from audit_core.uc03_p2_tasks import TaskStateError, create_p2_task, submit_action
 
 
@@ -143,7 +144,7 @@ def test_crash_looping_item_dead_letters(journey, monkeypatch):
 
 def test_failures_back_off_then_dead_letter_and_fail_the_page(journey, monkeypatch):
     monkeypatch.setattr(worker, "_MAX_ATTEMPTS", 2)
-    _, queue_id, _ = add_page(journey, status="DI_UPLOAD_PREPARING")
+    batch_id, queue_id, _ = add_page(journey, status="DI_UPLOAD_PREPARING")
     _enqueue(journey, work_type="DOCUMENT_INGEST", key=str(queue_id))
 
     [item] = worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)
@@ -161,17 +162,32 @@ def test_failures_back_off_then_dead_letter_and_fail_the_page(journey, monkeypat
     assert waiting["queue_status"] == "RETRY_WAIT"
     assert "Retrying automatically in 1 minute" in waiting["status_reason"]
     assert "check back later" in waiting["status_reason"]
-    # Issue 8 (2026-09-30): the PC is told at once, with "check back after 60 minutes".
+    # A first transient failure is not worth a task: the file is minutes old.
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
+        assert connection.execute(
+            text("SELECT COUNT(*) FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        ).scalar_one() == 0
+        # An hour on, still retrying: one Info task for the file, "check back after 1 hour".
+        connection.execute(
+            text("UPDATE auditcore.p2_upload_batches SET created_at_utc=now() - interval '61 minutes' "
+                 "WHERE tenant_id=:t AND batch_id=:b"),
+            {"t": journey.tenant_id, "b": batch_id},
+        )
+        assert sync_processing_failure_tasks(connection, tenant_id=journey.tenant_id,
+                                             journey_id=journey.journey_id) == {"RAISED": 1}
         task = connection.execute(
-            text("SELECT title, description, task_status, reference FROM auditcore.p2_tasks "
-                 "WHERE tenant_id=:t AND dedupe_key=:k"),
-            {"t": journey.tenant_id, "k": f"processing-failed:{journey.journey_id}:{queue_id}"},
+            text("SELECT task_type, severity, priority, title, description, task_status, reference "
+                 "FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k"),
+            {"t": journey.tenant_id, "k": f"upload-status:{journey.journey_id}:{batch_id}"},
         ).mappings().one()
-    assert task["task_status"] == "READY" and task["title"].endswith("is being retried")
-    assert "check back after 60 minutes" in task["description"]
-    assert task["reference"]["retrying"] is True and task["reference"]["pageNumbers"] == [1]
+    assert task["task_type"] == "PC_UPLOAD_STATUS" and task["severity"] == "INFO" and task["priority"] == "LOW"
+    assert task["task_status"] == "READY"
+    assert task["title"] == "scan.pdf: 0 of 1 pages read, still working"
+    assert "1 waiting for an automatic retry" in task["description"]
+    assert "check back after 1 hour" in task["description"]
+    assert task["reference"]["retrying"] is True and task["reference"]["pageNumbers"] == []
 
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
@@ -190,25 +206,23 @@ def test_failures_back_off_then_dead_letter_and_fail_the_page(journey, monkeypat
         ).mappings().one()
     assert page["queue_status"] == "FAILED" and "Retry" in page["status_reason"]
     assert "Not processed after 2 attempts" in page["status_reason"]
-    # ...and a task for the PC that carries the same reason.
+    # ...and the file's one task turns High and names the page to upload on its own.
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         task = connection.execute(
-            text("SELECT task_type, assigned_role_code, severity, title, task_status FROM auditcore.p2_tasks "
-                 "WHERE tenant_id=:t AND dedupe_key=:k"),
-            {"t": journey.tenant_id, "k": f"processing-failed:{journey.journey_id}:{queue_id}"},
+            text("SELECT task_type, assigned_role_code, severity, title, description, task_status, reference "
+                 "FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k"),
+            {"t": journey.tenant_id, "k": f"upload-status:{journey.journey_id}:{batch_id}"},
         ).mappings().one()
-    assert task["task_type"] == "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE" and task["assigned_role_code"] == "PC"
+        assert connection.execute(
+            text("SELECT COUNT(*) FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        ).scalar_one() == 1
+    assert task["task_type"] == "PC_UPLOAD_STATUS" and task["assigned_role_code"] == "PC"
     assert task["severity"] == "HIGH" and task["task_status"] == "READY"
-    # The same task (Issue 6): now it names the page to upload on its own.
-    assert task["title"] == "Page 1 of scan.pdf could not be processed"
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        description = connection.execute(
-            text("SELECT description FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k"),
-            {"t": journey.tenant_id, "k": f"processing-failed:{journey.journey_id}:{queue_id}"},
-        ).scalar_one()
-    assert "Upload page 1 on its own" in description
+    assert task["title"] == "scan.pdf: 1 page could not be processed"
+    assert "Upload page 1 of scan.pdf on its own" in task["description"]
+    assert task["reference"]["pageNumbers"] == [1] and task["reference"]["retrying"] is False
 
 
 def test_retries_are_staggered_over_an_hour():
@@ -241,7 +255,7 @@ def test_a_request_the_document_service_refuses_fails_at_once(journey, monkeypat
         ).mappings().one()
         tasks = connection.execute(
             text("SELECT COUNT(*) FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
-                 "AND task_type='PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE' AND task_status='READY'"),
+                 "AND task_type='PC_UPLOAD_STATUS' AND severity='HIGH' AND task_status='READY'"),
             {"t": journey.tenant_id, "j": journey.journey_id},
         ).scalar_one()
     assert page["queue_status"] == "FAILED"
@@ -500,3 +514,60 @@ def test_submitted_task_cannot_be_actioned_again_but_accepts_comments(journey):
     with pytest.raises(TaskStateError):
         act("REVIEW_DOCUMENT")
     assert act("ADD_COMMENT", "checked with dealer")["taskId"] == str(task_id)
+
+
+# ------------------------------------------------------------ nightly upload sweep
+
+def _set_page_age(journey, queue_id, *, hours: int) -> None:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_document_queue SET updated_at_utc=now() - (:h * interval '1 hour') "
+                 "WHERE tenant_id=:t AND queue_id=:q"),
+            {"t": journey.tenant_id, "q": queue_id, "h": hours},
+        )
+
+
+def test_nightly_sweep_re_drives_a_page_stuck_for_a_day_once(journey):
+    """Task #41 (2026-09-30): a page failed for a day is sent to DI again,
+    once; a page still in flight after a day is reconciled; a scan-quality
+    rejection is left alone (a retry cannot fix it); a page that failed
+    minutes ago waits for the normal retries."""
+    _, old_failed, _ = add_page(journey, page_number=1, status="FAILED")
+    _, fresh_failed, _ = add_page(journey, page_number=2, status="FAILED")
+    _, quality, _ = add_page(journey, page_number=3, status="FAILED")
+    _, stuck, _ = add_page(journey, page_number=4, status="CLASSIFYING")
+    _set_page_age(journey, old_failed, hours=25)
+    _set_page_age(journey, quality, hours=25)
+    _set_page_age(journey, stuck, hours=25)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_document_queue SET last_error='DI_QUALITY_BLUR' WHERE queue_id=:q"),
+            {"q": quality},
+        )
+        swept = worker.queue_nightly_upload_sweep(connection, tenant_id=journey.tenant_id)
+    assert swept == {"retried": 1, "reconciled": 1, "journeys": 1}
+    assert _page_status(journey, old_failed) == "QUEUED"
+    assert queue_row(journey, "DOCUMENT_INGEST", str(old_failed))["work_status"] == "PENDING"
+    assert _page_status(journey, fresh_failed) == "FAILED"
+    assert _page_status(journey, quality) == "FAILED"
+    assert queue_row(journey, "JOURNEY_RECONCILE", str(journey.journey_id))["work_status"] == "PENDING"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        upload_id = connection.execute(
+            text("SELECT client_upload_id FROM auditcore.p2_document_queue WHERE queue_id=:q"), {"q": old_failed},
+        ).scalar_one()
+    assert upload_id.endswith("~n1")
+
+    # The next night, the same page (failed again, a day old) is not re-driven a second time.
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_document_queue SET queue_status='FAILED', updated_at_utc=now() - interval '25 hours' "
+                 "WHERE queue_id=:q"),
+            {"q": old_failed},
+        )
+        swept = worker.queue_nightly_upload_sweep(connection, tenant_id=journey.tenant_id)
+    assert swept["retried"] == 0
+    assert _page_status(journey, old_failed) == "FAILED"
