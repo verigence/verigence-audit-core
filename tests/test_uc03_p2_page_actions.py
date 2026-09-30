@@ -154,15 +154,29 @@ def test_unclassified_page_can_be_kept_as_others_without_being_read(journey):
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         sync_unclassified_page_tasks(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    with journey.engine.begin() as connection, pytest.raises(HTTPException) as unnamed:
+        set_page_type(tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=page["queue_id"],
+                      command=SetPageTypeCommand(templateKey="supporting_document"), request=_request(),
+                      human_principal=principal(journey), authorization_client=AllowAllAuthorization(),
+                      connection=connection)
+    assert unnamed.value.status_code == 422  # Others needs a name (2026-09-30)
     with journey.engine.begin() as connection:
         result = set_page_type(tenant_id=journey.tenant_id, journey_id=journey.journey_id,
-                               queue_id=page["queue_id"], command=SetPageTypeCommand(templateKey="supporting_document"),
+                               queue_id=page["queue_id"],
+                               command=SetPageTypeCommand(templateKey="supporting_document", name="  Employer  letter "),
                                request=_request(), human_principal=principal(journey),
                                authorization_client=AllowAllAuthorization(), connection=connection)
-    assert result == {"queueId": str(page["queue_id"]), "status": "SUPPORTING", "templateKey": "supporting_document"}
+    assert result == {"queueId": str(page["queue_id"]), "status": "SUPPORTING", "templateKey": "supporting_document",
+                      "displayName": "Employer letter"}
     unit = _unit(journey, page["queue_id"])
     assert unit["queue_status"] == "SUPPORTING" and unit["template_key"] == "supporting_document"
-    assert unit["type_overridden_by_actor_id"] == journey.actor_id
+    assert unit["type_overridden_by_actor_id"] == journey.actor_id and unit["display_name"] == "Employer letter"
+    from audit_core.uc03_p2_journey360 import documents as journey_documents
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        listed = journey_documents(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    [other] = [d for d in listed["documents"] if d["queueId"] == str(page["queue_id"])]
+    assert other["label"] == "Employer letter" and other["fieldCount"] == 0
     assert queue_row(journey, "DOCUMENT_INGEST", str(page["queue_id"])) is None
     [task] = _open_unclassified_tasks(journey)
     assert task["task_status"] == "VERIFIED_COMPLETE"
@@ -172,7 +186,7 @@ def test_others_is_only_for_a_page_that_could_not_be_classified(journey):
     _, [page] = add_batch_pages(journey, [("pan_card", "READY")], grouping_status="NOT_NEEDED")
     with journey.engine.begin() as connection, pytest.raises(HTTPException) as raised:
         set_page_type(tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=page["queue_id"],
-                      command=SetPageTypeCommand(templateKey="supporting_document"), request=_request(),
+                      command=SetPageTypeCommand(templateKey="supporting_document", name="Letter"), request=_request(),
                       human_principal=principal(journey), authorization_client=AllowAllAuthorization(),
                       connection=connection)
     assert raised.value.status_code == 409

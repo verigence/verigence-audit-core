@@ -1306,7 +1306,7 @@ def list_documents(
                    di_document_id, classified_document_type, business_stage,
                    queue_status, status_reason, template_key, attempt_count,
                    extracted_field_count, last_error, created_at_utc, updated_at_utc,
-                   unit_kind, page_numbers, merged_into_queue_id, group_source,
+                   unit_kind, page_numbers, merged_into_queue_id, group_source, display_name,
                    (type_overridden_by_actor_id IS NOT NULL) AS type_set_by_pc
             FROM auditcore.p2_document_queue
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
@@ -1332,7 +1332,8 @@ def list_documents(
         item["groupSource"] = item.pop("group_source")
         item["typeSetByPc"] = bool(item.pop("type_set_by_pc"))
         item["templateKey"] = template.key if template else None
-        item["displayName"] = template.display_name if template else None
+        # A page kept as Others is shown under the name the PC gave it.
+        item["displayName"] = item.pop("display_name") or (template.display_name if template else None)
         item["requirement"] = template.requirement if template else None
         batch_key = str(item.pop("batch_id"))
         item["queueId"] = str(item.pop("queue_id"))
@@ -1504,6 +1505,8 @@ def retry_page(
 
 class SetPageTypeCommand(BaseModel):
     templateKey: str = Field(min_length=1, max_length=120)
+    # The name a page kept as Others is shown under (required for Others).
+    name: str | None = Field(default=None, max_length=120)
 
 
 @router.post("/journeys/{journey_id}/pages/{queue_id}:set-type", status_code=202)
@@ -1539,26 +1542,32 @@ def set_page_type(
             raise HTTPException(
                 status_code=409, detail="Only a page that could not be classified can be kept as Others.",
             )
+        # The PC names it (decision 2026-09-30): the card and Journey 360
+        # show the page under that name.
+        name = " ".join((command.name or "").split())
+        if len(name) < 2:
+            raise HTTPException(status_code=422, detail="Give the document a name, so it can be told apart on file.")
         connection.execute(
             text(
                 """
                 UPDATE auditcore.p2_document_queue
-                SET template_key=:template_key, type_overridden_by_actor_id=:actor,
+                SET template_key=:template_key, type_overridden_by_actor_id=:actor, display_name=:name,
                     status_reason=:reason, updated_at_utc=now()
                 WHERE tenant_id=:tenant_id AND queue_id=:queue_id
                 """
             ),
             {"tenant_id": tenant_id, "queue_id": queue_id, "template_key": template.key,
-             "actor": human_principal.subject,
-             "reason": f"Kept as Others by {access.operating_role or 'PC'}: on file, not read."},
+             "actor": human_principal.subject, "name": name,
+             "reason": f"Kept as Others ({name}) by {access.operating_role or 'PC'}: on file, not read."},
         )
         sync_unclassified_page_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
         _activity(
             connection, tenant_id=tenant_id, journey_id=journey_id, event_type="PAGE_KEPT_AS_OTHER",
-            subject_type="DOCUMENT_PAGE", subject_id=str(queue_id), details={"templateKey": template.key},
+            subject_type="DOCUMENT_PAGE", subject_id=str(queue_id),
+            details={"templateKey": template.key, "name": name},
             correlation_id=get_correlation_id(request),
         )
-        return {"queueId": str(queue_id), "status": "SUPPORTING", "templateKey": template.key}
+        return {"queueId": str(queue_id), "status": "SUPPORTING", "templateKey": template.key, "displayName": name}
     pages = list(unit["page_numbers"] or [unit["page_number"]])
     client_upload_id = f"p2t-{unit['batch_id']}-{'-'.join(map(str, pages))}-{template.key}-{queue_id.hex[:8]}"
     new_id = uuid4()

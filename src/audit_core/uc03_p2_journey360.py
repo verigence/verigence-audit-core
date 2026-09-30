@@ -918,10 +918,11 @@ def documents(connection: Connection, *, tenant_id: str, journey_id: UUID) -> di
         text(
             """
             SELECT e.evidence_id, e.di_document_id, e.document_type_key, e.process_area, e.linked_at_utc,
-                   q.queue_id, q.template_key, q.page_numbers, q.page_number
+                   q.queue_id, q.template_key, q.page_numbers, q.page_number, q.display_name
             FROM auditcore.evidence e
             LEFT JOIN LATERAL (
-              SELECT queue_id, template_key, page_numbers, page_number FROM auditcore.p2_document_queue q
+              SELECT queue_id, template_key, page_numbers, page_number, display_name
+              FROM auditcore.p2_document_queue q
               WHERE q.tenant_id=e.tenant_id AND q.journey_id=e.journey_id AND q.di_document_id=e.di_document_id
                 AND q.retired_at_utc IS NULL
               ORDER BY q.updated_at_utc DESC LIMIT 1
@@ -982,8 +983,8 @@ def documents(connection: Connection, *, tenant_id: str, journey_id: UUID) -> di
             "queueId": str(e["queue_id"]) if e["queue_id"] else None,
             "documentType": e["document_type_key"],
             "templateKey": template.key,
-            "label": template.display_name if template.key != "supporting_document"
-            else _document_label(e["document_type_key"]),
+            "label": e["display_name"] or (template.display_name if template.key != "supporting_document"
+                                           else _document_label(e["document_type_key"])),
             "stage": template.stage,
             "pages": list(e["page_numbers"] or ([e["page_number"]] if e["page_number"] else [])),
             "linkedAtUtc": e["linked_at_utc"],
@@ -991,6 +992,41 @@ def documents(connection: Connection, *, tenant_id: str, journey_id: UUID) -> di
             "fieldCount": len(rows),
             "needsReview": sum(1 for r in rows if r["needsReview"]),
             "corrected": sum(1 for r in rows if r["corrected"]),
+        })
+    # Pages the PC kept as Others (decision 2026-09-30): on file under the
+    # name the PC gave them, never read, so no evidence row and no values.
+    listed = {d["documentId"] for d in out}
+    others = connection.execute(
+        text(
+            """
+            SELECT queue_id, di_document_id, display_name, business_stage, page_numbers, page_number, updated_at_utc
+            FROM auditcore.p2_document_queue
+            WHERE tenant_id=:t AND journey_id=:j AND queue_status='SUPPORTING'
+              AND type_overridden_by_actor_id IS NOT NULL AND display_name IS NOT NULL
+              AND retired_at_utc IS NULL
+            ORDER BY updated_at_utc
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()
+    for o in others:
+        document_id = str(o["di_document_id"]) if o["di_document_id"] else f"page:{o['queue_id']}"
+        if document_id in listed:
+            continue
+        out.append({
+            "documentId": document_id,
+            "evidenceId": None,
+            "queueId": str(o["queue_id"]),
+            "documentType": None,
+            "templateKey": "supporting_document",
+            "label": o["display_name"],
+            "stage": o["business_stage"] or "BOOKING",
+            "pages": list(o["page_numbers"] or ([o["page_number"]] if o["page_number"] else [])),
+            "linkedAtUtc": o["updated_at_utc"],
+            "fields": [],
+            "fieldCount": 0,
+            "needsReview": 0,
+            "corrected": 0,
         })
     return {"documents": out}
 
