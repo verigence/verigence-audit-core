@@ -176,7 +176,8 @@ def add_extracted_field(
                     confidence_score, confidence_scale
                 ) VALUES (
                     :t, :j, :d, 1, :f, 'BOOKING', :cf, :dt,
-                    CAST(:v AS jsonb), CAST(:v AS jsonb), :c, 'PERCENT'
+                    CAST(:v AS jsonb), CAST(:v AS jsonb), :c,
+                    CASE WHEN CAST(:c AS numeric) IS NULL THEN NULL ELSE 'PERCENT' END
                 )
                 """
             ),

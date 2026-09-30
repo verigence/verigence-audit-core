@@ -100,6 +100,34 @@ def test_no_price_data_returns_empty() -> None:
     assert matched == [rows[0]] or matched == []  # model matched but nothing to disambiguate
 
 
+def test_match_without_any_price_narrows_by_variant_then_colour() -> None:
+    """Live case: a Booking Docket read "Thar Roxx / AX7L D(MT) / Stealth
+    Black" at 92% but left the total price blank. The SKU must still pin
+    from the variant and colour, not stay open across every Thar Roxx row."""
+    rows = [
+        _row("A", "THAR ROXX", variant="AX7L D (MT)", colour="Stealth Black"),
+        _row("B", "THAR ROXX", variant="AX7L D (MT)", colour="Everest White"),
+        _row("C", "THAR ROXX", variant="MX5 D (MT)", colour="Stealth Black"),
+    ]
+    matched, stage = mr._match(
+        rows, _inputs(model="Thar Roxx", variant="AX7L D(MT)", colour="Stealth Black")
+    )
+    assert stage == "VARIANT_COLOUR"
+    assert [r["sku_code"] for r in matched] == ["A"]
+
+
+def test_match_with_a_price_that_agrees_with_nothing_still_narrows_by_variant() -> None:
+    rows = [
+        _row("A", "THAR ROXX", variant="AX7L", colour="Black", total="1000000"),
+        _row("B", "THAR ROXX", variant="MX5", colour="Black", total="900000"),
+    ]
+    matched, stage = mr._match(
+        rows, _inputs(model="Thar Roxx", variant="AX7L", colour="Black", total="1234567")
+    )
+    assert stage == "VARIANT_COLOUR"
+    assert [r["sku_code"] for r in matched] == ["A"]
+
+
 # ── unit: _price_disambiguate's tolerance (real live case) ──────────────────
 def test_price_disambiguate_resolves_a_hairline_rounding_gap() -> None:
     """Reproduces a live case verbatim: 'Scorpio Classic' / 'S MT 7S' already

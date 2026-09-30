@@ -390,3 +390,53 @@ def test_one_certificate_however_many_times_it_was_read(journey):
     assert set(merged["documentIds"]) == {str(full), str(partial)}
     assert merged["certificateNumber"] == "COD2026091HR26AW8810" and merged["oldVehicleModel"] == "SANTRO"
     assert merged["stateOfScrapping"] == "Haryana"  # from the partial reading
+
+
+def test_documents_never_ask_to_verify_an_empty_field(journey):
+    """Reported live (2026-09-30): the Documents tab said "To verify" on every
+    field the extractor left blank (Booking date, Total price, ...). Only a
+    value that was read, below the 90% bar, needs a look -- the same rule the
+    review tasks apply (uc03_p2_stage.unreviewed_fields)."""
+    from p2_support import add_evidence, add_extracted_field
+
+    from audit_core.uc03_p2_journey360 import documents
+
+    document_id = uuid4()
+    add_evidence(journey, di_document_id=document_id, document_type_key="pan_card")
+    add_extracted_field(journey, di_document_id=document_id, field_key="pan_number", value="ABCDE1234F",
+                        confidence=92.0, document_type="pan_card")
+    add_extracted_field(journey, di_document_id=document_id, field_key="pan_name", value="Sujata",
+                        confidence=60.0, document_type="pan_card")
+    add_extracted_field(journey, di_document_id=document_id, field_key="date_of_birth", value=None,
+                        confidence=None, document_type="pan_card")
+    add_extracted_field(journey, di_document_id=document_id, field_key="father_name", value="",
+                        confidence=None, document_type="pan_card")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        view = documents(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+    [document] = view["documents"]
+    by_key = {f["key"]: f for f in document["fields"]}
+    assert by_key["pan_number"]["needsReview"] is False
+    assert by_key["pan_name"]["needsReview"] is True
+    assert by_key["date_of_birth"]["needsReview"] is False
+    assert by_key["father_name"]["needsReview"] is False
+    assert document["needsReview"] == 1
+
+
+def test_vehicle_section_carries_what_the_header_strip_used_to(journey):
+    """Issue 10 (2026-09-30): the Journey 360 header strip was removed as a
+    duplicate; registration, financier, insurer and the start date now live
+    on the Vehicle tab."""
+    from audit_core.uc03_p2_journey360 import vehicle
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.finance_records (tenant_id, journey_id, provider_name) VALUES (:t, :j, 'HDFC Bank')"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+        view = vehicle(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert view["journey"]["financier"] == "HDFC Bank"
+    assert view["journey"]["startedAtUtc"] is not None
+    assert view["journey"]["registrationNumber"] is None and view["journey"]["insurer"] is None
