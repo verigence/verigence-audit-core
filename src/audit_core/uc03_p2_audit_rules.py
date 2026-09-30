@@ -963,12 +963,57 @@ def accessory_fitted_unbilled(facts: _Facts) -> RuleOutcome:
 
 # ------------------------------------------------------------------ runner
 
+# ------------------------------------------------------ insurance source
+
+
+def _insurance_decided(insurance: dict[str, Any]) -> str:
+    if insurance.get("decidedBy") == "PC":
+        return f"confirmed by the PC on {_when(insurance.get('decidedAt'))}"
+    return "assumed until confirmed"
+
+
+def insurance_invoice_missing(facts: _Facts) -> RuleOutcome:
+    """The vehicle is invoiced but nothing bills the insurance premium: the
+    PC uploads the insurance invoice, or admits the customer arranged their
+    own insurance (which keeps the premium out of the deal and flags the
+    Team Lead). Decision 2026-09-30; the cover-note reading follows."""
+    code = "INSURANCE_INVOICE_MISSING"
+    insurance = facts.sheet["insurance"]
+    if insurance["source"] == "SELF":
+        return RuleOutcome(code, "PASS", f"Self insurance ({_insurance_decided(insurance)}): no dealer insurance invoice is due.")
+    if insurance["invoiceOnFile"]:
+        return RuleOutcome(code, "PASS", "The insurance premium is invoiced.")
+    if not insurance["vehicleInvoiced"]:
+        return RuleOutcome(code, "PASS", "The vehicle is not invoiced yet; the insurance invoice is due with it.")
+    return RuleOutcome(code, "FAIL", (
+        "The vehicle is invoiced but no invoice for the insurance premium is on file. Upload the insurance "
+        "invoice (debit note), or confirm that the customer arranged their own insurance."
+    ), {
+        "findingTitle": "Insurance invoice missing",
+        "question": "Is the insurance through the dealership? Upload its invoice; if the customer arranged their own, say so.",
+        "answers": [{"value": "SELF", "label": "Self insurance: the customer arranged it", "requiresComment": True}],
+        "uploadFirst": True, "documentTypes": ["debit_note"],
+    })
+
+
+def self_insurance_declared(facts: _Facts) -> RuleOutcome:
+    code = "SELF_INSURANCE_DECLARED"
+    insurance = facts.sheet["insurance"]
+    if insurance["source"] == "SELF":
+        return RuleOutcome(code, "FAIL", (
+            f"The customer arranged their own insurance ({_insurance_decided(insurance)}); "
+            "the premium is outside the dealer's deal."
+        ), {"findingTitle": "Customer arranged own insurance"})
+    return RuleOutcome(code, "PASS", "Insurance is through the dealership.")
+
+
 # Journey-wide checks run with the Booking unit (always evaluated); checks
 # that need a delivery run with the Delivery unit.
 _BOOKING_RULES = (
     deal_undercharged, excess_discount, tcs_short,
     third_party_payment_unconfirmed, third_party_payment_undeclared,
     cash_intimation_unconfirmed, cash_not_intimated, cash_above_limit, payment_before_booking,
+    insurance_invoice_missing, self_insurance_declared,
 )
 _DELIVERY_RULES = (
     delivered_on_short_payment, payment_after_delivery_within_grace, payment_after_delivery_beyond_grace,
@@ -989,6 +1034,7 @@ _FINDING_TYPES = {
     "TRADE_IN_NOT_RESOLD": "COMMERCIAL_EXCEPTION", "TRADE_IN_SOLD_AT_LOSS": "COMMERCIAL_EXCEPTION",
     "DELIVERY_NOT_COMPLETED_IN_TIME": "DELIVERY_EXCEPTION",
     "NDC_NOT_SIGNED": "PROCESS_NON_COMPLIANCE", "ACCESSORY_FITTED_UNBILLED": "PROCESS_NON_COMPLIANCE",
+    "SELF_INSURANCE_DECLARED": "COMMERCIAL_EXCEPTION",
 }
 _DEFAULT_FINDING_TYPE = "PAYMENT_EXCEPTION"
 

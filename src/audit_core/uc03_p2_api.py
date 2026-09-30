@@ -441,7 +441,11 @@ def list_p2_journeys(
                    COALESCE(pr.booking_receipt_total, pay.booking_total, 0) AS booking_receipt_total,
                    pr.booking_minimum_amount,
                    COALESCE(pr.manual_verification_pending_count,0) AS manual_verification_pending_count,
-                   COALESCE(bs.booking_confirm_date, bs.booking_confirmed_at_utc::date) AS booking_confirm_date,
+                   -- Booking confirmed = the day the receipts reached the minimum
+                   -- booking amount (a Phase 1 journey carries the date itself).
+                   COALESCE(bs.booking_confirm_date, bs.booking_confirmed_at_utc::date, bc.confirmed_on,
+                            CASE WHEN bs.business_status='BOOKING_CLOSED' THEN bs.business_completed_at_utc::date END)
+                     AS booking_confirm_date,
                    dl.actual_delivered_at AS delivered_at,
                    dl.planned_delivery_at AS planned_delivery_at,
                    (pr.journey_id IS NOT NULL) AS phase2,
@@ -476,6 +480,25 @@ def list_p2_journeys(
               WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id
                 AND COALESCE(payment_stage, 'BOOKING')='BOOKING'
             ) pay ON true
+            LEFT JOIN LATERAL (
+              -- The first receipt date at which the booking receipts (one per
+              -- receipt number, amount and date) reach the minimum booking amount.
+              SELECT MIN(receipt_date) AS confirmed_on
+              FROM (
+                SELECT receipt_date,
+                       SUM(amount) OVER (ORDER BY receipt_date, payment_id) AS running
+                FROM (
+                  SELECT DISTINCT ON (COALESCE(receipt_number, payment_id::text), amount, receipt_date)
+                         payment_id, receipt_date, amount
+                  FROM auditcore.payments
+                  WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id
+                    AND amount > 0 AND receipt_date IS NOT NULL
+                    AND COALESCE(payment_stage, 'BOOKING')='BOOKING'
+                  ORDER BY COALESCE(receipt_number, payment_id::text), amount, receipt_date, payment_id
+                ) receipts
+              ) running
+              WHERE pr.booking_minimum_amount > 0 AND running.running >= pr.booking_minimum_amount
+            ) bc ON true
             LEFT JOIN LATERAL (
               SELECT COUNT(*) AS documents FROM auditcore.evidence
               WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id AND association_status='ACTIVE'

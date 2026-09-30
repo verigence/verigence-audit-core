@@ -1386,6 +1386,40 @@ controls:
     task:
       type: PC_CONFIRMATION
       owner: PC
+  INSURANCE_INVOICE_MISSING:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
+    category: Manual Observations
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: DATA_GAP
+    severity: HIGH
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: PC_CONFIRMATION
+      owner: PC
+  SELF_INSURANCE_DECLARED:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
+    category: Manual Observations
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: MEDIUM
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
   CASH_NOT_INTIMATED:
     executor: NATIVE
     mode: RERUN
