@@ -37,7 +37,14 @@ jobs:
           set -euo pipefail
           [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN secret is not configured.'; exit 1; }
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --json >/tmp/link.json
-          railway service list --json >/tmp/services.json
+          # The Railway API sometimes answers a --json read with a non-JSON
+          # body; ask again, up to six times, until it parses.
+          for attempt in $(seq 1 6); do
+            if railway service list --json >/tmp/services.json 2>/dev/null \
+               && python -c "import json; json.load(open('/tmp/services.json'))" 2>/dev/null; then break; fi
+            echo "railway service list did not answer JSON (attempt $attempt)"; sleep 20
+          done
+          python -c "import json; json.load(open('/tmp/services.json'))"
 
       - name: Ensure dedicated P2 worker service
         shell: bash
