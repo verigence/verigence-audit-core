@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -99,7 +100,26 @@ _DISCOUNT_LABELS = {
     "INSURANCE": "Insurance discount",
     "OTHER_SCHEME": "Other scheme",
     "ADDITIONAL_DISCOUNT": "Additional dealer discount",
+    "MANAGEMENT_REFERRAL": "Management referral (MR)",
 }
+
+
+def management_referral(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """The MR discount as the Team Lead set it: opted out until they opt
+    the journey in with an amount and a reason (decision 2026-09-30)."""
+    row = connection.execute(
+        text(
+            """
+            SELECT opted, amount, reason, set_by_actor_id, set_by_role, set_at_utc
+            FROM auditcore.p2_management_referrals WHERE tenant_id=:t AND journey_id=:j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().first()
+    if row is None:
+        return {"opted": False, "amount": None, "reason": None, "setBy": None, "setByRole": None, "setAt": None}
+    return {"opted": bool(row["opted"]), "amount": _money(row["amount"]), "reason": row["reason"],
+            "setBy": row["set_by_actor_id"], "setByRole": row["set_by_role"], "setAt": row["set_at_utc"]}
 
 
 # Booking-form totals: declared by the form, never a component of the deal
@@ -200,11 +220,28 @@ def field_label(key: str) -> str:
     return text_[:1].upper() + text_[1:]
 
 
+def _norm_type(value: Any) -> str:
+    """"booking_docket", "Booking Docket" and "BOOKING-DOCKET" are one type."""
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+_BOOKING_NORM = frozenset(_norm_type(t) for t in _BOOKING_SOURCES)
+_LEDGER_NORM = frozenset(_norm_type(t) for t in _LEDGER_SOURCES)
+_QUOTE_NORM = frozenset(_norm_type(t) for t in _QUOTE_SOURCES)
+
+
 def _document_label(document_type: str | None) -> str:
     if not document_type:
         return "Document"
-    template = get_registry().template_for_di_type(document_type)
+    registry = get_registry()
+    template = registry.template_for_di_type(document_type)
     if template.key == "supporting_document":
+        # A spelling the registry does not know as a DI type: match it to a
+        # template by its normalised key or DI type before giving up.
+        wanted = _norm_type(document_type)
+        for candidate in registry.documents.values():
+            if wanted == _norm_type(candidate.key) or any(wanted == _norm_type(t) for t in candidate.di_types):
+                return candidate.display_name
         return document_type.replace("_", " ").capitalize()
     return template.display_name
 
@@ -421,10 +458,14 @@ def _column_for(document_type: Any) -> str:
     """Which column a document's value belongs in: the booking form is the
     offer, the ledger and cost sheet are what they are, and every invoice,
     cover note or challan is a billed (actual) value."""
+    # Matched on the normalised type: "Booking Docket" is the booking form,
+    # never an invoice (2026-09-30: that spelling put the booking figure in
+    # the invoice column and flagged the line above standard).
+    kind = _norm_type(document_type)
     return (
-        "booking" if document_type in _BOOKING_SOURCES
-        else "ledger" if document_type in _LEDGER_SOURCES
-        else "quote" if document_type in _QUOTE_SOURCES
+        "booking" if kind in _BOOKING_NORM
+        else "ledger" if kind in _LEDGER_NORM
+        else "quote" if kind in _QUOTE_NORM
         else "billed"
     )
 
@@ -538,15 +579,23 @@ def _flags(kind: str, standard: Any, booking: Any, billed: Any, ledger: Any) -> 
 
 
 def _source_list(per_source: list[Any]) -> list[dict[str, Any]]:
-    return [
-        {
+    """One entry per document and amount: the same document reported under
+    two spellings of its type (2026-09-30: "Booking Docket" twice on the
+    insurance line) is listed once."""
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str | None]] = set()
+    for s in per_source:
+        marker = (_norm_type(s["source_document_type"]), _money(s["amount"]))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        out.append({
             "document": _document_label(s["source_document_type"]),
             "documentType": s["source_document_type"],
             "amount": _money(s["amount"]),
             "documentId": str(s["source_document_id"]) if s["source_document_id"] else None,
-        }
-        for s in per_source
-    ]
+        })
+    return out
 
 
 def _column_total(rows: list[dict[str, Any]], column: str) -> str | None:
@@ -682,9 +731,10 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     )
     invoice_documents = [d for d in documents if d["documentType"] in _INVOICE_TYPES]
     invoiced_deal = bool(invoice_documents) or any(str(s["source_document_type"]) in _INVOICE_TYPES for s in sources)
-    present = {(str(s["component_key"]), str(s["source_document_type"])) for s in sources}
+    present = {(str(s["component_key"]), _norm_type(s["source_document_type"])) for s in sources}
     sources = list(sources) + [
-        s for s in _document_billed(documents) if (s["component_key"], s["source_document_type"]) not in present
+        s for s in _document_billed(documents)
+        if (s["component_key"], _norm_type(s["source_document_type"])) not in present
     ]
 
     # Normalise every source row onto (kind, key): discount-like commercial
@@ -810,6 +860,36 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             "flags": _flags("DISCOUNT", entitled, cols["booking"], cols["billed"], cols["ledger"]),
             "sources": _source_list(per_source),
         })
+
+    # Management Referral: always a line of the standard, opted out until a
+    # Team Lead opts the journey in with an amount; no master or document
+    # carries it, so its entitlement is what the TL approved (0 otherwise)
+    # and anything a document gives against it is an over-grant.
+    referral = management_referral(connection, tenant_id=tenant_id, journey_id=journey_id)
+    mr_key = "MANAGEMENT_REFERRAL"
+    mr_sources = [s for s in sources if s["line_kind"] == "DISCOUNT" and s["component_key"] == mr_key]
+    mr_cols = _columns(mr_sources)
+    mr_entitled = Decimal(referral["amount"]) if referral["opted"] and referral["amount"] else Decimal(0)
+    mr_reference = mr_cols["billed"] if mr_cols["billed"] is not None else mr_cols["booking"]
+    discount_rows = [r for r in discount_rows if r["key"] != mr_key]
+    discount_rows.append({
+        "key": mr_key,
+        "label": discount_label(mr_key),
+        "opted": {"taken": referral["opted"], "source": "tl"},
+        "management": referral,
+        "scheme": None,
+        "eligibility": "ELIGIBLE" if referral["opted"] else None,
+        "evidenceStatus": None,
+        "proof": None,
+        "entitled": _money(mr_entitled),
+        "booking": _money(mr_cols["booking"]),
+        "billed": _money(mr_cols["billed"]),
+        "ledger": _money(mr_cols["ledger"]),
+        "effective": None,
+        "variance": _minus(mr_reference, mr_entitled) if mr_reference is not None else None,
+        "flags": _flags("DISCOUNT", mr_entitled, mr_cols["booking"], mr_cols["billed"], mr_cols["ledger"]),
+        "sources": _source_list(mr_sources),
+    })
 
     # "Current" is what the deal stands at now: the billed value where the
     # component has been invoiced, else what the booking offered. Totals of a

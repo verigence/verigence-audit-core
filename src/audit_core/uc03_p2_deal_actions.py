@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -362,6 +363,66 @@ def put_insurance_source(
         via="DEAL_TAB",
     )
     return deal(connection, tenant_id=tenant_id, journey_id=journey_id)["insurance"]
+
+
+class ManagementReferralCommand(BaseModel):
+    """Opt a journey into the Management Referral (MR) discount with the
+    approved amount and the reason, or opt it out (decision 2026-09-30).
+    A Team Lead's call; the process follows."""
+
+    opted: bool
+    amount: Decimal | None = Field(default=None, gt=0)
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+@router.put("/journeys/{journey_id}/management-referral")
+def put_management_referral(
+    tenant_id: str,
+    journey_id: UUID,
+    command: ManagementReferralCommand,
+    request: Request,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    from audit_core.uc03_p2_journey360 import management_referral
+
+    access = _auth(connection, tenant_id, journey_id, human_principal, authorization_client, _UPDATE)
+    roles = {str(r or "").upper() for r in (access.operating_role, access.functional_role)}
+    role = next((r for r in ("TL", "PM") if r in roles), None)
+    if role is None:
+        raise HTTPException(status_code=403, detail="Only a Team Lead can set the Management Referral discount.")
+    reason = (command.reason or "").strip()
+    if command.opted and command.amount is None:
+        raise HTTPException(status_code=422, detail="Give the approved MR amount.")
+    if len(reason) < 5:
+        raise HTTPException(status_code=422, detail="Give a short reason for this MR decision.")
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.p2_management_referrals (
+                tenant_id, journey_id, opted, amount, reason, set_by_actor_id, set_by_role, set_at_utc
+            ) VALUES (:t, :j, :opted, :amount, :reason, :actor, :role, now())
+            ON CONFLICT (tenant_id, journey_id) DO UPDATE
+               SET opted=EXCLUDED.opted, amount=EXCLUDED.amount, reason=EXCLUDED.reason,
+                   set_by_actor_id=EXCLUDED.set_by_actor_id, set_by_role=EXCLUDED.set_by_role, set_at_utc=now()
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "opted": command.opted,
+         "amount": command.amount if command.opted else None, "reason": reason,
+         "actor": human_principal.subject, "role": role},
+    )
+    correlation_id = get_correlation_id(request)
+    record_activity(
+        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="MANAGEMENT_REFERRAL_SET",
+        subject_type="JOURNEY", subject_id=str(journey_id),
+        details={"opted": command.opted, "amount": str(command.amount) if command.opted and command.amount else None,
+                 "reason": reason, "role": role},
+        correlation_id=correlation_id,
+    )
+    note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id,
+                       reason="MANAGEMENT_REFERRAL_SET", correlation_id=correlation_id)
+    return management_referral(connection, tenant_id=tenant_id, journey_id=journey_id)
 
 
 @router.get("/journeys/{journey_id}/standard")
