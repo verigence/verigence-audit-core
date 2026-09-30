@@ -116,10 +116,28 @@ def management_referral(connection: Connection, *, tenant_id: str, journey_id: U
         ),
         {"t": tenant_id, "j": journey_id},
     ).mappings().first()
+    task = connection.execute(
+        text(
+            """
+            SELECT task_id, task_status, reference FROM auditcore.p2_tasks
+            WHERE tenant_id=:t AND journey_id=:j AND task_type='TL_MANAGEMENT_REFERRAL'
+              AND task_status NOT IN ('VERIFIED_COMPLETE', 'CANCELLED', 'FAILED', 'DEAD_LETTER')
+            ORDER BY created_at_utc DESC LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().first()
+    open_task = None
+    if task is not None:
+        reference = task["reference"] or {}
+        open_task = {"taskId": str(task["task_id"]), "status": task["task_status"],
+                     "proposedAmount": reference.get("proposedAmount"), "reason": reference.get("reason")}
     if row is None:
-        return {"opted": False, "amount": None, "reason": None, "setBy": None, "setByRole": None, "setAt": None}
+        return {"opted": False, "amount": None, "reason": None, "setBy": None, "setByRole": None, "setAt": None,
+                "task": open_task}
     return {"opted": bool(row["opted"]), "amount": _money(row["amount"]), "reason": row["reason"],
-            "setBy": row["set_by_actor_id"], "setByRole": row["set_by_role"], "setAt": row["set_at_utc"]}
+            "setBy": row["set_by_actor_id"], "setByRole": row["set_by_role"], "setAt": row["set_at_utc"],
+            "task": open_task}
 
 
 # Booking-form totals: declared by the form, never a component of the deal

@@ -375,28 +375,14 @@ class ManagementReferralCommand(BaseModel):
     reason: str | None = Field(default=None, max_length=1000)
 
 
-@router.put("/journeys/{journey_id}/management-referral")
-def put_management_referral(
-    tenant_id: str,
-    journey_id: UUID,
-    command: ManagementReferralCommand,
-    request: Request,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
-    connection: Annotated[Connection, Depends(get_connection)],
+def set_management_referral(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, opted: bool, amount: Decimal | None,
+    reason: str, actor_id: str, role: str, correlation_id: str | None, via: str,
 ) -> dict[str, Any]:
+    """Record the Team Lead's MR decision (from the Deal tab or the MR task)
+    and let the checks rerun."""
     from audit_core.uc03_p2_journey360 import management_referral
 
-    access = _auth(connection, tenant_id, journey_id, human_principal, authorization_client, _UPDATE)
-    roles = {str(r or "").upper() for r in (access.operating_role, access.functional_role)}
-    role = next((r for r in ("TL", "PM") if r in roles), None)
-    if role is None:
-        raise HTTPException(status_code=403, detail="Only a Team Lead can set the Management Referral discount.")
-    reason = (command.reason or "").strip()
-    if command.opted and command.amount is None:
-        raise HTTPException(status_code=422, detail="Give the approved MR amount.")
-    if len(reason) < 5:
-        raise HTTPException(status_code=422, detail="Give a short reason for this MR decision.")
     connection.execute(
         text(
             """
@@ -408,21 +394,46 @@ def put_management_referral(
                    set_by_actor_id=EXCLUDED.set_by_actor_id, set_by_role=EXCLUDED.set_by_role, set_at_utc=now()
             """
         ),
-        {"t": tenant_id, "j": journey_id, "opted": command.opted,
-         "amount": command.amount if command.opted else None, "reason": reason,
-         "actor": human_principal.subject, "role": role},
+        {"t": tenant_id, "j": journey_id, "opted": opted, "amount": amount if opted else None, "reason": reason,
+         "actor": actor_id, "role": role},
     )
-    correlation_id = get_correlation_id(request)
     record_activity(
         connection, tenant_id=tenant_id, journey_id=journey_id, event_type="MANAGEMENT_REFERRAL_SET",
         subject_type="JOURNEY", subject_id=str(journey_id),
-        details={"opted": command.opted, "amount": str(command.amount) if command.opted and command.amount else None,
-                 "reason": reason, "role": role},
+        details={"opted": opted, "amount": str(amount) if opted and amount else None, "reason": reason,
+                 "role": role, "via": via},
         correlation_id=correlation_id,
     )
     note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id,
                        reason="MANAGEMENT_REFERRAL_SET", correlation_id=correlation_id)
     return management_referral(connection, tenant_id=tenant_id, journey_id=journey_id)
+
+
+@router.put("/journeys/{journey_id}/management-referral")
+def put_management_referral(
+    tenant_id: str,
+    journey_id: UUID,
+    command: ManagementReferralCommand,
+    request: Request,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    access = _auth(connection, tenant_id, journey_id, human_principal, authorization_client, _UPDATE)
+    roles = {str(r or "").upper() for r in (access.operating_role, access.functional_role)}
+    role = next((r for r in ("TL", "PM") if r in roles), None)
+    if role is None:
+        raise HTTPException(status_code=403, detail="Only a Team Lead can set the Management Referral discount.")
+    reason = (command.reason or "").strip()
+    if command.opted and command.amount is None:
+        raise HTTPException(status_code=422, detail="Give the approved MR amount.")
+    if len(reason) < 5:
+        raise HTTPException(status_code=422, detail="Give a short reason for this MR decision.")
+    return set_management_referral(
+        connection, tenant_id=tenant_id, journey_id=journey_id, opted=command.opted, amount=command.amount,
+        reason=reason, actor_id=human_principal.subject, role=role, correlation_id=get_correlation_id(request),
+        via="DEAL_TAB",
+    )
 
 
 @router.get("/journeys/{journey_id}/standard")

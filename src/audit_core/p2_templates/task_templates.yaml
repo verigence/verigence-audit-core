@@ -217,6 +217,18 @@ task_types:
     - ADD_EVIDENCE
     - CORRECT_EXTRACTED_FIELD
     - ADD_COMMENT
+  # A Team Lead raises it to enable the Management Referral (MR) discount
+  # for one journey (decision 2026-09-30): completing it with the approved
+  # amount and the reason switches MR on. The TL's own process follows.
+  TL_MANAGEMENT_REFERRAL:
+    category: PROCESS_CONFIRMATION
+    owner: TL
+    origin: HUMAN
+    source: HUMAN_ACTION
+    completion: REQUESTER_CONFIRMED
+    actions:
+    - COMPLETE_ACTION
+    - ADD_COMMENT
   TL_TAKE_ACTION:
     category: FINDING_REMEDIATION
     owner: PC

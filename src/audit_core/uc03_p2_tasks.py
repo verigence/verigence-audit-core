@@ -273,6 +273,57 @@ def _create_requester_review(
     )
 
 
+def _enable_management_referral(
+    connection: Connection, *, tenant_id: str, task: dict[str, Any], actor_id: str, actor_role_code: str,
+    comment: str | None, details: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The MR task (decision 2026-09-30): a Team Lead completes it with the
+    approved amount and the reason, and the journey's Management Referral
+    discount is switched on; the task closes as the record of it."""
+    from decimal import Decimal, InvalidOperation
+
+    from audit_core.uc03_p2_deal_actions import set_management_referral
+
+    role = str(actor_role_code or "").upper()
+    if role not in {"TL", "PM"}:
+        raise ValueError("Only a Team Lead can enable the Management Referral discount")
+    reference = dict(task["reference"] or {})
+    raw = details or {}
+    try:
+        amount = Decimal(str(raw.get("amount") or reference.get("proposedAmount") or "0"))
+    except InvalidOperation as exc:
+        raise ValueError("The MR amount must be a number") from exc
+    if amount <= 0:
+        raise ValueError("Give the approved MR amount")
+    reason = str(raw.get("reason") or comment or reference.get("reason") or "").strip()
+    if len(reason) < 5:
+        raise ValueError("Give a short reason for enabling MR")
+    journey_id = UUID(str(task["journey_id"]))
+    set_management_referral(
+        connection, tenant_id=tenant_id, journey_id=journey_id, opted=True, amount=amount, reason=reason,
+        actor_id=actor_id, role=role, correlation_id=None, via=f"TASK:{task['task_id']}",
+    )
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_tasks
+            SET task_status='VERIFIED_COMPLETE', verified_at_utc=now(),
+                completion_result=CAST(:result AS jsonb), updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND task_id=:task_id
+            """
+        ),
+        {"tenant_id": tenant_id, "task_id": task["task_id"],
+         "result": _json({"outcome": "MR_ENABLED", "amount": str(amount), "reason": reason, "enabledBy": actor_id,
+                          "enabledRole": role, "enabledAt": datetime.now(UTC).isoformat()})},
+    )
+    record_task_event(
+        connection, tenant_id=tenant_id, journey_id=journey_id, task_id=UUID(str(task["task_id"])),
+        event_type="COMPLETED", actor_id=actor_id, actor_role_code=role, comment=comment,
+        details={"outcome": "MR_ENABLED", "amount": str(amount)},
+    )
+    return {"taskId": str(task["task_id"]), "status": "VERIFIED_COMPLETE", "outcome": "MR_ENABLED"}
+
+
 def _vehicle_identity(details: dict[str, Any] | None) -> dict[str, str | None]:
     raw = details or {}
     values: dict[str, str | None] = {}
@@ -388,6 +439,12 @@ def submit_action(
     if action in _VERDICT_ACTIONS:
         return _apply_verdict(connection, tenant_id=tenant_id, task=task, action=action, actor_id=actor_id,
                               actor_role_code=actor_role_code, comment=comment, details=details)
+
+    if task["task_type"] == "TL_MANAGEMENT_REFERRAL" and action == "COMPLETE_ACTION":
+        return _enable_management_referral(
+            connection, tenant_id=tenant_id, task=task, actor_id=actor_id, actor_role_code=actor_role_code,
+            comment=comment, details=details,
+        )
 
     if (action == "COMPLETE_ACTION" and str(task.get("dedupe_key") or "").endswith(":INSURANCE_INVOICE_MISSING")
             and str((details or {}).get("answer") or "").upper() == "SELF"):

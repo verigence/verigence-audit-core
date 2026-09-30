@@ -2266,6 +2266,10 @@ def create_human_task(
         authorization_client=authorization_client,
         permission_key=_UPDATE_PERMISSION,
     )
+    if command.taskType == "TL_MANAGEMENT_REFERRAL":
+        roles = {str(r or "").upper() for r in (access.operating_role, access.functional_role)}
+        if not roles & {"TL", "PM"}:
+            raise HTTPException(status_code=403, detail="Only a Team Lead can raise the Management Referral task.")
     unique = uuid4()
     created = create_p2_task(
         connection,

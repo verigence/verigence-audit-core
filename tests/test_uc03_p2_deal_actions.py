@@ -129,3 +129,36 @@ def test_management_referral_is_the_team_leads_call(journey):
     assert row["entitled"] == "15000.00" and row["opted"]["taken"] is True
     out = client.put(f"{base}/management-referral", json={"opted": False, "reason": "Withdrawn after review"})
     assert out.status_code == 200 and out.json()["opted"] is False and out.json()["amount"] is None
+
+
+def test_the_enable_mr_task_is_raised_and_completed_by_the_team_lead(journey):
+    """Decision 2026-09-30: MR is enabled through a task the TL raises on the
+    journey; completing it with the amount and reason switches MR on."""
+    from audit_core.uc03_p2_tasks import submit_action
+
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}"
+    raise_body = {"taskType": "TL_MANAGEMENT_REFERRAL", "category": "PROCESS_CONFIRMATION",
+                  "title": "Enable Management Referral (MR)", "description": "Enable MR of 15000. Dealer principal referral.",
+                  "assignedRoleCode": "TL", "allowedActions": ["COMPLETE_ACTION", "ADD_COMMENT"],
+                  "reference": {"kind": "MANAGEMENT_REFERRAL", "proposedAmount": "15000", "reason": "Dealer principal referral"}}
+    assert client.post(f"{base}/tasks", json=raise_body).status_code == 403  # a PC cannot raise it
+    app.dependency_overrides[get_security_authorization_client] = lambda: AllowAllAuthorization(role_key="TL")
+    raised = client.post(f"{base}/tasks", json=raise_body)
+    assert raised.status_code == 200, raised.text
+    task_id = raised.json()["taskId"]
+    pending = next(d for d in client.get(f"{base}/360/deal").json()["discounts"] if d["key"] == "MANAGEMENT_REFERRAL")
+    assert pending["opted"]["taken"] is False and pending["management"]["task"]["taskId"] == task_id
+    assert pending["management"]["task"]["proposedAmount"] == "15000"
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        with pytest.raises(ValueError, match="assigned to role TL"):
+            submit_action(connection, tenant_id=journey.tenant_id, task_id=task_id, action="COMPLETE_ACTION",
+                          actor_id=journey.actor_id, actor_role_code="PC", comment=None, details={})
+        done = submit_action(connection, tenant_id=journey.tenant_id, task_id=task_id, action="COMPLETE_ACTION",
+                             actor_id="tl-1", actor_role_code="TL", comment=None, details={"amount": "15000"})
+    assert done == {"taskId": task_id, "status": "VERIFIED_COMPLETE", "outcome": "MR_ENABLED"}
+    enabled = next(d for d in client.get(f"{base}/360/deal").json()["discounts"] if d["key"] == "MANAGEMENT_REFERRAL")
+    assert enabled["opted"]["taken"] is True and enabled["entitled"] == "15000.00" and enabled["management"]["task"] is None
+    assert enabled["management"]["reason"] == "Dealer principal referral" and enabled["management"]["setByRole"] == "TL"
