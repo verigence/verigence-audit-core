@@ -814,6 +814,35 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                  "shas": [r["pageSha"] for r in page_records]},
             ).mappings().all()
         }
+        # A failed page uploaded again (decision 2026-09-30): the fresh copy
+        # is the one that counts. The old FAILED page is cancelled as
+        # superseded, so its file's task closes on its own, and the new page
+        # is processed.
+        superseded_batches: set[str] = set()
+        for record in page_records:
+            if record["pageSha"] in already:
+                continue
+            for row in connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.p2_document_queue
+                    SET queue_status='CANCELLED', last_error='SUPERSEDED_PAGE', status_reason=:reason,
+                        updated_at_utc=now()
+                    WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND batch_id<>:batch_id
+                      AND unit_kind='PAGE' AND page_sha256=:sha AND queue_status IN ('FAILED','DEAD_LETTER')
+                    RETURNING batch_id
+                    """
+                ),
+                {"tenant_id": work.tenant_id, "journey_id": work.journey_id, "batch_id": batch["batch_id"],
+                 "sha": record["pageSha"],
+                 "reason": (f"Uploaded again as page {record['pageNumber']} of {batch['original_filename']}; "
+                            "this copy is replaced.")},
+            ).mappings().all():
+                superseded_batches.add(str(row["batch_id"]))
+        for superseded_batch in superseded_batches:
+            _refresh_batch_status(connection, work.tenant_id, UUID(superseded_batch))
+        if superseded_batches:
+            sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
         queued = 0
         for record in page_records:
             queue_id = uuid4()

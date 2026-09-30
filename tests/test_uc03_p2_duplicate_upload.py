@@ -253,3 +253,51 @@ def test_a_page_rejected_for_scan_quality_is_final(journey, monkeypatch):
     response = client.post(f"{base}/pages/{queue_id}:retry")
     assert response.status_code == 409
     assert "Re-scan it" in response.json()["detail"]
+
+
+def test_a_failed_page_uploaded_again_is_superseded_and_its_task_closes(journey, monkeypatch):
+    """#50 (2026-09-30): the task on a failed page tells the PC to upload it
+    again on its own; when the same scan arrives in a fresh upload the old
+    failed page is cancelled as superseded and the file's task closes on
+    its own, so nothing waits on a page that has since come in."""
+    from audit_core.uc03_p2_task_producer import sync_processing_failure_tasks
+
+    storage = MemoryStorage()
+    monkeypatch.setattr(worker, "get_p2_document_storage", lambda: storage)
+    monkeypatch.setattr(worker, "_owned", lambda *args, **kwargs: None)
+    first = _batch(journey, storage, "monday.pdf", _scanned_pdf(_SCAN_A, _SCAN_B))
+    _split(journey, first)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_document_queue SET queue_status='FAILED', last_error='CLASSIFICATION_FAILED' "
+                 "WHERE tenant_id=:t AND batch_id=:b"),
+            {"t": journey.tenant_id, "b": first},
+        )
+        sync_processing_failure_tasks(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+    def task():
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            return connection.execute(
+                text("SELECT severity, task_status FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k"),
+                {"t": journey.tenant_id, "k": f"upload-status:{journey.journey_id}:{first}"},
+            ).mappings().one()
+
+    assert (task()["severity"], task()["task_status"]) == ("HIGH", "READY")
+
+    # Page 2 comes in again on its own: the old copy is replaced, page 1 still waits.
+    second = _batch(journey, storage, "page2.pdf", _scanned_pdf(_SCAN_B))
+    _split(journey, second)
+    old = _pages(journey, first)
+    assert old[0]["queue_status"] == "FAILED"
+    assert old[1]["queue_status"] == "CANCELLED" and old[1]["last_error"] == "SUPERSEDED_PAGE"
+    assert old[1]["status_reason"] == "Uploaded again as page 1 of page2.pdf; this copy is replaced."
+    assert [p["queue_status"] for p in _pages(journey, second)] == ["QUEUED"]
+    assert task()["task_status"] == "READY"
+
+    # Page 1 too: nothing of monday.pdf is failed any more and its task closes.
+    third = _batch(journey, storage, "page1.pdf", _scanned_pdf(_SCAN_A))
+    _split(journey, third)
+    assert [p["queue_status"] for p in _pages(journey, first)] == ["CANCELLED", "CANCELLED"]
+    assert task()["task_status"] == "VERIFIED_COMPLETE"
