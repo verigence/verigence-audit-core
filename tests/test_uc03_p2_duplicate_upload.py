@@ -230,14 +230,14 @@ def test_a_page_rejected_for_scan_quality_is_final(journey, monkeypatch):
     rejected = worker.classify_page_outcome(
         di_item={"state": "FAILED", "failureCode": "DI_QUALITY_IMAGE_BLUR_SCORE",
                  "failureDetail": "Blur score 42.0 below threshold 100.0"},
-        extracted_count=0, submitted_at=None, processed_seen_at=None, now=worker.datetime.now(worker.UTC),
+        extracted_count=0, submitted_at=None, facts_copy=None, now=worker.datetime.now(worker.UTC),
     )
     assert rejected.status == "FAILED"
     assert rejected.reason == ("Page rejected: Blur score 42.0 below threshold 100.0. "
                                "Re-scan this page and upload it again; retrying will not help.")
     unreadable = worker.classify_page_outcome(
         di_item={"state": "FAILED", "failureCode": "INVALID_FILE_CONTENT", "failureDetail": "not a PDF"},
-        extracted_count=0, submitted_at=None, processed_seen_at=None, now=worker.datetime.now(worker.UTC),
+        extracted_count=0, submitted_at=None, facts_copy=None, now=worker.datetime.now(worker.UTC),
     )
     assert unreadable.reason == "The file could not be read: not a PDF. Upload it again."
 

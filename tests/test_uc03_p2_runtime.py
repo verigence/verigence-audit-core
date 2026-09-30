@@ -70,7 +70,7 @@ NOW = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
 
 
 @pytest.mark.parametrize(
-    ("di_item", "fields", "submitted_ago", "processed_ago", "expected"),
+    ("di_item", "fields", "submitted_ago", "facts_copy", "expected"),
     [
         (None, 3, 1, None, "READY"),
         ({"state": "CLASSIFIED", "processingStatus": "PROCESSING"}, 0, 1, None, "EXTRACTING"),
@@ -79,8 +79,13 @@ NOW = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
         ({"state": "FAILED"}, 0, 1, None, "FAILED"),
         ({"state": "CLASSIFIED", "processingStatus": "FAILED"}, 0, 1, None, "FAILED"),
         ({"state": "DELETED"}, 0, 1, None, "CANCELLED"),
-        ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, 0, 2, 1, "SYNCING_TO_AUDIT_CORE"),
-        ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, 0, 20, 10, "NEEDS_REVIEW"),
+        # DI is done; the worker's own copy decides, never a timer.
+        ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, 0, 2, None, "SYNCING_TO_AUDIT_CORE"),
+        ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, 0, 20, None, "SYNCING_TO_AUDIT_CORE"),
+        ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, 0, 2, "COPIED", "NEEDS_REVIEW"),
+        ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, 0, 2, "UNLINKED", "SUPPORTING"),
+        ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, 3, 2, "COPIED", "READY"),
+        ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, 0, 61, None, "FAILED"),
         ({"state": "CLASSIFIED", "processingStatus": "PROCESSING"}, 0, 45, None, "EXTRACTING"),
         ({"state": "CLASSIFIED", "processingStatus": "PROCESSING"}, 0, 61, None, "FAILED"),
         ({"state": "STORED"}, 0, 59, None, "CLASSIFYING"),  # inside DI's own retry ladder
@@ -88,12 +93,12 @@ NOW = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
         (None, 0, 10, None, "FAILED"),
     ],
 )
-def test_page_outcome_never_waits_forever(di_item, fields, submitted_ago, processed_ago, expected):
+def test_page_outcome_never_waits_forever(di_item, fields, submitted_ago, facts_copy, expected):
     outcome = worker.classify_page_outcome(
         di_item=di_item,
         extracted_count=fields,
         submitted_at=NOW - timedelta(minutes=submitted_ago),
-        processed_seen_at=NOW - timedelta(minutes=processed_ago) if processed_ago is not None else None,
+        facts_copy=facts_copy,
         now=NOW,
     )
     assert outcome.status == expected
@@ -287,10 +292,13 @@ class FakeCaptureClient:
         return {"documents": self.documents if phase == "BOOKING" else []}
 
 
-def _reconcile(journey, monkeypatch, documents):
+def _reconcile(journey, monkeypatch, documents, copy=None):
+    """``copy`` stands in for _copy_page_facts (DI and Security are not
+    reachable here): None means "could not copy this round"."""
     client = FakeCaptureClient(documents)
     monkeypatch.setattr(worker, "_di_context_and_requirements", lambda engine, work: ("ctx", "tok", [], {}))
     monkeypatch.setattr(worker, "get_di_capture_v2_client", lambda: client)
+    monkeypatch.setattr(worker, "_copy_page_facts", copy or (lambda engine, **kwargs: None))
     _enqueue(journey, work_type="JOURNEY_RECONCILE", key=str(journey.journey_id))
     [item] = [
         i for i in worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)
@@ -657,3 +665,78 @@ def test_nightly_sweep_re_drives_a_page_stuck_for_a_day_once(journey):
         swept = worker.queue_nightly_upload_sweep(connection, tenant_id=journey.tenant_id)
     assert swept["retried"] == 0
     assert _page_status(journey, old_failed) == "FAILED"
+
+
+# ------------------------------------------------- the worker copies the values
+
+def test_processed_page_is_ready_once_the_worker_copied_its_values(journey, monkeypatch):
+    """Issue 15 (2026-09-30): the worker copies a processed page's values
+    itself; no webhook, no background task, no timer. READY when values
+    landed, "nothing read" only when the copy ran and found none, and
+    "still saving" (re-polled) when the copy could not run this round."""
+    _, ready_q, ready_d = add_page(journey, page_number=1)
+    _, empty_q, empty_d = add_page(journey, page_number=2)
+    _, busy_q, busy_d = add_page(journey, page_number=3)
+    _, extra_q, extra_d = add_page(journey, page_number=4)
+    processed = {"state": "CLASSIFIED", "processingStatus": "PROCESSED", "classifiedDocumentTypeKey": "booking_form"}
+
+    def copy(engine, *, work, page, di_item, requirement_refs):
+        document_id = str(page["di_document_id"])
+        if document_id == str(ready_d):
+            add_extracted_field(journey, di_document_id=ready_d, field_key="customer_name", value="A")
+            return "COPIED"
+        if document_id == str(empty_d):
+            return "COPIED"
+        if document_id == str(extra_d):
+            return "UNLINKED"
+        return None
+
+    _, outcome = _reconcile(journey, monkeypatch, [
+        {"documentId": str(d), **processed} for d in (ready_d, empty_d, busy_d, extra_d)
+    ], copy=copy)
+    assert outcome == "RESCHEDULED"  # the busy page is looked at again shortly
+    assert _page_status(journey, ready_q) == "READY"
+    assert _page_status(journey, empty_q) == "NEEDS_REVIEW"
+    assert _page_status(journey, busy_q) == "SYNCING_TO_AUDIT_CORE"
+    assert _page_status(journey, extra_q) == "SUPPORTING"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        reason = connection.execute(
+            text("SELECT status_reason FROM auditcore.p2_document_queue WHERE queue_id=:q"), {"q": empty_q},
+        ).scalar_one()
+    assert reason == worker._NOTHING_READ_REASON
+
+
+def test_recheck_copies_values_for_nothing_read_pages_without_re_uploading(journey):
+    from starlette.requests import Request
+
+    from audit_core.uc03_p2_deal_actions import recheck_journey
+
+    _, queue_id, _ = add_page(journey, status="NEEDS_REVIEW", submitted_minutes_ago=20)
+    request = Request({"type": "http", "method": "POST", "path": "/", "headers": []})
+    with journey.engine.begin() as connection:
+        recheck_journey(
+            tenant_id=journey.tenant_id, journey_id=journey.journey_id, request=request,
+            human_principal=principal(journey), authorization_client=AllowAllAuthorization(),
+            connection=connection,
+        )
+    assert _page_status(journey, queue_id) == "SYNCING_TO_AUDIT_CORE"
+    assert queue_row(journey, "JOURNEY_RECONCILE", str(journey.journey_id))["work_status"] == "PENDING"
+    assert queue_row(journey, "DOCUMENT_INGEST", str(queue_id)) is None  # never sent to DI again
+
+
+def test_nightly_sweep_recopies_pages_the_old_timer_marked_nothing_read(journey):
+    _, legacy_q, _ = add_page(journey, page_number=1, status="NEEDS_REVIEW")
+    _, truly_empty_q, _ = add_page(journey, page_number=2, status="NEEDS_REVIEW")
+    _set_page_age(journey, legacy_q, hours=25)
+    _set_page_age(journey, truly_empty_q, hours=25)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_document_queue SET status_reason=:r WHERE queue_id=:q"),
+            {"q": truly_empty_q, "r": worker._NOTHING_READ_REASON},
+        )
+        worker.queue_nightly_upload_sweep(connection, tenant_id=journey.tenant_id)
+    assert _page_status(journey, legacy_q) == "SYNCING_TO_AUDIT_CORE"
+    assert _page_status(journey, truly_empty_q) == "NEEDS_REVIEW"
+    assert queue_row(journey, "JOURNEY_RECONCILE", str(journey.journey_id))["work_status"] == "PENDING"

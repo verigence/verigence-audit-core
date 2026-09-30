@@ -1711,6 +1711,21 @@ def acknowledge_booking_document_link_with_auto_sync(
         service_id=service_principal.subject,
         requirement_ref=payload.requirementRef,
     )
+    # A Phase 2 page: its worker copies the values itself, in its own
+    # reconcile, durably (uc03_p2_worker._copy_page_facts). A second copy
+    # from here would only contend for the same journey lock.
+    phase2_page = connection.execute(
+        text(
+            """
+            SELECT 1 FROM auditcore.p2_document_queue
+            WHERE tenant_id=:tenant_id AND di_document_id=:document_id
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": str(discovered["tenant_id"]), "document_id": payload.documentId},
+    ).scalar_one_or_none()
+    if phase2_page is not None:
+        return response
     # Root-caused live (2026-09-24) via direct DB inspection on a 10-document
     # batch upload: DI calls this webhook once per document, independently,
     # as each one finishes classifying -- a normal multi-file upload lands

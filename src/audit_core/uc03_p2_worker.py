@@ -122,7 +122,6 @@ _LEASE_RENEW_SECONDS = max(5, _LEASE_SECONDS // 3)
 _PAGE_DEADLINE_SECONDS = int(os.environ.get("P2_PAGE_DEADLINE_SECONDS", str(60 * 60)))
 # DI reports PROCESSED before the document-link sync has copied facts into
 # Audit Core. Allow the sync this long before treating "no facts" as a result.
-_SYNC_GRACE_SECONDS = int(os.environ.get("P2_SYNC_GRACE_SECONDS", "180"))
 _FACT_SWEEP_SECONDS = float(os.environ.get("P2_FACT_SWEEP_SECONDS", "30"))
 _FACT_SWEEP_WINDOW_MINUTES = int(os.environ.get("P2_FACT_SWEEP_WINDOW_MINUTES", "10"))
 # When (UTC, HH:MM) the nightly review of deliveries in progress is queued.
@@ -1215,21 +1214,32 @@ def _di_failure_reason(di_item: dict[str, Any] | None) -> str:
     return "Document Intelligence could not read this page. Retry or re-upload it." + (f" ({detail})" if detail else "")
 
 
+# Set on a page once the worker itself copied DI's result and there was
+# nothing in it. Distinct from the wording the old timer-based path used, so
+# the nightly sweep can tell a page that was genuinely read empty from one
+# that was merely never copied.
+_NOTHING_READ_REASON = "Document Intelligence read this page but found no values on it."
+_EXTRA_COPY_REASON = "Read, but this booking already has this document; kept as an extra copy."
+
+
 def classify_page_outcome(
     *,
     di_item: dict[str, Any] | None,
     extracted_count: int,
     submitted_at: datetime | None,
-    processed_seen_at: datetime | None,
+    facts_copy: str | None,
     now: datetime,
 ) -> PageOutcome:
     """Map DI's durable capture state onto one P2 page state.
 
     DI capture states: RECEIVING, STORED, CLASSIFYING, CLASSIFIED, UNKNOWN,
     FAILED, DELETED. DI processing (extraction) status: NOT_STARTED,
-    PROCESSING, RETRY_PENDING, PROCESSED, FAILED. Facts reach Audit Core via
-    the existing document-link sync, so READY means Audit Core has durable
-    facts, not merely that DI finished."""
+    PROCESSING, RETRY_PENDING, PROCESSED, FAILED. READY means Audit Core
+    holds the page's values. ``facts_copy`` is what this reconcile's own
+    copy of DI's result did (_copy_page_facts): "COPIED" (the values, or
+    the absence of any, are durable now), "UNLINKED" (nothing to hold them
+    against: the booking already has this document) or None (the copy did
+    not run this round, look again shortly)."""
     age = (now - submitted_at).total_seconds() if submitted_at else 0.0
     if extracted_count > 0:
         return PageOutcome("READY", None)
@@ -1251,15 +1261,113 @@ def classify_page_outcome(
             "Kept as supporting evidence. Set the document type if this is a checklist document.",
         )
     if state == "CLASSIFIED" and processing == "PROCESSED":
-        waited = (now - processed_seen_at).total_seconds() if processed_seen_at else 0.0
-        if waited > _SYNC_GRACE_SECONDS:
-            return PageOutcome("NEEDS_REVIEW", "No fields could be extracted from this page.")
+        if facts_copy == "COPIED":
+            return PageOutcome("NEEDS_REVIEW", _NOTHING_READ_REASON)
+        if facts_copy == "UNLINKED":
+            return PageOutcome("SUPPORTING", _EXTRA_COPY_REASON)
+        if age > _PAGE_DEADLINE_SECONDS:
+            return PageOutcome("FAILED", "The values could not be copied in time. Retry the page.")
         return PageOutcome("SYNCING_TO_AUDIT_CORE", None)
     if age > _PAGE_DEADLINE_SECONDS:
         return PageOutcome("FAILED", "Processing did not finish in time. Retry the page.")
     if state == "CLASSIFIED":
         return PageOutcome("EXTRACTING", None)
     return PageOutcome("CLASSIFYING", None)
+
+
+def _copy_page_facts(
+    engine: Engine,
+    *,
+    work: WorkItem,
+    page: dict[str, Any],
+    di_item: dict[str, Any],
+    requirement_refs: dict[str, str],
+) -> str | None:
+    """Copy a processed page's values from Document Intelligence into Audit
+    Core, right here in the reconcile, instead of waiting for DI's one-shot
+    link callback and the in-memory background task it used to trigger
+    (lost on a redeploy, dropped after lock contention, never retried on a
+    non-retryable reply). A plain read of a result DI already holds: no
+    model call, ever. Returns "COPIED" once the values (or the absence of
+    any) are durable, "UNLINKED" when the booking has no slot left for this
+    document (an extra copy), None when the copy could not run this round
+    (per-journey lock busy, DI or Security unreachable) and should be tried
+    again on the next poll."""
+    from audit_core.uc03_confidence_review_policy import (
+        DocumentSyncLockBusyError,
+        _prefetch_document_for_sync,
+        _sync_booking_document_once,
+    )
+    from audit_core.uc03_document_capture_v2 import _ensure_evidence_link_for_resync
+
+    document_id = UUID(str(page["di_document_id"]))
+    document_type = str(di_item.get("classifiedDocumentTypeKey") or "")
+    requirement_ref = requirement_refs.get(document_type)
+    try:
+        with engine.begin() as connection:
+            set_tenant_context(connection, work.tenant_id)
+            held = connection.execute(
+                text(
+                    """
+                    SELECT COUNT(*) FROM auditcore.journey_document_extracted_fields
+                    WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:d
+                    """
+                ),
+                {"t": work.tenant_id, "j": work.journey_id, "d": document_id},
+            ).scalar_one()
+            if int(held or 0) > 0:
+                return "COPIED"
+            if requirement_ref is not None:
+                linked = _ensure_evidence_link_for_resync(
+                    connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+                    requirement_ref=requirement_ref, document_id=document_id, service_id="p2-worker",
+                )
+            else:
+                linked = bool(connection.execute(
+                    text(
+                        """
+                        SELECT 1 FROM auditcore.evidence
+                        WHERE tenant_id=:t AND di_document_id=:d AND association_status='ACTIVE'
+                        """
+                    ),
+                    {"t": work.tenant_id, "d": document_id},
+                ).scalar_one_or_none())
+            stage_code = connection.execute(
+                text(
+                    """
+                    SELECT stage_code FROM auditcore.document_capture_v2_documents
+                    WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:d
+                    """
+                ),
+                {"t": work.tenant_id, "j": work.journey_id, "d": document_id},
+            ).scalar_one_or_none() or "BOOKING"
+        if not linked:
+            return "UNLINKED"
+        security_client = get_security_oauth_client()
+        di_client = get_di_client()
+        prefetched = _prefetch_document_for_sync(
+            engine, tenant_id=work.tenant_id, journey_id=work.journey_id, document_id=document_id,
+            security_client=security_client, di_client=di_client,
+        )
+        if prefetched is None:
+            return "UNLINKED"
+        _sync_booking_document_once(
+            engine, tenant_id=work.tenant_id, journey_id=work.journey_id, document_id=document_id,
+            service_id="p2-worker", stage_code=str(stage_code).upper(),
+            security_client=security_client, di_client=di_client, prefetched=prefetched,
+        )
+        return "COPIED"
+    except DocumentSyncLockBusyError:
+        return None
+    except Exception:
+        logger.warning(
+            "p2_page_facts_copy_failed",
+            tenant_id=work.tenant_id,
+            journey_id=str(work.journey_id),
+            di_document_id=str(document_id),
+            exc_info=True,
+        )
+        return None
 
 
 def _reconcile_delay(oldest_submitted: datetime | None, now: datetime) -> int:
@@ -1342,8 +1450,9 @@ def _journey_reconcile(engine: Engine, work: WorkItem) -> None:
         return
 
     di_documents: dict[str, dict[str, Any]] = {}
+    requirement_refs: dict[str, str] = {}
     if pending or fragments:
-        context_ref, token, _, _ = _di_context_and_requirements(engine, work)
+        context_ref, token, _, requirement_refs = _di_context_and_requirements(engine, work)
         v2_client = get_di_capture_v2_client()
         for phase in ("BOOKING", "DELIVERY"):
             listing = v2_client.list_documents(
@@ -1374,6 +1483,21 @@ def _journey_reconcile(engine: Engine, work: WorkItem) -> None:
                         exc_info=True,
                     )
 
+    # Pages DI has finished reading: copy their values now, outside any
+    # transaction, one page at a time (no lock storm), before settling.
+    facts_copies: dict[str, str | None] = {}
+    for page in pending:
+        di_item = di_documents.get(str(page["di_document_id"]))
+        if (
+            di_item is not None
+            and page["queue_status"] in ("CLASSIFYING", "EXTRACTING", "SYNCING_TO_AUDIT_CORE")
+            and str(di_item.get("state") or "") == "CLASSIFIED"
+            and str(di_item.get("processingStatus") or "") == "PROCESSED"
+        ):
+            facts_copies[str(page["queue_id"])] = _copy_page_facts(
+                engine, work=work, page=dict(page), di_item=di_item, requirement_refs=requirement_refs,
+            )
+
     now = datetime.now(UTC)
     still_waiting = False
     oldest_waiting: datetime | None = None
@@ -1399,6 +1523,7 @@ def _journey_reconcile(engine: Engine, work: WorkItem) -> None:
                 page=dict(page),
                 di_item=di_documents.get(str(page["di_document_id"])),
                 now=now,
+                facts_copy=facts_copies.get(str(page["queue_id"])),
             )
             if outcome.status == "READY":
                 facts_changed = True
@@ -1721,6 +1846,7 @@ def _reconcile_page(
     page: dict[str, Any],
     di_item: dict[str, Any] | None,
     now: datetime,
+    facts_copy: str | None = None,
 ) -> PageOutcome:
     queue_id = UUID(str(page["queue_id"]))
     di_document_id = UUID(str(page["di_document_id"]))
@@ -1769,7 +1895,7 @@ def _reconcile_page(
         di_item=di_item,
         extracted_count=extracted_count,
         submitted_at=page["di_submitted_at_utc"] or page["created_at_utc"],
-        processed_seen_at=processed_seen_at,
+        facts_copy=facts_copy,
         now=now,
     )
 
@@ -2153,6 +2279,24 @@ def queue_nightly_upload_sweep(connection, *, tenant_id: str, now: datetime | No
         ),
         {"t": tenant_id, "states": list(_PAGE_ACTIVE_STATES), "cutoff": cutoff},
     ).scalars().all()
+    # Pages the old timer-based path marked "nothing read" without the
+    # worker ever copying DI's result: put them back in line for one copy
+    # (a read of what DI already holds, not a re-upload). A page the worker
+    # itself read as empty carries _NOTHING_READ_REASON and is left alone.
+    recopy = connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue
+            SET queue_status='SYNCING_TO_AUDIT_CORE', status_reason=NULL, updated_at_utc=now()
+            WHERE tenant_id=:t AND queue_status='NEEDS_REVIEW' AND di_document_id IS NOT NULL
+              AND updated_at_utc < :cutoff
+              AND status_reason IS DISTINCT FROM :reason
+            RETURNING journey_id
+            """
+        ),
+        {"t": tenant_id, "cutoff": cutoff, "reason": _NOTHING_READ_REASON},
+    ).scalars().all()
+    stuck = list(dict.fromkeys([*stuck, *recopy]))
     for journey_id in stuck:
         journey_id = UUID(str(journey_id))
         enqueue_work(
