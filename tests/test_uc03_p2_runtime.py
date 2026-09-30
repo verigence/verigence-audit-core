@@ -352,6 +352,17 @@ def test_one_di_listing_settles_every_page_of_the_journey(journey, monkeypatch):
         ).mappings().all()
     assert [dict(t) for t in tasks] == [
         {"task_type": "PC_VERIFY_UNRECOGNIZED_DOCUMENT", "severity": "HIGH", "task_status": "READY"}]
+    # 2026-09-30: the page DI rejected is named in the file's High task in
+    # the same round the file finishes, not left to a later stage recompute.
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        status = connection.execute(
+            text("SELECT severity, task_status, title, reference FROM auditcore.p2_tasks "
+                 "WHERE tenant_id=:t AND journey_id=:j AND task_type='PC_UPLOAD_STATUS'"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        ).mappings().all()
+    assert len(status) == 1 and status[0]["severity"] == "HIGH" and status[0]["task_status"] == "READY"
+    assert "1 page could not be processed" in status[0]["title"] and status[0]["reference"]["pageNumbers"] == [2]
 
 
 def test_a_page_marked_nothing_read_turns_ready_once_its_facts_arrive(journey, monkeypatch):
