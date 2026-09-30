@@ -153,6 +153,28 @@ def test_dealer_documents_must_name_the_booking_forms_dealership(journey):
     assert task["reference"]["sourceCode"] == "WRONG_DEALER_NAME"
 
 
+def test_the_oems_name_on_the_booking_form_is_not_a_dealership(journey):
+    """2026-09-30: the booking form is the OEM's form and names Mahindra; the
+    receipts and invoice name the dealership (Aditya Motors). No task: the
+    OEM's name is skipped and the dealer documents agree among themselves.
+    One naming another dealership is still caught, against the receipt."""
+    with journey.engine.begin() as connection:
+        connection.execute(text("UPDATE auditcore.oems SET oem_name='Mahindra & Mahindra Ltd' WHERE oem_id="
+                                "(SELECT oem_id FROM auditcore.projects WHERE tenant_id=:t)"), {"t": journey.tenant_id})
+    add_ready_document(journey, "booking_form", customer_name="Ramakanta Sahoo", dealer_name="Mahindra")
+    add_ready_document(journey, "dealer_receipt", customer_name="Ramakanta Sahoo", dealer_name="ADITYA MOTORS",
+                       amount_paid="21000")
+    add_ready_document(journey, "customer_invoice_dms", buyer_name="Ramakanta Sahoo",
+                       seller_name="Aditya Motors Pvt Ltd", invoice_number="I1")
+    assert _sync(journey) == {}
+    other = add_ready_document(journey, "customer_invoice_dms", buyer_name="Ramakanta Sahoo",
+                               seller_name="Utkal Automobiles", invoice_number="I2")
+    assert _sync(journey) == {"RAISED": 1}
+    (task,) = _tasks(journey)
+    assert task["reference"]["documentId"] == str(other)
+    assert "but the Booking Payment Receipt names ADITYA MOTORS" in task["description"]
+
+
 def test_the_verified_kyc_name_stays_the_reference_when_another_persons_kyc_arrives(journey):
     """Customer A's PAN named the customer; a PAN of customer B uploaded later
     is the wrong document, and A's documents are not."""

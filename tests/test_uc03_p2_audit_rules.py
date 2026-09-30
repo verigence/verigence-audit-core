@@ -303,6 +303,25 @@ def test_financier_windows(journey):
 # ------------------------------------------------------------- trade-in
 
 
+def test_a_trade_in_row_without_an_exchange_vehicle_is_not_an_exchange(journey):
+    """2026-09-30: a docket read as "Exchange: No" (or an empty valuation
+    field) stores a trade-in row; that row made the Exchange Vehicle RC,
+    Transfer Letter and Valuation Report mandatory on every delivery."""
+    from audit_core.uc03_p2_stage import active_conditions
+
+    _sql(journey, "INSERT INTO auditcore.trade_in_cases (tenant_id, journey_id, actual_status_code, source_kind) "
+                  "VALUES (:t, :j, 'NO_EXCHANGE', 'OPERATIONAL_INPUT')")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert "exchangeBenefit" not in active_conditions(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert _run(journey, "DELIVERY")["TRADE_IN_NOT_RESOLD"].outcome != "FAIL"
+
+    _sql(journey, "UPDATE auditcore.trade_in_cases SET old_vehicle_registration='OD02AB1234' WHERE tenant_id=:t AND journey_id=:j")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert "exchangeBenefit" in active_conditions(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+
 def test_trade_in_resale_window_and_loss(journey):
     _sql(journey, "INSERT INTO auditcore.trade_in_cases (tenant_id, journey_id, old_vehicle_registration, "
                   "actual_value, handover_at_utc) VALUES (:t, :j, 'KA01AB1234', 300000, now() - interval '100 days')")

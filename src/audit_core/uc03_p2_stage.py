@@ -390,6 +390,15 @@ _TEXT_EVIDENCE = {
 _DEALER_WORDS = ("DEALER", "SHOWROOM", "IN-HOUSE", "INHOUSE", "IN HOUSE", "COMPANY")
 _SELF_WORDS = ("SELF", "CUSTOMER", "OWN")
 _YES_WORDS = ("YES", "Y", "TRUE", "APPLICABLE")
+# A trade-in row exists for many journeys with no exchange at all (a docket
+# read as "Exchange: No" stores NO_EXCHANGE; an empty valuation field stores
+# nulls). An exchange vehicle is on file only when the row says so.
+EXCHANGE_ON_FILE = (
+    "(actual_status_code = 'EXCHANGE_TAKEN'"
+    " OR NULLIF(btrim(COALESCE(old_vehicle_registration, '')), '') IS NOT NULL"
+    " OR COALESCE(actual_value, quoted_value, 0) > 0"
+    " OR (details ->> 'exchangeTaken') = 'true')"
+)
 
 
 def _as_amount(value: Any) -> Decimal | None:
@@ -437,12 +446,13 @@ def condition_reasons(connection: Connection, *, tenant_id: str, journey_id: UUI
     ).mappings().all()
     facts = connection.execute(
         text(
-            """
+            f"""
             SELECT
               (SELECT upper(c.customer_type_code) FROM auditcore.journeys j
                  JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
                 WHERE j.tenant_id=:t AND j.journey_id=:j) AS customer_type,
-              EXISTS (SELECT 1 FROM auditcore.trade_in_cases WHERE tenant_id=:t AND journey_id=:j) AS trade_in,
+              EXISTS (SELECT 1 FROM auditcore.trade_in_cases WHERE tenant_id=:t AND journey_id=:j
+                        AND {EXCHANGE_ON_FILE}) AS trade_in,
               (SELECT provider_name FROM auditcore.finance_records WHERE tenant_id=:t AND journey_id=:j
                  AND (provider_name IS NOT NULL OR financed_amount > 0) ORDER BY updated_at_utc DESC LIMIT 1)
                 AS financier,
