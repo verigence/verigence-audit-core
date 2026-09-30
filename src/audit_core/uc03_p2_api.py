@@ -51,6 +51,7 @@ from audit_core.uc03_p2_storage import (
     get_p2_document_storage,
 )
 from audit_core.uc03_p2_submission import upload_status
+from audit_core.uc03_p2_task_producer import sync_unclassified_page_tasks
 from audit_core.uc03_p2_tasks import (
     TaskPermissionError,
     TaskStateError,
@@ -397,6 +398,9 @@ def list_p2_journeys(
                   )
                   AND (
                     CAST(:state AS varchar) = 'all'
+                    -- Closed means the stage engine completed the Delivery (or the
+                    -- Booking was cancelled). The Gate Pass date in deliveries is
+                    -- the day the vehicle went out, never completion.
                     OR (CAST(:state AS varchar) = 'closed') = (
                       EXISTS (SELECT 1 FROM auditcore.journey_stage_states st
                               WHERE st.tenant_id=j.tenant_id AND st.journey_id=j.journey_id
@@ -404,9 +408,6 @@ def list_p2_journeys(
                                      OR (st.stage_code='BOOKING'
                                          AND (st.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING')
                                               OR st.closure_disposition='NO_DELIVERY'))))
-                      OR EXISTS (SELECT 1 FROM auditcore.deliveries dv
-                                 WHERE dv.tenant_id=j.tenant_id AND dv.journey_id=j.journey_id
-                                   AND dv.actual_delivered_at IS NOT NULL)
                     )
                   )
                   AND (
@@ -444,15 +445,15 @@ def list_p2_journeys(
                    dl.actual_delivered_at AS delivered_at,
                    dl.planned_delivery_at AS planned_delivery_at,
                    (pr.journey_id IS NOT NULL) AS phase2,
-                   (ds.business_completed_at_utc IS NOT NULL OR dl.actual_delivered_at IS NOT NULL
+                   COALESCE(ds.business_completed_at_utc IS NOT NULL
                     OR bs.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING')
-                    OR bs.closure_disposition='NO_DELIVERY') AS closed,
+                    OR bs.closure_disposition='NO_DELIVERY', false) AS closed,
                    (bs.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING')
                     OR bs.closure_disposition='NO_DELIVERY') AS cancelled,
                    bs.business_status AS booking_status,
                    CASE WHEN bs.business_status='BOOKING_CLOSED' THEN bs.business_completed_at_utc END
                      AS booking_completed_at,
-                   COALESCE(ds.business_completed_at_utc, dl.actual_delivered_at) AS delivery_completed_at,
+                   ds.business_completed_at_utc AS delivery_completed_at,
                    (SELECT jr.review_completed_at_utc FROM auditcore.journeys jr
                      WHERE jr.tenant_id=p.tenant_id AND jr.journey_id=p.journey_id) AS delivery_reviewed_at,
                    bs.capture_completed_at_utc AS booking_submitted_at,
@@ -615,7 +616,7 @@ def journeys_summary(
                      CASE WHEN bs.business_status='BOOKING_CLOSED' THEN bs.business_completed_at_utc END
                        AS booking_completed,
                      ds.first_started_at_utc AS delivery_started,
-                     COALESCE(ds.business_completed_at_utc, dl.actual_delivered_at) AS delivery_completed,
+                     ds.business_completed_at_utc AS delivery_completed,
                      COALESCE(bs.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING')
                               OR bs.closure_disposition='NO_DELIVERY', false) AS cancelled,
                      (pr.current_stage LIKE 'DELIVERY%' OR ds.journey_id IS NOT NULL OR dl.journey_id IS NOT NULL)
@@ -1305,7 +1306,8 @@ def list_documents(
                    di_document_id, classified_document_type, business_stage,
                    queue_status, status_reason, template_key, attempt_count,
                    extracted_field_count, last_error, created_at_utc, updated_at_utc,
-                   unit_kind, page_numbers, merged_into_queue_id, group_source
+                   unit_kind, page_numbers, merged_into_queue_id, group_source,
+                   (type_overridden_by_actor_id IS NOT NULL) AS type_set_by_pc
             FROM auditcore.p2_document_queue
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
             ORDER BY created_at_utc DESC, page_number
@@ -1328,6 +1330,7 @@ def list_documents(
         merged_into = item.pop("merged_into_queue_id")
         item["mergedIntoQueueId"] = str(merged_into) if merged_into else None
         item["groupSource"] = item.pop("group_source")
+        item["typeSetByPc"] = bool(item.pop("type_set_by_pc"))
         item["templateKey"] = template.key if template else None
         item["displayName"] = template.display_name if template else None
         item["requirement"] = template.requirement if template else None
@@ -1439,6 +1442,8 @@ def list_documents(
 
 _RETRYABLE_PAGE_STATES = ("FAILED", "DEAD_LETTER", "NEEDS_REVIEW")
 _RETYPEABLE_PAGE_STATES = ("SUPPORTING", "NEEDS_REVIEW", "READY", "FAILED")
+# The "Others" choice on a page DI could not classify: kept, never read.
+_OTHER_DOCUMENT_TEMPLATE = "supporting_document"
 
 
 def _page_unit(connection: Connection, *, tenant_id: str, journey_id: UUID, queue_id: UUID) -> dict[str, Any]:
@@ -1540,11 +1545,38 @@ def set_page_type(
     )
     registry = get_registry()
     template = registry.documents.get(command.templateKey)
-    if template is None or not template.di_types:
+    if template is None or (not template.di_types and template.key != _OTHER_DOCUMENT_TEMPLATE):
         raise HTTPException(status_code=422, detail="Choose a document type from the checklist.")
     unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id)
     if unit["queue_status"] not in _RETYPEABLE_PAGE_STATES:
         raise HTTPException(status_code=409, detail="This page is still being processed.")
+    if template.key == _OTHER_DOCUMENT_TEMPLATE:
+        # "Others": the PC confirms the page is not a checklist document. It
+        # stays on file as supporting evidence and is never sent for reading.
+        if unit["queue_status"] != "SUPPORTING":
+            raise HTTPException(
+                status_code=409, detail="Only a page that could not be classified can be kept as Others.",
+            )
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_document_queue
+                SET template_key=:template_key, type_overridden_by_actor_id=:actor,
+                    status_reason=:reason, updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+                """
+            ),
+            {"tenant_id": tenant_id, "queue_id": queue_id, "template_key": template.key,
+             "actor": human_principal.subject,
+             "reason": f"Kept as Others by {access.operating_role or 'PC'}: on file, not read."},
+        )
+        sync_unclassified_page_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
+        _activity(
+            connection, tenant_id=tenant_id, journey_id=journey_id, event_type="PAGE_KEPT_AS_OTHER",
+            subject_type="DOCUMENT_PAGE", subject_id=str(queue_id), details={"templateKey": template.key},
+            correlation_id=get_correlation_id(request),
+        )
+        return {"queueId": str(queue_id), "status": "SUPPORTING", "templateKey": template.key}
     pages = list(unit["page_numbers"] or [unit["page_number"]])
     client_upload_id = f"p2t-{unit['batch_id']}-{'-'.join(map(str, pages))}-{template.key}-{queue_id.hex[:8]}"
     new_id = uuid4()
@@ -1594,6 +1626,8 @@ def set_page_type(
         work_key=str(new_id), payload={"queueId": str(new_id), "uploadedBy": human_principal.subject},
         correlation_id=get_correlation_id(request),
     )
+    # The retired unit is no longer unclassified: its task closes now.
+    sync_unclassified_page_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
     _activity(
         connection, tenant_id=tenant_id, journey_id=journey_id, event_type="PAGE_RETYPED",
         subject_type="DOCUMENT_PAGE", subject_id=str(queue_id),

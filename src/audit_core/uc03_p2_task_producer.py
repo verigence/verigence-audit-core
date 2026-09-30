@@ -577,22 +577,26 @@ def sync_processing_failure_tasks(
     registry: Registry | None = None,
     evaluation_started_at: datetime | None = None,
 ) -> dict[str, int]:
-    """One High task (PC) per page, or whole upload, that could not be
-    processed: the retries are spent or the document service refused it.
-    The task carries the plain reason and closes itself when the page is
-    processed after a retry, or the upload is removed."""
+    """One High task (PC) per page, or whole upload, that is not getting
+    processed. While the page is being retried automatically the task tells
+    the PC to check back in an hour; once the retries are spent (or the
+    document service refused the page) the same task says which page to
+    upload on its own. It closes itself when the page is processed, or the
+    upload is removed."""
     registry = registry or get_registry()
     wanted: set[str] = set()
     counts: dict[str, int] = {}
     failed = connection.execute(
         text(
             """
-            SELECT q.queue_id AS key, b.batch_id, b.original_filename, q.page_numbers, q.status_reason
+            SELECT q.queue_id AS key, b.batch_id, b.original_filename,
+                   COALESCE(q.page_numbers, ARRAY[q.page_number]) AS page_numbers, q.status_reason,
+                   q.queue_status
             FROM auditcore.p2_document_queue q
             JOIN auditcore.p2_upload_batches b ON b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
-            WHERE q.tenant_id=:t AND q.journey_id=:j AND q.queue_status IN ('FAILED','DEAD_LETTER')
+            WHERE q.tenant_id=:t AND q.journey_id=:j AND q.queue_status IN ('FAILED','DEAD_LETTER','RETRY_WAIT')
             UNION ALL
-            SELECT b.batch_id AS key, b.batch_id, b.original_filename, NULL, NULL
+            SELECT b.batch_id AS key, b.batch_id, b.original_filename, NULL, NULL, 'FAILED'
             FROM auditcore.p2_upload_batches b
             WHERE b.tenant_id=:t AND b.journey_id=:j AND b.batch_status='FAILED' AND b.page_count=0
             ORDER BY 2
@@ -607,22 +611,91 @@ def sync_processing_failure_tasks(
         where = (f"Page {pages[0]}" if len(pages) == 1 else f"Pages {'-'.join(str(p) for p in pages)}"
                  if pages else "The upload")
         reason = row["status_reason"] or "The file could not be split into pages."
+        retrying = row["queue_status"] == "RETRY_WAIT"
+        if retrying:
+            title = f"{where} of {row['original_filename']} is being retried"
+            description = (f"{reason} Nothing to do yet: check back after 60 minutes. If it is still not "
+                           f"processed by then, this task will say so and ask you to upload "
+                           f"{where.lower()} on its own. It closes itself once the page is processed.")
+        else:
+            title = f"{where} of {row['original_filename']} could not be processed"
+            description = (f"{reason} Upload {where.lower()} on its own as a separate file from Upload / Edit "
+                           f"Documents (or retry the page from its card). This task closes itself once the "
+                           f"page is processed; delete this booking if nothing on it can be used.")
         _, outcome = raise_or_refresh(
             connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
             task_type="PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE", source_type="DOCUMENT",
-            source_code="DOCUMENT_PROCESSING_FAILED",
-            title=f"{where} of {row['original_filename']} could not be processed",
-            description=f"{reason} Retry the page from the document list, remove the upload and add the file "
-                        f"again, or delete this booking if nothing on it can be used.",
-            reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": "DOCUMENT_PROCESSING_FAILED",
+            source_code="DOCUMENT_PROCESSING_RETRYING" if retrying else "DOCUMENT_PROCESSING_FAILED",
+            title=title, description=description,
+            reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT",
+                       "sourceCode": "DOCUMENT_PROCESSING_RETRYING" if retrying else "DOCUMENT_PROCESSING_FAILED",
                        "batchId": str(row["batch_id"]), "queueId": str(row["key"]), "filename": row["original_filename"],
-                       "pageNumbers": pages},
+                       "pageNumbers": pages, "retrying": retrying},
             severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
         )
         counts[outcome] = counts.get(outcome, 0) + 1
     closed = _resolve_prefix_except(
         connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"processing-failed:{journey_id}:",
         keep=wanted, evidence={"reason": "The page was processed or the upload removed."},
+    )
+    if closed:
+        counts["VERIFIED"] = counts.get("VERIFIED", 0) + closed
+    return counts
+
+
+def sync_unclassified_page_tasks(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    registry: Registry | None = None,
+    evaluation_started_at: datetime | None = None,
+) -> dict[str, int]:
+    """One High task (PC) per page Document Intelligence could not classify.
+    The page is kept as supporting evidence, but nobody has said what it is:
+    the PC sets its type on the Upload / Edit Documents card (it is then
+    read as that document), or marks it Others (kept for the record, never
+    read). Either closes the task; so does removing the page."""
+    registry = registry or get_registry()
+    wanted: set[str] = set()
+    counts: dict[str, int] = {}
+    rows = connection.execute(
+        text(
+            """
+            SELECT q.queue_id, b.batch_id, b.original_filename, q.page_numbers, q.page_number
+            FROM auditcore.p2_document_queue q
+            JOIN auditcore.p2_upload_batches b ON b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
+            WHERE q.tenant_id=:t AND q.journey_id=:j AND q.queue_status='SUPPORTING'
+              AND COALESCE(q.template_key, 'supporting_document') = 'supporting_document'
+              AND q.type_overridden_by_actor_id IS NULL
+            ORDER BY b.created_at_utc, q.page_number
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()
+    for row in rows:
+        key = f"unclassified:{journey_id}:{row['queue_id']}"
+        wanted.add(key)
+        pages = list(row["page_numbers"] or [row["page_number"]])
+        where = f"Page {pages[0]}" if len(pages) == 1 else f"Pages {'-'.join(str(p) for p in pages)}"
+        _, outcome = raise_or_refresh(
+            connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+            task_type="PC_VERIFY_UNRECOGNIZED_DOCUMENT", source_type="DOCUMENT",
+            source_code="DOCUMENT_UNCLASSIFIED",
+            title=f"Set the document type: {where.lower()} of {row['original_filename']}",
+            description=(f"Document Intelligence could not tell what {where.lower()} of {row['original_filename']} "
+                         "is, so nothing was read from it. Open Upload / Edit Documents, find its card and "
+                         "choose the document type; it is then read as that document. Choose Others if it is "
+                         "not a checklist document: it stays on file without being read."),
+            reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": "DOCUMENT_UNCLASSIFIED",
+                       "batchId": str(row["batch_id"]), "queueId": str(row["queue_id"]),
+                       "filename": row["original_filename"], "pageNumbers": pages},
+            severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
+        )
+        counts[outcome] = counts.get(outcome, 0) + 1
+    closed = _resolve_prefix_except(
+        connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"unclassified:{journey_id}:",
+        keep=wanted, evidence={"reason": "The document type was set, the page was kept as Others, or it was removed."},
     )
     if closed:
         counts["VERIFIED"] = counts.get("VERIFIED", 0) + closed

@@ -958,6 +958,10 @@ def documents(connection: Connection, *, tenant_id: str, journey_id: UUID) -> di
         for f in by_document.get(str(e["di_document_id"]), []):
             confidence = float(f["confidence_score"]) if f["confidence_score"] is not None else None
             value = f["effective_value"] if f["effective_value"] is not None else f["extracted_value"]
+            # Same rule as the review tasks (uc03_p2_stage.unreviewed_fields):
+            # only a value that was read, below 90%, needs a look. A field the
+            # extractor left empty has nothing to verify.
+            populated = value is not None and value != ""
             rows.append({
                 "key": f["field_key"],
                 "label": field_label(str(f["field_key"])),
@@ -966,7 +970,7 @@ def documents(connection: Connection, *, tenant_id: str, journey_id: UUID) -> di
                 "corrected": bool(f["is_modified"]),
                 "confidence": confidence,
                 "reviewed": f["reviewed_at_utc"] is not None or bool(f["is_modified"]),
-                "needsReview": template.needs_review(f["field_key"], confidence)
+                "needsReview": populated and template.needs_review(f["field_key"], confidence)
                 and f["reviewed_at_utc"] is None and not f["is_modified"],
                 "keyField": f["field_key"] in template.key_fields,
             })
@@ -1570,9 +1574,38 @@ def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
                actual_delivered_at
         FROM auditcore.deliveries WHERE tenant_id=:t AND journey_id=:j ORDER BY updated_at_utc DESC LIMIT 1""",
         params)
+    # What the Journey 360 header strip used to carry (removed 2026-09-30 as
+    # a duplicate): the registration, financier and insurer on file, and
+    # when the journey started. Same sources as the summary.
+    head = connection.execute(
+        text(
+            """
+            SELECT j.created_at_utc,
+                   (SELECT r.registration_number FROM auditcore.registration_records r
+                     WHERE r.tenant_id=j.tenant_id AND r.journey_id=j.journey_id
+                       AND r.registration_number IS NOT NULL
+                     ORDER BY r.updated_at_utc DESC LIMIT 1) AS registration_number,
+                   (SELECT f.provider_name FROM auditcore.finance_records f
+                     WHERE f.tenant_id=j.tenant_id AND f.journey_id=j.journey_id
+                     ORDER BY f.updated_at_utc DESC LIMIT 1) AS financier,
+                   (SELECT i.insurer_name FROM auditcore.insurance_records i
+                     WHERE i.tenant_id=j.tenant_id AND i.journey_id=j.journey_id
+                     ORDER BY i.updated_at_utc DESC LIMIT 1) AS insurer
+            FROM auditcore.journeys j
+            WHERE j.tenant_id=:t AND j.journey_id=:j
+            """
+        ),
+        params,
+    ).mappings().one()
     return {
         "product": _plain(product) if product else None, "units": units, "photoCount": int(photo_count),
         "addons": addons, "booking": booking, "delivery": delivered[0] if delivered else None,
+        "journey": {
+            "startedAtUtc": head["created_at_utc"],
+            "registrationNumber": head["registration_number"],
+            "financier": head["financier"],
+            "insurer": head["insurer"],
+        },
     }
 
 
@@ -2273,7 +2306,9 @@ def audit(connection: Connection, *, tenant_id: str, journey_id: UUID, limit: in
     for code in ("BOOKING", "DELIVERY"):
         row = stages.get(code) or {}
         started = row.get("first_started_at_utc") or (journey["created_at_utc"] if code == "BOOKING" else None)
-        completed = row.get("business_completed_at_utc") or (journey["actual_delivered_at"] if code == "DELIVERY" else None)
+        # Completion is the stage engine's; the Gate Pass date (actual_delivered_at)
+        # is a separate milestone above, never completion.
+        completed = row.get("business_completed_at_utc")
         stage_cancelled = code == "BOOKING" and cancelled
         stage_times[code] = {
             "status": row.get("business_status"), "startedAtUtc": started,

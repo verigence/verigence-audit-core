@@ -455,6 +455,14 @@ def _match(
 
     if not model_rows:
         return [], "NONE"
+    # Price could not decide (none on the form, or nothing agreed with it):
+    # the variant and colour the form states are still exact facts about
+    # the vehicle. A Booking Form that reads "Thar Roxx / AX7L D(MT) /
+    # Stealth Black" but leaves the total blank must not stay unresolved
+    # across every Thar Roxx row in the price list.
+    narrowed = _narrow(model_rows, variant=inputs["variant_name"], colour=inputs["colour_name"])
+    if len(narrowed) < len(model_rows):
+        return narrowed, "VARIANT_COLOUR"
     return model_rows, "TOTAL" if total is not None else "NONE"
 
 
@@ -1171,6 +1179,10 @@ def _current_match(
     attr_matched, attr_stage, attr_trustworthy = _attribute_decomposition_fallback(
         connection, tenant_id=tenant_id, rows=rows, inputs=inputs
     )
+    if len(attr_matched) > 1:
+        # The decomposition never looks at colour, so one variant still
+        # leaves one row per colour; the colour on the form settles that.
+        attr_matched = _narrow(attr_matched, variant=inputs["variant_name"], colour=inputs["colour_name"])
     if len(attr_matched) == 1 and attr_trustworthy:
         return {"matched": attr_matched, "matchStage": attr_stage}
 

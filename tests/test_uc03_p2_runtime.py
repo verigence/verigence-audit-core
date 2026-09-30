@@ -159,6 +159,17 @@ def test_failures_back_off_then_dead_letter_and_fail_the_page(journey, monkeypat
     assert waiting["queue_status"] == "RETRY_WAIT"
     assert "Retrying automatically in 1 minute" in waiting["status_reason"]
     assert "check back later" in waiting["status_reason"]
+    # Issue 8 (2026-09-30): the PC is told at once, with "check back after 60 minutes".
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        task = connection.execute(
+            text("SELECT title, description, task_status, reference FROM auditcore.p2_tasks "
+                 "WHERE tenant_id=:t AND dedupe_key=:k"),
+            {"t": journey.tenant_id, "k": f"processing-failed:{journey.journey_id}:{queue_id}"},
+        ).mappings().one()
+    assert task["task_status"] == "READY" and task["title"].endswith("is being retried")
+    assert "check back after 60 minutes" in task["description"]
+    assert task["reference"]["retrying"] is True and task["reference"]["pageNumbers"] == [1]
 
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
@@ -187,7 +198,15 @@ def test_failures_back_off_then_dead_letter_and_fail_the_page(journey, monkeypat
         ).mappings().one()
     assert task["task_type"] == "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE" and task["assigned_role_code"] == "PC"
     assert task["severity"] == "HIGH" and task["task_status"] == "READY"
-    assert "could not be processed" in task["title"]
+    # The same task (Issue 6): now it names the page to upload on its own.
+    assert task["title"] == "Page 1 of scan.pdf could not be processed"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        description = connection.execute(
+            text("SELECT description FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k"),
+            {"t": journey.tenant_id, "k": f"processing-failed:{journey.journey_id}:{queue_id}"},
+        ).scalar_one()
+    assert "Upload page 1 on its own" in description
 
 
 def test_retries_are_staggered_over_an_hour():
@@ -296,6 +315,33 @@ def test_one_di_listing_settles_every_page_of_the_journey(journey, monkeypatch):
     assert _page_status(journey, unknown_q) == "SUPPORTING"
     assert _page_status(journey, failed_q) == "FAILED"
     assert _page_status(journey, ready_q) == "READY"
+    assert queue_row(journey, "STAGE_RECOMPUTE", f"booking:{journey.journey_id}") is not None
+    # Issue 9 (2026-09-30): the page DI could not classify is a High task
+    # for the PC straight away, not at the next stage recompute.
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        tasks = connection.execute(
+            text("SELECT task_type, severity, task_status FROM auditcore.p2_tasks "
+                 "WHERE tenant_id=:t AND dedupe_key=:k"),
+            {"t": journey.tenant_id, "k": f"unclassified:{journey.journey_id}:{unknown_q}"},
+        ).mappings().all()
+    assert [dict(t) for t in tasks] == [
+        {"task_type": "PC_VERIFY_UNRECOGNIZED_DOCUMENT", "severity": "HIGH", "task_status": "READY"}]
+
+
+def test_a_page_marked_nothing_read_turns_ready_once_its_facts_arrive(journey, monkeypatch):
+    """Issue 5 (2026-09-30): the fact sync ran late, so the page was marked
+    NEEDS_REVIEW ("no fields could be extracted"). The facts then arrived.
+    The next reconcile (an upload, Recheck documents) must turn it READY
+    instead of leaving the card on "check" for good."""
+    _, queue_id, di_document_id = add_page(journey, status="NEEDS_REVIEW", submitted_minutes_ago=20)
+    add_extracted_field(journey, di_document_id=di_document_id, field_key="customer_name", value="A")
+    _, outcome = _reconcile(journey, monkeypatch, [
+        {"documentId": str(di_document_id), "state": "CLASSIFIED", "processingStatus": "PROCESSED",
+         "classifiedDocumentTypeKey": "booking_form"},
+    ])
+    assert outcome == "DONE"
+    assert _page_status(journey, queue_id) == "READY"
     assert queue_row(journey, "STAGE_RECOMPUTE", f"booking:{journey.journey_id}") is not None
 
 

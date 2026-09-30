@@ -120,3 +120,27 @@ def test_claimed_corporate_discount_requires_the_corporate_id(journey):
     corporate = [c for c in checklist if c["templateKey"] == "corporate_id"]
     assert corporate and corporate[0]["requirement"] == "REQUIRED" and corporate[0]["status"] == "MISSING"
     assert "corporate privilege" in corporate[0]["reason"]
+
+
+def test_a_gate_pass_date_alone_never_shows_the_journey_as_delivered(journey):
+    """Issue 7 (2026-09-30): the Gate Pass gives the day the vehicle went
+    out (deliveries.actual_delivered_at). Delivery completion is the stage
+    engine's decision (required documents in, vehicle proof, tasks closed);
+    the list, the closed split and the KPIs must not read the date as it."""
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("""INSERT INTO auditcore.deliveries (tenant_id, journey_id, actual_delivered_at, status_source)
+                    VALUES (:t, :j, now(), 'EVIDENCE')"""),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+    client = _client()
+    base = f"/p2/v1/tenants/{journey.tenant_id}"
+    [row] = client.get(f"{base}/journeys", params={"state": "open"}).json()["items"]
+    assert row["closed"] is False and row["delivery_completed_at"] is None
+    assert row["delivered_at"] is not None  # the gate pass date itself still shows
+    assert client.get(f"{base}/journeys", params={"state": "closed"}).json()["items"] == []
+    summary = client.get(f"{base}/journeys:summary").json()
+    assert summary["closed"]["deliveries"] == 0
+    timeline = client.get(f"{base}/journeys/{journey.journey_id}/360/timeline").json()
+    assert timeline["stages"]["DELIVERY"]["completedAtUtc"] is None

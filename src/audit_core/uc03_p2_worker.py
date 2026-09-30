@@ -87,6 +87,7 @@ from audit_core.uc03_p2_task_producer import (
     sync_field_review_tasks,
     sync_name_consistency_tasks,
     sync_processing_failure_tasks,
+    sync_unclassified_page_tasks,
     sync_vehicle_photo_task,
 )
 from audit_core.uc03_p2_workflow import mark_delivery_reviewed
@@ -131,7 +132,10 @@ _PAGE_ACTIVE_STATES = (
 )
 # A page in RETRY_WAIT is waiting for its ingest step to run again; the
 # reconcile sweep leaves it alone until then.
-_PAGE_RECONCILE_STATES = ("CLASSIFYING", "EXTRACTING", "SYNCING_TO_AUDIT_CORE")
+# NEEDS_REVIEW is settled (no waiting loop), but it is re-read on every
+# reconcile: a page marked "no fields" because the fact sync ran late turns
+# READY as soon as its facts are in, instead of staying wrong for good.
+_PAGE_RECONCILE_STATES = ("CLASSIFYING", "EXTRACTING", "SYNCING_TO_AUDIT_CORE", "NEEDS_REVIEW")
 _PAGE_SETTLED_STATES = ("READY", "SUPPORTING", "NEEDS_REVIEW", "FAILED", "DEAD_LETTER", "CANCELLED")
 
 
@@ -513,6 +517,10 @@ def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
                             f"{_MAX_ATTEMPTS}). You can leave this page and check back later."),
                     last_error=error,
                 )
+                # The PC is told at once: check back in an hour; the same
+                # task turns into "upload this page on its own" if the
+                # retries run out, and closes itself if one succeeds.
+                sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
             return
         _mark_dead(connection, work, attempts=attempts, retryable=retryable, cause=cause, error=error)
 
@@ -1360,6 +1368,7 @@ def _journey_reconcile(engine: Engine, work: WorkItem) -> None:
     still_waiting = False
     oldest_waiting: datetime | None = None
     facts_changed = False
+    unclassified_settled = False
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
         _owned(connection, work)
@@ -1383,6 +1392,8 @@ def _journey_reconcile(engine: Engine, work: WorkItem) -> None:
             )
             if outcome.status == "READY":
                 facts_changed = True
+            if outcome.status == "SUPPORTING" and page["queue_status"] != "SUPPORTING":
+                unclassified_settled = True
             if outcome.status not in _PAGE_SETTLED_STATES:
                 still_waiting = True
                 submitted = page["di_submitted_at_utc"] or page["created_at_utc"]
@@ -1403,6 +1414,10 @@ def _journey_reconcile(engine: Engine, work: WorkItem) -> None:
                 reason="DOCUMENT_READY",
                 correlation_id=work.correlation_id,
             )
+        if unclassified_settled:
+            # A page DI could not classify needs the PC now, not at the
+            # next stage recompute (which a supporting page never triggers).
+            sync_unclassified_page_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
 
     if still_waiting:
         raise RescheduleWork(
@@ -1814,7 +1829,7 @@ def _reconcile_page(
         },
     )
 
-    if outcome.status in _PAGE_SETTLED_STATES and page["queue_status"] not in _PAGE_SETTLED_STATES:
+    if outcome.status in _PAGE_SETTLED_STATES and page["queue_status"] != outcome.status:
         _refresh_batch_status(connection, work.tenant_id, UUID(str(page["batch_id"])))
         record_activity(
             connection,
@@ -2031,6 +2046,8 @@ def _sync_rule_tasks(connection, *, tenant_id: str, journey_id: UUID, started_at
         "name_consistency": sync_name_consistency_tasks(
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
         "processing_failure": sync_processing_failure_tasks(
+            connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
+        "unclassified_page": sync_unclassified_page_tasks(
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
         "vehicle_photo": sync_vehicle_photo_task(
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),

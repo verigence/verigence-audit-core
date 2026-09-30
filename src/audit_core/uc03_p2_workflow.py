@@ -203,11 +203,6 @@ def timeline(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
         text("SELECT created_at_utc FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
         {"t": tenant_id, "j": journey_id},
     ).scalar_one()
-    delivered = connection.execute(
-        text("SELECT actual_delivered_at FROM auditcore.deliveries WHERE tenant_id=:t AND journey_id=:j"),
-        {"t": tenant_id, "j": journey_id},
-    ).scalar_one_or_none()
-
     def hours(start: Any, end: Any) -> float | None:
         return round((end - start).total_seconds() / 3600, 1) if start and end else None
 
@@ -215,7 +210,8 @@ def timeline(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     for code in ("BOOKING", "DELIVERY"):
         row = stages.get(code) or {}
         started = row.get("first_started_at_utc") or (created if code == "BOOKING" else None)
-        completed = row.get("business_completed_at_utc") or (delivered if code == "DELIVERY" else None)
+        # The stage engine's completion only; the Gate Pass date is not it.
+        completed = row.get("business_completed_at_utc")
         cancelled = code == "BOOKING" and (
             row.get("business_status") in CANCELLED_BOOKING or row.get("closure_disposition") == "NO_DELIVERY"
         )
