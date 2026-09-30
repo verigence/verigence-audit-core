@@ -490,6 +490,8 @@ def test_self_insurance_keeps_the_premium_out_of_every_total(journey):
     assert after["insurance"]["source"] == "SELF" and after["insurance"]["decidedBy"] == "PC"
     insurance = next(g for g in after["categories"] if g["code"] == "INSURANCE")
     assert insurance["excluded"] is True and insurance["components"][0]["excluded"] is True
+    assert insurance["components"][0]["opted"] == {"taken": False, "source": "insurance"}
+    assert next(g for g in before["categories"] if g["code"] == "INSURANCE")["components"][0]["opted"] == {"taken": True, "source": "insurance"}
     assert Decimal(insurance["components"][0]["billed"]) == 40000  # still shown
     assert Decimal(after["summary"]["gross"]["booking"]) == 1015000 and after["summary"]["components"] == 2
     assert Decimal(after["summary"]["net"]["current"]) == Decimal(before["summary"]["net"]["current"]) - 40000

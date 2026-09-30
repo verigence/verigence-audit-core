@@ -829,6 +829,9 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             group["excluded"] = self_insured
             for row in group["components"]:
                 row["excluded"] = self_insured
+                # Insurance is optional too: Inhouse (opted in, the default)
+                # or Self (opted out), as the PC confirms it.
+                row["opted"] = {"taken": not self_insured, "source": "insurance"}
     counted_rows = [r for r in all_rows if not r.get("excluded")]
     insurance["invoiceOnFile"] = any(
         s["line_kind"] == "COMMERCIAL" and s["component_key"] in _ADDON_COMPONENTS["insurance"]
