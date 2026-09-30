@@ -406,3 +406,84 @@ def test_corporate_policy_batches_large_company_registry(connection) -> None:
         text("SELECT count(*) FROM auditcore.corporate_privilege_registry WHERE oem_code='MAHINDRA'")
     ).scalar_one()
     assert remaining == 1
+
+
+def _items(connection, tenant_id, version_id) -> dict[tuple[str, str], tuple[Decimal, date]]:
+    rows = connection.execute(
+        text("""SELECT s.sku_code, i.component_key, i.standard_amount, i.price_since
+                FROM auditcore.price_list_items i JOIN auditcore.product_skus s ON s.product_sku_id = i.product_sku_id
+                WHERE i.tenant_id = :t AND i.price_list_version_id = :v"""),
+        {"t": tenant_id, "v": version_id},
+    ).all()
+    return {(r[0], r[1]): (Decimal(r[2]), r[3]) for r in rows}
+
+
+def test_a_partial_upload_makes_a_complete_version_and_dates_each_price(connection) -> None:
+    """Decision 2026-09-30: a mid-month file with only the changed models is
+    merged over the standing version; the others are carried forward at
+    their standing price, and every row keeps its own price-since date."""
+    tenant_id = connection.tenant_id
+    project = _project_oem(connection, tenant_id)
+    v1, _ = ingest_price_list(
+        connection, tenant_id=tenant_id, oem_id=project["oem_id"], effective_from=date(2026, 9, 1),
+        parsed=parse_price_list(_price_bytes(("THAR ROXX", "MX1 PMT 2WD", 1_000_000), ("XUV 3XO", "MX1", 800_000))),
+        actor_id="admin",
+    )
+    stats: dict = {}
+    v2, _ = ingest_price_list(
+        connection, tenant_id=tenant_id, oem_id=project["oem_id"], effective_from=date(2026, 9, 19),
+        parsed=parse_price_list(_price_bytes(("THAR ROXX", "MX1 PMT 2WD", 1_050_000))),
+        actor_id="admin", stats=stats,
+    )
+    assert stats == {"uploaded": 1, "changed": 1, "unchanged": 0, "carriedForward": 1, "standingVersionId": str(v1)}
+    first, second = _items(connection, tenant_id, v1), _items(connection, tenant_id, v2)
+    assert len(second) == len(first) == 20  # both SKUs, all ten components, in both versions
+    assert second[("THAR_ROXX::MX1 PMT 2WD", "EX_SHOWROOM")] == (Decimal(1_050_000), date(2026, 9, 19))
+    assert second[("THAR_ROXX::MX1 PMT 2WD", "TCS")] == (Decimal(100), date(2026, 9, 1))  # same figure: kept its date
+    assert second[("XUV_3XO::MX1", "EX_SHOWROOM")] == (Decimal(800_000), date(2026, 9, 1))  # carried forward
+    assert find_effective_price_plan(connection, tenant_id=tenant_id, effective_on=date(2026, 9, 20))["price_list_version_id"] == v2
+    assert find_effective_price_plan(connection, tenant_id=tenant_id, effective_on=date(2026, 9, 10))["price_list_version_id"] == v1
+
+    # The same file again: nothing changes, every date stands.
+    again: dict = {}
+    v3, _ = ingest_price_list(
+        connection, tenant_id=tenant_id, oem_id=project["oem_id"], effective_from=date(2026, 10, 1),
+        parsed=parse_price_list(_price_bytes(("THAR ROXX", "MX1 PMT 2WD", 1_050_000))),
+        actor_id="admin", stats=again,
+    )
+    assert again["changed"] == 0 and again["unchanged"] == 1 and again["carriedForward"] == 1
+    assert _items(connection, tenant_id, v3)[("THAR_ROXX::MX1 PMT 2WD", "EX_SHOWROOM")] == (Decimal(1_050_000), date(2026, 9, 19))
+
+
+def test_discount_grid_ingests_per_model_and_reports_unknown_models(connection) -> None:
+    from audit_core.oem_master_parsers import GridRow
+    from audit_core.oem_price_masters import grid_row_for_model, ingest_discount_grid
+
+    tenant_id = connection.tenant_id
+    project = _project_oem(connection, tenant_id)
+    _, skus = ingest_price_list(
+        connection, tenant_id=tenant_id, oem_id=project["oem_id"], effective_from=date(2026, 9, 1),
+        parsed=parse_price_list(_price_bytes(("THAR ROXX", "MX1 PMT 2WD", 1_000_000), ("PICK UP", "S6", 800_000))),
+        actor_id="admin",
+    )
+    parsed = ParseResult(kind="DISCOUNT_GRID")
+    parsed.grid_rows = [
+        GridRow(3, "Thar Roxx", ["Thar Roxx"], True, 60, Decimal(5000), Decimal(60), Decimal(3000)),
+        GridRow(4, "PICKUP, MAXX", ["PICKUP", "MAXX"], True, 30, Decimal(7000), Decimal(50), Decimal(3000)),
+        GridRow(5, "SCORPIO N Old", ["SCORPIO N Old"], False, None, None, None, None),
+    ]
+    parsed.grid_parameters = [{"parameter": "Penalty Amount", "note": "₹30,000 per case"}]
+    summary = ingest_discount_grid(
+        connection, tenant_id=tenant_id, oem_id=project["oem_id"], oem_code="MAHINDRA",
+        effective_from=date(2026, 9, 1), parsed=parsed, upload_id=None, actor_id="admin",
+    )
+    assert summary["published"] == 4 and summary["resolved"] == 2 and summary["parameters"] == 1
+    assert [u.split("'")[1] for u in summary["unresolved"]] == ["MAXX", "SCORPIO N Old"]
+    thar_model = connection.execute(
+        text("SELECT model_id FROM auditcore.product_skus WHERE product_sku_id = :s"),
+        {"s": skus["THAR_ROXX::MX1 PMT 2WD"]},
+    ).scalar_one()
+    row = grid_row_for_model(connection, tenant_id=tenant_id, model_id=thar_model, effective_on=date(2026, 9, 15))
+    assert row["booking_protection_days"] == 60 and Decimal(row["insurance_od_percent"]) == 60
+    assert row["parameters"][0]["parameter"] == "Penalty Amount"
+    assert grid_row_for_model(connection, tenant_id=tenant_id, model_id=thar_model, effective_on=date(2026, 8, 15)) is None

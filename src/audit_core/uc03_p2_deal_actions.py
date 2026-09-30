@@ -364,6 +364,61 @@ def put_insurance_source(
     return deal(connection, tenant_id=tenant_id, journey_id=journey_id)["insurance"]
 
 
+@router.get("/journeys/{journey_id}/standard")
+def get_journey_standard(
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    corporateCode: str | None = None,
+    corporateName: str | None = None,
+) -> dict[str, Any]:
+    """The full standard block for this journey's vehicle on its pricing
+    date: the SKU standard API answered from the journey's own facts (the
+    resolved SKU, the pricing date, the registration basis, whether an
+    exchange is taken). Decision 2026-09-30, the Deal tab's source."""
+    from audit_core.uc03_masters_alignment import registration_basis
+    from audit_core.uc03_sku_standard import (
+        catalogue_rows,
+        price_version_on,
+        standard_for_sku,
+    )
+
+    _auth(connection, tenant_id, journey_id, human_principal, authorization_client, _READ)
+    row = _pricing_row(connection, tenant_id=tenant_id, journey_id=journey_id)
+    on = row["pricing_effective_on"] or booking_date_for_pricing(connection, tenant_id=tenant_id, journey_id=journey_id, row=row)
+    base: dict[str, Any] = {
+        "journeyId": str(journey_id), "on": on, "skuCode": row.get("sku_code"),
+        "model": row.get("model_name_snapshot"), "variant": row.get("variant_name_snapshot"),
+    }
+    if on is None:
+        return {**base, "available": False, "reason": "No booking date yet: enter it on the booking form."}
+    if row.get("product_sku_id") is None:
+        return {**base, "available": False, "reason": "The vehicle model is not identified yet."}
+    version = price_version_on(connection, tenant_id=tenant_id, on=on)
+    if version is None:
+        return {**base, "available": False, "reason": f"No price list is effective on {on.isoformat()}."}
+    sku_row = next((r for r in catalogue_rows(connection, tenant_id=tenant_id, price_list_version_id=version["priceListVersionId"])
+                    if r["product_sku_id"] == row["product_sku_id"]), None)
+    if sku_row is None:
+        return {**base, "available": False, "reason": "The price list effective on the pricing date does not price this vehicle."}
+    exchange_taken = connection.execute(
+        text("SELECT details ->> 'exchangeTaken' FROM auditcore.trade_in_cases WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one_or_none()
+    basis = registration_basis(customer_type_code=row.get("customer_type_code"),
+                               registration_type_code=row.get("registration_type_code"))
+    return {
+        **base, "available": True,
+        **standard_for_sku(
+            connection, tenant_id=tenant_id, on=on, row=sku_row, version=version, basis=basis,
+            corporate_code=corporateCode, corporate_name=corporateName,
+            exchange="EXCHANGE" if str(exchange_taken).lower() == "true" else "NONE",
+        ),
+    }
+
+
 @router.post("/journeys/{journey_id}:recheck", status_code=202)
 def recheck_journey(
     tenant_id: str,
