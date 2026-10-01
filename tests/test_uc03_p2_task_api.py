@@ -110,7 +110,8 @@ def test_journey_list_shows_existing_journeys_with_dates(journey):
     assert response.status_code == 200, response.text
     [row] = response.json()["items"]
     assert row["booking_confirm_date"] == "2026-09-02"
-    assert row["current_stage"] == "BOOKING_COMPLETE" and row["phase2"] is False
+    # The date shows, but a date never decides the stage: only the Phase 2 stage record does.
+    assert row["current_stage"] == "BOOKING_DOCUMENT_UPLOAD" and row["phase2"] is False
     assert row["documents"] == 0 and row["open_tasks"] == 0
 
 
@@ -212,3 +213,29 @@ def test_a_team_lead_raises_a_task_for_the_pc_and_both_queues_show_it(journey):
     app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=journey.actor_id)
     pc_queue = client.get(f"{base}/tasks", params={"role": "PC"}).json()
     assert [i["task_id"] for i in pc_queue["items"]] == [task_id] and pc_queue["counts"]["DOCUMENTS"] == 1
+
+
+def test_a_delivery_date_from_a_gate_pass_never_makes_the_list_show_delivery_complete(journey):
+    from sqlalchemy import text
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.deliveries (tenant_id, journey_id, actual_status_domain, "
+                 "actual_delivered_at, status_source) VALUES (:t, :j, 'DELIVERY', now(), 'EVIDENCE')"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+    client = TestClient(app, raise_server_exceptions=False)
+    [row] = client.get(f"/p2/v1/tenants/{journey.tenant_id}/journeys").json()["items"]
+    assert row["current_stage"] == "BOOKING_DOCUMENT_UPLOAD"
+    assert row["delivered_at"] is not None  # the date is still shown as a date
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.p2_journey_runtime (tenant_id, journey_id, current_stage) "
+                 "VALUES (:t, :j, 'DELIVERY_DOCUMENT_UPLOAD')"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+    [row] = client.get(f"/p2/v1/tenants/{journey.tenant_id}/journeys").json()["items"]
+    assert row["current_stage"] == "DELIVERY_DOCUMENT_UPLOAD"
