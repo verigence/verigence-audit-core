@@ -38,8 +38,13 @@ from audit_core.uc03_p2_access import (
 )
 from audit_core.uc03_p2_controls import control_statistics
 from audit_core.uc03_p2_dates import parse_extracted_date
+from audit_core.uc03_p2_document_health import journey_document_health
 from audit_core.uc03_p2_registry import get_registry
-from audit_core.uc03_p2_runtime import enqueue_work, request_page_recovery
+from audit_core.uc03_p2_runtime import (
+    enqueue_work,
+    request_page_recovery,
+    request_page_reread,
+)
 from audit_core.uc03_p2_stage import (
     condition_reasons,
     read_booking_stage,
@@ -1349,9 +1354,14 @@ def list_documents(
     ).mappings().all()
 
     registry = get_registry()
+    # One health state per page, from the facts both sides hold (decision
+    # 2026-10-01): the card shows it and offers its one action, the summary
+    # strip counts it, the defects name the pages the pipeline still owes.
+    health = journey_document_health(connection, tenant_id=tenant_id, journey_id=journey_id)
     by_batch: dict[str, list[dict[str, Any]]] = {}
     for page in pages:
         item = dict(page)
+        item["health"] = health["units"].get(str(item["queue_id"]))
         template = (
             registry.documents.get(item["template_key"])
             if item.get("template_key")
@@ -1469,12 +1479,22 @@ def list_documents(
         "documents": documents,
         "checklist": checklist,
         "conditions": sorted(conditions),
+        "documentHealth": {"summary": health["summary"], "defects": health["defects"]},
         **upload_status(connection, tenant_id=tenant_id, journey_id=journey_id),
     }
 
 
 _RETRYABLE_PAGE_STATES = ("FAILED", "DEAD_LETTER", "NEEDS_REVIEW")
 _RETYPEABLE_PAGE_STATES = ("SUPPORTING", "NEEDS_REVIEW", "READY", "FAILED")
+# Pages a person may ask Document Intelligence to read again (decision
+# 2026-10-01): in hand too long, settled without being read, read with
+# nothing found, or failed technically. Never a READY page.
+_REREADABLE_PAGE_STATES = (
+    "CLASSIFYING", "EXTRACTING", "SYNCING_TO_AUDIT_CORE", "SUPPORTING", "NEEDS_REVIEW",
+    "FAILED", "DEAD_LETTER", "RETRY_WAIT",
+)
+# Pages whose values can be copied from DI again without any new reading.
+_RESYNCABLE_PAGE_STATES = ("READY", "NEEDS_REVIEW", "SUPPORTING", "SYNCING_TO_AUDIT_CORE")
 # The "Others" choice on a page DI could not classify: kept, never read.
 _OTHER_DOCUMENT_TEMPLATE = "supporting_document"
 
@@ -1495,6 +1515,197 @@ def _page_unit(connection: Connection, *, tenant_id: str, journey_id: UUID, queu
     if row is None:
         raise HTTPException(status_code=404, detail="Page was not found.")
     return dict(row)
+
+
+@router.post("/journeys/{journey_id}/pages/{queue_id}:reread", status_code=202)
+def reread_page(
+    tenant_id: str,
+    journey_id: UUID,
+    queue_id: UUID,
+    request: Request,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """The PC asks Document Intelligence to read this page again (decision
+    2026-10-01): one more reading of the document DI already holds, never
+    a re-upload. A page DI never received goes through Retry's recovery."""
+    _authorize(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
+    )
+    unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id)
+    if unit["queue_status"] not in _REREADABLE_PAGE_STATES:
+        raise HTTPException(status_code=409, detail="This page is already read, or cannot be read again.")
+    request_page_reread(
+        connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id,
+        requested_by=human_principal.subject, correlation_id=get_correlation_id(request),
+    )
+    return {"queueId": str(queue_id), "status": "REREAD_REQUESTED"}
+
+
+@router.post("/journeys/{journey_id}/pages/{queue_id}:resync", status_code=202)
+def resync_page(
+    tenant_id: str,
+    journey_id: UUID,
+    queue_id: UUID,
+    request: Request,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """Copy this page's values from Document Intelligence into Audit Core
+    once more (decision 2026-10-01): a read of what DI already holds, no
+    new reading. The journey reconcile does the copy and refreshes the card."""
+    _authorize(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
+    )
+    unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id)
+    if unit["queue_status"] not in _RESYNCABLE_PAGE_STATES or unit["di_document_id"] is None:
+        raise HTTPException(status_code=409, detail="This page has nothing to sync yet.")
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue
+            SET queue_status='SYNCING_TO_AUDIT_CORE', status_reason=NULL, updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+            """
+        ),
+        {"tenant_id": tenant_id, "queue_id": queue_id},
+    )
+    enqueue_work(
+        connection, tenant_id=tenant_id, journey_id=journey_id, work_type="JOURNEY_RECONCILE",
+        work_key=str(journey_id), payload={"reason": "PAGE_RESYNC", "uploadedBy": human_principal.subject},
+        correlation_id=get_correlation_id(request),
+    )
+    _activity(
+        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="PAGE_RESYNC_REQUESTED",
+        subject_type="DOCUMENT_PAGE", subject_id=str(queue_id), details={"by": human_principal.subject},
+        correlation_id=get_correlation_id(request),
+    )
+    return {"queueId": str(queue_id), "status": "SYNCING_TO_AUDIT_CORE"}
+
+
+@router.post("/journeys/{journey_id}/documents/{evidence_id}:restore", status_code=200)
+def restore_document_copy(
+    tenant_id: str,
+    journey_id: UUID,
+    evidence_id: UUID,
+    request: Request,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """Make a superseded copy of a single-slot document the active one
+    again (decision 2026-10-01: a newer upload supersedes automatically,
+    so the earlier copy must be one click away). The copy that was active
+    becomes superseded in turn; the stage is rebuilt from active evidence."""
+    _authorize(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
+    )
+    target = connection.execute(
+        text(
+            """
+            SELECT evidence_id, journey_document_requirement_id, di_document_id, association_status, process_area
+            FROM auditcore.evidence
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND evidence_id=:evidence_id
+            FOR UPDATE
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "evidence_id": evidence_id},
+    ).mappings().one_or_none()
+    if target is None:
+        raise HTTPException(status_code=404, detail="Document was not found.")
+    if target["association_status"] != "SUPERSEDED":
+        raise HTTPException(status_code=409, detail="Only a superseded copy can be restored.")
+    current = connection.execute(
+        text(
+            """
+            SELECT evidence_id, di_document_id FROM auditcore.evidence
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND journey_document_requirement_id=:requirement_ref
+              AND association_status='ACTIVE'
+            ORDER BY linked_at_utc DESC LIMIT 1
+            FOR UPDATE
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id,
+         "requirement_ref": target["journey_document_requirement_id"]},
+    ).mappings().one_or_none()
+    if current is not None:
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.evidence
+                SET association_status='SUPERSEDED', void_reason='EARLIER_COPY_RESTORED',
+                    voided_by_actor_id=:actor, voided_at_utc=now()
+                WHERE tenant_id=:tenant_id AND evidence_id=:evidence_id
+                """
+            ),
+            {"tenant_id": tenant_id, "evidence_id": current["evidence_id"], "actor": human_principal.subject},
+        )
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.document_capture_v2_documents
+                SET capture_status='SUPERSEDED', updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND di_document_id=:document_id
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "document_id": current["di_document_id"]},
+        )
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.evidence
+            SET association_status='ACTIVE', void_reason=NULL, voided_by_actor_id=NULL, voided_at_utc=NULL,
+                supersedes_evidence_id=:supersedes
+            WHERE tenant_id=:tenant_id AND evidence_id=:evidence_id
+            """
+        ),
+        {"tenant_id": tenant_id, "evidence_id": evidence_id,
+         "supersedes": current["evidence_id"] if current is not None else None},
+    )
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.document_capture_v2_documents
+            SET capture_status='CLASSIFIED', updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND di_document_id=:document_id
+              AND capture_status='SUPERSEDED'
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "document_id": target["di_document_id"]},
+    )
+    from audit_core.uc03_p2_worker import _rematerialize_stage
+
+    _rematerialize_stage(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+        stage_code=str(target["process_area"] or "BOOKING").upper(),
+    )
+    enqueue_work(
+        connection, tenant_id=tenant_id, journey_id=journey_id, work_type="STAGE_RECOMPUTE",
+        work_key=str(journey_id), payload={"reason": "DOCUMENT_COPY_RESTORED"},
+        correlation_id=get_correlation_id(request),
+    )
+    _activity(
+        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="DOCUMENT_COPY_RESTORED",
+        subject_type="DOCUMENT", subject_id=str(target["di_document_id"]),
+        details={"evidenceId": str(evidence_id),
+                 "supersededEvidenceId": str(current["evidence_id"]) if current is not None else None,
+                 "by": human_principal.subject},
+        correlation_id=get_correlation_id(request),
+    )
+    return {"evidenceId": str(evidence_id), "documentId": str(target["di_document_id"]), "status": "ACTIVE",
+            "supersededEvidenceId": str(current["evidence_id"]) if current is not None else None}
 
 
 @router.post("/journeys/{journey_id}/pages/{queue_id}:retry", status_code=202)

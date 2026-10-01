@@ -35,7 +35,13 @@ from audit_core.security_authorization import (
 from audit_core.uc03_p2_access import authorize_p2
 from audit_core.uc03_p2_controls import request_control_evaluation
 from audit_core.uc03_p2_dates import booking_form_date
-from audit_core.uc03_p2_runtime import enqueue_work, note_facts_changed, record_activity
+from audit_core.uc03_p2_document_health import journey_document_health
+from audit_core.uc03_p2_runtime import (
+    enqueue_work,
+    note_facts_changed,
+    record_activity,
+    request_page_reread,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -516,9 +522,21 @@ def recheck_journey(
         ),
         {"t": tenant_id, "j": journey_id},
     )
+    # Decision 2026-10-01 ("Re-sync with Document Intelligence"): every page
+    # DI has held too long, or settled without reading, is asked for again
+    # (one reading of the document DI holds, never a re-upload) before the
+    # reconcile copies whatever DI has finished.
+    health = journey_document_health(connection, tenant_id=tenant_id, journey_id=journey_id)
+    reread = [item for item in health["defects"] if item["state"] in ("STUCK", "NOT_READ")]
+    for item in reread:
+        request_page_reread(
+            connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=UUID(item["queueId"]),
+            requested_by=human_principal.subject, correlation_id=correlation_id,
+        )
     enqueue_work(
         connection, tenant_id=tenant_id, journey_id=journey_id, work_type="JOURNEY_RECONCILE",
         work_key=str(journey_id), payload={"reason": "MANUAL_RECHECK"}, correlation_id=correlation_id,
+        delay_seconds=5 if reread else 0,
     )
     version = note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id,
                                  reason="MANUAL_RECHECK", correlation_id=correlation_id)
@@ -528,7 +546,9 @@ def recheck_journey(
     )
     record_activity(
         connection, tenant_id=tenant_id, journey_id=journey_id, event_type="RECHECK_REQUESTED",
-        subject_type="JOURNEY", subject_id=str(journey_id), details={"units": units},
+        subject_type="JOURNEY", subject_id=str(journey_id),
+        details={"units": units, "pagesReread": len(reread)},
         correlation_id=correlation_id,
     )
-    return {"journeyId": str(journey_id), "factVersion": version, "checks": units}
+    return {"journeyId": str(journey_id), "factVersion": version, "checks": units,
+            "pagesReread": len(reread), "documentHealth": health["summary"]}

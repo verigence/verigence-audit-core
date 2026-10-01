@@ -9,56 +9,39 @@ def _link_source() -> str:
     return inspect.getsource(pc_booking_documents.acknowledge_booking_document_link)
 
 
-def test_duplicate_upload_against_a_single_slot_requirement_is_rejected_not_superseded() -> None:
-    # Standing rule, explicit and unambiguous: a second upload against a
-    # single-slot (non-repeatable) requirement -- a second PAN card, GST
-    # declaration, scrappage certificate, etc -- is rejected outright, even
-    # when it's a genuinely different (corrected/re-scanned) file, not
-    # silently superseded. The prior evidence must stay ACTIVE and
-    # untouched; the new document is voided as a duplicate.
+def test_a_newer_copy_of_a_single_slot_document_supersedes_the_earlier_one() -> None:
+    # Decision 2026-10-01 (replaces the September rule that voided the newer
+    # copy and raised a duplicate notice): a second upload against a
+    # single-slot requirement -- a second PAN card, a re-scanned docket --
+    # supersedes the earlier one. The earlier evidence becomes SUPERSEDED
+    # (restorable), its capture row says so, and the new document is the
+    # one linked ACTIVE with supersedes_evidence_id pointing back.
     source = _link_source()
-    assert "'VOIDED', 'DUPLICATE_UPLOAD'" in source
-    # The old unconditional silent-supersede write for a brand new document
-    # must be gone -- a genuinely new evidence row is only ever inserted as
-    # 'ACTIVE' when there was no prior ACTIVE evidence to begin with.
-    assert "SET association_status='SUPERSEDED'" not in source
-
-
-def test_duplicate_upload_raises_a_pc_facing_task() -> None:
-    source = _link_source()
-    assert "create_workflow_task(" in source
-    assert "_DUPLICATE_DOCUMENT_TASK_TYPE" in source
-    assert 'assigned_role_code="PC"' in source
-    assert source.index("'VOIDED', 'DUPLICATE_UPLOAD'") < source.index("create_workflow_task(")
-    assert pc_booking_documents._DUPLICATE_DOCUMENT_TASK_TYPE == "DUPLICATE_DOCUMENT_NOTICE"
-
-
-def test_duplicate_upload_returns_early_without_moving_the_assessment_pointer() -> None:
-    # journey_document_assessments must keep pointing at the ORIGINAL,
-    # still-ACTIVE evidence -- the rejected duplicate's evidence_id must
-    # never reach that INSERT.
-    source = _link_source()
-    early_return = source.index(
-        "return BookingDocumentLinkResponse(\n"
-        "                    requirementRef=payload.requirementRef,\n"
-        "                    documentId=payload.documentId,\n"
-        "                    evidenceId=rejected_evidence_id,"
-    )
-    assessment_insert = source.index("INSERT INTO auditcore.journey_document_assessments")
-    assert early_return < assessment_insert
-
-
-def test_repeatable_requirements_are_unaffected_by_the_reject_path() -> None:
-    # Receipts/bank-statements/scrappage-pair documents must still be able
-    # to accumulate multiple ACTIVE evidence rows -- the reject-as-duplicate
-    # behavior is scoped to `not repeatable` only, and the later unconditional
-    # insert (reached whenever there was no prior ACTIVE evidence, including
-    # every repeatable requirement) must still write 'ACTIVE', not 'VOIDED'.
-    source = _link_source()
-    not_repeatable_guard = source.index("if not repeatable:")
-    reject_insert = source.index("'VOIDED', 'DUPLICATE_UPLOAD'")
+    assert "'VOIDED', 'DUPLICATE_UPLOAD'" not in source
+    assert "create_workflow_task(" not in source
+    supersede = source.index("SET association_status='SUPERSEDED'")
+    assert "void_reason='REPLACED_BY_NEWER_UPLOAD'" in source
+    assert "SET capture_status='SUPERSEDED'" in source
     unconditional_insert = source.index("'ACTIVE', :supersedes_evidence_id,")
-    assert not_repeatable_guard < reject_insert < unconditional_insert
+    assert source.index("if not repeatable:") < supersede < unconditional_insert
+
+
+def test_repeatable_requirements_never_supersede() -> None:
+    # Receipts, bank statements and scrappage documents accumulate ACTIVE
+    # evidence rows: the supersede path is gated behind `if not repeatable:`
+    # and the prior-evidence lookup lives inside that guard.
+    source = _link_source()
+    guard = source.index("if not repeatable:")
+    prior_lookup = source.index("prior_evidence_id = connection.execute(")
+    supersede = source.index("SET association_status='SUPERSEDED'")
+    assert guard < prior_lookup < supersede
+
+
+def test_on_demand_checklist_rows_are_repeatable() -> None:
+    assert pc_booking_documents._is_repeatable_requirement("p2_extra_customer_kyc") is True
+    assert pc_booking_documents._is_repeatable_requirement("p2_extra_upi_screenshot") is True
+    assert pc_booking_documents._is_repeatable_requirement("p2_bank_approval_letter") is False
+    assert pc_booking_documents._is_repeatable_requirement("pan_card") is False
 
 
 def test_discover_requirement_for_callback_never_reads_document_capture_v2_documents() -> None:

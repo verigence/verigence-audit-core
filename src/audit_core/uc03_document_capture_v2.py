@@ -39,7 +39,6 @@ from audit_core.uc03_booking_commands import (
     _parse_if_match,
 )
 from audit_core.uc03_delivery_documents import _resolve_known_applicability
-from audit_core.uc03_pc_booking_documents import _is_repeatable_requirement
 from audit_core.uc03_requirement_satisfaction import (
     linked_documents_for_journey,
     requirements_for_journey,
@@ -531,42 +530,20 @@ def _requirement_refs_by_document_type_key(
 def _requirements_with_open_slot(
     connection: Connection, *, tenant_id: str, journey_id: UUID, requirements: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Requirements DI should still be told to extract a NEW document
-    against. A repeatable requirement (multiple payment receipts, bank
-    statements, scrappage certificates -- see _is_repeatable_requirement)
-    always has an open slot; a single-document requirement that already has
-    an ACTIVE evidence link does not -- a further upload of that same type
-    is an extra copy, not a new fact, and extracting it wastes DI's own
-    processing for data that will never be used.
+    """Requirements a NEW document may be linked and read against: every
+    one of them.
 
-    Deliberately NOT used to build candidate_document_type_keys (what DI is
-    allowed to classify the file as) -- that stays on the full, unfiltered
-    requirements list, so a duplicate copy still gets correctly classified
-    as whatever it actually is. Only requirement_refs_by_document_type_key
-    reads this filtered list, so a duplicate simply gets no requirement_ref
-    -- DI's own extraction gate (create_initial_job's requirement_ref
-    check) skips queuing extraction for it on that basis alone.
+    Until 2026-10-01 a single-document requirement that already held an
+    ACTIVE evidence link was left out, so a second copy got no requirement
+    ref, DI never read it, and Audit Core never stored its values (a second
+    PAN, a re-scanned docket). Decision 2026-10-01: a newer copy supersedes
+    the earlier one instead (acknowledge_booking_document_link), so every
+    requirement keeps an open slot. The function is kept so its callers
+    read the same way; ``connection``, ``tenant_id`` and ``journey_id`` are
+    unused now.
     """
-    fulfilled_refs = {
-        str(row[0])
-        for row in connection.execute(
-            text(
-                """
-                SELECT DISTINCT journey_document_requirement_id
-                FROM auditcore.evidence
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND association_status='ACTIVE'
-                  AND journey_document_requirement_id IS NOT NULL
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        )
-    }
-    return [
-        row for row in requirements
-        if _is_repeatable_requirement(row.get("requirement_key"))
-        or str(row.get("requirement_ref")) not in fulfilled_refs
-    ]
+    del connection, tenant_id, journey_id
+    return list(requirements)
 
 
 def _reconcile_documents(
