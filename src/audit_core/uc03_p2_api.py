@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
+import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, Engine, text
@@ -215,6 +216,86 @@ def list_templates(
     }
 
 
+logger = structlog.get_logger(__name__)
+
+_VJ_REFERENCE = re.compile(r"^VJ[0-9]{4}-[0-9]+$")
+
+
+def _outlet_code(outlet_name: str | None) -> str:
+    """Three letters from the outlet name (X pads a short name)."""
+    return re.sub(r"[^A-Za-z]", "", outlet_name or "").upper()[:3].ljust(3, "X")
+
+
+def _pc_code(created_by_name: str | None) -> str:
+    """Two letters for the PC: first and last name initials, else the first
+    two letters of a single name; XX when the PC's name is not known."""
+    words = re.findall(r"[A-Za-z]+", created_by_name or "")
+    if len(words) >= 2:
+        return (words[0][0] + words[-1][0]).upper()
+    if words:
+        return words[0][:2].upper().ljust(2, "X")
+    return "XX"
+
+
+def _assign_readable_reference(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, created_by_name: str | None,
+) -> str | None:
+    """Give a new Journey OUTLET-PC-YYMMDD-NNN in place of the VJ reference
+    the database trigger issued. Never fails the booking: on any error the
+    VJ reference stays and the failure is logged. A replayed request finds
+    the reference already converted and does nothing."""
+    try:
+        with connection.begin_nested():
+            row = connection.execute(
+                text(
+                    """
+                    SELECT j.journey_reference,
+                           to_char(j.created_at_utc AT TIME ZONE 'Asia/Kolkata', 'YYMMDD') AS day,
+                           o.outlet_name
+                    FROM auditcore.journeys j
+                    LEFT JOIN auditcore.dealer_outlets o
+                      ON o.tenant_id=j.tenant_id AND o.outlet_id=j.outlet_id
+                    WHERE j.tenant_id=:tenant_id AND j.journey_id=:journey_id
+                    """
+                ),
+                {"tenant_id": tenant_id, "journey_id": journey_id},
+            ).mappings().one_or_none()
+            if row is None or not _VJ_REFERENCE.match(row["journey_reference"] or ""):
+                return None
+            prefix = f"{_outlet_code(row['outlet_name'])}-{_pc_code(created_by_name)}-{row['day']}-"
+            # One booking at a time per tenant and prefix, until commit.
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": f"journey-reference|{tenant_id}|{prefix}"},
+            )
+            number = connection.execute(
+                text(
+                    """
+                    SELECT COALESCE(MAX(substring(journey_reference FROM '[0-9]+$')::int), 0) + 1
+                    FROM auditcore.journeys
+                    WHERE tenant_id=:tenant_id AND journey_reference ~ ('^' || :prefix || '[0-9]+$')
+                    """
+                ),
+                {"tenant_id": tenant_id, "prefix": prefix},
+            ).scalar_one()
+            reference = f"{prefix}{number:03d}"
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.journeys SET journey_reference=:reference
+                    WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND journey_reference=:old
+                    """
+                ),
+                {"tenant_id": tenant_id, "journey_id": journey_id,
+                 "reference": reference, "old": row["journey_reference"]},
+            )
+            return reference
+    except Exception:
+        logger.warning("journey_readable_reference_failed", tenant_id=tenant_id,
+                       journey_id=str(journey_id), exc_info=True)
+        return None
+
+
 class P2CreateJourneyCommand(BaseModel):
     outletId: UUID
     # Optional: the customer is named from the documents (PAN, Aadhaar,
@@ -284,6 +365,9 @@ def create_p2_journey(
             ),
             {"tenant_id": tenant_id, "journey_id": journey_id, "name": created_by_name},
         )
+    _assign_readable_reference(
+        connection, tenant_id=tenant_id, journey_id=journey_id, created_by_name=created_by_name,
+    )
     _activity(
         connection, tenant_id=tenant_id, journey_id=journey_id, event_type="JOURNEY_STARTED",
         subject_type="JOURNEY", subject_id=str(journey_id),
