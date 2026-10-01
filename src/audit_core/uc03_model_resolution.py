@@ -39,6 +39,7 @@ import json
 import logging
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from difflib import SequenceMatcher
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -59,6 +60,7 @@ from audit_core.uc03_delivery_commands import _machine_flag
 from audit_core.uc03_manual_verification import _resolve_finding
 from audit_core.uc03_masters_alignment import registration_basis
 from audit_core.uc03_model_attribute_matching import (
+    _decompose,
     _master_attributes,
     fuzzy_match_by_attributes,
     has_qualifying_signal,
@@ -856,6 +858,121 @@ def _fuzzy_or_none(
     return None
 
 
+# ── catalogue search: the model name itself never resolved ──────────────────
+# Handwriting read as a neighbouring nameplate ("XUV3XO AX7L EV" extracted as
+# "XUV300" / "W7L EV" at 92% confidence, a real DEV journey) resolves to no
+# model at all above: every fallback so far runs *inside* an already
+# resolved model, and the exact/alias model match is deliberately never
+# fuzzy. Rather than stop with an empty shortlist, score every SKU of the
+# effective price list on the evidence the paperwork does carry: the stated
+# fuel/transmission/drive/seater (a hard filter, an "EV" form never lands on
+# a diesel), an exact price, the model name with the usual OCR confusions
+# folded (O/0, I/1, S/5, B/8, Z/2) and the trim. Pins only a clear winner;
+# otherwise the top few go to the PC as the shortlist to pick from.
+_CATALOGUE_STAGE = "CATALOGUE_SEARCH"
+_CATALOGUE_CONFUSION_FOLD = str.maketrans({"O": "0", "I": "1", "S": "5", "B": "8", "Z": "2", "Q": "0"})
+_CATALOGUE_MODEL_FLOOR = 0.6  # below this the nameplate is simply not this one
+_CATALOGUE_PIN_MODEL = 0.8
+_CATALOGUE_PIN_TRIM = 0.7
+_CATALOGUE_PIN_MARGIN = 0.15
+_CATALOGUE_SHORTLIST = 5
+_CATALOGUE_MODEL_WEIGHT = 0.5
+_CATALOGUE_TRIM_WEIGHT = 0.3
+_CATALOGUE_ATTR_WEIGHT = 0.2
+_CATALOGUE_ATTR_KEYS = ("fuel", "transmission", "drive", "seater")
+
+
+def _catalogue_key(text_value: str | None, *, oem_code: str | None) -> str:
+    """Glued, upper-cased text with the OEM's fuel/transmission/drive/seater
+    tokens removed and OCR look-alike characters folded, so "XUV 3XO EV" and
+    a hand-written "XUV300" compare on the nameplate alone."""
+    decomposed = _decompose(text_value, oem_code=oem_code) if oem_code else None
+    key = decomposed.trim_key if decomposed is not None else normalized_model_key(text_value)
+    return key.translate(_CATALOGUE_CONFUSION_FOLD)
+
+
+def _catalogue_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _catalogue_search(
+    rows: list[dict[str, Any]], inputs: dict[str, Any], *, oem_code: str | None
+) -> tuple[list[dict[str, Any]], str]:
+    """Last resort once no model matched at all. Returns ``(rows, stage)``:
+    one row when the evidence is unambiguous, a ranked shortlist otherwise,
+    ``([], "NONE")`` when nothing in the list resembles the paperwork."""
+    model_text = str(inputs.get("model_name") or "")
+    variant_text = str(inputs.get("variant_name") or "")
+    combined = " ".join(part for part in (model_text, variant_text) if part)
+    stated = _decompose(combined, oem_code=oem_code) if oem_code else None
+    model_key = _catalogue_key(model_text, oem_code=oem_code)
+    full_key = _catalogue_key(combined, oem_code=oem_code)
+    if not model_key:
+        return [], "NONE"
+
+    basis = inputs["registration_basis"]
+    total, ex = inputs.get("offered_total"), inputs.get("offered_ex_showroom")
+    scored: list[tuple[float, float, float, bool, dict[str, Any]]] = []
+    for row in rows:
+        master = _master_attributes(row, oem_code=oem_code) if oem_code else None
+        if stated is not None and master is not None and any(
+            getattr(stated, key) and getattr(master, key) and getattr(stated, key) != getattr(master, key)
+            for key in _CATALOGUE_ATTR_KEYS
+        ):
+            continue
+        master_key = _catalogue_key(str(row["model_name"]), oem_code=oem_code)
+        model_sim = max(
+            _catalogue_similarity(master_key, model_key[: len(master_key)]),
+            _catalogue_similarity(master_key, model_key),
+        )
+        if model_sim < _CATALOGUE_MODEL_FLOOR:
+            continue
+        remainder = full_key[len(master_key):] if len(full_key) > len(master_key) else ""
+        master_trim = (master.trim_key if master is not None else "").translate(_CATALOGUE_CONFUSION_FOLD)
+        trim_sim = _catalogue_similarity(remainder, master_trim)
+        confirmed = (
+            sum(
+                1 for key in _CATALOGUE_ATTR_KEYS
+                if getattr(stated, key) and getattr(master, key) and getattr(stated, key) == getattr(master, key)
+            )
+            if stated is not None and master is not None
+            else 0
+        )
+        price_exact = (total is not None and _master_total(row, basis) == total) or (
+            ex is not None and _to_decimal(row.get("master_ex_showroom")) == ex
+        )
+        score = (
+            _CATALOGUE_MODEL_WEIGHT * model_sim
+            + _CATALOGUE_TRIM_WEIGHT * trim_sim
+            + _CATALOGUE_ATTR_WEIGHT * (confirmed / len(_CATALOGUE_ATTR_KEYS))
+        )
+        scored.append((score, model_sim, trim_sim, price_exact, row))
+    if not scored:
+        return [], "NONE"
+    scored.sort(key=lambda item: (item[3], item[0]), reverse=True)
+
+    # A price the form states that equals exactly one plausible SKU settles it.
+    priced = [row for score, _, _, exact, row in scored if exact]
+    if priced:
+        priced = _narrow(priced, variant=None, colour=inputs.get("colour_name"))
+        if len(priced) == 1:
+            return priced, _CATALOGUE_STAGE
+    # A near-certain nameplate with the exact trim stated, or a trim clearly
+    # closer than any other, settles it too.
+    top_score, top_model, top_trim, _, top_row = scored[0]
+    if top_model >= _CATALOGUE_PIN_MODEL:
+        exact_trim = [row for _, m, t, _, row in scored if m >= _CATALOGUE_PIN_MODEL and t == 1.0]
+        exact_trim = _narrow(exact_trim, variant=None, colour=inputs.get("colour_name"))
+        if len(exact_trim) == 1:
+            return exact_trim, _CATALOGUE_STAGE
+        runner_up = scored[1][0] if len(scored) > 1 else 0.0
+        if top_trim >= _CATALOGUE_PIN_TRIM and top_score - runner_up >= _CATALOGUE_PIN_MARGIN:
+            return [top_row], _CATALOGUE_STAGE
+    return [row for *_, row in scored[:_CATALOGUE_SHORTLIST]], _CATALOGUE_STAGE
+
+
 def _latest_invoice_field(
     connection: Connection, *, tenant_id: str, journey_id: UUID, field_keys: tuple[str, ...]
 ) -> str | None:
@@ -1082,6 +1199,12 @@ def sync_model_resolution_from_invoice(
             invoice_inputs["model_name"] = invoice_model
             invoice_inputs["variant_name"] = invoice_variant or inputs["variant_name"]
             matched, stage = _match(rows, invoice_inputs)
+            if not matched:
+                matched, stage = _catalogue_search(
+                    rows, invoice_inputs, oem_code=_oem_code_for_tenant(connection, tenant_id=tenant_id)
+                )
+                if len(matched) > 1:
+                    matched = []  # a shortlist is the Booking task's to show, never a pin
 
         if already_resolved is not None:
             # Never re-pin an already-resolved SKU (CONFIRMED or merely
@@ -1243,6 +1366,14 @@ def _current_match(
     if attr_matched and (not matched or len(attr_matched) < len(matched)):
         matched, stage = attr_matched, attr_stage
 
+    if not matched:
+        # The model name itself never resolved (misread handwriting, a
+        # neighbouring nameplate): search the whole list on what the
+        # paperwork does state before handing the PC an empty shortlist.
+        matched, stage = _catalogue_search(
+            rows, inputs, oem_code=_oem_code_for_tenant(connection, tenant_id=tenant_id)
+        )
+
     return {"matched": matched, "matchStage": stage}
 
 
@@ -1264,14 +1395,21 @@ def _format_candidate_line(row: dict[str, Any], basis: str) -> str:
 
 
 def _candidate_task_payload(
-    inputs: dict[str, Any], matched: list[dict[str, Any]], *, multiple: bool
+    inputs: dict[str, Any], matched: list[dict[str, Any]], *, multiple: bool, stage: str = ""
 ) -> dict[str, Any]:
     """The PC-facing shortlist for the auto-spawned Task: business-readable
     comment text naming each candidate model/variant/colour with its
     ex-showroom price, plus the same list structured for a UI picker."""
     basis = inputs["registration_basis"]
     shortlist = matched[:5]
-    if multiple:
+    if stage == _CATALOGUE_STAGE:
+        intro = (
+            "The booking model text did not match any SKU name in the current price masters "
+            "(the scan may have been misread). The closest SKUs on fuel, price, model and trim "
+            "are listed. Open the scanned Booking Form on the Journey Documents page and "
+            "select the one that matches it:"
+        )
+    elif multiple:
         intro = (
             f"The booking model text matched {len(matched)} possible vehicle SKUs and "
             "could not be narrowed to one automatically. Open the scanned Booking Form "
@@ -1740,7 +1878,7 @@ def sync_model_resolution(
             )
             return {"resolved": True, "skuCode": matched[0]["sku_code"], "matchStage": stage}
 
-        multiple = len(matched) > 1
+        multiple = len(matched) > 1 and stage != _CATALOGUE_STAGE
         _machine_flag(
             connection,
             tenant_id=tenant_id,
@@ -1762,8 +1900,13 @@ def sync_model_resolution(
                     if multiple
                     else " did not match any price-master SKU"
                 )
-                + " on model, on-road total or ex-showroom price. Confirm the model so "
-                "the deal can be checked against the price and discount masters."
+                + " on model, on-road total or ex-showroom price. "
+                + (
+                    f"The {len(matched)} closest SKUs are listed on the task. "
+                    if stage == _CATALOGUE_STAGE
+                    else ""
+                )
+                + "Confirm the model so the deal can be checked against the price and discount masters."
             ),
             correlation_id=correlation_id,
             safe_payload={
@@ -1796,7 +1939,7 @@ def sync_model_resolution(
                     for r in matched[:10]
                 ],
             },
-            task_payload_extra=_candidate_task_payload(inputs, matched, multiple=multiple),
+            task_payload_extra=_candidate_task_payload(inputs, matched, multiple=multiple, stage=stage),
         )
         return {"raised": True, "matchStage": stage, "candidateCount": len(matched)}
     except Exception:
