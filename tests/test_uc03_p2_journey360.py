@@ -607,3 +607,19 @@ def test_only_the_vehicle_line_of_a_vehicle_invoice_is_adjusted():
     ]
     docs = [{"documentType": "tax_invoice_tally", "documentId": "doc-1", "fields": dict(_PRATEEK_TAXES)}]
     assert _vehicle_invoice_with_tax(rows, docs) == rows
+
+
+def test_the_etag_changes_with_the_deployed_build(journey, monkeypatch):
+    """A fix to how a screen is calculated must reach a Journey whose data has not changed."""
+    from audit_core import uc03_p2_journey360 as model
+
+    def etag():
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            return model.journey_etag(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+    monkeypatch.setattr(model, "release_version", lambda: "build-a")
+    first = etag()
+    assert etag() == first  # unchanged data and build: same key, so 304 still works
+    monkeypatch.setattr(model, "release_version", lambda: "build-b")
+    assert etag() != first

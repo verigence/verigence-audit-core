@@ -24,6 +24,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core.logging_config import release_version
 from audit_core.uc03_duplicate_booking_detection import _BASIS_LABEL
 from audit_core.uc03_duplicate_receipt_detection import (
     ReceiptRecord,
@@ -296,7 +297,10 @@ def journey_etag(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
         ),
         {"t": tenant_id, "j": journey_id},
     ).mappings().one()
-    material = ":".join(str(v) for v in row.values())
+    # The build is part of the key: a change to how a screen is calculated must reach a
+    # Journey whose data has not changed since the last deploy, so a browser holding the
+    # earlier answer is told it is stale instead of being answered 304.
+    material = ":".join([release_version(), *(str(v) for v in row.values())])
     return '"' + hashlib.sha256(material.encode()).hexdigest()[:24] + '"'
 
 
