@@ -124,6 +124,17 @@ task_types:
     actions:
     - REUPLOAD_DOCUMENT
     - ADD_COMMENT
+  # A file still not read a day after upload (decision 2026-10-01): the
+  # Team Lead is told, with what the PC already has. Closes itself.
+  TL_DOCUMENT_STUCK:
+    category: SUPERVISORY_NOTICE
+    owner: TL
+    origin: SYSTEM
+    source: DOCUMENT
+    completion: MACHINE_VERIFIED
+    actions:
+    - COMPLETE_ACTION
+    - ADD_COMMENT
   # A PC deleted a booking that a failed document upload left stuck: the
   # TL is told.
   JOURNEY_CANCELLED_NOTICE:

@@ -64,6 +64,7 @@ from audit_core.uc03_p2_controls import (
     request_control_evaluation,
 )
 from audit_core.uc03_p2_customer import sync_customer_name
+from audit_core.uc03_p2_document_health import STUCK_AFTER_SECONDS
 from audit_core.uc03_p2_grouping import (
     PageFact,
     merge_pdf_pages,
@@ -78,6 +79,7 @@ from audit_core.uc03_p2_runtime import (
     note_facts_changed,
     record_activity,
     request_page_recovery,
+    request_page_reread,
     requeue_page_for_ingest,
 )
 from audit_core.uc03_p2_stage import recompute_journey_stage
@@ -2219,6 +2221,76 @@ def _reconcile_page(
     return outcome
 
 
+def _page_reread(engine: Engine, work: WorkItem) -> None:
+    """Ask Document Intelligence to read one page again (decision
+    2026-10-01): the PC's "Read again", the journey Re-sync or the nightly
+    sweep. DI never re-uploads or re-classifies; it queues one more reading
+    of the document it holds, or says the page is already read, still in
+    hand, or not classified. The page's own state follows that answer and
+    the journey reconcile picks the result up."""
+    queue_id = UUID(work.work_key)
+    with engine.begin() as connection:
+        set_tenant_context(connection, work.tenant_id)
+        row = connection.execute(
+            text(
+                """
+                SELECT queue_status, di_document_id FROM auditcore.p2_document_queue
+                WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+                """
+            ),
+            {"tenant_id": work.tenant_id, "queue_id": queue_id},
+        ).mappings().one_or_none()
+    if row is None or row["queue_status"] in ("MERGED", "CANCELLED", "READY") or row["di_document_id"] is None:
+        logger.info("p2_page_reread_skipped", queue_id=str(queue_id),
+                    queue_status=row["queue_status"] if row else None, **_work_fields(work))
+        return
+    context_ref, token, _, _ = _di_context_and_requirements(engine, work)
+    outcome = get_di_capture_v2_client().reprocess_document(
+        token=token, tenant_id=work.tenant_id, external_context_ref=context_ref,
+        document_id=str(row["di_document_id"]),
+    )
+    result = str(outcome.get("outcome") or "")
+    status = {
+        "queued": "EXTRACTING",
+        "in_progress": "EXTRACTING",
+        "already_processed": "SYNCING_TO_AUDIT_CORE",
+        "not_classified": "CLASSIFYING",
+    }.get(result)
+    logger.info(
+        "p2_page_reread",
+        queue_id=str(queue_id),
+        di_document_id=str(row["di_document_id"]),
+        di_outcome=result,
+        processing_job_id=outcome.get("processingJobId"),
+        new_status=status,
+        **_work_fields(work),
+    )
+    with engine.begin() as connection:
+        set_tenant_context(connection, work.tenant_id)
+        _owned(connection, work)
+        if status is not None:
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.p2_document_queue
+                    SET queue_status=:status, status_reason=NULL, last_error=NULL,
+                        di_submitted_at_utc=now(), updated_at_utc=now()
+                    WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+                      AND queue_status NOT IN ('MERGED', 'CANCELLED', 'READY')
+                    """
+                ),
+                {"tenant_id": work.tenant_id, "queue_id": queue_id, "status": status},
+            )
+        record_activity(
+            connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+            event_type="PAGE_REREAD", subject_type="DOCUMENT_PAGE", subject_id=str(queue_id),
+            details={"diOutcome": result, "processingJobId": outcome.get("processingJobId"),
+                     "status": status},
+            correlation_id=work.correlation_id,
+        )
+        _enqueue_journey_reconcile(connection, work=work, delay_seconds=5)
+
+
 def _legacy_document_reconcile(engine: Engine, work: WorkItem) -> None:
     """Items queued before 0121 reconcile through the Journey-level path."""
     with engine.begin() as connection:
@@ -2544,9 +2616,41 @@ def queue_nightly_upload_sweep(connection, *, tenant_id: str, now: datetime | No
             correlation_id=None,
         )
         journeys.add(journey_id)
+    # Decision 2026-10-01: a classified page DI has held for eight hours
+    # without reading it, or settled without reading, is asked for again
+    # tonight (one reading of the document DI holds, never a re-upload).
+    reread = connection.execute(
+        text(
+            """
+            SELECT q.queue_id, q.journey_id
+            FROM auditcore.p2_document_queue q
+            WHERE q.tenant_id=:t AND q.di_document_id IS NOT NULL
+              AND q.template_key IS NOT NULL AND q.template_key <> 'supporting_document'
+              AND (
+                (q.queue_status IN ('CLASSIFYING','EXTRACTING','SYNCING_TO_AUDIT_CORE')
+                 AND COALESCE(q.di_submitted_at_utc, q.created_at_utc) < :stuck_cutoff)
+                OR (q.queue_status='SUPPORTING' AND q.type_overridden_by_actor_id IS NULL
+                    AND q.updated_at_utc < :stuck_cutoff)
+              )
+            """
+        ),
+        {"t": tenant_id, "stuck_cutoff": now - timedelta(seconds=STUCK_AFTER_SECONDS)},
+    ).mappings().all()
+    for row in reread:
+        journey_id = UUID(str(row["journey_id"]))
+        request_page_reread(
+            connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=UUID(str(row["queue_id"])),
+            requested_by="SYSTEM", correlation_id=None,
+        )
+        journeys.add(journey_id)
     for journey_id in journeys:
         sync_processing_failure_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
-    return {"retried": len(failed), "reconciled": len(stuck), "journeys": len(journeys)}
+    if reread:
+        logger.warning(
+            "p2_nightly_document_defects", tenant_id=tenant_id, pages_unread=len(reread),
+            journeys=len({str(r["journey_id"]) for r in reread}),
+        )
+    return {"retried": len(failed), "reconciled": len(stuck), "reread": len(reread), "journeys": len(journeys)}
 
 
 def _stage_recompute(engine: Engine, work: WorkItem) -> None:
@@ -2684,6 +2788,7 @@ def process_work(engine: Engine, work: WorkItem) -> None:
         "DOCUMENT_INGEST": _ingest_document,
         "DOCUMENT_RECONCILE": _legacy_document_reconcile,
         "JOURNEY_RECONCILE": _journey_reconcile,
+        "PAGE_REREAD": _page_reread,
         "BATCH_GROUP": _group_batch,
         "STAGE_RECOMPUTE": _stage_recompute,
         "TASK_VERIFY": _task_verify,

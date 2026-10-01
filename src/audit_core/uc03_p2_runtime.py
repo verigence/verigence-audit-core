@@ -272,6 +272,47 @@ def request_page_recovery(
     return str(row["client_upload_id"])
 
 
+def request_page_reread(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    queue_id: UUID,
+    requested_by: str,
+    correlation_id: str | None,
+) -> None:
+    """Ask Document Intelligence to read a page it already holds once more
+    (decision 2026-10-01: never a re-upload for a page DI has). Queued work:
+    a second request for the same page coalesces, and DI itself never
+    doubles a reading already in hand. A page DI never received is sent
+    through the ordinary recovery instead."""
+    row = connection.execute(
+        text(
+            """
+            SELECT di_document_id, client_upload_id FROM auditcore.p2_document_queue
+            WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+            """
+        ),
+        {"tenant_id": tenant_id, "queue_id": queue_id},
+    ).mappings().one()
+    if row["di_document_id"] is None:
+        request_page_recovery(
+            connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id,
+            marker="r", requested_by=requested_by, correlation_id=correlation_id,
+        )
+        return
+    enqueue_work(
+        connection, tenant_id=tenant_id, journey_id=journey_id, work_type="PAGE_REREAD",
+        work_key=str(queue_id), payload={"queueId": str(queue_id), "uploadedBy": requested_by},
+        correlation_id=correlation_id,
+    )
+    record_activity(
+        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="PAGE_REREAD_REQUESTED",
+        subject_type="DOCUMENT_PAGE", subject_id=str(queue_id), details={"by": requested_by},
+        correlation_id=correlation_id,
+    )
+
+
 def requeue_page_for_ingest(
     connection: Connection,
     *,

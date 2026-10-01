@@ -103,6 +103,24 @@ class DiCaptureV2Client:
             params={"phase": phase},
         )
 
+    def reprocess_document(
+        self,
+        *,
+        token: str,
+        tenant_id: str,
+        external_context_ref: str,
+        document_id: str,
+    ) -> dict[str, Any]:
+        """Ask DI to read a document it already holds once more (no
+        re-upload). Returns DI's outcome: queued, in_progress,
+        already_processed or not_classified."""
+        return self._request(
+            "POST",
+            f"/v2/tenants/{tenant_id}/audit-storage-contexts/"
+            f"{external_context_ref}/capture-documents/{document_id}:reprocess",
+            token=token,
+        )
+
     def delete_document(
         self,
         *,

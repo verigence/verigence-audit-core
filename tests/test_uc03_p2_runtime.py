@@ -680,7 +680,7 @@ def test_nightly_sweep_re_drives_a_page_stuck_for_a_day_once(journey, monkeypatc
             {"q": quality},
         )
         swept = worker.queue_nightly_upload_sweep(connection, tenant_id=journey.tenant_id)
-    assert swept == {"retried": 1, "reconciled": 1, "journeys": 1}
+    assert swept == {"retried": 1, "reconciled": 1, "reread": 0, "journeys": 1}
     assert _page_status(journey, old_failed) == "QUEUED"
     ingest = queue_row(journey, "DOCUMENT_INGEST", str(old_failed))
     assert ingest["work_status"] == "PENDING" and ingest["payload"]["recover"] == "n"

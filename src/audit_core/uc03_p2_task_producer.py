@@ -23,9 +23,11 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_p2_document_health import STUCK_AFTER_SECONDS, TL_AFTER_SECONDS
 from audit_core.uc03_p2_names import display_name, same_organisation, same_person
 from audit_core.uc03_p2_registry import ControlTemplate, Registry, get_registry
 from audit_core.uc03_p2_stage import unreviewed_fields
@@ -576,6 +578,7 @@ def _resolve_prefix_except(connection: Connection, *, tenant_id: str, journey_id
 # or a quota is waited out); after an hour the PC is simply told how far the
 # file is, and the task updates itself until the file is done.
 _UPLOAD_STATUS_AFTER_SECONDS = int(os.environ.get("P2_UPLOAD_STATUS_AFTER_SECONDS", str(60 * 60)))
+_IST = ZoneInfo("Asia/Kolkata")
 _SETTLED_PAGE_STATES = ("READY", "SUPPORTING", "NEEDS_REVIEW", "CANCELLED", "MERGED")
 _FAILED_PAGE_STATES = ("FAILED", "DEAD_LETTER")
 
@@ -606,6 +609,7 @@ def sync_processing_failure_tasks(
     registry = registry or get_registry()
     now = now or datetime.now(UTC)
     wanted: set[str] = set()
+    tl_wanted: set[str] = set()
     counts: dict[str, int] = {}
     batches = connection.execute(
         text(
@@ -665,11 +669,39 @@ def sync_processing_failure_tasks(
                 parts.append(f"{retrying} waiting for an automatic retry")
             if failed_pages:
                 parts.append(f"{_pages_text(failed_pages)} could not be processed so far")
-            description = (", ".join(parts) + ". Nothing to do yet: check back after 1 hour. This task updates "
-                           "itself, and closes when the file is done or tells you which pages to upload on "
-                           "their own if any cannot be processed.")
+            if age >= STUCK_AFTER_SECONDS:
+                # Decision 2026-10-01: after eight hours the PC is told the
+                # truth, and what will happen next, instead of "check back".
+                since = row["created_at_utc"].astimezone(_IST).strftime("%H:%M on %d %b")
+                description = (", ".join(parts) + f". Waiting for the document service since {since}. It is "
+                               "retried automatically tonight; Re-sync on Upload / Edit Documents asks for it "
+                               "again now. This task updates itself and closes when the file is done.")
+            else:
+                description = (", ".join(parts) + ". Nothing to do yet: check back after 1 hour. This task "
+                               "updates itself, and closes when the file is done or tells you which pages to "
+                               "upload on their own if any cannot be processed.")
         else:
             continue
+        if in_progress and age >= TL_AFTER_SECONDS:
+            # Decision 2026-10-01: a file still not read after a day is the
+            # Team Lead's to know about, with what the PC has already been told.
+            tl_key = f"upload-stuck-tl:{journey_id}:{row['batch_id']}"
+            tl_wanted.add(tl_key)
+            _, tl_outcome = raise_or_refresh(
+                connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=tl_key,
+                task_type="TL_DOCUMENT_STUCK", source_type="DOCUMENT", source_code="DOCUMENT_PROCESSING_STUCK",
+                title=f"{filename}: not read for more than a day ({done} of {total} pages read)",
+                description=(f"{filename} was uploaded more than 24 hours ago and {total - done} of its pages "
+                             "are still not read. The PC has the file's own status task; the document service "
+                             "is asked again every night. If it stays unread, raise it with support. This task "
+                             "closes itself when the file is done."),
+                reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT",
+                           "sourceCode": "DOCUMENT_PROCESSING_STUCK", "batchId": str(row["batch_id"]),
+                           "filename": filename,
+                           "pages": {"total": total, "read": done, "working": working, "retrying": retrying}},
+                severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
+            )
+            counts[tl_outcome] = counts.get(tl_outcome, 0) + 1
         key = f"upload-status:{journey_id}:{row['batch_id']}"
         wanted.add(key)
         _, outcome = raise_or_refresh(
@@ -689,6 +721,10 @@ def sync_processing_failure_tasks(
     closed = _resolve_prefix_except(
         connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"upload-status:{journey_id}:",
         keep=wanted, evidence={"reason": "The file was processed or removed."},
+    )
+    closed += _resolve_prefix_except(
+        connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"upload-stuck-tl:{journey_id}:",
+        keep=tl_wanted, evidence={"reason": "The file was processed or removed."},
     )
     # The per-page tasks this replaced (one per failed page) close too.
     closed += _resolve_prefix_except(
