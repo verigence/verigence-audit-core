@@ -247,6 +247,49 @@ def test_match_bridge_is_a_no_op_for_unrelated_models() -> None:
 
 
 # ── integration ──────────────────────────────────────────────────────────────
+
+# ── unit: catalogue search once the model name itself never resolved ─────────
+def _ev_rows():
+    return [
+        _row("AX5L-EV", "XUV 3XO EV", variant="AX5L", ex="1500000") | {"fuel_powertrain": "ELECTRIC", "trim": "AX5L"},
+        _row("AX7L-EV", "XUV 3XO EV", variant="AX7L", ex="1700000") | {"fuel_powertrain": "ELECTRIC", "trim": "AX7L"},
+        _row("AX7L-P", "XUV 3XO", variant="AX7L PET MT", ex="1200000") | {"fuel_powertrain": "PETROL", "trim": "AX7L"},
+        _row("Z8L", "SCORPIO N", variant="Z8L D AT", ex="2000000") | {"fuel_powertrain": "DIESEL", "trim": "Z8L"},
+    ]
+
+
+def test_catalogue_search_shortlists_the_misread_nameplate_and_never_pins_on_a_weak_trim() -> None:
+    """The real DEV case: handwritten "XUV3XO AX7L EV" extracted as "XUV300" /
+    "W7L EV". The stated EV excludes the petrol twin, the folded nameplate
+    keeps both electric trims, and "W7L" is not close enough to either to
+    pin one: the PC gets exactly those two to pick from."""
+    matched, stage = mr._catalogue_search(
+        _ev_rows(), _inputs(model="XUV300", variant="W7L EV"), oem_code="MAHINDRA",
+    )
+    assert stage == "CATALOGUE_SEARCH"
+    assert sorted(r["sku_code"] for r in matched) == ["AX5L-EV", "AX7L-EV"]
+
+
+def test_catalogue_search_pins_when_an_exact_price_confirms_one_candidate() -> None:
+    matched, stage = mr._catalogue_search(
+        _ev_rows(), _inputs(model="XUV300", variant="W7L EV", ex="1700000"), oem_code="MAHINDRA",
+    )
+    assert stage == "CATALOGUE_SEARCH"
+    assert [r["sku_code"] for r in matched] == ["AX7L-EV"]
+
+
+def test_catalogue_search_pins_when_the_trim_is_stated_exactly() -> None:
+    matched, _ = mr._catalogue_search(
+        _ev_rows(), _inputs(model="XUV300", variant="AX7L EV"), oem_code="MAHINDRA",
+    )
+    assert [r["sku_code"] for r in matched] == ["AX7L-EV"]
+
+
+def test_catalogue_search_finds_nothing_for_an_unrelated_nameplate() -> None:
+    rows = [_row("AX", "THAR ROXX", variant="AX", ex="1400000") | {"fuel_powertrain": "DIESEL", "trim": "AX"}]
+    assert mr._catalogue_search(rows, _inputs(model="Scorpio N", variant="Z8L"), oem_code="MAHINDRA") == ([], "NONE")
+
+
 @pytest.fixture
 def journey():
     database_url = os.environ.get("DATABASE_URL")
@@ -1037,6 +1080,54 @@ def test_integration_trim_alone_disambiguates_when_it_genuinely_discriminates(ma
         {"t": c.tenant_id, "j": c.journey_id},
     ).scalar_one()
     assert pinned_variant == "Z8T G MT 2WD 7 STR BS6.2 - N"
+
+
+def test_integration_catalogue_search_lists_the_closest_skus_when_the_model_was_misread(mahindra_journey) -> None:
+    c = mahindra_journey
+    ax5l, ax7l, *_ = _seed_price_list(c, [
+        {"model": "XUV 3XO EV", "variant": "AX5L", "fuel": "ELECTRIC", "trim": "AX5L",
+         "components": {"EX_SHOWROOM": "1500000"}},
+        {"model": "XUV 3XO EV", "variant": "AX7L", "fuel": "ELECTRIC", "trim": "AX7L",
+         "components": {"EX_SHOWROOM": "1700000"}},
+        {"model": "XUV 3XO", "variant": "AX7L PET MT", "fuel": "PETROL", "transmission": "MT", "trim": "AX7L",
+         "components": {"EX_SHOWROOM": "1200000"}},
+    ])
+    _set_journey_product(c, "XUV300", "W7L EV")
+
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("raised") is True
+    assert result.get("matchStage") == "CATALOGUE_SEARCH"
+    assert _open_model_flags(c) == 1
+
+    shortlist = mr.get_model_resolution_candidates(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    assert shortlist["matchStage"] == "CATALOGUE_SEARCH"
+    assert sorted(str(item["productSkuId"]) for item in shortlist["candidates"]) == sorted([str(ax5l), str(ax7l)])
+
+
+def test_integration_catalogue_search_pins_when_the_ex_showroom_price_settles_it(mahindra_journey) -> None:
+    c = mahindra_journey
+    _, ax7l, *_ = _seed_price_list(c, [
+        {"model": "XUV 3XO EV", "variant": "AX5L", "fuel": "ELECTRIC", "trim": "AX5L",
+         "components": {"EX_SHOWROOM": "1500000"}},
+        {"model": "XUV 3XO EV", "variant": "AX7L", "fuel": "ELECTRIC", "trim": "AX7L",
+         "components": {"EX_SHOWROOM": "1700000"}},
+    ])
+    _set_journey_product(c, "XUV300", "W7L EV")
+    _set_commercial(c, "ex_showroom_price", "1700000")
+
+    result = mr.sync_model_resolution(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result.get("resolved") is True
+    assert result.get("matchStage") == "CATALOGUE_SEARCH"
+    pinned = c.execute(
+        text("SELECT product_sku_id FROM auditcore.journey_products WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert pinned == ax7l
+    assert _open_model_flags(c) == 0
 
 
 def test_integration_falls_back_to_latest_master_when_booking_predates_it(journey) -> None:
