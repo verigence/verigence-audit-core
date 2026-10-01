@@ -480,7 +480,7 @@ def test_high_confidence_correction_approval_keeps_machine_value_and_detects_sta
         ).mappings().one()
     assert (row["extracted_value"], row["effective_value"]) == ("100", "150")
 
-    # A second proposal made against 150 goes stale when the value changes first.
+    # A proposal made against 150 goes stale when the value changes first.
     with journey.engine.begin() as connection:
         stale = correct_p2_document_field(
             tenant_id=journey.tenant_id, journey_id=journey.journey_id, document_id=di_document_id,
@@ -491,19 +491,13 @@ def test_high_confidence_correction_approval_keeps_machine_value_and_detects_sta
             human_principal=principal(journey), authorization_client=AllowAllAuthorization(),
             connection=connection,
         )
-        competing = correct_p2_document_field(
-            tenant_id=journey.tenant_id, journey_id=journey.journey_id, document_id=di_document_id,
-            command=P2FieldCorrectionCommand(
-                canonicalFieldId=canonical, fieldKey="p2_test_amount",
-                sourceFactVersion=1, newValue="160", remarks="other",
-            ),
-            human_principal=principal(journey), authorization_client=AllowAllAuthorization(),
-            connection=connection,
-        )
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
-        submit_action(connection, tenant_id=journey.tenant_id, task_id=competing["taskId"],
-                      action="APPROVE_CORRECTION", actor_id="tl-1", actor_role_code="TL", comment=None)
+        connection.execute(
+            text("UPDATE auditcore.journey_document_extracted_fields SET effective_value=to_jsonb('160'::text) "
+                 "WHERE tenant_id=:t AND di_document_id=:d AND field_key='p2_test_amount'"),
+            {"t": journey.tenant_id, "d": di_document_id},
+        )
     with journey.engine.begin() as connection, pytest.raises(TaskStateError):
         set_tenant_context(connection, journey.tenant_id)
         submit_action(connection, tenant_id=journey.tenant_id, task_id=stale["taskId"],
@@ -890,3 +884,71 @@ def test_a_classified_type_outside_the_catalogue_gets_a_repeatable_checklist_row
         assert worker._ensure_extra_requirement_rows(
             connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
         ) == 0
+
+
+def test_a_field_with_a_correction_waiting_for_the_team_lead_cannot_be_edited_or_confirmed_again(journey):
+    from fastapi import HTTPException
+
+    from audit_core.uc03_p2_documents import (
+        P2FieldConfirmCommand,
+        _pending_corrections,
+        _pending_for,
+        confirm_p2_document_field,
+    )
+
+    di_document_id = uuid4()
+    add_page(journey, di_document_id=di_document_id)
+    canonical = add_extracted_field(
+        journey, di_document_id=di_document_id, field_key="p2_test_amount", value="100", confidence=98.0,
+    )
+
+    def propose(new_value):
+        with journey.engine.begin() as connection:
+            return correct_p2_document_field(
+                tenant_id=journey.tenant_id, journey_id=journey.journey_id, document_id=di_document_id,
+                command=P2FieldCorrectionCommand(
+                    canonicalFieldId=canonical, fieldKey="p2_test_amount",
+                    sourceFactVersion=1, newValue=new_value, remarks="wrong year captured",
+                ),
+                human_principal=principal(journey), authorization_client=AllowAllAuthorization(),
+                connection=connection,
+            )
+
+    def pending_on_review():
+        """What the document review shows on the field: the open proposal, if any."""
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            open_proposals = _pending_corrections(
+                connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id, document_id=di_document_id,
+            )
+        return _pending_for(
+            open_proposals, field_key="p2_test_amount", canonical_field_id=canonical, source_fact_version=1,
+        )
+
+    assert pending_on_review() is None
+    first = propose("150")
+    waiting = pending_on_review()
+    assert waiting["taskId"] == first["taskId"] and waiting["proposedValue"] == "150"
+
+    with pytest.raises(HTTPException) as again:
+        propose("175")
+    assert again.value.status_code == 409 and "waiting for the Team Lead" in again.value.detail
+    with journey.engine.begin() as connection, pytest.raises(HTTPException) as confirm:
+        confirm_p2_document_field(
+            tenant_id=journey.tenant_id, journey_id=journey.journey_id, document_id=di_document_id,
+            field_key="p2_test_amount",
+            command=P2FieldConfirmCommand(canonicalFieldId=canonical, sourceFactVersion=1),
+            human_principal=principal(journey), authorization_client=AllowAllAuthorization(),
+            connection=connection,
+        )
+    assert confirm.value.status_code == 409
+
+    # Once the Team Lead rejects it, the PC can correct the field again.
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        submit_action(
+            connection, tenant_id=journey.tenant_id, task_id=first["taskId"],
+            action="REJECT_CORRECTION", actor_id="tl-1", actor_role_code="TL", comment="Year is right",
+        )
+    assert pending_on_review() is None
+    assert propose("175")["applied"] is False

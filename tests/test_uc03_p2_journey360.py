@@ -532,3 +532,78 @@ def test_a_document_reported_under_two_spellings_of_its_type_is_one_source(journ
     row = next(r for g in view["categories"] for r in g["components"] if r["key"] == "insurance_amount")
     assert Decimal(row["booking"]) == 96082 and row["billed"] is None
     assert [(s["document"], s["amount"]) for s in row["sources"]] == [("Booking Docket", "96082.00")]
+
+
+# ------------------------------------------- vehicle invoice amount includes tax
+
+def _vehicle_source(amount, doc_id="doc-1", doc_type="tax_invoice_tally", component="ex_showroom_price"):
+    return {"line_kind": "COMMERCIAL", "component_key": component, "source_document_type": doc_type,
+            "amount": Decimal(amount), "source_document_id": doc_id}
+
+
+def _cash_discount(amount, doc_type="tax_invoice_tally"):
+    return {"line_kind": "DISCOUNT", "component_key": "cash_discount", "source_document_type": doc_type,
+            "amount": Decimal(amount), "source_document_id": "doc-1"}
+
+
+_PRATEEK_TAXES = {"cgst_amount": "199714.31", "sgst_amount": "199714.31", "igst_amount": None, "cess_amount": None}
+
+
+def test_vehicle_invoice_amount_is_the_price_before_discount_plus_cgst_and_sgst():
+    from audit_core.uc03_p2_journey360 import _vehicle_invoice_with_tax
+
+    out = _vehicle_invoice_with_tax(
+        [_vehicle_source("998571.57"), _cash_discount("17857")],
+        [{"documentType": "tax_invoice_tally", "documentId": "doc-1", "fields": dict(_PRATEEK_TAXES)}],
+    )
+    vehicle = next(s for s in out if s["component_key"] == "ex_showroom_price")
+    # gross 1,016,428.57 + CGST 199,714.31 + SGST 199,714.31
+    assert vehicle["amount"] == Decimal("1415857.19")
+    # The sheet nets the 17,857 discount off once: 13,98,000.19, what the customer pays before TCS.
+    assert vehicle["amount"] - Decimal(17857) == Decimal("1398000.19")
+    # Nothing else moves.
+    assert [s for s in out if s["component_key"] != "ex_showroom_price"] == [_cash_discount("17857")]
+
+
+def test_vehicle_invoice_taxes_are_read_from_another_copy_of_the_same_invoice():
+    from audit_core.uc03_p2_journey360 import _vehicle_invoice_with_tax
+
+    out = _vehicle_invoice_with_tax(
+        [_vehicle_source("998571.57", doc_id="copy-without-taxes"), _cash_discount("17857")],
+        [
+            {"documentType": "tax_invoice_tally", "documentId": "copy-without-taxes", "fields": {}},
+            {"documentType": "tax_invoice_tally", "documentId": "copy-with-taxes", "fields": dict(_PRATEEK_TAXES)},
+        ],
+    )
+    assert next(s for s in out if s["component_key"] == "ex_showroom_price")["amount"] == Decimal("1415857.19")
+
+
+def test_vehicle_invoice_without_printed_tax_keeps_its_value():
+    from audit_core.uc03_p2_journey360 import _vehicle_invoice_with_tax
+
+    rows = [_vehicle_source("998571.57"), _cash_discount("17857")]
+    out = _vehicle_invoice_with_tax(rows, [{"documentType": "tax_invoice_tally", "documentId": "doc-1", "fields": {}}])
+    assert out == rows
+
+
+def test_vehicle_invoice_igst_and_cess_count_like_cgst_and_sgst():
+    from audit_core.uc03_p2_journey360 import _vehicle_invoice_with_tax
+
+    out = _vehicle_invoice_with_tax(
+        [_vehicle_source("100000", doc_type="customer_invoice_dms")],
+        [{"documentType": "customer_invoice_dms", "documentId": "doc-1",
+          "fields": {"igst_amount": "28000", "cess_amount": "22000"}}],
+    )
+    assert out[0]["amount"] == Decimal(150000)
+
+
+def test_only_the_vehicle_line_of_a_vehicle_invoice_is_adjusted():
+    from audit_core.uc03_p2_journey360 import _vehicle_invoice_with_tax
+
+    rows = [
+        _vehicle_source("78688.04", doc_type="accessory_invoice_tally", component="accessories_cost"),
+        _vehicle_source("1423001", doc_type="cost_sheet"),
+        _vehicle_source("13980", component="tcs_amount"),
+    ]
+    docs = [{"documentType": "tax_invoice_tally", "documentId": "doc-1", "fields": dict(_PRATEEK_TAXES)}]
+    assert _vehicle_invoice_with_tax(rows, docs) == rows

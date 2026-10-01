@@ -580,6 +580,57 @@ def _document_billed(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+_VEHICLE_TAX_KEYS = ("cgst_amount", "sgst_amount", "igst_amount", "cess_amount")
+
+
+def _vehicle_invoice_with_tax(sources: list[Any], documents: list[dict[str, Any]]) -> list[Any]:
+    """The vehicle line of a vehicle invoice, as the customer is charged for
+    it: the price before the invoice discount plus CGST and SGST (IGST and
+    cess where the invoice carries them).
+
+    The invoice header's taxable value is the price after the discount and
+    before tax, while the price master and the booking form quote the
+    ex-showroom price with tax; set against them it read about 30% short.
+    The invoice discount stays on the sheet as its own discount line, so
+    the price before discount is the taxable value plus that discount; the
+    sheet then nets it off once. The taxes come from the invoice document
+    of the row, else any invoice of the same type that printed them. A row
+    whose invoice printed no tax keeps the value it had."""
+    out: list[Any] = []
+    for source in sources:
+        if (
+            source["line_kind"] != "COMMERCIAL" or source["component_key"] != "ex_showroom_price"
+            or str(source["source_document_type"]) not in _VEHICLE_INVOICE_TYPES
+        ):
+            out.append(source)
+            continue
+        kind = _norm_type(source["source_document_type"])
+        same_type = [d for d in documents if _norm_type(d["documentType"]) == kind]
+        own = [d for d in same_type if str(d["documentId"]) == str(source["source_document_id"])]
+        taxes = next(
+            (
+                [_dec(d["fields"].get(key)) or Decimal(0) for key in _VEHICLE_TAX_KEYS]
+                for d in own + same_type
+                if any(_dec(d["fields"].get(key)) for key in _VEHICLE_TAX_KEYS)
+            ),
+            None,
+        )
+        amount = _dec(source["amount"])
+        if taxes is None or amount is None:
+            out.append(source)
+            continue
+        discount = sum(
+            (
+                _dec(s["amount"]) or Decimal(0) for s in sources
+                if s["line_kind"] == "DISCOUNT" and s["component_key"] == "cash_discount"
+                and _norm_type(s["source_document_type"]) == kind
+            ),
+            Decimal(0),
+        )
+        out.append({**dict(source), "amount": amount + discount + sum(taxes, Decimal(0))})
+    return out
+
+
 def _flags(kind: str, standard: Any, booking: Any, billed: Any, ledger: Any) -> list[str]:
     flags: list[str] = []
     std, bk, bl, lg = _dec(standard), _dec(booking), _dec(billed), _dec(ledger)
@@ -754,6 +805,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         s for s in _document_billed(documents)
         if (s["component_key"], _norm_type(s["source_document_type"])) not in present
     ]
+    sources = _vehicle_invoice_with_tax(sources, documents)
 
     # Normalise every source row onto (kind, key): discount-like commercial
     # fields fold onto their scheme benefit, declared totals are set apart.

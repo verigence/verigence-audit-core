@@ -213,6 +213,65 @@ def _related_tasks(
     return [dict(row) for row in rows]
 
 
+def _pending_corrections(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    document_id: UUID,
+) -> list[dict[str, Any]]:
+    """Corrections the PC has proposed on this document that the Team Lead
+    has not yet approved or rejected, newest first. While one is open the
+    field is not edited or confirmed again: the PC already gave the answer."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT task_id, reference, created_at_utc
+            FROM auditcore.p2_tasks
+            WHERE tenant_id=:tenant_id
+              AND journey_id=:journey_id
+              AND task_type='FIELD_CORRECTION_REVIEW_P2'
+              AND reference->>'documentId'=:document_id
+              AND task_status NOT IN ('VERIFIED_COMPLETE', 'CANCELLED', 'FAILED', 'DEAD_LETTER')
+            ORDER BY created_at_utc DESC
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "document_id": str(document_id)},
+    ).mappings().all()
+    return [
+        {
+            "taskId": str(row["task_id"]),
+            "fieldKey": (row["reference"] or {}).get("fieldKey"),
+            "canonicalFieldId": (row["reference"] or {}).get("canonicalFieldId"),
+            "sourceFactVersion": (row["reference"] or {}).get("sourceFactVersion"),
+            "proposedValue": (row["reference"] or {}).get("proposedValue"),
+            "proposedAtUtc": row["created_at_utc"],
+        }
+        for row in rows
+    ]
+
+
+def _pending_for(
+    pending: list[dict[str, Any]], *, field_key: str, canonical_field_id: str, source_fact_version: int,
+) -> dict[str, Any] | None:
+    """The open proposal for this exact field fact, if any."""
+    return next(
+        (
+            p for p in pending
+            if p["fieldKey"] == field_key
+            and str(p["canonicalFieldId"] or "") == str(canonical_field_id or "")
+            and int(p["sourceFactVersion"] or 0) == int(source_fact_version or 0)
+        ),
+        None,
+    )
+
+
+_PENDING_CORRECTION_DETAIL = (
+    "A correction for this field is already waiting for the Team Lead. "
+    "It can be changed once the Team Lead approves or rejects it."
+)
+
+
 def _durable_lookup(rows: list[dict[str, Any]]) -> dict[tuple[str, int], dict[str, Any]]:
     result: dict[tuple[str, int], dict[str, Any]] = {}
     for row in rows:
@@ -361,6 +420,9 @@ def get_p2_document_review(
 
     # Why each value needs a look, decided here so the editor and the Task
     # Queue flag the same fields for the same reasons.
+    pending_corrections = _pending_corrections(
+        connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+    )
     registry = get_registry()
     di_type = context["document_type_key"]
     template = registry.template_for_di_type(di_type, stage=str(context["stage_code"] or "").upper() or None)
@@ -372,6 +434,16 @@ def get_p2_document_review(
         item["reviewReasons"] = [] if reviewed or blank else field_review_reasons(
             registry, template, di_type=di_type, field_key=str(item["fieldKey"]), value=value,
             confidence=float(confidence) if confidence is not None else None,
+        )
+        proposal = _pending_for(
+            pending_corrections, field_key=str(item["fieldKey"]),
+            canonical_field_id=str(item.get("canonicalFieldId") or ""),
+            source_fact_version=int(item.get("sourceFactVersion") or 0),
+        )
+        item["pendingCorrection"] = (
+            {"taskId": proposal["taskId"], "proposedValue": proposal["proposedValue"],
+             "proposedAtUtc": proposal["proposedAtUtc"]}
+            if proposal else None
         )
 
     correction_history = [
@@ -676,6 +748,12 @@ def confirm_p2_document_field(
         permission_key=_UPDATE_PERMISSION,
     )
     _document_context(connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id)
+    if _pending_for(
+        _pending_corrections(connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id),
+        field_key=field_key, canonical_field_id=command.canonicalFieldId,
+        source_fact_version=command.sourceFactVersion,
+    ):
+        raise HTTPException(status_code=409, detail=_PENDING_CORRECTION_DETAIL)
     confirmed = connection.execute(
         text(
             """
@@ -795,6 +873,12 @@ def correct_p2_document_field(
             status_code=409,
             detail="The extracted field changed. Refresh the document and retry.",
         )
+    if _pending_for(
+        _pending_corrections(connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id),
+        field_key=command.fieldKey, canonical_field_id=command.canonicalFieldId,
+        source_fact_version=command.sourceFactVersion,
+    ):
+        raise HTTPException(status_code=409, detail=_PENDING_CORRECTION_DETAIL)
 
     confidence = (
         float(field["confidence_score"])
