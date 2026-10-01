@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, Engine, text
 
+from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_engine, get_human_principal
 from audit_core.di_client import DiClient, DiClientError
 from audit_core.errors import DependencyUnavailableError
@@ -148,6 +149,32 @@ def _document_context(
         "queue_id": row["queue_id"],
         "queue_status": row["queue_status"],
     }
+
+
+def _awaits_set_type(
+    engine: Engine, *, tenant_id: str, journey_id: UUID, document_id: UUID,
+) -> bool:
+    """The page is one DI could not classify and the PC has not typed yet:
+    the "Set type" case of the page health (uc03_p2_document_health)."""
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        return bool(
+            connection.execute(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM auditcore.p2_document_queue
+                        WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                          AND di_document_id=:document_id
+                          AND queue_status='SUPPORTING'
+                          AND (template_key IS NULL OR template_key IN ('', 'supporting_document'))
+                          AND type_overridden_by_actor_id IS NULL
+                    )
+                    """
+                ),
+                {"tenant_id": tenant_id, "journey_id": journey_id, "document_id": document_id},
+            ).scalar_one()
+        )
 
 
 def _durable_fields(
@@ -328,6 +355,9 @@ def get_p2_document_review(
         related_task_rows = _related_tasks(
             connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
         )
+        pending_corrections = _pending_corrections(
+            connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+        )
         context_ref, token = _ensure_di_context(
             connection=connection,
             engine=engine,
@@ -356,11 +386,19 @@ def get_p2_document_review(
             document_id=str(document_id),
         )
     except DiClientError as exc:
-        di_error = exc.code
-        if not durable:
-            raise DependencyUnavailableError(
-                detail="Document facts are temporarily unavailable."
-            ) from exc
+        # DI answers E008 ("not yet confirmed") for a page it never classified:
+        # there are no fields to read, which is not an outage. Such a page is
+        # shown as uploaded, with its preview, so the PC can set its type.
+        if exc.code == "E008" and not durable and _awaits_set_type(
+            engine, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+        ):
+            di_facts = ()
+        else:
+            di_error = exc.code
+            if not durable:
+                raise DependencyUnavailableError(
+                    detail="Document facts are temporarily unavailable."
+                ) from exc
 
     fields: list[dict[str, Any]] = []
     seen: set[tuple[str, int]] = set()
@@ -420,9 +458,6 @@ def get_p2_document_review(
 
     # Why each value needs a look, decided here so the editor and the Task
     # Queue flag the same fields for the same reasons.
-    pending_corrections = _pending_corrections(
-        connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
-    )
     registry = get_registry()
     di_type = context["document_type_key"]
     template = registry.template_for_di_type(di_type, stage=str(context["stage_code"] or "").upper() or None)

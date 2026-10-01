@@ -952,3 +952,111 @@ def test_a_field_with_a_correction_waiting_for_the_team_lead_cannot_be_edited_or
         )
     assert pending_on_review() is None
     assert propose("175")["applied"] is False
+
+
+# ------------------------------------- opening a page DI never classified
+
+def _review_with_facts_error(journey, monkeypatch, *, queue_status, template_key, overridden, code):
+    from types import SimpleNamespace
+
+    from audit_core import uc03_p2_documents as documents
+    from audit_core.di_client import DiClientError, DiDocument
+
+    di_document_id = uuid4()
+    add_page(journey, di_document_id=di_document_id, status=queue_status)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_document_queue SET template_key=:k, "
+                 "type_overridden_by_actor_id=:o WHERE tenant_id=:t AND di_document_id=:d"),
+            {"k": template_key, "o": journey.actor_id if overridden else None,
+             "t": journey.tenant_id, "d": di_document_id},
+        )
+    monkeypatch.setattr(documents, "_ensure_di_context", lambda **_: ("ctx", "token"))
+
+    class Di:
+        def get_audit_document(self, **_):
+            return DiDocument(document_id=str(di_document_id), upload_status="UPLOADED",
+                              processing_status="PROCESSED", confirmation_status="UNCONFIRMED")
+
+        def get_audit_document_facts(self, **_):
+            raise DiClientError(status_code=422, code=code, retryable=False)
+
+    return documents.get_p2_document_review(
+        tenant_id=journey.tenant_id, journey_id=journey.journey_id, document_id=di_document_id,
+        human_principal=principal(journey), authorization_client=AllowAllAuthorization(),
+        engine=journey.engine,
+        security_client=SimpleNamespace(get_service_token=lambda **_: "token"),
+        di_client=Di(),
+    )
+
+
+def test_a_page_awaiting_its_type_opens_with_its_preview_instead_of_an_error(journey, monkeypatch):
+    review = _review_with_facts_error(
+        journey, monkeypatch, queue_status="SUPPORTING", template_key="supporting_document",
+        overridden=False, code="E008",
+    )
+    assert review["fields"] == []
+    assert review["contentAvailable"] is True
+    assert review["diReadError"] is None
+
+
+def test_every_other_facts_failure_still_reports_the_dependency_error(journey, monkeypatch):
+    from audit_core.errors import DependencyUnavailableError
+
+    for queue_status, template_key, overridden, code in (
+        ("SUPPORTING", "supporting_document", False, "DI_UNAVAILABLE"),  # DI really failing
+        ("SUPPORTING", "booking_form", False, "E008"),                    # classified page
+        ("SUPPORTING", "supporting_document", True, "E008"),              # PC already typed it (Others)
+        ("READY", None, False, "E008"),                                   # not a Set type page
+    ):
+        with pytest.raises(DependencyUnavailableError):
+            _review_with_facts_error(
+                journey, monkeypatch, queue_status=queue_status, template_key=template_key,
+                overridden=overridden, code=code,
+            )
+
+
+def test_a_normal_document_review_returns_fields_with_the_correction_waiting_for_the_team_lead(journey, monkeypatch):
+    from types import SimpleNamespace
+
+    from audit_core import uc03_p2_documents as documents
+    from audit_core.di_client import DiDocument, DiFact
+
+    di_document_id = uuid4()
+    add_page(journey, di_document_id=di_document_id, status="READY")
+    canonical = add_extracted_field(
+        journey, di_document_id=di_document_id, field_key="p2_test_amount", value="100", confidence=98.0,
+    )
+    with journey.engine.begin() as connection:
+        proposal = correct_p2_document_field(
+            tenant_id=journey.tenant_id, journey_id=journey.journey_id, document_id=di_document_id,
+            command=P2FieldCorrectionCommand(
+                canonicalFieldId=canonical, fieldKey="p2_test_amount",
+                sourceFactVersion=1, newValue="150", remarks="wrong year captured",
+            ),
+            human_principal=principal(journey), authorization_client=AllowAllAuthorization(),
+            connection=connection,
+        )
+    monkeypatch.setattr(documents, "_ensure_di_context", lambda **_: ("ctx", "token"))
+
+    class Di:
+        def get_audit_document(self, **_):
+            return DiDocument(document_id=str(di_document_id), upload_status="UPLOADED",
+                              processing_status="PROCESSED", confirmation_status="CONFIRMED")
+
+        def get_audit_document_facts(self, **_):
+            return (DiFact(canonical_field_id=canonical, field_key="p2_test_amount", value="100",
+                           value_source="EXTRACTED", confidence_score=98.0, version_no=1),)
+
+    review = documents.get_p2_document_review(
+        tenant_id=journey.tenant_id, journey_id=journey.journey_id, document_id=di_document_id,
+        human_principal=principal(journey), authorization_client=AllowAllAuthorization(),
+        engine=journey.engine,
+        security_client=SimpleNamespace(get_service_token=lambda **_: "token"),
+        di_client=Di(),
+    )
+    field = next(f for f in review["fields"] if f["fieldKey"] == "p2_test_amount")
+    assert field["pendingCorrection"]["taskId"] == proposal["taskId"]
+    assert field["pendingCorrection"]["proposedValue"] == "150"
+    assert review["diReadError"] is None and review["contentAvailable"] is True
