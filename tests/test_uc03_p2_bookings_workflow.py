@@ -82,6 +82,12 @@ def test_booking_completion_closes_the_existing_stage_and_lists_split(journey):
         set_tenant_context(connection, journey.tenant_id)
         assert mark_booking_completed(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
         assert not mark_booking_completed(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        # The stage engine writes its stage record before it marks the booking completed.
+        connection.execute(
+            text("INSERT INTO auditcore.p2_journey_runtime (tenant_id, journey_id, current_stage, "
+                 "booking_completion_state) VALUES (:t, :j, 'BOOKING_COMPLETE', 'COMPLETE')"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
     client = _client()
     base = f"/p2/v1/tenants/{journey.tenant_id}"
     [row] = client.get(f"{base}/journeys", params={"state": "open"}).json()["items"]

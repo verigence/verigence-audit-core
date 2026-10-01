@@ -1,4 +1,4 @@
-name: One-shot Puspanjali stage diagnose (DEV, read-only)
+name: One-shot Run the Deal build on real Prateek data diagnose (DEV, read-only)
 
 # Read-only: one customer's journeys. Never writes.
 on:
@@ -59,56 +59,29 @@ jobs:
           echo "::add-mask::$url"
           echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
 
-      - name: Print the journeys, stage records, uploads and delivery rows
+      - name: Build the Deal for both Prateek journeys, read-only
         shell: bash
         run: |
           python - <<'PY'
           import json, os
-          from decimal import Decimal
-          from datetime import datetime, date
           from sqlalchemy import create_engine, text
+          from audit_core.db import set_tenant_context
+          from audit_core.uc03_p2_journey360 import deal
 
-          def show(title, rows):
-              print(f"\n===== {title} ({len(rows)})")
-              for r in rows:
-                  print(json.dumps({k: (str(v) if isinstance(v, (Decimal, datetime, date)) else v) for k, v in dict(r).items()},
-                                   default=str, ensure_ascii=False))
-
+          T = "5fbe26ab-6ed7-444a-8488-5bfb81208588"
           engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=60000"})
-          with engine.connect() as c:
-              c.execute(text("SET TRANSACTION READ ONLY"))
-              js = c.execute(text("""
-                  SELECT j.journey_id, j.tenant_id, cu.display_name, j.journey_reference, j.audit_state,
-                         j.created_at_utc, j.updated_at_utc, j.review_completed_at_utc
-                  FROM auditcore.journeys j
-                  JOIN auditcore.customers cu ON cu.tenant_id=j.tenant_id AND cu.customer_id=j.customer_id
-                  WHERE cu.display_name ILIKE 'PUSPANJALI%'
-                  ORDER BY j.created_at_utc
-              """)).mappings().all()
-              show("journeys", js)
-              for j in js:
-                  p = {"j": j["journey_id"]}
-                  show("p2_journey_runtime", c.execute(text("SELECT * FROM auditcore.p2_journey_runtime WHERE journey_id=:j"), p).mappings().all())
-                  show("journey_stage_states", c.execute(text("""
-                      SELECT stage_code, business_status, business_completed_at_utc, capture_completed_at_utc,
-                             booking_confirm_date, closure_disposition, created_at_utc, updated_at_utc
-                      FROM auditcore.journey_stage_states WHERE journey_id=:j ORDER BY stage_code"""), p).mappings().all())
-                  show("deliveries", c.execute(text("SELECT * FROM auditcore.deliveries WHERE journey_id=:j"), p).mappings().all())
-                  show("upload batches", c.execute(text("""
-                      SELECT batch_id, original_filename, page_count, batch_status, created_at_utc
-                      FROM auditcore.p2_upload_batches WHERE journey_id=:j ORDER BY created_at_utc"""), p).mappings().all())
-                  show("page queue by status", c.execute(text("""
-                      SELECT queue_status, template_key, last_error, count(*) AS pages
-                      FROM auditcore.p2_document_queue WHERE journey_id=:j GROUP BY 1,2,3 ORDER BY 1"""), p).mappings().all())
-                  show("capture documents by status", c.execute(text("""
-                      SELECT stage_code, capture_status, count(*) AS n
-                      FROM auditcore.document_capture_v2_documents WHERE journey_id=:j GROUP BY 1,2"""), p).mappings().all())
-                  show("evidence", c.execute(text("""
-                      SELECT process_area, document_type_key, association_status, count(*) AS n
-                      FROM auditcore.evidence WHERE journey_id=:j GROUP BY 1,2,3 ORDER BY 1,2"""), p).mappings().all())
-                  show("stage gates", c.execute(text("""
-                      SELECT * FROM auditcore.p2_stage_gate_state WHERE journey_id=:j"""), p).mappings().all())
-                  show("activity (stage / upload events)", c.execute(text("""
-                      SELECT event_type, details, occurred_at_utc FROM auditcore.p2_activity_events
-                      WHERE journey_id=:j ORDER BY occurred_at_utc LIMIT 40"""), p).mappings().all())
+          for ref, jid in (("VJ2610-000028", "20f1de3c-46a7-4ac9-a7c1-dd9c39035255"), ("VJ2610-000033", "749e6c59-facc-489f-bf5b-6e087f2e319a")):
+              with engine.connect() as c:
+                  c.execute(text("SET TRANSACTION READ ONLY"))
+                  set_tenant_context(c, T)
+                  view = deal(c, tenant_id=T, journey_id=jid)
+                  rows = [x for g in view["categories"] for x in g["components"] if x["key"] in ("ex_showroom_price", "tcs_amount")]
+                  print("\n=====", ref)
+                  for r in rows:
+                      print(r["key"], "standard", r["standard"], "booking", r["booking"], "billed", r["billed"], "variance", r["variance"],
+                            "sources", json.dumps(r["sources"])[:400])
+                  print("summary gross", json.dumps(view["summary"]["gross"]))
+                  print("summary discounts", json.dumps(view["summary"]["discounts"]))
+                  print("summary net", json.dumps(view["summary"]["net"]))
+                  print("discount keys", [(d["key"], d["billed"], d["booking"], d["current"]) for d in view["discounts"]])
           PY

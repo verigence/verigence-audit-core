@@ -431,16 +431,12 @@ def list_p2_journeys(
             SELECT p.journey_id, p.journey_reference, p.customer_name, p.mobile_last4,
                    p.dealer_name, p.outlet_name, p.outlet_code, p.vehicle, p.created_at_utc, p.updated_at_utc,
                    p.pc_name, pv.price_variance, gp.gate_pass_date, op.opened_at,
-                   COALESCE(pr.current_stage,
-                     CASE
-                       WHEN ds.business_completed_at_utc IS NOT NULL OR dl.actual_delivered_at IS NOT NULL
-                         THEN 'DELIVERY_COMPLETE'
-                       WHEN ds.journey_id IS NOT NULL OR dl.journey_id IS NOT NULL
-                         THEN 'DELIVERY_DOCUMENT_UPLOAD'
-                       WHEN bs.business_status='BOOKING_CLOSED' OR bs.booking_confirm_date IS NOT NULL
-                         THEN 'BOOKING_COMPLETE'
-                       ELSE 'BOOKING_DOCUMENT_UPLOAD'
-                     END) AS current_stage,
+                   -- The stage is the Phase 2 stage record's, nothing else: a delivery
+                   -- or booking date from an older record never makes a journey
+                   -- "complete" (a gate pass date once showed Delivery complete before
+                   -- any stage record existed). Until the record exists it starts at
+                   -- the first step.
+                   COALESCE(pr.current_stage, 'BOOKING_DOCUMENT_UPLOAD') AS current_stage,
                    COALESCE(pr.booking_completion_state, 'IN_PROGRESS') AS booking_completion_state,
                    COALESCE(pr.delivery_completion_state, 'IN_PROGRESS') AS delivery_completion_state,
                    COALESCE(pr.booking_receipt_total, pay.booking_total, 0) AS booking_receipt_total,
