@@ -36,7 +36,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "sqlalchemy>=2" "psycopg[binary]>=3"
+          python -m pip install -e .
           npm install --global @railway/cli
 
       - name: Resolve Railway DEV database connection
@@ -170,4 +170,79 @@ jobs:
               show("price list versions of the tenant", c.execute(text("""
                   SELECT * FROM auditcore.price_list_versions WHERE tenant_id = :t ORDER BY created_at_utc DESC LIMIT 12
               """), {"t": journeys[0]["tenant_id"]}).mappings().all())
+          PY
+
+      - name: Replay the match read-only for the newest journeys
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          from decimal import Decimal
+          from datetime import datetime, date
+          from uuid import UUID
+          from sqlalchemy import create_engine, text
+          from audit_core.db import set_tenant_context
+          from audit_core import uc03_model_resolution as mr
+          from audit_core.uc03_sku_candidates import _price_plan_for_journey
+
+          def j(o):
+              return json.dumps(o, default=str, ensure_ascii=False)
+
+          # Every statement on this connection is read-only: a write raises.
+          engine = create_engine(os.environ["DATABASE_URL"],
+                                 connect_args={"options": "-c default_transaction_read_only=on -c statement_timeout=60000"})
+          with engine.connect() as c:
+              journeys = c.execute(text("""
+                  SELECT j.tenant_id, j.journey_id, cu.display_name AS customer
+                  FROM auditcore.journeys j
+                  LEFT JOIN auditcore.customers cu ON cu.tenant_id=j.tenant_id AND cu.customer_id=j.customer_id
+                  WHERE j.created_at_utc > now() - interval '1 day'
+                  ORDER BY j.created_at_utc DESC LIMIT 6
+              """)).mappings().all()
+              for row in journeys:
+                  tenant_id, journey_id = row["tenant_id"], UUID(str(row["journey_id"]))
+                  set_tenant_context(c, tenant_id)
+                  print(f"\n########## {row['customer']} {journey_id}")
+                  runs = c.execute(text("""
+                      SELECT rule_code, triggering_event, outcome, reason, evaluated_at_utc
+                      FROM auditcore.rule_executions
+                      WHERE tenant_id=:t AND journey_id=:j AND rule_code IN ('MODEL_NOT_IDENTIFIED','INVOICE_SKU_MISMATCH')
+                      ORDER BY evaluated_at_utc
+                  """), {"t": tenant_id, "j": journey_id}).mappings().all()
+                  print("resolver runs:", len(runs))
+                  for r in runs: print("  ", j(dict(r)))
+                  print("commercial_lines:", j([dict(r) for r in c.execute(text(
+                      "SELECT component_key, actual_amount, standard_amount, actual_source_kind FROM auditcore.commercial_lines "
+                      "WHERE tenant_id=:t AND journey_id=:j ORDER BY component_key"), {"t": tenant_id, "j": journey_id}).mappings()]))
+                  print("booking:", j([dict(r) for r in c.execute(text(
+                      "SELECT booking_date, pricing_effective_on, pricing_basis, pricing_reason FROM auditcore.bookings "
+                      "WHERE tenant_id=:t AND journey_id=:j"), {"t": tenant_id, "j": journey_id}).mappings()]))
+                  inputs = mr._resolution_inputs(c, tenant_id=tenant_id, journey_id=journey_id)
+                  print("inputs:", j(inputs))
+                  if inputs is None:
+                      continue
+                  outcome = mr._current_match(c, tenant_id=tenant_id, journey_id=journey_id, inputs=inputs)
+                  if outcome.get("skipped"):
+                      print("match:", j(outcome)); continue
+                  print("match stage:", outcome["matchStage"], "candidates:", len(outcome["matched"]))
+                  for m in outcome["matched"][:8]:
+                      print("   ", j({k: m.get(k) for k in ("sku_code","model_name","variant_name","colour_name","fuel_powertrain",
+                                     "transmission","drive","seater","trim","master_ex_showroom","master_total_individual")}))
+                  oem = mr._oem_code_for_tenant(c, tenant_id=tenant_id)
+                  print("oem:", oem, "model key:", mr._catalogue_key(str(inputs.get("model_name") or ""), oem_code=oem),
+                        "full key:", mr._catalogue_key(" ".join(x for x in (inputs.get("model_name"), inputs.get("variant_name")) if x), oem_code=oem))
+                  effective_on = date.fromisoformat(c.execute(text(
+                      "SELECT COALESCE(b.pricing_effective_on, b.booking_date, CURRENT_DATE) FROM auditcore.journeys j "
+                      "LEFT JOIN auditcore.bookings b ON b.tenant_id=j.tenant_id AND b.journey_id=j.journey_id "
+                      "WHERE j.tenant_id=:t AND j.journey_id=:j"), {"t": tenant_id, "j": journey_id}).scalar_one().isoformat())
+                  plan = _price_plan_for_journey(c, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on)
+                  print("plan:", j(plan))
+                  rows = mr._sku_rows_for_version(c, tenant_id=tenant_id, price_list_version_id=plan["price_list_version_id"])
+                  words = [w for w in str(inputs.get("model_name") or "").upper().replace("/", " ").split() if len(w) > 2]
+                  near = [r for r in rows if any(w in str(r["model_name"]).upper() for w in words)]
+                  print(f"price-master rows whose model shares a word with the paperwork ({len(near)} of {len(rows)}):")
+                  for r in sorted(near, key=lambda r: (str(r["model_name"]), str(r["variant_name"])))[:40]:
+                      print("   ", j({k: r.get(k) for k in ("model_name","variant_name","colour_name","fuel_powertrain","transmission",
+                                     "drive","seater","trim","master_ex_showroom","master_total_individual")}),
+                            "key:", mr._catalogue_key(str(r["model_name"]), oem_code=oem))
           PY
