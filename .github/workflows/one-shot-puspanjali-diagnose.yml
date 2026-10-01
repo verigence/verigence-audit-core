@@ -1,4 +1,4 @@
-name: One-shot Run the Deal build on real Prateek data diagnose (DEV, read-only)
+name: One-shot Duplicate booking signals diagnose (DEV, read-only)
 
 # Read-only: one customer's journeys. Never writes.
 on:
@@ -59,29 +59,38 @@ jobs:
           echo "::add-mask::$url"
           echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
 
-      - name: Build the Deal for both Prateek journeys, read-only
+      - name: Print the identity values the duplicate detector sees for the Pritishree pair
         shell: bash
         run: |
           python - <<'PY'
           import json, os
+          from decimal import Decimal
+          from datetime import datetime, date
           from sqlalchemy import create_engine, text
-          from audit_core.db import set_tenant_context
-          from audit_core.uc03_p2_journey360 import deal
 
-          T = "5fbe26ab-6ed7-444a-8488-5bfb81208588"
+          def show(title, rows):
+              print(f"\n===== {title} ({len(rows)})")
+              for r in rows:
+                  print(json.dumps({k: (str(v) if isinstance(v, (Decimal, datetime, date)) else v) for k, v in dict(r).items()},
+                                   default=str, ensure_ascii=False))
+
           engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=60000"})
-          for ref, jid in (("VJ2610-000028", "20f1de3c-46a7-4ac9-a7c1-dd9c39035255"), ("VJ2610-000033", "749e6c59-facc-489f-bf5b-6e087f2e319a")):
-              with engine.connect() as c:
-                  c.execute(text("SET TRANSACTION READ ONLY"))
-                  set_tenant_context(c, T)
-                  view = deal(c, tenant_id=T, journey_id=jid)
-                  rows = [x for g in view["categories"] for x in g["components"] if x["key"] in ("ex_showroom_price", "tcs_amount")]
-                  print("\n=====", ref)
-                  for r in rows:
-                      print(r["key"], "standard", r["standard"], "booking", r["booking"], "billed", r["billed"], "variance", r["variance"],
-                            "sources", json.dumps(r["sources"])[:400])
-                  print("summary gross", json.dumps(view["summary"]["gross"]))
-                  print("summary discounts", json.dumps(view["summary"]["discounts"]))
-                  print("summary net", json.dumps(view["summary"]["net"]))
-                  print("discount keys", [(d["key"], d["billed"], d["booking"], d["current"]) for d in view["discounts"]])
+          with engine.connect() as c:
+              c.execute(text("SET TRANSACTION READ ONLY"))
+              show("the finding", c.execute(text("""
+                  SELECT j.journey_reference, f.rule_key, f.finding_status, f.title, left(f.description, 300) AS description,
+                         f.created_at_utc, f.updated_at_utc
+                  FROM auditcore.audit_findings f JOIN auditcore.journeys j ON j.tenant_id=f.tenant_id AND j.journey_id=f.journey_id
+                  WHERE f.rule_key LIKE 'DUPLICATE_BOOKING%' ORDER BY f.created_at_utc DESC LIMIT 6""")).mappings().all())
+              for ref in ("VJ2609-000023", "VJ2610-000026"):
+                  show("identity fields for " + ref, c.execute(text("""
+                      SELECT f.source_document_type_key AS doc_type, e.association_status AS evidence_status, f.field_key,
+                             f.effective_value, f.confidence_score, f.is_modified, f.updated_at_utc
+                      FROM auditcore.journey_document_extracted_fields f
+                      JOIN auditcore.journeys j ON j.tenant_id=f.tenant_id AND j.journey_id=f.journey_id
+                      LEFT JOIN auditcore.evidence e ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id AND e.di_document_id=f.di_document_id
+                      WHERE j.journey_reference=:r
+                        AND f.field_key IN ('pan_number','aadhaar_number','customer_phone','pan_name','aadhaar_name','customer_name',
+                                            'address_pincode','aadhaar_address','customer_address')
+                      ORDER BY f.field_key, f.confidence_score DESC NULLS LAST"""), {"r": ref}).mappings().all())
           PY
