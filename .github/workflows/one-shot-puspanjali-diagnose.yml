@@ -1,4 +1,4 @@
-name: One-shot Duplicate booking signals diagnose (DEV, read-only)
+name: One-shot Duplicate booking rule run diagnose (DEV, read-only)
 
 # Read-only: one customer's journeys. Never writes.
 on:
@@ -59,7 +59,7 @@ jobs:
           echo "::add-mask::$url"
           echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
 
-      - name: Print the identity values the duplicate detector sees for the Pritishree pair
+      - name: Run the duplicate matcher read-only on the real pair and print the rule history
         shell: bash
         run: |
           python - <<'PY'
@@ -67,30 +67,39 @@ jobs:
           from decimal import Decimal
           from datetime import datetime, date
           from sqlalchemy import create_engine, text
+          from audit_core.db import set_tenant_context
+          from audit_core import uc03_duplicate_booking_detection as d
 
           def show(title, rows):
               print(f"\n===== {title} ({len(rows)})")
               for r in rows:
                   print(json.dumps({k: (str(v) if isinstance(v, (Decimal, datetime, date)) else v) for k, v in dict(r).items()},
-                                   default=str, ensure_ascii=False))
+                                   default=str, ensure_ascii=False)[:900])
 
+          T = "5fbe26ab-6ed7-444a-8488-5bfb81208588"
           engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=60000"})
           with engine.connect() as c:
               c.execute(text("SET TRANSACTION READ ONLY"))
-              show("the finding", c.execute(text("""
-                  SELECT j.journey_reference, f.rule_key, f.finding_status, f.title, left(f.description, 300) AS description,
-                         f.created_at_utc, f.updated_at_utc
-                  FROM auditcore.audit_findings f JOIN auditcore.journeys j ON j.tenant_id=f.tenant_id AND j.journey_id=f.journey_id
-                  WHERE f.rule_key LIKE 'DUPLICATE_BOOKING%' ORDER BY f.created_at_utc DESC LIMIT 6""")).mappings().all())
-              for ref in ("VJ2609-000023", "VJ2610-000026"):
-                  show("identity fields for " + ref, c.execute(text("""
-                      SELECT f.source_document_type_key AS doc_type, e.association_status AS evidence_status, f.field_key,
-                             f.effective_value, f.confidence_score, f.is_modified, f.updated_at_utc
-                      FROM auditcore.journey_document_extracted_fields f
-                      JOIN auditcore.journeys j ON j.tenant_id=f.tenant_id AND j.journey_id=f.journey_id
-                      LEFT JOIN auditcore.evidence e ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id AND e.di_document_id=f.di_document_id
-                      WHERE j.journey_reference=:r
-                        AND f.field_key IN ('pan_number','aadhaar_number','customer_phone','pan_name','aadhaar_name','customer_name',
-                                            'address_pincode','aadhaar_address','customer_address')
-                      ORDER BY f.field_key, f.confidence_score DESC NULLS LAST"""), {"r": ref}).mappings().all())
+              set_tenant_context(c, T)
+              ids = {r[0]: r[1] for r in c.execute(text("SELECT journey_reference, journey_id FROM auditcore.journeys WHERE journey_reference IN ('VJ2609-000023','VJ2610-000026')")).all()}
+              print("journeys", ids)
+              j26, j23 = ids["VJ2610-000026"], ids["VJ2609-000023"]
+              sig = d._identity_signals(c, tenant_id=T, journey_id=j26)
+              print("\nsignals VJ26:", json.dumps(sig, default=str))
+              cands = d._candidate_journeys(c, tenant_id=T, journey_id=j26)
+              for cand in cands:
+                  basis = d._match_basis(sig, cand)
+                  if basis:
+                      print("candidate", cand["journey_id"], "basis", basis, "conf", d._CONFIDENCE_PERCENT_BY_BASIS[basis],
+                            "pan", cand.get("pan"), "aadhaar", cand.get("aadhaar"), "mobile", cand.get("mobile"), "name", cand.get("name"))
+              show("finding rows for VJ26 (payload, events)", c.execute(text("""
+                  SELECT to_jsonb(f) - 'description' AS finding FROM auditcore.audit_findings f
+                  WHERE f.journey_id=:j AND f.rule_key LIKE 'DUPLICATE_BOOKING%'"""), {"j": j26}).mappings().all())
+              show("rule executions for VJ26", c.execute(text("""
+                  SELECT to_jsonb(r) AS execution FROM auditcore.rule_executions r
+                  WHERE r.journey_id=:j AND to_jsonb(r)::text ILIKE '%DUPLICATE_BOOKING%'
+                  ORDER BY r.evaluated_at_utc"""), {"j": j26}).mappings().all())
+              show("control state for VJ26 duplicate", c.execute(text("""
+                  SELECT to_jsonb(s) AS state FROM auditcore.p2_control_state s
+                  WHERE s.journey_id=:j AND to_jsonb(s)::text ILIKE '%DUPLICATE_BOOKING%'"""), {"j": j26}).mappings().all())
           PY
