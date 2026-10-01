@@ -1,4 +1,4 @@
-name: One-shot Duplicate booking rule run diagnose (DEV, read-only)
+name: One-shot Reference naming data diagnose (DEV, read-only)
 
 # Read-only: one customer's journeys. Never writes.
 on:
@@ -59,7 +59,7 @@ jobs:
           echo "::add-mask::$url"
           echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
 
-      - name: Run the duplicate matcher read-only on the real pair and print the rule history
+      - name: Print outlet, dealer and creator naming data (read-only)
         shell: bash
         run: |
           python - <<'PY'
@@ -68,38 +68,26 @@ jobs:
           from datetime import datetime, date
           from sqlalchemy import create_engine, text
           from audit_core.db import set_tenant_context
-          from audit_core import uc03_duplicate_booking_detection as d
 
           def show(title, rows):
               print(f"\n===== {title} ({len(rows)})")
               for r in rows:
                   print(json.dumps({k: (str(v) if isinstance(v, (Decimal, datetime, date)) else v) for k, v in dict(r).items()},
-                                   default=str, ensure_ascii=False)[:900])
+                                   default=str, ensure_ascii=False)[:600])
 
           T = "5fbe26ab-6ed7-444a-8488-5bfb81208588"
           engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=60000"})
           with engine.connect() as c:
               c.execute(text("SET TRANSACTION READ ONLY"))
               set_tenant_context(c, T)
-              ids = {r[0]: r[1] for r in c.execute(text("SELECT journey_reference, journey_id FROM auditcore.journeys WHERE journey_reference IN ('VJ2609-000023','VJ2610-000026')")).all()}
-              print("journeys", ids)
-              j26, j23 = ids["VJ2610-000026"], ids["VJ2609-000023"]
-              sig = d._identity_signals(c, tenant_id=T, journey_id=j26)
-              print("\nsignals VJ26:", json.dumps(sig, default=str))
-              cands = d._candidate_journeys(c, tenant_id=T, journey_id=j26)
-              for cand in cands:
-                  basis = d._match_basis(sig, cand)
-                  if basis:
-                      print("candidate", cand["journey_id"], "basis", basis, "conf", d._CONFIDENCE_PERCENT_BY_BASIS[basis],
-                            "pan", cand.get("pan"), "aadhaar", cand.get("aadhaar"), "mobile", cand.get("mobile"), "name", cand.get("name"))
-              show("finding rows for VJ26 (payload, events)", c.execute(text("""
-                  SELECT to_jsonb(f) - 'description' AS finding FROM auditcore.audit_findings f
-                  WHERE f.journey_id=:j AND f.rule_key LIKE 'DUPLICATE_BOOKING%'"""), {"j": j26}).mappings().all())
-              show("rule executions for VJ26", c.execute(text("""
-                  SELECT to_jsonb(r) AS execution FROM auditcore.rule_executions r
-                  WHERE r.journey_id=:j AND to_jsonb(r)::text ILIKE '%DUPLICATE_BOOKING%'
-                  ORDER BY r.evaluated_at_utc"""), {"j": j26}).mappings().all())
-              show("control state for VJ26 duplicate", c.execute(text("""
-                  SELECT to_jsonb(s) AS state FROM auditcore.p2_control_state s
-                  WHERE s.journey_id=:j AND to_jsonb(s)::text ILIKE '%DUPLICATE_BOOKING%'"""), {"j": j26}).mappings().all())
+              show("outlet columns", c.execute(text("""
+                  SELECT table_name, column_name FROM information_schema.columns
+                  WHERE table_schema='auditcore' AND table_name IN ('outlets','dealers') ORDER BY table_name, ordinal_position""")).mappings().all())
+              show("outlets", c.execute(text("""
+                  SELECT to_jsonb(o) AS o FROM auditcore.outlets o LIMIT 40""")).mappings().all())
+              show("dealers", c.execute(text("""
+                  SELECT dealer_id, dealer_code, to_jsonb(d)->>'dealer_name' AS name FROM auditcore.dealers d LIMIT 40""")).mappings().all())
+              show("creators per journey", c.execute(text("""
+                  SELECT created_by_display_name AS name, count(*) AS n FROM auditcore.journeys
+                  GROUP BY 1 ORDER BY 2 DESC LIMIT 40""")).mappings().all())
           PY
