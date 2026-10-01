@@ -89,6 +89,11 @@ NOW = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
         ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, 0, 61, None, "SYNCING_TO_AUDIT_CORE"),
         ({"state": "CLASSIFIED", "processingStatus": "PROCESSING"}, 0, 45, None, "EXTRACTING"),
         ({"state": "CLASSIFIED", "processingStatus": "PROCESSING"}, 0, 601, None, "EXTRACTING"),
+        # Queued and waiting its turn: still in hand, however long.
+        ({"state": "CLASSIFIED", "processingStatus": "PENDING", "extractionQueued": True}, 0, 601, None, "EXTRACTING"),
+        ({"state": "CLASSIFIED", "processingStatus": "PENDING"}, 0, 601, None, "EXTRACTING"),
+        # Classified and never queued (extra copy, no slot, no profile): settled at once.
+        ({"state": "CLASSIFIED", "processingStatus": "PENDING", "extractionQueued": False}, 0, 1, None, "SUPPORTING"),
         ({"state": "STORED"}, 0, 601, None, "CLASSIFYING"),
         (None, 0, 1, None, "CLASSIFYING"),
         (None, 0, 10, None, "FAILED"),
