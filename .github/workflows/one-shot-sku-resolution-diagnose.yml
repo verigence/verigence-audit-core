@@ -138,8 +138,8 @@ jobs:
                   JOIN auditcore.audit_findings f ON f.tenant_id=e.tenant_id AND f.audit_finding_id=e.audit_finding_id
                   WHERE f.journey_id = ANY(:ids)
                     AND (f.rule_key LIKE 'MODEL_NOT_IDENTIFIED%' OR f.rule_key = 'INVOICE_SKU_MISMATCH')
-                  ORDER BY e.created_at_utc
-              """), p).mappings().all())
+                  ORDER BY e.occurred_at_utc
+              """), p).mappings().all()
               show("finding events (payload with inputs, stage, candidates)", events)
               show("open P2 tasks about the vehicle", c.execute(text("""
                   SELECT journey_id, task_type, severity, task_status, title, left(description, 500) AS description,
