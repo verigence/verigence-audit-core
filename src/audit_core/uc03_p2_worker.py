@@ -106,10 +106,11 @@ from audit_core.uc03_unified_document_capture import (
 logger = structlog.get_logger(__name__)
 
 # Retries for a step that hit a transient fault (the document service or
-# storage down, rate limited): two quick ones for a blip, two spaced ones
-# for an outage, then the PC is told. A fault that cannot recover (the
-# document service refused the request, an unreadable file) is told at once.
-_RETRY_DELAYS_SECONDS = (60, 240, 1800, 3600)
+# storage down, rate limited): never within five minutes (decision
+# 2026-10-01: ten minutes, ten minutes, then spaced out for an outage),
+# then the PC is told. A fault that cannot recover (the document service
+# refused the request, an unreadable file) is told at once.
+_RETRY_DELAYS_SECONDS = (600, 600, 1800, 3600)
 _MAX_ATTEMPTS = int(os.environ.get("P2_WORKER_MAX_ATTEMPTS", str(len(_RETRY_DELAYS_SECONDS) + 1)))
 _POLL_SECONDS = float(os.environ.get("P2_WORKER_POLL_SECONDS", "1.0"))
 _MAX_PDF_PAGES = int(os.environ.get("P2_MAX_PDF_PAGES", "100"))
