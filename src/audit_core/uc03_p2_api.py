@@ -514,7 +514,8 @@ def list_p2_journeys(
             )
             SELECT p.journey_id, p.journey_reference, p.customer_name, p.mobile_last4,
                    p.dealer_name, p.outlet_name, p.outlet_code, p.vehicle, p.created_at_utc, p.updated_at_utc,
-                   p.pc_name, pv.price_variance, gp.gate_pass_date, op.opened_at,
+                   p.pc_name, COALESCE(pr.price_variance, pv.price_variance) AS price_variance,
+                   gp.gate_pass_date, op.opened_at,
                    -- The stage is the Phase 2 stage record's, nothing else: a delivery
                    -- or booking date from an older record never makes a journey
                    -- "complete" (a gate pass date once showed Delivery complete before

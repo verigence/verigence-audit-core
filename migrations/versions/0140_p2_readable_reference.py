@@ -1,4 +1,4 @@
-"""0140_p2_readable_journey_reference — a readable reference per Journey.
+"""0140_p2_readable_reference — a readable reference per Journey.
 
 A Phase 2 Journey now gets OUTLET-PC-YYMMDD-NNN (e.g. UTK-AC-261001-003): the
 first three letters of the outlet, two letters for the PC, the IST day, and a
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0140_p2_readable_journey_reference"
+revision = "0140_p2_readable_reference"
 down_revision = "0139_p2_page_reread_work"
 branch_labels = None
 depends_on = None
