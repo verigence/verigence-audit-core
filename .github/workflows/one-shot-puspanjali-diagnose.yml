@@ -59,7 +59,7 @@ jobs:
           echo "::add-mask::$url"
           echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
 
-      - name: Print the journeys, stage records, uploads and delivery rows
+      - name: Print documents, queue pages and stage records with times
         shell: bash
         run: |
           python - <<'PY'
@@ -77,38 +77,25 @@ jobs:
           engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=60000"})
           with engine.connect() as c:
               c.execute(text("SET TRANSACTION READ ONLY"))
-              js = c.execute(text("""
-                  SELECT j.journey_id, j.tenant_id, cu.display_name, j.journey_reference, j.audit_state,
-                         j.created_at_utc, j.updated_at_utc, j.review_completed_at_utc
-                  FROM auditcore.journeys j
-                  JOIN auditcore.customers cu ON cu.tenant_id=j.tenant_id AND cu.customer_id=j.customer_id
-                  WHERE cu.display_name ILIKE 'PUSPANJALI%'
-                  ORDER BY j.created_at_utc
-              """)).mappings().all()
-              show("journeys", js)
-              for j in js:
-                  p = {"j": j["journey_id"]}
-                  show("p2_journey_runtime", c.execute(text("SELECT * FROM auditcore.p2_journey_runtime WHERE journey_id=:j"), p).mappings().all())
-                  show("journey_stage_states", c.execute(text("""
-                      SELECT stage_code, business_status, business_completed_at_utc, capture_completed_at_utc,
-                             booking_confirm_date, closure_disposition, created_at_utc, updated_at_utc
-                      FROM auditcore.journey_stage_states WHERE journey_id=:j ORDER BY stage_code"""), p).mappings().all())
-                  show("deliveries", c.execute(text("SELECT * FROM auditcore.deliveries WHERE journey_id=:j"), p).mappings().all())
-                  show("upload batches", c.execute(text("""
-                      SELECT batch_id, original_filename, page_count, batch_status, created_at_utc
-                      FROM auditcore.p2_upload_batches WHERE journey_id=:j ORDER BY created_at_utc"""), p).mappings().all())
-                  show("page queue by status", c.execute(text("""
-                      SELECT queue_status, template_key, last_error, count(*) AS pages
-                      FROM auditcore.p2_document_queue WHERE journey_id=:j GROUP BY 1,2,3 ORDER BY 1"""), p).mappings().all())
-                  show("capture documents by status", c.execute(text("""
-                      SELECT stage_code, capture_status, count(*) AS n
-                      FROM auditcore.document_capture_v2_documents WHERE journey_id=:j GROUP BY 1,2"""), p).mappings().all())
-                  show("evidence", c.execute(text("""
-                      SELECT process_area, document_type_key, association_status, count(*) AS n
-                      FROM auditcore.evidence WHERE journey_id=:j GROUP BY 1,2,3 ORDER BY 1,2"""), p).mappings().all())
-                  show("stage gates", c.execute(text("""
-                      SELECT * FROM auditcore.p2_stage_gate_state WHERE journey_id=:j"""), p).mappings().all())
-                  show("activity (stage / upload events)", c.execute(text("""
-                      SELECT event_type, details, occurred_at_utc FROM auditcore.p2_activity_events
-                      WHERE journey_id=:j ORDER BY occurred_at_utc LIMIT 40"""), p).mappings().all())
+              p = {"j": "dc9b79f4-1885-4ef1-9f80-92fb39919389"}
+              print("now:", c.execute(text("SELECT now()")).scalar())
+              show("runtime now", c.execute(text("SELECT current_stage, booking_completion_state, delivery_completion_state, created_at_utc, updated_at_utc FROM auditcore.p2_journey_runtime WHERE journey_id=:j"), p).mappings().all())
+              show("queue pages by status now", c.execute(text("SELECT queue_status, count(*) AS pages, min(created_at_utc) AS first, max(updated_at_utc) AS last_update FROM auditcore.p2_document_queue WHERE journey_id=:j GROUP BY 1"), p).mappings().all())
+              show("evidence rows (what the journey holds)", c.execute(text("""
+                  SELECT e.process_area, e.document_type_key, e.association_status, e.created_at_utc,
+                         e.di_document_id, (q.queue_id IS NOT NULL) AS in_queue, q.queue_status, q.page_number
+                  FROM auditcore.evidence e
+                  LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id=e.tenant_id AND q.journey_id=e.journey_id AND q.di_document_id=e.di_document_id
+                  WHERE e.journey_id=:j ORDER BY e.created_at_utc"""), p).mappings().all())
+              show("capture documents", c.execute(text("""
+                  SELECT capture_status, classified_document_type_key, count(*) AS n, min(created_at_utc) AS first, max(created_at_utc) AS last
+                  FROM auditcore.document_capture_v2_documents WHERE journey_id=:j GROUP BY 1,2 ORDER BY 1,2"""), p).mappings().all())
+              show("queue pages (first 40)", c.execute(text("""
+                  SELECT page_number, queue_status, template_key, classified_document_type, di_document_id IS NOT NULL AS has_di_doc,
+                         di_submitted_at_utc, updated_at_utc, last_error
+                  FROM auditcore.p2_document_queue WHERE journey_id=:j ORDER BY page_number LIMIT 40"""), p).mappings().all())
+              show("activity events", c.execute(text("SELECT to_jsonb(e) AS ev FROM auditcore.p2_activity_events e WHERE journey_id=:j LIMIT 60"), p).mappings().all())
+              show("work queue for the journey", c.execute(text("""
+                  SELECT work_type, work_status, attempt_count, created_at_utc, updated_at_utc, last_error
+                  FROM auditcore.p2_work_queue WHERE journey_id=:j ORDER BY created_at_utc LIMIT 30"""), p).mappings().all())
           PY
