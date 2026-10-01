@@ -135,7 +135,8 @@ def test_run_all_rules_for_delivery_stage_only_runs_delivery_scoped_rules(
     # instead, plus the two stage-scoped checks.
     rule_codes = {r.ruleCode for r in results}
     assert rule_codes == {
-        "MODEL_NOT_IDENTIFIED", "MANUAL_VERIFICATION", "PAYMENT_BANK_UNMATCHED", "AUTOMATED_SYNC_FAILURE",
+        "MODEL_NOT_IDENTIFIED", "INVOICE_SKU_MISMATCH",
+        "MANUAL_VERIFICATION", "PAYMENT_BANK_UNMATCHED", "AUTOMATED_SYNC_FAILURE",
         # The deal-audit checks that need a delivery.
         "DELIVERED_ON_SHORT_PAYMENT", "PAYMENT_AFTER_DELIVERY_WITHIN_GRACE", "PAYMENT_AFTER_DELIVERY_BEYOND_GRACE",
         "DO_PAYMENT_NOT_RECEIVED", "DO_SHORT_PAYMENT", "TRADE_IN_NOT_RESOLD", "TRADE_IN_SOLD_AT_LOSS",
