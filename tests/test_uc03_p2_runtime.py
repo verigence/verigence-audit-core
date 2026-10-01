@@ -171,7 +171,7 @@ def test_failures_back_off_then_dead_letter_and_fail_the_page(journey, monkeypat
             {"q": queue_id},
         ).mappings().one()
     assert waiting["queue_status"] == "RETRY_WAIT"
-    assert "Retrying automatically in 1 minute" in waiting["status_reason"]
+    assert "Retrying automatically in 10 minutes" in waiting["status_reason"]
     assert "check back later" in waiting["status_reason"]
     # A first transient failure is not worth a task: the file is minutes old.
     with journey.engine.begin() as connection:
@@ -236,9 +236,10 @@ def test_failures_back_off_then_dead_letter_and_fail_the_page(journey, monkeypat
     assert task["reference"]["pageNumbers"] == [1] and task["reference"]["retrying"] is False
 
 
-def test_retries_are_staggered_over_an_hour():
+def test_retries_are_never_within_five_minutes():
     delays = [worker._RETRY_DELAYS_SECONDS[min(n, len(worker._RETRY_DELAYS_SECONDS)) - 1] for n in (1, 2, 3, 4)]
-    assert delays == [60, 240, 1800, 3600]  # two quick, two spaced, then the PC is told
+    assert delays == [600, 600, 1800, 3600]  # decision 2026-10-01: no retry within five minutes
+    assert min(delays) >= 300
     assert worker._MAX_ATTEMPTS == 5
 
 
