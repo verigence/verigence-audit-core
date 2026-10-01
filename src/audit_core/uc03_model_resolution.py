@@ -705,6 +705,86 @@ def _resolve_open_flag(
     return len(open_ids)
 
 
+def _refresh_open_flag(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    finding_id: UUID,
+    title: str,
+    description: str,
+    safe_payload: dict[str, Any],
+    task_payload_extra: dict[str, Any],
+    correlation_id: str,
+) -> bool:
+    """Decision 2026-10-01: an open MODEL_NOT_IDENTIFIED finding follows the
+    latest run. ``_machine_flag`` leaves an existing open finding untouched,
+    so a finding first raised from an invoice's text kept that wording and
+    an empty shortlist for ever, however many Booking Form reads and
+    re-syncs came after (Sonali Das on DEV: "did not match any SKU" while
+    the resolver held eleven). When the wording changed, the finding's
+    title and description are rewritten (the Phase 2 task refreshes from
+    them), the new inputs and shortlist are recorded as a REFRESHED event,
+    and the open self-serve task's candidates are replaced. Returns whether
+    anything changed."""
+    current = connection.execute(
+        text(
+            """
+            SELECT title, description FROM auditcore.audit_findings
+            WHERE tenant_id=:tenant_id AND audit_finding_id=:fid
+              AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
+            """
+        ),
+        {"tenant_id": tenant_id, "fid": finding_id},
+    ).mappings().one_or_none()
+    if current is None or (current["title"] == title and current["description"] == description):
+        return False
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.audit_findings
+            SET title=:title, description=:description, updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND audit_finding_id=:fid
+            """
+        ),
+        {"tenant_id": tenant_id, "fid": finding_id, "title": title, "description": description},
+    )
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.audit_finding_events (
+                tenant_id, audit_finding_id, journey_id, stage_code,
+                event_type, actor_id, actor_role_snapshot, safe_payload, correlation_id
+            ) VALUES (
+                :tenant_id, :fid, :journey_id, :stage,
+                'REFRESHED', NULL, 'SYSTEM', CAST(:payload AS jsonb), :correlation_id
+            )
+            """
+        ),
+        {
+            "tenant_id": tenant_id, "fid": finding_id, "journey_id": journey_id, "stage": _STAGE,
+            "payload": json.dumps({**safe_payload, "ruleKey": _RULE_KEY, "originKind": "MACHINE"}, default=str),
+            "correlation_id": correlation_id,
+        },
+    )
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.workflow_tasks
+            SET task_payload = COALESCE(task_payload, '{}'::jsonb) || CAST(:extra AS jsonb), updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND related_finding_id=:fid
+              AND task_status NOT IN ('COMPLETED', 'CANCELLED', 'FAILED', 'DEAD_LETTER')
+            """
+        ),
+        {"tenant_id": tenant_id, "fid": finding_id, "extra": json.dumps(task_payload_extra, default=str)},
+    )
+    logger.info(
+        "model_resolution_finding_refreshed tenant=%s journey=%s finding=%s stage=%s candidates=%s",
+        tenant_id, journey_id, finding_id, safe_payload.get("matchStage"), safe_payload.get("candidateCount"),
+    )
+    return True
+
+
 def _run_deal_reconciliation(
     connection: Connection,
     *,
@@ -1358,6 +1438,9 @@ def _current_match(
     if len(attr_matched) == 1 and attr_trustworthy:
         return {"matched": attr_matched, "matchStage": attr_stage}
 
+    def settle(matched: list[dict[str, Any]], stage: str) -> dict[str, Any]:
+        return _settle(connection, tenant_id=tenant_id, rows=rows, inputs=inputs, matched=matched, stage=stage)
+
     if attr_trustworthy:
         # attr_matched genuinely narrowed a real ambiguity using a stated
         # fuel/transmission/drive/seater fact (len > 1 here, since the ==1
@@ -1368,7 +1451,7 @@ def _current_match(
         if len(price_matched) == 1:
             return {"matched": price_matched, "matchStage": price_stage}
         if len(price_matched) < len(attr_matched):
-            return {"matched": price_matched, "matchStage": price_stage}
+            return settle(price_matched, price_stage)
         # Neither the exact prefix/suffix check nor price narrowed this --
         # including the case where attr_matched is itself empty (a
         # qualifying signal was stated, but nothing survived the exact
@@ -1381,8 +1464,8 @@ def _current_match(
             best_len=len(attr_matched) or _NO_EXISTING_CANDIDATES,
         )
         if fuzzy_result is not None:
-            return fuzzy_result
-        return {"matched": attr_matched, "matchStage": attr_stage}
+            return settle(fuzzy_result["matched"], fuzzy_result["matchStage"])
+        return settle(attr_matched, attr_stage)
 
     # No trustworthy attribute signal at all (no OEM vocabulary, no
     # qualifying token, or too little starting ambiguity to mean anything)
@@ -1408,21 +1491,73 @@ def _current_match(
         connection, tenant_id=tenant_id, rows=rows, inputs=inputs, best_len=best_len,
     )
     if fuzzy_result is not None:
-        return fuzzy_result
+        return settle(fuzzy_result["matched"], fuzzy_result["matchStage"])
 
     # Neither pass reached exactly one on its own -- report whichever
-    # leaves the smaller, more defensible shortlist.
+    # leaves the smaller, more defensible shortlist; the price may still
+    # settle it, and an empty one goes to the catalogue search (_settle).
     if attr_matched and (not matched or len(attr_matched) < len(matched)):
         matched, stage = attr_matched, attr_stage
+    return settle(matched, stage)
 
-    if not matched:
-        # The model name itself never resolved (misread handwriting, a
-        # neighbouring nameplate): search the whole list on what the
-        # paperwork does state before handing the PC an empty shortlist.
-        matched, stage = _catalogue_search(
-            rows, inputs, oem_code=_oem_code_for_tenant(connection, tenant_id=tenant_id)
-        )
 
+def _price_pick(rows: list[dict[str, Any]], inputs: dict[str, Any]) -> tuple[list[dict[str, Any]], str] | None:
+    """Decision 2026-10-01: within a shortlist the ladder already scoped to
+    one model, the form's price settles it when exactly one row agrees. Each
+    stated price (ex-showroom, on-road total) is tried exactly, then within
+    the usual 0.5 % tolerance; a price that singles out no row, or several,
+    says nothing. The two prices must not disagree: when each names a
+    different row, nothing is pinned. A "total" no greater than the
+    ex-showroom is not an on-road total (a form that repeats the ex-showroom
+    in the total box, a real DEV case) and is ignored. Returns ``None`` when
+    the price does not settle it."""
+    basis = inputs["registration_basis"]
+    ex, total = inputs.get("offered_ex_showroom"), inputs.get("offered_total")
+    if total is not None and ex is not None and total <= ex:
+        total = None
+
+    def single(offered: Decimal | None, value: Any, exact_stage: str, approx_stage: str):
+        if offered is None:
+            return None
+        exact = _narrow([r for r in rows if value(r) == offered],
+                        variant=inputs.get("variant_name"), colour=inputs.get("colour_name"))
+        if len(exact) == 1:
+            return exact, exact_stage
+        if exact:
+            return None
+        approx = _closest_within_tolerance(rows, offered=offered, field_value=value)
+        return (approx, approx_stage) if len(approx) == 1 else None
+
+    by_ex = single(ex, lambda r: _to_decimal(r.get("master_ex_showroom")), "EX_SHOWROOM", "EX_SHOWROOM_APPROX")
+    by_total = single(total, lambda r: _master_total(r, basis), "TOTAL", "TOTAL_APPROX")
+    if by_ex and by_total and by_ex[0][0]["product_sku_id"] != by_total[0][0]["product_sku_id"]:
+        return None
+    return by_ex or by_total
+
+
+def _settle(
+    connection: Connection, *, tenant_id: str, rows: list[dict[str, Any]], inputs: dict[str, Any],
+    matched: list[dict[str, Any]], stage: str,
+) -> dict[str, Any]:
+    """The one way out of the ladder (decision 2026-10-01). A single
+    candidate stands as found. A wider shortlist is narrowed by the form's
+    price (``_price_pick``) and otherwise reported as it is, for the PC to
+    pick from. Nothing at all goes to the catalogue search: a reading the
+    attribute filter emptied ("XUV3XO" + "AX7L EV" against the petrol and
+    diesel XUV3XO rows, a real DEV case) still names the vehicle the price
+    list holds under a sibling nameplate."""
+    if len(matched) == 1:
+        return {"matched": matched, "matchStage": stage}
+    if matched:
+        picked = _price_pick(matched, inputs)
+        if picked is not None:
+            logger.info(
+                "model_resolution_price_settled_shortlist tenant=%s shortlist=%d stage=%s price_stage=%s sku=%s",
+                tenant_id, len(matched), stage, picked[1], picked[0][0]["sku_code"],
+            )
+            return {"matched": picked[0], "matchStage": picked[1]}
+        return {"matched": matched, "matchStage": stage}
+    matched, stage = _catalogue_search(rows, inputs, oem_code=_oem_code_for_tenant(connection, tenant_id=tenant_id))
     return {"matched": matched, "matchStage": stage}
 
 
@@ -1928,7 +2063,59 @@ def sync_model_resolution(
             return {"resolved": True, "skuCode": matched[0]["sku_code"], "matchStage": stage}
 
         multiple = len(matched) > 1 and stage != _CATALOGUE_STAGE
-        _machine_flag(
+        title = (
+            "Vehicle model matched multiple price-master SKUs"
+            if multiple
+            else "Vehicle model could not be matched to the price masters"
+            )
+        description = (
+            f"Booking model '{inputs['model_name']}'"
+            + (f" / '{inputs['variant_name']}'" if inputs["variant_name"] else "")
+            + (
+                f" matched {len(matched)} price-master SKUs"
+                if multiple
+                else " did not match any price-master SKU"
+            )
+            + " on model, on-road total or ex-showroom price. "
+            + (
+                f"The {len(matched)} closest SKUs are listed on the task. "
+                if stage == _CATALOGUE_STAGE
+                else ""
+            )
+            + "Confirm the model so the deal can be checked against the price and discount masters."
+            )
+        safe_payload = {
+            "modelName": inputs["model_name"],
+            "variantName": inputs["variant_name"],
+            "colourName": inputs["colour_name"],
+            "offeredTotal": str(inputs["offered_total"]) if inputs["offered_total"] is not None else None,
+            "offeredExShowroom": (
+                str(inputs["offered_ex_showroom"]) if inputs["offered_ex_showroom"] is not None else None
+            ),
+            "matchStage": stage,
+            "candidateCount": len(matched),
+            "candidates": [
+                {
+                    "skuCode": r["sku_code"],
+                    "modelName": r["model_name"],
+                    "variantName": r["variant_name"],
+                    "colourName": r["colour_name"],
+                    "masterTotal": (
+                        str(_master_total(r, inputs["registration_basis"]))
+                        if _master_total(r, inputs["registration_basis"]) is not None
+                        else None
+                    ),
+                    "exShowroom": (
+                        str(_to_decimal(r.get("master_ex_showroom")))
+                        if _to_decimal(r.get("master_ex_showroom")) is not None
+                        else None
+                    ),
+                }
+                for r in matched[:10]
+            ],
+            }
+        task_payload_extra = _candidate_task_payload(inputs, matched, multiple=multiple, stage=stage)
+        finding_id = _machine_flag(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
@@ -1936,59 +2123,16 @@ def sync_model_resolution(
             rule_key=_RULE_KEY,
             finding_type=_FINDING_TYPE,
             severity="MEDIUM",
-            title=(
-                "Vehicle model matched multiple price-master SKUs"
-                if multiple
-                else "Vehicle model could not be matched to the price masters"
-            ),
-            description=(
-                f"Booking model '{inputs['model_name']}'"
-                + (f" / '{inputs['variant_name']}'" if inputs["variant_name"] else "")
-                + (
-                    f" matched {len(matched)} price-master SKUs"
-                    if multiple
-                    else " did not match any price-master SKU"
-                )
-                + " on model, on-road total or ex-showroom price. "
-                + (
-                    f"The {len(matched)} closest SKUs are listed on the task. "
-                    if stage == _CATALOGUE_STAGE
-                    else ""
-                )
-                + "Confirm the model so the deal can be checked against the price and discount masters."
-            ),
+            title=title,
+            description=description,
             correlation_id=correlation_id,
-            safe_payload={
-                "modelName": inputs["model_name"],
-                "variantName": inputs["variant_name"],
-                "colourName": inputs["colour_name"],
-                "offeredTotal": str(inputs["offered_total"]) if inputs["offered_total"] is not None else None,
-                "offeredExShowroom": (
-                    str(inputs["offered_ex_showroom"]) if inputs["offered_ex_showroom"] is not None else None
-                ),
-                "matchStage": stage,
-                "candidateCount": len(matched),
-                "candidates": [
-                    {
-                        "skuCode": r["sku_code"],
-                        "modelName": r["model_name"],
-                        "variantName": r["variant_name"],
-                        "colourName": r["colour_name"],
-                        "masterTotal": (
-                            str(_master_total(r, inputs["registration_basis"]))
-                            if _master_total(r, inputs["registration_basis"]) is not None
-                            else None
-                        ),
-                        "exShowroom": (
-                            str(_to_decimal(r.get("master_ex_showroom")))
-                            if _to_decimal(r.get("master_ex_showroom")) is not None
-                            else None
-                        ),
-                    }
-                    for r in matched[:10]
-                ],
-            },
-            task_payload_extra=_candidate_task_payload(inputs, matched, multiple=multiple, stage=stage),
+            safe_payload=safe_payload,
+            task_payload_extra=task_payload_extra,
+        )
+        _refresh_open_flag(
+            connection, tenant_id=tenant_id, journey_id=journey_id, finding_id=finding_id,
+            title=title, description=description, safe_payload=safe_payload,
+            task_payload_extra=task_payload_extra, correlation_id=correlation_id,
         )
         return {"raised": True, "matchStage": stage, "candidateCount": len(matched)}
     except Exception:
