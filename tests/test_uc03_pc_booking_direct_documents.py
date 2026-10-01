@@ -53,17 +53,15 @@ def test_booking_payment_receipt_is_repeatable_but_identity_documents_are_not() 
     assert _is_repeatable_requirement("aadhaar") is False
 
 
-def test_repeatable_callback_does_not_reject_prior_receipts() -> None:
-    # A second receipt against a repeatable requirement must never be
-    # treated as a duplicate-to-reject -- that path (see
-    # test_uc03_pc_booking_documents.py for the full behavior) is gated
-    # behind `if not repeatable:` only. Superseding a single-slot document
-    # (a second PAN card, say) was itself retired in favor of rejecting it
-    # outright and flagging PC -- see uc03_pc_booking_documents's own
-    # _DUPLICATE_DOCUMENT_TASK_TYPE / 'VOIDED' handling.
+def test_repeatable_callback_does_not_supersede_prior_receipts() -> None:
+    # A second receipt against a repeatable requirement is a further
+    # document, never a replacement: the supersede path (decision
+    # 2026-10-01, see test_uc03_pc_booking_documents.py) is gated behind
+    # `if not repeatable:` only.
     source = inspect.getsource(acknowledge_booking_document_link)
     assert "if not repeatable:" in source
-    assert "'VOIDED', 'DUPLICATE_UPLOAD'" in source
+    assert "'VOIDED', 'DUPLICATE_UPLOAD'" not in source
+    assert source.index("if not repeatable:") < source.index("SET association_status='SUPERSEDED'")
     assert 'supersedes_evidence_id=NULL' in source
 
 

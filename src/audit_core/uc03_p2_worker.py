@@ -990,6 +990,84 @@ def _ensure_p2_requirement_rows(connection, *, tenant_id: str, journey_id: UUID)
         )
 
 
+def _ensure_extra_requirement_rows(connection, *, tenant_id: str, journey_id: UUID) -> int:
+    """A checklist row for every classified type on this journey that the
+    tenant's catalogue does not list (a KYC form, a UPI screenshot, an
+    optional type the profile left out). Without a row the type has no
+    requirement ref, so its values could never be linked or stored, however
+    well DI read it (decision 2026-10-01: every classified page gets a
+    checklist home). The row is OPTIONAL and repeatable (its key starts with
+    ``p2_extra_``, see uc03_pc_booking_documents._is_repeatable_requirement),
+    so every copy of the type is held. Never shown as a checklist card: the
+    screen builds its cards from the templates, not from these rows.
+    Returns the number of rows created."""
+    from audit_core.uc03_document_capture_v2 import _canonical_document_type
+
+    registry = get_registry()
+    classified = connection.execute(
+        text(
+            """
+            SELECT DISTINCT template_key FROM auditcore.p2_document_queue
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND template_key IS NOT NULL AND template_key <> 'supporting_document'
+              AND queue_status NOT IN ('CANCELLED', 'MERGED')
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalars().all()
+    existing = {
+        _canonical_document_type(str(row[0]))
+        for row in connection.execute(
+            text(
+                """
+                SELECT document_type_key FROM auditcore.journey_document_requirements
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND document_type_key IS NOT NULL
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        )
+    }
+    created = 0
+    for template_key in classified:
+        template = registry.documents.get(str(template_key))
+        if template is None or not template.di_types:
+            continue
+        document_type_key = template.di_types[0]
+        if _canonical_document_type(document_type_key) in existing:
+            continue
+        process_area = template.stage if template.stage in ("BOOKING", "DELIVERY") else "BOOKING"
+        inserted = connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.journey_document_requirements (
+                    tenant_id, journey_id, document_requirement_item_id,
+                    requirement_key, document_type_key, process_area,
+                    requirement_level, requirement_status, condition_snapshot
+                ) VALUES (
+                    CAST(:t AS varchar), CAST(:j AS uuid), NULL, CAST(:rk AS varchar),
+                    CAST(:dt AS varchar), CAST(:pa AS varchar), 'OPTIONAL', 'PENDING', '{}'::jsonb
+                )
+                ON CONFLICT (tenant_id, journey_id, requirement_key) DO NOTHING
+                RETURNING journey_document_requirement_id
+                """
+            ),
+            {"t": tenant_id, "j": journey_id, "rk": f"p2_extra_{template.key}",
+             "dt": document_type_key, "pa": process_area},
+        ).scalar_one_or_none()
+        if inserted is not None:
+            created += 1
+            existing.add(_canonical_document_type(document_type_key))
+            logger.info(
+                "p2_extra_requirement_row_created",
+                tenant_id=tenant_id,
+                journey_id=str(journey_id),
+                template_key=template.key,
+                document_type_key=document_type_key,
+                process_area=process_area,
+            )
+    return created
+
+
 def _di_context_and_requirements(engine: Engine, work: WorkItem) -> tuple[str, str, list[str], dict[str, str]]:
     security_client = get_security_oauth_client()
     di_client = get_di_client()
@@ -999,6 +1077,7 @@ def _di_context_and_requirements(engine: Engine, work: WorkItem) -> tuple[str, s
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
         _ensure_p2_requirement_rows(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
+        _ensure_extra_requirement_rows(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
         booking, delivery = _merged_candidate_requirements(
             connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
         )

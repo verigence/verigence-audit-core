@@ -849,3 +849,43 @@ def test_nightly_sweep_recopies_pages_the_old_timer_marked_nothing_read(journey)
     assert _page_status(journey, lost_q) == "SYNCING_TO_AUDIT_CORE"
     assert _page_status(journey, held_q) == "READY"
     assert queue_row(journey, "JOURNEY_RECONCILE", str(journey.journey_id))["work_status"] == "PENDING"
+
+
+def test_a_classified_type_outside_the_catalogue_gets_a_repeatable_checklist_row(journey):
+    """Decision 2026-10-01: a KYC form or a UPI screenshot has no catalogue
+    row, so it had no requirement ref and its values could never be stored.
+    The worker creates an OPTIONAL, repeatable row for it on demand; a type
+    the catalogue already lists gets nothing; a second call creates nothing."""
+    _, kyc_queue, _ = add_page(journey, page_number=1, status="EXTRACTING")
+    _, docket_queue, _ = add_page(journey, page_number=2, status="EXTRACTING")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_document_queue SET template_key='customer_kyc' WHERE queue_id=:q"),
+            {"q": kyc_queue},
+        )
+        connection.execute(
+            text("UPDATE auditcore.p2_document_queue SET template_key='booking_docket' WHERE queue_id=:q"),
+            {"q": docket_queue},
+        )
+        connection.execute(
+            text("""INSERT INTO auditcore.journey_document_requirements (
+                        tenant_id, journey_id, document_requirement_item_id, requirement_key,
+                        document_type_key, process_area, requirement_level, requirement_status, condition_snapshot)
+                    VALUES (:t, :j, NULL, 'BOOKING_DOCKET', 'booking_form', 'BOOKING', 'REQUIRED', 'PENDING', '{}'::jsonb)
+                    ON CONFLICT (tenant_id, journey_id, requirement_key) DO NOTHING"""),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+        assert worker._ensure_extra_requirement_rows(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+        ) == 1
+        rows = connection.execute(
+            text("SELECT requirement_key, document_type_key, process_area, requirement_level "
+                 "FROM auditcore.journey_document_requirements WHERE tenant_id=:t AND journey_id=:j "
+                 "AND requirement_key LIKE 'p2_extra_%'"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        ).mappings().all()
+        assert [tuple(r.values()) for r in rows] == [("p2_extra_customer_kyc", "customer_kyc", "BOOKING", "OPTIONAL")]
+        assert worker._ensure_extra_requirement_rows(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+        ) == 0
