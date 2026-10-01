@@ -1752,3 +1752,216 @@ def test_backfills_missing_task_for_a_preexisting_open_finding(journey) -> None:
     assert task["task_type"] == "AUTO_SELF_SERVE"
     assert task["assigned_role_code"] == "PC"
     assert task["task_status"] == "READY"
+
+
+# ── decision 2026-10-01: the ladder's one way out ─────────────────────────────
+# Two real DEV journeys could not be pinned although the price list held the
+# vehicle: "XUV3XO" + "AX7L EV" (the attribute filter emptied the petrol/
+# diesel XUV3XO rows and the ladder stopped there, never reaching the EV
+# sibling), and "MAXX HD 1.7L LX" at 9,96,500 (the fuzzy stage returned all
+# eleven MAXX HD rows and the price was never asked). Every non-single exit
+# now settles the same way: the form's price narrows a shortlist, nothing at
+# all goes to the catalogue search, and the open finding follows the latest
+# run instead of keeping the first run's wording.
+
+def _maxx_hd_rows():
+    return [
+        _row("17L-LX", "MAXX HD", variant="MAXX HD 1.7L LX BS6.2", ex="996499.88", total="1044691.78"),
+        _row("17-LX", "MAXX HD", variant="MAXX HD 1.7 LX BS6.2", ex="971499.84", total="1019188.99"),
+        _row("17-LX-CBC", "MAXX HD", variant="MAXX HD 1.7 LX CBC BS6.2", ex="947499.97", total="995506.47"),
+        _row("17L-MXI", "MAXX HD", variant="MAXX HD 1.7L MXi BS6.2", ex="1027499.97", total="1086590.29"),
+    ]
+
+
+def test_price_pick_settles_a_shortlist_on_the_ex_showroom_within_tolerance() -> None:
+    """Sonali Das: the form says 9,96,500; the master holds 9,96,499.88 for
+    exactly one of the eleven MAXX HD rows."""
+    picked = mr._price_pick(_maxx_hd_rows(), _inputs(model="MAXX HD 1.7L LX", variant="LX", ex="996500"))
+    assert picked is not None
+    rows, stage = picked
+    assert [r["sku_code"] for r in rows] == ["17L-LX"] and stage == "EX_SHOWROOM_APPROX"
+
+
+def test_price_pick_ignores_a_total_that_only_repeats_the_ex_showroom() -> None:
+    """The same form repeats 9,96,500 in the total box. Read as an on-road
+    total it would land within 0.5 % of the CBC row's 9,95,506.47 and pin the
+    wrong vehicle; a total no greater than the ex-showroom is not a total."""
+    picked = mr._price_pick(
+        _maxx_hd_rows(), _inputs(model="MAXX HD 1.7L LX", variant="LX", ex="996500", total="996500"),
+    )
+    assert picked is not None and [r["sku_code"] for r in picked[0]] == ["17L-LX"]
+
+
+def test_price_pick_refuses_when_the_two_prices_name_different_rows() -> None:
+    picked = mr._price_pick(
+        _maxx_hd_rows(), _inputs(model="MAXX HD 1.7L LX", ex="996500", total="1019188.99"),
+    )
+    assert picked is None
+
+
+def test_price_pick_refuses_when_several_rows_sit_within_tolerance() -> None:
+    rows = _maxx_hd_rows() + [_row("17L-LX-TWIN", "MAXX HD", variant="MAXX HD 1.7L LX AC", ex="998000")]
+    assert mr._price_pick(rows, _inputs(model="MAXX HD 1.7L LX", ex="996500")) is None
+
+
+def test_price_pick_says_nothing_without_a_price() -> None:
+    assert mr._price_pick(_maxx_hd_rows(), _inputs(model="MAXX HD 1.7L LX", variant="LX")) is None
+
+
+def _seed_xuv3xo_family(c):
+    """The DEV master's shape: the petrol/diesel XUV3XO rows and the two
+    electric rows under the sibling nameplate "XUV3XO EV"."""
+    ids = _seed_price_list(c, [
+        {"model": "XUV3XO", "variant": "AX7L TGDI AT DT", "fuel": "PETROL", "transmission": "AT", "trim": "AX7L",
+         "components": {"EX_SHOWROOM": "1503500.54", "REGISTRATION_INDIVIDUAL": "290829.95"}},
+        {"model": "XUV3XO", "variant": "AX7L DS MT DT", "fuel": "DIESEL", "transmission": "MT", "trim": "AX7L",
+         "components": {"EX_SHOWROOM": "1407500.54", "REGISTRATION_INDIVIDUAL": "277389.72"}},
+        {"model": "XUV3XO", "variant": "AX5 PM MT", "fuel": "PETROL", "transmission": "MT", "trim": "AX5",
+         "components": {"EX_SHOWROOM": "1029900.54", "REGISTRATION_INDIVIDUAL": "224524.79"}},
+        {"model": "XUV3XO EV", "variant": "XUV3XO EV - AX5 FH", "fuel": "ELECTRIC",
+         "components": {"EX_SHOWROOM": "1389000.00", "REGISTRATION_INDIVIDUAL": "107033.00"}},
+        {"model": "XUV3XO EV", "variant": "XUV3XO EV - AX7 L FH", "fuel": "ELECTRIC",
+         "components": {"EX_SHOWROOM": "1496000.00", "REGISTRATION_INDIVIDUAL": "111267.00"}},
+    ])
+    return {"ax7l_petrol": ids[0], "ax7l_diesel": ids[1], "ax5": ids[2], "ev_ax5": ids[3], "ev_ax7l": ids[4]}
+
+
+def _pinned(c):
+    return c.execute(
+        text("SELECT product_sku_id FROM auditcore.journey_products WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+
+
+def test_integration_an_emptied_attribute_filter_still_reaches_the_catalogue_search(mahindra_journey) -> None:
+    """Pritishree Nayak on DEV: "XUV3XO" / "AX7L EV", ex-showroom 14,96,000.
+    The nameplate resolves to the petrol/diesel XUV3XO rows, the stated EV
+    rightly removes every one of them, and the ladder used to stop there
+    with nothing. The catalogue search names the vehicle the list holds
+    under "XUV3XO EV" on the exact price."""
+    c = mahindra_journey
+    skus = _seed_xuv3xo_family(c)
+    _set_journey_product(c, "XUV3XO", "AX7L EV")
+    _set_commercial(c, "ex_showroom_price", "1496000.00")
+
+    result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert result.get("resolved") is True, result
+    assert result["matchStage"] == "CATALOGUE_SEARCH"
+    assert _pinned(c) == skus["ev_ax7l"]
+    assert _open_model_flags(c) == 0
+
+
+def test_integration_an_emptied_attribute_filter_without_a_price_shortlists_the_siblings(mahindra_journey) -> None:
+    """The same reading with no price on the form: not pinned, but the PC is
+    offered the two electric rows rather than an empty shortlist."""
+    c = mahindra_journey
+    skus = _seed_xuv3xo_family(c)
+    _set_journey_product(c, "XUV3XO", "AX7L EV")
+
+    result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert result.get("raised") is True, result
+    assert result["matchStage"] == "CATALOGUE_SEARCH"
+    shortlist = mr.get_model_resolution_candidates(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    offered = {str(item["productSkuId"]) for item in shortlist["candidates"]}
+    assert str(skus["ev_ax7l"]) in offered
+    assert not offered & {str(skus["ax7l_petrol"]), str(skus["ax7l_diesel"]), str(skus["ax5"])}
+
+
+def _seed_maxx_hd(c):
+    return _seed_price_list(c, [
+        {"model": "MAXX HD", "variant": "MAXX HD 1.7L LX BS6.2", "fuel": "DIESEL",
+         "components": {"EX_SHOWROOM": "996499.88", "REGISTRATION_INDIVIDUAL": "48191.90"}},
+        {"model": "MAXX HD", "variant": "MAXX HD 1.7 LX BS6.2", "fuel": "DIESEL",
+         "components": {"EX_SHOWROOM": "971499.84", "REGISTRATION_INDIVIDUAL": "47689.15"}},
+        {"model": "MAXX HD", "variant": "MAXX HD 1.7 LX CBC BS6.2", "fuel": "DIESEL",
+         "components": {"EX_SHOWROOM": "947499.97", "REGISTRATION_INDIVIDUAL": "48006.50"}},
+        {"model": "MAXX HD", "variant": "MAXX HD 1.7L MXi BS6.2", "fuel": "DIESEL",
+         "components": {"EX_SHOWROOM": "1027499.97", "REGISTRATION_INDIVIDUAL": "59090.32"}},
+        {"model": "MAXX HD", "variant": "MAXX HD 1.3 LX BS6.2", "fuel": "DIESEL",
+         "components": {"EX_SHOWROOM": "961499.48", "REGISTRATION_INDIVIDUAL": "102286.01"}},
+    ])
+
+
+def test_integration_a_wide_fuzzy_shortlist_is_settled_by_the_ex_showroom_price(mahindra_journey) -> None:
+    """Sonali Das on DEV: Booking Form "MAXX HD 1.7L LX" / "LX", ex-showroom
+    and total both 9,96,500. The fuzzy stage left every MAXX HD row; the
+    ex-showroom is 12 paise off exactly one of them. The repeated total is
+    not an on-road total and must not drag the pick to the CBC row."""
+    c = mahindra_journey
+    lx_17l, *_ = _seed_maxx_hd(c)
+    _set_journey_product(c, "MAXX HD 1.7L LX", "LX")
+    _set_commercial(c, "ex_showroom_price", "996500.00")
+    _set_commercial(c, "total_price", "996500.00")
+
+    result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert result.get("resolved") is True, result
+    assert result["matchStage"] == "EX_SHOWROOM_APPROX"
+    assert _pinned(c) == lx_17l
+    assert _open_model_flags(c) == 0
+
+
+def test_integration_a_wide_shortlist_stays_a_task_when_no_price_singles_one_out(mahindra_journey) -> None:
+    """The same reading with a price between two rows: the shortlist is
+    reported as before, nothing is guessed."""
+    c = mahindra_journey
+    _seed_maxx_hd(c)
+    _set_journey_product(c, "MAXX HD 1.7L LX", "LX")
+    _set_commercial(c, "ex_showroom_price", "985000.00")
+
+    result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert result.get("raised") is True, result
+    assert result["candidateCount"] > 1
+    assert _open_model_flags(c) == 1
+
+
+def test_integration_an_open_finding_follows_the_latest_run(mahindra_journey) -> None:
+    """Sonali Das again: the finding was first raised from the invoice's
+    text with no candidates and kept that wording after the Booking Form
+    arrived. Now the title, description, event payload and the self-serve
+    task's candidates follow the latest run, and the finding resolves
+    itself once the price settles the shortlist."""
+    c = mahindra_journey
+    lx_17l, *_ = _seed_maxx_hd(c)
+    _set_journey_product(c, "BOL MAXX PUP HD 1.7L LX", None)
+    first = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert first.get("raised") is True and first["candidateCount"] == 0
+    finding_id = _open_model_finding_id(c)
+    before = c.execute(
+        text("SELECT description FROM auditcore.audit_findings WHERE tenant_id=:t AND audit_finding_id=:f"),
+        {"t": c.tenant_id, "f": finding_id},
+    ).scalar_one()
+    assert "did not match any price-master SKU" in before
+
+    # The Booking Form is read: the model resolves, the price is between rows.
+    c.execute(
+        text("UPDATE auditcore.journey_products SET model_name_snapshot='MAXX HD 1.7L LX', variant_name_snapshot='LX' "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    )
+    _set_commercial(c, "ex_showroom_price", "985000.00")
+    second = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert second.get("raised") is True and second["candidateCount"] > 1
+    assert _open_model_finding_id(c) == finding_id  # the same finding, refreshed, not a second one
+    after = c.execute(
+        text("SELECT title, description FROM auditcore.audit_findings WHERE tenant_id=:t AND audit_finding_id=:f"),
+        {"t": c.tenant_id, "f": finding_id},
+    ).mappings().one()
+    assert after["title"] == "Vehicle model matched multiple price-master SKUs"
+    assert "MAXX HD 1.7L LX" in after["description"] and f"matched {second['candidateCount']}" in after["description"]
+    events = c.execute(
+        text("SELECT event_type, safe_payload FROM auditcore.audit_finding_events "
+             "WHERE tenant_id=:t AND audit_finding_id=:f ORDER BY occurred_at_utc"),
+        {"t": c.tenant_id, "f": finding_id},
+    ).mappings().all()
+    # Both events carry the same transaction timestamp: compare as a set.
+    assert sorted(e["event_type"] for e in events) == ["RAISED", "REFRESHED"]
+    [refreshed] = [e for e in events if e["event_type"] == "REFRESHED"]
+    assert refreshed["safe_payload"]["candidateCount"] == second["candidateCount"]
+    payload = _related_task_payload(c, finding_id)
+    assert len(payload["candidates"]) == second["candidateCount"]
+
+    # The price now settles it: the finding resolves and the task closes.
+    _set_commercial(c, "ex_showroom_price", "996500.00")
+    third = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert third.get("resolved") is True and _pinned(c) == lx_17l
+    assert _open_model_flags(c) == 0
