@@ -213,6 +213,22 @@ def _run_audit_core_rules_for_stage(
             rule_code="MODEL_NOT_IDENTIFIED", triggering_event=_TRIGGERING_EVENT, result=invoice_model_result,
         )
         _record("MODEL_NOT_IDENTIFIED", "ERROR" if invoice_model_result.get("error") else ("SKIPPED" if invoice_model_result.get("skipped") else ("FAIL" if invoice_model_result.get("raised") else "PASS")))
+        # The invoice's vehicle is checked against the pinned SKU even when
+        # the Booking Form already pinned one (rule 2026-10-01).
+        if invoice_model_result.get("error"):
+            cross_check = "ERROR"
+        elif invoice_model_result.get("mismatchFlagged"):
+            cross_check = "FAIL"
+        elif invoice_model_result.get("crossChecked"):
+            cross_check = "PASS"
+        else:
+            cross_check = "SKIPPED"
+        record_execution(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            rule_code="INVOICE_SKU_MISMATCH", triggering_event=_TRIGGERING_EVENT, outcome=cross_check,
+            reason=None if cross_check in ("PASS", "FAIL") else "no invoice vehicle to check against the pinned SKU yet",
+        )
+        _record("INVOICE_SKU_MISMATCH", cross_check)
 
     manual_verification_result = sync_manual_verification_findings(
         connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage, correlation_id=correlation_id

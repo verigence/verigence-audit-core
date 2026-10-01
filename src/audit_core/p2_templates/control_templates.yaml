@@ -77,6 +77,23 @@ controls:
     task:
       type: FINDING_REMEDIATION
       owner: PC
+  INVOICE_SKU_MISMATCH:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - DELIVERY
+    category: Vehicle & Model Resolution
+    triggers:
+    - DOCUMENT_SYNCED
+    - DELIVERY_COMPLETED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
   PAYMENT_BANK_UNMATCHED:
     executor: NATIVE
     mode: RERUN

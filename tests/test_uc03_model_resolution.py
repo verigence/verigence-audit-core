@@ -1262,7 +1262,7 @@ def test_invoice_fallback_is_noop_once_already_resolved(journey) -> None:
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
 
-    assert result == {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False}
+    assert result == {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False, "crossChecked": False}
     pinned = c.execute(
         text("SELECT product_sku_id FROM auditcore.journey_products "
              "WHERE tenant_id=:t AND journey_id=:j"),
@@ -1295,7 +1295,7 @@ def test_invoice_mismatch_raises_finding_and_pc_task_without_repinning(journey) 
     result = mr.sync_model_resolution_from_invoice(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
-    assert result == {"skipped": True, "reason": "already_resolved", "mismatchFlagged": True}
+    assert result == {"skipped": True, "reason": "already_resolved", "mismatchFlagged": True, "crossChecked": True}
 
     # journey_products itself is untouched -- this never repins.
     pinned = c.execute(
@@ -1370,6 +1370,96 @@ def test_invoice_mismatch_resolves_once_invoice_matches_confirmed_sku(journey) -
              "WHERE tenant_id=:t AND journey_id=:j AND rule_key='INVOICE_SKU_MISMATCH'"),
         {"t": c.tenant_id, "j": c.journey_id},
     ).scalar_one() == "RESOLVED"
+
+
+def _confirm_sku(c, sku_id) -> None:
+    c.execute(
+        text("UPDATE auditcore.journey_products SET product_sku_id=:s, selection_status='CONFIRMED' "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"s": sku_id, "t": c.tenant_id, "j": c.journey_id},
+    )
+
+
+def _open_mismatch(c) -> int:
+    return c.execute(
+        text("SELECT count(*) FROM auditcore.audit_findings WHERE tenant_id=:t AND journey_id=:j "
+             "AND rule_key='INVOICE_SKU_MISMATCH' AND finding_status IN ('OPEN','ACKNOWLEDGED')"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+
+
+def test_invoice_cross_check_reads_a_differently_spelled_invoice_through_the_full_ladder(mahindra_journey) -> None:
+    """Rule 2026-10-01: the invoice's vehicle is checked even when the Booking
+    Form already pinned one. The invoice spells the vehicle the way real
+    DMS invoices do, not the way the master does; the plain name match
+    used to find nothing and the check was silently skipped."""
+    c = mahindra_journey
+    ax7l, ax7t = _seed_price_list(c, [
+        {"model": "XUV 7XO", "variant": "AX7L DSL AT 7 STR",
+         "fuel": "DIESEL", "transmission": "AT", "drive": "2WD", "seater": "7", "trim": "AX7L",
+         "components": {"EX_SHOWROOM": "2000000"}},
+        {"model": "XUV 7XO", "variant": "AX7T DSL AT 7 STR",
+         "fuel": "DIESEL", "transmission": "AT", "drive": "2WD", "seater": "7", "trim": "AX7T",
+         "components": {"EX_SHOWROOM": "2050000"}},
+    ])
+    _set_journey_product(c, "XUV 7XO", "AX7T DSL AT 7 STR")
+    _confirm_sku(c, ax7t)
+    _set_invoice_field(c, "model_name_raw", "XUV-7XO")
+    _set_invoice_field(c, "variant_raw", "AX-7L(D) AT 2WD 7STR")
+
+    result = mr.sync_model_resolution_from_invoice(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result == {"skipped": True, "reason": "already_resolved", "mismatchFlagged": True, "crossChecked": True}
+    assert _open_mismatch(c) == 1
+    pinned = c.execute(
+        text("SELECT product_sku_id FROM auditcore.journey_products WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert pinned == ax7t  # never re-pinned; the PC explains, the TL decides
+    assert ax7l != ax7t
+
+
+def test_invoice_cross_check_agrees_when_the_confirmed_sku_is_one_of_the_invoice_matches(journey) -> None:
+    c = journey
+    first, _second = _seed_price_list(c, [
+        {"model": "XUV700", "variant": "AX7L", "components": {"EX_SHOWROOM": "2000000"}},
+        {"model": "XUV700", "variant": "AX7L", "components": {"EX_SHOWROOM": "2000000"}},
+    ])
+    _set_journey_product(c, "XUV700", "AX7L")
+    _confirm_sku(c, first)
+    _set_invoice_field(c, "model_name_raw", "XUV700")
+    _set_invoice_field(c, "variant_raw", "AX7L")
+
+    result = mr.sync_model_resolution_from_invoice(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result == {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False, "crossChecked": True}
+    assert _open_mismatch(c) == 0
+
+
+def test_invoice_cross_check_flags_a_different_variant_whatever_the_colour(journey) -> None:
+    c = journey
+    z8l, *_ = _seed_price_list(c, [
+        {"model": "SCORPIO N", "variant": "Z8L", "components": {"EX_SHOWROOM": "1600000"}},
+        {"model": "XUV700", "variant": "AX7L", "components": {"EX_SHOWROOM": "2000000"}},
+        {"model": "XUV700", "variant": "AX7L", "components": {"EX_SHOWROOM": "2000000"}},
+    ])
+    _set_journey_product(c, "SCORPIO N", "Z8L")
+    _confirm_sku(c, z8l)
+    _set_invoice_field(c, "model_name_raw", "XUV700")
+    _set_invoice_field(c, "variant_raw", "AX7L")
+
+    result = mr.sync_model_resolution_from_invoice(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert result == {"skipped": True, "reason": "already_resolved", "mismatchFlagged": True, "crossChecked": True}
+    description = c.execute(
+        text("SELECT description FROM auditcore.audit_findings WHERE tenant_id=:t AND journey_id=:j "
+             "AND rule_key='INVOICE_SKU_MISMATCH'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert "XUV700 AX7L (any colour)" in description
 
 
 def test_invoice_fallback_skips_without_any_invoice_data(journey) -> None:

@@ -127,6 +127,7 @@ def _closest_within_tolerance(
 _INVOICE_SKU_CODE_FIELD_KEYS = ("sku_code",)
 _INVOICE_MODEL_FIELD_KEYS = ("model_name_raw",)
 _INVOICE_VARIANT_FIELD_KEYS = ("variant_raw",)
+_INVOICE_COLOUR_FIELD_KEYS = ("vehicle_color",)
 _INVOICE_SELECTION_METHOD = "MODEL_RESOLUTION_INVOICE_FALLBACK_V1"
 
 # A SKU already on the journey (CONFIRMED or merely tentative) is never
@@ -1014,6 +1015,7 @@ def check_invoice_sku_mismatch(
     invoice_sku_id: UUID,
     invoice_sku_code: str,
     correlation_id: str,
+    invoice_label: str | None = None,
 ) -> None:
     """The Delivery invoice's own implied vehicle disagrees with the SKU
     already on the journey (CONFIRMED or merely tentative) -- raise a finding
@@ -1064,10 +1066,14 @@ def check_invoice_sku_mismatch(
         title="Invoice shows a different vehicle than the confirmed SKU",
         description=(
             f"The confirmed vehicle is {confirmed_code}, but the Delivery invoice implies "
-            f"{invoice_sku_code}. A PC must explain the reason for the change."
+            f"{invoice_label or invoice_sku_code}. A PC must explain the reason for the change."
         ),
         correlation_id=correlation_id,
-        safe_payload={"confirmedSkuCode": confirmed_code, "invoiceSkuCode": invoice_sku_code},
+        safe_payload={
+            "confirmedSkuCode": confirmed_code,
+            "invoiceSkuCode": invoice_sku_code,
+            "invoiceVehicle": invoice_label,
+        },
         blocking_completion=False,
     )
     open_task_count = connection.execute(
@@ -1100,6 +1106,36 @@ def check_invoice_sku_mismatch(
             effect_key=f"task:{finding_id}:invoice-sku-mismatch",
             correlation_id=correlation_id,
         )
+
+
+def _invoice_implied_vehicle(
+    matched: list[dict[str, Any]], confirmed_sku_id: UUID
+) -> tuple[UUID, str, str | None] | None:
+    """What the invoice says the vehicle is, for the cross-check against the
+    SKU already on the journey: ``(sku_id, sku_code, label)`` or None when
+    the invoice text settles nothing.
+
+    One match is the answer. Several matches that include the confirmed
+    SKU agree with it (the invoice names the variant, the colour rows are
+    the only spread). Several matches of one model and variant that do
+    not include the confirmed SKU are a different vehicle, whatever the
+    colour (rule 2026-10-01: the invoice's model is checked even when the
+    booking form already pinned one, the customer may have changed it).
+    """
+    if not matched:
+        return None
+    if len(matched) == 1:
+        row = matched[0]
+        return row["product_sku_id"], str(row["sku_code"]), None
+    for row in matched:
+        if row["product_sku_id"] == confirmed_sku_id:
+            return confirmed_sku_id, str(row["sku_code"]), None
+    identities = {(str(r["model_name"]).strip().upper(), str(r["variant_name"] or "").strip().upper()) for r in matched}
+    if len(identities) != 1:
+        return None
+    row = matched[0]
+    label = f"{row['model_name']} {row['variant_name'] or ''}".strip() + " (any colour)"
+    return row["product_sku_id"], str(row["sku_code"]), label
 
 
 # ── producer ──────────────────────────────────────────────────────────────────
@@ -1195,34 +1231,47 @@ def sync_model_resolution_from_invoice(
                 connection, tenant_id=tenant_id, journey_id=journey_id,
                 field_keys=_INVOICE_VARIANT_FIELD_KEYS,
             )
+            invoice_colour = _latest_invoice_field(
+                connection, tenant_id=tenant_id, journey_id=journey_id,
+                field_keys=_INVOICE_COLOUR_FIELD_KEYS,
+            )
             invoice_inputs = dict(inputs)
             invoice_inputs["model_name"] = invoice_model
             invoice_inputs["variant_name"] = invoice_variant or inputs["variant_name"]
-            matched, stage = _match(rows, invoice_inputs)
-            if not matched:
-                matched, stage = _catalogue_search(
-                    rows, invoice_inputs, oem_code=_oem_code_for_tenant(connection, tenant_id=tenant_id)
-                )
-                if len(matched) > 1:
-                    matched = []  # a shortlist is the Booking task's to show, never a pin
+            invoice_inputs["colour_name"] = invoice_colour or inputs["colour_name"]
+            # The same ladder the Booking Form gets (exact name, attribute
+            # decomposition, fuzzy trim, price, catalogue search): an
+            # invoice spelled differently from the master is no longer
+            # silently skipped (rule 2026-10-01).
+            outcome = _current_match(connection, tenant_id=tenant_id, journey_id=journey_id, inputs=invoice_inputs)
+            if outcome.get("skipped"):
+                matched, stage = [], "NONE"
+            else:
+                matched, stage = outcome["matched"], outcome["matchStage"]
 
         if already_resolved is not None:
             # Never re-pin an already-resolved SKU (CONFIRMED or merely
-            # tentative) -- but a single clear invoice match is exactly the
+            # tentative) -- but what the invoice implies is exactly the
             # signal that must be cross-checked against it, not dropped.
             mismatch_flagged = False
-            if len(matched) == 1:
-                mismatch_flagged = matched[0]["product_sku_id"] != already_resolved
+            implied = _invoice_implied_vehicle(matched, already_resolved)
+            if implied is not None:
+                invoice_sku_id, invoice_sku_code, invoice_label = implied
+                mismatch_flagged = invoice_sku_id != already_resolved
                 check_invoice_sku_mismatch(
                     connection,
                     tenant_id=tenant_id,
                     journey_id=journey_id,
                     confirmed_sku_id=already_resolved,
-                    invoice_sku_id=matched[0]["product_sku_id"],
-                    invoice_sku_code=matched[0]["sku_code"],
+                    invoice_sku_id=invoice_sku_id,
+                    invoice_sku_code=invoice_sku_code,
                     correlation_id=correlation_id,
+                    invoice_label=invoice_label,
                 )
-            return {"skipped": True, "reason": "already_resolved", "mismatchFlagged": mismatch_flagged}
+            return {
+                "skipped": True, "reason": "already_resolved",
+                "mismatchFlagged": mismatch_flagged, "crossChecked": implied is not None,
+            }
 
         if len(matched) == 1:
             _pin_sku(
