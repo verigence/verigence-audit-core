@@ -1,6 +1,7 @@
 """P2 New Booking: one idempotent way to start a Journey."""
 from __future__ import annotations
 
+import re
 from uuid import UUID
 
 from fastapi.testclient import TestClient
@@ -10,6 +11,7 @@ from test_uc03_create_booking import uc03_create_booking_setup  # noqa: F401  (f
 
 from audit_core.db import set_tenant_context
 from audit_core.main import app
+from audit_core.uc03_p2_api import _outlet_code, _pc_code
 from audit_core.uc03_p2_customer import sync_customer_name
 
 
@@ -141,3 +143,63 @@ def test_a_pc_can_delete_a_booking_a_failed_upload_left_stuck(uc03_create_bookin
     assert "Scanner output was corrupt" in notice["description"]
     assert stage["business_status"] == "BOOKING_CANCELLED" and stage["close_reason_code"] == "DOCUMENT_UPLOAD_FAILED"
     assert client.post(cancel, json={}).status_code == 409  # already closed
+
+
+def test_reference_letters_for_the_outlet_and_the_pc():
+    assert _outlet_code("Utkal Mahindra - CDA") == "UTK"
+    assert _outlet_code("  a-b ") == "ABX"
+    assert _outlet_code(None) == "XXX"
+    assert _pc_code("Asha Rao") == "AR"
+    assert _pc_code(" akansh  kumar chopra ") == "AC"
+    assert _pc_code("akanshchopra") == "AK"
+    assert _pc_code("Z") == "ZX"
+    assert _pc_code(None) == "XX" and _pc_code("123") == "XX"
+
+
+def _reference(setup, journey_id: str) -> str:
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        return connection.execute(
+            text("SELECT journey_reference FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": setup["tenant_id"], "j": journey_id},
+        ).scalar_one()
+
+
+def test_a_new_booking_gets_a_readable_reference_numbered_per_outlet_pc_and_day(uc03_create_booking_setup):  # noqa: F811
+    setup = uc03_create_booking_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    url = f"/p2/v1/tenants/{setup['tenant_id']}/journeys"
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        outlet_name = connection.execute(
+            text("SELECT outlet_name FROM auditcore.dealer_outlets WHERE tenant_id=:t AND outlet_id=:o"),
+            {"t": setup["tenant_id"], "o": setup["outlet_id"]},
+        ).scalar_one()
+    outlet = _outlet_code(outlet_name)
+
+    def start(key: str, name: str | None):
+        body = {"outletId": str(setup["outlet_id"])}
+        if name:
+            body["createdByName"] = name
+        response = client.post(url, headers={"Idempotency-Key": key}, json=body)
+        assert response.status_code == 201, response.text
+        return response.json()["journeyId"]
+
+    first = start("p2-readable-ref-001", "Asha Rao")
+    second = start("p2-readable-ref-002", "Asha Rao")
+    other_pc = start("p2-readable-ref-003", "Bikash Das")
+    no_name = start("p2-readable-ref-004", None)
+    refs = [_reference(setup, j) for j in (first, second, other_pc, no_name)]
+    day = re.match(rf"^{outlet}-AR-(\d{{6}})-001$", refs[0])
+    assert day, refs
+    assert refs[1] == f"{outlet}-AR-{day.group(1)}-002"  # next booking of the same PC, outlet and day
+    assert refs[2] == f"{outlet}-BD-{day.group(1)}-001"  # another PC counts on its own
+    assert refs[3] == f"{outlet}-XX-{day.group(1)}-001"  # PC name not known
+
+    # The same request again returns the same Journey and leaves its reference alone.
+    replay = client.post(url, headers={"Idempotency-Key": "p2-readable-ref-001"},
+                         json={"outletId": str(setup["outlet_id"]), "createdByName": "Asha Rao"})
+    assert replay.status_code == 201 and replay.json()["journeyId"] == first
+    assert _reference(setup, first) == refs[0]
+    listed = client.get(url, params={"state": "open"}).json()["items"]
+    assert next(i for i in listed if i["journey_id"] == first)["journey_reference"] == refs[0]
