@@ -82,9 +82,9 @@ jobs:
               set_tenant_context(c, T)
               show("outlet columns", c.execute(text("""
                   SELECT table_name, column_name FROM information_schema.columns
-                  WHERE table_schema='auditcore' AND table_name IN ('outlets','dealers') ORDER BY table_name, ordinal_position""")).mappings().all())
-              show("outlets", c.execute(text("""
-                  SELECT to_jsonb(o) AS o FROM auditcore.outlets o LIMIT 40""")).mappings().all())
+                  WHERE table_schema='auditcore' AND table_name IN ('dealer_outlets','dealers') ORDER BY table_name, ordinal_position""")).mappings().all())
+              show("dealer_outlets", c.execute(text("""
+                  SELECT to_jsonb(o) AS o FROM auditcore.dealer_outlets o LIMIT 40""")).mappings().all())
               show("dealers", c.execute(text("""
                   SELECT dealer_id, dealer_code, to_jsonb(d)->>'dealer_name' AS name FROM auditcore.dealers d LIMIT 40""")).mappings().all())
               show("creators per journey", c.execute(text("""
