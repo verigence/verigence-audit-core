@@ -1355,6 +1355,10 @@ def _di_failure_reason(di_item: dict[str, Any] | None) -> str:
 # the nightly sweep can tell a page that was genuinely read empty from one
 # that was merely never copied.
 _NOTHING_READ_REASON = "Document Intelligence read this page but found no values on it."
+_NOT_QUEUED_REASON = (
+    "Identified but not read: the booking already holds this document, or this document "
+    "type is not read. Kept as supporting evidence."
+)
 _EXTRA_COPY_REASON = "Read, but this booking already has this document; kept as an extra copy."
 
 
@@ -1403,6 +1407,13 @@ def classify_page_outcome(
             return PageOutcome("SUPPORTING", _EXTRA_COPY_REASON)
         return PageOutcome("SYNCING_TO_AUDIT_CORE", None)
     if state == "CLASSIFIED":
+        if di_item.get("extractionQueued") is False and processing in ("", "PENDING", "NOT_STARTED"):
+            # DI classified the page and then left it alone (an extra copy
+            # of a document the booking already holds, a type with no
+            # checklist slot or no extraction profile). Nothing is ever
+            # going to read it: settle it now rather than show "reading"
+            # for ever (seen live 2026-10-01, a file stuck for 12 hours).
+            return PageOutcome("SUPPORTING", _NOT_QUEUED_REASON)
         return PageOutcome("EXTRACTING", None)
     return PageOutcome("CLASSIFYING", None)
 
