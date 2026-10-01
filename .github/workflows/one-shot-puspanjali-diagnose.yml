@@ -1,4 +1,4 @@
-name: One-shot Reference naming data diagnose (DEV, read-only)
+name: One-shot List price variance vs Deal diagnose (DEV, read-only)
 
 # Read-only: one customer's journeys. Never writes.
 on:
@@ -59,35 +59,58 @@ jobs:
           echo "::add-mask::$url"
           echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
 
-      - name: Print outlet, dealer and creator naming data (read-only)
+      - name: Compare the list price variance with the Deal build, read-only
         shell: bash
         run: |
           python - <<'PY'
           import json, os
-          from decimal import Decimal
-          from datetime import datetime, date
           from sqlalchemy import create_engine, text
           from audit_core.db import set_tenant_context
-
-          def show(title, rows):
-              print(f"\n===== {title} ({len(rows)})")
-              for r in rows:
-                  print(json.dumps({k: (str(v) if isinstance(v, (Decimal, datetime, date)) else v) for k, v in dict(r).items()},
-                                   default=str, ensure_ascii=False)[:600])
+          from audit_core.uc03_p2_journey360 import deal
+          import audit_core.uc03_p2_api as api
 
           T = "5fbe26ab-6ed7-444a-8488-5bfb81208588"
+          src = open(api.__file__).read()
+          start = src.index("-- Journey 360's \"current vs standard\"")
+          start = src.index("SELECT COALESCE((", start)
+          end = src.index(") pv ON true", start)
+          PV_SQL = src[start:end].replace("p.tenant_id", ":t").replace("p.journey_id", ":j")
           engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=60000"})
           with engine.connect() as c:
               c.execute(text("SET TRANSACTION READ ONLY"))
               set_tenant_context(c, T)
-              show("outlet columns", c.execute(text("""
-                  SELECT table_name, column_name FROM information_schema.columns
-                  WHERE table_schema='auditcore' AND table_name IN ('dealer_outlets','dealers') ORDER BY table_name, ordinal_position""")).mappings().all())
-              show("dealer_outlets", c.execute(text("""
-                  SELECT to_jsonb(o) AS o FROM auditcore.dealer_outlets o LIMIT 40""")).mappings().all())
-              show("dealers", c.execute(text("""
-                  SELECT dealer_id, dealer_code, to_jsonb(d)->>'dealer_name' AS name FROM auditcore.dealers d LIMIT 40""")).mappings().all())
-              show("creators per journey", c.execute(text("""
-                  SELECT created_by_display_name AS name, count(*) AS n FROM auditcore.journeys
-                  GROUP BY 1 ORDER BY 2 DESC LIMIT 40""")).mappings().all())
+              js = c.execute(text("""SELECT journey_id, journey_reference, created_at_utc FROM auditcore.journeys
+                                     WHERE tenant_id=:t ORDER BY created_at_utc"""), {"t": T}).all()
+              print("journeys", len(js))
+              for jid, ref, created in js:
+                  try:
+                      lst = c.execute(text(PV_SQL.replace(":j", ":jj").replace(":jj", ":j")), {"t": T, "j": jid}).scalar()
+                      view = deal(c, tenant_id=T, journey_id=jid)
+                      v = view["summary"]["variance"]
+                      g = view["summary"]["gross"]
+                      print(ref, str(jid)[:8], "LIST_PV", lst, "| DEAL cur-std", v["currentVsStandard"], "book-std", v["bookingVsStandard"],
+                            "billed-book", v["billedVsBooking"], "| gross std", g["standard"], "cur", g["current"], "billed", g["billed"])
+                  except Exception as exc:
+                      print(ref, "ERR", type(exc).__name__, str(exc)[:200])
+                      c.rollback(); c.execute(text("SET TRANSACTION READ ONLY")); set_tenant_context(c, T)
+              for ref in ("VJ2610-000028", "VJ2610-000033"):
+                  jid = next(j for j, r, _ in js if r == ref)
+                  print("\n===== list-side lines for", ref)
+                  for r in c.execute(text("""
+                      SELECT cl.component_key, cl.standard_amount, cl.actual_amount, cl.updated_at_utc,
+                        (SELECT s.amount||' '||s.source_document_type FROM auditcore.commercial_line_source_values s
+                          WHERE s.tenant_id=cl.tenant_id AND s.journey_id=cl.journey_id AND s.line_kind='COMMERCIAL'
+                            AND s.component_key=cl.component_key
+                            AND s.source_document_type NOT IN ('booking_form','booking_docket','order_taking_form','customer_ledger','cost_sheet')
+                          ORDER BY s.updated_at_utc DESC LIMIT 1) AS invoice_value
+                      FROM auditcore.commercial_lines cl WHERE cl.tenant_id=:t AND cl.journey_id=:j
+                      ORDER BY cl.component_key"""), {"t": T, "j": jid}).mappings():
+                      print(json.dumps({k: str(v) for k, v in dict(r).items()}))
+                  for r in c.execute(text("""SELECT discount_key, actual_discount_amount, standard_eligible_amount, updated_at_utc
+                      FROM auditcore.discount_applications WHERE tenant_id=:t AND journey_id=:j"""), {"t": T, "j": jid}).mappings():
+                      print("discount", json.dumps({k: str(v) for k, v in dict(r).items()}))
+                  view = deal(c, tenant_id=T, journey_id=jid)
+                  for g in view["categories"]:
+                      for x in g["components"]:
+                          print("DEAL", x["key"], "std", x["standard"], "book", x["booking"], "cur", x.get("current"), "billed", x["billed"])
           PY
