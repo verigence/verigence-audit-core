@@ -1,4 +1,4 @@
-name: One-shot Puspanjali stage diagnose (DEV, read-only)
+name: One-shot Prateek deal amount diagnose (DEV, read-only)
 
 # Read-only: one customer's journeys. Never writes.
 on:
@@ -59,7 +59,7 @@ jobs:
           echo "::add-mask::$url"
           echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
 
-      - name: Print documents, queue pages and stage records with times
+      - name: Print Prateek's journeys, invoice documents, tax fields and deal sources
         shell: bash
         run: |
           python - <<'PY'
@@ -77,25 +77,26 @@ jobs:
           engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=60000"})
           with engine.connect() as c:
               c.execute(text("SET TRANSACTION READ ONLY"))
-              p = {"j": "dc9b79f4-1885-4ef1-9f80-92fb39919389"}
-              print("now:", c.execute(text("SELECT now()")).scalar())
-              show("runtime now", c.execute(text("SELECT current_stage, booking_completion_state, delivery_completion_state, created_at_utc, updated_at_utc FROM auditcore.p2_journey_runtime WHERE journey_id=:j"), p).mappings().all())
-              show("queue pages by status now", c.execute(text("SELECT queue_status, count(*) AS pages, min(created_at_utc) AS first, max(updated_at_utc) AS last_update FROM auditcore.p2_document_queue WHERE journey_id=:j GROUP BY 1"), p).mappings().all())
-              show("evidence rows (what the journey holds)", c.execute(text("""
-                  SELECT e.process_area, e.document_type_key, e.association_status, e.cache_updated_at_utc, e.processing_status_cache, e.confirmation_status_cache, e.linked_by_actor_id,
-                         e.di_document_id, (q.queue_id IS NOT NULL) AS in_queue, q.queue_status, q.page_number
-                  FROM auditcore.evidence e
-                  LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id=e.tenant_id AND q.journey_id=e.journey_id AND q.di_document_id=e.di_document_id
-                  WHERE e.journey_id=:j ORDER BY e.cache_updated_at_utc"""), p).mappings().all())
-              show("capture documents", c.execute(text("""
-                  SELECT capture_status, classified_document_type_key, count(*) AS n, min(created_at_utc) AS first, max(created_at_utc) AS last
-                  FROM auditcore.document_capture_v2_documents WHERE journey_id=:j GROUP BY 1,2 ORDER BY 1,2"""), p).mappings().all())
-              show("queue pages (first 40)", c.execute(text("""
-                  SELECT page_number, queue_status, template_key, classified_document_type, di_document_id IS NOT NULL AS has_di_doc,
-                         di_submitted_at_utc, updated_at_utc, last_error
-                  FROM auditcore.p2_document_queue WHERE journey_id=:j ORDER BY page_number LIMIT 40"""), p).mappings().all())
-              show("activity events", c.execute(text("SELECT to_jsonb(e) AS ev FROM auditcore.p2_activity_events e WHERE journey_id=:j LIMIT 60"), p).mappings().all())
-              show("work queue for the journey", c.execute(text("""
-                  SELECT work_type, work_status, attempt_count, created_at_utc, updated_at_utc, last_error
-                  FROM auditcore.p2_work_queue WHERE journey_id=:j ORDER BY created_at_utc LIMIT 30"""), p).mappings().all())
+              js = c.execute(text("""
+                  SELECT j.journey_id, j.journey_reference, cu.display_name, j.created_at_utc
+                  FROM auditcore.journeys j JOIN auditcore.customers cu ON cu.tenant_id=j.tenant_id AND cu.customer_id=j.customer_id
+                  WHERE cu.display_name ILIKE 'PRATEEK%' ORDER BY j.created_at_utc""")).mappings().all()
+              show("journeys", js)
+              for j in js:
+                  p = {"j": j["journey_id"]}
+                  print("\n######## journey", j["journey_reference"], j["journey_id"])
+                  show("deal source values", c.execute(text("""
+                      SELECT line_kind, component_key, source_document_type, amount, source_document_id
+                      FROM auditcore.commercial_line_source_values WHERE journey_id=:j
+                      ORDER BY line_kind, component_key, source_document_type"""), p).mappings().all())
+                  show("invoice-type evidence", c.execute(text("""
+                      SELECT di_document_id, document_type_key, association_status, process_area
+                      FROM auditcore.evidence WHERE journey_id=:j
+                        AND document_type_key IN ('customer_invoice_dms','tax_invoice_tally','accessory_invoice_dms','accessory_invoice_tally','credit_note','debit_note')"""), p).mappings().all())
+                  show("invoice amount fields", c.execute(text("""
+                      SELECT source_document_type_key, di_document_id, field_key, effective_value
+                      FROM auditcore.journey_document_extracted_fields WHERE journey_id=:j
+                        AND source_document_type_key IN ('customer_invoice_dms','tax_invoice_tally')
+                        AND field_key IN ('gross_amount_before_discount','invoice_discount_amount','taxable_amount','cgst_amount','sgst_amount','igst_amount','cess_amount','tcs_amount','grand_total_amount','invoice_number')
+                      ORDER BY source_document_type_key, di_document_id, field_key"""), p).mappings().all())
           PY
