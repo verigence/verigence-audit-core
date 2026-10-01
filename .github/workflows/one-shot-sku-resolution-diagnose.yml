@@ -1,0 +1,173 @@
+name: One-shot SKU resolution diagnose (DEV, read-only)
+
+# Read-only: for every open Phase 2 journey on DEV, prints what the model
+# resolver had to work with (booking form and invoice values, the
+# journey_products row, the open MODEL_NOT_IDENTIFIED / INVOICE_SKU_MISMATCH
+# findings with their candidate lists, the open tasks) so "SKU not
+# identified" can be traced to the real inputs. Never writes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/one-shot-sku-resolution-diagnose.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-sku-resolution-diagnose
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "sqlalchemy>=2" "psycopg[binary]>=3"
+          npm install --global @railway/cli
+
+      - name: Resolve Railway DEV database connection
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          raw="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          variables = json.loads(Path('/tmp/audit-vars.json').read_text())
+          print(variables.get('DATABASE_PUBLIC_URL') or variables.get('DATABASE_URL') or '')
+          PY
+          )"
+          [[ -n "$raw" ]] || { echo '::error::no DATABASE_URL on the DEV service.'; exit 1; }
+          case "$raw" in
+            postgresql+psycopg://*) url="$raw" ;;
+            postgresql+asyncpg://*) url="postgresql+psycopg://${raw#postgresql+asyncpg://}" ;;
+            postgresql://*) url="postgresql+psycopg://${raw#postgresql://}" ;;
+            postgres://*) url="postgresql+psycopg://${raw#postgres://}" ;;
+            *) echo '::error::DATABASE_URL is not a PostgreSQL URL.'; exit 1 ;;
+          esac
+          echo "::add-mask::$url"
+          echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
+
+      - name: Print the resolver's view of every open journey
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          from decimal import Decimal
+          from datetime import datetime
+          from sqlalchemy import create_engine, text
+
+          def show(title, rows):
+              print(f"\n===== {title} ({len(rows)})")
+              for r in rows:
+                  print(json.dumps({k: (str(v) if isinstance(v, (Decimal, datetime)) else v) for k, v in dict(r).items()},
+                                   default=str, ensure_ascii=False))
+
+          engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=60000"})
+          with engine.connect() as c:
+              c.execute(text("SET TRANSACTION READ ONLY"))
+              journeys = c.execute(text("""
+                  SELECT j.tenant_id, j.journey_id, cu.display_name AS customer, j.audit_state, j.price_list_version_id, j.created_at_utc
+                  FROM auditcore.journeys j
+                  LEFT JOIN auditcore.customers cu ON cu.tenant_id=j.tenant_id AND cu.customer_id=j.customer_id
+                  WHERE j.created_at_utc > now() - interval '3 days'
+                  ORDER BY j.created_at_utc DESC
+                  LIMIT 12
+              """)).mappings().all()
+              show("journeys created in the last 3 days", journeys)
+              ids = [r["journey_id"] for r in journeys]
+              if not ids:
+                  raise SystemExit(0)
+              p = {"ids": ids}
+              show("journey_products", c.execute(text("""
+                  SELECT jp.journey_id, jp.product_sku_id, jp.model_name_snapshot, jp.variant_name_snapshot,
+                         jp.colour_name_snapshot, jp.selection_status, jp.selection_source, jp.selection_method,
+                         jp.selection_score, jp.sku_resolution_remarks, jp.updated_at_utc,
+                         s.sku_code, pm.model_name AS sku_model, pv.variant_name AS sku_variant, c.colour_name AS sku_colour
+                  FROM auditcore.journey_products jp
+                  LEFT JOIN auditcore.product_skus s ON s.product_sku_id=jp.product_sku_id
+                  LEFT JOIN auditcore.product_models pm ON pm.model_id=s.model_id
+                  LEFT JOIN auditcore.product_variants pv ON pv.variant_id=s.variant_id
+                  LEFT JOIN auditcore.colours c ON c.colour_id=s.colour_id
+                  WHERE jp.journey_id = ANY(:ids)
+              """), p).mappings().all())
+              show("booking_form_review_values (latest per journey)", c.execute(text("""
+                  SELECT DISTINCT ON (journey_id) journey_id, vehicle_model, vehicle_variant, vehicle_color, sku_code,
+                         ex_showroom_price, total_price, net_amount, reviewed_at_utc
+                  FROM auditcore.booking_form_review_values
+                  WHERE journey_id = ANY(:ids)
+                  ORDER BY journey_id, reviewed_at_utc DESC NULLS LAST
+              """), p).mappings().all())
+              show("vehicle fields read from documents", c.execute(text("""
+                  SELECT journey_id, source_document_type_key, field_key, extracted_value, modified_value,
+                         effective_value, confidence_score, reviewed_at_utc, updated_at_utc
+                  FROM auditcore.journey_document_extracted_fields
+                  WHERE journey_id = ANY(:ids)
+                    AND field_key IN ('model_name','model_name_raw','variant_name','variant_raw','sku_code',
+                                      'vehicle_color','colour_name','ex_showroom_price','total_price',
+                                      'on_road_price','fuel_type','transmission','model','variant')
+                  ORDER BY journey_id, source_document_type_key, field_key
+              """), p).mappings().all())
+              show("findings: model resolution / invoice SKU", c.execute(text("""
+                  SELECT journey_id, audit_finding_id, rule_key, finding_status, severity, title,
+                         left(description, 400) AS description, created_at_utc, updated_at_utc
+                  FROM auditcore.audit_findings
+                  WHERE journey_id = ANY(:ids)
+                    AND (rule_key LIKE 'MODEL_NOT_IDENTIFIED%' OR rule_key = 'INVOICE_SKU_MISMATCH')
+                  ORDER BY journey_id, created_at_utc
+              """), p).mappings().all())
+              events = c.execute(text("""
+                  SELECT e.*
+                  FROM auditcore.audit_finding_events e
+                  JOIN auditcore.audit_findings f ON f.tenant_id=e.tenant_id AND f.audit_finding_id=e.audit_finding_id
+                  WHERE f.journey_id = ANY(:ids)
+                    AND (f.rule_key LIKE 'MODEL_NOT_IDENTIFIED%' OR f.rule_key = 'INVOICE_SKU_MISMATCH')
+                  ORDER BY e.created_at_utc
+              """), p).mappings().all())
+              show("finding events (payload with inputs, stage, candidates)", events)
+              show("open P2 tasks about the vehicle", c.execute(text("""
+                  SELECT journey_id, task_type, severity, task_status, title, left(description, 500) AS description,
+                         reference, created_at_utc
+                  FROM auditcore.p2_tasks
+                  WHERE journey_id = ANY(:ids)
+                    AND task_status IN ('READY','IN_PROGRESS','RETURNED','ACTION_COMPLETED','VERIFYING')
+                    AND (title ILIKE '%model%' OR title ILIKE '%SKU%' OR title ILIKE '%vehicle%'
+                         OR task_type ILIKE '%MODEL%' OR task_type ILIKE '%SKU%')
+                  ORDER BY journey_id, created_at_utc
+              """), p).mappings().all())
+              show("open workflow tasks about the vehicle", c.execute(text("""
+                  SELECT journey_id, task_type, task_status, task_payload, related_finding_id, created_at_utc
+                  FROM auditcore.workflow_tasks
+                  WHERE journey_id = ANY(:ids)
+                    AND (task_type ILIKE '%MODEL%' OR task_type ILIKE '%SKU%')
+                  ORDER BY journey_id, created_at_utc
+              """), p).mappings().all())
+              show("price-master models per price list version (tenant)", c.execute(text("""
+                  SELECT pli.price_list_version_id, pm.model_name, COUNT(DISTINCT s.product_sku_id) AS skus,
+                         COUNT(DISTINCT s.product_sku_id) FILTER (WHERE pli.component_key='EX_SHOWROOM') AS with_ex_showroom
+                  FROM auditcore.price_list_items pli
+                  JOIN auditcore.product_skus s ON s.product_sku_id=pli.product_sku_id
+                  JOIN auditcore.product_models pm ON pm.model_id=s.model_id
+                  WHERE pli.tenant_id = :t
+                  GROUP BY pli.price_list_version_id, pm.model_name ORDER BY 1, 2
+              """), {"t": journeys[0]["tenant_id"]}).mappings().all())
+              show("price list versions of the tenant", c.execute(text("""
+                  SELECT * FROM auditcore.price_list_versions WHERE tenant_id = :t ORDER BY created_at_utc DESC LIMIT 12
+              """), {"t": journeys[0]["tenant_id"]}).mappings().all())
+          PY
