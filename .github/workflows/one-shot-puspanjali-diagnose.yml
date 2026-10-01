@@ -1,4 +1,4 @@
-name: One-shot Prateek deal amount diagnose (DEV, read-only)
+name: One-shot List variance, task counts and live build diagnose (DEV, read-only)
 
 # Read-only: one customer's journeys. Never writes.
 on:
@@ -59,7 +59,14 @@ jobs:
           echo "::add-mask::$url"
           echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
 
-      - name: Print Prateek's journeys, invoice documents, tax fields and deal sources
+      - name: Which build is the DEV API running
+        shell: bash
+        run: |
+          railway logs --service "$AUDIT_SERVICE" --latest --deployment --lines 400 2>/dev/null \
+            | grep -oE 'version[": =]+[0-9a-f]{7,40}' | sort | uniq -c | sort -rn | head -5 || true
+          railway deployment list --service "$AUDIT_SERVICE" --limit 4 --json 2>/dev/null | python -c "import json,sys; [print(r.get('id'), r.get('status'), r.get('createdAt'), str(r.get('meta',{}))[:160]) for r in json.load(sys.stdin)]" || true
+
+      - name: Print task counts per journey, Hero totals and list price variance
         shell: bash
         run: |
           python - <<'PY'
@@ -74,29 +81,45 @@ jobs:
                   print(json.dumps({k: (str(v) if isinstance(v, (Decimal, datetime, date)) else v) for k, v in dict(r).items()},
                                    default=str, ensure_ascii=False))
 
+          T = "5fbe26ab-6ed7-444a-8488-5bfb81208588"
           engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=60000"})
           with engine.connect() as c:
               c.execute(text("SET TRANSACTION READ ONLY"))
-              js = c.execute(text("""
-                  SELECT j.journey_id, j.journey_reference, cu.display_name, j.created_at_utc
-                  FROM auditcore.journeys j JOIN auditcore.customers cu ON cu.tenant_id=j.tenant_id AND cu.customer_id=j.customer_id
-                  WHERE cu.display_name ILIKE 'PRATEEK%' ORDER BY j.created_at_utc""")).mappings().all()
-              show("journeys", js)
-              for j in js:
-                  p = {"j": j["journey_id"]}
-                  print("\n######## journey", j["journey_reference"], j["journey_id"])
-                  show("deal source values", c.execute(text("""
-                      SELECT line_kind, component_key, source_document_type, amount, source_document_id
-                      FROM auditcore.commercial_line_source_values WHERE journey_id=:j
-                      ORDER BY line_kind, component_key, source_document_type"""), p).mappings().all())
-                  show("invoice-type evidence", c.execute(text("""
-                      SELECT di_document_id, document_type_key, association_status, process_area
-                      FROM auditcore.evidence WHERE journey_id=:j
-                        AND document_type_key IN ('customer_invoice_dms','tax_invoice_tally','accessory_invoice_dms','accessory_invoice_tally','credit_note','debit_note')"""), p).mappings().all())
-                  show("invoice amount fields", c.execute(text("""
-                      SELECT source_document_type_key, di_document_id, field_key, effective_value
-                      FROM auditcore.journey_document_extracted_fields WHERE journey_id=:j
-                        AND source_document_type_key IN ('customer_invoice_dms','tax_invoice_tally')
-                        AND field_key IN ('gross_amount_before_discount','invoice_discount_amount','taxable_amount','cgst_amount','sgst_amount','igst_amount','cess_amount','tcs_amount','grand_total_amount','invoice_number')
-                      ORDER BY source_document_type_key, di_document_id, field_key"""), p).mappings().all())
+              p = {"t": T}
+              show("per journey: stage, closed, open p2 tasks, open legacy tasks", c.execute(text("""
+                  SELECT j.journey_reference, cu.display_name, pr.current_stage, (pr.journey_id IS NOT NULL) AS has_runtime,
+                         (ds.business_completed_at_utc IS NOT NULL) AS delivery_done,
+                         (bs.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING') OR bs.closure_disposition='NO_DELIVERY') AS cancelled,
+                         (SELECT COUNT(*) FROM auditcore.p2_tasks t WHERE t.tenant_id=j.tenant_id AND t.journey_id=j.journey_id
+                            AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')) AS open_p2,
+                         (SELECT COUNT(*) FROM auditcore.workflow_tasks w WHERE w.tenant_id=j.tenant_id AND w.journey_id=j.journey_id
+                            AND w.assigned_role_code IN ('PC','TL','PM','EXECUTIVE')
+                            AND w.task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT')) AS open_legacy
+                  FROM auditcore.journeys j
+                  JOIN auditcore.customers cu ON cu.tenant_id=j.tenant_id AND cu.customer_id=j.customer_id
+                  LEFT JOIN auditcore.p2_journey_runtime pr ON pr.tenant_id=j.tenant_id AND pr.journey_id=j.journey_id
+                  LEFT JOIN auditcore.journey_stage_states bs ON bs.tenant_id=j.tenant_id AND bs.journey_id=j.journey_id AND bs.stage_code='BOOKING'
+                  LEFT JOIN auditcore.journey_stage_states ds ON ds.tenant_id=j.tenant_id AND ds.journey_id=j.journey_id AND ds.stage_code='DELIVERY'
+                  WHERE j.tenant_id=:t ORDER BY j.journey_reference"""), p).mappings().all())
+              show("Hero style total: every open p2 task on every journey", c.execute(text("""
+                  SELECT COUNT(*) AS open_p2_all_journeys FROM auditcore.p2_tasks
+                  WHERE tenant_id=:t AND task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')"""), p).mappings().all())
+              show("open p2 tasks by type", c.execute(text("""
+                  SELECT task_type, assigned_role_code, count(*) AS n FROM auditcore.p2_tasks
+                  WHERE tenant_id=:t AND task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')
+                  GROUP BY 1,2 ORDER BY n DESC"""), p).mappings().all())
+              show("list variance inputs for the two Prateek journeys", c.execute(text("""
+                  SELECT j.journey_reference, cl.component_key, cl.standard_amount, cl.actual_amount,
+                         (SELECT s.amount FROM auditcore.commercial_line_source_values s WHERE s.tenant_id=cl.tenant_id AND s.journey_id=cl.journey_id
+                            AND s.line_kind='COMMERCIAL' AND s.component_key=cl.component_key
+                            AND s.source_document_type NOT IN ('booking_form','booking_docket','order_taking_form','customer_ledger','cost_sheet')
+                          ORDER BY s.updated_at_utc DESC LIMIT 1) AS non_booking_source
+                  FROM auditcore.commercial_lines cl JOIN auditcore.journeys j ON j.tenant_id=cl.tenant_id AND j.journey_id=cl.journey_id
+                  WHERE j.journey_id IN ('20f1de3c-46a7-4ac9-a7c1-dd9c39035255','749e6c59-facc-489f-bf5b-6e087f2e319a')
+                  ORDER BY j.journey_reference, cl.component_key"""), p).mappings().all())
+              show("list variance: discount applications", c.execute(text("""
+                  SELECT j.journey_reference, da.discount_key, da.standard_eligible_amount, da.actual_discount_amount
+                  FROM auditcore.discount_applications da JOIN auditcore.journeys j ON j.tenant_id=da.tenant_id AND j.journey_id=da.journey_id
+                  WHERE j.journey_id IN ('20f1de3c-46a7-4ac9-a7c1-dd9c39035255','749e6c59-facc-489f-bf5b-6e087f2e319a')
+                  ORDER BY 1,2"""), p).mappings().all())
           PY
