@@ -72,6 +72,10 @@ from audit_core.uc03_p2_grouping import (
     plan_documents,
     read_once_di_types,
 )
+from audit_core.uc03_p2_price_variance import (
+    backfill_price_variance,
+    refresh_price_variance,
+)
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_runtime import (
     enqueue_work,
@@ -2659,6 +2663,8 @@ def _stage_recompute(engine: Engine, work: WorkItem) -> None:
         set_tenant_context(connection, work.tenant_id)
         _owned(connection, work, lock=False)
         result = settle_journey(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
+        # The Journey list reads the Deal's own price variance, stored here.
+        refresh_price_variance(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
         # Delivery documents just became complete: every compliance rule runs
         # now (forced), not at a button press.
         force = "DELIVERY_DOCUMENTS_COMPLETE" in result.get("transitions", ())
@@ -2881,6 +2887,12 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
             logger.info("p2_fact_sweep_changes", tenant_id=tenant_id, journeys=changed)
     except Exception:
         logger.warning("p2_fact_sweep_failed", tenant_id=tenant_id, exc_info=True)
+    try:
+        filled = backfill_price_variance(engine, tenant_id=tenant_id)
+        if filled:
+            logger.info("p2_price_variance_backfilled", tenant_id=tenant_id, journeys=filled)
+    except Exception:
+        logger.warning("p2_price_variance_backfill_failed", tenant_id=tenant_id, exc_info=True)
     due = _nightly_review_due(tenant_id)
     if due is None:
         return
