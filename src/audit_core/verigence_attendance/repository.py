@@ -426,6 +426,37 @@ def list_leave_for_employee(connection: Connection, employee_id: UUID) -> list[d
     ]
 
 
+def list_team_attendance(
+    connection: Connection,
+    *,
+    actor_user_id: str,
+    attendance_date: date,
+) -> list[dict[str, Any]]:
+    """Read one day's attendance for employees explicitly assigned to TL/PMO."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            text(
+                """
+                SELECT e.employee_id,e.display_name,a.attendance_date,a.status,
+                       a.present_fraction,a.check_in_at_utc,a.check_out_at_utc
+                FROM verigence_attendance.employees e
+                LEFT JOIN verigence_attendance.attendance_days a
+                  ON a.employee_id=e.employee_id
+                 AND a.attendance_date=:attendance_date
+                WHERE e.employment_status='ACTIVE'
+                  AND (
+                    e.tl_user_id=CAST(:actor AS uuid)
+                    OR e.pmo_user_id=CAST(:actor AS uuid)
+                  )
+                ORDER BY lower(e.display_name),e.employee_id
+                """
+            ),
+            {"actor": actor_user_id, "attendance_date": attendance_date},
+        ).mappings()
+    ]
+
+
 def list_team_leave(connection: Connection, actor_user_id: str) -> list[dict[str, Any]]:
     return [
         dict(row)
