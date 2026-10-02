@@ -164,3 +164,59 @@ class PayrollItemResponse(BaseModel):
     grossAmount: Decimal
     deductionAmount: Decimal
     netAmount: Decimal
+
+
+class ConfigUpdateRequest(BaseModel):
+    value: object
+
+
+class WorkLocationCreateRequest(BaseModel):
+    locationCode: str = Field(min_length=1, max_length=80)
+    locationName: str = Field(min_length=1, max_length=240)
+    addressText: str | None = None
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    geofenceRadiusMeters: int = Field(default=500, ge=50, le=5000)
+
+
+class WorkLocationResponse(BaseModel):
+    locationId: UUID
+    locationCode: str
+    locationName: str
+    addressText: str | None = None
+    latitude: float
+    longitude: float
+    geofenceRadiusMeters: int
+    status: str
+
+
+class LeaveTypeCreateRequest(BaseModel):
+    leaveCode: str = Field(min_length=1, max_length=40)
+    leaveName: str = Field(min_length=1, max_length=120)
+    isPaid: bool = True
+    defaultEntitlementDays: Decimal = Field(default=Decimal(0), ge=0)
+    allowHalfDay: bool = True
+
+
+class LeaveTypeResponse(BaseModel):
+    leaveTypeId: UUID
+    leaveCode: str
+    leaveName: str
+    isPaid: bool
+    defaultEntitlementDays: Decimal
+    allowHalfDay: bool
+    status: str
+
+
+class HolidayCreateRequest(BaseModel):
+    holidayDate: date
+    holidayName: str = Field(min_length=1, max_length=240)
+    workLocationId: UUID | None = None
+
+
+class HolidayResponse(BaseModel):
+    holidayId: UUID
+    holidayDate: date
+    holidayName: str
+    workLocationId: UUID | None = None
+    status: str
