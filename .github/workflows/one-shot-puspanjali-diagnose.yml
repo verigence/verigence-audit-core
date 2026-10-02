@@ -1,4 +1,4 @@
-name: One-shot Ramakanta page health diagnose (DEV, read-only)
+name: One-shot Ramakanta evidence diagnose (DEV, read-only)
 
 # Read-only: one customer's journeys. Never writes.
 on:
@@ -59,7 +59,7 @@ jobs:
           echo "::add-mask::$url"
           echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
 
-      - name: Ramakanta Sahoo page health, read-only
+      - name: Ramakanta evidence void reasons and the failed re-read, read-only
         shell: bash
         run: |
           python - <<'PY'
@@ -68,45 +68,41 @@ jobs:
           from decimal import Decimal
           from sqlalchemy import create_engine, text
           from audit_core.db import set_tenant_context
-          from audit_core.uc03_p2_document_health import journey_document_health
 
           def show(title, rows):
               print(f"\n===== {title} ({len(rows)})")
               for r in rows:
                   print(json.dumps({k: (str(v) if isinstance(v, (Decimal, datetime, date)) else v) for k, v in dict(r).items()},
-                                   default=str, ensure_ascii=False)[:700])
+                                   default=str, ensure_ascii=False)[:900])
 
           T = "5fbe26ab-6ed7-444a-8488-5bfb81208588"
           engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=60000"})
           with engine.connect() as c:
               c.execute(text("SET TRANSACTION READ ONLY"))
               set_tenant_context(c, T)
-              j = c.execute(text("""SELECT j.journey_id, j.journey_reference, cu.legal_name, cu.display_name
-                  FROM auditcore.journeys j JOIN auditcore.customers cu ON cu.tenant_id=j.tenant_id AND cu.customer_id=j.customer_id
-                  WHERE j.tenant_id=:t AND (cu.legal_name ILIKE '%ramakanta%' OR cu.display_name ILIKE '%ramakanta%')"""), {"t": T}).mappings().all()
-              show("journey", j)
-              jid = j[0]["journey_id"]
-              show("queue rows", c.execute(text("""
-                  SELECT q.queue_id, q.page_number, q.page_numbers, q.queue_status, q.template_key, q.last_error,
-                         q.type_overridden_by_actor_id IS NOT NULL AS type_set, q.di_document_id, q.di_submitted_at_utc,
-                         q.updated_at_utc, b.original_filename, d.capture_status,
-                         (SELECT COUNT(*) FROM auditcore.journey_document_extracted_fields f
-                           WHERE f.tenant_id=q.tenant_id AND f.journey_id=q.journey_id AND f.di_document_id=q.di_document_id) AS fields
-                  FROM auditcore.p2_document_queue q
-                  JOIN auditcore.p2_upload_batches b ON b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
-                  LEFT JOIN auditcore.document_capture_v2_documents d ON d.tenant_id=q.tenant_id AND d.journey_id=q.journey_id AND d.di_document_id=q.di_document_id
-                  WHERE q.tenant_id=:t AND q.journey_id=:j ORDER BY b.created_at_utc, q.page_number"""), {"t": T, "j": jid}).mappings().all())
-              show("evidence", c.execute(text("""
-                  SELECT evidence_id, document_type_key, association_status, di_document_id, linked_at_utc
+              jid = c.execute(text("""SELECT j.journey_id FROM auditcore.journeys j JOIN auditcore.customers cu
+                  ON cu.tenant_id=j.tenant_id AND cu.customer_id=j.customer_id
+                  WHERE j.tenant_id=:t AND (cu.legal_name ILIKE '%ramakanta%' OR cu.display_name ILIKE '%ramakanta%')"""), {"t": T}).scalar_one()
+              show("evidence of the journey", c.execute(text("""
+                  SELECT evidence_id, document_type_key, association_status, void_reason, voided_by_actor_id, voided_at_utc,
+                         supersedes_evidence_id, di_document_id, linked_at_utc, journey_document_requirement_id
                   FROM auditcore.evidence WHERE tenant_id=:t AND journey_id=:j ORDER BY linked_at_utc"""), {"t": T, "j": jid}).mappings().all())
-              show("fields per document", c.execute(text("""
-                  SELECT di_document_id, source_document_type_key, COUNT(*) AS n
-                  FROM auditcore.journey_document_extracted_fields WHERE tenant_id=:t AND journey_id=:j
-                  GROUP BY 1,2 ORDER BY 2"""), {"t": T, "j": jid}).mappings().all())
-              h = journey_document_health(c, tenant_id=T, journey_id=jid)
-              print("\nhealth summary", h["summary"]); print("defects", json.dumps(h["defects"], default=str))
-              show("activity", c.execute(text("""
-                  SELECT created_at_utc, event_type, subject_type, details FROM auditcore.p2_activity_events
-                  WHERE tenant_id=:t AND journey_id=:j AND (details::text ILIKE '%read%' OR event_type ILIKE '%PAGE%' OR event_type ILIKE '%DOC%')
-                  ORDER BY event_id DESC LIMIT 25"""), {"t": T, "j": jid}).mappings().all())
+              show("work items for the journey", c.execute(text("""
+                  SELECT work_type, work_key, work_status, attempt_count, last_error, created_at_utc, updated_at_utc
+                  FROM auditcore.p2_work_queue WHERE tenant_id=:t AND journey_id=:j
+                    AND work_type IN ('PAGE_REREAD','DOCUMENT_RECONCILE','DOCUMENT_INGEST') ORDER BY updated_at_utc DESC LIMIT 12"""), {"t": T, "j": jid}).mappings().all())
+              show("tenant: void reasons on evidence", c.execute(text("""
+                  SELECT association_status, COALESCE(void_reason,'-') AS void_reason, COUNT(*) AS n,
+                         MIN(voided_at_utc) AS first, MAX(voided_at_utc) AS last
+                  FROM auditcore.evidence WHERE tenant_id=:t AND association_status<>'ACTIVE'
+                  GROUP BY 1,2 ORDER BY 3 DESC"""), {"t": T}).mappings().all())
+              show("tenant: pages settled SUPPORTING with a real type", c.execute(text("""
+                  SELECT j.journey_reference, q.template_key, q.page_number, q.updated_at_utc,
+                         (SELECT association_status||'/'||COALESCE(void_reason,'-') FROM auditcore.evidence e
+                           WHERE e.tenant_id=q.tenant_id AND e.di_document_id=q.di_document_id LIMIT 1) AS evidence,
+                         (SELECT COUNT(*) FROM auditcore.evidence e2 WHERE e2.tenant_id=q.tenant_id AND e2.journey_id=q.journey_id
+                            AND e2.document_type_key=q.template_key AND e2.association_status='ACTIVE') AS active_same_type
+                  FROM auditcore.p2_document_queue q JOIN auditcore.journeys j ON j.tenant_id=q.tenant_id AND j.journey_id=q.journey_id
+                  WHERE q.tenant_id=:t AND q.queue_status='SUPPORTING' AND q.template_key NOT IN ('supporting_document','')
+                    AND q.template_key IS NOT NULL ORDER BY j.journey_reference, q.page_number"""), {"t": T}).mappings().all())
           PY
