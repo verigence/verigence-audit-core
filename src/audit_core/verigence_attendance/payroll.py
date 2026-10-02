@@ -15,7 +15,10 @@ from audit_core.verigence_attendance.errors import (
     AttendanceRuleError,
 )
 from audit_core.verigence_attendance.pdf import simple_text_pdf
-from audit_core.verigence_attendance.storage import AttendanceStorage, AttendanceStorageError
+from audit_core.verigence_attendance.storage import (
+    AttendanceStorage,
+    AttendanceStorageError,
+)
 
 _MONEY = Decimal("0.01")
 _DAY = Decimal("0.01")
