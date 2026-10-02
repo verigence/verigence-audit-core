@@ -40,6 +40,9 @@ class EmployeeCreateRequest(BaseModel):
     allowances: Decimal = Decimal(0)
     otherEarnings: Decimal = Decimal(0)
     fixedDeductions: Decimal = Decimal(0)
+    bankAccountMasked: str | None = Field(default=None, max_length=80)
+    panMasked: str | None = Field(default=None, max_length=32)
+    aadhaarMasked: str | None = Field(default=None, max_length=32)
 
 
 class AttendanceEventResponse(BaseModel):
