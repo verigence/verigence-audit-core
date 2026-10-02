@@ -296,5 +296,7 @@ INSERT INTO verigence_attendance.module_configuration
 VALUES
 ('attendance.default_geofence_meters','500'::jsonb,'00000000-0000-0000-0000-000000000000'),
 ('reimbursement.finance_threshold_inr','3000'::jsonb,'00000000-0000-0000-0000-000000000000'),
-('payroll.working_days_per_week','6'::jsonb,'00000000-0000-0000-0000-000000000000')
+('payroll.working_days_per_week','6'::jsonb,'00000000-0000-0000-0000-000000000000'),
+('payroll.weekly_off_iso_weekdays','[7]'::jsonb,'00000000-0000-0000-0000-000000000000'),
+('payroll.fixed_deductions_prorated','false'::jsonb,'00000000-0000-0000-0000-000000000000')
 ON CONFLICT (config_key) DO NOTHING;
