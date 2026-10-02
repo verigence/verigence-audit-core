@@ -90,6 +90,13 @@ class AttendanceSecurityClient:
             raise AttendanceAuthorizationError(str(reason or "PERMISSION_DENIED"))
         return {str(key): value for key, value in payload.items()}
 
+    def allowed(self, *, user_id: str, permission_key: str) -> bool:
+        try:
+            self.require(user_id=user_id, permission_key=permission_key)
+            return True
+        except AttendanceAuthorizationError:
+            return False
+
 
 @lru_cache
 def security_client() -> AttendanceSecurityClient:
