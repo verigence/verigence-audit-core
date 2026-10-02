@@ -649,6 +649,33 @@ def list_reimbursements_for_employee(
     ]
 
 
+def list_pm_team_reimbursements(
+    connection: Connection,
+    actor_user_id: str,
+) -> list[dict[str, Any]]:
+    """Read-only team claims for employees explicitly assigned to this PM/PMO.
+
+    This intentionally does not grant approval authority. Scope is enforced in SQL,
+    so a normal PC/TL cannot enumerate another employee's reimbursement claims.
+    """
+    return [
+        dict(row)
+        for row in connection.execute(
+            text(
+                """
+                SELECT c.*,e.display_name
+                FROM verigence_attendance.reimbursement_claims c
+                JOIN verigence_attendance.employees e ON e.employee_id=c.employee_id
+                WHERE e.employment_status='ACTIVE'
+                  AND e.pmo_user_id=CAST(:actor AS uuid)
+                ORDER BY c.expense_date DESC,c.created_at_utc DESC
+                """
+            ),
+            {"actor": actor_user_id},
+        ).mappings()
+    ]
+
+
 def list_reimbursements_by_status(
     connection: Connection,
     status: str,
