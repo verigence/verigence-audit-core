@@ -63,7 +63,7 @@ def build_employee_template() -> bytes:
             5000,
             0,
             2000,
-            date.today(),
+            datetime.now(UTC).date(),
         ]
     )
     for column in sheet.columns:
