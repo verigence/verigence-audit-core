@@ -62,6 +62,16 @@ class AttendanceDayResponse(BaseModel):
     checkOutAtUtc: datetime | None = None
 
 
+class TeamAttendanceResponse(BaseModel):
+    employeeId: UUID
+    employeeName: str
+    attendanceDate: date
+    status: str
+    presentFraction: Decimal
+    checkInAtUtc: datetime | None = None
+    checkOutAtUtc: datetime | None = None
+
+
 class LeaveCreateRequest(BaseModel):
     leaveTypeId: UUID
     startDate: date
