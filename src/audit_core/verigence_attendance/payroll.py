@@ -4,7 +4,7 @@ import hashlib
 import json
 from calendar import monthrange
 from datetime import date, timedelta
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, text
