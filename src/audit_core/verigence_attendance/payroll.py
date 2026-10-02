@@ -10,7 +10,10 @@ from uuid import UUID, uuid4
 from sqlalchemy import Connection, text
 
 from audit_core.verigence_attendance.domain import payable_days
-from audit_core.verigence_attendance.errors import AttendanceNotFoundError, AttendanceRuleError
+from audit_core.verigence_attendance.errors import (
+    AttendanceNotFoundError,
+    AttendanceRuleError,
+)
 from audit_core.verigence_attendance.pdf import simple_text_pdf
 from audit_core.verigence_attendance.storage import AttendanceStorage, AttendanceStorageError
 
