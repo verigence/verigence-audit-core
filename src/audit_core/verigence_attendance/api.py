@@ -11,6 +11,16 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import Connection
 
 from audit_core.security import HumanPrincipal
+from audit_core.verigence_attendance.admin_config import (
+    create_holiday,
+    create_leave_type,
+    create_work_location,
+    list_configuration,
+    list_holidays,
+    list_leave_types,
+    list_work_locations,
+    update_configuration,
+)
 from audit_core.verigence_attendance.bulk_import import (
     apply_employee_import,
     build_employee_template,
@@ -42,6 +52,11 @@ from audit_core.verigence_attendance.repository import (
 from audit_core.verigence_attendance.schemas import (
     AdminCapabilities,
     BulkImportResponse,
+    ConfigUpdateRequest,
+    HolidayCreateRequest,
+    HolidayResponse,
+    LeaveTypeCreateRequest,
+    LeaveTypeResponse,
     AttendanceDayResponse,
     AttendanceEventResponse,
     EmployeeCreateRequest,
@@ -54,6 +69,8 @@ from audit_core.verigence_attendance.schemas import (
     PayslipResponse,
     ReimbursementDecisionRequest,
     ReimbursementResponse,
+    WorkLocationCreateRequest,
+    WorkLocationResponse,
 )
 from audit_core.verigence_attendance.reports import attendance_report, payroll_report
 from audit_core.verigence_attendance.security import human_principal, security_client
@@ -411,6 +428,190 @@ def my_payslips(
 
 
 
+
+
+@router.get("/admin/config")
+def admin_config(
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, object]:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.config.manage",
+    )
+    return list_configuration(connection)
+
+
+@router.put("/admin/config/{config_key}")
+def admin_update_config(
+    config_key: str,
+    body: ConfigUpdateRequest,
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, object]:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.config.manage",
+    )
+    return update_configuration(
+        connection,
+        key=config_key,
+        value=body.value,
+        actor_user_id=principal.subject,
+    )
+
+
+@router.get("/admin/work-locations", response_model=list[WorkLocationResponse])
+def admin_work_locations(
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> list[WorkLocationResponse]:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.config.manage",
+    )
+    return [
+        WorkLocationResponse(
+            locationId=row["location_id"],
+            locationCode=row["location_code"],
+            locationName=row["location_name"],
+            addressText=row.get("address_text"),
+            latitude=row["latitude"],
+            longitude=row["longitude"],
+            geofenceRadiusMeters=row["geofence_radius_meters"],
+            status=row["status"],
+        )
+        for row in list_work_locations(connection)
+    ]
+
+
+@router.post("/admin/work-locations", response_model=WorkLocationResponse)
+def admin_create_work_location(
+    body: WorkLocationCreateRequest,
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> WorkLocationResponse:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.config.manage",
+    )
+    row = create_work_location(
+        connection,
+        code=body.locationCode,
+        name=body.locationName,
+        address=body.addressText,
+        latitude=body.latitude,
+        longitude=body.longitude,
+        radius_meters=body.geofenceRadiusMeters,
+    )
+    return WorkLocationResponse(
+        locationId=row["location_id"],
+        locationCode=row["location_code"],
+        locationName=row["location_name"],
+        addressText=row.get("address_text"),
+        latitude=row["latitude"],
+        longitude=row["longitude"],
+        geofenceRadiusMeters=row["geofence_radius_meters"],
+        status=row["status"],
+    )
+
+
+@router.get("/admin/leave-types", response_model=list[LeaveTypeResponse])
+def admin_leave_types(
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> list[LeaveTypeResponse]:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.config.manage",
+    )
+    return [
+        LeaveTypeResponse(
+            leaveTypeId=row["leave_type_id"],
+            leaveCode=row["leave_code"],
+            leaveName=row["leave_name"],
+            isPaid=row["is_paid"],
+            defaultEntitlementDays=row["default_entitlement_days"],
+            allowHalfDay=row["allow_half_day"],
+            status=row["status"],
+        )
+        for row in list_leave_types(connection)
+    ]
+
+
+@router.post("/admin/leave-types", response_model=LeaveTypeResponse)
+def admin_create_leave_type(
+    body: LeaveTypeCreateRequest,
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> LeaveTypeResponse:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.config.manage",
+    )
+    row = create_leave_type(
+        connection,
+        code=body.leaveCode,
+        name=body.leaveName,
+        is_paid=body.isPaid,
+        entitlement_days=body.defaultEntitlementDays,
+        allow_half_day=body.allowHalfDay,
+    )
+    return LeaveTypeResponse(
+        leaveTypeId=row["leave_type_id"],
+        leaveCode=row["leave_code"],
+        leaveName=row["leave_name"],
+        isPaid=row["is_paid"],
+        defaultEntitlementDays=row["default_entitlement_days"],
+        allowHalfDay=row["allow_half_day"],
+        status=row["status"],
+    )
+
+
+@router.get("/admin/holidays", response_model=list[HolidayResponse])
+def admin_holidays(
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> list[HolidayResponse]:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.config.manage",
+    )
+    return [
+        HolidayResponse(
+            holidayId=row["holiday_id"],
+            holidayDate=row["holiday_date"],
+            holidayName=row["holiday_name"],
+            workLocationId=row.get("work_location_id"),
+            status=row["status"],
+        )
+        for row in list_holidays(connection)
+    ]
+
+
+@router.post("/admin/holidays", response_model=HolidayResponse)
+def admin_create_holiday(
+    body: HolidayCreateRequest,
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> HolidayResponse:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.config.manage",
+    )
+    row = create_holiday(
+        connection,
+        holiday_date=body.holidayDate,
+        name=body.holidayName,
+        work_location_id=body.workLocationId,
+    )
+    return HolidayResponse(
+        holidayId=row["holiday_id"],
+        holidayDate=row["holiday_date"],
+        holidayName=row["holiday_name"],
+        workLocationId=row.get("work_location_id"),
+        status=row["status"],
+    )
 
 @router.post("/admin/payroll/calculate", response_model=PayrollSummaryResponse)
 def calculate_payroll(
