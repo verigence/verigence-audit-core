@@ -105,26 +105,40 @@ def update_configuration(
     actor_user_id: str,
 ) -> dict[str, Any]:
     normalized = _validate_config(key, value)
-    connection.execute(
-        text(
-            """
-            INSERT INTO verigence_attendance.module_configuration (
-                config_key,config_value_json,updated_by_user_id,updated_at_utc
-            ) VALUES (
-                :key,CAST(:value AS jsonb),CAST(:actor AS uuid),now()
-            )
-            ON CONFLICT (config_key) DO UPDATE SET
-                config_value_json=EXCLUDED.config_value_json,
-                updated_by_user_id=EXCLUDED.updated_by_user_id,
-                updated_at_utc=now()
-            """
-        ),
-        {
-            "key": key,
-            "value": json.dumps(normalized),
-            "actor": actor_user_id,
-        },
-    )
+    def write_config(config_key: str, config_value: Any) -> None:
+        connection.execute(
+            text(
+                """
+                INSERT INTO verigence_attendance.module_configuration (
+                    config_key,config_value_json,updated_by_user_id,updated_at_utc
+                ) VALUES (
+                    :key,CAST(:value AS jsonb),CAST(:actor AS uuid),now()
+                )
+                ON CONFLICT (config_key) DO UPDATE SET
+                    config_value_json=EXCLUDED.config_value_json,
+                    updated_by_user_id=EXCLUDED.updated_by_user_id,
+                    updated_at_utc=now()
+                """
+            ),
+            {
+                "key": config_key,
+                "value": json.dumps(config_value),
+                "actor": actor_user_id,
+            },
+        )
+
+    write_config(key, normalized)
+    if key == "payroll.working_days_per_week":
+        working_days = int(normalized)
+        write_config(
+            "payroll.weekly_off_iso_weekdays",
+            list(range(working_days + 1, 8)),
+        )
+    elif key == "payroll.weekly_off_iso_weekdays":
+        write_config(
+            "payroll.working_days_per_week",
+            7 - len(normalized),
+        )
     return list_configuration(connection)
 
 
