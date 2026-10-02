@@ -314,13 +314,14 @@ def apply_leave(
 def team_attendance(
     principal: Annotated[HumanPrincipal, Depends(human_principal)],
     connection: Annotated[Connection, Depends(get_connection)],
-    attendanceDate: date = Query(default_factory=date.today),
+    attendanceDate: date | None = None,
 ) -> list[TeamAttendanceResponse]:
+    requested_date = attendanceDate or datetime.now(UTC).date()
     return [
         TeamAttendanceResponse(
             employeeId=row["employee_id"],
             employeeName=row["display_name"],
-            attendanceDate=row["attendance_date"] or attendanceDate,
+            attendanceDate=row["attendance_date"] or requested_date,
             status=row["status"] or "NOT_STARTED",
             presentFraction=row["present_fraction"] or Decimal(0),
             checkInAtUtc=row.get("check_in_at_utc"),
@@ -329,7 +330,7 @@ def team_attendance(
         for row in list_team_attendance(
             connection,
             actor_user_id=principal.subject,
-            attendance_date=attendanceDate,
+            attendance_date=requested_date,
         )
     ]
 
