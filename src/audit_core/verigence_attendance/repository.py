@@ -569,38 +569,37 @@ def decide_hr_leave(
                 "leave_type_id": row["leave_type_id"],
             },
         ).mappings().one()
-        if bool(balance["is_paid"]) and Decimal(str(balance["available_days"])) < Decimal(
-            str(row["requested_days"])
-        ):
-            raise AttendanceRuleError(
-                "LEAVE_BALANCE_INSUFFICIENT",
-                "Insufficient leave balance for this request.",
-                status_code=409,
-            )
-        connection.execute(
-            text(
-                """
-                INSERT INTO verigence_attendance.leave_balances (
-                    employee_id,leave_type_id,leave_year,opening_days,
-                    entitled_days,adjustment_days,used_days,updated_at_utc
+        if bool(balance["is_paid"]):
+            if Decimal(str(balance["available_days"])) < Decimal(str(row["requested_days"])):
+                raise AttendanceRuleError(
+                    "LEAVE_BALANCE_INSUFFICIENT",
+                    "Insufficient leave balance for this request.",
+                    status_code=409,
                 )
-                SELECT :employee_id,lt.leave_type_id,:leave_year,0,
-                       lt.default_entitlement_days,0,:used_days,now()
-                FROM verigence_attendance.leave_types lt
-                WHERE lt.leave_type_id=:leave_type_id
-                ON CONFLICT (employee_id,leave_type_id,leave_year) DO UPDATE SET
-                    used_days=verigence_attendance.leave_balances.used_days
-                              + EXCLUDED.used_days,
-                    updated_at_utc=now()
-                """
-            ),
-            {
-                "employee_id": row["employee_id"],
-                "leave_type_id": row["leave_type_id"],
-                "leave_year": row["start_date"].year,
-                "used_days": row["requested_days"],
-            },
-        )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO verigence_attendance.leave_balances (
+                        employee_id,leave_type_id,leave_year,opening_days,
+                        entitled_days,adjustment_days,used_days,updated_at_utc
+                    )
+                    SELECT :employee_id,lt.leave_type_id,:leave_year,0,
+                           lt.default_entitlement_days,0,:used_days,now()
+                    FROM verigence_attendance.leave_types lt
+                    WHERE lt.leave_type_id=:leave_type_id
+                    ON CONFLICT (employee_id,leave_type_id,leave_year) DO UPDATE SET
+                        used_days=verigence_attendance.leave_balances.used_days
+                                  + EXCLUDED.used_days,
+                        updated_at_utc=now()
+                    """
+                ),
+                {
+                    "employee_id": row["employee_id"],
+                    "leave_type_id": row["leave_type_id"],
+                    "leave_year": row["start_date"].year,
+                    "used_days": row["requested_days"],
+                },
+            )
     connection.execute(
         text(
             """
