@@ -6,6 +6,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, text
+from sqlalchemy.exc import IntegrityError
 
 from audit_core.verigence_attendance.errors import AttendanceNotFoundError, AttendanceRuleError
 
@@ -129,7 +130,7 @@ def create_employee(
                 "work_location_id": work_location_id,
             },
         )
-    except Exception as exc:
+    except IntegrityError as exc:
         raise AttendanceRuleError(
             "EMPLOYEE_ALREADY_EXISTS",
             "Employee code or Security user is already onboarded.",
