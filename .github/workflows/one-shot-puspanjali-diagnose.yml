@@ -1,4 +1,4 @@
-name: One-shot Worker re-read log diagnose (DEV, read-only)
+name: One-shot All journeys overview diagnose (DEV, read-only)
 
 # Read-only: one customer's journeys. Never writes.
 on:
@@ -59,11 +59,76 @@ jobs:
           echo "::add-mask::$url"
           echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
 
-      - name: Worker log lines about the failed page re-read, read-only
+      - name: All journeys - documents, SKU and PC tasks, read-only
         shell: bash
         run: |
-          set +e
-          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service verigence-p2-worker --json >/dev/null 2>&1
-          railway logs --service verigence-p2-worker --environment dev --since 30h --json >/tmp/worker.log 2>/tmp/worker.err
-          echo "log bytes: $(wc -c </tmp/worker.log) err: $(head -c 300 /tmp/worker.err)"
-          grep -i "b17fc02a\|PAGE_REREAD\|page_reread" /tmp/worker.log | head -40 | cut -c1-900
+          python - <<'PY'
+          import json, os
+          from collections import Counter, defaultdict
+          from datetime import datetime, date
+          from decimal import Decimal
+          from sqlalchemy import create_engine, text
+          from audit_core.db import set_tenant_context
+          from audit_core.uc03_p2_document_health import journey_document_health
+
+          def js(v):
+              return json.dumps(v, default=str, ensure_ascii=False)
+
+          T = "5fbe26ab-6ed7-444a-8488-5bfb81208588"
+          engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=60000"})
+          with engine.connect() as c:
+              c.execute(text("SET TRANSACTION READ ONLY"))
+              set_tenant_context(c, T)
+              journeys = c.execute(text("""
+                  SELECT j.journey_id, j.journey_reference, COALESCE(cu.legal_name, cu.display_name) AS customer,
+                         to_jsonb(j)->>'created_at_utc' AS created, r.current_stage,
+                         to_jsonb(jp) AS product
+                  FROM auditcore.journeys j
+                  LEFT JOIN auditcore.customers cu ON cu.tenant_id=j.tenant_id AND cu.customer_id=j.customer_id
+                  LEFT JOIN auditcore.p2_journey_runtime r ON r.tenant_id=j.tenant_id AND r.journey_id=j.journey_id
+                  LEFT JOIN auditcore.journey_products jp ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
+                  WHERE j.tenant_id=:t ORDER BY j.created_at_utc"""), {"t": T}).mappings().all()
+              task_types = Counter(); task_journeys = defaultdict(set); samples = {}
+              sku_states = Counter(); page_states = Counter(); health_states = Counter()
+              print("columns of journey_products:", sorted((journeys[0]["product"] or {}).keys()) if journeys and journeys[0]["product"] else None)
+              for j in journeys:
+                  jid = j["journey_id"]
+                  prod = j["product"] or {}
+                  q = Counter(r[0] + "/" + str(r[1]) for r in c.execute(text("""
+                      SELECT q.queue_status, COALESCE(q.template_key,'-') FROM auditcore.p2_document_queue q
+                      WHERE q.tenant_id=:t AND q.journey_id=:j AND q.queue_status NOT IN ('MERGED','CANCELLED')"""), {"t": T, "j": jid}).all())
+                  qs = Counter(r[0] for r in c.execute(text("""
+                      SELECT q.queue_status FROM auditcore.p2_document_queue q
+                      WHERE q.tenant_id=:t AND q.journey_id=:j AND q.queue_status NOT IN ('MERGED','CANCELLED')"""), {"t": T, "j": jid}).all())
+                  page_states.update(qs)
+                  h = journey_document_health(c, tenant_id=T, journey_id=jid)
+                  for k, v in h["summary"].items():
+                      if v and k != "defects":
+                          health_states[k] += v
+                  tasks = c.execute(text("""
+                      SELECT task_type, assigned_role_code AS role, to_jsonb(t)->>'priority' AS priority, task_status, title,
+                             to_jsonb(t)->>'source_code' AS source_code
+                      FROM auditcore.p2_tasks t WHERE tenant_id=:t AND journey_id=:j
+                        AND task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')"""), {"t": T, "j": jid}).mappings().all()
+                  by = Counter(f"{x['task_type']}|{x['role']}|{x['priority']}" for x in tasks)
+                  for x in tasks:
+                      key = f"{x['task_type']}|{x['role']}|{x['priority']}|{x['source_code']}"
+                      task_types[key] += 1; task_journeys[key].add(j["journey_reference"])
+                      samples.setdefault(key, x["title"])
+                  sku_state = f"sel={prod.get('selection_status')} sku={'Y' if prod.get('product_sku_id') else 'N'}" if prod else "NO_PRODUCT_ROW"
+                  sku_states[sku_state] += 1
+                  print(f"\n## {j['journey_reference']} {j['customer']} stage={j['current_stage']} | {sku_state} | model={prod.get('model_name_snapshot')}")
+                  print("   pages:", js(dict(qs)), "| health:", js({k: v for k, v in h['summary'].items() if v}))
+                  print("   open tasks:", len(tasks), js(dict(by)))
+              print("\n===== AGGREGATE open tasks (type|role|priority|source): count, journeys")
+              for k, n in task_types.most_common():
+                  print(f"{n:3d} x {len(task_journeys[k])} journeys  {k}  e.g. {samples[k][:110]}")
+              print("\n===== SKU states", js(dict(sku_states)))
+              print("===== page states", js(dict(page_states)))
+              print("===== health states", js(dict(health_states)))
+              print("\n===== vehicle identification rows")
+              for r in c.execute(text("""SELECT j.journey_reference, to_jsonb(v) AS v FROM auditcore.p2_vehicle_identifications v
+                  JOIN auditcore.journeys j ON j.tenant_id=v.tenant_id AND j.journey_id=v.journey_id WHERE v.tenant_id=:t
+                  ORDER BY j.journey_reference LIMIT 30"""), {"t": T}).all():
+                  print(r[0], js(r[1])[:500])
+          PY
