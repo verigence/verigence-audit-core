@@ -743,3 +743,60 @@ def list_payslips(connection: Connection, employee_id: UUID) -> list[dict[str, A
             {"employee_id": employee_id},
         ).mappings()
     ]
+
+
+
+def leave_balances_for_employee(
+    connection: Connection,
+    *,
+    employee_id: UUID,
+    leave_year: int,
+) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in connection.execute(
+            text(
+                """
+                SELECT lt.leave_type_id,lt.leave_code,lt.leave_name,lt.is_paid,
+                       lt.allow_half_day,
+                       COALESCE(lb.opening_days,0) AS opening_days,
+                       COALESCE(lb.entitled_days,lt.default_entitlement_days) AS entitled_days,
+                       COALESCE(lb.adjustment_days,0) AS adjustment_days,
+                       COALESCE(lb.used_days,0) AS used_days,
+                       (
+                         COALESCE(lb.opening_days,0)
+                         + COALESCE(lb.entitled_days,lt.default_entitlement_days)
+                         + COALESCE(lb.adjustment_days,0)
+                         - COALESCE(lb.used_days,0)
+                       ) AS available_days
+                FROM verigence_attendance.leave_types lt
+                LEFT JOIN verigence_attendance.leave_balances lb
+                  ON lb.leave_type_id=lt.leave_type_id
+                 AND lb.employee_id=:employee_id
+                 AND lb.leave_year=:leave_year
+                WHERE lt.status='ACTIVE'
+                ORDER BY lt.leave_code
+                """
+            ),
+            {"employee_id": employee_id, "leave_year": leave_year},
+        ).mappings()
+    ]
+
+
+def list_leave_by_status(connection: Connection, status: str) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in connection.execute(
+            text(
+                """
+                SELECT l.*,e.display_name,lt.leave_name
+                FROM verigence_attendance.leave_requests l
+                JOIN verigence_attendance.employees e ON e.employee_id=l.employee_id
+                JOIN verigence_attendance.leave_types lt ON lt.leave_type_id=l.leave_type_id
+                WHERE l.status=:status
+                ORDER BY l.created_at_utc
+                """
+            ),
+            {"status": status},
+        ).mappings()
+    ]
