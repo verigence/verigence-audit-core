@@ -8,7 +8,10 @@ from uuid import UUID, uuid4
 from sqlalchemy import Connection, text
 from sqlalchemy.exc import IntegrityError
 
-from audit_core.verigence_attendance.errors import AttendanceNotFoundError, AttendanceRuleError
+from audit_core.verigence_attendance.errors import (
+    AttendanceNotFoundError,
+    AttendanceRuleError,
+)
 
 
 def employee_for_user(connection: Connection, user_id: str) -> dict[str, Any]:
