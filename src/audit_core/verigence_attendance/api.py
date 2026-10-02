@@ -302,6 +302,12 @@ def apply_leave(
             "Leave end date cannot be before start date.",
             status_code=400,
         )
+    if body.startDate.year != body.endDate.year:
+        raise AttendanceRuleError(
+            "LEAVE_YEAR_SPAN_UNSUPPORTED",
+            "A leave request must stay within one calendar year.",
+            status_code=400,
+        )
     return _leave(
         create_leave_request(
             connection,
