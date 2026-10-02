@@ -18,6 +18,12 @@ from audit_core.verigence_attendance.bulk_import import (
 )
 from audit_core.verigence_attendance.db import get_connection
 from audit_core.verigence_attendance.errors import AttendanceRuleError
+from audit_core.verigence_attendance.payroll import (
+    finalize_payroll,
+    generate_payroll,
+    payroll_items,
+    payroll_summary,
+)
 from audit_core.verigence_attendance.repository import (
     attendance_history,
     create_employee,
@@ -43,10 +49,13 @@ from audit_core.verigence_attendance.schemas import (
     LeaveCreateRequest,
     LeaveDecisionRequest,
     LeaveRequestResponse,
+    PayrollItemResponse,
+    PayrollSummaryResponse,
     PayslipResponse,
     ReimbursementDecisionRequest,
     ReimbursementResponse,
 )
+from audit_core.verigence_attendance.reports import attendance_report, payroll_report
 from audit_core.verigence_attendance.security import human_principal, security_client
 from audit_core.verigence_attendance.service import record_attendance, submit_reimbursement
 from audit_core.verigence_attendance.storage import storage
@@ -401,6 +410,145 @@ def my_payslips(
     ]
 
 
+
+
+@router.post("/admin/payroll/calculate", response_model=PayrollSummaryResponse)
+def calculate_payroll(
+    month: date,
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> PayrollSummaryResponse:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.payroll.manage",
+    )
+    return PayrollSummaryResponse.model_validate(
+        generate_payroll(
+            connection,
+            payroll_month=month,
+            actor_user_id=principal.subject,
+        )
+    )
+
+
+@router.get("/admin/payroll/{run_id}", response_model=PayrollSummaryResponse)
+def get_payroll(
+    run_id: UUID,
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> PayrollSummaryResponse:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.payroll.manage",
+    )
+    return PayrollSummaryResponse.model_validate(payroll_summary(connection, run_id))
+
+
+@router.get(
+    "/admin/payroll/{run_id}/items",
+    response_model=list[PayrollItemResponse],
+)
+def get_payroll_items(
+    run_id: UUID,
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> list[PayrollItemResponse]:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.payroll.manage",
+    )
+    return [
+        PayrollItemResponse(
+            payrollItemId=row["payroll_item_id"],
+            employeeId=row["employee_id"],
+            employeeCode=row["employee_code"],
+            employeeName=row["display_name"],
+            scheduledDays=row["scheduled_days"],
+            presentDays=row["present_days"],
+            paidLeaveDays=row["paid_leave_days"],
+            unpaidLeaveDays=row["unpaid_leave_days"],
+            payableDays=row["payable_days"],
+            grossAmount=row["gross_amount"],
+            deductionAmount=row["deduction_amount"],
+            netAmount=row["net_amount"],
+        )
+        for row in payroll_items(connection, run_id)
+    ]
+
+
+@router.post("/admin/payroll/{run_id}/finalize", response_model=PayrollSummaryResponse)
+def finalize_payroll_run(
+    run_id: UUID,
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> PayrollSummaryResponse:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.payroll.manage",
+    )
+    return PayrollSummaryResponse.model_validate(
+        finalize_payroll(
+            connection,
+            run_id=run_id,
+            actor_user_id=principal.subject,
+            storage=storage(),
+        )
+    )
+
+
+@router.get("/admin/reports/attendance")
+def export_attendance_report(
+    startDate: date,
+    endDate: date,
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> StreamingResponse:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.report.export",
+    )
+    if endDate < startDate or (endDate - startDate).days > 31:
+        raise AttendanceRuleError(
+            "REPORT_RANGE_INVALID",
+            "Attendance report range must be between 1 and 32 days.",
+            status_code=400,
+        )
+    data = attendance_report(
+        connection,
+        start_date=startDate,
+        end_date=endDate,
+    )
+    return StreamingResponse(
+        BytesIO(data),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="attendance-{startDate}-{endDate}.xlsx"'
+            )
+        },
+    )
+
+
+@router.get("/admin/reports/payroll/{run_id}")
+def export_payroll_report(
+    run_id: UUID,
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> StreamingResponse:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.report.export",
+    )
+    data = payroll_report(connection, run_id=run_id)
+    return StreamingResponse(
+        BytesIO(data),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="payroll-{run_id}.xlsx"'
+            )
+        },
+    )
 
 @router.get("/admin/capabilities", response_model=AdminCapabilities)
 def admin_capabilities(
