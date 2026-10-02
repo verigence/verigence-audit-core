@@ -10,8 +10,8 @@ from sqlalchemy import Connection
 
 from audit_core.verigence_attendance.domain import (
     GeoPoint,
-    finance_approval_required,
     distance_meters,
+    finance_approval_required,
 )
 from audit_core.verigence_attendance.errors import AttendanceRuleError
 from audit_core.verigence_attendance.repository import (
