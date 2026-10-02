@@ -50,7 +50,7 @@ def build_employee_template() -> bytes:
             "Sample Employee",
             "employee@example.com",
             "+919876543210",
-            date.today(),
+            datetime.now(UTC).date(),
             "",
             "",
             "",
