@@ -123,3 +123,19 @@ class AdminCapabilities(BaseModel):
     payrollManage: bool
     reportRead: bool
     configManage: bool
+
+
+class BulkImportRowResponse(BaseModel):
+    rowNumber: int
+    employeeCode: str | None = None
+    action: Literal["CREATE", "UPDATE", "UNCHANGED", "ERROR"]
+    messages: list[str] = Field(default_factory=list)
+    applied: bool = False
+
+
+class BulkImportResponse(BaseModel):
+    importId: UUID
+    filename: str
+    status: str
+    counts: dict[str, int]
+    rows: list[BulkImportRowResponse]
