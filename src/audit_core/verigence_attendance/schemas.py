@@ -114,6 +114,7 @@ class ReimbursementResponse(BaseModel):
     description: str | None = None
     status: str
     financeApprovalRequired: bool
+    receiptUrl: str | None = None
     createdAtUtc: datetime
 
 
