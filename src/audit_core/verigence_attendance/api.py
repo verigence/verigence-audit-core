@@ -134,6 +134,11 @@ def _claim(row: dict) -> ReimbursementResponse:
         description=row.get("description"),
         status=row["status"],
         financeApprovalRequired=bool(row["finance_approval_required"]),
+        receiptUrl=(
+            storage().presign(object_key=row["receipt_object_key"])
+            if row.get("receipt_object_key")
+            else None
+        ),
         createdAtUtc=row["created_at_utc"],
     )
 
