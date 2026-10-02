@@ -60,3 +60,35 @@ def payable_days(
         raise ValueError("day counts cannot be negative")
     credited = present_days + paid_leave_days
     return min(scheduled_days, max(Decimal(0), credited - unpaid_leave_days))
+
+
+def can_view_employee_attendance(
+    *,
+    actor_user_id: str,
+    employee_user_id: str,
+    actor_role: str | None,
+    employee_tl_user_id: str | None,
+    employee_pmo_user_id: str | None,
+) -> bool:
+    """Attendance/leave visibility without Audit Core dependency.
+
+    Employees see only themselves. TL/PM see only employees explicitly assigned
+    to them by the Attendance employee-onboarding record. HRADMIN/SuperAdmin
+    checks are handled by Security permissions at the API boundary.
+    """
+    if actor_user_id == employee_user_id:
+        return True
+    if actor_role == "TL":
+        return employee_tl_user_id == actor_user_id
+    if actor_role in {"PM", "PMO"}:
+        return employee_pmo_user_id == actor_user_id
+    return False
+
+
+def can_view_employee_expense(
+    *,
+    actor_user_id: str,
+    employee_user_id: str,
+) -> bool:
+    """Normal employees/TL/PM never gain peer expense visibility."""
+    return actor_user_id == employee_user_id
