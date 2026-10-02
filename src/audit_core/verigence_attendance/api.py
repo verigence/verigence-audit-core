@@ -51,6 +51,7 @@ from audit_core.verigence_attendance.repository import (
     list_pm_team_reimbursements,
     list_reimbursements_by_status,
     list_reimbursements_for_employee,
+    list_team_attendance,
     list_team_leave,
 )
 from audit_core.verigence_attendance.schemas import (
@@ -74,6 +75,7 @@ from audit_core.verigence_attendance.schemas import (
     PayslipResponse,
     ReimbursementDecisionRequest,
     ReimbursementResponse,
+    TeamAttendanceResponse,
     WorkLocationCreateRequest,
     WorkLocationResponse,
 )
@@ -306,6 +308,30 @@ def apply_leave(
             reason=body.reason,
         )
     )
+
+
+@router.get("/team/attendance", response_model=list[TeamAttendanceResponse])
+def team_attendance(
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    attendanceDate: date = Query(default_factory=date.today),
+) -> list[TeamAttendanceResponse]:
+    return [
+        TeamAttendanceResponse(
+            employeeId=row["employee_id"],
+            employeeName=row["display_name"],
+            attendanceDate=row["attendance_date"] or attendanceDate,
+            status=row["status"] or "NOT_STARTED",
+            presentFraction=row["present_fraction"] or Decimal(0),
+            checkInAtUtc=row.get("check_in_at_utc"),
+            checkOutAtUtc=row.get("check_out_at_utc"),
+        )
+        for row in list_team_attendance(
+            connection,
+            actor_user_id=principal.subject,
+            attendance_date=attendanceDate,
+        )
+    ]
 
 
 @router.get("/team/leave", response_model=list[LeaveRequestResponse])
