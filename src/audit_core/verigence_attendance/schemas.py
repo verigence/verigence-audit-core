@@ -139,3 +139,28 @@ class BulkImportResponse(BaseModel):
     status: str
     counts: dict[str, int]
     rows: list[BulkImportRowResponse]
+
+
+class PayrollSummaryResponse(BaseModel):
+    payrollRunId: UUID
+    payrollMonth: date
+    status: str
+    employeeCount: int
+    totalNetAmount: Decimal
+    generatedAtUtc: datetime
+    finalizedAtUtc: datetime | None = None
+
+
+class PayrollItemResponse(BaseModel):
+    payrollItemId: UUID
+    employeeId: UUID
+    employeeCode: str
+    employeeName: str
+    scheduledDays: Decimal
+    presentDays: Decimal
+    paidLeaveDays: Decimal
+    unpaidLeaveDays: Decimal
+    payableDays: Decimal
+    grossAmount: Decimal
+    deductionAmount: Decimal
+    netAmount: Decimal
