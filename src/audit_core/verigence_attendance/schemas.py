@@ -110,3 +110,13 @@ class PayslipResponse(BaseModel):
     netAmount: Decimal
     generatedAtUtc: datetime
     downloadUrl: str
+
+
+class AdminCapabilities(BaseModel):
+    employeeManage: bool
+    leaveHrApprove: bool
+    reimbursementHrApprove: bool
+    reimbursementFinanceApprove: bool
+    payrollManage: bool
+    reportRead: bool
+    configManage: bool
