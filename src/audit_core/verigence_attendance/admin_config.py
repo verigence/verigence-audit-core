@@ -8,7 +8,10 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, text
 
-from audit_core.verigence_attendance.errors import AttendanceNotFoundError, AttendanceRuleError
+from audit_core.verigence_attendance.errors import (
+    AttendanceNotFoundError,
+    AttendanceRuleError,
+)
 
 _ALLOWED_CONFIG_KEYS = {
     "attendance.default_geofence_meters",
