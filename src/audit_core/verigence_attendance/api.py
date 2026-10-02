@@ -450,6 +450,9 @@ def admin_create_employee(
         pmo_user_id=body.pmoUserId,
         project_tenant_id=body.projectTenantId,
         work_location_id=body.workLocationId,
+        bank_account_masked=body.bankAccountMasked,
+        pan_masked=body.panMasked,
+        aadhaar_masked=body.aadhaarMasked,
         salary={
             "basic_salary": body.basicSalary,
             "hra": body.hra,
