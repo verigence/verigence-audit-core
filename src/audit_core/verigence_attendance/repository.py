@@ -81,6 +81,9 @@ def create_employee(
     pmo_user_id: UUID | None,
     project_tenant_id: UUID | None,
     work_location_id: UUID | None,
+    bank_account_masked: str | None,
+    pan_masked: str | None,
+    aadhaar_masked: str | None,
     salary: dict[str, Decimal],
     actor_user_id: str,
 ) -> dict[str, Any]:
@@ -108,11 +111,13 @@ def create_employee(
                 INSERT INTO verigence_attendance.employees (
                     employee_id,security_user_id,employee_code,display_name,
                     primary_email,mobile,joining_date,tl_user_id,pmo_user_id,
-                    project_tenant_id,work_location_id
+                    project_tenant_id,work_location_id,
+                    bank_account_masked,pan_masked,aadhaar_masked
                 ) VALUES (
                     :employee_id,:security_user_id,:employee_code,:display_name,
                     :primary_email,:mobile,:joining_date,:tl_user_id,:pmo_user_id,
-                    :project_tenant_id,:work_location_id
+                    :project_tenant_id,:work_location_id,
+                    :bank_account_masked,:pan_masked,:aadhaar_masked
                 )
                 """
             ),
@@ -128,6 +133,9 @@ def create_employee(
                 "pmo_user_id": pmo_user_id,
                 "project_tenant_id": project_tenant_id,
                 "work_location_id": work_location_id,
+                "bank_account_masked": bank_account_masked,
+                "pan_masked": pan_masked,
+                "aadhaar_masked": aadhaar_masked,
             },
         )
     except IntegrityError as exc:
@@ -155,6 +163,22 @@ def create_employee(
             **salary,
             "actor": actor_user_id,
         },
+    )
+    connection.execute(
+        text(
+            """
+            INSERT INTO verigence_attendance.leave_balances (
+                employee_id,leave_type_id,leave_year,opening_days,
+                entitled_days,adjustment_days,used_days
+            )
+            SELECT :employee_id,leave_type_id,:leave_year,0,
+                   default_entitlement_days,0,0
+            FROM verigence_attendance.leave_types
+            WHERE status='ACTIVE'
+            ON CONFLICT (employee_id,leave_type_id,leave_year) DO NOTHING
+            """
+        ),
+        {"employee_id": employee_id, "leave_year": joining_date.year},
     )
     return employee_by_id(connection, employee_id)
 
