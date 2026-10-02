@@ -7,7 +7,11 @@ import httpx
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from audit_core.security import HumanPrincipal, SecurityTokenError, SecurityTokenValidator
+from audit_core.security import (
+    HumanPrincipal,
+    SecurityTokenError,
+    SecurityTokenValidator,
+)
 from audit_core.security_integration import SecurityOAuthClient
 from audit_core.verigence_attendance.settings import get_settings
 
