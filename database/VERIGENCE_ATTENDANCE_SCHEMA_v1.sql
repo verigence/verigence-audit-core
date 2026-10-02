@@ -195,7 +195,8 @@ CREATE TABLE IF NOT EXISTS verigence_attendance.salary_structures (
   fixed_deductions numeric(14,2) NOT NULL DEFAULT 0,
   created_by_user_id uuid NOT NULL,
   created_at_utc timestamptz NOT NULL DEFAULT now(),
-  CHECK (effective_to IS NULL OR effective_to >= effective_from)
+  CHECK (effective_to IS NULL OR effective_to >= effective_from),
+  UNIQUE(employee_id,effective_from)
 );
 
 CREATE INDEX IF NOT EXISTS ix_va_salary_employee_effective
