@@ -27,6 +27,7 @@ from audit_core.verigence_attendance.repository import (
     list_team_leave,
 )
 from audit_core.verigence_attendance.schemas import (
+    AdminCapabilities,
     AttendanceDayResponse,
     AttendanceEventResponse,
     EmployeeCreateRequest,
@@ -391,6 +392,29 @@ def my_payslips(
         for row in rows
     ]
 
+
+
+@router.get("/admin/capabilities", response_model=AdminCapabilities)
+def admin_capabilities(
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+) -> AdminCapabilities:
+    client = security_client()
+    user_id = principal.subject
+    return AdminCapabilities(
+        employeeManage=client.allowed(user_id=user_id, permission_key="attendance.employee.manage"),
+        leaveHrApprove=client.allowed(user_id=user_id, permission_key="attendance.leave.hr.approve"),
+        reimbursementHrApprove=client.allowed(
+            user_id=user_id,
+            permission_key="attendance.reimbursement.hr.approve",
+        ),
+        reimbursementFinanceApprove=client.allowed(
+            user_id=user_id,
+            permission_key="attendance.reimbursement.finance.approve",
+        ),
+        payrollManage=client.allowed(user_id=user_id, permission_key="attendance.payroll.manage"),
+        reportRead=client.allowed(user_id=user_id, permission_key="attendance.report.read"),
+        configManage=client.allowed(user_id=user_id, permission_key="attendance.config.manage"),
+    )
 
 @router.get("/admin/employees", response_model=list[EmployeeProfile])
 def admin_employees(
