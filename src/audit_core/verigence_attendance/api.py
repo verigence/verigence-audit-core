@@ -43,6 +43,8 @@ from audit_core.verigence_attendance.repository import (
     decide_team_leave,
     employee_for_user,
     list_employees,
+    leave_balances_for_employee,
+    list_leave_by_status,
     list_leave_for_employee,
     list_payslips,
     list_reimbursements_by_status,
@@ -61,6 +63,7 @@ from audit_core.verigence_attendance.schemas import (
     AttendanceEventResponse,
     EmployeeCreateRequest,
     EmployeeProfile,
+    LeaveBalanceResponse,
     LeaveCreateRequest,
     LeaveDecisionRequest,
     LeaveRequestResponse,
@@ -232,6 +235,34 @@ async def check_out(
     )
 
 
+
+@router.get("/me/leave-balances", response_model=list[LeaveBalanceResponse])
+def my_leave_balances(
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> list[LeaveBalanceResponse]:
+    employee = employee_for_user(connection, principal.subject)
+    year = datetime.now().year
+    return [
+        LeaveBalanceResponse(
+            leaveTypeId=row["leave_type_id"],
+            leaveCode=row["leave_code"],
+            leaveName=row["leave_name"],
+            isPaid=row["is_paid"],
+            allowHalfDay=row["allow_half_day"],
+            openingDays=row["opening_days"],
+            entitledDays=row["entitled_days"],
+            adjustmentDays=row["adjustment_days"],
+            usedDays=row["used_days"],
+            availableDays=row["available_days"],
+        )
+        for row in leave_balances_for_employee(
+            connection,
+            employee_id=UUID(str(employee["employee_id"])),
+            leave_year=year,
+        )
+    ]
+
 @router.get("/me/leave", response_model=list[LeaveRequestResponse])
 def my_leave(
     principal: Annotated[HumanPrincipal, Depends(human_principal)],
@@ -298,6 +329,18 @@ def team_leave_decision(
         )
     )
 
+
+
+@router.get("/admin/leave", response_model=list[LeaveRequestResponse])
+def hr_leave_queue(
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> list[LeaveRequestResponse]:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.leave.hr.approve",
+    )
+    return [_leave(row) for row in list_leave_by_status(connection, "PENDING_HR")]
 
 @router.post("/admin/leave/{leave_id}/decision", response_model=LeaveRequestResponse)
 def hr_leave_decision(
