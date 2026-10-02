@@ -24,7 +24,10 @@ from audit_core.verigence_attendance.repository import (
     update_attendance_day,
 )
 from audit_core.verigence_attendance.settings import get_settings
-from audit_core.verigence_attendance.storage import AttendanceStorage, AttendanceStorageError
+from audit_core.verigence_attendance.storage import (
+    AttendanceStorage,
+    AttendanceStorageError,
+)
 
 _ALLOWED_PHOTO_TYPES = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
 _ALLOWED_RECEIPT_TYPES = _ALLOWED_PHOTO_TYPES | {"application/pdf"}
