@@ -242,7 +242,7 @@ def my_leave_balances(
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> list[LeaveBalanceResponse]:
     employee = employee_for_user(connection, principal.subject)
-    year = datetime.now().year
+    year = datetime.now(UTC).year
     return [
         LeaveBalanceResponse(
             leaveTypeId=row["leave_type_id"],
