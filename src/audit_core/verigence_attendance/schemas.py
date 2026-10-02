@@ -220,3 +220,16 @@ class HolidayResponse(BaseModel):
     holidayName: str
     workLocationId: UUID | None = None
     status: str
+
+
+class LeaveBalanceResponse(BaseModel):
+    leaveTypeId: UUID
+    leaveCode: str
+    leaveName: str
+    isPaid: bool
+    allowHalfDay: bool
+    openingDays: Decimal
+    entitledDays: Decimal
+    adjustmentDays: Decimal
+    usedDays: Decimal
+    availableDays: Decimal
