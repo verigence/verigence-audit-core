@@ -34,6 +34,7 @@ from audit_core.verigence_attendance.payroll import (
     payroll_items,
     payroll_summary,
 )
+from audit_core.verigence_attendance.reports import attendance_report, payroll_report
 from audit_core.verigence_attendance.repository import (
     attendance_history,
     create_employee,
@@ -42,31 +43,32 @@ from audit_core.verigence_attendance.repository import (
     decide_reimbursement,
     decide_team_leave,
     employee_for_user,
-    list_employees,
     leave_balances_for_employee,
+    list_employees,
     list_leave_by_status,
     list_leave_for_employee,
     list_payslips,
+    list_pm_team_reimbursements,
     list_reimbursements_by_status,
     list_reimbursements_for_employee,
     list_team_leave,
 )
 from audit_core.verigence_attendance.schemas import (
     AdminCapabilities,
-    BulkImportResponse,
-    ConfigUpdateRequest,
-    HolidayCreateRequest,
-    HolidayResponse,
-    LeaveTypeCreateRequest,
-    LeaveTypeResponse,
     AttendanceDayResponse,
     AttendanceEventResponse,
+    BulkImportResponse,
+    ConfigUpdateRequest,
     EmployeeCreateRequest,
     EmployeeProfile,
+    HolidayCreateRequest,
+    HolidayResponse,
     LeaveBalanceResponse,
     LeaveCreateRequest,
     LeaveDecisionRequest,
     LeaveRequestResponse,
+    LeaveTypeCreateRequest,
+    LeaveTypeResponse,
     PayrollItemResponse,
     PayrollSummaryResponse,
     PayslipResponse,
@@ -75,9 +77,11 @@ from audit_core.verigence_attendance.schemas import (
     WorkLocationCreateRequest,
     WorkLocationResponse,
 )
-from audit_core.verigence_attendance.reports import attendance_report, payroll_report
 from audit_core.verigence_attendance.security import human_principal, security_client
-from audit_core.verigence_attendance.service import record_attendance, submit_reimbursement
+from audit_core.verigence_attendance.service import (
+    record_attendance,
+    submit_reimbursement,
+)
 from audit_core.verigence_attendance.storage import storage
 
 router = APIRouter(prefix="/employee-attendance/v1", tags=["employee-attendance"])
@@ -402,6 +406,18 @@ async def create_my_reimbursement(
         storage=storage(),
     )
     return _claim(row)
+
+
+@router.get("/team/reimbursements", response_model=list[ReimbursementResponse])
+def pm_team_reimbursements(
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> list[ReimbursementResponse]:
+    """PM/PMO read-only view of claims for employees explicitly assigned to them."""
+    return [
+        _claim(row)
+        for row in list_pm_team_reimbursements(connection, principal.subject)
+    ]
 
 
 @router.get("/admin/reimbursements", response_model=list[ReimbursementResponse])
