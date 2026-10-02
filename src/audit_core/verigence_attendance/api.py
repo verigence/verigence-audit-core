@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from io import BytesIO
 from decimal import Decimal
 from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy import Connection
 
 from audit_core.security import HumanPrincipal
+from audit_core.verigence_attendance.bulk_import import (
+    apply_employee_import,
+    build_employee_template,
+    preview_employee_workbook,
+)
 from audit_core.verigence_attendance.db import get_connection
 from audit_core.verigence_attendance.errors import AttendanceRuleError
 from audit_core.verigence_attendance.repository import (
@@ -28,6 +35,7 @@ from audit_core.verigence_attendance.repository import (
 )
 from audit_core.verigence_attendance.schemas import (
     AdminCapabilities,
+    BulkImportResponse,
     AttendanceDayResponse,
     AttendanceEventResponse,
     EmployeeCreateRequest,
@@ -415,6 +423,73 @@ def admin_capabilities(
         reportRead=client.allowed(user_id=user_id, permission_key="attendance.report.read"),
         configManage=client.allowed(user_id=user_id, permission_key="attendance.config.manage"),
     )
+
+
+@router.get("/admin/employees/import-template")
+def employee_import_template(
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+) -> StreamingResponse:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.employee.manage",
+    )
+    data = build_employee_template()
+    return StreamingResponse(
+        BytesIO(data),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": (
+                'attachment; filename="verigence-employee-onboarding-template.xlsx"'
+            )
+        },
+    )
+
+
+@router.post("/admin/employees/imports/preview", response_model=BulkImportResponse)
+async def employee_import_preview(
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    workbook: Annotated[UploadFile, File(...)],
+) -> BulkImportResponse:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.employee.manage",
+    )
+    data = await workbook.read()
+    if len(data) > 5 * 1024 * 1024:
+        raise AttendanceRuleError(
+            "IMPORT_TOO_LARGE",
+            "Employee onboarding workbook exceeds 5 MB.",
+            status_code=400,
+        )
+    result = preview_employee_workbook(
+        connection,
+        filename=workbook.filename or "employee-onboarding.xlsx",
+        data=data,
+        actor_user_id=principal.subject,
+    )
+    return BulkImportResponse.model_validate(result)
+
+
+@router.post(
+    "/admin/employees/imports/{import_id}/apply",
+    response_model=BulkImportResponse,
+)
+def employee_import_apply(
+    import_id: UUID,
+    principal: Annotated[HumanPrincipal, Depends(human_principal)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> BulkImportResponse:
+    security_client().require(
+        user_id=principal.subject,
+        permission_key="attendance.employee.manage",
+    )
+    result = apply_employee_import(
+        connection,
+        import_id=import_id,
+        actor_user_id=principal.subject,
+    )
+    return BulkImportResponse.model_validate(result)
 
 @router.get("/admin/employees", response_model=list[EmployeeProfile])
 def admin_employees(
