@@ -1,6 +1,11 @@
 from decimal import Decimal
 
-from audit_core.verigence_attendance.domain import GeoPoint, finance_approval_required, leave_can_move_to_hr, within_geofence
+from audit_core.verigence_attendance.domain import (
+    GeoPoint,
+    finance_approval_required,
+    leave_can_move_to_hr,
+    within_geofence,
+)
 
 
 def test_geofence_accepts_employee_within_500m():
@@ -16,8 +21,8 @@ def test_geofence_rejects_employee_outside_500m():
 
 
 def test_finance_threshold_is_month_total_and_strictly_over_3000():
-    assert not finance_approval_required(Decimal("2500"), Decimal("500"))
-    assert finance_approval_required(Decimal("2500"), Decimal("501"))
+    assert not finance_approval_required(Decimal(2500), Decimal(500))
+    assert finance_approval_required(Decimal(2500), Decimal(501))
 
 
 def test_tl_or_pmo_can_move_leave_to_hr():
