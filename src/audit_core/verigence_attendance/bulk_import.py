@@ -9,7 +9,10 @@ from uuid import UUID, uuid4
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import Connection, text
 
-from audit_core.verigence_attendance.errors import AttendanceNotFoundError, AttendanceRuleError
+from audit_core.verigence_attendance.errors import (
+    AttendanceNotFoundError,
+    AttendanceRuleError,
+)
 from audit_core.verigence_attendance.repository import create_employee
 
 _HEADERS = [
