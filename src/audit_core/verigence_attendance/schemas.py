@@ -1,0 +1,112 @@
+from __future__ import annotations
+
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Literal
+from uuid import UUID
+
+from pydantic import BaseModel, Field
+
+
+class EmployeeProfile(BaseModel):
+    employeeId: UUID
+    securityUserId: UUID
+    employeeCode: str
+    displayName: str
+    primaryEmail: str | None = None
+    mobile: str | None = None
+    joiningDate: date
+    employmentStatus: str
+    tlUserId: UUID | None = None
+    pmoUserId: UUID | None = None
+    projectTenantId: UUID | None = None
+    workLocationId: UUID | None = None
+    workLocationName: str | None = None
+
+
+class EmployeeCreateRequest(BaseModel):
+    securityUserId: UUID
+    employeeCode: str = Field(min_length=1, max_length=80)
+    displayName: str = Field(min_length=1, max_length=240)
+    primaryEmail: str | None = Field(default=None, max_length=320)
+    mobile: str | None = Field(default=None, max_length=40)
+    joiningDate: date
+    tlUserId: UUID | None = None
+    pmoUserId: UUID | None = None
+    projectTenantId: UUID | None = None
+    workLocationId: UUID | None = None
+    basicSalary: Decimal = Decimal(0)
+    hra: Decimal = Decimal(0)
+    allowances: Decimal = Decimal(0)
+    otherEarnings: Decimal = Decimal(0)
+    fixedDeductions: Decimal = Decimal(0)
+
+
+class AttendanceEventResponse(BaseModel):
+    attendanceEventId: UUID
+    attendanceDate: date
+    eventType: Literal["CHECK_IN", "CHECK_OUT"]
+    capturedAtUtc: datetime
+    distanceMeters: float
+    geofenceRadiusMeters: int
+
+
+class AttendanceDayResponse(BaseModel):
+    attendanceDate: date
+    status: str
+    presentFraction: Decimal
+    checkInAtUtc: datetime | None = None
+    checkOutAtUtc: datetime | None = None
+
+
+class LeaveCreateRequest(BaseModel):
+    leaveTypeId: UUID
+    startDate: date
+    endDate: date
+    requestedDays: Decimal = Field(gt=0)
+    reason: str | None = Field(default=None, max_length=2000)
+
+
+class LeaveDecisionRequest(BaseModel):
+    decision: Literal["APPROVE", "REJECT"]
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class LeaveRequestResponse(BaseModel):
+    leaveRequestId: UUID
+    employeeId: UUID
+    employeeName: str
+    leaveTypeId: UUID
+    leaveTypeName: str
+    startDate: date
+    endDate: date
+    requestedDays: Decimal
+    reason: str | None = None
+    status: str
+    createdAtUtc: datetime
+
+
+class ReimbursementDecisionRequest(BaseModel):
+    decision: Literal["APPROVE", "REJECT"]
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class ReimbursementResponse(BaseModel):
+    claimId: UUID
+    employeeId: UUID
+    employeeName: str
+    expenseDate: date
+    category: str
+    amount: Decimal
+    description: str | None = None
+    status: str
+    financeApprovalRequired: bool
+    createdAtUtc: datetime
+
+
+class PayslipResponse(BaseModel):
+    payslipId: UUID
+    payrollMonth: date
+    netAmount: Decimal
+    generatedAtUtc: datetime
+    downloadUrl: str
