@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import date, datetime
-from io import BytesIO
+from datetime import UTC, date, datetime
 from decimal import Decimal
+from io import BytesIO
 from typing import Annotated, Literal
 from uuid import UUID
 
