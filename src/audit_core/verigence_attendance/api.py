@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
@@ -10,7 +10,6 @@ from sqlalchemy import Connection
 
 from audit_core.security import HumanPrincipal
 from audit_core.verigence_attendance.db import get_connection
-from audit_core.verigence_attendance.domain import can_view_employee_expense
 from audit_core.verigence_attendance.errors import AttendanceRuleError
 from audit_core.verigence_attendance.repository import (
     attendance_history,
