@@ -58,8 +58,9 @@ def payable_days(
 ) -> Decimal:
     if min(scheduled_days, paid_leave_days, present_days, unpaid_leave_days) < 0:
         raise ValueError("day counts cannot be negative")
+    _ = unpaid_leave_days
     credited = present_days + paid_leave_days
-    return min(scheduled_days, max(Decimal(0), credited - unpaid_leave_days))
+    return min(scheduled_days, max(Decimal(0), credited))
 
 
 def can_view_employee_attendance(
