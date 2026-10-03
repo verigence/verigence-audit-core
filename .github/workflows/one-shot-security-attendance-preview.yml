@@ -1,0 +1,119 @@
+name: One-shot Security attendance cleanup PREVIEW (DEV, read-only)
+
+# READ-ONLY preview of the cleanup: the connection is opened with
+# default_transaction_read_only=on so nothing can be written. Prints the rows the cleanup
+# would delete or change, the count for every planned statement, and dependency checks.
+on:
+  push:
+    branches: [claude/verigence-phase-2-issues-w515pq]
+    paths:
+      - '.github/workflows/one-shot-security-attendance-preview.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-attendance-preview
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'psycopg[binary]>=3.2,<4'
+          npm install --global @railway/cli
+
+      - name: Preview
+        shell: bash
+        run: |
+          set -uo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service security --json >/dev/null
+          railway variable list --service security --json >/tmp/sec.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import psycopg
+
+          v = json.loads(Path('/tmp/sec.json').read_text())
+          url = v['DATABASE_URL']
+          for pre in ('postgresql+psycopg://', 'postgresql+asyncpg://', 'postgres://'):
+              if url.startswith(pre):
+                  url = 'postgresql://' + url[len(pre):]
+
+          NEW9 = ['attendance.employee.manage', 'attendance.attendance.admin', 'attendance.leave.hr.approve',
+                  'attendance.reimbursement.read', 'attendance.reimbursement.hr.approve',
+                  'attendance.reimbursement.finance.approve', 'attendance.payroll.manage',
+                  'attendance.config.manage', 'attendance.reimbursement.payment.manage']
+          SHARED2 = ['attendance.report.read', 'attendance.report.export']
+          LEDGER_SEC = ['0033_attendance_financeadmin.sql', '0034_attendance_reimbursement_payment.sql']
+
+          conn = psycopg.connect(url, connect_timeout=20,
+                                 options='-c default_transaction_read_only=on -c statement_timeout=30000')
+          cur = conn.cursor()
+          cur.execute('show transaction_read_only'); print('transaction_read_only =', cur.fetchone()[0])
+
+          def rows(sql, args=None):
+              cur.execute(sql, args)
+              cols = [d.name for d in cur.description]
+              return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+          def n(sql, args=None):
+              cur.execute(sql, args); return cur.fetchone()[0]
+
+          print('\n=== PLANNED STATEMENTS AND WHAT EACH WOULD AFFECT (expected in brackets)')
+          print('delete security.module_role_permissions where permission in 9 new:', n('select count(*) from security.module_role_permissions where permission_key = any(%s)', (NEW9,)), '[9]')
+          print('delete security.platform_role_permissions where permission in 9 new:', n('select count(*) from security.platform_role_permissions where permission_key = any(%s)', (NEW9,)), '[9]')
+          print('delete security.permissions (the 9 new):', n('select count(*) from security.permissions where permission_key = any(%s)', (NEW9,)), '[9]')
+          print('restore 2 shared permissions to migration-0027 values:', n('select count(*) from security.permissions where permission_key = any(%s)', (SHARED2,)), '[2]')
+          print('delete security.schema_migrations rows 0033, 0034:', n('select count(*) from security.schema_migrations where migration_name = any(%s)', (LEDGER_SEC,)), '[2]')
+          print('delete attendance.schema_migrations rows 0003, 0004:', n("select count(*) from attendance.schema_migrations where migration_name in ('0003_employee_module.sql','0004_reimbursement_payment_lifecycle.sql')"), '[2]')
+
+          print('\n=== NOT TOUCHED (must stay exactly as they are)')
+          print('attendance.* permissions that remain after cleanup (the 13 from August):', n("select count(*) from security.permissions where permission_key like 'attendance.%%'") - 9, '[13]')
+          print('tenant_role_permissions on attendance.*:', n("select count(*) from security.tenant_role_permissions where permission_key like 'attendance.%%'"), '[440, unchanged]')
+          print('module_operating_role_permission_defaults:', n("select count(*) from security.module_operating_role_permission_defaults where module_key='attendance'"), '[20, unchanged]')
+          print('HRADMIN grants that remain (13 of 19):', n("select count(*) from security.module_role_permissions where role_key='HRADMIN' and permission_key <> all(%s)", (NEW9,)), '[13]')
+          print('module_roles (both stay: HRADMIN, and FINANCEADMIN as a role definition only):', rows("select module_key, role_key, status from security.module_roles order by 2"))
+          print('FINANCEADMIN grants that WILL be removed:', rows("select permission_key from security.module_role_permissions where role_key='FINANCEADMIN' order by 1"))
+
+          print('\n=== GUARDS: other tables that reference the 9 new permissions (all must be 0)')
+          for t in ('tenant_role_permissions', 'module_operating_role_permission_defaults', 'principal_permission_grants',
+                    'role_permissions', 'platform_role_permission_defaults', 'module_role_template_permissions'):
+              print(f'  {t}:', n(f'select count(*) from security."{t}" where permission_key = any(%s)', (NEW9,)))
+
+          print('\n=== verigence_attendance schema (would be dropped)')
+          tabs = [r['table_name'] for r in rows("select table_name from information_schema.tables where table_schema='verigence_attendance' and table_type='BASE TABLE' order by 1")]
+          for t in tabs:
+              cnt = n('select count(*) from verigence_attendance."' + t + '"')
+              print('  ' + t + ': ' + str(cnt) + ' rows')
+          print('  table count:', len(tabs), '[20]')
+          print('  views/functions/types/sequences outside tables in that schema:',
+                n("select count(*) from pg_proc p join pg_namespace s on s.oid=p.pronamespace where s.nspname='verigence_attendance'"), 'functions;',
+                n("select count(*) from pg_class c join pg_namespace s on s.oid=c.relnamespace where s.nspname='verigence_attendance' and c.relkind in ('v','m')"), 'views;',
+                n("select count(*) from pg_class c join pg_namespace s on s.oid=c.relnamespace where s.nspname='verigence_attendance' and c.relkind='S'"), 'sequences')
+          print('  foreign keys from OTHER schemas into it:', rows("select conrelid::regclass::text as from_table from pg_constraint where contype='f' and confrelid::regclass::text like 'verigence_attendance.%%' and conrelid::regclass::text not like 'verigence_attendance.%%'"))
+          print('  views OUTSIDE the schema that depend on it:', n("""select count(*) from pg_depend d
+              join pg_rewrite r on r.oid=d.objid join pg_class vc on vc.oid=r.ev_class join pg_namespace vn on vn.oid=vc.relnamespace
+              join pg_class ref on ref.oid=d.refobjid join pg_namespace rn on rn.oid=ref.relnamespace
+              where rn.nspname='verigence_attendance' and vn.nspname<>'verigence_attendance'"""))
+          print('  module_configuration rows (default config):', json.dumps(rows('select config_key from verigence_attendance.module_configuration order by 1')))
+
+          print('\n=== ROWS THAT WOULD CHANGE (full copy, for restore)')
+          print('permissions to delete:', json.dumps(rows('select * from security.permissions where permission_key = any(%s) order by 1', (NEW9,)), default=str))
+          print('permissions to restore (current values):', json.dumps(rows('select * from security.permissions where permission_key = any(%s) order by 1', (SHARED2,)), default=str))
+          print('ledger rows (security 0033/0034):', json.dumps(rows('select * from security.schema_migrations where migration_name = any(%s) order by 1', (LEDGER_SEC,)), default=str))
+          print('ledger rows (attendance, all):', json.dumps(rows('select * from attendance.schema_migrations order by 1'), default=str))
+          conn.rollback()
+          print('\nPREVIEW COMPLETE: nothing was written')
+          PY
