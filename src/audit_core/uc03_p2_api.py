@@ -515,6 +515,7 @@ def list_p2_journeys(
             SELECT p.journey_id, p.journey_reference, p.customer_name, p.mobile_last4,
                    p.dealer_name, p.outlet_name, p.outlet_code, p.vehicle, p.created_at_utc, p.updated_at_utc,
                    p.pc_name, COALESCE(pr.price_variance, pv.price_variance) AS price_variance,
+                   gt.kyc_status, gt.docs_required, gt.docs_received,
                    gp.gate_pass_date, op.opened_at,
                    -- The stage is the Phase 2 stage record's, nothing else: a delivery
                    -- or booking date from an older record never makes a journey
@@ -598,6 +599,16 @@ def list_p2_journeys(
               FROM auditcore.p2_document_queue q
               WHERE q.tenant_id=p.tenant_id AND q.journey_id=p.journey_id
             ) pq ON true
+            LEFT JOIN LATERAL (
+              -- What the journey holds, from the stage engine's own gate records (no
+              -- second calculation): customer KYC read, and required documents in against
+              -- required (Booking and Delivery together).
+              SELECT MAX(g.gate_status) FILTER (WHERE g.stage_code='BOOKING' AND g.gate_key='KYC_EXTRACTED') AS kyc_status,
+                     SUM(COALESCE((g.details ->> 'requiredCount')::int, 0)) FILTER (WHERE g.gate_key='REQUIRED_DOCUMENTS') AS docs_required,
+                     SUM(COALESCE((g.details ->> 'receivedCount')::int, 0)) FILTER (WHERE g.gate_key='REQUIRED_DOCUMENTS') AS docs_received
+              FROM auditcore.p2_stage_gate_state g
+              WHERE g.tenant_id=p.tenant_id AND g.journey_id=p.journey_id
+            ) gt ON true
             LEFT JOIN LATERAL (
               SELECT COUNT(*) AS total_tasks,
                      COUNT(*) FILTER (WHERE is_open) AS open_tasks,
@@ -697,6 +708,10 @@ def list_p2_journeys(
         for key in ("documents", "total_tasks", "open_tasks", "overdue_tasks", "open_findings",
                     "pc_open_tasks", "tl_open_tasks"):
             item[key] = int(item.get(key) or 0)
+        # Gate records exist for a Phase 2 journey only: absent stays null, never a guess.
+        for key in ("docs_required", "docs_received"):
+            if item.get(key) is not None:
+                item[key] = int(item[key])
         for key in ("booking_receipt_total", "booking_minimum_amount", "price_variance"):
             if item.get(key) is not None:
                 item[key] = str(item[key])

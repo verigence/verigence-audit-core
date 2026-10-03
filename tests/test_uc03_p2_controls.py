@@ -324,3 +324,46 @@ def test_duplicate_booking_fail_links_its_finding_and_match(journey):
                  "AND control_code='DUPLICATE_BOOKING'"), {"t": second.tenant_id, "j": second.journey_id},
         ).scalar_one()
     assert linked is not None
+
+
+def _apply_tasks(journey, transitions):
+    """What the worker does with a unit's transitions: raise or refresh the control's task."""
+    from audit_core.uc03_p2_task_producer import apply_control_transitions
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        apply_control_transitions(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                                  transitions=transitions, evaluation_started_at=None)
+
+
+def test_a_stronger_duplicate_match_replaces_the_finding_the_control_and_task_follow(journey):
+    """A pair first seen on the mobile number alone, then on the PAN: the control
+    state, its details and the one Team Lead task follow the finding raised on
+    the current basis, not the voided one."""
+    add_ready_document(journey, "booking_form", customer_phone="9123456789")
+    second = _second_journey(journey)
+    add_ready_document(second, "booking_form", customer_phone="9123456789")
+    _apply_tasks(second, _evaluate(second, "NATIVE:BOOKING"))
+    assert _states(second)["DUPLICATE_BOOKING"]["details"]["matchBasis"] == "MOBILE"
+
+    add_ready_document(journey, "pan_card", pan_number="ABCDE1234F", pan_name="RAVI KUMAR")
+    add_ready_document(second, "pan_card", pan_number="ABCDE1234F", pan_name="RAVI KUMAR")
+    _apply_tasks(second, _evaluate(second, "NATIVE:BOOKING"))
+
+    with second.engine.begin() as connection:
+        set_tenant_context(connection, second.tenant_id)
+        linked, status = connection.execute(
+            text("SELECT s.finding_id, f.finding_status FROM auditcore.p2_control_state s "
+                 "JOIN auditcore.audit_findings f ON f.tenant_id=s.tenant_id AND f.audit_finding_id=s.finding_id "
+                 "WHERE s.tenant_id=:t AND s.journey_id=:j AND s.control_code='DUPLICATE_BOOKING'"),
+            {"t": second.tenant_id, "j": second.journey_id},
+        ).one()
+        tasks = connection.execute(
+            text("SELECT reference->>'findingId' AS finding_id FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
+                 "AND source_code='DUPLICATE_BOOKING' AND task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')"),
+            {"t": second.tenant_id, "j": second.journey_id},
+        ).scalars().all()
+    state = _states(second)["DUPLICATE_BOOKING"]
+    assert state["details"]["matchBasis"] == "PAN" and state["details"]["matchConfidencePercent"] == 99
+    assert status == "OPEN"  # the control follows the finding on the current basis, not the voided one
+    assert tasks == [str(linked)]  # one open Team Lead task, pointing at it
