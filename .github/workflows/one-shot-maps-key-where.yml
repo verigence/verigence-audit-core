@@ -1,0 +1,63 @@
+name: One-shot Maps key location check (DEV, read-only)
+
+# Lists, per DEV service, whether a Google Maps key variable exists, its length, and whether it is
+# the earlier (rejected) key. Prints names, lengths and a yes/no only. Never a key value.
+on:
+  push:
+    branches: [claude/verigence-phase-2-issues-w515pq]
+    paths:
+      - '.github/workflows/one-shot-maps-key-where.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-maps-key-where
+  cancel-in-progress: false
+
+jobs:
+  where:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      - name: Look for the key on every DEV service
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service verigence-audit-core --json >/dev/null
+          railway status --json >/tmp/status.json
+          python3 - <<'PY'
+          import hashlib, json, subprocess
+          status = json.load(open('/tmp/status.json'))
+          edges = status.get('environments', {}).get('edges', [])
+          services = set()
+          for env in edges:
+              for inst in env['node'].get('serviceInstances', {}).get('edges', []):
+                  services.add(inst['node'].get('serviceName'))
+          print('services in DEV:', sorted(s for s in services if s))
+          for name in sorted(s for s in services if s):
+              r = subprocess.run(['railway', 'variable', 'list', '--service', name, '--json'],
+                                 capture_output=True, text=True)
+              if r.returncode != 0:
+                  print(name, ': could not read variables'); continue
+              try:
+                  v = json.loads(r.stdout)
+              except Exception:
+                  print(name, ': unreadable'); continue
+              hits = {k: val for k, val in v.items() if 'MAPS' in k.upper() or 'GEOCOD' in k.upper()}
+              if not hits:
+                  print(name, ': no maps/geocoding variable'); continue
+              for k, val in hits.items():
+                  val = (val or '').strip()
+                  same = hashlib.sha256(val.encode()).hexdigest()[:12] == 'b71c824cbdff'
+                  print(name, ':', k, '| length', len(val), '| starts with AIza:', val.startswith('AIza'), '| is the old rejected key:', same)
+          PY
