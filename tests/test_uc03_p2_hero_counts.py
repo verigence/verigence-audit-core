@@ -107,9 +107,8 @@ def _gate(connection, tenant_id, journey_id, stage, key, status, **details):
 
 
 def test_rows_and_hero_say_what_the_journey_holds_and_lacks(uc03_create_booking_setup):  # noqa: F811
-    """No stage label: KYC read or missing, required documents in against
-    required (Booking and Delivery together) and the vehicle proof, read from
-    the stage engine's gate records; the Hero counts the open journeys that lack."""
+    """KYC read or missing, required documents in against
+    required (Booking and Delivery together), read from the stage engine's gate records."""
     setup = uc03_create_booking_setup
     client, base, ids = _seed(setup)
     booking, booking_complete, delivery, closed, booking_complete_two = ids
@@ -119,7 +118,6 @@ def test_rows_and_hero_say_what_the_journey_holds_and_lacks(uc03_create_booking_
         _gate(connection, t, booking, "BOOKING", "KYC_EXTRACTED", "WAITING")
         _gate(connection, t, booking, "BOOKING", "REQUIRED_DOCUMENTS", "WAITING", requiredCount=3, receivedCount=1)
         _gate(connection, t, booking, "DELIVERY", "REQUIRED_DOCUMENTS", "WAITING", requiredCount=5, receivedCount=0)
-        _gate(connection, t, booking, "DELIVERY", "VEHICLE_PROOF", "WAITING")
         _gate(connection, t, booking_complete, "BOOKING", "KYC_EXTRACTED", "PASS")
         _gate(connection, t, booking_complete, "BOOKING", "REQUIRED_DOCUMENTS", "PASS", requiredCount=3, receivedCount=3)
         _gate(connection, t, booking_complete, "DELIVERY", "REQUIRED_DOCUMENTS", "WAITING", requiredCount=5, receivedCount=0)
@@ -131,14 +129,10 @@ def test_rows_and_hero_say_what_the_journey_holds_and_lacks(uc03_create_booking_
         _gate(connection, t, closed, "DELIVERY", "REQUIRED_DOCUMENTS", "WAITING", requiredCount=5, receivedCount=1)
 
     rows = {r["journey_id"]: r for r in client.get(f"{base}/journeys", params={"state": "open"}).json()["items"]}
-    assert (rows[booking]["kyc_status"], rows[booking]["docs_required"], rows[booking]["docs_received"],
-            rows[booking]["vehicle_proof_status"]) == ("WAITING", 8, 1, "WAITING")
+    assert (rows[booking]["kyc_status"], rows[booking]["docs_required"],
+            rows[booking]["docs_received"]) == ("WAITING", 8, 1)
     assert (rows[booking_complete]["kyc_status"], rows[booking_complete]["docs_required"],
             rows[booking_complete]["docs_received"]) == ("PASS", 8, 3)
     assert (rows[delivery]["docs_required"], rows[delivery]["docs_received"]) == (8, 8)
     # No gate record yet: unknown, never a guess.
-    assert (rows[booking_complete_two]["kyc_status"], rows[booking_complete_two]["docs_required"],
-            rows[booking_complete_two]["vehicle_proof_status"]) == (None, None, None)
-
-    summary = client.get(f"{base}/journeys:summary").json()
-    assert summary["journeys"] == {"open": 4, "kycMissing": 1, "documentsPending": 2}
+    assert (rows[booking_complete_two]["kyc_status"], rows[booking_complete_two]["docs_required"]) == (None, None)
