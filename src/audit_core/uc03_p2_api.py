@@ -515,6 +515,7 @@ def list_p2_journeys(
             SELECT p.journey_id, p.journey_reference, p.customer_name, p.mobile_last4,
                    p.dealer_name, p.outlet_name, p.outlet_code, p.vehicle, p.created_at_utc, p.updated_at_utc,
                    p.pc_name, COALESCE(pr.price_variance, pv.price_variance) AS price_variance,
+                   gt.kyc_status, gt.proof_status AS vehicle_proof_status, gt.docs_required, gt.docs_received,
                    gp.gate_pass_date, op.opened_at,
                    -- The stage is the Phase 2 stage record's, nothing else: a delivery
                    -- or booking date from an older record never makes a journey
@@ -598,6 +599,17 @@ def list_p2_journeys(
               FROM auditcore.p2_document_queue q
               WHERE q.tenant_id=p.tenant_id AND q.journey_id=p.journey_id
             ) pq ON true
+            LEFT JOIN LATERAL (
+              -- What the journey holds, from the stage engine's own gate records (no
+              -- second calculation): customer KYC read, required documents in against
+              -- required (Booking and Delivery together) and the vehicle proof.
+              SELECT MAX(g.gate_status) FILTER (WHERE g.stage_code='BOOKING' AND g.gate_key='KYC_EXTRACTED') AS kyc_status,
+                     MAX(g.gate_status) FILTER (WHERE g.stage_code='DELIVERY' AND g.gate_key='VEHICLE_PROOF') AS proof_status,
+                     SUM(COALESCE((g.details ->> 'requiredCount')::int, 0)) FILTER (WHERE g.gate_key='REQUIRED_DOCUMENTS') AS docs_required,
+                     SUM(COALESCE((g.details ->> 'receivedCount')::int, 0)) FILTER (WHERE g.gate_key='REQUIRED_DOCUMENTS') AS docs_received
+              FROM auditcore.p2_stage_gate_state g
+              WHERE g.tenant_id=p.tenant_id AND g.journey_id=p.journey_id
+            ) gt ON true
             LEFT JOIN LATERAL (
               SELECT COUNT(*) AS total_tasks,
                      COUNT(*) FILTER (WHERE is_open) AS open_tasks,
@@ -697,6 +709,10 @@ def list_p2_journeys(
         for key in ("documents", "total_tasks", "open_tasks", "overdue_tasks", "open_findings",
                     "pc_open_tasks", "tl_open_tasks"):
             item[key] = int(item.get(key) or 0)
+        # Gate records exist for a Phase 2 journey only: absent stays null, never a guess.
+        for key in ("docs_required", "docs_received"):
+            if item.get(key) is not None:
+                item[key] = int(item[key])
         for key in ("booking_receipt_total", "booking_minimum_amount", "price_variance"):
             if item.get(key) is not None:
                 item[key] = str(item[key])
@@ -748,7 +764,16 @@ def journeys_summary(
                      (pr.journey_id IS NOT NULL) AS phase2,
                      COALESCE(ds.business_completed_at_utc IS NOT NULL
                               OR bs.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING')
-                              OR bs.closure_disposition='NO_DELIVERY', false) AS closed
+                              OR bs.closure_disposition='NO_DELIVERY', false) AS closed,
+                     -- The checks, from the stage engine's gate records: customer KYC not read
+                     -- yet, and required documents (Booking and Delivery) still missing.
+                     EXISTS (SELECT 1 FROM auditcore.p2_stage_gate_state g
+                             WHERE g.tenant_id=j.tenant_id AND g.journey_id=j.journey_id
+                               AND g.stage_code='BOOKING' AND g.gate_key='KYC_EXTRACTED'
+                               AND g.gate_status <> 'PASS') AS kyc_missing,
+                     EXISTS (SELECT 1 FROM auditcore.p2_stage_gate_state g
+                             WHERE g.tenant_id=j.tenant_id AND g.journey_id=j.journey_id
+                               AND g.gate_key='REQUIRED_DOCUMENTS' AND g.gate_status <> 'PASS') AS docs_pending
               FROM auditcore.journeys j
               LEFT JOIN auditcore.p2_journey_runtime pr ON pr.tenant_id=j.tenant_id AND pr.journey_id=j.journey_id
               LEFT JOIN auditcore.journey_stage_states bs
@@ -791,6 +816,9 @@ def journeys_summary(
               COUNT(*) FILTER (WHERE in_delivery AND delivery_completed IS NULL AND NOT cancelled) AS open_deliveries,
               COUNT(*) FILTER (WHERE booking_completed IS NOT NULL) AS closed_bookings,
               COUNT(*) FILTER (WHERE delivery_completed IS NOT NULL) AS closed_deliveries,
+              COUNT(*) FILTER (WHERE NOT closed) AS open_journeys,
+              COUNT(*) FILTER (WHERE NOT closed AND kyc_missing) AS kyc_missing_journeys,
+              COUNT(*) FILTER (WHERE NOT closed AND docs_pending) AS docs_pending_journeys,
               (SELECT COUNT(*) FROM open_task_rows) AS open_tasks,
               (SELECT COUNT(*) FROM open_task_rows WHERE role='PC') AS pc_open_tasks,
               (SELECT COUNT(*) FROM open_task_rows WHERE role IN ('TL','PM')) AS tl_open_tasks,
@@ -818,6 +846,9 @@ def journeys_summary(
         # All-time closed stages and the open tasks across the open journeys in
         # scope: the five numbers the Booking & Delivery screen shows.
         "closed": {"bookings": int(row["closed_bookings"] or 0), "deliveries": int(row["closed_deliveries"] or 0)},
+        # The open journeys and what they lack, without a Booking or Delivery split.
+        "journeys": {"open": int(row["open_journeys"] or 0), "kycMissing": int(row["kyc_missing_journeys"] or 0),
+                     "documentsPending": int(row["docs_pending_journeys"] or 0)},
         # Open tasks of the open journeys, as the rows count them: all roles, the
         # PC's and the Team Lead's (the screen shows the signed-in role's).
         "tasks": {"open": int(row["open_tasks"] or 0), "pc": int(row["pc_open_tasks"] or 0),

@@ -3,6 +3,7 @@ deliveries open follow each row's stage chip, and open tasks are the open
 journeys' tasks counted as the rows count them, by role (real Postgres)."""
 from __future__ import annotations
 
+import json
 from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
@@ -32,8 +33,8 @@ def _task(connection, tenant_id, journey_id, role, status="READY"):
         )
 
 
-def test_hero_deliveries_and_tasks_agree_with_the_rows(uc03_create_booking_setup):  # noqa: F811
-    setup = uc03_create_booking_setup
+
+def _seed(setup):
     client = TestClient(app, raise_server_exceptions=False)
     base = f"/p2/v1/tenants/{setup['tenant_id']}"
     ids = []
@@ -75,7 +76,12 @@ def test_hero_deliveries_and_tasks_agree_with_the_rows(uc03_create_booking_setup
             for role in roles:
                 _task(connection, setup["tenant_id"], journey_id, role)
         _task(connection, setup["tenant_id"], delivery, "PC", status="VERIFIED_COMPLETE")  # not open
+    return client, base, ids
 
+
+def test_hero_deliveries_and_tasks_agree_with_the_rows(uc03_create_booking_setup):  # noqa: F811
+    setup = uc03_create_booking_setup
+    client, base, _ = _seed(setup)
     summary = client.get(f"{base}/journeys:summary").json()
     rows = client.get(f"{base}/journeys", params={"state": "open"}).json()["items"]
     by_chip = {"booking": 0, "delivery": 0}
@@ -90,3 +96,49 @@ def test_hero_deliveries_and_tasks_agree_with_the_rows(uc03_create_booking_setup
     assert summary["tasks"]["open"] == sum(r["open_tasks"] for r in rows) == 3 + 1 + 1 + 3
     assert summary["tasks"]["pc"] == sum(r["pc_open_tasks"] for r in rows) == 2 + 1 + 1 + 1
     assert summary["tasks"]["tl"] == sum(r["tl_open_tasks"] for r in rows) == 1 + 0 + 0 + 2
+
+
+def _gate(connection, tenant_id, journey_id, stage, key, status, **details):
+    connection.execute(
+        text("INSERT INTO auditcore.p2_stage_gate_state (tenant_id, journey_id, stage_code, gate_key, gate_status, details) "
+             "VALUES (:t, :j, :s, :k, :st, CAST(:d AS jsonb))"),
+        {"t": tenant_id, "j": journey_id, "s": stage, "k": key, "st": status, "d": json.dumps(details)},
+    )
+
+
+def test_rows_and_hero_say_what_the_journey_holds_and_lacks(uc03_create_booking_setup):  # noqa: F811
+    """No stage label: KYC read or missing, required documents in against
+    required (Booking and Delivery together) and the vehicle proof, read from
+    the stage engine's gate records; the Hero counts the open journeys that lack."""
+    setup = uc03_create_booking_setup
+    client, base, ids = _seed(setup)
+    booking, booking_complete, delivery, closed, booking_complete_two = ids
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        t = setup["tenant_id"]
+        _gate(connection, t, booking, "BOOKING", "KYC_EXTRACTED", "WAITING")
+        _gate(connection, t, booking, "BOOKING", "REQUIRED_DOCUMENTS", "WAITING", requiredCount=3, receivedCount=1)
+        _gate(connection, t, booking, "DELIVERY", "REQUIRED_DOCUMENTS", "WAITING", requiredCount=5, receivedCount=0)
+        _gate(connection, t, booking, "DELIVERY", "VEHICLE_PROOF", "WAITING")
+        _gate(connection, t, booking_complete, "BOOKING", "KYC_EXTRACTED", "PASS")
+        _gate(connection, t, booking_complete, "BOOKING", "REQUIRED_DOCUMENTS", "PASS", requiredCount=3, receivedCount=3)
+        _gate(connection, t, booking_complete, "DELIVERY", "REQUIRED_DOCUMENTS", "WAITING", requiredCount=5, receivedCount=0)
+        _gate(connection, t, delivery, "BOOKING", "KYC_EXTRACTED", "PASS")
+        _gate(connection, t, delivery, "BOOKING", "REQUIRED_DOCUMENTS", "PASS", requiredCount=3, receivedCount=3)
+        _gate(connection, t, delivery, "DELIVERY", "REQUIRED_DOCUMENTS", "PASS", requiredCount=5, receivedCount=5)
+        # A closed journey that still lacks KYC is not an open journey's lack.
+        _gate(connection, t, closed, "BOOKING", "KYC_EXTRACTED", "WAITING")
+        _gate(connection, t, closed, "DELIVERY", "REQUIRED_DOCUMENTS", "WAITING", requiredCount=5, receivedCount=1)
+
+    rows = {r["journey_id"]: r for r in client.get(f"{base}/journeys", params={"state": "open"}).json()["items"]}
+    assert (rows[booking]["kyc_status"], rows[booking]["docs_required"], rows[booking]["docs_received"],
+            rows[booking]["vehicle_proof_status"]) == ("WAITING", 8, 1, "WAITING")
+    assert (rows[booking_complete]["kyc_status"], rows[booking_complete]["docs_required"],
+            rows[booking_complete]["docs_received"]) == ("PASS", 8, 3)
+    assert (rows[delivery]["docs_required"], rows[delivery]["docs_received"]) == (8, 8)
+    # No gate record yet: unknown, never a guess.
+    assert (rows[booking_complete_two]["kyc_status"], rows[booking_complete_two]["docs_required"],
+            rows[booking_complete_two]["vehicle_proof_status"]) == (None, None, None)
+
+    summary = client.get(f"{base}/journeys:summary").json()
+    assert summary["journeys"] == {"open": 4, "kycMissing": 1, "documentsPending": 2}
