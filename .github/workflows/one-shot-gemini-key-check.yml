@@ -1,0 +1,83 @@
+name: One-shot Gemini key check (DEV, read-only)
+
+# For each DEV service that holds a Gemini key: prints variable name, length, whether it is the key
+# pasted in chat earlier, and Google's answer to a FREE "list models" call (no tokens used).
+# Also counts error patterns in recent DI logs (counts only, no log text). Never prints a key.
+on:
+  push:
+    branches: [claude/verigence-phase-2-issues-w515pq]
+    paths:
+      - '.github/workflows/one-shot-gemini-key-check.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-gemini-key-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      - name: Check the Gemini key and recent DI log patterns
+        shell: bash
+        run: |
+          set -uo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service di-api --json >/dev/null
+          python3 - <<'PY'
+          import hashlib, json, re, subprocess, urllib.error, urllib.request
+          CHAT_FP = 'b71c824cbdff'
+          services = ['di-api', 'di-worker', 'di-worker-v2', 'verigence-audit-core', 'verigence-p2-worker']
+          tested = {}
+          for svc in services:
+              r = subprocess.run(['railway', 'variable', 'list', '--service', svc, '--json'], capture_output=True, text=True)
+              try:
+                  v = json.loads(r.stdout)
+              except Exception:
+                  print(svc, ': could not read variables'); continue
+              hits = {k: (val or '').strip() for k, val in v.items() if 'GEMINI' in k.upper()}
+              if not hits:
+                  print(svc, ': no Gemini variable'); continue
+              for name, val in hits.items():
+                  print('::add-mask::' + val)
+                  fp = hashlib.sha256(val.encode()).hexdigest()[:12]
+                  same_as_chat = fp == CHAT_FP
+                  if fp not in tested:
+                      try:
+                          req = urllib.request.Request(
+                              'https://generativelanguage.googleapis.com/v1beta/models?pageSize=1',
+                              headers={'x-goog-api-key': val})
+                          with urllib.request.urlopen(req, timeout=20) as resp:
+                              tested[fp] = 'HTTP %d (key accepted)' % resp.status
+                      except urllib.error.HTTPError as err:
+                          try:
+                              e = json.load(err).get('error', {})
+                          except Exception:
+                              e = {}
+                          tested[fp] = 'HTTP %d %s' % (err.code, str(e.get('status', '')))
+                      except Exception as exc:
+                          tested[fp] = 'request failed: ' + type(exc).__name__
+                  print(svc, ':', name, '| length', len(val), '| same as the key pasted in chat:', same_as_chat, '| list-models:', tested[fp])
+          PY
+          echo '--- recent DI log pattern counts (last ~400 lines each; counts only) ---'
+          for svc in di-api di-worker di-worker-v2; do
+            railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$svc" --json >/dev/null 2>&1
+            timeout 40 railway logs --service "$svc" --lines 400 >/tmp/$svc.log 2>&1 || true
+            total=$(wc -l < /tmp/$svc.log)
+            g=$(grep -ci 'gemini' /tmp/$svc.log || true)
+            quota=$(grep -ciE '429|RESOURCE_EXHAUSTED|quota' /tmp/$svc.log || true)
+            auth=$(grep -ciE 'API key not valid|API_KEY_INVALID|PERMISSION_DENIED|UNAUTHENTICATED| 403 ' /tmp/$svc.log || true)
+            fail=$(grep -ciE 'CLASSIFICATION_FAILED|extraction_failed|gemini.*(error|failed)' /tmp/$svc.log || true)
+            echo "$svc: lines=$total gemini-mentions=$g quota/429=$quota auth-errors=$auth failures=$fail"
+          done
