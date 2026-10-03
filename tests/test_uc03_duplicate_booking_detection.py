@@ -402,3 +402,96 @@ def test_pairing_that_no_longer_matches_self_heals(two_journeys) -> None:
     )
     assert result2["resolved"] == 1
     assert _open_findings(c, duplicate_journey) == []
+
+
+def _sync_both(c) -> None:
+    for journey_id in (c.journey_a, c.journey_b):
+        dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=journey_id, correlation_id="")
+
+
+def _findings_with_basis(c) -> list[dict]:
+    return [
+        dict(row)
+        for row in c.execute(
+            text("""
+                SELECT f.audit_finding_id, f.journey_id, f.finding_status, f.severity,
+                       (SELECT e.safe_payload FROM auditcore.audit_finding_events e
+                         WHERE e.tenant_id=f.tenant_id AND e.audit_finding_id=f.audit_finding_id
+                           AND e.event_type='RAISED' ORDER BY e.occurred_at_utc LIMIT 1) AS raised
+                FROM auditcore.audit_findings f
+                WHERE f.tenant_id=:t AND f.finding_type_code='DUPLICATE_BOOKING'
+                ORDER BY f.created_at_utc, f.audit_finding_id"""),
+            {"t": c.tenant_id},
+        ).mappings().all()
+    ]
+
+
+def _mobile_then_pan(c) -> None:
+    for journey_id in (c.journey_a, c.journey_b):
+        _set_field(c, journey_id=journey_id, document_type_key="booking_form", field_key="customer_phone", value="9123456789")
+    _sync_both(c)
+
+
+def _add_pan(c) -> None:
+    for journey_id in (c.journey_a, c.journey_b):
+        _set_field(c, journey_id=journey_id, document_type_key="pan_card", field_key="pan_number", value="GGGGG7777G")
+
+
+def test_an_open_finding_raised_on_a_weaker_basis_is_raised_again_on_the_stronger_one(two_journeys) -> None:
+    c = two_journeys
+    _mobile_then_pan(c)
+    [first] = _findings_with_basis(c)
+    assert first["finding_status"] == "OPEN" and first["severity"] == "MEDIUM"
+    assert first["raised"]["matchBasis"] == "MOBILE" and first["raised"]["matchConfidencePercent"] == 70
+
+    _add_pan(c)  # the PAN cards were read afterwards and match too
+    _sync_both(c)
+    old, new = _findings_with_basis(c)
+    assert old["audit_finding_id"] == first["audit_finding_id"] and old["finding_status"] == "VOIDED"
+    assert new["finding_status"] == "OPEN" and new["severity"] == "CRITICAL"
+    assert new["raised"]["matchBasis"] == "PAN" and new["raised"]["matchConfidencePercent"] == 99
+    assert new["journey_id"] == first["journey_id"]  # still the same journey flagged as the duplicate
+    event = c.execute(
+        text("SELECT safe_payload FROM auditcore.audit_finding_events WHERE tenant_id=:t "
+             "AND audit_finding_id=:f AND event_type='VOIDED'"),
+        {"t": c.tenant_id, "f": first["audit_finding_id"]},
+    ).scalar_one()
+    assert event["previousBasis"] == "MOBILE" and event["currentBasis"] == "PAN"
+
+    _sync_both(c)  # idempotent: nothing more is voided or raised
+    assert [f["audit_finding_id"] for f in _findings_with_basis(c)] == [old["audit_finding_id"], new["audit_finding_id"]]
+    assert len(_open_findings(c, new["journey_id"])) == 1
+
+
+def test_a_finding_the_team_lead_acknowledged_is_left_as_it_is(two_journeys) -> None:
+    c = two_journeys
+    _mobile_then_pan(c)
+    [first] = _findings_with_basis(c)
+    c.execute(
+        text("UPDATE auditcore.audit_findings SET finding_status='ACKNOWLEDGED' "
+             "WHERE tenant_id=:t AND audit_finding_id=:f"),
+        {"t": c.tenant_id, "f": first["audit_finding_id"]},
+    )
+    _add_pan(c)
+    _sync_both(c)
+    [only] = _findings_with_basis(c)
+    assert only["audit_finding_id"] == first["audit_finding_id"] and only["finding_status"] == "ACKNOWLEDGED"
+    assert only["raised"]["matchBasis"] == "MOBILE"
+
+
+def test_a_failure_while_refreshing_leaves_the_finding_and_never_raises(two_journeys, monkeypatch) -> None:
+    c = two_journeys
+    _mobile_then_pan(c)
+    [first] = _findings_with_basis(c)
+    _add_pan(c)
+
+    original = c.execute
+    def failing(statement, *args, **kwargs):
+        if "SET finding_status = 'VOIDED'" in str(statement):
+            raise RuntimeError("boom")
+        return original(statement, *args, **kwargs)
+    monkeypatch.setattr(c, "execute", failing)
+    _sync_both(c)
+    monkeypatch.setattr(c, "execute", original)
+    [only] = _findings_with_basis(c)
+    assert only["audit_finding_id"] == first["audit_finding_id"] and only["finding_status"] == "OPEN"
