@@ -38,7 +38,7 @@ jobs:
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
           railway variable list --service "$AUDIT_SERVICE" --json >/tmp/vars.json
           python3 - <<'PY'
-          import json, urllib.parse, urllib.request
+          import json, urllib.error, urllib.parse, urllib.request
           key = (json.load(open('/tmp/vars.json')).get('GOOGLE_MAPS_API_KEY') or '').strip()
           if not key:
               print('GOOGLE_MAPS_API_KEY: NOT SET on the Audit Core DEV service')
@@ -48,7 +48,9 @@ jobs:
               print('total variables on the service:', len(all_vars))
               raise SystemExit(0)
           print('::add-mask::' + key)
+          import hashlib
           print('GOOGLE_MAPS_API_KEY: set, length', len(key), ', starts with AIza:', key.startswith('AIza'))
+          print('identical to the key pasted earlier in chat:', hashlib.sha256(key.encode()).hexdigest()[:12] == 'b71c824cbdff')
           url = 'https://maps.googleapis.com/maps/api/geocode/json?' + urllib.parse.urlencode(
               {'address': 'Cuttack Sadar, Odisha, India', 'components': 'country:IN', 'key': key})
           try:
@@ -57,6 +59,25 @@ jobs:
           except Exception as exc:
               print('request failed:', type(exc).__name__)
               raise SystemExit(0)
+          # Second opinion from Google's newer Geocoding API: its errors say WHY a key is refused.
+          try:
+              req = urllib.request.Request(
+                  'https://geocode.googleapis.com/v4beta/geocode/address/Cuttack%20Sadar%2C%20Odisha%2C%20India',
+                  headers={'X-Goog-Api-Key': key})
+              with urllib.request.urlopen(req, timeout=20) as r2:
+                  print('new Geocoding API: HTTP', r2.status)
+          except urllib.error.HTTPError as err:
+              try:
+                  detail = json.load(err).get('error', {})
+              except Exception:
+                  detail = {}
+              print('new Geocoding API: HTTP', err.code, '| status:', detail.get('status'),
+                    '| reason:', str(detail.get('message', '-')).replace(key, '***')[:220])
+              for d in detail.get('details', []):
+                  if isinstance(d, dict) and d.get('reason'):
+                      print('  reason code:', d.get('reason'))
+          except Exception as exc:
+              print('new Geocoding API request failed:', type(exc).__name__)
           print('Google status:', body.get('status'))
           msg = str(body.get('error_message', ''))
           print('Google message:', msg.replace(key, '***')[:200] or '-')
