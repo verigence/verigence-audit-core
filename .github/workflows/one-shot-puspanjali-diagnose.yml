@@ -1,4 +1,4 @@
-name: One-shot List price variance vs Deal diagnose (DEV, read-only)
+name: One-shot Hero counts diagnose (DEV, read-only)
 
 # Read-only: one customer's journeys. Never writes.
 on:
@@ -59,58 +59,48 @@ jobs:
           echo "::add-mask::$url"
           echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
 
-      - name: Compare the list price variance with the Deal build, read-only
+      - name: Hero counts vs rows, read-only
         shell: bash
         run: |
           python - <<'PY'
-          import json, os
+          import os, re
           from sqlalchemy import create_engine, text
           from audit_core.db import set_tenant_context
-          from audit_core.uc03_p2_journey360 import deal
           import audit_core.uc03_p2_api as api
 
           T = "5fbe26ab-6ed7-444a-8488-5bfb81208588"
           src = open(api.__file__).read()
-          start = src.index("-- Journey 360's \"current vs standard\"")
-          start = src.index("SELECT COALESCE((", start)
-          end = src.index(") pv ON true", start)
-          PV_SQL = src[start:end].replace("p.tenant_id", ":t").replace("p.journey_id", ":j")
+          a = src.index('def journeys_summary')
+          start = src.index('WITH scoped AS (', a)
+          end = src.index('"""', start)
+          HERO = src[start:end]
           engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=60000"})
           with engine.connect() as c:
               c.execute(text("SET TRANSACTION READ ONLY"))
               set_tenant_context(c, T)
-              js = c.execute(text("""SELECT journey_id, journey_reference, created_at_utc FROM auditcore.journeys
-                                     WHERE tenant_id=:t ORDER BY created_at_utc"""), {"t": T}).all()
-              print("journeys", len(js))
-              for jid, ref, created in js:
-                  try:
-                      lst = c.execute(text(PV_SQL.replace(":j", ":jj").replace(":jj", ":j")), {"t": T, "j": jid}).scalar()
-                      view = deal(c, tenant_id=T, journey_id=jid)
-                      v = view["summary"]["variance"]
-                      g = view["summary"]["gross"]
-                      print(ref, str(jid)[:8], "LIST_PV", lst, "| DEAL cur-std", v["currentVsStandard"], "book-std", v["bookingVsStandard"],
-                            "billed-book", v["billedVsBooking"], "| gross std", g["standard"], "cur", g["current"], "billed", g["billed"])
-                  except Exception as exc:
-                      print(ref, "ERR", type(exc).__name__, str(exc)[:200])
-                      c.rollback(); c.execute(text("SET TRANSACTION READ ONLY")); set_tenant_context(c, T)
-              for ref in ("VJ2610-000028", "VJ2610-000033"):
-                  jid = next(j for j, r, _ in js if r == ref)
-                  print("\n===== list-side lines for", ref)
-                  for r in c.execute(text("""
-                      SELECT cl.component_key, cl.standard_amount, cl.actual_amount, cl.updated_at_utc,
-                        (SELECT s.amount||' '||s.source_document_type FROM auditcore.commercial_line_source_values s
-                          WHERE s.tenant_id=cl.tenant_id AND s.journey_id=cl.journey_id AND s.line_kind='COMMERCIAL'
-                            AND s.component_key=cl.component_key
-                            AND s.source_document_type NOT IN ('booking_form','booking_docket','order_taking_form','customer_ledger','cost_sheet')
-                          ORDER BY s.updated_at_utc DESC LIMIT 1) AS invoice_value
-                      FROM auditcore.commercial_lines cl WHERE cl.tenant_id=:t AND cl.journey_id=:j
-                      ORDER BY cl.component_key"""), {"t": T, "j": jid}).mappings():
-                      print(json.dumps({k: str(v) for k, v in dict(r).items()}))
-                  for r in c.execute(text("""SELECT discount_key, actual_discount_amount, standard_eligible_amount, updated_at_utc
-                      FROM auditcore.discount_applications WHERE tenant_id=:t AND journey_id=:j"""), {"t": T, "j": jid}).mappings():
-                      print("discount", json.dumps({k: str(v) for k, v in dict(r).items()}))
-                  view = deal(c, tenant_id=T, journey_id=jid)
-                  for g in view["categories"]:
-                      for x in g["components"]:
-                          print("DEAL", x["key"], "std", x["standard"], "book", x["booking"], "cur", x.get("current"), "billed", x["billed"])
+              actors = c.execute(text("""SELECT DISTINCT security_actor_id, business_role_code, dealer_id IS NULL AS tenant_wide
+                  FROM auditcore.business_assignments WHERE tenant_id=:t AND assignment_status='ACTIVE'
+                  AND effective_from <= now() AND (effective_to IS NULL OR effective_to >= now())"""), {"t": T}).all()
+              print("actors:", [(a[0][:8], a[1], a[2]) for a in actors])
+              for actor, role, wide in actors:
+                  row = c.execute(text(HERO), {"tenant_id": T, "actor_id": actor}).mappings().one()
+                  print("HERO as", actor[:8], role, "wide" if wide else "scoped", {k: (str(v) if v is not None else None) for k, v in row.items() if k in ("open_bookings","open_deliveries","closed_bookings","closed_deliveries","open_tasks")})
+              print()
+              for r in c.execute(text("""
+                  SELECT j.journey_reference, pr.current_stage, bs.business_status AS bstatus,
+                         bs.business_completed_at_utc IS NOT NULL AS b_done, ds.journey_id IS NOT NULL AS has_ds_row,
+                         ds.business_completed_at_utc IS NOT NULL AS d_done, dl.journey_id IS NOT NULL AS has_dl_row,
+                         (SELECT COUNT(*) FROM auditcore.p2_tasks t WHERE t.tenant_id=j.tenant_id AND t.journey_id=j.journey_id
+                            AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')) AS p2_open,
+                         (SELECT COUNT(*) FROM auditcore.p2_tasks t WHERE t.tenant_id=j.tenant_id AND t.journey_id=j.journey_id
+                            AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER') AND t.assigned_role_code='PC') AS pc_open,
+                         (SELECT COUNT(*) FROM auditcore.p2_tasks t WHERE t.tenant_id=j.tenant_id AND t.journey_id=j.journey_id
+                            AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER') AND t.assigned_role_code IN ('TL','PM')) AS tl_open
+                  FROM auditcore.journeys j
+                  LEFT JOIN auditcore.p2_journey_runtime pr ON pr.tenant_id=j.tenant_id AND pr.journey_id=j.journey_id
+                  LEFT JOIN auditcore.journey_stage_states bs ON bs.tenant_id=j.tenant_id AND bs.journey_id=j.journey_id AND bs.stage_code='BOOKING'
+                  LEFT JOIN auditcore.journey_stage_states ds ON ds.tenant_id=j.tenant_id AND ds.journey_id=j.journey_id AND ds.stage_code='DELIVERY'
+                  LEFT JOIN auditcore.deliveries dl ON dl.tenant_id=j.tenant_id AND dl.journey_id=j.journey_id
+                  WHERE j.tenant_id=:t ORDER BY j.created_at_utc"""), {"t": T}).mappings():
+                  print(dict(r))
           PY

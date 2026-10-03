@@ -737,8 +737,18 @@ def journeys_summary(
                      ds.business_completed_at_utc AS delivery_completed,
                      COALESCE(bs.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING')
                               OR bs.closure_disposition='NO_DELIVERY', false) AS cancelled,
-                     (pr.current_stage LIKE 'DELIVERY%' OR ds.journey_id IS NOT NULL OR dl.journey_id IS NOT NULL)
-                       AS in_delivery
+                     -- In delivery is the row's own Delivery chip: a Phase 2 journey by its
+                     -- stage record (booking complete, or a delivery stage); delivery rows
+                     -- alone never make a booking still being completed a delivery. A
+                     -- Phase 1 journey has no stage record and keeps the delivery-row rule.
+                     CASE WHEN pr.journey_id IS NOT NULL
+                          THEN (pr.current_stage = 'BOOKING_COMPLETE' OR pr.current_stage LIKE 'DELIVERY%')
+                          ELSE (ds.journey_id IS NOT NULL OR dl.journey_id IS NOT NULL) END
+                       AS in_delivery,
+                     (pr.journey_id IS NOT NULL) AS phase2,
+                     COALESCE(ds.business_completed_at_utc IS NOT NULL
+                              OR bs.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING')
+                              OR bs.closure_disposition='NO_DELIVERY', false) AS closed
               FROM auditcore.journeys j
               LEFT JOIN auditcore.p2_journey_runtime pr ON pr.tenant_id=j.tenant_id AND pr.journey_id=j.journey_id
               LEFT JOIN auditcore.journey_stage_states bs
@@ -759,16 +769,31 @@ def journeys_summary(
             bounds AS (
               SELECT (date_trunc('week', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata') AS week_start,
                      (date_trunc('month', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata') AS month_start
+            ),
+            -- The open tasks of the open journeys, counted as each journey row counts
+            -- them: Phase 2 tasks, plus the legacy workflow tasks of a Phase 1 journey.
+            open_task_rows AS (
+              SELECT p.assigned_role_code AS role
+              FROM auditcore.p2_tasks p
+              JOIN scoped s ON s.journey_id=p.journey_id
+              WHERE p.tenant_id=:tenant_id AND NOT s.closed
+                AND p.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')
+              UNION ALL
+              SELECT w.assigned_role_code AS role
+              FROM auditcore.workflow_tasks w
+              JOIN scoped s ON s.journey_id=w.journey_id
+              WHERE w.tenant_id=:tenant_id AND NOT s.closed AND NOT s.phase2
+                AND w.assigned_role_code IN ('PC','TL','PM','EXECUTIVE')
+                AND w.task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT')
             )
             SELECT
               COUNT(*) FILTER (WHERE booking_completed IS NULL AND NOT cancelled) AS open_bookings,
               COUNT(*) FILTER (WHERE in_delivery AND delivery_completed IS NULL AND NOT cancelled) AS open_deliveries,
               COUNT(*) FILTER (WHERE booking_completed IS NOT NULL) AS closed_bookings,
               COUNT(*) FILTER (WHERE delivery_completed IS NOT NULL) AS closed_deliveries,
-              (SELECT COUNT(*) FROM auditcore.p2_tasks t
-                WHERE t.tenant_id=:tenant_id
-                  AND t.journey_id IN (SELECT s.journey_id FROM scoped s)
-                  AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')) AS open_tasks,
+              (SELECT COUNT(*) FROM open_task_rows) AS open_tasks,
+              (SELECT COUNT(*) FROM open_task_rows WHERE role='PC') AS pc_open_tasks,
+              (SELECT COUNT(*) FROM open_task_rows WHERE role IN ('TL','PM')) AS tl_open_tasks,
               COUNT(*) FILTER (WHERE booking_started >= b.week_start) AS week_started,
               COUNT(*) FILTER (WHERE booking_completed >= b.week_start) AS week_bookings_completed,
               COUNT(*) FILTER (WHERE delivery_completed >= b.week_start) AS week_deliveries_completed,
@@ -790,10 +815,13 @@ def journeys_summary(
 
     return {
         "open": {"bookings": int(row["open_bookings"] or 0), "deliveries": int(row["open_deliveries"] or 0)},
-        # All-time closed stages and the open tasks across every journey in
+        # All-time closed stages and the open tasks across the open journeys in
         # scope: the five numbers the Booking & Delivery screen shows.
         "closed": {"bookings": int(row["closed_bookings"] or 0), "deliveries": int(row["closed_deliveries"] or 0)},
-        "tasks": {"open": int(row["open_tasks"] or 0)},
+        # Open tasks of the open journeys, as the rows count them: all roles, the
+        # PC's and the Team Lead's (the screen shows the signed-in role's).
+        "tasks": {"open": int(row["open_tasks"] or 0), "pc": int(row["pc_open_tasks"] or 0),
+                  "tl": int(row["tl_open_tasks"] or 0)},
         "week": {
             "bookingsStarted": int(row["week_started"] or 0),
             "bookingsCompleted": int(row["week_bookings_completed"] or 0),

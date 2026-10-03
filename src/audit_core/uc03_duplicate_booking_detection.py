@@ -56,6 +56,7 @@ believed to duplicate.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from difflib import SequenceMatcher
@@ -406,6 +407,93 @@ def _booking_confirm_date(connection: Connection, *, tenant_id: str, journey_id:
     ).scalar_one_or_none()
 
 
+def _void_open_finding_with_stale_basis(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    rule_key: str,
+    basis: str,
+    correlation_id: str,
+) -> bool:
+    """Replace an OPEN finding that was raised on a different match basis.
+
+    The basis, confidence and severity are fixed when a finding is raised
+    (its RAISED event is append-only), and ``_machine_flag`` returns an
+    existing finding untouched. A pair first seen on the mobile number alone
+    therefore stayed "MOBILE 70%" after the PAN and Aadhaar were read and
+    matched too. When the current basis differs, the OPEN finding is voided
+    (closing its open tasks, as any void does) and ``_machine_flag`` then
+    raises a fresh one on the current basis. A finding a Team Lead has
+    already acknowledged is left alone: someone has reviewed it. A failure
+    here leaves the finding as it was."""
+    try:
+        with connection.begin_nested():
+            row = connection.execute(
+                text(
+                    """
+                    SELECT f.audit_finding_id,
+                           (SELECT e.safe_payload ->> 'matchBasis'
+                              FROM auditcore.audit_finding_events e
+                             WHERE e.tenant_id = f.tenant_id
+                               AND e.audit_finding_id = f.audit_finding_id
+                               AND e.event_type = 'RAISED'
+                             ORDER BY e.occurred_at_utc LIMIT 1) AS stored_basis
+                    FROM auditcore.audit_findings f
+                    WHERE f.tenant_id = :tenant_id AND f.journey_id = :journey_id
+                      AND f.stage_code = :stage AND f.rule_key = :rule_key
+                      AND f.finding_status = 'OPEN'
+                    ORDER BY f.created_at_utc DESC, f.audit_finding_id DESC
+                    LIMIT 1
+                    """
+                ),
+                {"tenant_id": tenant_id, "journey_id": journey_id, "stage": _STAGE, "rule_key": rule_key},
+            ).mappings().one_or_none()
+            if row is None or row["stored_basis"] == basis:
+                return False
+            note = (f"Match basis changed from {row['stored_basis'] or 'unknown'} to {basis}; "
+                    "raised again on the current basis.")
+            voided = connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.audit_findings
+                    SET finding_status = 'VOIDED', resolution_reason = :note,
+                        updated_at_utc = now(), version_no = version_no + 1
+                    WHERE tenant_id = :tenant_id AND audit_finding_id = :finding_id
+                      AND finding_status = 'OPEN'
+                    """
+                ),
+                {"tenant_id": tenant_id, "finding_id": row["audit_finding_id"], "note": note},
+            )
+            if voided.rowcount != 1:
+                return False
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO auditcore.audit_finding_events (
+                        tenant_id, audit_finding_id, journey_id, stage_code,
+                        event_type, actor_id, actor_role_snapshot, safe_payload, correlation_id
+                    ) VALUES (
+                        :tenant_id, :finding_id, :journey_id, :stage,
+                        'VOIDED', NULL, 'SYSTEM', CAST(:payload AS jsonb), :correlation_id
+                    )
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "finding_id": row["audit_finding_id"],
+                    "journey_id": journey_id,
+                    "stage": _STAGE,
+                    "payload": json.dumps({"note": note, "previousBasis": row["stored_basis"], "currentBasis": basis}),
+                    "correlation_id": correlation_id,
+                },
+            )
+            return True
+    except Exception:
+        logger.warning("duplicate booking finding refresh failed", exc_info=True)
+        return False
+
+
 def sync_duplicate_booking_detection(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
 ) -> dict[str, Any]:
@@ -472,6 +560,10 @@ def sync_duplicate_booking_detection(
 
             rule_key = f"{_RULE_PREFIX}:{candidate['journey_id']}"
             current_rule_keys.add(rule_key)
+            _void_open_finding_with_stale_basis(
+                connection, tenant_id=tenant_id, journey_id=journey_id,
+                rule_key=rule_key, basis=basis, correlation_id=correlation_id,
+            )
             _machine_flag(
                 connection,
                 tenant_id=tenant_id,
