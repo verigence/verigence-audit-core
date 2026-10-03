@@ -36,15 +36,6 @@ jobs:
           python -m pip install 'psycopg[binary]>=3.2,<4'
           npm install --global @railway/cli
 
-      - name: Which routes does the attendance service answer? (unauthenticated GETs, status codes only)
-        shell: bash
-        run: |
-          set -uo pipefail
-          for p in /health /ready /employee-attendance/v1/me /employee-attendance/v1/admin/payroll-profiles /attendance/v1/tenants/x/policy /openapi.json; do
-            code="$(curl -sS -m 20 -o /dev/null -w '%{http_code}' "https://attendance-dev.up.railway.app$p" || echo ERR)"
-            echo "$p -> $code"
-          done
-
       - name: Attendance database vs Audit Core database (booleans, schemas, tables, row counts only)
         shell: bash
         run: |
@@ -86,14 +77,7 @@ jobs:
                       oi = ident(v[key])
                       print(f'{other}.{key}: same host+port as attendance DB: {oi[:2] == ai[:2]}; same database name: {oi[2] == ai[2]}')
 
-          # connect: same host as Audit Core -> use Audit Core's public URL host with the attendance db name and login
-          pub = urlparse(norm(audit['DATABASE_PUBLIC_URL']))
-          att_u = urlparse(norm(att_url))
-          if ai[:2] == audit_internal[:2]:
-              netloc = f"{att_u.username}:{att_u.password}@{pub.hostname}:{pub.port}"
-              target = urlunparse(('postgresql', netloc, att_u.path, '', '', ''))
-          else:
-              target = norm(att_url)
+          target = norm(att_url)
           try:
               with psycopg.connect(target, connect_timeout=15, options='-c statement_timeout=20000 -c default_transaction_read_only=on') as c:
                   cur = c.cursor()
