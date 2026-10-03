@@ -44,6 +44,7 @@ from audit_core.observability import install_observability
 from audit_core.oem_price_masters import router as oem_price_masters_router
 from audit_core.onboarding_imports import router as onboarding_router
 from audit_core.otel import configure_otlp, install_correlation_propagation
+from audit_core.outlet_geocoding import router as outlet_geocoding_router
 from audit_core.payments_finance import router as payments_finance_router
 from audit_core.pricing import router as pricing_router
 from audit_core.project_activation import router as project_activation_router
@@ -342,6 +343,7 @@ def create_app() -> FastAPI:
     application.include_router(project_master_import_router)
     application.include_router(uc02_project_admin_stabilization_router)
     application.include_router(dealer_router)
+    application.include_router(outlet_geocoding_router)
     application.include_router(role_mapping_router)
     application.include_router(customer_router)
     application.include_router(journey_router)
