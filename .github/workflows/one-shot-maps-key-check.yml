@@ -2,7 +2,7 @@ name: One-shot Maps key check (DEV, read-only)
 
 # Reads GOOGLE_MAPS_API_KEY from the Audit Core DEV service and makes ONE Geocoding request.
 # Prints only: whether the variable is set, its length, and Google's status. Never the key.
-# (Re-run after the key was replaced on Railway.)
+# (Re-run after the new key was deployed.)
 on:
   push:
     branches: [claude/verigence-phase-2-issues-w515pq]
