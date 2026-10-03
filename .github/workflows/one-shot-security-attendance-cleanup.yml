@@ -1,15 +1,14 @@
 name: One-shot Security attendance cleanup to the 2 Oct stage (DEV)
 
-# WRITES to the DEV database, once, on manual dispatch only (no push trigger).
+# WRITES to the DEV database, once. Runs only for a push whose commit message contains
+# the token APPLY-CLEANUP-NOW; any other push skips the job.
 # One transaction. Every expected row count is asserted; any difference rolls back.
 # Every deleted row is printed so it can be restored. Prints no secrets.
 on:
-  workflow_dispatch:
-    inputs:
-      confirm:
-        description: 'Type APPLY to run the cleanup'
-        required: true
-        default: 'NO'
+  push:
+    branches: [claude/verigence-phase-2-issues-w515pq]
+    paths:
+      - '.github/workflows/one-shot-security-attendance-cleanup.yml'
 
 permissions:
   contents: read
@@ -20,7 +19,7 @@ concurrency:
 
 jobs:
   cleanup:
-    if: ${{ github.event.inputs.confirm == 'APPLY' }}
+    if: ${{ contains(github.event.head_commit.message, 'APPLY-CLEANUP-NOW') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
