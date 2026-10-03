@@ -1,0 +1,94 @@
+name: One-shot HR rollout preview (DEV, read-only)
+
+# Read-only. Prints names, counts and yes/no only. Never a secret, never row data.
+on:
+  push:
+    branches: [claude/verigence-phase-2-issues-w515pq]
+    paths:
+      - '.github/workflows/one-shot-hr-preview.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-hr-preview
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          npm install --global @railway/cli
+          python -m pip install -q "psycopg[binary]"
+      - name: Preview
+        shell: bash
+        run: |
+          set -uo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service security --json >/dev/null
+          python3 - <<'PY'
+          import json, subprocess
+
+          def variables(svc):
+              r = subprocess.run(['railway', 'variable', 'list', '--service', svc, '--json'], capture_output=True, text=True)
+              try:
+                  return json.loads(r.stdout)
+              except Exception:
+                  return {}
+
+          sec = variables('security')
+          raw = (sec.get('DATABASE_PUBLIC_URL') or sec.get('DATABASE_URL') or '').strip()
+          print('security service has a DATABASE url:', bool(raw))
+          if raw:
+              print('::add-mask::' + raw)
+              import psycopg
+              for pre in ('postgresql+psycopg://', 'postgresql+asyncpg://', 'postgres://'):
+                  if raw.startswith(pre):
+                      raw = 'postgresql://' + raw[len(pre):]
+              with psycopg.connect(raw, options='-c default_transaction_read_only=on', connect_timeout=15) as c:
+                  cur = c.cursor()
+                  q = lambda sql: cur.execute(sql) or cur.fetchall()
+                  print('security ledger last migration:', q("select name from security.schema_migrations order by name desc limit 1"))
+                  print('hr permissions:', q("select count(*) from security.permissions where module_key='hr' and status='ACTIVE'"))
+                  print('hr module roles:', q("select role_key from security.module_roles where module_key='hr' order by 1"))
+                  print('hr role grants:', q("select role_key, count(*) from security.module_role_permissions where module_key='hr' group by 1 order by 1"))
+                  print('SERVICE_INTEGRATION keys:', q("select integration_key from security.service_integrations order by 1"))
+                  print('active SuperAdmins:', q("select count(*) from security.user_admin_role_assignments where role_key='SuperAdmin' and scope_type='PLATFORM' and status='ACTIVE'"))
+                  print('hr schema exists in this database:', q("select count(*) from information_schema.schemata where schema_name='hr'"))
+                  print('principal_credentials client_id lengths (existing):', q("select length(client_id) from security.principal_credentials order by 1"))
+
+          print('--- HRMgmt Railway service ---')
+          hv = variables('HRMgmt')
+          print('HRMgmt variable names:', sorted(k for k in hv if not k.startswith('RAILWAY_')))
+          print('--- candidate source variable NAMES (not values) ---')
+          ac = variables('verigence-audit-core')
+          print('audit-core SECURITY_* names:', sorted(k for k in ac if k.startswith('SECURITY_')))
+          print('audit-core storage names:', sorted(k for k in ac if 'STORAGE' in k))
+          print('audit-core CORS/origin names:', sorted(k for k in ac if 'ORIGIN' in k or 'CORS' in k))
+          print('security service names (DB/issuer-ish):', sorted(k for k in sec if k.startswith(('DATABASE', 'SECURITY_TOKEN', 'SECURITY_PUBLIC', 'PUBLIC_', 'APP_'))))
+          st = subprocess.run(['railway', 'status', '--json'], capture_output=True, text=True)
+          try:
+              j = json.loads(st.stdout)
+              for env in j.get('environments', {}).get('edges', []):
+                  for inst in env['node'].get('serviceInstances', {}).get('edges', []):
+                      n = inst['node']
+                      if n.get('serviceName') in ('HRMgmt', 'attendance', 'security', 'verigence-audit-core'):
+                          src = n.get('source') or {}
+                          dep = n.get('latestDeployment') or {}
+                          print(n.get('serviceName'), '| source repo:', src.get('repo'), '| branch:', n.get('branch') or src.get('branch'),
+                                '| latest deployment status:', dep.get('status'), '| domains:', [d.get('domain') for d in (n.get('domains', {}).get('serviceDomains') or [])])
+          except Exception as exc:
+              print('status parse failed:', type(exc).__name__)
+          PY
