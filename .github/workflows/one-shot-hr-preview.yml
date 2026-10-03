@@ -59,7 +59,9 @@ jobs:
                       raw = 'postgresql://' + raw[len(pre):]
               with psycopg.connect(raw, options='-c default_transaction_read_only=on', connect_timeout=15) as c:
                   cur = c.cursor()
-                  q = lambda sql: cur.execute(sql) or cur.fetchall()
+                  def q(sql):
+                      cur.execute(sql)
+                      return cur.fetchall()
                   print('security ledger last migration:', q("select migration_name from security.schema_migrations order by migration_name desc limit 1"))
                   print('hr permissions:', q("select count(*) from security.permissions where module_key='hr' and status='ACTIVE'"))
                   print('hr module roles:', q("select role_key from security.module_roles where module_key='hr' order by 1"))
