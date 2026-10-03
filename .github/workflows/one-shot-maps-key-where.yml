@@ -2,6 +2,7 @@ name: One-shot Maps key location check (DEV, read-only)
 
 # Lists, per DEV service, whether a Google Maps key variable exists, its length, and whether it is
 # the earlier (rejected) key. Prints names, lengths and a yes/no only. Never a key value.
+# (Re-run after the new key was applied.)
 on:
   push:
     branches: [claude/verigence-phase-2-issues-w515pq]
