@@ -1,6 +1,9 @@
-name: One-shot Hero counts diagnose (DEV, read-only)
+name: One-shot Attendance service inspect (DEV, read-only)
 
-# Read-only: one customer's journeys. Never writes.
+# Read-only. Lists Railway services, where each deploys from, variable NAMES
+# (never values) and, for the attendance database, schema/table names with row
+# counts only. Never writes. Logs of this repo are public: nothing secret or
+# row-level is printed.
 on:
   workflow_dispatch:
   push:
@@ -16,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  diagnose:
+  inspect:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
@@ -24,83 +27,134 @@ jobs:
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       AUDIT_SERVICE: verigence-audit-core
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e .
+          python -m pip install 'psycopg[binary]>=3.2,<4'
           npm install --global @railway/cli
 
-      - name: Resolve Railway DEV database connection
+      - name: Railway services and deployment sources
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
-          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
-          raw="$(python - <<'PY'
+          railway status --json >/tmp/status.json 2>/tmp/status.err || { echo 'status failed:'; head -c 400 /tmp/status.err; }
+          python - <<'PY'
           import json
           from pathlib import Path
-          variables = json.loads(Path('/tmp/audit-vars.json').read_text())
-          print(variables.get('DATABASE_PUBLIC_URL') or variables.get('DATABASE_URL') or '')
+          try:
+              s = json.loads(Path('/tmp/status.json').read_text())
+          except Exception as exc:
+              print('could not read status json:', type(exc).__name__)
+              raise SystemExit(0)
+          print('project:', s.get('name'))
+          envs = s.get('environments', {}).get('edges', [])
+          for e in envs:
+              node = e['node']
+              print('environment:', node.get('name'))
+              for si in node.get('serviceInstances', {}).get('edges', []):
+                  n = si['node']
+                  dep = n.get('latestDeployment') or {}
+                  meta = dep.get('meta') or {}
+                  src = n.get('source') or {}
+                  domains = (n.get('domains') or {})
+                  doms = [d.get('domain') for d in domains.get('serviceDomains', [])] + [d.get('domain') for d in domains.get('customDomains', [])]
+                  print('---')
+                  print('service:', n.get('serviceName'))
+                  print('  source repo:', src.get('repo'), '| image:', src.get('image'), '| root:', meta.get('rootDirectory'))
+                  print('  deploy repo/branch:', meta.get('repo'), '/', meta.get('branch'))
+                  print('  commit:', (meta.get('commitHash') or '')[:10], '|', (meta.get('commitMessage') or '').splitlines()[0:1])
+                  print('  status:', dep.get('status'), '| created:', dep.get('createdAt'))
+                  print('  builder:', n.get('builder'), '| start:', n.get('startCommand'), '| pre-deploy:', n.get('preDeployCommand'))
+                  print('  domains:', doms)
           PY
-          )"
-          [[ -n "$raw" ]] || { echo '::error::no DATABASE_URL on the DEV service.'; exit 1; }
-          case "$raw" in
-            postgresql+psycopg://*) url="$raw" ;;
-            postgresql+asyncpg://*) url="postgresql+psycopg://${raw#postgresql+asyncpg://}" ;;
-            postgresql://*) url="postgresql+psycopg://${raw#postgresql://}" ;;
-            postgres://*) url="postgresql+psycopg://${raw#postgres://}" ;;
-            *) echo '::error::DATABASE_URL is not a PostgreSQL URL.'; exit 1 ;;
-          esac
-          echo "::add-mask::$url"
-          echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
 
-      - name: Hero counts vs rows, read-only
+      - name: Variable names per service (values never printed)
         shell: bash
         run: |
+          set -uo pipefail
           python - <<'PY'
-          import os, re
-          from sqlalchemy import create_engine, text
-          from audit_core.db import set_tenant_context
-          import audit_core.uc03_p2_api as api
+          import json, subprocess
+          from pathlib import Path
+          s = json.loads(Path('/tmp/status.json').read_text())
+          names = []
+          for e in s.get('environments', {}).get('edges', []):
+              for si in e['node'].get('serviceInstances', {}).get('edges', []):
+                  names.append(si['node'].get('serviceName'))
+          for name in names:
+              r = subprocess.run(['railway', 'variable', 'list', '--service', name, '--json'], capture_output=True, text=True)
+              if r.returncode != 0:
+                  print(name, ': variable list failed')
+                  continue
+              try:
+                  keys = sorted(json.loads(r.stdout).keys())
+              except Exception:
+                  print(name, ': unreadable')
+                  continue
+              keep = [k for k in keys if not k.startswith('RAILWAY_')]
+              print('---', name, f'({len(keep)} variables)')
+              print('  ', ', '.join(keep))
+          PY
 
-          T = "5fbe26ab-6ed7-444a-8488-5bfb81208588"
-          src = open(api.__file__).read()
-          a = src.index('def journeys_summary')
-          start = src.index('WITH scoped AS (', a)
-          end = src.index('"""', start)
-          HERO = src[start:end]
-          engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=60000"})
-          with engine.connect() as c:
-              c.execute(text("SET TRANSACTION READ ONLY"))
-              set_tenant_context(c, T)
-              actors = c.execute(text("""SELECT DISTINCT security_actor_id, business_role_code, dealer_id IS NULL AS tenant_wide
-                  FROM auditcore.business_assignments WHERE tenant_id=:t AND assignment_status='ACTIVE'
-                  AND effective_from <= now() AND (effective_to IS NULL OR effective_to >= now())"""), {"t": T}).all()
-              print("actors:", [(a[0][:8], a[1], a[2]) for a in actors])
-              for actor, role, wide in actors:
-                  row = c.execute(text(HERO), {"tenant_id": T, "actor_id": actor}).mappings().one()
-                  print("HERO as", actor[:8], role, "wide" if wide else "scoped", {k: (str(v) if v is not None else None) for k, v in row.items() if k in ("open_bookings","open_deliveries","closed_bookings","closed_deliveries","open_tasks")})
-              print()
-              for r in c.execute(text("""
-                  SELECT j.journey_reference, pr.current_stage, bs.business_status AS bstatus,
-                         bs.business_completed_at_utc IS NOT NULL AS b_done, ds.journey_id IS NOT NULL AS has_ds_row,
-                         ds.business_completed_at_utc IS NOT NULL AS d_done, dl.journey_id IS NOT NULL AS has_dl_row,
-                         (SELECT COUNT(*) FROM auditcore.p2_tasks t WHERE t.tenant_id=j.tenant_id AND t.journey_id=j.journey_id
-                            AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')) AS p2_open,
-                         (SELECT COUNT(*) FROM auditcore.p2_tasks t WHERE t.tenant_id=j.tenant_id AND t.journey_id=j.journey_id
-                            AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER') AND t.assigned_role_code='PC') AS pc_open,
-                         (SELECT COUNT(*) FROM auditcore.p2_tasks t WHERE t.tenant_id=j.tenant_id AND t.journey_id=j.journey_id
-                            AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER') AND t.assigned_role_code IN ('TL','PM')) AS tl_open
-                  FROM auditcore.journeys j
-                  LEFT JOIN auditcore.p2_journey_runtime pr ON pr.tenant_id=j.tenant_id AND pr.journey_id=j.journey_id
-                  LEFT JOIN auditcore.journey_stage_states bs ON bs.tenant_id=j.tenant_id AND bs.journey_id=j.journey_id AND bs.stage_code='BOOKING'
-                  LEFT JOIN auditcore.journey_stage_states ds ON ds.tenant_id=j.tenant_id AND ds.journey_id=j.journey_id AND ds.stage_code='DELIVERY'
-                  LEFT JOIN auditcore.deliveries dl ON dl.tenant_id=j.tenant_id AND dl.journey_id=j.journey_id
-                  WHERE j.tenant_id=:t ORDER BY j.created_at_utc"""), {"t": T}).mappings():
-                  print(dict(r))
+      - name: Attendance database, same instance as Audit Core? schemas, tables, row counts only
+        shell: bash
+        run: |
+          set -uo pipefail
+          python - <<'PY'
+          import json, subprocess
+          from urllib.parse import urlparse
+          import psycopg
+          from pathlib import Path
+
+          s = json.loads(Path('/tmp/status.json').read_text())
+          names = []
+          for e in s.get('environments', {}).get('edges', []):
+              for si in e['node'].get('serviceInstances', {}).get('edges', []):
+                  names.append(si['node'].get('serviceName'))
+
+          def vars_of(name):
+              r = subprocess.run(['railway', 'variable', 'list', '--service', name, '--json'], capture_output=True, text=True)
+              return json.loads(r.stdout) if r.returncode == 0 else {}
+
+          def ident(url):
+              if not url:
+                  return None
+              u = urlparse(url.replace('postgresql+psycopg://', 'postgresql://').replace('postgresql+asyncpg://', 'postgresql://'))
+              return (u.hostname, u.port, (u.path or '').lstrip('/'))
+
+          audit = vars_of('verigence-audit-core')
+          audit_ids = {ident(audit.get('DATABASE_URL')), ident(audit.get('DATABASE_PUBLIC_URL'))} - {None}
+          for name in names:
+              v = vars_of(name)
+              url = v.get('VERIGENCE_ATTENDANCE_DATABASE_URL')
+              if not url:
+                  continue
+              print('service with VERIGENCE_ATTENDANCE_DATABASE_URL:', name)
+              same = ident(url) in audit_ids
+              print('  same host/port/database as Audit Core DATABASE_URL:', same)
+              public = v.get('VERIGENCE_ATTENDANCE_DATABASE_PUBLIC_URL') or url
+              raw = public.replace('postgresql+psycopg://', 'postgresql://').replace('postgresql+asyncpg://', 'postgresql://').replace('postgres://', 'postgresql://')
+              try:
+                  with psycopg.connect(raw, connect_timeout=15, options='-c statement_timeout=20000 -c default_transaction_read_only=on') as c:
+                      cur = c.cursor()
+                      cur.execute("select current_setting('server_version')")
+                      print('  postgres version:', cur.fetchone()[0])
+                      cur.execute("""select table_schema, count(*) from information_schema.tables
+                                     where table_schema not in ('pg_catalog','information_schema')
+                                     group by 1 order by 1""")
+                      for schema, n in cur.fetchall():
+                          print(f'  schema {schema}: {n} tables')
+                      cur.execute("""select table_schema, table_name from information_schema.tables
+                                     where table_schema not in ('pg_catalog','information_schema','auditcore') and table_type='BASE TABLE'
+                                     order by 1,2""")
+                      tables = cur.fetchall()
+                      for schema, t in tables:
+                          cur.execute(f'select count(*) from "{schema}"."{t}"')
+                          print(f'    {schema}.{t}: {cur.fetchone()[0]} rows')
+              except Exception as exc:
+                  print('  db inspect failed:', type(exc).__name__)
           PY
