@@ -420,7 +420,7 @@ def _findings_with_basis(c) -> list[dict]:
                            AND e.event_type='RAISED' ORDER BY e.occurred_at_utc LIMIT 1) AS raised
                 FROM auditcore.audit_findings f
                 WHERE f.tenant_id=:t AND f.finding_type_code='DUPLICATE_BOOKING'
-                ORDER BY f.created_at_utc, f.audit_finding_id"""),
+                ORDER BY f.created_at_utc, (f.finding_status <> 'VOIDED'), f.audit_finding_id"""),
             {"t": c.tenant_id},
         ).mappings().all()
     ]
