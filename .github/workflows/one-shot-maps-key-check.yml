@@ -42,6 +42,10 @@ jobs:
           key = (json.load(open('/tmp/vars.json')).get('GOOGLE_MAPS_API_KEY') or '').strip()
           if not key:
               print('GOOGLE_MAPS_API_KEY: NOT SET on the Audit Core DEV service')
+              all_vars = json.load(open('/tmp/vars.json'))
+              near = sorted(n for n in all_vars if any(w in n.lower() for w in ('google', 'maps', 'geocod')))
+              print('variable NAMES that look related (names only, no values):', near or 'none')
+              print('total variables on the service:', len(all_vars))
               raise SystemExit(0)
           print('::add-mask::' + key)
           print('GOOGLE_MAPS_API_KEY: set, length', len(key), ', starts with AIza:', key.startswith('AIza'))
