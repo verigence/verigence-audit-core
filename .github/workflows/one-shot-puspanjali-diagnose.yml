@@ -1,7 +1,6 @@
-name: One-shot Security attendance RBAC inventory (DEV, read-only)
+name: One-shot Hero counts diagnose (DEV, read-only)
 
-# Read-only. Prints table names, row counts and permission keys only (no secrets,
-# no user data). Never writes.
+# Read-only: one customer's journeys. Never writes.
 on:
   workflow_dispatch:
   push:
@@ -17,107 +16,91 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  inspect:
+  diagnose:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install 'psycopg[binary]>=3.2,<4'
+          python -m pip install -e .
           npm install --global @railway/cli
 
-      - name: Inventory
+      - name: Resolve Railway DEV database connection
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
           [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
-          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service security --json >/dev/null
-          railway variable list --service security --json >/tmp/sec.json
-          python - <<'PY'
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          raw="$(python - <<'PY'
           import json
           from pathlib import Path
-          import psycopg
+          variables = json.loads(Path('/tmp/audit-vars.json').read_text())
+          print(variables.get('DATABASE_PUBLIC_URL') or variables.get('DATABASE_URL') or '')
+          PY
+          )"
+          [[ -n "$raw" ]] || { echo '::error::no DATABASE_URL on the DEV service.'; exit 1; }
+          case "$raw" in
+            postgresql+psycopg://*) url="$raw" ;;
+            postgresql+asyncpg://*) url="postgresql+psycopg://${raw#postgresql+asyncpg://}" ;;
+            postgresql://*) url="postgresql+psycopg://${raw#postgresql://}" ;;
+            postgres://*) url="postgresql+psycopg://${raw#postgres://}" ;;
+            *) echo '::error::DATABASE_URL is not a PostgreSQL URL.'; exit 1 ;;
+          esac
+          echo "::add-mask::$url"
+          echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
 
-          v = json.loads(Path('/tmp/sec.json').read_text())
-          print('security service has variables:', sorted(k for k in v if 'DATABASE' in k))
+      - name: Hero counts vs rows, read-only
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, re
+          from sqlalchemy import create_engine, text
+          from audit_core.db import set_tenant_context
+          import audit_core.uc03_p2_api as api
 
-          def norm(u):
-              for pre in ('postgresql+psycopg://', 'postgresql+asyncpg://', 'postgres://'):
-                  if u.startswith(pre):
-                      return 'postgresql://' + u[len(pre):]
-              return u
-
-          NEW9 = ['attendance.employee.manage', 'attendance.attendance.admin', 'attendance.leave.hr.approve',
-                  'attendance.reimbursement.read', 'attendance.reimbursement.hr.approve',
-                  'attendance.reimbursement.finance.approve', 'attendance.payroll.manage',
-                  'attendance.config.manage', 'attendance.reimbursement.payment.manage']
-          OLD13 = ['attendance.self.read', 'attendance.self.checkin', 'attendance.self.checkout', 'attendance.team.read',
-                   'attendance.all.read', 'attendance.location.read', 'attendance.exception.read',
-                   'attendance.exception.resolve', 'attendance.correction.write', 'attendance.policy.read',
-                   'attendance.policy.manage', 'attendance.report.read', 'attendance.report.export']
-
-          for key in ('DATABASE_URL', 'SECURITY_ROLE_DATABASE_URL'):
-              if not v.get(key):
-                  print(key, ': not set'); continue
-              print('=====', key)
-              try:
-                  with psycopg.connect(norm(v[key]), connect_timeout=15,
-                                       options='-c statement_timeout=20000 -c default_transaction_read_only=on') as c:
-                      cur = c.cursor()
-                      cur.execute('select current_user')
-                      print('connected as role:', cur.fetchone()[0])
-                      for tbl in ('permissions', 'module_roles', 'module_role_permissions', 'schema_migrations',
-                                  'tenant_role_permissions', 'module_operating_role_permission_defaults'):
-                          cur.execute("select has_table_privilege(current_user, %s, 'DELETE'), has_table_privilege(current_user, %s, 'UPDATE')",
-                                      (f'security.{tbl}', f'security.{tbl}'))
-                          d, u = cur.fetchone()
-                          print(f'  privilege on security.{tbl}: DELETE={d} UPDATE={u}')
-                      # ledger
-                      cur.execute("select column_name from information_schema.columns where table_schema='security' and table_name='schema_migrations' order by ordinal_position")
-                      print('ledger columns:', [r[0] for r in cur.fetchall()])
-                      cur.execute("select migration_name from security.schema_migrations where migration_name ~* 'attend' order by 1")
-                      print('ledger rows matching attendance:', [r[0] for r in cur.fetchall()])
-                      cur.execute("select migration_name from security.schema_migrations order by 1 desc limit 3")
-                      print('latest ledger rows:', [r[0] for r in cur.fetchall()])
-                      # every security table with a permission_key / module_key column
-                      cur.execute("""select table_name, column_name from information_schema.columns
-                                     where table_schema='security' and column_name in ('permission_key','module_key')
-                                     order by 1,2""")
-                      cols = cur.fetchall()
-                      print('tables with permission_key/module_key:', sorted({t for t, _ in cols}))
-                      for t, col in cols:
-                          if col == 'permission_key':
-                              cur.execute(f'select count(*) from security."{t}" where permission_key = any(%s)', (NEW9,))
-                              n_new = cur.fetchone()[0]
-                              cur.execute(f'select count(*) from security."{t}" where permission_key = any(%s)', (OLD13,))
-                              n_old = cur.fetchone()[0]
-                              cur.execute(f'select count(*) from security."{t}" where permission_key like %s', ('attendance.%',))
-                              n_any = cur.fetchone()[0]
-                              print(f'  {t}.permission_key: new9={n_new} old13={n_old} any attendance.*={n_any}')
-                          else:
-                              cur.execute(f"select count(*) from security.\"{t}\" where module_key = 'attendance'")
-                              print(f'  {t}.module_key=attendance: {cur.fetchone()[0]}')
-                      cur.execute("select module_key, role_key, status from security.module_roles order by 1,2")
-                      print('module_roles:', cur.fetchall())
-                      cur.execute("select role_key, count(*) from security.module_role_permissions where module_key='attendance' group by 1 order by 1")
-                      print('module_role_permissions by role:', cur.fetchall())
-                      cur.execute("select permission_key, resource_key, catalog_version, status from security.permissions where permission_key like 'attendance.%' order by 1")
-                      for r in cur.fetchall():
-                          print('   perm', r)
-                      cur.execute("select count(*) from security.user_module_role_assignments"); print('user_module_role_assignments rows:', cur.fetchone()[0])
-                      cur.execute("select count(*) from security.user_global_module_role_assignments"); print('user_global_module_role_assignments rows:', cur.fetchone()[0])
-                      # foreign keys that point at permissions / module_roles
-                      cur.execute("""select conrelid::regclass::text, conname, confrelid::regclass::text
-                                     from pg_constraint where contype='f' and confrelid in ('security.permissions'::regclass,'security.module_roles'::regclass)
-                                     order by 1""")
-                      print('foreign keys into permissions/module_roles:'); [print('   ', r) for r in cur.fetchall()]
-              except Exception as exc:
-                  print('inspect failed:', type(exc).__name__, str(exc)[:160])
+          T = "5fbe26ab-6ed7-444a-8488-5bfb81208588"
+          src = open(api.__file__).read()
+          a = src.index('def journeys_summary')
+          start = src.index('WITH scoped AS (', a)
+          end = src.index('"""', start)
+          HERO = src[start:end]
+          engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=60000"})
+          with engine.connect() as c:
+              c.execute(text("SET TRANSACTION READ ONLY"))
+              set_tenant_context(c, T)
+              actors = c.execute(text("""SELECT DISTINCT security_actor_id, business_role_code, dealer_id IS NULL AS tenant_wide
+                  FROM auditcore.business_assignments WHERE tenant_id=:t AND assignment_status='ACTIVE'
+                  AND effective_from <= now() AND (effective_to IS NULL OR effective_to >= now())"""), {"t": T}).all()
+              print("actors:", [(a[0][:8], a[1], a[2]) for a in actors])
+              for actor, role, wide in actors:
+                  row = c.execute(text(HERO), {"tenant_id": T, "actor_id": actor}).mappings().one()
+                  print("HERO as", actor[:8], role, "wide" if wide else "scoped", {k: (str(v) if v is not None else None) for k, v in row.items() if k in ("open_bookings","open_deliveries","closed_bookings","closed_deliveries","open_tasks")})
+              print()
+              for r in c.execute(text("""
+                  SELECT j.journey_reference, pr.current_stage, bs.business_status AS bstatus,
+                         bs.business_completed_at_utc IS NOT NULL AS b_done, ds.journey_id IS NOT NULL AS has_ds_row,
+                         ds.business_completed_at_utc IS NOT NULL AS d_done, dl.journey_id IS NOT NULL AS has_dl_row,
+                         (SELECT COUNT(*) FROM auditcore.p2_tasks t WHERE t.tenant_id=j.tenant_id AND t.journey_id=j.journey_id
+                            AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')) AS p2_open,
+                         (SELECT COUNT(*) FROM auditcore.p2_tasks t WHERE t.tenant_id=j.tenant_id AND t.journey_id=j.journey_id
+                            AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER') AND t.assigned_role_code='PC') AS pc_open,
+                         (SELECT COUNT(*) FROM auditcore.p2_tasks t WHERE t.tenant_id=j.tenant_id AND t.journey_id=j.journey_id
+                            AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER') AND t.assigned_role_code IN ('TL','PM')) AS tl_open
+                  FROM auditcore.journeys j
+                  LEFT JOIN auditcore.p2_journey_runtime pr ON pr.tenant_id=j.tenant_id AND pr.journey_id=j.journey_id
+                  LEFT JOIN auditcore.journey_stage_states bs ON bs.tenant_id=j.tenant_id AND bs.journey_id=j.journey_id AND bs.stage_code='BOOKING'
+                  LEFT JOIN auditcore.journey_stage_states ds ON ds.tenant_id=j.tenant_id AND ds.journey_id=j.journey_id AND ds.stage_code='DELIVERY'
+                  LEFT JOIN auditcore.deliveries dl ON dl.tenant_id=j.tenant_id AND dl.journey_id=j.journey_id
+                  WHERE j.tenant_id=:t ORDER BY j.created_at_utc"""), {"t": T}).mappings():
+                  print(dict(r))
           PY
