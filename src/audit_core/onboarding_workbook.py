@@ -53,7 +53,7 @@ _REQUIRED = {
     PROJECT_SHEET: ("Code", "Name", "OEM", "Start Date"),
     DEALERSHIP_SHEET: ("Code", "Project Code", "Dealership", "Outlet Name"),
 }
-PC_PRESENCE = {"ONSITE": "ONSITE", "SATELLITE": "SATELLITE"}
+PC_PRESENCE = {"ONSITE": "ONSITE", "SATELLITE": "SATELLITE", "YES": "ONSITE", "NO": "SATELLITE"}
 PC_PRESENCE_LABEL = {"ONSITE": "Onsite", "SATELLITE": "Satellite"}
 DEFAULT_TIMEZONE = "Asia/Kolkata"
 MAX_ROWS = 5000
@@ -104,6 +104,9 @@ _HEADER_ALIASES = {
         "monthlycarsales": "Monthly Car Sales Volume", "monthlysalesvolume": "Monthly Car Sales Volume",
         "monthlyvehiclevolume": "Monthly Car Sales Volume", "pincode": "Postal Code", "lat": "Latitude",
         "long": "Longitude", "lng": "Longitude",
+        # The OEM geofencing master (one sheet, one row per outlet).
+        "dealergroup": "Dealer Group", "completeaddressrecommended": "Location", "completeaddress": "Location",
+        "citysource": "City", "dealershipcode": "Dealer Code",
     },
 }
 
@@ -135,7 +138,24 @@ def _find_sheet(workbook: Any, name: str) -> Any:
     for sheet in workbook.worksheets:
         if _norm(sheet.title) == _norm(name) or (_norm(name) == "dealerships" and _norm(sheet.title) in {"dealers", "outlets", "dealership"}):
             return sheet
+    if _norm(name) == "dealerships":
+        # An OEM master has one differently named sheet (Hyundai_Master): the one with Outlet Name and Latitude.
+        for sheet in workbook.worksheets:
+            header = next(sheet.iter_rows(max_row=1, values_only=True), None) or ()
+            if {"outletname", "latitude"} <= {_norm(t) for t in header}:
+                return sheet
     return None
+
+
+def _required_columns(name: str, columns: set[str]) -> list[str]:
+    """Dealer Group stands in for Dealership, and the OEM column lets the project be found without a Project Code."""
+    needed = list(_REQUIRED[name])
+    if name == DEALERSHIP_SHEET:
+        if "Dealer Group" in columns:
+            needed.remove("Dealership")
+        if "OEM" in columns:
+            needed.remove("Project Code")
+    return [c for c in needed if c not in columns]
 
 
 def _parse_sheet(workbook: Any, name: str) -> ParsedSheet:
@@ -147,11 +167,14 @@ def _parse_sheet(workbook: Any, name: str) -> ParsedSheet:
     header = next(rows, None) or ()
     aliases = _HEADER_ALIASES[name]
     columns: dict[int, str] = {}
+    titles = {_norm(t) for t in header}
     for index, title in enumerate(header):
         canonical = aliases.get(_norm(title))
+        if name == DEALERSHIP_SHEET and _norm(title) == "code" and "outletcode" in titles:
+            canonical = "OEM Code"  # the OEM's own code; the Verigence outlet code is the Outlet Code column
         if canonical and canonical not in columns.values():
             columns[index] = canonical
-    missing = [c for c in _REQUIRED[name] if c not in columns.values()]
+    missing = _required_columns(name, set(columns.values()))
     if missing:
         parsed.errors.append(f"{name} sheet is missing column(s): {', '.join(missing)}.")
         return parsed
@@ -159,6 +182,9 @@ def _parse_sheet(workbook: Any, name: str) -> ParsedSheet:
         record = {columns[i]: _clean(values[i]) for i in columns if i < len(values)}
         if not any(v is not None for v in record.values()):
             continue
+        if name == DEALERSHIP_SHEET and record.get("Dealer Group") and not record.get("Dealership"):
+            group, oem = str(record["Dealer Group"]), str(record.get("OEM") or "")
+            record["Dealership"] = group if not oem or _norm(oem) in _norm(group) else f"{group} {oem}"
         record["_row"] = number
         parsed.rows.append(record)
         if len(parsed.rows) > MAX_ROWS:
@@ -297,6 +323,23 @@ def _project_changes(existing: dict[str, Any], row: dict[str, Any]) -> dict[str,
     return changes
 
 
+def _project_code_for_oem(oem_value: Any, state: ExistingState, messages: list[str]) -> str | None:
+    """A file without a Project Code belongs to the OEM's only project; with none or several it must say which."""
+    oem = _oem_lookup(state).get(_norm(oem_value))
+    if oem is None:
+        return None  # the OEM itself is reported by the caller
+    candidates = [p for p in state.projects if p.get("oem_code") == oem["oem_code"]]
+    if len(candidates) == 1 and candidates[0].get("business_code"):
+        return str(candidates[0]["business_code"])
+    if not candidates:
+        messages.append(f"There is no {oem['oem_name']} project yet; add a Project Code and a Projects sheet.")
+    elif len(candidates) > 1:
+        messages.append(f"There are {len(candidates)} {oem['oem_name']} projects; add a Project Code column to say which.")
+    else:
+        messages.append(f"The {oem['oem_name']} project has no code yet; add a Project Code and a Projects sheet.")
+    return None
+
+
 def plan_import(parsed: ParsedWorkbook, state: ExistingState) -> dict[str, Any]:
     oems = _oem_lookup(state)
     segments = {_norm(s["segment_code"]): s for s in state.segments} | {_norm(s["segment_name"]): s for s in state.segments}
@@ -388,6 +431,8 @@ def plan_import(parsed: ParsedWorkbook, state: ExistingState) -> dict[str, Any]:
     for raw in parsed.dealerships.rows:
         messages = []
         project_code = _text(raw.get("Project Code"))
+        if not project_code and raw.get("OEM"):
+            project_code = _project_code_for_oem(raw.get("OEM"), state, messages)
         project = file_codes.get((project_code or "").upper())
         existing_project = None
         if project is not None and project.get("tenantId"):
@@ -485,6 +530,9 @@ def plan_import(parsed: ParsedWorkbook, state: ExistingState) -> dict[str, Any]:
                     messages.append("Outlet ID does not match any outlet; clear it to create a new one.")
             elif outlet_code:
                 match = next((o for o in existing_outlets if str(o["outlet_code"]).upper() == outlet_code.upper()), None)
+                oem_code = _text(raw.get("OEM Code"))
+                if match is None and oem_code:  # onboarded earlier under the OEM's own code
+                    match = next((o for o in existing_outlets if str(o["outlet_code"]).upper() == oem_code.upper()), None)
                 if match is None and dealer["dealerId"]:
                     match = next((o for o in existing_outlets
                                   if str(o["dealer_id"]) == dealer["dealerId"] and _same(o["outlet_name"], outlet_name)
@@ -564,7 +612,14 @@ _INSTRUCTIONS = (
         False,
     ),
     (
-        ("PC Presence: Onsite or Satellite. Monthly Car Sales Volume: a whole number."),
+        ("PC Presence: Onsite or Satellite (Yes = Onsite, No = Satellite). Monthly Car Sales Volume: a whole number."),
+        False,
+    ),
+    (
+        ("An OEM geofencing master (Dealer Group, Code, OEM, Outlet Name, Complete Address, State, City, Latitude, "
+         "Longitude, Dealership Code, Outlet Code, PC Presence) can be uploaded as it is: the Dealer Group plus the "
+         "OEM is the dealership name, Outlet Code is the outlet's code, and the OEM's only project is used when "
+         "there is no Project Code. Latitude and Longitude drive attendance geofencing."),
         False,
     ),
     (
