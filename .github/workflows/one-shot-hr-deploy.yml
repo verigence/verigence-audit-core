@@ -60,7 +60,7 @@ jobs:
               val = (v.get(name) or '').strip()
               if not val:
                   state = 'MISSING OR EMPTY'
-              elif '${{' in val:
+              elif ('$' + '{{') in val:
                   state = 'UNRESOLVED REFERENCE'
               else:
                   state = 'ok'
