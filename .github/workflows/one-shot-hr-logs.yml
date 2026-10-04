@@ -1,0 +1,37 @@
+name: One-shot Railway plan and mail check (read-only)
+
+# Prints the plan name of the workspace and the recorded mail failure reasons. No secret is printed.
+on:
+  push:
+    branches: [claude/verigence-phase-2-issues-w515pq]
+    paths:
+      - '.github/workflows/one-shot-hr-logs.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-hr-logs
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install --global @railway/cli
+      - name: Check
+        shell: bash
+        run: |
+          set -uo pipefail
+          curl -s -m 30 https://backboard.railway.com/graphql/v2 -H "Authorization: Bearer $RAILWAY_API_TOKEN" -H 'Content-Type: application/json' -d '{"query":"{ workspace(workspaceId: \"353d2d4d-32dc-4fb0-b448-5e4bde921332\") { plan } }"}' | python3 -c "import sys,json; print('plan:', json.load(sys.stdin))"
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service HRMgmt --json >/dev/null
+          timeout 60 railway logs --service HRMgmt --lines 1500 > /tmp/hr.log 2>&1 || true
+          echo "log lines captured: $(wc -l < /tmp/hr.log)"
+          grep -E "hr_mail_failed|hr_email_not_configured|Application startup|Started server" /tmp/hr.log | cut -c1-220 | tail -12
