@@ -2128,7 +2128,7 @@ def get_delivery_workspace(
         text(
             """
             SELECT p.payment_id, p.payment_at_utc, p.amount, p.currency_code,
-                   p.payment_method_code, p.payment_reference,
+                   p.payment_method_code, p.payment_reference, p.receipt_number,
                    latest.verification_result, latest.verification_notes,
                    latest.occurred_at_utc AS verification_at_utc
             FROM auditcore.payments p
@@ -2225,6 +2225,7 @@ def get_delivery_workspace(
                 "currencyCode": row["currency_code"],
                 "paymentMethodCode": row["payment_method_code"],
                 "paymentReference": row["payment_reference"],
+                "receiptNumber": row["receipt_number"],
                 "verificationResult": row["verification_result"],
                 "verificationNotes": row["verification_notes"],
                 "verificationAtUtc": _iso(row["verification_at_utc"]),
