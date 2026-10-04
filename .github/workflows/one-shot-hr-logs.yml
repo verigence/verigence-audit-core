@@ -1,0 +1,50 @@
+name: One-shot HRMgmt mail check (DEV, read-only)
+
+# Prints only: which HR_SMTP_* variables are set (host and port values, yes/no for the rest) and the
+# reasons recorded for failed emails. No secret is printed.
+on:
+  push:
+    branches: [claude/verigence-phase-2-issues-w515pq]
+    paths:
+      - '.github/workflows/one-shot-hr-logs.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-hr-logs
+  cancel-in-progress: false
+
+jobs:
+  logs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install --global @railway/cli
+      - name: Mail check
+        shell: bash
+        run: |
+          set -uo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service HRMgmt --json >/dev/null
+          railway variable list --service HRMgmt --json > /tmp/v.json
+          python3 - <<'PY'
+          import json
+          v = json.load(open('/tmp/v.json'))
+          for k in ('HR_SMTP_PASSWORD', 'HR_SMTP_USER'):
+              val = (v.get(k) or '').strip()
+              if val:
+                  print('::add-mask::' + val)
+          print('HR_SMTP_HOST =', v.get('HR_SMTP_HOST') or '(not set, default smtp.gmail.com)')
+          print('HR_SMTP_PORT =', v.get('HR_SMTP_PORT') or '(not set, default 587)')
+          for k in ('HR_SMTP_USER', 'HR_SMTP_PASSWORD', 'HR_SMTP_FROM'):
+              print(k, 'set:', bool((v.get(k) or '').strip()))
+          PY
+          timeout 60 railway logs --service HRMgmt --lines 1500 > /tmp/hr.log 2>&1 || true
+          echo "log lines captured: $(wc -l < /tmp/hr.log)"
+          grep -E "hr_mail_failed|hr_email_not_configured" /tmp/hr.log | cut -c1-200 | tail -15
