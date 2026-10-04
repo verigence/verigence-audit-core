@@ -26,7 +26,5 @@ jobs:
         run: |
           set -uo pipefail
           q() { curl -s -m 30 https://backboard.railway.com/graphql/v2 -H "Authorization: Bearer $RAILWAY_API_TOKEN" -H 'Content-Type: application/json' -d "$1"; }
-          echo "--- Workspace fields about plan:"
-          q '{"query":"{ __type(name: \"Workspace\") { fields { name } } }"}' | python3 -c "import sys,json; d=json.load(sys.stdin); print([f['name'] for f in (d.get('data') or {}).get('__type',{}).get('fields',[]) if any(k in f['name'].lower() for k in ('plan','subscription','tier','team','customer'))] or d)"
-          echo "--- me / workspaces:"
-          q '{"query":"{ me { workspaces { id name } } }"}' | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d)[:400])"
+          echo "--- plan:"
+          q '{"query":"{ workspace(workspaceId: \"353d2d4d-32dc-4fb0-b448-5e4bde921332\") { name plan } }"}' | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin))[:300])"
