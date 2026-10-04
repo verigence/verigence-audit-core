@@ -163,6 +163,7 @@ from audit_core.uc03_unified_document_capture import (
 from audit_core.uc03_work_item_enrichment import (
     router as uc03_work_item_enrichment_router,
 )
+from audit_core.user_project_history import router as user_project_history_router
 from audit_core.vehicle_delivery import router as vehicle_delivery_router
 from audit_core.workflow_stale_task_recovery import (
     DEFAULT_SWEEP_INTERVAL_SECONDS,
@@ -367,6 +368,7 @@ def create_app() -> FastAPI:
     application.include_router(feedback_router)
     application.include_router(finding_types_admin_router)
     application.include_router(hr_work_context_router)
+    application.include_router(user_project_history_router)
     application.include_router(oem_price_masters_router)
 
     @application.get("/health")
