@@ -1,0 +1,124 @@
+name: One-shot HRMgmt deploy to DEV
+
+# Runs only for a push whose head commit message contains DEPLOY-HRMGMT-NOW.
+# Checks the HRMgmt variables are present and resolved (names and yes/no only), uploads the HRMgmt
+# code from Verigence-admin/hrmgmt (dev), waits for /health and /ready, and lists the hr tables.
+# Writes no secret anywhere and prints none. (Run 5: the container migrates itself.)
+on:
+  push:
+    branches: [claude/verigence-phase-2-issues-w515pq]
+    paths:
+      - '.github/workflows/one-shot-hr-deploy.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-hr-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: contains(github.event.head_commit.message, 'DEPLOY-HRMGMT-NOW')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Verigence-admin/hrmgmt
+          ref: dev
+          path: hrmgmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          npm install --global @railway/cli
+          python -m pip install -q "psycopg[binary]" httpx
+      - name: Check variables, deploy, verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          cd hrmgmt
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service HRMgmt --json >/dev/null
+          railway variable list --service HRMgmt --json > /tmp/hr-vars.json
+          python3 - <<'PY'
+          import json, sys
+          v = json.load(open('/tmp/hr-vars.json'))
+          required = ['DATABASE_URL', 'SECURITY_BASE_URL', 'SECURITY_JWKS_URL', 'SECURITY_ISSUER', 'SECURITY_AUDIENCE',
+                      'SECURITY_CLIENT_ID', 'SECURITY_CLIENT_SECRET', 'HR_ALLOWED_ORIGINS', 'HR_STORAGE_ENDPOINT',
+                      'HR_STORAGE_BUCKET', 'HR_STORAGE_REGION', 'HR_STORAGE_ACCESS_KEY_ID', 'HR_STORAGE_SECRET_ACCESS_KEY']
+          bad = []
+          for name in required:
+              val = (v.get(name) or '').strip()
+              if not val:
+                  state = 'MISSING OR EMPTY'
+              elif ('$' + '{{') in val:
+                  state = 'UNRESOLVED REFERENCE'
+              else:
+                  state = 'ok'
+              if state != 'ok':
+                  bad.append(name)
+              print(f'{name}: {state} (length {len(val)})')
+          db = (v.get('DATABASE_URL') or '')
+          print('DATABASE_URL looks like a Postgres URL:', db.startswith(('postgres://', 'postgresql://', 'postgresql+psycopg://', 'postgresql+asyncpg://')))
+          print('SECURITY_JWKS_URL is https:', (v.get('SECURITY_JWKS_URL') or '').startswith('https://'))
+          print('SECURITY_CLIENT_SECRET length >= 32:', len(v.get('SECURITY_CLIENT_SECRET') or '') >= 32)
+          if bad:
+              sys.exit('variables to fix before deploying: ' + ', '.join(bad))
+          PY
+          echo '--- uploading and building the HRMgmt code ---'
+          set +e
+          railway up --service HRMgmt --environment dev --ci > /tmp/up.log 2>&1
+          code=$?
+          set -e
+          echo "railway up exit: $code"
+          tail -n 15 /tmp/up.log | cut -c1-200
+          [ "$code" -eq 0 ] || exit 1
+          python3 - <<'PY'
+          import json, time
+          import httpx
+          HR = 'https://attendance-dev.up.railway.app'
+          ok = False
+          for _ in range(40):
+              try:
+                  h = httpx.get(HR + '/health', timeout=10)
+                  if h.status_code == 200 and h.json().get('service') == 'hrmgmt':
+                      ok = True
+                      break
+              except Exception:
+                  pass
+              time.sleep(15)
+          print('HRMgmt /health answers as hrmgmt:', ok)
+          if not ok:
+              raise SystemExit(1)
+          for _ in range(12):
+              r = httpx.get(HR + '/ready', timeout=15)
+              print('HRMgmt /ready:', r.status_code, r.text[:80])
+              if r.status_code == 200:
+                  break
+              time.sleep(10)
+          print('GET /hr/v1/me without a token:', httpx.get(HR + '/hr/v1/me', timeout=15).status_code, '(expected 401)')
+          v = json.load(open('/tmp/hr-vars.json'))
+          import psycopg
+          db = v['DATABASE_URL'].strip()
+          for p in ('postgresql+psycopg://', 'postgresql+asyncpg://', 'postgres://'):
+              if db.startswith(p):
+                  db = 'postgresql://' + db[len(p):]
+          with psycopg.connect(db, options='-c default_transaction_read_only=on', connect_timeout=20) as c:
+              cur = c.cursor()
+              cur.execute("select table_name from information_schema.tables where table_schema='hr' order by 1")
+              print('hr tables:', [r[0] for r in cur.fetchall()])
+              cur.execute('select version_num from hr.alembic_version')
+              print('hr migration version:', cur.fetchall())
+              cur.execute('select count(*) from hr.degree')
+              print('degrees loaded:', cur.fetchall())
+          PY
+# 2026-10-04T18:31:57Z project history
