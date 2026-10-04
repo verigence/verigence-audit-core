@@ -4,6 +4,7 @@ import os
 from uuid import uuid4
 
 import pytest
+from conftest import delete_tenant_data
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
@@ -12,7 +13,6 @@ from audit_core.hr_work_context import load_work_context
 from audit_core.main import app
 from audit_core.security import ServiceIntegrationPrincipal
 from audit_core.uc03_pc_booking_documents import require_audit_service_principal
-from conftest import delete_tenant_data
 
 
 def _as(subject: str) -> None:
