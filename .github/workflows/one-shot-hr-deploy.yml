@@ -122,3 +122,4 @@ jobs:
               print('degrees loaded:', cur.fetchall())
           PY
 # 2026-10-04T16:12:32Z support tickets
+# 2026-10-04T16:49:19Z tagged location wording
