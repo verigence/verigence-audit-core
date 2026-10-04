@@ -12,7 +12,7 @@ from audit_core.hr_work_context import load_work_context
 from audit_core.main import app
 from audit_core.security import ServiceIntegrationPrincipal
 from audit_core.uc03_pc_booking_documents import require_audit_service_principal
-from tests.conftest import delete_tenant_data
+from conftest import delete_tenant_data
 
 
 def _as(subject: str) -> None:
