@@ -46,6 +46,7 @@ from audit_core.onboarding_workbook import (
     ParsedWorkbook,
     build_workbook,
     export_rows,
+    oem_abbreviation,
     parse_workbook,
     plan_import,
 )
@@ -70,6 +71,10 @@ def _json(value: Any) -> Any:
     raise TypeError(f"not JSON serialisable: {type(value).__name__}")
 
 
+def _norm_oem(value: Any) -> str:
+    return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+
 def workbook_tenants(parsed: ParsedWorkbook, projects: list[dict[str, Any]]) -> set[str]:
     """The Projects a workbook refers to (by Project ID or Project Code): only
     their dealers and outlets are needed to plan it."""
@@ -87,6 +92,10 @@ def workbook_tenants(parsed: ParsedWorkbook, projects: list[dict[str, Any]]) -> 
         code = str(row.get("Project Code") or "").strip().upper()
         if code in by_code:
             tenants.add(by_code[code])
+        elif not code and row.get("OEM"):  # no Project Code: the projects of that OEM
+            wanted = _norm_oem(row.get("OEM"))
+            tenants.update(p["tenant_id"] for p in projects if _norm_oem(p.get("oem_code")) == wanted
+                           or oem_abbreviation(str(p.get("oem_code") or "")).lower() == wanted)
     return tenants
 
 

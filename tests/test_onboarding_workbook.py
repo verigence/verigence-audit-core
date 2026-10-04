@@ -189,3 +189,93 @@ def test_a_preview_only_needs_the_projects_the_workbook_mentions():
     parsed = parse_workbook(_book([["JBR-01", "M", "Mahindra", "Yes", date(2026, 9, 4), None]],
                                   [["UH-HYU-1", "Hyundai", "JBR-02", "Utkal Hyundai", "One", "x", "Odisha", "B", "Yes", "Onsite", 1]]))
     assert workbook_tenants(parsed, projects) == {"t1", "t2"}
+
+
+# ------------------------------------------------ the OEM geofencing master (Hyundai_Master)
+
+MASTER_HEADER = ["Dealer Group", "Code", "OEM", "Outlet Name", "Complete Address (Recommended)", "State",
+                 "City (Source)", "Google Maps URL", "Google Place ID", "Latitude", "Longitude",
+                 "Dealership Code", "Outlet Code", "PC Presence"]
+MASTER_ROWS = [
+    ["Aditya", "E7205", "Hyundai", "Aditya Hyundai, Tamando", "Plot No. 11, NH-5, Tamando, Odisha 752054", "Odisha",
+     "Bhubaneshwar", "https://maps.example/1", "ChIJ1", 20.230755, 85.737483, "AH-HYU", "AH-HYU-TAMANDO", "Yes"],
+    ["Premier", "E7215", "Hyundai", "Premier Hyundai, Baripada", "Baripada, Odisha", "Odisha", "Baripada",
+     "https://maps.example/2", "ChIJ2", 21.899926, 86.758471, "PH-HYU", "PH-HYU-BARIPADA", "Yes"],
+]
+
+
+def _master(rows=None, header=None, title="Hyundai_Master") -> bytes:
+    wb = Workbook()
+    sheet = wb.active
+    sheet.title = title
+    sheet.append(header or MASTER_HEADER)
+    for row in (MASTER_ROWS if rows is None else rows):
+        sheet.append(row)
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def _hyundai_project(tenant="t-hyu", code="JBR-02"):
+    return {"tenant_id": tenant, "business_code": code, "project_code": "t", "project_name": "Hyundai Orissa",
+            "oem_code": "HYUNDAI", "effective_start_date": date(2026, 9, 14), "effective_end_date": None,
+            "timezone_name": "Asia/Kolkata", "project_status": "ACTIVE"}
+
+
+def test_the_oem_geofencing_master_is_read_as_it_is():
+    parsed = parse_workbook(_master())
+    assert not parsed.errors and len(parsed.dealerships.rows) == 2
+    plan = plan_import(parsed, _state(projects=[_hyundai_project()]))
+    assert plan["summary"]["errors"] == 0 and plan["summary"]["outlets"] == {"CREATE": 2}
+    assert sorted((d["dealerCode"], d["dealerName"]) for d in plan["dealers"]) == [
+        ("AH-HYU", "Aditya Hyundai"), ("PH-HYU", "Premier Hyundai")]
+    tamando = plan["outlets"][0]
+    assert tamando["outletCode"] == "AH-HYU-TAMANDO" and tamando["projectCode"] == "JBR-02"
+    assert (tamando["latitude"], tamando["longitude"]) == ("20.2307550", "85.7374830")
+    assert tamando["outletClassification"] == "ONSITE" and tamando["city"] == "Bhubaneshwar"
+    assert tamando["addressText"].startswith("Plot No. 11")
+
+
+def test_the_master_needs_its_oems_only_project_or_a_project_code():
+    two = _state(projects=[_hyundai_project(), _hyundai_project("t-2", "JBR-03")])
+    plan = plan_import(parse_workbook(_master()), two)
+    assert plan["summary"]["errors"] == 2
+    assert any("2 Hyundai projects" in m for m in plan["outlets"][0]["messages"])
+    none = plan_import(parse_workbook(_master()), _state())
+    assert any("no Hyundai project" in m for m in none["outlets"][0]["messages"])
+    with_code = _master(header=MASTER_HEADER + ["Project Code"], rows=[r + ["JBR-03"] for r in MASTER_ROWS])
+    plan = plan_import(parse_workbook(with_code), two)
+    assert plan["summary"]["errors"] == 0 and plan["outlets"][0]["tenantId"] == "t-2"
+
+
+def test_an_outlet_onboarded_under_the_oems_code_is_updated_not_duplicated():
+    tenant = "t-hyu"
+    state = _state(
+        projects=[_hyundai_project(tenant)],
+        dealers={tenant: [{"dealer_id": "d1", "dealer_code": "AH-HYU", "dealer_name": "Aditya Hyundai", "status": "ACTIVE"}]},
+        outlets={tenant: [{"outlet_id": "o1", "dealer_id": "d1", "outlet_code": "E7205",
+                           "outlet_name": "Aditya Hyundai, Tamando", "outlet_classification": "ONSITE",
+                           "address_text": "Plot No. 11, NH-5, Tamando, Odisha 752054", "city": "Bhubaneshwar",
+                           "state_region": "Odisha", "postal_code": None, "latitude": None, "longitude": None,
+                           "monthly_vehicle_volume": None, "status": "ACTIVE"}]},
+    )
+    plan = plan_import(parse_workbook(_master()), state)
+    tamando, baripada = plan["outlets"]
+    assert tamando["action"] == "UPDATE" and tamando["outletId"] == "o1"
+    assert tamando["changes"]["outletCode"] == ["E7205", "AH-HYU-TAMANDO"]
+    assert tamando["changes"]["latitude"][1] == "20.2307550"
+    assert baripada["action"] == "CREATE"
+    assert plan["summary"]["dealers"] == {"UNCHANGED": 1, "CREATE": 1}
+
+
+def test_the_master_reports_bad_coordinates_and_presence_per_row():
+    rows = [MASTER_ROWS[0][:9] + [120.0, 85.7] + MASTER_ROWS[0][11:13] + ["Maybe"], MASTER_ROWS[1]]
+    plan = plan_import(parse_workbook(_master(rows=rows)), _state(projects=[_hyundai_project()]))
+    bad = plan["outlets"][0]["messages"]
+    assert any("Latitude must be between" in m for m in bad) and any("PC Presence" in m for m in bad)
+    assert plan["outlets"][1]["action"] == "CREATE"
+
+
+def test_a_sheet_that_is_not_an_outlet_master_is_still_not_found():
+    parsed = parse_workbook(_master(header=["Name", "Notes"], rows=[["a", "b"]]))
+    assert not parsed.dealerships.rows and parsed.projects.errors
