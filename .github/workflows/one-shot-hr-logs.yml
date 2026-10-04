@@ -1,7 +1,6 @@
-name: One-shot HRMgmt mail check (DEV, read-only)
+name: One-shot Railway plan check (read-only)
 
-# Prints only: which HR_SMTP_* variables are set (host and port values, yes/no for the rest) and the
-# reasons recorded for failed emails. No secret is printed.
+# Prints only the plan name of the Railway workspace that holds the HRMgmt service. No secret is printed.
 on:
   push:
     branches: [claude/verigence-phase-2-issues-w515pq]
@@ -16,36 +15,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  logs:
+  plan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 5
     env:
       RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
-      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
     steps:
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - run: npm install --global @railway/cli
-      - name: Mail check
+      - name: Plan
         shell: bash
         run: |
           set -uo pipefail
-          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service HRMgmt --json >/dev/null
-          railway variable list --service HRMgmt --json > /tmp/v.json
-          python3 - <<'PY'
-          import json
-          v = json.load(open('/tmp/v.json'))
-          for k in ('HR_SMTP_PASSWORD', 'HR_SMTP_USER'):
-              val = (v.get(k) or '').strip()
-              if val:
-                  print('::add-mask::' + val)
-          print('HR_SMTP_HOST =', v.get('HR_SMTP_HOST') or '(not set, default smtp.gmail.com)')
-          print('HR_SMTP_PORT =', v.get('HR_SMTP_PORT') or '(not set, default 587)')
-          for k in ('HR_SMTP_USER', 'HR_SMTP_PASSWORD', 'HR_SMTP_FROM'):
-              print(k, 'set:', bool((v.get(k) or '').strip()))
-          PY
-          timeout 60 railway logs --service HRMgmt --lines 1500 > /tmp/hr.log 2>&1 || true
-          echo "log lines captured: $(wc -l < /tmp/hr.log)"
-          grep -E "hr_mail_failed|hr_email_not_configured" /tmp/hr.log | cut -c1-200 | tail -15
-# 20:17:44 recheck
+          q() { curl -s -m 30 https://backboard.railway.com/graphql/v2 -H "Authorization: Bearer $RAILWAY_API_TOKEN" -H 'Content-Type: application/json' -d "$1"; }
+          echo "--- Workspace fields about plan:"
+          q '{"query":"{ __type(name: \"Workspace\") { fields { name } } }"}' | python3 -c "import sys,json; d=json.load(sys.stdin); print([f['name'] for f in (d.get('data') or {}).get('__type',{}).get('fields',[]) if any(k in f['name'].lower() for k in ('plan','subscription','tier','team','customer'))] or d)"
+          echo "--- me / workspaces:"
+          q '{"query":"{ me { workspaces { id name } } }"}' | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d)[:400])"
