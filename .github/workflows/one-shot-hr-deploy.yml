@@ -3,7 +3,7 @@ name: One-shot HRMgmt deploy to DEV
 # Runs only for a push whose head commit message contains DEPLOY-HRMGMT-NOW.
 # Checks the HRMgmt variables are present and resolved (names and yes/no only), uploads the HRMgmt
 # code from Verigence-admin/hrmgmt (dev), waits for /health and /ready, and lists the hr tables.
-# Writes no secret anywhere and prints none. (Run 3: HR now ships its own Dockerfile.)
+# Writes no secret anywhere and prints none. (Run 4: stopgap Dockerfile.attendance added.)
 on:
   push:
     branches: [claude/verigence-phase-2-issues-w515pq]
