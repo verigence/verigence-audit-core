@@ -1,0 +1,53 @@
+name: One-shot HRMgmt log peek (DEV, read-only)
+
+# Prints a filtered, length-limited slice of the HRMgmt service logs. Database URL parts are masked.
+on:
+  push:
+    branches: [claude/verigence-phase-2-issues-w515pq]
+    paths:
+      - '.github/workflows/one-shot-hr-logs.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-hr-logs
+  cancel-in-progress: false
+
+jobs:
+  logs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install --global @railway/cli
+      - name: Peek
+        shell: bash
+        run: |
+          set -uo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service HRMgmt --json >/dev/null
+          railway variable list --service HRMgmt --json > /tmp/v.json
+          python3 - <<'PY'
+          import json
+          v = json.load(open('/tmp/v.json'))
+          for k in ('DATABASE_URL', 'SECURITY_CLIENT_SECRET', 'HR_STORAGE_SECRET_ACCESS_KEY', 'HR_STORAGE_ACCESS_KEY_ID'):
+              val = (v.get(k) or '').strip()
+              if val:
+                  print('::add-mask::' + val)
+          db = (v.get('DATABASE_URL') or '')
+          host = db.split('@')[-1].split('/')[0] if '@' in db else ''
+          if host:
+              print('::add-mask::' + host)
+          print('service variable names set by Railway for the build/deploy:', sorted(k for k in v if k.startswith('RAILWAY_')))
+          dfp = v.get('RAILWAY_DOCKERFILE_PATH')
+          print('RAILWAY_DOCKERFILE_PATH value:', dfp)
+          print('RAILWAY_PRE_DEPLOY_COMMAND set:', 'RAILWAY_PRE_DEPLOY_COMMAND' in v)
+          PY
+          timeout 60 railway logs --service HRMgmt --lines 300 > /tmp/hr.log 2>&1 || true
+          echo "log lines captured: $(wc -l < /tmp/hr.log)"
+          grep -iE "alembic|migrat|error|exception|traceback|schema|ready|started|uvicorn|running|pre-?deploy|hr_" /tmp/hr.log | cut -c1-220 | tail -60
