@@ -48,3 +48,4 @@ jobs:
           timeout 60 railway logs --service HRMgmt --lines 1500 > /tmp/hr.log 2>&1 || true
           echo "log lines captured: $(wc -l < /tmp/hr.log)"
           grep -E "hr_mail_failed|hr_email_not_configured" /tmp/hr.log | cut -c1-200 | tail -15
+# 20:17:44 recheck
