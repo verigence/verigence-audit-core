@@ -1,6 +1,6 @@
 name: One-shot HRMgmt send failure check (read-only)
 
-# Prints only the recorded failure reasons for email and password sends. No secret is printed.
+# Prints only the recorded failure reasons and timing lines for email and password sends. No secret is printed. (check 4)
 on:
   push:
     branches: [claude/verigence-phase-2-issues-w515pq]
