@@ -1,0 +1,36 @@
+name: One-shot HRMgmt send failure check (read-only)
+
+# Prints only the recorded failure reasons for email and password sends. No secret is printed.
+on:
+  push:
+    branches: [claude/verigence-phase-2-issues-w515pq]
+    paths:
+      - '.github/workflows/one-shot-hr-logs.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-hr-logs
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install --global @railway/cli
+      - name: Check
+        shell: bash
+        run: |
+          set -uo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service HRMgmt --json >/dev/null
+          timeout 60 railway logs --service HRMgmt --lines 3000 > /tmp/hr.log 2>&1 || true
+          echo "log lines captured: $(wc -l < /tmp/hr.log)"
+          grep -E "hr_mail_failed|hr_set_password_failed|hr_unhandled_error|hr_email_not_configured" /tmp/hr.log | sed -E 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/<email>/g' | cut -c1-260 | tail -30
