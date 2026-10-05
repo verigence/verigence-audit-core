@@ -1,6 +1,6 @@
 name: One-shot HRMgmt send failure check (read-only)
 
-# Prints only counts and short status lines from the HR log. No secret is printed (503 investigation).
+# Prints only counts and short status lines from the HR log. No secret is printed (security side of the 503s).
 on:
   push:
     branches: [claude/verigence-phase-2-issues-w515pq]
@@ -30,10 +30,15 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service HRMgmt --json >/dev/null
-          timeout 90 railway logs --service HRMgmt --lines 5000 > /tmp/hr.log 2>&1 || true
-          echo "HR log lines captured: $(wc -l < /tmp/hr.log)"
-          echo "--- non-access lines (warnings, events) with their time, emails masked"
-          sed -E "s/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/<email>/g" /tmp/hr.log | grep -v '^INFO: ' | cut -c1-330 | tail -40 || true
-          echo "--- every 503 with its neighbours"
-          sed -E "s/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/<email>/g" /tmp/hr.log | cut -c1-200 | grep -n -B2 -A1 ' 503 ' | head -60 || true
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service security --json >/dev/null
+          timeout 120 railway logs --service security --lines 8000 > /tmp/sec.log 2>&1 || true
+          echo "security log lines: $(wc -l < /tmp/sec.log)"
+          echo "--- first and last timestamped lines"
+          grep -E '^20[0-9]{2}-' /tmp/sec.log | head -1 | cut -c1-60 || true
+          grep -E '^20[0-9]{2}-' /tmp/sec.log | tail -1 | cut -c1-60 || true
+          echo "--- requests by route and status"
+          grep -E 'INFO: +[0-9.]+:[0-9]+ - "' /tmp/sec.log | sed -E 's/.*"(GET|POST|PUT|DELETE) ([^ ?]+)[^"]*" ([0-9]+).*/\1 \2 \3/' | sed -E 's#/[0-9a-f]{8}-[0-9a-f-]{27,}#/<id>#g' | sort | uniq -c | sort -rn | head -25 || true
+          echo "--- warnings and errors (time, kind), emails masked"
+          sed -E "s/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/<email>/g" /tmp/sec.log | grep -E '\[(WARN|ERROR|CRITICAL)' | cut -c1-260 | tail -25 || true
+          echo "--- other keywords"
+          for k in Traceback "timeout" "pool" "OperationalError" "database" "Connection" "SSL" "Killed" "OOM" "SIGTERM" "Starting Container" "Application startup complete"; do echo "$k: $(grep -c -i -- "$k" /tmp/sec.log)"; done
