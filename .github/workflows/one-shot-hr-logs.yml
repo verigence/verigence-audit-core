@@ -31,8 +31,9 @@ jobs:
         run: |
           set -uo pipefail
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service security --json >/dev/null
-          timeout 120 railway logs --service security --lines 8000 > /tmp/sec.log 2>&1 || true
+          timeout 120 railway logs --service security --lines 4000 > /tmp/sec.log 2>&1 || true
           echo "security log lines: $(wc -l < /tmp/sec.log)"
+          [ "$(wc -l < /tmp/sec.log)" -lt 5 ] && head -c 400 /tmp/sec.log
           echo "--- first and last timestamped lines"
           grep -E '^20[0-9]{2}-' /tmp/sec.log | head -1 | cut -c1-60 || true
           grep -E '^20[0-9]{2}-' /tmp/sec.log | tail -1 | cut -c1-60 || true
