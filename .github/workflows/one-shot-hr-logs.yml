@@ -1,6 +1,6 @@
 name: One-shot HRMgmt send failure check (read-only)
 
-# Prints only counts and short status lines from the Security log. No secret is printed (security log check).
+# Prints only short status lines from the Security log. No secret is printed (security 422 check).
 on:
   push:
     branches: [claude/verigence-phase-2-issues-w515pq]
@@ -37,5 +37,7 @@ jobs:
           for k in security_user_login_success login_attempt_not_recorded app_download_not_recorded Traceback "Human credential authentication denied" "Application startup complete" "ERROR"; do
             echo "$k: $(grep -c -- "$k" /tmp/sec.log)"
           done
-          echo "--- last 40 relevant lines (emails masked)"
-          sed -E "s/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/<email>/g" /tmp/sec.log | cut -c1-260 | grep -E "login|attempt|download|Traceback|ERROR|startup|denied|health" | tail -40
+          echo "--- context around every 422 (emails masked)"
+          sed -E "s/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/<email>/g" /tmp/sec.log | cut -c1-400 | grep -n -B4 -A2 " 422 " | head -60
+          echo "--- validation / warning lines"
+          sed -E "s/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/<email>/g" /tmp/sec.log | cut -c1-400 | grep -i -E "validation|warning|WARN|not_recorded|unprocessable" | tail -20
