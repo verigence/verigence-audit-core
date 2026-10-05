@@ -1,6 +1,6 @@
-name: One-shot Railway plan and mail check (read-only)
+name: One-shot Security sign-in denial check (read-only)
 
-# Prints the plan name of the workspace and the recorded mail failure reasons. No secret is printed.
+# Prints only the coarse stage Security records when a sign-in is refused. No identifiers or secrets.
 on:
   push:
     branches: [claude/verigence-phase-2-issues-w515pq]
@@ -30,8 +30,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          curl -s -m 30 https://backboard.railway.com/graphql/v2 -H "Authorization: Bearer $RAILWAY_API_TOKEN" -H 'Content-Type: application/json' -d '{"query":"{ workspace(workspaceId: \"353d2d4d-32dc-4fb0-b448-5e4bde921332\") { plan } }"}' | python3 -c "import sys,json; print('plan:', json.load(sys.stdin))"
-          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service HRMgmt --json >/dev/null
-          timeout 60 railway logs --service HRMgmt --lines 1500 > /tmp/hr.log 2>&1 || true
-          echo "log lines captured: $(wc -l < /tmp/hr.log)"
-          grep -E "hr_mail_failed|hr_email_not_configured|Application startup|Started server" /tmp/hr.log | cut -c1-220 | tail -12
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service security --json >/dev/null
+          timeout 60 railway logs --service security --lines 3000 > /tmp/sec.log 2>&1 || true
+          echo "log lines captured: $(wc -l < /tmp/sec.log)"
+          grep -E "authentication (denied|failed|accepted)|stage=" /tmp/sec.log | sed -E 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/<email>/g' | cut -c1-200 | tail -25
