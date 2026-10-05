@@ -1,6 +1,6 @@
 name: One-shot HRMgmt send failure check (read-only)
 
-# (rerun 2) Prints only the recorded failure reasons for email and password sends. No secret is printed.
+Prints only the recorded failure reasons for email and password sends. No secret is printed.
 on:
   push:
     branches: [claude/verigence-phase-2-issues-w515pq]
@@ -33,4 +33,4 @@ jobs:
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service HRMgmt --json >/dev/null
           timeout 60 railway logs --service HRMgmt --lines 3000 > /tmp/hr.log 2>&1 || true
           echo "log lines captured: $(wc -l < /tmp/hr.log)"
-          sed -E "s/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/<email>/g" /tmp/hr.log | cut -c1-300 | grep -E 'messages|hr_mail|hr_set_password|password|error|Error|timing|ms' | tail -80
+          sed -E "s/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/<email>/g" /tmp/hr.log | cut -c1-300 | grep -E 'messages|hr_mail|hr_set_password|password|error|Error|timing' | tail -80
