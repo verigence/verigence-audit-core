@@ -1,6 +1,6 @@
 name: One-shot HRMgmt send failure check (read-only)
 
-# Prints only counts and short status lines from the HR log. No secret is printed (face check live proof).
+# Prints only counts and short status lines from the HR log. No secret is printed (face check live proof, evening).
 on:
   push:
     branches: [claude/verigence-phase-2-issues-w515pq]
@@ -38,6 +38,6 @@ jobs:
             echo "$k: $(grep -c -- "$k" /tmp/hr.log)"
           done
           echo "--- last attendance timing lines (emails masked)"
-          sed -E "s/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/<email>/g" /tmp/hr.log | cut -c1-300 | grep -E "hr_attendance_timing|face_check|unhandled|Traceback| 500 | 503 " | tail -12
+          sed -E "s/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/<email>/g" /tmp/hr.log | cut -c1-300 | grep -E "hr_attendance_timing|face_check|unhandled|Traceback| 500 | 503 " | tail -12 || true
           echo "--- attendance requests by status"
-          grep -E 'POST /hr/v1/attendance/(check-in|check-out)|GET /hr/v1/attendance/(daily|report)' /tmp/hr.log | sed -E 's/.*(GET|POST) ([^ ?]+).*HTTP\/1.1" ([0-9]+).*/\1 \2 \3/' | sort | uniq -c
+          grep -E 'POST /hr/v1/attendance/(check-in|check-out)|GET /hr/v1/attendance/(daily|report)' /tmp/hr.log | sed -E 's/.*(GET|POST) ([^ ?]+).*HTTP\/1.1" ([0-9]+).*/\1 \2 \3/' | sort | uniq -c || true
