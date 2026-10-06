@@ -14,7 +14,7 @@ from io import BytesIO
 from pathlib import Path
 
 import pytest
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from audit_core.oem_master_parsers import (
     MasterParseError,
@@ -300,12 +300,10 @@ def test_dealer_pv_sheet_parses_reconciles_and_dates_from_the_sheet() -> None:
     content = _dealer_pv_workbook([
         _pv_row("1.6XXL HD V2", 859_501, 3_632, 3_632),
         _pv_row("1.5XXL SD V2", 839_500, 51_110, 51_110),
-        _pv_row("1.5XXL SD V2", 839_500, 51_110, 51_110),  # the sheet repeats a row verbatim
     ])
     result = parse_price_list(content, filename="veero_LNT_Price.xlsx")
     assert not result.errors, result.errors
     assert result.meta["layout"] == "DEALER_PER_MODEL" and result.meta["sheets"] == 1
-    assert result.meta["duplicateRowsCollapsed"] == 1
     assert result.effective_from_hint == date(2026, 9, 3) and result.meta["effectiveFromSource"] == "SHEET"
     first, second = result.price_rows
     assert first.model_name == "VEERO" and first.variant_name == "1.6XXL HD V2" and first.fuel == "DIESEL"
@@ -339,10 +337,14 @@ def test_dealer_ev_workbook_reads_every_model_sheet_and_the_file_name_date() -> 
     by_variant = {r.variant_name: r for r in result.price_rows}
     be6 = by_variant["BE 6 One B59 R18 NCH"]
     assert be6.components["REGISTRATION_INDIVIDUAL"] == Decimal("140.00")
-    assert be6.components["REGISTRATION_CORPORATE"] == Decimal("1640.00")
-    assert be6.onroad_corporate - be6.onroad_individual == Decimal("1500.00")
+    # decision 2026-10-06: corporate is the individual figure; the with-hypothecation pair is its own field
+    assert be6.components["REGISTRATION_CORPORATE"] == Decimal("140.00")
+    assert be6.components["REGISTRATION_WITH_HYPO"] == Decimal("1640.00")
+    assert be6.components["HYPOTHECATION_CHARGE"] == Decimal("1500.00")
+    assert be6.onroad_corporate == be6.onroad_individual
     assert be6.category == "UNSPECIFIED"  # nothing on the sheet says electric
-    assert "RSA_1YR" not in be6.components and "ACCESSORIES_KIT" in be6.components
+    assert "RSA_1YR" not in be6.components and "ACCESSORIES_KIT" not in be6.components
+    assert be6.components["ESSENTIAL_ACCESSORIES"] == Decimal("25000.00")
     ev = by_variant["XUV3XO EV - AX5 FH"]
     assert ev.fuel == "ELECTRIC" and ev.category == "BEV"
 
@@ -358,6 +360,148 @@ def test_dealer_sheet_preview_shows_absent_components_as_blank() -> None:
     result = parse_price_list(_dealer_pv_workbook([_pv_row("1.6XXL HD V2", 859_501, 3_632, 3_632)]))
     sample = _build_preview(result, "PRICE_LIST")["sample"][0]
     assert sample["exShowroom"] == "859501.00" and sample["extWarranty4thYr"] is None
+
+
+def test_a_repeated_vehicle_is_an_error_and_nothing_is_loaded_for_it() -> None:
+    content = _dealer_pv_workbook([
+        _pv_row("1.5XXL SD V2", 839_500, 51_110, 51_110),
+        _pv_row("1.5XXL SD V2", 839_500, 51_110, 51_110),  # the sheet repeats a row verbatim
+        _pv_row("1.6XXL SD V2", 839_501, 3_632, 3_632),
+        _pv_row("1.6XXL SD V2", 849_501, 3_632, 3_632),  # ... and one with a different price
+    ])
+    result = parse_price_list(content)
+    assert not result.ok
+    assert sum("repeats the vehicle" in e for e in result.errors) == 2
+    assert any("identical prices" in e for e in result.errors) and any("different prices" in e for e in result.errors)
+
+
+def _dealer_trim_workbook(rows, *, notes=(), fuel="DISEL", wef="Price list w.e.f. Dt.23.09.2026", variant_column=True) -> bytes:
+    """The Thar 3-door layout: the first column is headed TRIM and holds the full variant, a second
+    TRIM column holds the trim code, then fuel / transmission / drive / seats; the MODEL NAME label is
+    repeated in a merged cell; the fuel is mis-spelt on the sheet."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "THAR 3DOOR"
+    ws.append(["ADITYA MOTORS"])
+    ws.append([wef])
+    ws.append(["MODEL NAME", None, "MODEL NAME", None, None, None, None, "NEW THAR 2WD & 4WD", None, "FUEL TYPE", None, fuel])
+    if variant_column:
+        ws.append(["TRIM", None, "TRIM", "FUEL", "TRANSMISSION", "DRIVE", "SEATER", "Ex-showroom Price", "Tax Collection at Source (TCS)",
+                   "Insurance", "Extended Warranty (4th year)", "Extended Warranty (4th & 5th year)", "Accessories Kit",
+                   "RSA (1 year)", "Fastag", None, "On Road Price - Individual", None, "On Road Price - Corporate"])
+        ws.append([None] * 16 + ["Registration without Hypoth", "On Road Price without Hypoth", "Registration without Hypoth",
+                                 "On Road Price without Hypoth"])
+        ws.append([None] * 7 + ["(A)", "(B)", "(C)", "(D)", "(E)", "(F)", "(G)", "(H)", None, "(H)", "(I)=(A+B+C+D+E+F+G+H)", "(J)",
+                                "(K)=(A+B+C+D+E+F+G+J)"])
+    else:
+        ws.append(["TRIM", "FUEL", "TRANSMISSION", "DRIVE", "SEATER", "Ex-showroom Price", "Tax Collection at Source (TCS)",
+                   "Insurance", "Extended Warranty (4th year)", "Extended Warranty (4th & 5th year)", "Accessories Kit",
+                   "RSA (1 year)", "Fastag", "On Road Price - Individual", None, "On Road Price - Corporate"])
+        ws.append([None] * 13 + ["Registration without Hypoth", "On Road Price without Hypoth", "Registration without Hypoth",
+                                 "On Road Price without Hypoth"])
+        ws.append([None] * 5 + ["(A)", "(B)", "(C)", "(D)", "(E)", "(F)", "(G)", "(H)", "(H)", "(I)=(A+B+C+D+E+F+G+H)", "(J)",
+                                "(K)=(A+B+C+D+E+F+G+J)"])
+    for row in rows:
+        ws.append(row)
+    ws.append([None, "NOTE-"])
+    for note in notes:
+        ws.append([None, note])
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _trim_row(variant, trim, ex, *, fuel="DIESEL", trans="MT", drive="2WD", seats=4, ew4=17_999, ew45=32_999, reg=103_940, with_variant=True,
+              tamper=None):
+    tcs, ins, acc, rsa, fastag = 10_320, 45_288, 30_000, 2_021, 500
+    onroad = ex + tcs + ins + ew4 + ew45 + acc + rsa + fastag + reg
+    if tamper is not None:
+        onroad = tamper
+    cells = [trim, fuel, trans, drive, seats, ex, tcs, ins, ew4, ew45, acc, rsa, fastag, reg, onroad, reg, onroad]
+    return [variant, None, *cells[:1], *cells[1:5], *cells[5:13], None, reg, onroad, reg, onroad] if with_variant else [
+        trim, fuel, trans, drive, seats, ex, tcs, ins, ew4, ew45, acc, rsa, fastag, reg, onroad, reg, onroad]
+
+
+_THAR_NOTES = (
+    "1.HYPOTHETICATION CHARGES RS.1500/- APPLICABLE IF VEHICLE REGISTERED IN FINANCE",
+    "Minimum Booking Amount Rs.21,000/-",
+    "2.PERMIT CHARGES APPLICABLE IN COMMERCIAL REGISTRATION BELOW 7 STR = RS.1700/-",
+    "3.TR CHARGES APPLICABLE ON CBC MODELS",
+)
+
+
+def test_trim_headed_sheet_is_read_by_its_labels_with_the_notes_under_the_table() -> None:
+    content = _dealer_trim_workbook([
+        _trim_row("AXT D MT 2WD 4S HT BS6.2", "AXT", 1_032_000),
+        _trim_row("LXT D AT 4WD 4S HT BS6.2", "LXT", 1_799_500, trans="AT", drive="4WD", reg=180_690),
+    ], notes=_THAR_NOTES)
+    result = parse_price_list(content, filename="Thar_3Door_price.xlsx")
+    assert not result.errors, result.errors
+    assert result.meta["models"] == ["NEW THAR 2WD & 4WD"]  # not the repeated label
+    assert result.effective_from_hint == date(2026, 9, 23)
+    first, second = result.price_rows
+    assert (first.trim, first.fuel, first.transmission, first.drive, first.seater) == ("AXT", "DIESEL", "MT", "2WD", "4")
+    assert second.transmission == "AT" and second.drive == "4WD"
+    assert first.variant_name == "AXT D MT 2WD 4S HT BS6.2"
+    assert first.components["HYPOTHECATION_CHARGE"] == Decimal("1500.00")
+    assert first.components["REGISTRATION_WITH_HYPO"] == Decimal("105440.00")
+    assert first.components["MIN_BOOKING_AMOUNT"] == Decimal("21000.00")
+    extras = {k: v for k, v in first.components.items() if k.startswith("EXTRA_CHARGE_")}
+    assert list(extras.values()) == [Decimal("1700.00")]
+    assert "BELOW 7 STR" in first.component_notes[next(iter(extras))]
+    assert any("TR CHARGES" in n for n in result.meta["notesWithoutAnAmount"])
+    # on-road is the dealer's own figure (both warranty tiers inside it), untouched
+    assert first.onroad_individual == Decimal("1275067.00") and first.onroad_corporate == first.onroad_individual
+
+
+def test_single_trim_column_builds_the_variant_from_its_parts_and_a_blank_cell_is_nil() -> None:
+    rows = [
+        _trim_row("", "AX7T", 2_199_000, fuel="DIESEL", seats=6, with_variant=False),
+        _trim_row("", "AX7T", 2_164_000, fuel="DIESEL", seats=7, ew4=0, ew45=0, with_variant=False),
+    ]
+    rows[1][8] = None  # the sheet leaves the 4th-year warranty empty for this vehicle
+    rows[1][9] = None
+    content = _dealer_trim_workbook(rows, variant_column=False)
+    result = parse_price_list(content)
+    assert not result.errors, result.errors
+    six, seven = result.price_rows
+    assert six.variant_name == "AX7T DIESEL MT 2WD 6 STR" and six.seater == "6"
+    assert seven.variant_name == "AX7T DIESEL MT 2WD 7 STR" and seven.seater == "7"
+    assert seven.components["EXT_WARRANTY_4TH_YR"] == Decimal("0.00")
+    assert any("empty price cell" in w for w in result.warnings)
+
+
+def test_a_sheet_without_a_variant_column_or_enough_attributes_is_refused_not_guessed() -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["MODEL NAME", "X"])
+    ws.append(["TRIM", "Ex-showroom Price", "Insurance"])
+    ws.append([None, "(A)", "(B)", "(C)"])
+    ws.append(["AX", 1_000_000, 40_000])
+    buf = BytesIO()
+    wb.save(buf)
+    with pytest.raises(MasterParseError):
+        parse_price_list(buf.getvalue())
+
+
+def test_hypothecation_columns_that_disagree_with_the_note_are_an_error() -> None:
+    row = _ev_row("BE 6 One B59 R18 NCH", 1_890_000)
+    content = _dealer_ev_workbook({"BE6": [row]})
+    wb = load_workbook(BytesIO(content))
+    wb["BE6"].append([None, "1.HYPOTHETICATION CHARGES RS.1800/- APPLICABLE IF VEHICLE REGISTERED IN FINANCE"])
+    buf = BytesIO()
+    wb.save(buf)
+    result = parse_price_list(buf.getvalue())
+    assert any("the note says hypothecation is 1800.00 but the columns differ by 1500.00" in e for e in result.errors)
+
+
+def test_a_row_whose_on_road_is_off_in_a_trim_sheet_is_an_error() -> None:
+    content = _dealer_trim_workbook([
+        _trim_row("AXT D MT 2WD 4S HT BS6.2", "AXT", 1_032_000),
+        _trim_row("LXT D MT 2WD 4S HT BS6.2", "LXT", 1_299_000, tamper=1_579_999),
+    ], notes=_THAR_NOTES)
+    result = parse_price_list(content)
+    assert len(result.price_rows) == 1 and any("LXT D MT 2WD" in e and "on-road is 1579999" in e for e in result.errors)
 
 
 # ── the dealer's discount grid (fifth master, decision 2026-09-30) ─────────────
