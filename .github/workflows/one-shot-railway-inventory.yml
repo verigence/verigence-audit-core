@@ -1,8 +1,8 @@
 name: One-shot Railway inventory (read-only)
 
-# Reads the Railway account and prints, per service: replicas, region, sleep setting, last deploy,
-# source, domains and usage. It changes nothing. No variable value is printed: only the NAMES of a
-# short list of variables, and for URL values only the host name. Secrets are never printed.
+# Reads the Railway account and prints facts that decide which services cost money and which are
+# not needed. It changes nothing. No variable value is printed: for database URLs only the KIND of
+# host (Neon, Railway Postgres, other) is printed, never the host, user, password or database name.
 on:
   push:
     branches: [claude/verigence-phase-2-issues-w515pq]
@@ -48,7 +48,7 @@ jobs:
                       out = json.loads(r.read())
               except urllib.error.HTTPError as e:
                   return None, f'HTTP {e.code}'
-              except Exception as e:  # network problem
+              except Exception as e:
                   return None, type(e).__name__
               if out.get('errors'):
                   return out.get('data'), '; '.join(str(x.get('message'))[:160] for x in out['errors'])[:400]
@@ -57,129 +57,49 @@ jobs:
           def nodes(conn):
               return [e['node'] for e in ((conn or {}).get('edges') or [])]
 
-          print('=== 1. Projects visible to this token')
-          data, err = gql('query{ projects{ edges{ node{ id name services{edges{node{name}}} environments{edges{node{name}}} } } } }')
-          if err: print('  (projects query:', err, ')')
-          for p in nodes((data or {}).get('projects')):
-              print(f"  project {p['name']} [{p['id']}]  envs={[e['name'] for e in nodes(p['environments'])]}  services={[s['name'] for s in nodes(p['services'])]}")
-          if not data:
-              d2, e2 = gql('query($id:String!){ project(id:$id){ id name } }', {'id': PROJECT})
-              print('  platform project:', d2, e2)
+          data, err = gql('query($id:String!){ project(id:$id){ environments{edges{node{ id name }}} services{edges{node{ id name }}} } }', {'id': PROJECT})
+          if err: print('(project query:', err, ')')
+          proj = (data or {}).get('project') or {}
+          names = {s['id']: s['name'] for s in nodes(proj.get('services'))}
+          envs = nodes(proj.get('environments'))
+          env = next((e for e in envs if e['name'] == 'dev'), envs[0] if envs else None)
+          print('environments:', [e['name'] for e in envs])
 
-          print('\n=== 2. Platform project services, per environment')
-          Q = '''query($id:String!){ project(id:$id){ name
-            environments{edges{node{ id name
-              serviceInstances{edges{node{ serviceId serviceName numReplicas region sleepApplication startCommand cronSchedule healthcheckPath
-                source{repo image}
-                latestDeployment{ status createdAt }
-                domains{ serviceDomains{domain} customDomains{domain} }
-              }}}
-            }}}
-            services{edges{node{ id name }}}
-          }}'''
-          data, err = gql(Q, {'id': PROJECT})
-          if err: print('  (full query:', err, ')')
-          if not data or not data.get('project'):
-              Q2 = '''query($id:String!){ project(id:$id){ name
-                environments{edges{node{ id name
-                  serviceInstances{edges{node{ serviceId serviceName numReplicas region latestDeployment{status createdAt} }}}
-                }}}
-                services{edges{node{ id name }}}
-              }}'''
-              data, err = gql(Q2, {'id': PROJECT})
-              if err: print('  (reduced query:', err, ')')
-          names = {}
-          envs = []
-          if data and data.get('project'):
-              proj = data['project']
-              names = {s['id']: s['name'] for s in nodes(proj['services'])}
-              print('  all services in the project:', sorted(names.values()))
-              for env in nodes(proj['environments']):
-                  envs.append(env)
-                  print(f"\n  -- environment {env['name']} [{env['id']}]")
-                  insts = nodes(env['serviceInstances'])
-                  seen = {i['serviceId'] for i in insts}
-                  for i in sorted(insts, key=lambda x: x['serviceName'] or ''):
-                      d = i.get('latestDeployment') or {}
-                      src = i.get('source') or {}
-                      doms = i.get('domains') or {}
-                      hosts = [x['domain'] for x in (doms.get('serviceDomains') or [])] + [x['domain'] for x in (doms.get('customDomains') or [])]
-                      print(f"   {i['serviceName']:<24} replicas={i.get('numReplicas')} region={i.get('region')} sleep={i.get('sleepApplication')} "
-                            f"last_deploy={d.get('status')}@{(d.get('createdAt') or '')[:16]} cron={i.get('cronSchedule')} "
-                            f"source={src.get('repo') or src.get('image')} domains={hosts}")
-                  absent = sorted(n for sid, n in names.items() if sid not in seen)
-                  if absent: print('   (not deployed in this environment:', absent, ')')
+          print('\n=== A. Which database each service points at (kind of host only)')
+          def kind(val):
+              host = (urlparse(val.strip()).hostname or '').lower()
+              if not host: return 'empty'
+              if host.endswith('neon.tech'): return 'neon'
+              if host.endswith('.railway.internal') or host.endswith('rlwy.net'): return 'railway-postgres'
+              return 'other'
+          DBVAR = re.compile(r'(DB_URL|DATABASE_URL|DATABASE_PUBLIC_URL|DSN)', re.I)
+          for sid, n in sorted(names.items(), key=lambda x: x[1]):
+              d, e = gql('query($p:String!,$e:String!,$s:String!){ variables(projectId:$p, environmentId:$e, serviceId:$s) }', {'p': PROJECT, 'e': env['id'], 's': sid})
+              v = (d or {}).get('variables')
+              if not isinstance(v, dict): continue
+              found = [f"{k}={kind(str(v[k]))}" for k in sorted(v) if DBVAR.search(k) and not k.startswith('RAILWAY_')]
+              if found: print(f'   {n:<24}', ' | '.join(found))
 
-          print('\n=== 3. Usage by service (this billing month and last 30 days)')
-          if names:
-              meas = '[CPU_USAGE, MEMORY_USAGE_GB, NETWORK_TX_GB, DISK_USAGE_GB]'
-              now = datetime.now(timezone.utc)
-              start = (now - timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
-              end = now.strftime('%Y-%m-%dT%H:%M:%SZ')
-              q = 'query($p:String!,$s:DateTime!,$e:DateTime!){ usage(projectId:$p, measurements:%s, groupBy:[SERVICE_ID], startDate:$s, endDate:$e){ measurement value tags{ serviceId } } }' % meas
-              d, e = gql(q, {'p': PROJECT, 's': start, 'e': end})
-              if e: print('  (usage query:', e, ')')
-              rows = {}
-              for u in (d or {}).get('usage') or []:
-                  sid = (u.get('tags') or {}).get('serviceId')
-                  rows.setdefault(names.get(sid, str(sid)), {})[u['measurement']] = u['value']
-              for n, m in sorted(rows.items()):
-                  print(f"   {n:<24} " + '  '.join(f"{k}={v:.2f}" for k, v in sorted(m.items())))
-              q2 = 'query($p:String!){ estimatedUsage(projectId:$p, measurements:%s){ measurement estimatedValue projectId } }' % meas
-              d, e = gql(q2, {'p': PROJECT})
-              if e: print('  (estimatedUsage query:', e, ')')
-              for u in (d or {}).get('estimatedUsage') or []:
-                  print('   project estimate this month:', u.get('measurement'), u.get('estimatedValue'))
+          print('\n=== B. Memory (GB) and CPU through the last 7 days, 6-hour averages, per service')
+          sid_by_name = {n: s for s, n in names.items()}
+          start = (datetime.now(timezone.utc) - timedelta(days=7)).strftime('%Y-%m-%dT%H:%M:%SZ')
+          for n in ['di-worker-v2', 'di-api', 'Postgres', 'di-worker', 'verigence-audit-core', 'verigence-p2-worker', 'security', 'HRMgmt', 'audit-api', 'analytics']:
+              sid = sid_by_name.get(n)
+              if not sid: continue
+              q = 'query($e:String!,$s:String!,$st:DateTime!){ metrics(environmentId:$e, serviceId:$s, startDate:$st, measurements:[MEMORY_USAGE_GB, CPU_USAGE], sampleRateSeconds:21600, averagingWindowSeconds:21600){ measurement values{ ts value } } }'
+              d, e = gql(q, {'e': env['id'], 's': sid, 'st': start})
+              if e and not d: print(f'   {n}: (metrics query: {e})'); continue
+              for m in (d or {}).get('metrics') or []:
+                  vals = ' '.join(f"{x['value']:.2f}" for x in m['values'])
+                  print(f"   {n:<22} {m['measurement']:<16} {vals}")
 
-          print('\n=== 4. Variables that link services (names only; URL values shown as host name only)')
-          PAT = re.compile(r'(WHATSAPP|RULE_ENGINE|ANALYTICS|UPSTREAM|BASE_URL|_URL$|WORKER_MODE|NUM_|CONCURRENCY|LANES|REPLICA)', re.I)
-          SECRET = re.compile(r'(KEY|SECRET|TOKEN|PASSWORD|PASS|DATABASE|DSN|CREDENTIAL)', re.I)
-          for env in envs:
-              for sid, n in sorted(names.items(), key=lambda x: x[1]):
-                  d, e = gql('query($p:String!,$e:String!,$s:String!){ variables(projectId:$p, environmentId:$e, serviceId:$s) }', {'p': PROJECT, 'e': env['id'], 's': sid})
-                  v = (d or {}).get('variables')
-                  if not isinstance(v, dict):
-                      continue
-                  shown = []
-                  for k in sorted(v):
-                      if SECRET.search(k) or not PAT.search(k):
-                          continue
-                      val = str(v[k])
-                      if val.startswith('http'):
-                          val = 'host:' + (urlparse(val).hostname or '?')
-                      elif len(val) > 40:
-                          val = '<long>'
-                      shown.append(f'{k}={val}')
-                  if shown:
-                      print(f"   [{env['name']}] {n}: " + ' | '.join(shown))
-                  has = [k for k in v if re.search('whatsapp', k, re.I)]
-                  if has: print(f"   [{env['name']}] {n}: WHATSAPP variable names: {has}")
-          print('\n=== 5. Daily usage, last 7 days (UTC days, oldest first)')
-          if names:
-              for back in range(7, 0, -1):
-                  day0 = (datetime.now(timezone.utc) - timedelta(days=back)).replace(hour=0, minute=0, second=0, microsecond=0)
-                  day1 = day0 + timedelta(days=1)
-                  q = 'query($p:String!,$s:DateTime!,$e:DateTime!){ usage(projectId:$p, measurements:[CPU_USAGE, MEMORY_USAGE_GB], groupBy:[SERVICE_ID], startDate:$s, endDate:$e){ measurement value tags{ serviceId } } }'
-                  d, e = gql(q, {'p': PROJECT, 's': day0.strftime('%Y-%m-%dT%H:%M:%SZ'), 'e': day1.strftime('%Y-%m-%dT%H:%M:%SZ')})
-                  if e: print('  (daily query:', e, ')'); break
-                  rows = {}
-                  for u in (d or {}).get('usage') or []:
-                      n = names.get((u.get('tags') or {}).get('serviceId'), 'deleted-service')
-                      rows.setdefault(n, {})[u['measurement']] = u['value']
-                  top = sorted(rows.items(), key=lambda kv: -kv[1].get('MEMORY_USAGE_GB', 0))[:4]
-                  print('  ' + day0.strftime('%m-%d') + '  ' + ' | '.join(f"{n} cpu={m.get('CPU_USAGE',0):.1f} mem={m.get('MEMORY_USAGE_GB',0):.0f}" for n, m in top))
+          print('\n=== C. Recent deployments of the DI workers and API (restarts and redeploys)')
+          for n in ['di-worker-v2', 'di-worker', 'di-api']:
+              sid = sid_by_name.get(n)
+              if not sid: continue
+              q = 'query($p:String!,$e:String!,$s:String!){ deployments(first:25, input:{projectId:$p, environmentId:$e, serviceId:$s}){ edges{ node{ status createdAt } } } }'
+              d, e = gql(q, {'p': PROJECT, 'e': env['id'], 's': sid})
+              if e and not d: print(f'   {n}: (deployments query: {e})'); continue
+              rows = [(x['createdAt'][:16], x['status']) for x in nodes((d or {}).get('deployments'))]
+              print(f'   {n}: {len(rows)} most recent:', ', '.join(f'{c} {s}' for c, s in rows[:12]))
           PY
-      - name: Replicas and regions (Railway CLI)
-        shell: bash
-        run: |
-          set -uo pipefail
-          npm install --global @railway/cli >/dev/null 2>&1
-          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --json >/dev/null 2>&1 || echo 'link failed'
-          railway service list --json > /tmp/services.json 2>/tmp/err.txt || { echo "service list failed:"; head -c 300 /tmp/err.txt; exit 0; }
-          python3 - <<'PY2'
-          import json
-          rows = json.load(open('/tmp/services.json'))
-          for r in sorted(rows, key=lambda x: x.get('name', '')):
-              regs = [f"{g.get('name')}={g.get('configured')}" for g in (r.get('regions') or [])]
-              print(f"   {r.get('name'):<24} regions={regs} keys={sorted(k for k in r if k not in ('id','name'))[:8]}")
-          PY2
