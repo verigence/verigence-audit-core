@@ -560,6 +560,7 @@ def ingest_price_list(
                         "category": row.category,
                         "onRoadIndividual": str(row.onroad_individual),
                         "onRoadCorporate": str(row.onroad_corporate),
+                        **({"note": row.component_notes[component_key]} if component_key in row.component_notes else {}),
                     }
                 ),
             })

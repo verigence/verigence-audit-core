@@ -31,6 +31,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import Connection, text
 
 from audit_core.dependencies import get_connection, get_human_principal
+from audit_core.oem_master_parsers import NON_ADDITIVE_KEYS, is_extra_charge_key
 from audit_core.oem_price_masters import _alias_map, _resolve_models, grid_row_for_model
 from audit_core.price_lists import find_effective_price_plan
 from audit_core.security import HumanPrincipal
@@ -52,6 +53,7 @@ COMPONENT_LABELS: dict[str, str] = {
     "EXT_WARRANTY_4TH_YR": "Extended warranty (4th year)",
     "EXT_WARRANTY_4TH_5TH_YR": "Extended warranty (4th and 5th year)",
     "ACCESSORIES_KIT": "Accessories kit",
+    "ESSENTIAL_ACCESSORIES": "Essential accessories",
     "RSA_1YR": "Road-side assistance (1 year)",
     "FASTAG": "FASTag",
     "REGISTRATION_INDIVIDUAL": "Registration (individual)",
@@ -80,6 +82,15 @@ _SCENARIO_SECTIONS = {
     "WELCOME": ("WELCOME_BONUS",),
 }
 RegistrationBasis = Literal["INDIVIDUAL", "CORPORATE"]
+EwOption = Literal["NONE", "4TH", "4TH_5TH"]
+InsuranceType = Literal["PRIVATE", "COMMERCIAL"]
+_EW_KEY = {"4TH": "EXT_WARRANTY_4TH_YR", "4TH_5TH": "EXT_WARRANTY_4TH_5TH_YR"}
+# A customer takes at most one warranty tier, so neither is part of the on-road base; the chosen one is added.
+# Registration lines, the hypothecation charge, the minimum booking amount and the dealer's extra charges are
+# not summed as price lines either.
+_NOT_IN_BASE = frozenset({"EXT_WARRANTY_4TH_YR", "EXT_WARRANTY_4TH_5TH_YR"}) | NON_ADDITIVE_KEYS
+_NOT_A_PRICE_LINE = frozenset({"REGISTRATION_WITH_HYPO", "HYPOTHECATION_CHARGE", "MIN_BOOKING_AMOUNT"})
+_INSURANCE_SUFFIX = re.compile(r"::(PRI|COM)$")  # the suffix ingest_price_list gives a private / commercial price
 
 
 def _norm(value: str | None) -> str:
@@ -114,7 +125,7 @@ def catalogue_rows(connection: Connection, *, tenant_id: str, price_list_version
                    pv.attributes ->> 'drive' AS drive, pv.attributes ->> 'seater' AS seater,
                    pv.attributes ->> 'trim' AS trim, pv.attributes ->> 'category' AS category,
                    json_agg(json_build_object('key', pli.component_key, 'amount', pli.standard_amount,
-                                              'priceSince', pli.price_since)
+                                              'priceSince', pli.price_since, 'note', pli.metadata ->> 'note')
                             ORDER BY pli.component_key) AS components
             FROM auditcore.price_list_items pli
             JOIN auditcore.product_skus s ON s.product_sku_id = pli.product_sku_id
@@ -147,10 +158,28 @@ def _sku_summary(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _base_code(sku_code: str) -> str:
+    return _INSURANCE_SUFFIX.sub("", sku_code)
+
+
+def _insurance_type_of(sku_code: str) -> str | None:
+    match = _INSURANCE_SUFFIX.search(sku_code)
+    return {"PRI": "PRIVATE", "COM": "COMMERCIAL"}[match.group(1)] if match else None
+
+
+def pick_insurance_row(rows: list[dict[str, Any]], insurance_type: str | None) -> dict[str, Any]:
+    """Among the private / commercial prices of one vehicle: the one asked for, else the private one."""
+    for wanted in ([insurance_type] if insurance_type else []) + ["PRIVATE", None]:
+        hit = next((r for r in rows if _insurance_type_of(r["sku_code"]) == wanted), None)
+        if hit is not None:
+            return hit
+    return rows[0]
+
+
 def search_sku(
     rows: list[dict[str, Any]], *, alias_map: dict[str, str], sku_code: str | None = None, model: str | None = None,
     variant: str | None = None, trim: str | None = None, fuel: str | None = None, transmission: str | None = None,
-    drive: str | None = None, seater: str | None = None,
+    drive: str | None = None, seater: str | None = None, insurance_type: str | None = None,
 ) -> dict[str, Any]:
     """EXACT on a SKU code; else the rows matching every attribute given
     (model through the alias map, variant by normalised text, the rest
@@ -169,6 +198,9 @@ def search_sku(
     for key, wanted_value in (("trim", trim), ("fuel", fuel), ("transmission", transmission), ("drive", drive), ("seater", seater)):
         if wanted_value:
             matches = [r for r in matches if _norm(r.get(key)) == _norm(wanted_value)]
+    if len(matches) > 1 and len({_base_code(r["sku_code"]) for r in matches}) == 1:
+        # one vehicle priced twice, for private and for commercial insurance: not ambiguous, the booking form chooses
+        matches = [pick_insurance_row(matches, insurance_type)]
     if len(matches) == 1:
         return {"matched": "UNIQUE", "sku": _sku_summary(matches[0]), "candidates": [], "row": matches[0]}
     return {
@@ -180,29 +212,127 @@ def search_sku(
 
 
 # ── the blocks ──────────────────────────────────────────────────────────────────
-def _price_block(row: dict[str, Any], version: dict[str, Any], basis: str) -> dict[str, Any]:
+def _amounts(row: dict[str, Any]) -> dict[str, Decimal]:
+    return {str(item["key"]): Decimal(str(item["amount"])) for item in row["components"]}
+
+
+def on_road_for(amounts: dict[str, Decimal], *, ew: str, basis: str = "INDIVIDUAL") -> dict[str, Decimal | None]:
+    """The on-road price with ONE warranty tier (or none): every price line except the two tiers, the
+    registration lines and the notes, plus the chosen tier, plus registration. The with-hypothecation
+    figure is added only where the charge is known."""
+    base = sum((v for k, v in amounts.items() if k not in _NOT_IN_BASE and not is_extra_charge_key(k)), Decimal(0))
+    warranty = amounts.get(_EW_KEY[ew], Decimal(0)) if ew in _EW_KEY else Decimal(0)
+    individual = amounts.get("REGISTRATION_INDIVIDUAL", Decimal(0))
+    registration = amounts.get("REGISTRATION_CORPORATE", individual) if basis == "CORPORATE" else individual
+    without = base + warranty + registration
+    hypo = amounts.get("HYPOTHECATION_CHARGE")
+    return {"withoutHypo": without, "withHypo": None if hypo is None else without + hypo}
+
+
+def _price_block(row: dict[str, Any], version: dict[str, Any], basis: str, ew: str = "NONE") -> dict[str, Any]:
+    amounts = _amounts(row)
     components = []
-    total_individual = Decimal(0)
-    total_corporate = Decimal(0)
     for item in row["components"]:
-        amount = Decimal(str(item["amount"]))
         key = str(item["key"])
-        if key != "REGISTRATION_CORPORATE":
-            total_individual += amount
-        if key != "REGISTRATION_INDIVIDUAL":
-            total_corporate += amount
+        if key in _NOT_A_PRICE_LINE or is_extra_charge_key(key):
+            continue  # shown in the standard format block, never as a price line
         components.append({
             "key": key,
             "label": COMPONENT_LABELS.get(key, key.replace("_", " ").title()),
             "commercialKey": commercial_key_for_price_component(key, basis=basis),  # type: ignore[arg-type]
-            "amount": _money(amount),
+            "amount": _money(Decimal(str(item["amount"]))),
             "priceSince": item.get("priceSince"),
         })
-    on_road = {"individual": _money(total_individual), "corporate": _money(total_corporate)}
+    individual = on_road_for(amounts, ew=ew, basis="INDIVIDUAL")["withoutHypo"]
+    corporate = on_road_for(amounts, ew=ew, basis="CORPORATE")["withoutHypo"]
+    on_road = {"individual": _money(individual), "corporate": _money(corporate)}
     return {
         **version,
         "components": components,
-        "onRoad": {**on_road, "basis": basis, "amount": on_road["corporate" if basis == "CORPORATE" else "individual"]},
+        "onRoad": {**on_road, "basis": basis, "ew": ew, "amount": on_road["corporate" if basis == "CORPORATE" else "individual"]},
+    }
+
+
+def _version_hypothecation(connection: Connection, *, tenant_id: str, price_list_version_id: str) -> Decimal | None:
+    """The hypothecation charge most of this version's vehicles carry (the dealer prints one charge for
+    every vehicle), for a vehicle whose own sheet did not state it."""
+    value = connection.execute(
+        text(
+            """
+            SELECT standard_amount FROM auditcore.price_list_items
+            WHERE tenant_id = :t AND price_list_version_id = :v AND component_key = 'HYPOTHECATION_CHARGE'
+            GROUP BY standard_amount ORDER BY COUNT(*) DESC, standard_amount LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "v": price_list_version_id},
+    ).scalar_one_or_none()
+    return None if value is None else Decimal(str(value))
+
+
+def standard_format(
+    row: dict[str, Any], version: dict[str, Any], *, basis: str, ew: str,
+    version_hypothecation: Decimal | None, catalogue: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """The full standard output for one vehicle (decision 2026-10-06), the same shape for every OEM:
+    ex-showroom, TCS, insurance (every option the vehicle has), both warranty tiers, accessories kit and
+    essential accessories, RSA, FASTag, registration and on-road without and with hypothecation (one warranty
+    tier at most), the hypothecation charge, the minimum booking amount, the dealer's priced extra charges and
+    the WEF date. A line the price list does not carry for the vehicle is nil."""
+    amounts = _amounts(row)
+    notes = {str(i["key"]): i.get("note") for i in row["components"]}
+    since = {str(i["key"]): i.get("priceSince") for i in row["components"]}
+    own_hypo = amounts.get("HYPOTHECATION_CHARGE")
+    hypo, hypo_source = (own_hypo, "PRICE_LIST") if own_hypo is not None else (
+        (version_hypothecation, "VERSION_DEFAULT") if version_hypothecation is not None else (None, None))
+    working = dict(amounts)
+    if hypo is not None:
+        working["HYPOTHECATION_CHARGE"] = hypo
+
+    def figures(by_ew: str) -> dict[str, str | None]:
+        got = on_road_for(working, ew=by_ew, basis=basis)
+        return {"withoutHypo": _money(got["withoutHypo"]), "withHypo": _money(got["withHypo"])}
+
+    individual = amounts.get("REGISTRATION_INDIVIDUAL", Decimal(0))
+    registration = amounts.get("REGISTRATION_CORPORATE", individual) if basis == "CORPORATE" else individual
+    options = []
+    siblings = [r for r in (catalogue or []) if _base_code(r["sku_code"]) == _base_code(row["sku_code"])] or [row]
+    for sibling in siblings:
+        sib = _amounts(sibling)
+        if hypo is not None:
+            sib["HYPOTHECATION_CHARGE"] = hypo
+        got = on_road_for(sib, ew=ew, basis=basis)
+        options.append({
+            "type": _insurance_type_of(sibling["sku_code"]) or "STANDARD", "skuCode": sibling["sku_code"],
+            "amount": _money(sib.get("INSURANCE", Decimal(0))), "selected": sibling["sku_code"] == row["sku_code"],
+            "onRoadWithoutHypo": _money(got["withoutHypo"]), "onRoadWithHypo": _money(got["withHypo"]),
+        })
+    zero = Decimal(0)
+    return {
+        "wefDate": version.get("effectiveFrom"),
+        "priceListVersion": version.get("version"),
+        "ewOption": ew,
+        "exShowroom": _money(amounts.get("EX_SHOWROOM", zero)),
+        "tcs": _money(amounts.get("TCS", zero)),
+        "insurance": {"inHouse": _money(amounts.get("INSURANCE", zero)), "options": options,
+                      "selectionNeeded": len(options) > 1 and ew is not None},
+        "ewFourthYear": _money(amounts.get("EXT_WARRANTY_4TH_YR", zero)),
+        "ewFourthAndFifthYear": _money(amounts.get("EXT_WARRANTY_4TH_5TH_YR", zero)),
+        "accessoriesKit": _money(amounts.get("ACCESSORIES_KIT", zero)),
+        "essentialAccessories": _money(amounts.get("ESSENTIAL_ACCESSORIES", zero)),
+        "rsa": _money(amounts.get("RSA_1YR", zero)),
+        "fastag": _money(amounts.get("FASTAG", zero)),
+        "registrationWithoutHypo": _money(registration),
+        "registrationWithHypo": _money(registration + hypo) if hypo is not None else None,
+        "hypothecationCharge": _money(hypo),
+        "hypothecationSource": hypo_source,
+        "onRoadWithoutHypo": figures(ew)["withoutHypo"],
+        "onRoadWithHypo": figures(ew)["withHypo"],
+        "onRoadByEw": {name: figures(name) for name in ("NONE", "4TH", "4TH_5TH")},
+        "minimumBookingAmount": _money(amounts.get("MIN_BOOKING_AMOUNT")),
+        "extraCharges": [
+            {"key": k, "label": notes.get(k) or k, "amount": _money(v)} for k, v in sorted(amounts.items()) if is_extra_charge_key(k)
+        ],
+        "priceSince": {k: v for k, v in since.items() if v is not None and k not in _NOT_A_PRICE_LINE and not is_extra_charge_key(k)},
     }
 
 
@@ -375,11 +505,16 @@ def _oem_code(connection: Connection, tenant_id: str) -> str | None:
 def standard_for_sku(
     connection: Connection, *, tenant_id: str, on: date, row: dict[str, Any], version: dict[str, Any],
     basis: str = "INDIVIDUAL", corporate_code: str | None = None, corporate_name: str | None = None,
-    exchange: str = "NONE", quantity: int = 1,
+    exchange: str = "NONE", quantity: int = 1, ew: str = "NONE", catalogue: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Every block for one priced SKU; ``unknown`` names the blocks no master answers."""
     scheme_rows = _scheme_rows(connection, tenant_id=tenant_id, model_id=row["model_id"], variant_id=row["variant_id"], on=on)
-    price = _price_block(row, version, basis)
+    price = _price_block(row, version, basis, ew)
+    standard = standard_format(
+        row, version, basis=basis, ew=ew, catalogue=catalogue,
+        version_hypothecation=None if "HYPOTHECATION_CHARGE" in _amounts(row)
+        else _version_hypothecation(connection, tenant_id=tenant_id, price_list_version_id=version["priceListVersionId"]),
+    )
     consumer = _consumer_block(scheme_rows)
     exchange_block = _exchange_block(scheme_rows, exchange)
     corporate = _corporate_block(connection, scheme_rows, oem_code=_oem_code(connection, tenant_id),
@@ -396,6 +531,7 @@ def standard_for_sku(
         "basis": basis,
         "quantity": quantity,
         "priceList": price,
+        "standard": standard,
         "consumerScheme": consumer,
         "exchangeScheme": exchange_block,
         "corporate": corporate,
@@ -459,6 +595,8 @@ def sku_standard(
     corporateName: str | None = Query(default=None, max_length=400),
     exchange: ExchangeScenario = "NONE",
     quantity: int = Query(default=1, ge=1, le=1000),
+    ew: EwOption = "NONE",
+    insuranceType: InsuranceType | None = None,
 ) -> dict[str, Any]:
     _auth(connection, tenant_id, human_principal, authorization_client)
     if not skuCode and not (model or variant):
@@ -472,7 +610,11 @@ def sku_standard(
     found = search_sku(
         rows, alias_map=_alias_map(connection, _oem_code(connection, tenant_id) or ""), sku_code=skuCode, model=model,
         variant=variant, trim=trim, fuel=fuel, transmission=transmission, drive=drive, seater=seater,
+        insurance_type=insuranceType,
     )
+    if found["row"] is not None and insuranceType:
+        siblings = [r for r in rows if _base_code(r["sku_code"]) == _base_code(found["row"]["sku_code"])]
+        found["row"] = pick_insurance_row(siblings, insuranceType)
     if found["row"] is None:
         return {"on": on, "sku": None, "matched": found["matched"], "candidates": found["candidates"],
                 "priceList": version, "unknown": ["priceList", "consumerScheme", "exchangeScheme", "corporate", "grid"],
@@ -484,5 +626,6 @@ def sku_standard(
         **standard_for_sku(
             connection, tenant_id=tenant_id, on=on, row=found["row"], version=version, basis=registrationBasis,
             corporate_code=corporateCode, corporate_name=corporateName, exchange=exchange, quantity=quantity,
+            ew=ew, catalogue=rows,
         ),
     }
