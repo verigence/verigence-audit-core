@@ -1,0 +1,157 @@
+name: One-shot Railway inventory (read-only)
+
+# Reads the Railway account and prints, per service: replicas, region, sleep setting, last deploy,
+# source, domains and usage. It changes nothing. No variable value is printed: only the NAMES of a
+# short list of variables, and for URL values only the host name. Secrets are never printed.
+on:
+  push:
+    branches: [claude/verigence-phase-2-issues-w515pq]
+    paths:
+      - '.github/workflows/one-shot-railway-inventory.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: railway-inventory
+  cancel-in-progress: false
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - name: Inventory
+        shell: bash
+        run: |
+          set -uo pipefail
+          [[ -n "${RAILWAY_API_TOKEN:-}" ]] || { echo '::error::RAILWAY_API_TOKEN is not set'; exit 1; }
+          python3 - <<'PY'
+          import json, os, re, urllib.request, urllib.error
+          from datetime import datetime, timedelta, timezone
+          from urllib.parse import urlparse
+
+          URL = 'https://backboard.railway.com/graphql/v2'
+          TOKEN = os.environ['RAILWAY_API_TOKEN']
+          PROJECT = os.environ['PLATFORM_PROJECT_ID']
+
+          def gql(query, variables=None):
+              body = json.dumps({'query': query, 'variables': variables or {}}).encode()
+              req = urllib.request.Request(URL, data=body, headers={
+                  'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json',
+                  'User-Agent': 'verigence-inventory/1.0'})
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      out = json.loads(r.read())
+              except urllib.error.HTTPError as e:
+                  return None, f'HTTP {e.code}'
+              except Exception as e:  # network problem
+                  return None, type(e).__name__
+              if out.get('errors'):
+                  return out.get('data'), '; '.join(str(x.get('message'))[:160] for x in out['errors'])[:400]
+              return out.get('data'), None
+
+          def nodes(conn):
+              return [e['node'] for e in ((conn or {}).get('edges') or [])]
+
+          print('=== 1. Projects visible to this token')
+          data, err = gql('query{ projects{ edges{ node{ id name services{edges{node{name}}} environments{edges{node{name}}} } } } }')
+          if err: print('  (projects query:', err, ')')
+          for p in nodes((data or {}).get('projects')):
+              print(f"  project {p['name']} [{p['id']}]  envs={[e['name'] for e in nodes(p['environments'])]}  services={[s['name'] for s in nodes(p['services'])]}")
+          if not data:
+              d2, e2 = gql('query($id:String!){ project(id:$id){ id name } }', {'id': PROJECT})
+              print('  platform project:', d2, e2)
+
+          print('\n=== 2. Platform project services, per environment')
+          Q = '''query($id:String!){ project(id:$id){ name
+            environments{edges{node{ id name
+              serviceInstances{edges{node{ serviceId serviceName numReplicas region sleepApplication startCommand cronSchedule healthcheckPath
+                source{repo image}
+                latestDeployment{ status createdAt }
+                domains{ serviceDomains{domain} customDomains{domain} }
+              }}}
+            }}}
+            services{edges{node{ id name }}}
+          }}'''
+          data, err = gql(Q, {'id': PROJECT})
+          if err: print('  (full query:', err, ')')
+          if not data or not data.get('project'):
+              Q2 = '''query($id:String!){ project(id:$id){ name
+                environments{edges{node{ id name
+                  serviceInstances{edges{node{ serviceId serviceName numReplicas region latestDeployment{status createdAt} }}}
+                }}}
+                services{edges{node{ id name }}}
+              }}'''
+              data, err = gql(Q2, {'id': PROJECT})
+              if err: print('  (reduced query:', err, ')')
+          names = {}
+          envs = []
+          if data and data.get('project'):
+              proj = data['project']
+              names = {s['id']: s['name'] for s in nodes(proj['services'])}
+              print('  all services in the project:', sorted(names.values()))
+              for env in nodes(proj['environments']):
+                  envs.append(env)
+                  print(f"\n  -- environment {env['name']} [{env['id']}]")
+                  insts = nodes(env['serviceInstances'])
+                  seen = {i['serviceId'] for i in insts}
+                  for i in sorted(insts, key=lambda x: x['serviceName'] or ''):
+                      d = i.get('latestDeployment') or {}
+                      src = i.get('source') or {}
+                      doms = i.get('domains') or {}
+                      hosts = [x['domain'] for x in (doms.get('serviceDomains') or [])] + [x['domain'] for x in (doms.get('customDomains') or [])]
+                      print(f"   {i['serviceName']:<24} replicas={i.get('numReplicas')} region={i.get('region')} sleep={i.get('sleepApplication')} "
+                            f"last_deploy={d.get('status')}@{(d.get('createdAt') or '')[:16]} cron={i.get('cronSchedule')} "
+                            f"source={src.get('repo') or src.get('image')} domains={hosts}")
+                  absent = sorted(n for sid, n in names.items() if sid not in seen)
+                  if absent: print('   (not deployed in this environment:', absent, ')')
+
+          print('\n=== 3. Usage by service (this billing month and last 30 days)')
+          if names:
+              meas = '[CPU_USAGE, MEMORY_USAGE_GB, NETWORK_TX_GB, DISK_USAGE_GB]'
+              now = datetime.now(timezone.utc)
+              start = (now - timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
+              end = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+              q = 'query($p:String!,$s:DateTime!,$e:DateTime!){ usage(projectId:$p, measurements:%s, groupBy:[SERVICE_ID], startDate:$s, endDate:$e){ measurement value tags{ serviceId } } }' % meas
+              d, e = gql(q, {'p': PROJECT, 's': start, 'e': end})
+              if e: print('  (usage query:', e, ')')
+              rows = {}
+              for u in (d or {}).get('usage') or []:
+                  sid = (u.get('tags') or {}).get('serviceId')
+                  rows.setdefault(names.get(sid, str(sid)), {})[u['measurement']] = u['value']
+              for n, m in sorted(rows.items()):
+                  print(f"   {n:<24} " + '  '.join(f"{k}={v:.2f}" for k, v in sorted(m.items())))
+              q2 = 'query($p:String!){ estimatedUsage(projectId:$p, measurements:%s){ measurement estimatedValue projectId } }' % meas
+              d, e = gql(q2, {'p': PROJECT})
+              if e: print('  (estimatedUsage query:', e, ')')
+              for u in (d or {}).get('estimatedUsage') or []:
+                  print('   project estimate this month:', u.get('measurement'), u.get('estimatedValue'))
+
+          print('\n=== 4. Variables that link services (names only; URL values shown as host name only)')
+          PAT = re.compile(r'(WHATSAPP|RULE_ENGINE|ANALYTICS|UPSTREAM|BASE_URL|_URL$|WORKER_MODE|NUM_|CONCURRENCY|LANES|REPLICA)', re.I)
+          SECRET = re.compile(r'(KEY|SECRET|TOKEN|PASSWORD|PASS|DATABASE|DSN|CREDENTIAL)', re.I)
+          for env in envs:
+              for sid, n in sorted(names.items(), key=lambda x: x[1]):
+                  d, e = gql('query($p:String!,$e:String!,$s:String!){ variables(projectId:$p, environmentId:$e, serviceId:$s) }', {'p': PROJECT, 'e': env['id'], 's': sid})
+                  v = (d or {}).get('variables')
+                  if not isinstance(v, dict):
+                      continue
+                  shown = []
+                  for k in sorted(v):
+                      if SECRET.search(k) or not PAT.search(k):
+                          continue
+                      val = str(v[k])
+                      if val.startswith('http'):
+                          val = 'host:' + (urlparse(val).hostname or '?')
+                      elif len(val) > 40:
+                          val = '<long>'
+                      shown.append(f'{k}={val}')
+                  if shown:
+                      print(f"   [{env['name']}] {n}: " + ' | '.join(shown))
+                  has = [k for k in v if re.search('whatsapp', k, re.I)]
+                  if has: print(f"   [{env['name']}] {n}: WHATSAPP variable names: {has}")
+          PY
