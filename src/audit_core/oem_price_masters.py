@@ -33,10 +33,12 @@ from pydantic import BaseModel
 from sqlalchemy import Connection, text
 
 from audit_core.db import set_platform_super_admin_context, set_tenant_context
+from audit_core.authorization import AuthorizationError
 from audit_core.dependencies import (
-    HumanAdminRequest,
+    get_bearer_token,
     get_connection,
-    require_super_admin_request,
+    get_human_admin_request,
+    get_human_principal,
 )
 from audit_core.discount_schemes import (
     add_discount_benefit,
@@ -57,6 +59,12 @@ from audit_core.price_lists import (
     create_price_list_version,
     publish_price_list_version,
 )
+from audit_core.security import HumanPrincipal
+from audit_core.security_authorization import (
+    SecurityAuthorizationClient,
+    get_security_authorization_client,
+)
+from audit_core.uc03_p2_access import check_p2_permission
 
 router = APIRouter(prefix="/v1/admin/oem-masters", tags=["admin-oem-masters"])
 
@@ -1329,9 +1337,41 @@ def _build_preview(parsed: ParseResult, kind: str) -> dict[str, Any]:
 
 
 # ── routes ──────────────────────────────────────────────────────────────────────
+UPLOAD_PERMISSION = "audit.master.upload"
+
+
+class _Uploader(BaseModel):
+    user_id: str
+
+
+def authorize_master_upload(
+    *,
+    tenant_id: str,
+    bearer_token: str,
+    human_principal: HumanPrincipal,
+    authorization_client: SecurityAuthorizationClient,
+) -> _Uploader:
+    """SuperAdmin, or a person Security allows `audit.master.upload` on this project
+    (Team Lead and Project Manager by default). Nobody else."""
+    try:
+        if get_human_admin_request(bearer_token, human_principal).admin_context.is_super_admin:
+            return _Uploader(user_id=human_principal.subject)
+    except AuthorizationError:
+        pass  # not an administrator: the project permission decides
+    check_p2_permission(
+        tenant_id=tenant_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        permission_key=UPLOAD_PERMISSION,
+    )
+    return _Uploader(user_id=human_principal.subject)
+
+
 @router.post("/uploads", response_model=MasterUploadPreview)
 async def upload_oem_master(
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    bearer_token: Annotated[str, Depends(get_bearer_token)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
     tenant_id: Annotated[str, Form(alias="tenantId")],
     master_kind: Annotated[MasterKind, Form(alias="masterKind")],
@@ -1341,6 +1381,10 @@ async def upload_oem_master(
 ) -> MasterUploadPreview:
     """Effective date: the file's own (its sheet, else its name) unless the
     admin enters one, which wins (decision 2026-09-30)."""
+    admin_request = authorize_master_upload(
+        tenant_id=tenant_id, bearer_token=bearer_token, human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
     content = await file.read()
     if not content:
         raise ValidationError(detail="Uploaded file is empty.")
@@ -1495,11 +1539,16 @@ async def upload_oem_master(
 
 @router.get("/uploads", response_model=list[MasterUploadRow])
 def list_oem_master_uploads(
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    bearer_token: Annotated[str, Depends(get_bearer_token)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
     tenant_id: Annotated[str, Query(alias="tenantId")],
 ) -> list[MasterUploadRow]:
-    del admin_request
+    authorize_master_upload(
+        tenant_id=tenant_id, bearer_token=bearer_token, human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
     set_platform_super_admin_context(connection)
     set_tenant_context(connection, tenant_id)
     rows = connection.execute(
@@ -1534,11 +1583,16 @@ def list_oem_master_uploads(
 @router.get("/uploads/{upload_id}", response_model=MasterUploadPreview)
 def get_oem_master_upload(
     upload_id: UUID,
-    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    bearer_token: Annotated[str, Depends(get_bearer_token)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
     tenant_id: Annotated[str, Query(alias="tenantId")],
 ) -> MasterUploadPreview:
-    del admin_request
+    authorize_master_upload(
+        tenant_id=tenant_id, bearer_token=bearer_token, human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
     set_platform_super_admin_context(connection)
     set_tenant_context(connection, tenant_id)
     row = connection.execute(
