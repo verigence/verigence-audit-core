@@ -104,8 +104,9 @@ def test_a_person_who_is_not_a_super_admin_loads_price_lists_only(connection, cl
 
 
 def test_the_template_downloads_for_an_uploader_and_a_file_without_a_date_can_be_checked(connection, client_for, monkeypatch) -> None:  # noqa: F811
-    from audit_core.oem_master_templates import build_template
     from test_oem_master_templates import _real_price_workbook
+
+    from audit_core.oem_master_templates import build_template
 
     _admin(monkeypatch, super_admin=False)
     client = client_for(_Auth("audit.master.upload"))

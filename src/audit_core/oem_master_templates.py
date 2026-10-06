@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from io import BytesIO
 from typing import Any
+from zipfile import BadZipFile
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.exceptions import InvalidFileException
 
 from audit_core.oem_master_parsers import (
     STANDARD_PRICE_COLUMNS,
@@ -216,7 +218,7 @@ def refuse_template_samples(content: bytes) -> str | None:
     """Plain words for the person when a workbook still has a template's sample cells; None when it has none."""
     try:
         workbook = load_workbook(BytesIO(content), data_only=True, read_only=True)
-    except Exception:  # not a workbook: the reader reports that in its own words
+    except (BadZipFile, InvalidFileException, KeyError, OSError, ValueError):  # not a workbook: the reader says so itself
         return None
     for sheet in workbook.worksheets:
         for row in sheet.iter_rows(values_only=True):

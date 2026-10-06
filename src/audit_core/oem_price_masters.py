@@ -32,8 +32,8 @@ from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import Connection, text
 
-from audit_core.db import set_platform_super_admin_context, set_tenant_context
 from audit_core.authorization import AuthorizationError
+from audit_core.db import set_platform_super_admin_context, set_tenant_context
 from audit_core.dependencies import (
     get_bearer_token,
     get_connection,
