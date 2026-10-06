@@ -43,3 +43,9 @@ jobs:
           grep 'hr_security_check_failed' /tmp/hr.log | sed -E 's/.*permission=([^ ]+).*/\1/' | sort | uniq -c | sort -rn | head -12 || true
           echo "--- check-in/out timing lines"
           grep 'hr_attendance_timing' /tmp/hr.log | cut -c1-230 | tail -8 || true
+          echo "--- /hr/v1/me answers (status codes, count)"
+          grep -E '"GET /hr/v1/me' /tmp/hr.log | sed -E 's/.*"GET \/hr\/v1\/me[^"]*" ([0-9]+).*/\1/' | sort | uniq -c || true
+          echo "--- Security check failures by kind (batch and single), count"
+          grep -E 'hr_security_check_failed|hr_security_token_failed' /tmp/hr.log | sed -E 's/.*(hr_security_[a-z_]+).*(http_status=[0-9]+)?.*/\1 \2/' | sort | uniq -c | head -12 || true
+          echo "--- last 6 failure lines (no secrets in these lines)"
+          grep -E 'hr_security_check_failed|hr_security_token_failed' /tmp/hr.log | tail -6 | cut -c1-230 || true
