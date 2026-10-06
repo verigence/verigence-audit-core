@@ -140,3 +140,5 @@ jobs:
 # 2026-10-06 employee self-edit, e-mail/mobile change requests, immediate suspension
 
 # 2026-10-06 CI clean-up of HRMgmt dev (types, format; infinite claim amount refused)
+
+# 2026-10-06 status direct (CEO/SuperAdmin), daily attendance: joining date never hides a check-in, log of counts
