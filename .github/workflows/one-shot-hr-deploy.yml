@@ -142,3 +142,5 @@ jobs:
 # 2026-10-06 CI clean-up of HRMgmt dev (types, format; infinite claim amount refused)
 
 # 2026-10-06 status direct (CEO/SuperAdmin), daily attendance: joining date never hides a check-in, log of counts
+
+# 2026-10-06 menu permissions asked in one batch call (/hr/v1/me)
