@@ -593,6 +593,52 @@ def _price_sheet_source(connection: Connection, *, tenant_id: str, price_list_ve
     return [str(name) for name in rows]
 
 
+_PRICE_VERSIONS_LIMIT = 60
+
+
+@router.get("/price-versions")
+def price_versions(
+    tenant_id: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """Every price list version the project has (its WEF dates), newest first, with the files each was
+    loaded from. The browse screen lists these, so a person can pick a date and compare dates. Read only."""
+    _auth(connection, tenant_id, human_principal, authorization_client)
+    rows = connection.execute(
+        text(
+            """
+            SELECT pl.price_list_code, pl.price_list_name, plv.price_list_version_id, plv.version_no,
+                   plv.effective_from, plv.effective_to, plv.lifecycle_status
+            FROM auditcore.price_list_versions plv
+            JOIN auditcore.price_lists pl
+              ON pl.tenant_id = plv.tenant_id AND pl.price_list_id = plv.price_list_id
+            WHERE plv.tenant_id = :t AND plv.lifecycle_status IN ('PUBLISHED', 'RETIRED')
+            ORDER BY plv.effective_from DESC, plv.version_no DESC, plv.price_list_version_id DESC
+            LIMIT :limit
+            """
+        ),
+        {"t": tenant_id, "limit": _PRICE_VERSIONS_LIMIT},
+    ).mappings().all()
+    return {
+        "versions": [
+            {
+                "priceListVersionId": str(row["price_list_version_id"]),
+                "priceList": row["price_list_name"] or row["price_list_code"],
+                "version": row["version_no"],
+                "effectiveFrom": row["effective_from"],
+                "effectiveTo": row["effective_to"],
+                "status": row["lifecycle_status"],
+                "sourceFiles": _price_sheet_source(
+                    connection, tenant_id=tenant_id, price_list_version_id=str(row["price_list_version_id"])
+                ),
+            }
+            for row in rows
+        ]
+    }
+
+
 @router.get("/price-sheet")
 def price_sheet(
     tenant_id: str,

@@ -151,5 +151,12 @@ def test_the_standard_routes_answer_over_http(connection) -> None:  # noqa: F811
         assert all(v["standard"]["wefDate"] == "2026-09-01" for v in listed["vehicles"])
         assert client.get(f"{base}/price-sheet", params={"on": "2026-09-15", "model": "thar", "variant": "mx5"}).json()["total"] == 1
         assert client.get(f"{base}/price-sheet", params={"on": "2026-01-15"}).json()["vehicles"] == []
+        versions = client.get(f"{base}/price-versions")
+        assert versions.status_code == 200, versions.text
+        listed_versions = versions.json()["versions"]
+        assert [v["effectiveFrom"] for v in listed_versions] == ["2026-09-01"]  # newest first
+        assert listed_versions[0]["version"] == 1 and listed_versions[0]["status"] in ("PUBLISHED", "RETIRED")
+        assert set(listed_versions[0]) == {"priceListVersionId", "priceList", "version", "effectiveFrom", "effectiveTo",
+                                           "status", "sourceFiles"}
     finally:
         app.dependency_overrides.clear()
