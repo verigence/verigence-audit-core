@@ -154,4 +154,32 @@ jobs:
                       print(f"   [{env['name']}] {n}: " + ' | '.join(shown))
                   has = [k for k in v if re.search('whatsapp', k, re.I)]
                   if has: print(f"   [{env['name']}] {n}: WHATSAPP variable names: {has}")
+          print('\n=== 5. Daily usage, last 7 days (UTC days, oldest first)')
+          if names:
+              for back in range(7, 0, -1):
+                  day0 = (datetime.now(timezone.utc) - timedelta(days=back)).replace(hour=0, minute=0, second=0, microsecond=0)
+                  day1 = day0 + timedelta(days=1)
+                  q = 'query($p:String!,$s:DateTime!,$e:DateTime!){ usage(projectId:$p, measurements:[CPU_USAGE, MEMORY_USAGE_GB], groupBy:[SERVICE_ID], startDate:$s, endDate:$e){ measurement value tags{ serviceId } } }'
+                  d, e = gql(q, {'p': PROJECT, 's': day0.strftime('%Y-%m-%dT%H:%M:%SZ'), 'e': day1.strftime('%Y-%m-%dT%H:%M:%SZ')})
+                  if e: print('  (daily query:', e, ')'); break
+                  rows = {}
+                  for u in (d or {}).get('usage') or []:
+                      n = names.get((u.get('tags') or {}).get('serviceId'), 'deleted-service')
+                      rows.setdefault(n, {})[u['measurement']] = u['value']
+                  top = sorted(rows.items(), key=lambda kv: -kv[1].get('MEMORY_USAGE_GB', 0))[:4]
+                  print('  ' + day0.strftime('%m-%d') + '  ' + ' | '.join(f"{n} cpu={m.get('CPU_USAGE',0):.1f} mem={m.get('MEMORY_USAGE_GB',0):.0f}" for n, m in top))
           PY
+      - name: Replicas and regions (Railway CLI)
+        shell: bash
+        run: |
+          set -uo pipefail
+          npm install --global @railway/cli >/dev/null 2>&1
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --json >/dev/null 2>&1 || echo 'link failed'
+          railway service list --json > /tmp/services.json 2>/tmp/err.txt || { echo "service list failed:"; head -c 300 /tmp/err.txt; exit 0; }
+          python3 - <<'PY2'
+          import json
+          rows = json.load(open('/tmp/services.json'))
+          for r in sorted(rows, key=lambda x: x.get('name', '')):
+              regs = [f"{g.get('name')}={g.get('configured')}" for g in (r.get('regions') or [])]
+              print(f"   {r.get('name'):<24} regions={regs} keys={sorted(k for k in r if k not in ('id','name'))[:8]}")
+          PY2
