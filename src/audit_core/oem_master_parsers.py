@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from io import BytesIO
 from typing import Any
@@ -339,6 +339,12 @@ def parse_price_list(content: bytes, *, filename: str | None = None) -> ParseRes
     if sheet is None:
         sheet = workbook[workbook.sheetnames[0]]
 
+    if STANDARD_PRICE_META_SHEET in workbook.sheetnames and (
+        workbook[STANDARD_PRICE_META_SHEET]["B1"].value == STANDARD_PRICE_META_KEY
+    ):
+        # the Verigence template: read strictly, never by guessing
+        result = _parse_standard_template(workbook, sheet)
+        return _with_file_date(result, filename)
     rows = list(sheet.iter_rows(values_only=True))
     if not rows:
         raise MasterParseError("Price list sheet is empty.")
@@ -347,6 +353,10 @@ def parse_price_list(content: bytes, *, filename: str | None = None) -> ParseRes
         result = _parse_dealer_sheets(workbook, header_seen=header)
     else:
         result = _parse_consolidated(rows)
+    return _with_file_date(result, filename)
+
+
+def _with_file_date(result: ParseResult, filename: str | None) -> ParseResult:
     from_name = _loose_date_hint(filename or "")
     if result.effective_from_hint is None and from_name is not None:
         result.effective_from_hint = from_name
@@ -358,6 +368,202 @@ def parse_price_list(content: bytes, *, filename: str | None = None) -> ParseRes
                 f"The sheet says effective {result.effective_from_hint.isoformat()} but the file name says "
                 f"{from_name.isoformat()}; enter the date to be sure."
             )
+    return result
+
+
+# ── the Verigence price list template: one row per vehicle, exact columns ───────
+STANDARD_PRICE_META_SHEET = "_meta"
+STANDARD_PRICE_META_KEY = "VERIGENCE_PRICE_LIST"
+STANDARD_PRICE_VERSION = "1"
+STANDARD_PRICE_COLUMNS = (
+    "Model", "Variant", "Trim", "Fuel", "Transmission", "Drive", "Seater", "Insurance Type",
+    "Ex-Showroom Price", "TCS", "Insurance", "Extended Warranty (4th Year)", "Extended Warranty (4th & 5th Year)",
+    "Accessories Kit", "Essential Accessories", "RSA (1 Year)", "FASTag", "Registration (Without Hypothecation)",
+    "Hypothecation Charge", "On-Road Price (Without Hypothecation, Without Extended Warranty)",
+    "Minimum Booking Amount", "Extra Charge 1 Name", "Extra Charge 1 Amount", "Extra Charge 2 Name", "Extra Charge 2 Amount",
+)
+_STANDARD_REQUIRED = (
+    "Model", "Variant", "Ex-Showroom Price", "Insurance", "Registration (Without Hypothecation)",
+    "On-Road Price (Without Hypothecation, Without Extended Warranty)",
+)
+# the price lines that add to the on-road price in the template, with the component each becomes
+_STANDARD_COMPONENT_COLUMNS = (
+    ("EX_SHOWROOM", "Ex-Showroom Price"), ("TCS", "TCS"), ("INSURANCE", "Insurance"),
+    ("EXT_WARRANTY_4TH_YR", "Extended Warranty (4th Year)"), ("EXT_WARRANTY_4TH_5TH_YR", "Extended Warranty (4th & 5th Year)"),
+    ("ACCESSORIES_KIT", "Accessories Kit"), ("ESSENTIAL_ACCESSORIES", "Essential Accessories"),
+    ("RSA_1YR", "RSA (1 Year)"), ("FASTAG", "FASTag"),
+)
+_STANDARD_NOT_IN_ON_ROAD = ("EXT_WARRANTY_4TH_YR", "EXT_WARRANTY_4TH_5TH_YR")
+
+
+def _norm_header(value: Any) -> str:
+    return re.sub(r"\s+", " ", (_text(value) or "")).strip().upper()
+
+
+def _standard_wef(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    body = _text(value)
+    if not body:
+        return None
+    return _date_hint(f"w.e.f. {body}") or _loose_date_hint(body)
+
+
+def _parse_standard_template(workbook: Any, sheet: Any) -> ParseResult:
+    result = ParseResult(kind="PRICE_LIST", meta={"layout": "VERIGENCE_TEMPLATE"})
+    if str(workbook[STANDARD_PRICE_META_SHEET]["B2"].value) != STANDARD_PRICE_VERSION:
+        raise MasterParseError("This price list template is an old version. Download the current template and copy the rows into it.")
+    rows = [list(r) for r in sheet.iter_rows(values_only=True)]
+    wanted = [_norm_header(c) for c in STANDARD_PRICE_COLUMNS]
+    header_row = next((i for i, raw in enumerate(rows[:6]) if "MODEL" in [_norm_header(c) for c in raw] and "VARIANT" in [_norm_header(c) for c in raw]), None)
+    if header_row is None:
+        raise MasterParseError("The header row of the template was not found. Do not rename, move or delete the template's header row.")
+    for raw in rows[:header_row]:
+        for col, cell in enumerate(raw):
+            if "WEF" in _norm_header(cell) and result.effective_from_hint is None:
+                result.effective_from_hint = next((_standard_wef(v) for v in raw[col + 1:] if _text(v) or isinstance(v, (date, datetime))), None)
+    headers = [_norm_header(c) for c in rows[header_row]]
+    while headers and not headers[-1]:
+        headers.pop()
+    unknown = [h for h in headers if h not in wanted]
+    missing = [STANDARD_PRICE_COLUMNS[i] for i, h in enumerate(wanted) if h not in headers]
+    if unknown or missing:
+        raise MasterParseError(
+            "The columns are not those of the template"
+            + (f"; not in the template: {', '.join(unknown)}" if unknown else "")
+            + (f"; missing: {', '.join(missing)}" if missing else "")
+            + ". Use the template as downloaded, with no column added, renamed or removed."
+        )
+    if len(headers) != len(set(headers)):
+        raise MasterParseError("A column appears twice in the template's header row.")
+    col_of = {h: i for i, h in enumerate(headers)}
+
+    def get(raw: list[Any], name: str) -> Any:
+        i = col_of[_norm_header(name)]
+        return raw[i] if i < len(raw) else None
+
+    seen: dict[tuple[str, ...], int] = {}
+    blank_as_zero = 0
+    for idx, raw in enumerate(rows[header_row + 1:], start=header_row + 2):
+        if all(_text(c) is None for c in raw):
+            continue
+        model_name, variant_name = _text(get(raw, "Model")), _text(get(raw, "Variant"))
+        if not model_name or not variant_name:
+            result.errors.append(f"row {idx}: the model and the variant are both required")
+            continue
+        label = f"row {idx} ({model_name} / {variant_name})"
+        insurance_type = (_text(get(raw, "Insurance Type")) or "STANDARD").upper()
+        if insurance_type not in {"STANDARD", "PRIVATE", "COMMERCIAL"}:
+            result.errors.append(f"{label}: Insurance Type must be blank, PRIVATE or COMMERCIAL, not '{insurance_type}'")
+            continue
+        values: dict[str, Decimal] = {}
+        bad = False
+        for key, column in _STANDARD_COMPONENT_COLUMNS + (("REGISTRATION_INDIVIDUAL", "Registration (Without Hypothecation)"),):
+            raw_value = get(raw, column)
+            number = _money(raw_value)
+            if number is None and _text(raw_value) is None:
+                if column in _STANDARD_REQUIRED:
+                    result.errors.append(f"{label}: {column} is required")
+                    bad = True
+                    break
+                number = Decimal(0)
+                blank_as_zero += 1
+            if number is None:
+                result.errors.append(f"{label}: {column} must be a number, not '{_text(raw_value)}'")
+                bad = True
+                break
+            if number < 0:
+                result.errors.append(f"{label}: {column} cannot be negative")
+                bad = True
+                break
+            values[key] = number
+        if bad:
+            continue
+        if values["EX_SHOWROOM"] <= 0:
+            result.errors.append(f"{label}: Ex-Showroom Price must be more than zero")
+            continue
+        onroad = _money(get(raw, _STANDARD_REQUIRED[-1]))
+        if onroad is None:
+            result.errors.append(f"{label}: the on-road price is required and must be a number")
+            continue
+        calculated = sum((v for k, v in values.items() if k not in _STANDARD_NOT_IN_ON_ROAD), Decimal(0))
+        if abs(calculated - onroad) > _MONEY_TOLERANCE:
+            result.errors.append(
+                f"{label}: Ex-showroom, TCS, Insurance, Accessories Kit, Essential Accessories, RSA, FASTag and Registration add up to "
+                f"{_q2(calculated)} but the on-road price says {_q2(onroad)} (the on-road price carries no extended warranty)"
+            )
+            continue
+        registration = values["REGISTRATION_INDIVIDUAL"]
+        components = dict(values)
+        components["REGISTRATION_CORPORATE"] = registration
+        notes: dict[str, str] = {}
+        hypo_raw = get(raw, "Hypothecation Charge")
+        hypo = _money(hypo_raw)
+        if hypo is None and _text(hypo_raw) is not None:
+            result.errors.append(f"{label}: Hypothecation Charge must be a number, not '{_text(hypo_raw)}'")
+            continue
+        if hypo is not None:
+            if hypo < 0:
+                result.errors.append(f"{label}: Hypothecation Charge cannot be negative")
+                continue
+            components["HYPOTHECATION_CHARGE"] = hypo
+            components["REGISTRATION_WITH_HYPO"] = registration + hypo
+        min_raw = get(raw, "Minimum Booking Amount")
+        minimum = _money(min_raw)
+        if minimum is None and _text(min_raw) is not None:
+            result.errors.append(f"{label}: Minimum Booking Amount must be a number, not '{_text(min_raw)}'")
+            continue
+        if minimum is not None:
+            components["MIN_BOOKING_AMOUNT"] = minimum
+        extras_ok = True
+        for n in (1, 2):
+            name, amount_raw = _text(get(raw, f"Extra Charge {n} Name")), get(raw, f"Extra Charge {n} Amount")
+            amount = _money(amount_raw)
+            if name is None and _text(amount_raw) is None:
+                continue
+            if name is None or amount is None or amount < 0:
+                result.errors.append(f"{label}: Extra Charge {n} needs both a name and an amount (a number)")
+                extras_ok = False
+                break
+            slug = _slug_model(name)[:70]
+            components[f"EXTRA_CHARGE_{slug}"] = amount
+            notes[f"EXTRA_CHARGE_{slug}"] = name
+        if not extras_ok:
+            continue
+        fuel = _fuel_from(get(raw, "Fuel"))
+        key = (_slug_model(model_name), variant_name.upper(), fuel or "", (_text(get(raw, "Transmission")) or "").upper(),
+               (_text(get(raw, "Drive")) or "").upper(), _seater_from(get(raw, "Seater")) or "", insurance_type)
+        if key in seen:
+            result.errors.append(f"{label}: repeats the vehicle on row {seen[key]}; nothing is loaded until it is fixed")
+            continue
+        seen[key] = idx
+        result.price_rows.append(
+            PriceRow(
+                row_no=idx,
+                category="BEV" if fuel == "ELECTRIC" else "ICE" if fuel else "UNSPECIFIED",
+                model_name=model_name,
+                variant_name=variant_name,
+                trim=_text(get(raw, "Trim")),
+                fuel=fuel,
+                transmission=(_text(get(raw, "Transmission")) or "").upper() or None,
+                drive=(_text(get(raw, "Drive")) or "").upper() or None,
+                seater=_seater_from(get(raw, "Seater")),
+                components={k: _q2(v) for k, v in components.items()},
+                onroad_individual=_q2(onroad),
+                onroad_corporate=_q2(onroad),
+                registration_basis=insurance_type,
+                source_sheet=sheet.title,
+                component_notes=notes,
+            )
+        )
+    if blank_as_zero:
+        result.warnings.append(f"{blank_as_zero} empty price cell(s) were read as nil (no such line for that vehicle)")
+    result.meta["models"] = sorted({r.model_name for r in result.price_rows})
+    result.meta["categoryCounts"] = _counts(r.category for r in result.price_rows)
+    if not result.price_rows and not result.errors:
+        raise MasterParseError("The template contains no vehicle rows.")
     return result
 
 
@@ -1487,6 +1693,12 @@ def parse_master(kind: str, content: bytes, *, filename: str | None = None) -> P
     parser = _PARSERS.get(kind)
     if parser is None:
         raise MasterParseError(f"Unknown master kind '{kind}'.")
+    if kind in ("PRICE_LIST", "CORPORATE_POLICY", "DISCOUNT_GRID"):
+        from audit_core.oem_master_templates import refuse_template_samples
+
+        sample = refuse_template_samples(content)
+        if sample:
+            raise MasterParseError(sample)
     if kind in ("PRICE_LIST", "DISCOUNT_GRID"):
         return parser(content, filename=filename)
     return parser(content)

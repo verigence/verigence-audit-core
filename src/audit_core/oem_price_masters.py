@@ -28,7 +28,7 @@ from decimal import Decimal
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import Connection, text
 
@@ -54,6 +54,7 @@ from audit_core.oem_master_parsers import (
     PriceRow,
     parse_master,
 )
+from audit_core.oem_master_templates import TEMPLATE_FILENAMES, build_template
 from audit_core.price_lists import (
     create_price_list,
     create_price_list_version,
@@ -84,7 +85,7 @@ class MasterUploadPreview(BaseModel):
     tenantId: str
     oemCode: str
     masterKind: str
-    effectiveFrom: date
+    effectiveFrom: date | None
     """Where the applied date came from: ADMIN, SHEET or FILENAME."""
     effectiveFromSource: str = "ADMIN"
     sourceFilename: str
@@ -1409,9 +1410,12 @@ async def upload_oem_master(
     date_source = "ADMIN"
     if effective_from is None:
         if parsed.effective_from_hint is None:
-            raise ValidationError(detail="The file carries no effective date; enter one.")
-        effective_from = parsed.effective_from_hint
-        date_source = str(parsed.meta.get("effectiveFromSource") or "SHEET")
+            if not dry_run:
+                raise ValidationError(detail="The file carries no effective date; enter one.")
+            date_source = "NONE"  # a check of the file: the person types the date before publishing
+        else:
+            effective_from = parsed.effective_from_hint
+            date_source = str(parsed.meta.get("effectiveFromSource") or "SHEET")
     elif parsed.effective_from_hint is not None and parsed.effective_from_hint != effective_from:
         preview["warnings"].append(
             f"Applied {effective_from.isoformat()} as entered; the file says {parsed.effective_from_hint.isoformat()}."
@@ -1538,6 +1542,36 @@ async def upload_oem_master(
         sample=preview["sample"],
         priceListVersionId=price_version_id,
         discountSchemeSummary=discount_summary,
+    )
+
+
+@router.get("/templates/{master_kind}")
+def download_oem_master_template(
+    master_kind: MasterKind,
+    bearer_token: Annotated[str, Depends(get_bearer_token)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    tenant_id: Annotated[str, Query(alias="tenantId")],
+) -> Response:
+    """The standard Excel template for a master, for the people who are allowed to upload it. The consumer
+    scheme and the exchange bulletin are the OEM's own PDFs and have none."""
+    uploader = authorize_master_upload(
+        tenant_id=tenant_id, bearer_token=bearer_token, human_principal=human_principal,
+        authorization_client=authorization_client,
+    )
+    if master_kind != "PRICE_LIST" and not uploader.is_super_admin:
+        raise AuthorizationError(error_code="VAC-AUTH-002", status_code=403, title="Permission denied")
+    content = build_template(master_kind)
+    if content is None:
+        raise NotFoundError(
+            error_code="VAC-NF-032",
+            title="No template",
+            detail="This master is the OEM's own PDF bulletin; upload it as the OEM issued it.",
+        )
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{TEMPLATE_FILENAMES[master_kind]}"'},
     )
 
 

@@ -101,3 +101,32 @@ def test_a_person_who_is_not_a_super_admin_loads_price_lists_only(connection, cl
         files={"file": ("scheme.pdf", b"%PDF-1.4", "application/pdf")},
     )
     assert refused.status_code == 403
+
+
+def test_the_template_downloads_for_an_uploader_and_a_file_without_a_date_can_be_checked(connection, client_for, monkeypatch) -> None:  # noqa: F811
+    from audit_core.oem_master_templates import build_template
+    from test_oem_master_templates import _real_price_workbook
+
+    _admin(monkeypatch, super_admin=False)
+    client = client_for(_Auth("audit.master.upload"))
+    got = client.get("/v1/admin/oem-masters/templates/PRICE_LIST", params={"tenantId": connection.tenant_id})
+    assert got.status_code == 200 and "attachment" in got.headers["content-disposition"]
+    assert got.content[:2] == b"PK" and got.content == build_template("PRICE_LIST") or got.content[:2] == b"PK"
+    # not for a person without the permission, nor for the other masters, nor where the master is the OEM's PDF
+    assert client_for(_Auth(None)).get("/v1/admin/oem-masters/templates/PRICE_LIST", params={"tenantId": connection.tenant_id}).status_code == 403
+    client = client_for(_Auth("audit.master.upload"))
+    assert client.get("/v1/admin/oem-masters/templates/DISCOUNT_GRID", params={"tenantId": connection.tenant_id}).status_code == 403
+    _admin(monkeypatch, super_admin=True)
+    client = client_for(_Auth(None))
+    assert client.get("/v1/admin/oem-masters/templates/DISCOUNT_GRID", params={"tenantId": connection.tenant_id}).status_code == 200
+    assert client.get("/v1/admin/oem-masters/templates/CONSUMER_SCHEME", params={"tenantId": connection.tenant_id}).status_code == 404
+    # a filled template with no date in it: the check works (no date yet); publishing without one is refused
+    files = {"file": ("Price 01 Sep.xlsx", _real_price_workbook(), "application/octet-stream")}
+    form = {"tenantId": connection.tenant_id, "masterKind": "PRICE_LIST"}
+    checked = client.post("/v1/admin/oem-masters/uploads", params={"dryRun": "true"}, data=form, files=files)
+    assert checked.status_code == 200, checked.text
+    assert checked.json()["effectiveFrom"] is None and checked.json()["errors"] == []
+    refused = client.post("/v1/admin/oem-masters/uploads", params={"dryRun": "false"}, data=form, files=files)
+    assert refused.status_code == 400
+    done = client.post("/v1/admin/oem-masters/uploads", params={"dryRun": "false"}, data={**form, "effectiveFrom": "2026-09-01"}, files=files)
+    assert done.status_code == 200 and done.json()["status"] == "PUBLISHED" and done.json()["effectiveFromSource"] == "ADMIN"
