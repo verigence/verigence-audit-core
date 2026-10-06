@@ -148,3 +148,5 @@ jobs:
 # 2026-10-06 rollback: HR menu goes back to asking Security per permission (batch timed out)
 
 # 2026-10-06 shadow check of the one-call permission batch (logs only)
+
+# 2026-10-06 shadow check also logs the one-by-one time
