@@ -40,6 +40,8 @@ PRICE_COMPONENT_TO_COMMERCIAL_KEY: dict[str, str] = {
     "EXT_WARRANTY_4TH_YR":     "additional_warranty_amount",
     "EXT_WARRANTY_4TH_5TH_YR": "additional_warranty_amount",
     "ACCESSORIES_KIT":         "accessories_cost",
+    # an EV sheet prices "Essential Accessories" where the others price the kit: same booking-form line
+    "ESSENTIAL_ACCESSORIES":   "accessories_cost",
     "RSA_1YR":                 "rsa_amount",
     "FASTAG":                  "fastag_amount",
     "REGISTRATION_INDIVIDUAL": "registration_charges",
