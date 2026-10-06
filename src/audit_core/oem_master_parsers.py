@@ -86,6 +86,8 @@ class PriceRow:
     onroad_corporate: Decimal
     registration_basis: str = "STANDARD"  # STANDARD / PRIVATE / COMMERCIAL
     source_sheet: str | None = None
+    # the dealer's own wording for a line that is a note rather than a column (an extra charge, a derived hypothecation)
+    component_notes: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -519,6 +521,8 @@ def _component_for_label(label: str) -> str | None:
         return "INSURANCE"
     if "WARRANTY" in up:
         return "EXT_WARRANTY_4TH_5TH_YR" if re.search(r"5\s*TH", up) else "EXT_WARRANTY_4TH_YR"
+    if "ESSENTIAL" in up and "ACCESSOR" in up:
+        return "ESSENTIAL_ACCESSORIES"
     if "ACCESSOR" in up:
         return "ACCESSORIES_KIT"
     if re.search(r"\bRSA\b", up) or "ROAD SIDE" in up or "ROADSIDE" in up:
@@ -556,9 +560,54 @@ def _labelled_cell_after(rows: list[Any], label: str) -> str | None:
         for col, cell in enumerate(raw):
             if _text(cell) and _text(cell).upper().rstrip(":") == label:
                 for value in raw[col + 1:]:
-                    if _text(value):
+                    # a sheet may repeat the label cell (merged cells); the value is the next different text
+                    if _text(value) and _text(value).upper().rstrip(":") != label:
                         return _text(value)
     return None
+
+
+# ── dealer per-model sheets ─────────────────────────────────────────────────────
+# Header-driven: columns are found by their printed labels, never by position, so a
+# sheet that adds, drops or re-orders a column is still read correctly -- or refused.
+_ATTRIBUTE_HEADERS = {
+    "FUEL": "fuel",
+    "TRANSMISSION": "transmission",
+    "DRIVE": "drive",
+    "SEATER": "seater",
+    "SEATERS": "seater",
+    "SEATS": "seater",
+    "SEATING": "seater",
+}
+_FUEL_TYPOS = {"DISEL": "DIESEL", "DEISEL": "DIESEL", "ELE": "ELECTRIC", "ELECTR": "ELECTRIC", "ELEC": "ELECTRIC"}
+_WITH_HYPO_RE = re.compile(r"\bWITH\s+HYPO", re.IGNORECASE)
+_HYPO_NOTE_RE = re.compile(r"HYPOTH\w*\s+CHARGES?\s*(?:RS\.?|₹)?\s*([\d,]+)", re.IGNORECASE)
+_MIN_BOOKING_RE = re.compile(r"MINIMUM\s+BOOKING\s+AMOUNT\s*:?\s*(?:RS\.?|₹)?\s*([\d,]+)", re.IGNORECASE)
+_EXTRA_CHARGE_RE = re.compile(
+    r"^\s*(?:\d+\s*[.)]\s*)?(?P<label>[A-Za-z][^=]*?CHARGES?[^=]*?)\s*=?\s*(?:RS\.?|₹)\s*(?P<amount>[\d,]+)\s*/?-?\s*$",
+    re.IGNORECASE,
+)
+# printed with the dealer's own wording; nothing here is an amount that adds to the on-road price
+NON_ADDITIVE_KEYS = frozenset(
+    {
+        "REGISTRATION_INDIVIDUAL",
+        "REGISTRATION_CORPORATE",
+        "REGISTRATION_WITH_HYPO",
+        "HYPOTHECATION_CHARGE",
+        "MIN_BOOKING_AMOUNT",
+    }
+)
+
+
+def is_extra_charge_key(key: str) -> bool:
+    return key.startswith("EXTRA_CHARGE_")
+
+
+def _header_label(rows: list[Any], header_row: int, letter_row: int, col: int) -> str:
+    return " ".join(
+        _text(rows[i][col]) or ""
+        for i in range(header_row, letter_row)
+        if col < len(rows[i]) and _text(rows[i][col])
+    )
 
 
 def _dealer_sheet_layout(rows: list[Any]) -> dict[str, Any] | None:
@@ -569,13 +618,42 @@ def _dealer_sheet_layout(rows: list[Any]) -> dict[str, Any] | None:
     )
     if letter_row is None:
         return None
+
+    def _upper_cells(i: int) -> list[str]:
+        return [(_text(c) or "").upper() for c in rows[i]]
+
     header_row = next(
-        (i for i in range(letter_row - 1, -1, -1)
-         if any(_text(c) and "VARIANT" in _text(c).upper() for c in rows[i])),
+        (i for i in range(letter_row - 1, -1, -1) if any("VARIANT" in c for c in _upper_cells(i))),
         None,
     )
-    if header_row is None:
-        return None
+    variant_col: int | None = None
+    trim_col: int | None = None
+    if header_row is not None:
+        variant_col = next(col for col, c in enumerate(_upper_cells(header_row)) if "VARIANT" in c)
+    else:
+        # the TRIM layout: either "TRIM | ... | TRIM | FUEL ..." (a full variant name, then the trim code)
+        # or a single TRIM column (the variant is then built from trim, fuel, transmission, drive, seats)
+        header_row = next(
+            (i for i in range(letter_row - 1, -1, -1)
+             if "TRIM" in _upper_cells(i) and any(re.search(r"EX[\s\-]?SHOWROOM", c) for c in _upper_cells(i))),
+            None,
+        )
+        if header_row is None:
+            return None
+        trim_cols = [col for col, c in enumerate(_upper_cells(header_row)) if c == "TRIM"]
+        if len(trim_cols) >= 2:
+            variant_col, trim_col = trim_cols[0], trim_cols[1]
+        else:
+            trim_col = trim_cols[0]
+
+    attribute_cols: dict[str, int] = {}
+    for col, c in enumerate(_upper_cells(header_row)):
+        name = _ATTRIBUTE_HEADERS.get(re.sub(r"\s+", "", c))
+        if name and name not in attribute_cols:
+            attribute_cols[name] = col
+    if variant_col is None and not {"fuel", "transmission", "drive", "seater"} <= set(attribute_cols):
+        return None  # no variant column and not enough to build one: refuse, never guess
+
     letter_by_col: dict[int, str] = {}
     formula_by_letter: dict[str, list[str]] = {}
     for col, cell in enumerate(rows[letter_row]):
@@ -585,19 +663,12 @@ def _dealer_sheet_layout(rows: list[Any]) -> dict[str, Any] | None:
         letter_by_col[col] = match.group(1)
         if match.group(2):
             formula_by_letter[match.group(1)] = [x for x in match.group(2).replace(" ", "").split("+") if x]
-    col_by_letter = {letter: col for col, letter in letter_by_col.items()}
 
-    def label(col: int) -> str:
-        return " ".join(
-            _text(rows[i][col]) or "" for i in range(header_row, letter_row) if col < len(rows[i]) and _text(rows[i][col])
-        )
-
-    variant_col = next(col for col, c in enumerate(rows[header_row]) if _text(c) and "VARIANT" in _text(c).upper())
     components: dict[str, int] = {}
     registration_cols: list[int] = []
     onroad_cols: list[int] = []
     for col in sorted(letter_by_col):
-        text_label = label(col).upper()
+        text_label = _header_label(rows, header_row, letter_row, col).upper()
         if "REGISTRATION" in text_label:
             registration_cols.append(col)
         elif "ON ROAD" in text_label or "ON-ROAD" in text_label or "ONROAD" in text_label:
@@ -608,22 +679,106 @@ def _dealer_sheet_layout(rows: list[Any]) -> dict[str, Any] | None:
                 components[key] = col
     if "EX_SHOWROOM" not in components or not registration_cols or not onroad_cols:
         return None
+
+    pairs: list[dict[str, Any]] = []
+    for reg_col in registration_cols:
+        onroad_col = next((c for c in onroad_cols if c > reg_col), None)
+        if onroad_col is None:
+            return None
+        combined = (
+            _header_label(rows, header_row, letter_row, reg_col)
+            + " " + _header_label(rows, header_row, letter_row, onroad_col)
+        )
+        if _WITH_HYPO_RE.search(combined):
+            kind = "WITH_HYPO"
+        elif "CORPORATE" in combined.upper():
+            kind = "CORPORATE"
+        else:
+            kind = "INDIVIDUAL"
+        pairs.append({"reg_col": reg_col, "onroad_col": onroad_col, "kind": kind, "letter": letter_by_col.get(onroad_col, "")})
+    if not any(p["kind"] == "INDIVIDUAL" for p in pairs):
+        pairs[0]["kind"] = "INDIVIDUAL"
     return {
         "letter_row": letter_row,
         "variant_col": variant_col,
+        "trim_col": trim_col,
+        "attribute_cols": attribute_cols,
         "components": components,
-        "registration_cols": registration_cols,
-        "onroad_cols": onroad_cols,
+        "pairs": pairs,
         "letter_by_col": letter_by_col,
-        "col_by_letter": col_by_letter,
         "formula_by_letter": formula_by_letter,
     }
 
 
+def _sheet_notes(rows: list[Any], start: int) -> dict[str, Any]:
+    """What the dealer prints under the table: the hypothecation charge, the minimum booking
+    amount and any other charge that carries an amount. A note with no amount is kept as text."""
+    found: dict[str, Any] = {"hypothecation": None, "minBooking": None, "extras": {}, "unpriced": []}
+    seen_text: set[str] = set()
+    for raw in rows[start:]:
+        for cell in raw:
+            body = _text(cell)
+            if not body or not isinstance(cell, str) or body in seen_text:
+                continue
+            seen_text.add(body)
+            if hit := _HYPO_NOTE_RE.search(body):
+                found["hypothecation"] = Decimal(hit.group(1).replace(",", ""))
+                continue
+            if hit := _MIN_BOOKING_RE.search(body):
+                found["minBooking"] = Decimal(hit.group(1).replace(",", ""))
+                continue
+            if hit := _EXTRA_CHARGE_RE.match(body):
+                label = _text(hit.group("label")) or ""
+                slug = _slug_model(label)[:70]
+                if slug:
+                    found["extras"][f"EXTRA_CHARGE_{slug}"] = (Decimal(hit.group("amount").replace(",", "")), label.rstrip(" =:-"))
+                continue
+            if re.search(r"\bCHARGES\b", body, re.IGNORECASE) and len(body) < 160:
+                found["unpriced"].append(body)
+    return found
+
+
+def _fuel_from(value: Any) -> str | None:
+    word = (_text(value) or "").upper()
+    if not word:
+        return None
+    word = _FUEL_TYPOS.get(word, word)
+    return _FUEL_TOKENS.get(word, word)
+
+
+def _seater_from(value: Any) -> str | None:
+    if value is None:
+        return None
+    match = re.search(r"\d{1,2}", str(value))
+    return match.group(0) if match else None
+
+
+def _check_pair(
+    result: ParseResult, *, cell: Any, pair: dict[str, Any], sheet_title: str, idx: int,
+    model_name: str, variant_name: str, sheet_sum: Decimal,
+) -> tuple[Decimal, Decimal] | None:
+    """One registration / on-road pair of a row: both read, and the on-road price equals the sheet's
+    own components plus that registration. Anything else is an error and the row is not loaded."""
+    registration = _money(cell(pair["reg_col"]))
+    onroad = _money(cell(pair["onroad_col"]))
+    if registration is None or onroad is None:
+        result.errors.append(f"sheet '{sheet_title}' row {idx} ({variant_name}): missing registration or on-road price")
+        return None
+    if abs(sheet_sum + registration - onroad) > _MONEY_TOLERANCE:
+        result.errors.append(
+            f"sheet '{sheet_title}' row {idx} ({model_name} / {variant_name}): components sum to "
+            f"{_q2(sheet_sum + registration)} but on-road is {_q2(onroad)}"
+        )
+        return None
+    return registration, onroad
+
+
 def _parse_dealer_sheets(workbook: Any, *, header_seen: list[str]) -> ParseResult:
     result = ParseResult(kind="PRICE_LIST", meta={"layout": "DEALER_PER_MODEL"})
-    seen: dict[tuple[str, ...], Any] = {}
+    seen: dict[tuple[str, ...], tuple[str, int]] = {}
+    seen_signatures: dict[tuple[str, ...], Any] = {}
     sheets_read = 0
+    blank_as_zero = 0
     for sheet in workbook.worksheets:
         rows = [list(r) for r in sheet.iter_rows(values_only=True)]
         layout = _dealer_sheet_layout(rows)
@@ -634,29 +789,51 @@ def _parse_dealer_sheets(workbook: Any, *, header_seen: list[str]) -> ParseResul
         if not model_name:
             result.errors.append(f"sheet '{sheet.title}': no model name")
             continue
-        fuel_hint = _labelled_cell_after(rows[: layout["letter_row"]], "FUEL TYPE")
-        fuel_hint = fuel_hint.upper() if fuel_hint else None
+        fuel_hint = _fuel_from(_labelled_cell_after(rows[: layout["letter_row"]], "FUEL TYPE"))
         electric = bool(re.search(r"\bEV\b|ELECTRIC|\bBEV\b", f"{model_name} {sheet.title} {fuel_hint or ''}".upper()))
         if result.effective_from_hint is None:
             blob = " ".join(str(c) for raw in rows[: layout["letter_row"]] for c in raw if isinstance(c, str))
             result.effective_from_hint = _date_hint(blob)
-        pairs = list(zip(layout["registration_cols"], layout["onroad_cols"]))
-        if len(pairs) == 1:
-            result.warnings.append(
-                f"sheet '{sheet.title}': one registration / on-road pair; the corporate basis takes the same figures"
-            )
+        notes = _sheet_notes(rows, layout["letter_row"] + 1)
+        for line in notes["unpriced"]:
+            result.meta.setdefault("notesWithoutAnAmount", []).append(f"{sheet.title}: {line}")
         comp_cols: dict[str, int] = layout["components"]
+        pairs: list[dict[str, Any]] = layout["pairs"]
+        individual = next(p for p in pairs if p["kind"] == "INDIVIDUAL")
+        corporate = next((p for p in pairs if p["kind"] == "CORPORATE"), None)
+        with_hypo = next((p for p in pairs if p["kind"] == "WITH_HYPO"), None)
+        attr_cols: dict[str, int] = layout["attribute_cols"]
 
         for idx, raw in enumerate(rows[layout["letter_row"] + 1:], start=layout["letter_row"] + 2):
             cell = _cell_reader(raw)
-            variant_name = _text(cell(layout["variant_col"]))
+            trim = _text(cell(layout["trim_col"])) if layout["trim_col"] is not None else None
+            attrs_from_cells = {
+                name: (_fuel_from(cell(col)) if name == "fuel" else _seater_from(cell(col)) if name == "seater"
+                       else (_text(cell(col)) or "").upper() or None)
+                for name, col in attr_cols.items()
+            }
+            if layout["variant_col"] is not None:
+                variant_name = _text(cell(layout["variant_col"]))
+            else:
+                parts = [trim, attrs_from_cells.get("fuel"), attrs_from_cells.get("transmission"),
+                         attrs_from_cells.get("drive"),
+                         f"{attrs_from_cells['seater']} STR" if attrs_from_cells.get("seater") else None]
+                variant_name = " ".join(p for p in parts if p) if trim else None
             ex_showroom = _money(cell(comp_cols["EX_SHOWROOM"]))
             if not variant_name or ex_showroom is None or ex_showroom <= 0:
                 continue
             components: dict[str, Decimal] = {}
             bad = False
             for key, col in comp_cols.items():
-                value = _money(cell(col))
+                raw_value = cell(col)
+                value = _money(raw_value)
+                if value is None and raw_value is None:
+                    if key == "INSURANCE":
+                        result.errors.append(f"sheet '{sheet.title}' row {idx} ({variant_name}): Insurance is blank")
+                        bad = True
+                        break
+                    value = Decimal(0)  # a component the sheet leaves empty is nil for that vehicle
+                    blank_as_zero += 1
                 if value is None:
                     result.errors.append(f"sheet '{sheet.title}' row {idx}: non-numeric {key} '{cell(col)}'")
                     bad = True
@@ -664,54 +841,92 @@ def _parse_dealer_sheets(workbook: Any, *, header_seen: list[str]) -> ParseResul
                 components[key] = value
             if bad:
                 continue
-            basis_values: list[tuple[Decimal, Decimal]] = []
-            for reg_col, onroad_col in pairs:
-                registration = _money(cell(reg_col))
-                onroad = _money(cell(onroad_col))
-                if registration is None or onroad is None:
-                    result.errors.append(f"sheet '{sheet.title}' row {idx} ({variant_name}): missing registration or on-road price")
-                    bad = True
-                    break
-                letters = layout["formula_by_letter"].get(layout["letter_by_col"].get(onroad_col, ""))
-                if letters:
-                    calc = sum((_money(cell(layout["col_by_letter"][x])) or Decimal(0) for x in letters
-                                if x in layout["col_by_letter"]), Decimal(0))
-                else:
-                    calc = sum(components.values(), Decimal(0)) + registration
-                if abs(calc - onroad) > _MONEY_TOLERANCE:
-                    result.errors.append(
-                        f"sheet '{sheet.title}' row {idx} ({model_name} / {variant_name}): components sum to "
-                        f"{_q2(calc)} but on-road is {_q2(onroad)}"
-                    )
-                    bad = True
-                    break
-                basis_values.append((registration, onroad))
-            if bad:
+            sheet_sum = sum(components.values(), Decimal(0))
+
+            individual_values = _check_pair(
+                result, cell=cell, pair=individual, sheet_title=sheet.title, idx=idx,
+                model_name=model_name, variant_name=variant_name, sheet_sum=sheet_sum,
+            )
+            if individual_values is None:
                 continue
-            (reg_ind, onroad_ind) = basis_values[0]
-            (reg_corp, onroad_corp) = basis_values[1] if len(basis_values) > 1 else basis_values[0]
+            (reg_ind, onroad_ind) = individual_values
+            reg_corp, onroad_corp = reg_ind, onroad_ind
+            if corporate is not None:
+                corporate_values = _check_pair(
+                result, cell=cell, pair=corporate, sheet_title=sheet.title, idx=idx,
+                model_name=model_name, variant_name=variant_name, sheet_sum=sheet_sum,
+            )
+                if corporate_values is None:
+                    continue
+                (reg_corp, onroad_corp) = corporate_values
+                if (reg_corp, onroad_corp) != (reg_ind, onroad_ind):
+                    result.warnings.append(
+                        f"sheet '{sheet.title}' row {idx} ({variant_name}): the corporate columns differ from the individual ones"
+                    )
+            hypo: Decimal | None = notes["hypothecation"]
+            hypo_source = "NOTE" if hypo is not None else None
+            if with_hypo is not None:
+                hypo_values = _check_pair(
+                result, cell=cell, pair=with_hypo, sheet_title=sheet.title, idx=idx,
+                model_name=model_name, variant_name=variant_name, sheet_sum=sheet_sum,
+            )
+                if hypo_values is None:
+                    continue
+                (reg_with, onroad_with) = hypo_values
+                column_charge = reg_with - reg_ind
+                if abs((onroad_with - onroad_ind) - column_charge) > _MONEY_TOLERANCE or column_charge <= 0:
+                    result.errors.append(
+                        f"sheet '{sheet.title}' row {idx} ({variant_name}): the with-hypothecation columns do not differ "
+                        "from the without columns by one consistent charge"
+                    )
+                    continue
+                if hypo is not None and abs(hypo - column_charge) > _MONEY_TOLERANCE:
+                    result.errors.append(
+                        f"sheet '{sheet.title}' row {idx} ({variant_name}): the note says hypothecation is {_q2(hypo)} "
+                        f"but the columns differ by {_q2(column_charge)}"
+                    )
+                    continue
+                hypo, hypo_source = column_charge, "COLUMNS"
+            if attrs_from_cells.get("fuel"):
+                attrs = _variant_attributes(variant_name, fuel_hint=attrs_from_cells["fuel"], electric=electric)
+                attrs["fuel"] = "ELECTRIC" if electric else attrs_from_cells["fuel"]
+            else:
+                attrs = _variant_attributes(variant_name, fuel_hint=fuel_hint, electric=electric)
+            for name in ("transmission", "drive", "seater"):
+                if attrs_from_cells.get(name):
+                    attrs[name] = attrs_from_cells[name]
             components["REGISTRATION_INDIVIDUAL"] = reg_ind
             components["REGISTRATION_CORPORATE"] = reg_corp
-            attrs = _variant_attributes(variant_name, fuel_hint=fuel_hint, electric=electric)
+            notes_by_key: dict[str, str] = {}
+            if hypo is not None:
+                components["HYPOTHECATION_CHARGE"] = hypo
+                components["REGISTRATION_WITH_HYPO"] = reg_ind + hypo
+                notes_by_key["HYPOTHECATION_CHARGE"] = f"read from the sheet's {hypo_source.lower()}"
+            if notes["minBooking"] is not None:
+                components["MIN_BOOKING_AMOUNT"] = notes["minBooking"]
+            for extra_key, (extra_amount, extra_label) in notes["extras"].items():
+                components[extra_key] = extra_amount
+                notes_by_key[extra_key] = extra_label
             signature = (_q2(onroad_ind), _q2(onroad_corp), tuple(sorted((k, _q2(v)) for k, v in components.items())))
             key = (_slug_model(model_name), variant_name.upper(), attrs["fuel"] or "", attrs["transmission"] or "",
                    attrs["drive"] or "", attrs["seater"] or "", "STANDARD")
             if key in seen:
-                if seen[key] != signature:
-                    result.errors.append(
-                        f"sheet '{sheet.title}' row {idx} ({model_name} / {variant_name}): conflicting prices for the same variant"
-                    )
-                else:
-                    result.meta["duplicateRowsCollapsed"] = result.meta.get("duplicateRowsCollapsed", 0) + 1
+                first_sheet, first_row = seen[key]
+                same = "identical" if signature == seen_signatures.get(key) else "different"
+                result.errors.append(
+                    f"sheet '{sheet.title}' row {idx} ({model_name} / {variant_name}): repeats the vehicle on "
+                    f"sheet '{first_sheet}' row {first_row} with {same} prices; nothing is loaded until it is fixed"
+                )
                 continue
-            seen[key] = signature
+            seen[key] = (sheet.title, idx)
+            seen_signatures[key] = signature
             result.price_rows.append(
                 PriceRow(
                     row_no=idx,
                     category="BEV" if attrs["fuel"] == "ELECTRIC" else "ICE" if attrs["fuel"] else "UNSPECIFIED",
                     model_name=model_name,
                     variant_name=variant_name,
-                    trim=None,
+                    trim=trim,
                     fuel=attrs["fuel"],
                     transmission=attrs["transmission"],
                     drive=attrs["drive"],
@@ -721,13 +936,16 @@ def _parse_dealer_sheets(workbook: Any, *, header_seen: list[str]) -> ParseResul
                     onroad_corporate=_q2(onroad_corp),
                     registration_basis="STANDARD",
                     source_sheet=sheet.title,
+                    component_notes=notes_by_key,
                 )
             )
     if not sheets_read:
         raise MasterParseError(
             "Price list not recognised: neither the consolidated layout (header got "
-            f"{header_seen}) nor a dealer per-model sheet (Model & Variant header with column letters)."
+            f"{header_seen}) nor a dealer per-model sheet (a Model & Variant or Trim header with column letters)."
         )
+    if blank_as_zero:
+        result.warnings.append(f"{blank_as_zero} empty price cell(s) were read as nil (no such line for that vehicle)")
     result.meta["sheets"] = sheets_read
     result.meta["models"] = sorted({r.model_name for r in result.price_rows})
     result.meta["categoryCounts"] = _counts(r.category for r in result.price_rows)
