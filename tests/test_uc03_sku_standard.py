@@ -143,5 +143,13 @@ def test_the_standard_routes_answer_over_http(connection) -> None:  # noqa: F811
         nothing = client.get(f"{base}/sku", params={"on": "2026-01-15", "model": "Thar Roxx"})
         assert nothing.status_code == 200 and nothing.json()["matched"] == "NONE" and "No price list" in nothing.json()["reason"]
         assert client.get(f"{base}/sku", params={"on": "2026-09-15"}).status_code == 422
+        sheet = client.get(f"{base}/price-sheet", params={"on": "2026-09-15", "model": "thar"})
+        assert sheet.status_code == 200, sheet.text
+        listed = sheet.json()
+        assert listed["total"] == 2 and listed["truncated"] is False and listed["sourceFiles"] == []
+        assert sorted(v["standard"]["exShowroom"] for v in listed["vehicles"]) == ["1000000.00", "1800000.00"]
+        assert all(v["standard"]["wefDate"] == "2026-09-01" for v in listed["vehicles"])
+        assert client.get(f"{base}/price-sheet", params={"on": "2026-09-15", "model": "thar", "variant": "mx5"}).json()["total"] == 1
+        assert client.get(f"{base}/price-sheet", params={"on": "2026-01-15"}).json()["vehicles"] == []
     finally:
         app.dependency_overrides.clear()

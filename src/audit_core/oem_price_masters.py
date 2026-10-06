@@ -1342,6 +1342,7 @@ UPLOAD_PERMISSION = "audit.master.upload"
 
 class _Uploader(BaseModel):
     user_id: str
+    is_super_admin: bool = False
 
 
 def authorize_master_upload(
@@ -1352,10 +1353,11 @@ def authorize_master_upload(
     authorization_client: SecurityAuthorizationClient,
 ) -> _Uploader:
     """SuperAdmin, or a person Security allows `audit.master.upload` on this project
-    (Team Lead and Project Manager by default). Nobody else."""
+    (Team Lead and Project Manager by default). Nobody else. A person who is not a SuperAdmin
+    loads price lists only; the discount documents stay with the SuperAdmin."""
     try:
         if get_human_admin_request(bearer_token, human_principal).admin_context.is_super_admin:
-            return _Uploader(user_id=human_principal.subject)
+            return _Uploader(user_id=human_principal.subject, is_super_admin=True)
     except AuthorizationError:
         pass  # not an administrator: the project permission decides
     check_p2_permission(
@@ -1385,6 +1387,8 @@ async def upload_oem_master(
         tenant_id=tenant_id, bearer_token=bearer_token, human_principal=human_principal,
         authorization_client=authorization_client,
     )
+    if master_kind != "PRICE_LIST" and not admin_request.is_super_admin:
+        raise AuthorizationError(error_code="VAC-AUTH-002", status_code=403, title="Permission denied")
     content = await file.read()
     if not content:
         raise ValidationError(detail="Uploaded file is empty.")
