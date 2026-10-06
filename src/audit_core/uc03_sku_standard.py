@@ -575,6 +575,68 @@ def catalogue(
     return {"on": on, "priceList": version, "models": list(models.values())}
 
 
+_PRICE_SHEET_LIMIT = 300
+
+
+def _price_sheet_source(connection: Connection, *, tenant_id: str, price_list_version_id: str) -> list[str]:
+    """The original names of the files this price list version was loaded from."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT source_filename FROM auditcore.oem_master_uploads
+            WHERE tenant_id = :t AND price_list_version_id = :v AND master_kind = 'PRICE_LIST' AND status = 'PUBLISHED'
+            ORDER BY uploaded_at_utc
+            """
+        ),
+        {"t": tenant_id, "v": price_list_version_id},
+    ).scalars().all()
+    return [str(name) for name in rows]
+
+
+@router.get("/price-sheet")
+def price_sheet(
+    tenant_id: str,
+    on: date,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    model: str | None = Query(default=None, max_length=200),
+    trim: str | None = Query(default=None, max_length=100),
+    variant: str | None = Query(default=None, max_length=240),
+    fuel: str | None = Query(default=None, max_length=100),
+    seater: str | None = Query(default=None, max_length=10),
+) -> dict[str, Any]:
+    """Browse the price master standing on a date: every vehicle matching the words given (any part of the
+    model, trim, variant or fuel; the seating exactly), each in the full standard format. Read only."""
+    _auth(connection, tenant_id, human_principal, authorization_client)
+    version = price_version_on(connection, tenant_id=tenant_id, on=on)
+    if version is None:
+        return {"on": on, "priceList": None, "sourceFiles": [], "total": 0, "truncated": False, "vehicles": []}
+    rows = catalogue_rows(connection, tenant_id=tenant_id, price_list_version_id=version["priceListVersionId"])
+    for key, wanted in (("model_name", model), ("trim", trim), ("variant_name", variant), ("fuel", fuel)):
+        if wanted:
+            rows = [r for r in rows if _norm(wanted) in _norm(r.get(key))]
+    if seater:
+        rows = [r for r in rows if _norm(r.get("seater")) == _norm(seater)]
+    by_vehicle: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_vehicle.setdefault(_base_code(row["sku_code"]), []).append(row)
+    hypo = _version_hypothecation(connection, tenant_id=tenant_id, price_list_version_id=version["priceListVersionId"])
+    vehicles = []
+    for siblings in list(by_vehicle.values())[:_PRICE_SHEET_LIMIT]:
+        chosen = pick_insurance_row(siblings, None)
+        vehicles.append({
+            "sku": _sku_summary(chosen),
+            "standard": standard_format(chosen, version, basis="INDIVIDUAL", ew="NONE", version_hypothecation=hypo,
+                                        catalogue=siblings),
+        })
+    return {
+        "on": on, "priceList": version,
+        "sourceFiles": _price_sheet_source(connection, tenant_id=tenant_id, price_list_version_id=version["priceListVersionId"]),
+        "total": len(by_vehicle), "truncated": len(by_vehicle) > _PRICE_SHEET_LIMIT, "vehicles": vehicles,
+    }
+
+
 @router.get("/sku")
 def sku_standard(
     tenant_id: str,

@@ -90,3 +90,14 @@ def test_a_super_admin_needs_no_project_permission(connection, client_for, monke
 def test_allow_all_double_is_not_a_super_admin_shortcut(connection, client_for, monkeypatch) -> None:  # noqa: F811
     _admin(monkeypatch, super_admin=False)
     assert _upload(client_for(AllowAllAuthorization("TL")), connection.tenant_id).status_code == 200
+
+
+def test_a_person_who_is_not_a_super_admin_loads_price_lists_only(connection, client_for, monkeypatch) -> None:  # noqa: F811
+    _admin(monkeypatch, super_admin=False)
+    client = client_for(_Auth("audit.master.upload"))
+    refused = client.post(
+        "/v1/admin/oem-masters/uploads", params={"dryRun": "true"},
+        data={"tenantId": connection.tenant_id, "masterKind": "CONSUMER_SCHEME", "effectiveFrom": "2026-09-01"},
+        files={"file": ("scheme.pdf", b"%PDF-1.4", "application/pdf")},
+    )
+    assert refused.status_code == 403
