@@ -16,21 +16,17 @@ import audit_core.uc03_post_extraction_materialization  # noqa: F401
 from audit_core import mahindra_masters, role_mappings
 from audit_core.audit_review import router as audit_review_router
 from audit_core.bookings import router as booking_router
-from audit_core.commercials import router as commercials_router
 from audit_core.config import load_settings
 from audit_core.contract_guards import install_contract_guards
-from audit_core.crm_api import router as crm_router
 from audit_core.customers import router as customer_router
 from audit_core.daily_operations_api import router as daily_operations_router
 from audit_core.dealers import router as dealer_router
 from audit_core.dependencies import get_engine
 from audit_core.di_project_master_proxy import router as di_project_master_proxy_router
 from audit_core.errors import install_error_handlers
-from audit_core.escalations_api import router as escalation_router
 from audit_core.evidence import router as evidence_router
 from audit_core.evidence_read import router as evidence_read_router
 from audit_core.feedback import router as feedback_router
-from audit_core.finding_types_admin import router as finding_types_admin_router
 from audit_core.findings import router as findings_router
 from audit_core.hr_work_context import router as hr_work_context_router
 from audit_core.insurance_tradein import router as insurance_tradein_router
@@ -57,7 +53,6 @@ from audit_core.project_provisioning import router as project_provisioning_route
 from audit_core.project_reference_data import router as project_reference_data_router
 from audit_core.projects import router as project_router
 from audit_core.readiness import router as readiness_router
-from audit_core.reference_data import router as reference_data_router
 from audit_core.role_mapping_policy import install_role_mapping_policy
 from audit_core.runtime_warmup import warm_runtime_dependencies
 from audit_core.tasks_api import router as task_router
@@ -352,7 +347,6 @@ def create_app() -> FastAPI:
     application.include_router(evidence_router)
     application.include_router(evidence_read_router)
     application.include_router(booking_router)
-    application.include_router(commercials_router)
     application.include_router(payments_finance_router)
     application.include_router(insurance_tradein_router)
     application.include_router(vehicle_delivery_router)
@@ -361,12 +355,8 @@ def create_app() -> FastAPI:
     application.include_router(audit_review_router)
     application.include_router(task_router)
     application.include_router(daily_operations_router)
-    application.include_router(crm_router)
-    application.include_router(escalation_router)
-    application.include_router(reference_data_router)
     application.include_router(pricing_router)
     application.include_router(feedback_router)
-    application.include_router(finding_types_admin_router)
     application.include_router(hr_work_context_router)
     application.include_router(user_project_history_router)
     application.include_router(oem_price_masters_router)
