@@ -27,18 +27,29 @@ jobs:
         with:
           node-version: '20'
       - run: npm install --global @railway/cli
-      - name: Probe the log command
+      - name: Probe HTTP request logs
         shell: bash
         run: |
           set -uo pipefail
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service verigence-audit-core --json >/dev/null
-          railway logs --help 2>&1 | head -40
-          for n in 5000 10000 20000 50000; do
-            timeout 120 railway logs --service verigence-audit-core --since 30d --lines $n > /tmp/p.log 2>/tmp/p.err
-            echo "lines=$n -> got $(wc -l < /tmp/p.log) lines; err: $(head -c 120 /tmp/p.err)"
+          for n in 1000 5000 20000 100000; do
+            timeout 180 railway logs --http --json --since 30d --lines $n > /tmp/h_$n.json 2>/tmp/h_$n.err
+            echo "lines=$n -> got $(wc -l < /tmp/h_$n.json) lines; err: $(head -c 150 /tmp/h_$n.err | tr '\n' ' ')"
           done
-          echo "oldest line available (30d window): $(head -1 /tmp/p.log | cut -c1-60)"
-          echo "newest: $(tail -1 /tmp/p.log | cut -c1-60)"
-          timeout 120 railway logs --service verigence-audit-core --since 30d --lines 50 --filter "http_request" > /tmp/f.log 2>/tmp/f.err
-          echo "filter test: $(wc -l < /tmp/f.log) lines; err: $(head -c 150 /tmp/f.err)"
-          head -2 /tmp/f.log | cut -c1-300
+          f=$(ls -S /tmp/h_*.json | head -1)
+          echo "using $f"
+          sed -n 1p "$f" | cut -c1-500
+          python3 - "$f" <<'PY'
+          import json, sys, re, collections
+          rows = []
+          for line in open(sys.argv[1], errors='ignore'):
+              line = line.strip()
+              if not line.startswith('{'): continue
+              try: rows.append(json.loads(line))
+              except Exception: pass
+          print('parsed rows:', len(rows))
+          if rows:
+              print('keys:', sorted(rows[0].keys()))
+              ts = sorted(r.get('timestamp', '') for r in rows if r.get('timestamp'))
+              print('oldest:', ts[0] if ts else None, ' newest:', ts[-1] if ts else None)
+          PY
