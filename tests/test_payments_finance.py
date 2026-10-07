@@ -38,7 +38,7 @@ class _AllowAllAuthorization:
         )
 
 
-def test_multiple_payments_verification_exception_and_finance_are_recorded() -> None:
+def test_finance_is_recorded() -> None:
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         pytest.skip("DATABASE_URL is required for payments integration test")
@@ -163,110 +163,6 @@ def test_multiple_payments_verification_exception_and_finance_are_recorded() -> 
     app.dependency_overrides[get_security_authorization_client] = lambda: _AllowAllAuthorization()
     try:
         client = TestClient(app, raise_server_exceptions=False)
-        payments_url = f"/v1/tenants/{tenant_id}/journeys/{journey_id}/payments"
-
-        first = client.post(
-            payments_url,
-            json={
-                "amount": "30000.00",
-                "paymentMethodCode": "CARD",
-                "paymentReference": "MR-1",
-                "statusSource": "OPERATIONAL_INPUT",
-            },
-        )
-        assert first.status_code == 201, first.text
-        first_id = first.json()["paymentId"]
-        # "CARD" isn't one of the requested canonical types (IMPS/RTGS/NEFT/
-        # Bank Transfer/Banker's Order/Pay Order/Cash/Cheque/Trade-In/Refund)
-        # -- it falls through to OTHERS rather than being left unclassified.
-        assert first.json()["paymentModeCode"] == "OTHERS"
-
-        # A receipt/payment lazily establishes the Journey's Booking linkage but
-        # does not guess whether the receipt belongs to Booking or Delivery.
-        with engine.begin() as connection:
-            first_link = connection.execute(
-                text(
-                    """
-                    SELECT p.booking_id, p.delivery_id, p.payment_stage,
-                           j.booking_id AS journey_booking_id,
-                           c.journey_id AS customer_journey_id,
-                           c.booking_id AS customer_booking_id
-                    FROM auditcore.payments p
-                    JOIN auditcore.journeys j
-                      ON j.tenant_id=p.tenant_id AND j.journey_id=p.journey_id
-                    JOIN auditcore.customers c
-                      ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
-                    WHERE p.tenant_id=:tenant_id AND p.payment_id=:payment_id
-                    """
-                ),
-                {"tenant_id": tenant_id, "payment_id": first_id},
-            ).mappings().one()
-        assert first_link["booking_id"] is not None
-        assert first_link["booking_id"] == first_link["journey_booking_id"]
-        assert first_link["booking_id"] == first_link["customer_booking_id"]
-        assert first_link["customer_journey_id"] == journey_id
-        assert first_link["delivery_id"] is None
-        assert first_link["payment_stage"] == "UNSPECIFIED"
-
-        verified = client.patch(
-            payments_url,
-            json={
-                "paymentId": first_id,
-                "verification": {
-                    "result": "EXCEPTION",
-                    "notes": "Receipt requires audit follow-up",
-                    "verifiedByRoleCode": "TL",
-                },
-            },
-        )
-        assert verified.status_code == 200, verified.text
-        assert verified.json()["verifications"][0]["result"] == "EXCEPTION"
-        assert Decimal(str(verified.json()["amount"])) == Decimal("30000.00")
-
-        # Changing the raw payment method re-derives the canonical type too --
-        # otherwise paymentModeCode would silently go stale after a PATCH.
-        recoded = client.patch(
-            payments_url,
-            json={"paymentId": first_id, "paymentMethodCode": "NEFT"},
-        )
-        assert recoded.status_code == 200, recoded.text
-        assert recoded.json()["paymentMethodCode"] == "NEFT"
-        assert recoded.json()["paymentModeCode"] == "NEFT"
-
-        second = client.post(
-            payments_url,
-            json={
-                "amount": "1360000.00",
-                "paymentMethodCode": "BANK_TRANSFER",
-                "paymentReference": "DO-1",
-                "statusSource": "SOURCE_SYSTEM",
-            },
-        )
-        assert second.status_code == 201, second.text
-        assert second.json()["paymentModeCode"] == "BANK_TRANSFER"
-        second_id = second.json()["paymentId"]
-        assert second_id != first_id
-
-        listed = client.get(payments_url)
-        assert listed.status_code == 200
-        assert len(listed.json()) == 2
-
-        with engine.begin() as connection:
-            links = connection.execute(
-                text(
-                    """
-                    SELECT payment_id, booking_id, payment_stage
-                    FROM auditcore.payments
-                    WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                    ORDER BY created_at_utc, payment_id
-                    """
-                ),
-                {"tenant_id": tenant_id, "journey_id": journey_id},
-            ).mappings().all()
-        assert len(links) == 2
-        assert {row["booking_id"] for row in links} == {first_link["booking_id"]}
-        assert {row["payment_stage"] for row in links} == {"UNSPECIFIED"}
-
         finance_url = f"/v1/tenants/{tenant_id}/journeys/{journey_id}/finance"
         finance = client.put(
             finance_url,

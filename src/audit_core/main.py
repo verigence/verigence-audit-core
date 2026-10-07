@@ -16,13 +16,11 @@ import audit_core.uc03_post_extraction_materialization  # noqa: F401
 from audit_core import mahindra_masters, role_mappings
 from audit_core.config import load_settings
 from audit_core.contract_guards import install_contract_guards
-from audit_core.customers import router as customer_router
 from audit_core.daily_operations_api import router as daily_operations_router
 from audit_core.dealers import router as dealer_router
 from audit_core.dependencies import get_engine
 from audit_core.di_project_master_proxy import router as di_project_master_proxy_router
 from audit_core.errors import install_error_handlers
-from audit_core.evidence import router as evidence_router
 from audit_core.feedback import router as feedback_router
 from audit_core.hr_work_context import router as hr_work_context_router
 from audit_core.insurance_tradein import router as insurance_tradein_router
@@ -336,9 +334,7 @@ def create_app() -> FastAPI:
     application.include_router(dealer_router)
     application.include_router(outlet_geocoding_router)
     application.include_router(role_mapping_router)
-    application.include_router(customer_router)
     application.include_router(journey_router)
-    application.include_router(evidence_router)
     application.include_router(payments_finance_router)
     application.include_router(insurance_tradein_router)
     application.include_router(uc03_compliance_report_router)

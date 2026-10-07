@@ -1,23 +1,18 @@
-from typing import Annotated, Literal
+from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
 from audit_core.authorization import AuthorizationError
-from audit_core.customer_matching import find_customer_matches
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.errors import AuditCoreError, DependencyUnavailableError, NotFoundError
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     SecurityAuthorizationError,
-    get_security_authorization_client,
 )
 
-router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["customers"])
 
 _CUSTOMER_READ_PERMISSION = "audit.customer.read"
 _CUSTOMER_WRITE_PERMISSION = "audit.customer.write"
@@ -208,257 +203,11 @@ def _dealer_for_outlet(connection: Connection, tenant_id: str, outlet_id: UUID) 
     return dealer_id
 
 
-@router.post(
-    "/outlets/{outlet_id}/customers",
-    response_model=CustomerResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-def create_customer(
-    tenant_id: str,
-    outlet_id: UUID,
-    payload: CustomerCreate,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> CustomerResponse:
-    _authorize(
-        connection,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        tenant_id=tenant_id,
-        permission_key=_CUSTOMER_WRITE_PERMISSION,
-    )
-    dealer_id = _dealer_for_outlet(connection, tenant_id, outlet_id)
-    mobile_number, mobile_last4 = _mobile_fields(payload.mobileNumber, payload.mobileLast4)
-    row = connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.customers (
-                tenant_id, dealer_id, outlet_id, customer_type_code,
-                display_name, mobile_number, mobile_last4, email_reference,
-                external_customer_ref, created_by_actor_id
-            ) VALUES (
-                :tenant_id, :dealer_id, :outlet_id, :customer_type_code,
-                :display_name, :mobile_number, :mobile_last4, :email_reference,
-                :external_customer_ref, :actor_id
-            )
-            RETURNING customer_id, dealer_id, outlet_id, customer_type_code,
-                      display_name, mobile_number, mobile_last4, email_reference,
-                      external_customer_ref, status
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "dealer_id": dealer_id,
-            "outlet_id": outlet_id,
-            "customer_type_code": payload.customerTypeCode,
-            "display_name": payload.displayName,
-            "mobile_number": mobile_number,
-            "mobile_last4": mobile_last4,
-            "email_reference": payload.emailReference,
-            "external_customer_ref": payload.externalCustomerRef,
-            "actor_id": human_principal.subject,
-        },
-    ).mappings().one()
-    full_contact = _can_read_full_contact(
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        tenant_id=tenant_id,
-    )
-    return _customer_response(row, full_contact=full_contact)
 
 
-@router.get("/outlets/{outlet_id}/customers", response_model=list[CustomerResponse])
-def list_customers(
-    tenant_id: str,
-    outlet_id: UUID,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> list[CustomerResponse]:
-    _authorize(
-        connection,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        tenant_id=tenant_id,
-        permission_key=_CUSTOMER_READ_PERMISSION,
-    )
-    _dealer_for_outlet(connection, tenant_id, outlet_id)
-    rows = connection.execute(
-        text(
-            """
-            SELECT customer_id, dealer_id, outlet_id, customer_type_code,
-                   display_name, mobile_number, mobile_last4, email_reference,
-                   external_customer_ref, status
-            FROM auditcore.customers
-            WHERE tenant_id = :tenant_id AND outlet_id = :outlet_id
-            ORDER BY created_at_utc, customer_id
-            """
-        ),
-        {"tenant_id": tenant_id, "outlet_id": outlet_id},
-    ).mappings()
-    full_contact = _can_read_full_contact(
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        tenant_id=tenant_id,
-    )
-    return [_customer_response(row, full_contact=full_contact) for row in rows]
 
 
-@router.get("/customers/matches", response_model=list[CustomerMatchResponse])
-def match_customers(
-    tenant_id: str,
-    identity_type: Annotated[str, Query(alias="identityType", min_length=1, max_length=40)],
-    match_hash: Annotated[str, Query(alias="matchHash", min_length=1, max_length=256)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> list[CustomerMatchResponse]:
-    _authorize(
-        connection,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        tenant_id=tenant_id,
-        permission_key=_CUSTOMER_READ_PERMISSION,
-    )
-    rows = find_customer_matches(
-        connection,
-        tenant_id=tenant_id,
-        identity_type=identity_type,
-        match_hash=match_hash,
-    )
-    return [
-        CustomerMatchResponse(
-            customerId=row["customer_id"],
-            dealerId=row["dealer_id"],
-            outletId=row["outlet_id"],
-            displayName=row["display_name"],
-            identityType=row["identity_type"],
-        )
-        for row in rows
-    ]
 
 
-@router.get("/customers/{customer_id}", response_model=CustomerResponse)
-def get_customer(
-    tenant_id: str,
-    customer_id: UUID,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> CustomerResponse:
-    _authorize(
-        connection,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        tenant_id=tenant_id,
-        permission_key=_CUSTOMER_READ_PERMISSION,
-    )
-    row = connection.execute(
-        text(
-            """
-            SELECT customer_id, dealer_id, outlet_id, customer_type_code,
-                   display_name, mobile_number, mobile_last4, email_reference,
-                   external_customer_ref, status
-            FROM auditcore.customers
-            WHERE tenant_id = :tenant_id AND customer_id = :customer_id
-            """
-        ),
-        {"tenant_id": tenant_id, "customer_id": customer_id},
-    ).mappings().one_or_none()
-    if row is None:
-        raise NotFoundError(
-            error_code="VAC-NF-004",
-            title="Customer not found",
-            detail="Customer not found for the requested tenant.",
-        )
-    full_contact = _can_read_full_contact(
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        tenant_id=tenant_id,
-    )
-    return _customer_response(row, full_contact=full_contact)
 
 
-@router.patch("/customers/{customer_id}", response_model=CustomerResponse)
-def patch_customer(
-    tenant_id: str,
-    customer_id: UUID,
-    payload: CustomerPatch,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> CustomerResponse:
-    _authorize(
-        connection,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        tenant_id=tenant_id,
-        permission_key=_CUSTOMER_WRITE_PERMISSION,
-    )
-    mobile_number, derived_last4 = _mobile_fields(payload.mobileNumber, payload.mobileLast4)
-    row = connection.execute(
-        text(
-            """
-            UPDATE auditcore.customers
-            SET customer_type_code = COALESCE(:customer_type_code, customer_type_code),
-                display_name = COALESCE(:display_name, display_name),
-                mobile_number = COALESCE(:mobile_number, mobile_number),
-                mobile_last4 = CASE
-                    WHEN :mobile_number IS NOT NULL THEN :derived_last4
-                    WHEN mobile_number IS NULL THEN COALESCE(:mobile_last4, mobile_last4)
-                    ELSE mobile_last4
-                END,
-                email_reference = COALESCE(:email_reference, email_reference),
-                external_customer_ref = COALESCE(:external_customer_ref, external_customer_ref),
-                status = COALESCE(:status, status),
-                updated_by_actor_id = :actor_id,
-                updated_at_utc = now(),
-                version_no = version_no + 1
-            WHERE tenant_id = :tenant_id AND customer_id = :customer_id
-            RETURNING customer_id, dealer_id, outlet_id, customer_type_code,
-                      display_name, mobile_number, mobile_last4, email_reference,
-                      external_customer_ref, status
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "customer_id": customer_id,
-            "customer_type_code": payload.customerTypeCode,
-            "display_name": payload.displayName,
-            "mobile_number": mobile_number,
-            "derived_last4": derived_last4,
-            "mobile_last4": payload.mobileLast4,
-            "email_reference": payload.emailReference,
-            "external_customer_ref": payload.externalCustomerRef,
-            "status": payload.status,
-            "actor_id": human_principal.subject,
-        },
-    ).mappings().one_or_none()
-    if row is None:
-        raise NotFoundError(
-            error_code="VAC-NF-004",
-            title="Customer not found",
-            detail="Customer not found for the requested tenant.",
-        )
-    full_contact = _can_read_full_contact(
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        tenant_id=tenant_id,
-    )
-    return _customer_response(row, full_contact=full_contact)

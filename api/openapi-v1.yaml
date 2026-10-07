@@ -396,20 +396,6 @@ paths:
       responses:
         '200': {description: Booking document assessment recorded, content: {application/json: {schema: {type: object, additionalProperties: true}}}}
         default: {$ref: '#/components/responses/ProblemResponse'}
-  /tenants/{tenantId}/customers/{customerId}/journeys:
-    post:
-      operationId: createJourney
-      parameters:
-        - $ref: '#/components/parameters/TenantId'
-        - $ref: '#/components/parameters/CustomerId'
-        - $ref: '#/components/parameters/IdempotencyKey'
-      responses:
-        '201':
-          description: Journey created
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/Journey'}
-        default: {$ref: '#/components/responses/ProblemResponse'}
   /tenants/{tenantId}/journeys/{journeyId}:
     get:
       operationId: getJourney
@@ -422,33 +408,6 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Journey'}
-        default: {$ref: '#/components/responses/ProblemResponse'}
-  /tenants/{tenantId}/journeys/{journeyId}/evidence:
-    post:
-      operationId: uploadJourneyEvidence
-      description: Audit Core façade over internal DI. Client never calls DI directly.
-      parameters:
-        - $ref: '#/components/parameters/TenantId'
-        - $ref: '#/components/parameters/JourneyId'
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              type: object
-              required: [file, evidencePurpose]
-              properties:
-                file: {type: string, format: binary}
-                evidencePurpose: {type: string}
-                requirementKey: {type: string}
-                documentTypeKey: {type: string}
-      responses:
-        '201':
-          description: Evidence accepted by Audit Core
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/Evidence'}
         default: {$ref: '#/components/responses/ProblemResponse'}
   /tenants/{tenantId}/tasks/{taskId}/complete:
     post:

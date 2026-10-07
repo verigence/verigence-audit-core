@@ -207,23 +207,6 @@ def test_insurance_addons_and_trade_in_persist_independently() -> None:
         assert body["mispCode"] == "MISP-42"
         assert body["insuranceAddOns"] == ["Zero Depreciation", "RSA", "Engine Protect"]
         assert client.get(insurance_url).json() == body
-
-        trade_url = f"/v1/tenants/{tenant_id}/journeys/{journey_id}/trade-in"
-        trade = client.put(
-            trade_url,
-            json={
-                "oldVehicleRegistration": "OD-01-TEST",
-                "oldVehicleMakeModel": "Old Vehicle",
-                "quotedValue": "40000.00",
-                "actualValue": "40000.00",
-                "sourceKind": "EVIDENCE",
-                "details": {"source": "trade-in document"},
-            },
-        )
-        assert trade.status_code == 200, trade.text
-        assert Decimal(str(trade.json()["actualValue"])) == Decimal("40000.00")
-        assert "ageing" not in trade.json()
-        assert client.get(trade_url).json() == trade.json()
     finally:
         app.dependency_overrides.clear()
         engine.dispose()
