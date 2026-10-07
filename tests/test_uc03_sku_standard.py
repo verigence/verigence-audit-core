@@ -95,9 +95,7 @@ def test_the_standard_answers_every_block_for_one_vehicle_on_a_date(connection) 
     assert price["version"] == 1 and len(price["components"]) == 10
     ex = next(c for c in price["components"] if c["key"] == "EX_SHOWROOM")
     assert ex["amount"] == "1000000.00" and ex["priceSince"] == "2026-09-01" and ex["commercialKey"] == "ex_showroom_price"
-    # decision 2026-10-06: one warranty tier at most; none is the default, so neither tier (300, 400) is in the total
-    assert price["onRoad"] == {"individual": "1005900.00", "corporate": "1005900.00", "basis": "INDIVIDUAL", "ew": "NONE",
-                               "amount": "1005900.00"}
+    assert price["onRoad"] == {"individual": "1006600.00", "corporate": "1006600.00", "basis": "INDIVIDUAL", "amount": "1006600.00"}
     assert standard["consumerScheme"]["total"] == "35000.00"
     assert {b["key"] for b in standard["consumerScheme"]["benefits"]} == {"CASH_DISCOUNT", "ACCESSORIES_KIT"}
     exchange = standard["exchangeScheme"]
@@ -109,14 +107,14 @@ def test_the_standard_answers_every_block_for_one_vehicle_on_a_date(connection) 
     assert corporate["exact"]["amount"] == "15000.00"
     assert standard["grid"]["bookingProtectionDays"] == 60 and standard["grid"]["insuranceOdPercentMax"] == "60.0000"
     assert standard["summary"] == {
-        "onRoad": "1005900.00", "consumerBenefits": "35000.00", "exchangeBenefit": "25000.00",
-        "corporateBenefit": "15000.00", "standardNet": "930900.00", "standardNetForQuantity": "1861800.00",
+        "onRoad": "1006600.00", "consumerBenefits": "35000.00", "exchangeBenefit": "25000.00",
+        "corporateBenefit": "15000.00", "standardNet": "931600.00", "standardNetForQuantity": "1863200.00",
     }
 
     # No corporate named: the range stands and nothing is subtracted for it.
     plain = standard_for_sku(connection, tenant_id=tenant_id, on=ON, row=found["row"], version=version)
     assert plain["corporate"]["exact"] is None and plain["summary"]["corporateBenefit"] is None
-    assert plain["summary"]["standardNet"] == "970900.00" and plain["exchangeScheme"]["applicable"] == []
+    assert plain["summary"]["standardNet"] == "971600.00" and plain["exchangeScheme"]["applicable"] == []
     # A model no scheme or grid names: the blocks are named unknown, never guessed.
     xuv = search_sku(rows, alias_map=aliases, model="XUV 3XO", variant="MX1")["row"]
     assert standard_for_sku(connection, tenant_id=tenant_id, on=ON, row=xuv, version=version)["unknown"] == [
@@ -139,24 +137,9 @@ def test_the_standard_routes_answer_over_http(connection) -> None:  # noqa: F811
         assert answer.status_code == 200, answer.text
         body = answer.json()
         assert body["matched"] == "UNIQUE" and body["priceList"]["onRoad"]["basis"] == "CORPORATE"
-        assert body["summary"]["standardNet"] == "970900.00"
+        assert body["summary"]["standardNet"] == "971600.00"
         nothing = client.get(f"{base}/sku", params={"on": "2026-01-15", "model": "Thar Roxx"})
         assert nothing.status_code == 200 and nothing.json()["matched"] == "NONE" and "No price list" in nothing.json()["reason"]
         assert client.get(f"{base}/sku", params={"on": "2026-09-15"}).status_code == 422
-        sheet = client.get(f"{base}/price-sheet", params={"on": "2026-09-15", "model": "thar"})
-        assert sheet.status_code == 200, sheet.text
-        listed = sheet.json()
-        assert listed["total"] == 2 and listed["truncated"] is False and listed["sourceFiles"] == []
-        assert sorted(v["standard"]["exShowroom"] for v in listed["vehicles"]) == ["1000000.00", "1800000.00"]
-        assert all(v["standard"]["wefDate"] == "2026-09-01" for v in listed["vehicles"])
-        assert client.get(f"{base}/price-sheet", params={"on": "2026-09-15", "model": "thar", "variant": "mx5"}).json()["total"] == 1
-        assert client.get(f"{base}/price-sheet", params={"on": "2026-01-15"}).json()["vehicles"] == []
-        versions = client.get(f"{base}/price-versions")
-        assert versions.status_code == 200, versions.text
-        listed_versions = versions.json()["versions"]
-        assert [v["effectiveFrom"] for v in listed_versions] == ["2026-09-01"]  # newest first
-        assert listed_versions[0]["version"] == 1 and listed_versions[0]["status"] in ("PUBLISHED", "RETIRED")
-        assert set(listed_versions[0]) == {"priceListVersionId", "priceList", "version", "effectiveFrom", "effectiveTo",
-                                           "status", "sourceFiles"}
     finally:
         app.dependency_overrides.clear()

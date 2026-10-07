@@ -28,17 +28,15 @@ from decimal import Decimal
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import Connection, text
 
-from audit_core.authorization import AuthorizationError
 from audit_core.db import set_platform_super_admin_context, set_tenant_context
 from audit_core.dependencies import (
-    get_bearer_token,
+    HumanAdminRequest,
     get_connection,
-    get_human_admin_request,
-    get_human_principal,
+    require_super_admin_request,
 )
 from audit_core.discount_schemes import (
     add_discount_benefit,
@@ -54,18 +52,11 @@ from audit_core.oem_master_parsers import (
     PriceRow,
     parse_master,
 )
-from audit_core.oem_master_templates import TEMPLATE_FILENAMES, build_template
 from audit_core.price_lists import (
     create_price_list,
     create_price_list_version,
     publish_price_list_version,
 )
-from audit_core.security import HumanPrincipal
-from audit_core.security_authorization import (
-    SecurityAuthorizationClient,
-    get_security_authorization_client,
-)
-from audit_core.uc03_p2_access import check_p2_permission
 
 router = APIRouter(prefix="/v1/admin/oem-masters", tags=["admin-oem-masters"])
 
@@ -85,7 +76,7 @@ class MasterUploadPreview(BaseModel):
     tenantId: str
     oemCode: str
     masterKind: str
-    effectiveFrom: date | None
+    effectiveFrom: date
     """Where the applied date came from: ADMIN, SHEET or FILENAME."""
     effectiveFromSource: str = "ADMIN"
     sourceFilename: str
@@ -569,7 +560,6 @@ def ingest_price_list(
                         "category": row.category,
                         "onRoadIndividual": str(row.onroad_individual),
                         "onRoadCorporate": str(row.onroad_corporate),
-                        **({"note": row.component_notes[component_key]} if component_key in row.component_notes else {}),
                     }
                 ),
             })
@@ -1338,43 +1328,9 @@ def _build_preview(parsed: ParseResult, kind: str) -> dict[str, Any]:
 
 
 # ── routes ──────────────────────────────────────────────────────────────────────
-UPLOAD_PERMISSION = "audit.master.upload"
-
-
-class _Uploader(BaseModel):
-    user_id: str
-    is_super_admin: bool = False
-
-
-def authorize_master_upload(
-    *,
-    tenant_id: str,
-    bearer_token: str,
-    human_principal: HumanPrincipal,
-    authorization_client: SecurityAuthorizationClient,
-) -> _Uploader:
-    """SuperAdmin, or a person Security allows `audit.master.upload` on this project
-    (Team Lead and Project Manager by default). Nobody else. A person who is not a SuperAdmin
-    loads price lists only; the discount documents stay with the SuperAdmin."""
-    try:
-        if get_human_admin_request(bearer_token, human_principal).admin_context.is_super_admin:
-            return _Uploader(user_id=human_principal.subject, is_super_admin=True)
-    except AuthorizationError:
-        pass  # not an administrator: the project permission decides
-    check_p2_permission(
-        tenant_id=tenant_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        permission_key=UPLOAD_PERMISSION,
-    )
-    return _Uploader(user_id=human_principal.subject)
-
-
 @router.post("/uploads", response_model=MasterUploadPreview)
 async def upload_oem_master(
-    bearer_token: Annotated[str, Depends(get_bearer_token)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
     tenant_id: Annotated[str, Form(alias="tenantId")],
     master_kind: Annotated[MasterKind, Form(alias="masterKind")],
@@ -1384,12 +1340,6 @@ async def upload_oem_master(
 ) -> MasterUploadPreview:
     """Effective date: the file's own (its sheet, else its name) unless the
     admin enters one, which wins (decision 2026-09-30)."""
-    admin_request = authorize_master_upload(
-        tenant_id=tenant_id, bearer_token=bearer_token, human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    if master_kind != "PRICE_LIST" and not admin_request.is_super_admin:
-        raise AuthorizationError(error_code="VAC-AUTH-002", status_code=403, title="Permission denied")
     content = await file.read()
     if not content:
         raise ValidationError(detail="Uploaded file is empty.")
@@ -1410,12 +1360,9 @@ async def upload_oem_master(
     date_source = "ADMIN"
     if effective_from is None:
         if parsed.effective_from_hint is None:
-            if not dry_run:
-                raise ValidationError(detail="The file carries no effective date; enter one.")
-            date_source = "NONE"  # a check of the file: the person types the date before publishing
-        else:
-            effective_from = parsed.effective_from_hint
-            date_source = str(parsed.meta.get("effectiveFromSource") or "SHEET")
+            raise ValidationError(detail="The file carries no effective date; enter one.")
+        effective_from = parsed.effective_from_hint
+        date_source = str(parsed.meta.get("effectiveFromSource") or "SHEET")
     elif parsed.effective_from_hint is not None and parsed.effective_from_hint != effective_from:
         preview["warnings"].append(
             f"Applied {effective_from.isoformat()} as entered; the file says {parsed.effective_from_hint.isoformat()}."
@@ -1545,48 +1492,13 @@ async def upload_oem_master(
     )
 
 
-@router.get("/templates/{master_kind}")
-def download_oem_master_template(
-    master_kind: MasterKind,
-    bearer_token: Annotated[str, Depends(get_bearer_token)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
-    tenant_id: Annotated[str, Query(alias="tenantId")],
-) -> Response:
-    """The standard Excel template for a master, for the people who are allowed to upload it. The consumer
-    scheme and the exchange bulletin are the OEM's own PDFs and have none."""
-    uploader = authorize_master_upload(
-        tenant_id=tenant_id, bearer_token=bearer_token, human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    if master_kind != "PRICE_LIST" and not uploader.is_super_admin:
-        raise AuthorizationError(error_code="VAC-AUTH-002", status_code=403, title="Permission denied")
-    content = build_template(master_kind)
-    if content is None:
-        raise NotFoundError(
-            error_code="VAC-NF-032",
-            title="No template",
-            detail="This master is the OEM's own PDF bulletin; upload it as the OEM issued it.",
-        )
-    return Response(
-        content=content,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{TEMPLATE_FILENAMES[master_kind]}"'},
-    )
-
-
 @router.get("/uploads", response_model=list[MasterUploadRow])
 def list_oem_master_uploads(
-    bearer_token: Annotated[str, Depends(get_bearer_token)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
     tenant_id: Annotated[str, Query(alias="tenantId")],
 ) -> list[MasterUploadRow]:
-    authorize_master_upload(
-        tenant_id=tenant_id, bearer_token=bearer_token, human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
+    del admin_request
     set_platform_super_admin_context(connection)
     set_tenant_context(connection, tenant_id)
     rows = connection.execute(
@@ -1621,16 +1533,11 @@ def list_oem_master_uploads(
 @router.get("/uploads/{upload_id}", response_model=MasterUploadPreview)
 def get_oem_master_upload(
     upload_id: UUID,
-    bearer_token: Annotated[str, Depends(get_bearer_token)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
     tenant_id: Annotated[str, Query(alias="tenantId")],
 ) -> MasterUploadPreview:
-    authorize_master_upload(
-        tenant_id=tenant_id, bearer_token=bearer_token, human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
+    del admin_request
     set_platform_super_admin_context(connection)
     set_tenant_context(connection, tenant_id)
     row = connection.execute(
