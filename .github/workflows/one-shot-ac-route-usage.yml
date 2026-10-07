@@ -27,37 +27,18 @@ jobs:
         with:
           node-version: '20'
       - run: npm install --global @railway/cli
-      - name: Count
+      - name: Probe the log command
         shell: bash
         run: |
           set -uo pipefail
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service verigence-audit-core --json >/dev/null
-          railway --version
-          for since in 30d 14d 7d 3d 1d; do
-            timeout 240 railway logs --service verigence-audit-core --since "$since" --lines 400000 > /tmp/ac.log 2>/tmp/ac.err && break || true
+          railway logs --help 2>&1 | head -40
+          for n in 5000 10000 20000 50000; do
+            timeout 120 railway logs --service verigence-audit-core --since 30d --lines $n > /tmp/p.log 2>/tmp/p.err
+            echo "lines=$n -> got $(wc -l < /tmp/p.log) lines; err: $(head -c 120 /tmp/p.err)"
           done
-          echo "log lines: $(wc -l < /tmp/ac.log)  (since=$since)"
-          head -c 300 /tmp/ac.err || true
-          echo "first line: $(head -1 /tmp/ac.log | cut -c1-40)"
-          echo "last line:  $(tail -1 /tmp/ac.log | cut -c1-40)"
-          python3 - <<'PY'
-          import re, collections
-          c = collections.Counter(); st = collections.defaultdict(collections.Counter)
-          rx = re.compile(r'http_request\w*.*?method=(\w+).*?route=(\S+)|http_request\w*.*?route=(\S+).*?method=(\w+)')
-          lines = open('/tmp/ac.log', errors='ignore').read().splitlines()
-          sample = [l for l in lines if 'http_request' in l][:2]
-          print('sample lines:'); [print('  ', s[:260]) for s in sample]
-          for l in lines:
-              if 'http_request' not in l: continue
-              m = re.search(r'method=(\w+)', l); r = re.search(r'route=([^\s]+)', l); s = re.search(r'status(?:_code)?=(\d+)', l)
-              if not (m and r): continue
-              route = r.group(1).split('?')[0]
-              route = re.sub(r'[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}', '{id}', route)
-              route = re.sub(r'(?<=/)\d+(?=/|$)', '{n}', route)
-              key = f'{m.group(1)} {route}'
-              c[key] += 1
-              if s: st[key][s.group(1)] += 1
-          print('distinct routes called:', len(c))
-          for k, n in sorted(c.items(), key=lambda kv: kv[0].split(' ', 1)[1]):
-              print(f'{n:6d}  {k}   {dict(st[k])}')
-          PY
+          echo "oldest line available (30d window): $(head -1 /tmp/p.log | cut -c1-60)"
+          echo "newest: $(tail -1 /tmp/p.log | cut -c1-60)"
+          timeout 120 railway logs --service verigence-audit-core --since 30d --lines 50 --filter "http_request" > /tmp/f.log 2>/tmp/f.err
+          echo "filter test: $(wc -l < /tmp/f.log) lines; err: $(head -c 150 /tmp/f.err)"
+          head -2 /tmp/f.log | cut -c1-300
