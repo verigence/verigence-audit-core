@@ -217,12 +217,6 @@ def receipt_split(connection: Connection, *, tenant_id: str, journey_id: UUID,
     }
 
 
-def eligible_receipt_total(connection: Connection, *, tenant_id: str, journey_id: UUID) -> tuple[Decimal, int, int]:
-    """(total, counted receipts, excluded duplicates) over every receipt-backed payment."""
-    split = receipt_split(connection, tenant_id=tenant_id, journey_id=journey_id)
-    return split["total"], len(split["BOOKING"]) + len(split["DELIVERY"]), split["duplicates"]
-
-
 def open_task_count(connection: Connection, *, tenant_id: str, journey_id: UUID, task_types: tuple[str, ...]) -> int:
     row = connection.execute(
         text(

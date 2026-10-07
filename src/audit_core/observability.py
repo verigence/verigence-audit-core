@@ -75,11 +75,6 @@ def get_correlation_id(request: Request) -> str:
     )
 
 
-def current_correlation_id() -> str | None:
-    value = structlog.contextvars.get_contextvars().get("correlation_id")
-    return str(value) if value else None
-
-
 def request_business_context(request: Request) -> dict[str, str]:
     context: dict[str, str] = {}
     for source_key, target_key in _BUSINESS_PATH_KEYS.items():

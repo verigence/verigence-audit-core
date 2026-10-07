@@ -104,14 +104,6 @@ def request_control_evaluation(
     return units
 
 
-def unit_for_control(control: ControlTemplate, stage: str) -> str:
-    if control.mode == "RERUN":
-        return f"NATIVE:{stage}"
-    if control.mode == "EXTERNAL":
-        return f"RULE_ENGINE:{stage}"
-    return "P2:DERIVED"
-
-
 # -------------------------------------------------------------------- ledger
 
 def write_control_state(

@@ -194,14 +194,6 @@ def _safe_metric_labels(labels: Mapping[str, str]) -> dict[str, str]:
     return {str(key): str(value) for key, value in labels.items()}
 
 
-def current_trace_id() -> str | None:
-    return _trace_id.get()
-
-
-def current_span_id() -> str | None:
-    return _span_id.get()
-
-
 @contextmanager
 def trace_span(
     name: str,

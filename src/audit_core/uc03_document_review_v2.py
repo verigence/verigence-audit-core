@@ -229,15 +229,6 @@ def _stage_submission_state(
     return submitted, status, version
 
 
-def _submission_state(connection: Connection, *, tenant_id: str, journey_id: UUID) -> tuple[bool, str, int]:
-    return _stage_submission_state(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        stage_code="BOOKING",
-    )
-
-
 def _missing_declarations(
     connection: Connection,
     *,

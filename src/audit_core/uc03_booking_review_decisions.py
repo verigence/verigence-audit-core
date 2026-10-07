@@ -334,16 +334,6 @@ def _missing_core_owner_error(
     )
 
 
-def _raw_review_key(
-    field: review_v2.ReviewV2UnmappedField,
-    *,
-    receipt_ordinals: dict[UUID, int],
-) -> str:
-    if is_receipt_document_type(field.documentTypeKey):
-        return receipt_review_key(receipt_ordinals[field.documentId], field.fieldKey)
-    return f"raw:{field.fieldKey}"
-
-
 def _document_field_review_key(
     document: review_v2.ReviewV2Document,
     field: review_v2.ReviewV2Field,

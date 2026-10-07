@@ -26,7 +26,7 @@ States and the one action each offers:
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -150,5 +150,3 @@ def journey_document_health(
     return {"units": units, "summary": summarize(list(units.values())), "defects": defects}
 
 
-def stale_before(now: datetime | None = None, *, seconds: int = STUCK_AFTER_SECONDS) -> datetime:
-    return (now or datetime.now(UTC)) - timedelta(seconds=seconds)

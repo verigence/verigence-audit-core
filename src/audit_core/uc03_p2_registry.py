@@ -251,19 +251,6 @@ class Registry:
             and (t.requirement != "CONDITIONAL" or bool(active.intersection(t.conditions)))
         ]
 
-    def required_documents(self, stage: str, *, conditions: set[str] | None = None) -> list[DocumentTemplate]:
-        return [
-            t for t in self.stage_documents(stage, conditions=conditions)
-            if t.requirement in {"REQUIRED", "CONDITIONAL"}
-        ]
-
-    def controls_for_document(self, key: str) -> list[ControlTemplate]:
-        template = self.document(key)
-        by_dependency = [c for c in self.controls.values() if key in c.depends_on_documents]
-        declared = [self.controls[c] for c in template.controls if c in self.controls]
-        merged: dict[str, ControlTemplate] = {c.code: c for c in declared + by_dependency}
-        return list(merged.values())
-
     def controls_by_mode(self, mode: str) -> list[ControlTemplate]:
         return [c for c in self.controls.values() if c.mode == mode]
 

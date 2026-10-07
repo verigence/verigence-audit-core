@@ -152,35 +152,6 @@ def claim_administrative_operation(
         return _operation(row)
 
 
-def get_administrative_operation(
-    engine: Engine,
-    *,
-    operation_id: str,
-    operation_type: str | None = None,
-) -> AdministrativeOperation | None:
-    with engine.connect() as connection:
-        connection.execute(text(f"SET ROLE {_RUNTIME_ROLE}"))
-        filters = ["operation_id = :operation_id"]
-        parameters: dict[str, object] = {"operation_id": operation_id}
-        if operation_type is not None:
-            filters.append("operation_type = :operation_type")
-            parameters["operation_type"] = operation_type
-        row = connection.execute(
-            text(
-                f"""
-                SELECT operation_id, operation_type, tenant_id, idempotency_key,
-                       status, current_step, semantic_request_hash, safe_request_summary,
-                       security_receipt, audit_core_receipt, di_receipt,
-                       last_error_code, last_error_summary
-                FROM auditcore.administrative_operations
-                WHERE {' AND '.join(filters)}
-                """
-            ),
-            parameters,
-        ).mappings().one_or_none()
-    return _operation(row) if row is not None else None
-
-
 def update_administrative_operation(
     engine: Engine,
     *,

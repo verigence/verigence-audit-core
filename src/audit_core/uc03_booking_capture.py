@@ -136,12 +136,6 @@ class CaptureCommand(BaseModel):
     sourceEvidenceId: UUID | None = None
 
 
-class ProposalDecision(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    acceptedValue: Any | None = None
-
-
 class HumanFlagCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
