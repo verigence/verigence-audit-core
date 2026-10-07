@@ -31,7 +31,6 @@ from audit_core.uc03_di_core_persistence import (
     persist_reviewed_di_fields,
 )
 from audit_core.uc03_document_registry import is_receipt_document_type
-from audit_core.uc03_review_confidence import has_value, requires_pc_review
 from audit_core.uc03_v2_review_materialization import (
     receipt_document_ordinals,
     receipt_review_key,
@@ -74,15 +73,6 @@ def _field_target(
         field.canonicalFieldId,
         field.fieldKey,
         field.sourceFactVersion,
-    )
-
-
-def _source_target(source: review_v2.ReviewV2SourceValue) -> tuple[UUID, str, str, int]:
-    return _target(
-        source.documentId,
-        source.canonicalFieldId,
-        source.fieldKey,
-        source.sourceFactVersion,
     )
 
 
@@ -142,30 +132,6 @@ def _correction_map(
             )
         result[key] = correction
     return result
-
-
-def _validate_mapped_corrections(
-    attributes: list[review_v2.ReviewV2Attribute],
-    corrections: dict[tuple[UUID, str, str, int], ReviewFieldCorrection],
-) -> None:
-    for attribute in attributes:
-        source = attribute.resolvedSource
-        if source is None:
-            continue
-        correction = corrections.get(_source_target(source))
-        if correction is None:
-            continue
-        value = correction.effectiveValue
-        if value is None or (isinstance(value, str) and not value.strip()):
-            raise ConflictError(
-                error_code="VAC-CONFLICT-013",
-                title="Reviewed value cannot be projected",
-                detail=(
-                    f"Mapped attribute '{attribute.attributeKey}' cannot be confirmed "
-                    "with an empty effective value because its Audit Core projection "
-                    "would be lost."
-                ),
-            )
 
 
 def _duplicate_raw_field_keys(
@@ -317,26 +283,6 @@ def _reviewed_fields(
     return reviewed
 
 
-def _unresolved_low_confidence_fields(
-    documents: list[review_v2.ReviewV2Document],
-    corrections: dict[tuple[UUID, str, str, int], ReviewFieldCorrection],
-) -> list[str]:
-    """Populated DI values below the 90% threshold that this confirm request
-    doesn't account for -- Delivery's stand-in for Booking's decision_required/
-    missing_keys gate. Delivery has no separate Accept/Reject decision table,
-    so a correction submitted for the field (any effective value, including
-    the extracted one resubmitted as-is) stands in for that decision here."""
-
-    return sorted(
-        f"{field.fieldKey}@{document.documentId}"
-        for document in documents
-        for field in document.fields
-        if has_value(field.value)
-        and requires_pc_review(field.confidenceScore)
-        and _field_target(document, field) not in corrections
-    )
-
-
 def _corrected_documents(
     documents: list[review_v2.ReviewV2Document],
     corrections: dict[tuple[UUID, str, str, int], ReviewFieldCorrection],
@@ -347,24 +293,6 @@ def _corrected_documents(
             correction = corrections.get(_field_target(document, field))
             if correction is not None:
                 field.value = correction.effectiveValue
-    return corrected
-
-
-def _corrected_attributes(
-    attributes: list[review_v2.ReviewV2Attribute],
-    corrections: dict[tuple[UUID, str, str, int], ReviewFieldCorrection],
-) -> list[review_v2.ReviewV2Attribute]:
-    corrected = [attribute.model_copy(deep=True) for attribute in attributes]
-    for attribute in corrected:
-        for source in attribute.sources:
-            correction = corrections.get(_source_target(source))
-            if correction is not None:
-                source.value = correction.effectiveValue
-        if attribute.resolvedSource is not None:
-            correction = corrections.get(_source_target(attribute.resolvedSource))
-            if correction is not None:
-                attribute.resolvedSource.value = correction.effectiveValue
-                attribute.resolvedValue = correction.effectiveValue
     return corrected
 
 

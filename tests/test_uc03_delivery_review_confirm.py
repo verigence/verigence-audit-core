@@ -53,47 +53,6 @@ def test_delivery_review_confirm_route_is_a_single_registration() -> None:
     assert routes[0].endpoint is effective_values.confirm_delivery_review_v2_effective_values
 
 
-def test_low_confidence_field_without_a_correction_is_unresolved() -> None:
-    document = _delivery_document(confidence=85.0)
-    unresolved = effective_values._unresolved_low_confidence_fields(
-        [document], corrections={}
-    )
-    assert unresolved == [f"future_delivery_field@{document.documentId}"]
-
-
-def test_low_confidence_field_with_any_correction_is_resolved() -> None:
-    # Delivery has no separate Accept/Reject decision table -- resubmitting
-    # the same extracted value as a "correction" is how a PC accepts a
-    # low-confidence value as-is.
-    document = _delivery_document(confidence=85.0)
-    field = document.fields[0]
-    corrections = effective_values._correction_map(
-        [document],
-        [
-            effective_values.ReviewFieldCorrection(
-                documentId=document.documentId,
-                canonicalFieldId=field.canonicalFieldId,
-                fieldKey=field.fieldKey,
-                sourceFactVersion=field.sourceFactVersion,
-                effectiveValue=field.value,
-            )
-        ],
-    )
-    assert effective_values._unresolved_low_confidence_fields([document], corrections) == []
-
-
-def test_high_confidence_field_needs_no_correction() -> None:
-    document = _delivery_document(confidence=97.0)
-    assert effective_values._unresolved_low_confidence_fields([document], corrections={}) == []
-
-
-def test_unpopulated_low_confidence_field_needs_no_correction() -> None:
-    # Nothing was extracted for this field on this document -- there is
-    # nothing for a PC to review.
-    document = _delivery_document(value=None, confidence=None)
-    assert effective_values._unresolved_low_confidence_fields([document], corrections={}) == []
-
-
 def test_confirm_no_longer_blocks_on_unresolved_low_confidence_fields() -> None:
     # Document completeness is the sole criterion for Delivery to finish
     # (2026-09-13 design change), mirroring Booking's own equivalent gate

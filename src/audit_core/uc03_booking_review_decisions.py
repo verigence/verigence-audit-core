@@ -6,7 +6,6 @@ from typing import Any, Literal
 from uuid import UUID
 
 from audit_core import uc03_document_review_v2 as review_v2
-from audit_core.errors import ConflictError
 from audit_core.uc03_document_registry import is_receipt_document_type
 from audit_core.uc03_review_confidence import requires_pc_review
 from audit_core.uc03_v2_review_materialization import (
@@ -158,25 +157,6 @@ def _current_review_items(
 # (uc03_confidence_review_policy.py) is the live handler -- functionally
 # equivalent (same journey_attribute_review_decisions write), now decorated
 # directly on review_v2.router's POST /booking/review/decision.
-
-
-def _missing_core_owner_error(
-    *,
-    field_key: str,
-    document_type_key: str | None,
-    attribute_key: str | None = None,
-) -> ConflictError:
-    document_type = str(document_type_key or "UNKNOWN")
-    subject = f"attribute '{attribute_key}' / " if attribute_key else ""
-    return ConflictError(
-        error_code="VAC-CONFLICT-013",
-        title="Reviewed value has no Audit Core owner",
-        detail=(
-            f"Accepted {subject}DI field '{field_key}' from document type "
-            f"'{document_type}' has no Audit Core persistence owner. "
-            "Add an explicit Core owner before confirming Review."
-        ),
-    )
 
 
 def _install_mismatch_review_rule() -> None:
