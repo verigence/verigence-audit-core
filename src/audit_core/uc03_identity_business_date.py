@@ -1,40 +1,20 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
-from typing import Annotated, Any
+from datetime import date
+from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from fastapi import APIRouter
 from sqlalchemy import Connection, text
 
 from audit_core import uc03_booking_capture
-from audit_core.db import set_tenant_context
-from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.errors import AuditCoreError, NotFoundError
-from audit_core.security import HumanPrincipal
-from audit_core.security_authorization import (
-    SecurityAuthorizationClient,
-    get_security_authorization_client,
-)
-from audit_core.uc03_booking_commands import _authorize_security, _journey_context
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/journeys/{journey_id}/booking",
     tags=["uc03-identity-business-date"],
 )
-
-
-class BookingIdentityBusinessDateView(BaseModel):
-    journeyId: UUID
-    enteredName: str
-    legalName: str | None
-    legalNameStatus: str
-    legalNameSourceEvidenceId: UUID | None
-    actualBookingDate: date | None
-    auditCapturedAtUtc: datetime
-    captureLagDays: int | None
 
 
 _original_write_typed_capture = uc03_booking_capture._write_typed_capture
@@ -541,74 +521,3 @@ def install_uc03_identity_business_date() -> None:
     _installed = True
 
 
-@router.get("/identity-context", response_model=BookingIdentityBusinessDateView)
-def get_booking_identity_business_date(
-    tenant_id: str,
-    journey_id: UUID,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> BookingIdentityBusinessDateView:
-    _authorize_security(
-        authorization_client,
-        human_principal=human_principal,
-        tenant_id=tenant_id,
-    )
-    set_tenant_context(connection, tenant_id)
-    _journey_context(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        actor_id=human_principal.subject,
-    )
-
-    row = connection.execute(
-        text(
-            """
-            SELECT
-                j.journey_id,
-                c.display_name AS entered_name,
-                c.legal_name,
-                c.legal_name_status,
-                c.legal_name_source_evidence_id,
-                b.booking_date AS actual_booking_date,
-                j.created_at_utc AS audit_captured_at_utc,
-                CASE
-                    WHEN b.booking_date IS NULL THEN NULL
-                    ELSE ((j.created_at_utc AT TIME ZONE p.timezone_name)::date - b.booking_date)
-                END AS capture_lag_days
-            FROM auditcore.journeys j
-            JOIN auditcore.customers c
-              ON c.tenant_id = j.tenant_id
-             AND c.customer_id = j.customer_id
-            JOIN auditcore.projects p
-              ON p.tenant_id = j.tenant_id
-            LEFT JOIN auditcore.bookings b
-              ON b.tenant_id = j.tenant_id
-             AND b.journey_id = j.journey_id
-            WHERE j.tenant_id = :tenant_id
-              AND j.journey_id = :journey_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one_or_none()
-    if row is None:
-        raise NotFoundError(
-            error_code="VAC-NF-005",
-            title="Booking not found",
-            detail="Booking case not found for the requested Project.",
-        )
-
-    return BookingIdentityBusinessDateView(
-        journeyId=row["journey_id"],
-        enteredName=row["entered_name"],
-        legalName=row["legal_name"],
-        legalNameStatus=row["legal_name_status"],
-        legalNameSourceEvidenceId=row["legal_name_source_evidence_id"],
-        actualBookingDate=row["actual_booking_date"],
-        auditCapturedAtUtc=row["audit_captured_at_utc"],
-        captureLagDays=row["capture_lag_days"],
-    )

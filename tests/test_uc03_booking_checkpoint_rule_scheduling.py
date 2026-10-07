@@ -8,7 +8,6 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from audit_core import uc03_confidence_review_policy as confidence_policy
-from audit_core import uc03_post_extraction_materialization
 from audit_core.uc03_booking_rule_trigger import (
     run_booking_review_rule_task,
     schedule_booking_checkpoint_rules,
@@ -277,18 +276,6 @@ def test_confirm_handler_schedules_checkpoint_rules_as_a_safety_net() -> None:
     assert "background_tasks: BackgroundTasks" in source
     assert "background_tasks.add_task(" in source
     assert "schedule_booking_checkpoint_rules" in source
-
-
-def test_booking_submit_schedules_checkpoint_rules_with_raise_new() -> None:
-    # The third real caller (docstring on schedule_booking_checkpoint_rules
-    # says "three places") -- Submit is PC declaring Booking complete, the
-    # same genuine-gap-check moment as Review Confirm, not the async
-    # trigger's self-heal-only pass.
-    source = inspect.getsource(
-        uc03_post_extraction_materialization.close_booking_ready_with_lazy_v2_sync
-    )
-    assert "schedule_booking_checkpoint_rules" in source
-    assert "raise_new=True" in source
 
 
 def test_async_document_sync_schedules_checkpoint_rules_for_booking() -> None:

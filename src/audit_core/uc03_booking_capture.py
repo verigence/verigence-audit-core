@@ -25,15 +25,12 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_booking_commands import (
-    BookingCommandResponse,
     _aggregate_lock,
     _append_workflow_event,
     _authorize_security,
-    _build_response,
     _journey_context,
     _parse_if_match,
     _require_expected_version,
-    _require_transition,
     _set_etag,
     _stage_state,
 )
@@ -129,13 +126,6 @@ _CAPTURE_FIELDS = {
 }
 
 
-class CaptureCommand(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    value: Any
-    sourceEvidenceId: UUID | None = None
-
-
 class HumanFlagCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -144,14 +134,6 @@ class HumanFlagCommand(BaseModel):
     summary: str = Field(min_length=1, max_length=500)
     remarks: str | None = Field(default=None, max_length=4000)
     evidenceIds: list[UUID] = Field(default_factory=list, max_length=20)
-
-
-class ExtractionRefreshResponse(BaseModel):
-    journeyId: UUID
-    refreshedDocuments: int
-    createdProposals: int
-    failedDocuments: int
-    aggregateVersion: int
 
 
 def _require_active_booking(state) -> None:
@@ -501,148 +483,6 @@ def _write_typed_capture(
     raise RuntimeError("Unreachable capture mapping")
 
 
-def _condition_value(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-    condition_key: str,
-) -> bool | None:
-    normalized = condition_key.strip().lower()
-    if normalized in {"exchangetaken", "exchange_taken"}:
-        status = connection.execute(
-            text(
-                "SELECT actual_status_code FROM auditcore.trade_in_cases WHERE tenant_id=:tenant_id AND journey_id=:journey_id"
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).scalar_one_or_none()
-        if status is None:
-            return None
-        return str(status).upper() == "EXCHANGE_TAKEN"
-    if normalized in {
-        "corporatecustomer",
-        "customeriscorporate",
-        "corporatediscounttaken",
-        "corporate_customer",
-    }:
-        customer_type = connection.execute(
-            text(
-                """
-                SELECT c.customer_type_code
-                FROM auditcore.journeys j
-                JOIN auditcore.customers c
-                  ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
-                WHERE j.tenant_id=:tenant_id AND j.journey_id=:journey_id
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).scalar_one_or_none()
-        if customer_type is None:
-            return None
-        return str(customer_type).upper() in {"CORPORATE", "BUSINESS", "COMPANY"}
-    return None
-
-
-def _resolve_booking_applicability(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-) -> list[dict[str, Any]]:
-    changes: list[dict[str, Any]] = []
-    rows = connection.execute(
-        text(
-            """
-            SELECT journey_document_requirement_id, requirement_key,
-                   requirement_status, condition_snapshot
-            FROM auditcore.journey_document_requirements
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND upper(process_area)='BOOKING'
-              AND requirement_level='CONDITIONAL'
-            FOR UPDATE
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().all()
-    for row in rows:
-        snapshot = dict(row["condition_snapshot"] or {})
-        raw_key = snapshot.get("conditionKey")
-        if not isinstance(raw_key, str) or not raw_key.strip():
-            continue
-        resolved = _condition_value(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            condition_key=raw_key,
-        )
-        if resolved is None:
-            continue
-        new_state = "APPLICABLE" if resolved else "NOT_APPLICABLE"
-        old_state = snapshot.get("applicabilityState")
-        if old_state == new_state:
-            continue
-        reason = f"{raw_key}={'Yes' if resolved else 'No'}"
-        snapshot["applicabilityState"] = new_state
-        snapshot["applicabilityReason"] = reason
-        new_requirement_status = "PENDING" if resolved else "NOT_APPLICABLE"
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.journey_document_requirements
-                SET requirement_status=:requirement_status,
-                    condition_snapshot=CAST(:snapshot AS jsonb),
-                    updated_at_utc=now()
-                WHERE tenant_id=:tenant_id
-                  AND journey_document_requirement_id=:requirement_id
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "requirement_id": row["journey_document_requirement_id"],
-                "requirement_status": new_requirement_status,
-                "snapshot": json.dumps(snapshot),
-            },
-        )
-        existing = _assessment_row(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            requirement_key=row["requirement_key"],
-        )
-        if existing is not None and existing["applicability_state"] != new_state:
-            connection.execute(
-                text(
-                    """
-                    UPDATE auditcore.journey_document_assessments
-                    SET applicability_state=:state,
-                        applicability_reason=:reason,
-                        answer='UNANSWERED', evidence_id=NULL,
-                        answered_at_utc=NULL,
-                        version_no=version_no+1,
-                        updated_at_utc=now()
-                    WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                      AND stage_code='BOOKING' AND requirement_key=:requirement_key
-                    """
-                ),
-                {
-                    "tenant_id": tenant_id,
-                    "journey_id": journey_id,
-                    "requirement_key": row["requirement_key"],
-                    "state": new_state,
-                    "reason": reason,
-                },
-            )
-        changes.append(
-            {
-                "requirementKey": row["requirement_key"],
-                "previousState": old_state or "UNRESOLVED",
-                "applicabilityState": new_state,
-                "reason": reason,
-            }
-        )
-    return changes
-
-
 def _capture_snapshot(connection: Connection, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     row = connection.execute(
         text(
@@ -949,110 +789,6 @@ def _completion_summary(connection: Connection, tenant_id: str, journey_id: UUID
     }
 
 
-@router.put("/capture/{field_key}")
-def record_booking_capture(
-    tenant_id: str,
-    journey_id: UUID,
-    field_key: str,
-    payload: CaptureCommand,
-    request: Request,
-    response: Response,
-    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
-    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> dict[str, Any]:
-    context = _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    expected_version = _parse_if_match(if_match)
-    correlation_id = get_correlation_id(request)
-    normalized_field = field_key.strip().upper()
-
-    def execute() -> dict[str, Any]:
-        _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
-        state = _stage_state(connection, tenant_id=tenant_id, journey_id=journey_id)
-        _require_expected_version(state, expected_version)
-        _require_active_booking(state)
-        domain, record_reference = _write_typed_capture(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            field_key=normalized_field,
-            value=payload.value,
-            source_evidence_id=payload.sourceEvidenceId,
-        )
-        applicability_changes = _resolve_booking_applicability(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-        )
-        next_version = int(state["version_no"]) + 1
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.journey_stage_states
-                SET business_status='BOOKING_IN_PROGRESS',
-                    audit_state=CASE WHEN audit_state='NOT_STARTED' THEN 'IN_PROGRESS' ELSE audit_state END,
-                    latest_activity_at_utc=now(), updated_at_utc=now(),
-                    version_no=:version
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND stage_code='BOOKING'
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id, "version": next_version},
-        )
-        event_id = _append_workflow_event(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            event_type="BOOKING_CAPTURE_RECORDED",
-            source_kind="HUMAN",
-            actor_id=human_principal.subject,
-            actor_role_snapshot=context["operating_role"],
-            idempotency_key=idempotency_key,
-            correlation_id=correlation_id,
-            safe_payload={
-                "fieldKey": normalized_field,
-                "owningDomainKey": domain,
-                "sourceEvidenceId": str(payload.sourceEvidenceId) if payload.sourceEvidenceId else None,
-                "applicabilityChanges": applicability_changes,
-            },
-            aggregate_version=next_version,
-        )
-        return {
-            "journeyId": str(journey_id),
-            "fieldKey": normalized_field,
-            "value": payload.value,
-            "owningDomainKey": domain,
-            "owningRecordReference": record_reference,
-            "applicabilityChanges": applicability_changes,
-            "aggregateVersion": next_version,
-            "eventId": str(event_id),
-        }
-
-    body, _ = execute_idempotent_json_command(
-        connection,
-        tenant_id=tenant_id,
-        operation_key=f"uc03.booking.capture:{journey_id}:{normalized_field}",
-        idempotency_key=idempotency_key,
-        request_payload={
-            "expectedVersion": expected_version,
-            "fieldKey": normalized_field,
-            "payload": payload.model_dump(mode="json"),
-        },
-        execute=execute,
-    )
-    _set_etag(response, body)
-    return body
 
 
 # _proposal_row, _decide_proposal, accept_extraction_proposal and
@@ -1067,68 +803,6 @@ def record_booking_capture(
 # itself dead code (no caller, no test) -- so this whole table is now fully
 # retired end to end, a candidate to drop outright in the Phase 4 schema
 # squash rather than migrate forward.
-
-
-# refresh_booking_extraction removed (Phase 0 dead-code cleanup): shadowed by
-# uc03_booking_integrations.py's identical POST /booking/extraction/refresh
-# route (registered first in main.py, so this one never received a request),
-# had zero callers anywhere in verigence-web or verigence-audit-core, and no
-# test referenced it by name. ExtractionRefreshResponse stays defined here --
-# uc03_booking_integrations.py's live refresh_booking_extraction_strict
-# imports it.
-
-
-@router.get("/processing-status")
-def get_booking_processing_status(
-    tenant_id: str,
-    journey_id: UUID,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> dict[str, Any]:
-    _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    state = _stage_state(connection, tenant_id=tenant_id, journey_id=journey_id)
-    _require_active_booking(state)
-    documents = _document_views(connection, tenant_id, journey_id)
-    pending = 0
-    failed = 0
-    for document in documents:
-        processing = (document["processingStatus"] or "").upper()
-        if processing in {"FAILED", "ERROR", "REJECTED"}:
-            failed += 1
-        elif document["evidenceId"] and processing not in _TERMINAL_PROCESSING_STATUSES:
-            pending += 1
-    proposal_count = connection.execute(
-        text(
-            """
-            SELECT count(*) FROM auditcore.journey_capture_proposals
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code='BOOKING' AND proposal_status='PENDING'
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).scalar_one()
-    return {
-        "version": int(state["version_no"]),
-        "pendingCount": pending,
-        "readyProposalCount": int(proposal_count),
-        "failedCount": failed,
-        "documents": documents,
-        "userMessage": (
-            "One or more documents need attention. Retry processing or upload a clearer document."
-            if failed
-            else None
-        ),
-    }
 
 
 @router.get("/flags")
@@ -1316,119 +990,6 @@ def create_booking_flag(
     )
     _set_etag(response, body)
     return body
-
-
-# No @router decorator: uc03_post_extraction_materialization.py's
-# close_booking_ready_with_lazy_v2_sync is decorated directly on this same
-# router for this same path (POST /booking/close-ready) -- it calls this
-# function at the end of its own body, so this stays plain library code
-# rather than a second, competing registration on the router.
-def close_booking_ready(
-    tenant_id: str,
-    journey_id: UUID,
-    request: Request,
-    response: Response,
-    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
-    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> BookingCommandResponse:
-    context = _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    expected_version = _parse_if_match(if_match)
-    correlation_id = get_correlation_id(request)
-
-    def execute() -> dict[str, Any]:
-        _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
-        state = _stage_state(connection, tenant_id=tenant_id, journey_id=journey_id)
-        _require_expected_version(state, expected_version)
-        _require_transition(
-            state,
-            allowed=_ACTIVE_BOOKING_STATUSES,
-            action="closed ready for Delivery",
-        )
-        completion = _completion_summary(connection, tenant_id, journey_id)
-        if not completion["ready"]:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-009",
-                title="Booking checkpoint is incomplete",
-                detail="Complete the outstanding Booking audit work before closing ready for Delivery.",
-            )
-        open_flags = connection.execute(
-            text(
-                """
-                SELECT count(*) FROM auditcore.audit_findings
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND stage_code='BOOKING' AND finding_status IN ('OPEN','ACKNOWLEDGED')
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).scalar_one()
-        next_version = int(state["version_no"]) + 1
-        row = connection.execute(
-            text(
-                """
-                UPDATE auditcore.journey_stage_states
-                SET business_status='BOOKING_CLOSED',
-                    closure_disposition='PROCEED_TO_DELIVERY',
-                    audit_state='COMPLETE',
-                    audit_status=:audit_status,
-                    capture_completed_at_utc=now(),
-                    business_completed_at_utc=now(),
-                    closed_by_actor_id=:actor_id,
-                    closed_at_utc=now(),
-                    latest_activity_at_utc=now(),
-                    updated_at_utc=now(),
-                    version_no=:version
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND stage_code='BOOKING'
-                RETURNING journey_id, business_status, closure_disposition,
-                          audit_state, audit_status, close_reason_code,
-                          closure_remarks, latest_activity_at_utc, version_no
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "actor_id": human_principal.subject,
-                "audit_status": "FLAGS_RAISED" if open_flags else "NO_FLAGS",
-                "version": next_version,
-            },
-        ).mappings().one()
-        event_id = _append_workflow_event(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            event_type="BOOKING_CLOSED",
-            source_kind="HUMAN",
-            actor_id=human_principal.subject,
-            actor_role_snapshot=context["operating_role"],
-            idempotency_key=idempotency_key,
-            correlation_id=correlation_id,
-            safe_payload={"closureDisposition": "PROCEED_TO_DELIVERY"},
-            aggregate_version=next_version,
-        )
-        return _build_response(row, event_id=event_id)
-
-    body, _ = execute_idempotent_json_command(
-        connection,
-        tenant_id=tenant_id,
-        operation_key=f"uc03.booking.close-ready:{journey_id}",
-        idempotency_key=idempotency_key,
-        request_payload={"expectedVersion": expected_version},
-        execute=execute,
-    )
-    _set_etag(response, body)
-    return BookingCommandResponse.model_validate(body)
 
 
 # No @router decorator: uc03_booking_integrations.py's `/uc03-workspace` route

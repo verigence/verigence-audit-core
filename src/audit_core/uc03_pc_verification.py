@@ -1,18 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Query, Request, Response
-from pydantic import BaseModel, ConfigDict
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
 from sqlalchemy import Connection, text
 
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_human_principal
-from audit_core.errors import ConflictError, NotFoundError
-from audit_core.idempotency import execute_idempotent_json_command
-from audit_core.observability import get_correlation_id
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
@@ -23,38 +20,10 @@ from audit_core.uc03_booking_capture import (
     _PROPOSAL_CAPTURE_MAP,
     _TERMINAL_PROCESSING_STATUSES,
     _document_views,
-    _resolve_booking_applicability,
-    _scope,
-    _write_typed_capture,
-)
-from audit_core.uc03_booking_commands import (
-    _aggregate_lock,
-    _append_workflow_event,
-    _parse_if_match,
 )
 
 router = APIRouter(tags=["uc03-pc-verification"])
 _FAILED_PROCESSING_STATUSES = {"FAILED", "ERROR", "REJECTED"}
-
-
-class PcBookingSubmitCommand(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    values: dict[str, Any]
-
-
-class PcVerificationView(BaseModel):
-    journeyId: UUID
-    captureSubmitted: bool
-    pcVerificationStatus: Literal["NOT_SUBMITTED", "PENDING", "VERIFIED"]
-    reviewReady: bool
-    linkedDocumentCount: int
-    pendingDocumentCount: int
-    failedDocumentCount: int
-    pendingProposalCount: int
-    aggregateVersion: int
-    captureCompletedAtUtc: datetime | None
-    latestActivityAtUtc: datetime
 
 
 class ReviewPendingItem(BaseModel):
@@ -72,35 +41,6 @@ class ReviewPendingItem(BaseModel):
 class ReviewPendingPage(BaseModel):
     items: list[ReviewPendingItem]
     totalCount: int
-
-
-def _verification_state(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-    for_update: bool = False,
-):
-    suffix = " FOR UPDATE" if for_update else ""
-    row = connection.execute(
-        text(
-            """
-            SELECT journey_id, business_status, capture_completed_at_utc,
-                   pc_verification_status, latest_activity_at_utc, version_no
-            FROM auditcore.journey_stage_states
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND stage_code='BOOKING'
-            """ + suffix
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one_or_none()
-    if row is None:
-        raise NotFoundError(
-            error_code="VAC-NF-005",
-            title="Booking not found",
-            detail="Booking stage not found for the requested Project.",
-        )
-    return row
 
 
 def _review_readiness(
@@ -146,247 +86,10 @@ def _review_readiness(
     }
 
 
-def _view(connection: Connection, *, tenant_id: str, journey_id: UUID) -> PcVerificationView:
-    state = _verification_state(connection, tenant_id=tenant_id, journey_id=journey_id)
-    readiness = _review_readiness(connection, tenant_id=tenant_id, journey_id=journey_id)
-    status = state["pc_verification_status"]
-    if state["capture_completed_at_utc"] is None:
-        status = "NOT_SUBMITTED"
-    elif status is None:
-        status = "PENDING"
-    return PcVerificationView(
-        journeyId=journey_id,
-        captureSubmitted=state["capture_completed_at_utc"] is not None,
-        pcVerificationStatus=status,
-        aggregateVersion=int(state["version_no"]),
-        captureCompletedAtUtc=state["capture_completed_at_utc"],
-        latestActivityAtUtc=state["latest_activity_at_utc"],
-        **readiness,
-    )
 
 
-@router.get(
-    "/v1/tenants/{tenant_id}/journeys/{journey_id}/pc-verification",
-    response_model=PcVerificationView,
-)
-def get_pc_verification(
-    tenant_id: str,
-    journey_id: UUID,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> PcVerificationView:
-    _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    return _view(connection, tenant_id=tenant_id, journey_id=journey_id)
 
 
-@router.post(
-    "/v1/tenants/{tenant_id}/journeys/{journey_id}/pc-verification/submit",
-    response_model=PcVerificationView,
-)
-def submit_pc_booking_capture(
-    tenant_id: str,
-    journey_id: UUID,
-    payload: PcBookingSubmitCommand,
-    request: Request,
-    response: Response,
-    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
-    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> PcVerificationView:
-    context = _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    expected_version = _parse_if_match(if_match)
-    correlation_id = get_correlation_id(request)
-
-    def execute() -> dict[str, Any]:
-        _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
-        state = _verification_state(connection, tenant_id=tenant_id, journey_id=journey_id, for_update=True)
-        if int(state["version_no"]) != expected_version:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-005",
-                title="Booking version conflict",
-                detail="Booking changed since it was loaded. Refresh the Booking and retry.",
-            )
-
-        captured_fields: list[str] = []
-        for raw_key, value in payload.values.items():
-            key = raw_key.strip().upper()
-            if value is None or (isinstance(value, str) and not value.strip()):
-                continue
-            _write_typed_capture(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                field_key=key,
-                value=value,
-                source_evidence_id=None,
-            )
-            captured_fields.append(key)
-
-        applicability_changes = _resolve_booking_applicability(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-        )
-        next_version = expected_version + 1
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.journey_stage_states
-                SET capture_completed_at_utc=now(),
-                    pc_verification_status='PENDING',
-                    latest_activity_at_utc=now(),
-                    updated_at_utc=now(),
-                    version_no=:version
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND stage_code='BOOKING'
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id, "version": next_version},
-        )
-        _append_workflow_event(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            event_type="PC_BOOKING_CAPTURE_SUBMITTED",
-            source_kind="HUMAN",
-            actor_id=human_principal.subject,
-            actor_role_snapshot=context["operating_role"],
-            idempotency_key=idempotency_key,
-            correlation_id=correlation_id,
-            safe_payload={
-                "pcVerificationStatus": "PENDING",
-                "capturedFields": captured_fields,
-                "applicabilityChanges": applicability_changes,
-                "bookingBusinessStatusChanged": False,
-            },
-            aggregate_version=next_version,
-        )
-        return _view(connection, tenant_id=tenant_id, journey_id=journey_id).model_dump(mode="json")
-
-    body, _ = execute_idempotent_json_command(
-        connection,
-        tenant_id=tenant_id,
-        operation_key=f"uc03.pc-verification.submit:{journey_id}",
-        idempotency_key=idempotency_key,
-        request_payload={"expectedVersion": expected_version, "values": payload.values},
-        execute=execute,
-    )
-    response.headers["ETag"] = f'"{body["aggregateVersion"]}"'
-    return PcVerificationView.model_validate(body)
-
-
-@router.post(
-    "/v1/tenants/{tenant_id}/journeys/{journey_id}/pc-verification/verify",
-    response_model=PcVerificationView,
-)
-def verify_pc_booking(
-    tenant_id: str,
-    journey_id: UUID,
-    request: Request,
-    response: Response,
-    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
-    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> PcVerificationView:
-    context = _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    expected_version = _parse_if_match(if_match)
-    correlation_id = get_correlation_id(request)
-
-    def execute() -> dict[str, Any]:
-        _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
-        state = _verification_state(connection, tenant_id=tenant_id, journey_id=journey_id, for_update=True)
-        if int(state["version_no"]) != expected_version:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-005",
-                title="Booking version conflict",
-                detail="Booking changed since it was loaded. Refresh the Booking and retry.",
-            )
-        if state["capture_completed_at_utc"] is None or state["pc_verification_status"] != "PENDING":
-            raise ConflictError(
-                error_code="VAC-CONFLICT-010",
-                title="PC verification is not pending",
-                detail="Submit Booking capture before completing PC verification.",
-            )
-        readiness = _review_readiness(connection, tenant_id=tenant_id, journey_id=journey_id)
-        if not readiness["reviewReady"]:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-011",
-                title="Documents are not ready for review",
-                detail="Document Intelligence is still preparing one or more Booking documents.",
-            )
-        if int(readiness["pendingProposalCount"]) > 0:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-012",
-                title="PC document review is incomplete",
-                detail="Review the remaining extracted values before marking the Booking verified.",
-            )
-        next_version = expected_version + 1
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.journey_stage_states
-                SET pc_verification_status='VERIFIED',
-                    latest_activity_at_utc=now(),
-                    updated_at_utc=now(),
-                    version_no=:version
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND stage_code='BOOKING'
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id, "version": next_version},
-        )
-        _append_workflow_event(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            event_type="PC_BOOKING_VERIFIED",
-            source_kind="HUMAN",
-            actor_id=human_principal.subject,
-            actor_role_snapshot=context["operating_role"],
-            idempotency_key=idempotency_key,
-            correlation_id=correlation_id,
-            safe_payload={
-                "pcVerificationStatus": "VERIFIED",
-                "bookingBusinessStatusChanged": False,
-                "tlReviewRequired": False,
-            },
-            aggregate_version=next_version,
-        )
-        return _view(connection, tenant_id=tenant_id, journey_id=journey_id).model_dump(mode="json")
-
-    body, _ = execute_idempotent_json_command(
-        connection,
-        tenant_id=tenant_id,
-        operation_key=f"uc03.pc-verification.verify:{journey_id}",
-        idempotency_key=idempotency_key,
-        request_payload={"expectedVersion": expected_version},
-        execute=execute,
-    )
-    response.headers["ETag"] = f'"{body["aggregateVersion"]}"'
-    return PcVerificationView.model_validate(body)
 
 
 @router.get(

@@ -12,26 +12,17 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
-from typing import Annotated, Any
+from typing import Any
 from uuid import UUID
 
-from fastapi import BackgroundTasks, Depends, Header, Request, Response
 from sqlalchemy import Connection, text
 
 from audit_core import uc03_booking_capture as booking_capture
 from audit_core import uc03_journey_reviewed_details as reviewed_details
 from audit_core import uc03_v2_review_materialization as materialization
-from audit_core.dependencies import get_connection, get_engine, get_human_principal
 from audit_core.errors import AuditCoreError
-from audit_core.observability import get_correlation_id
-from audit_core.security import HumanPrincipal
-from audit_core.security_authorization import (
-    SecurityAuthorizationClient,
-    get_security_authorization_client,
-)
 from audit_core.uc03_attribute_mapping import spec_for_field
 from audit_core.uc03_attribute_resolution import apply_supported_operational_attribute
-from audit_core.uc03_booking_rule_trigger import schedule_booking_checkpoint_rules
 from audit_core.uc03_deal_source_history import record_source_value
 
 logger = logging.getLogger(__name__)
@@ -342,144 +333,3 @@ def materialize_machine_booking_values(
     }
 
 
-def _v2_booking_document_ids(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-) -> list[UUID]:
-    """Return only V2 capture documents eligible for the pre-submit race check."""
-
-    return list(
-        connection.execute(
-            text(
-                """
-                SELECT DISTINCT e.di_document_id
-                FROM auditcore.evidence e
-                JOIN auditcore.document_capture_v2_documents d
-                  ON d.tenant_id=e.tenant_id
-                 AND d.journey_id=e.journey_id
-                 AND d.di_document_id=e.di_document_id
-                WHERE e.tenant_id=:tenant_id AND e.journey_id=:journey_id
-                  AND e.association_status='ACTIVE'
-                  AND e.di_document_id IS NOT NULL
-                  AND d.stage_code='BOOKING'
-                  AND d.capture_status <> 'SUPERSEDED'
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).scalars().all()
-    )
-
-
-# Decorated directly on booking_capture.router (Phase 0 monkeypatch removal):
-# this used to be installed via install_uc03_post_extraction_materialization's
-# _replace_route call, discarding uc03_booking_capture.py's own undecorated
-# close_booking_ready (kept there as plain library code -- this function calls
-# through to it below). Registering the route here, at plain import time
-# (main.py imports this module directly, before create_app() builds the app),
-# means the decorator always wins outright instead of a startup-time swap
-# needing to discard a competing registration first.
-@booking_capture.router.post(
-    "/booking/close-ready", response_model=booking_capture.BookingCommandResponse
-)
-def close_booking_ready_with_lazy_v2_sync(
-    tenant_id: str,
-    journey_id: UUID,
-    request: Request,
-    response: Response,
-    background_tasks: BackgroundTasks,
-    idempotency_key: Annotated[
-        str,
-        Header(alias="Idempotency-Key", min_length=8, max_length=200),
-    ],
-    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-):
-    """Submit Booking without making DI availability a business-process dependency.
-
-    Only current V2-capture documents participate in the pre-submit race check.
-    Each one's sync is queued as its own background task (the same
-    _run_sync_booking_document_task the DI webhook uses), not run inline here --
-    confirmed live: this loop ran every document's full sync (a Security token
-    fetch, DI network round trips, durable fact copy, materialization) inside
-    this one request-scoped connection with no headroom, so a Booking with
-    several documents could sit long enough for Postgres's own
-    idle_in_transaction_session_timeout to kill the connection mid-loop
-    (``psycopg.errors.IdleInTransactionSessionTimeout`` at commit), discarding
-    whatever had already synced. _run_sync_booking_document_task's own
-    transaction already carries the deliberate statement_timeout/idle_in_
-    transaction_session_timeout headroom this needs (see its own docstring) --
-    reused here rather than duplicated. The durable callback remains the
-    source of eventual post-submit synchronization; this is a best-effort
-    head start, same as it always was, just no longer able to fail the
-    request or lose work to a killed connection.
-    """
-
-    from audit_core import uc03_confidence_review_policy as confidence_policy
-
-    confidence_policy.booking_review._scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    document_ids = _v2_booking_document_ids(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-    )
-    for index, document_id in enumerate(document_ids):
-        background_tasks.add_task(
-            confidence_policy._run_sync_booking_document_task,
-            get_engine(),
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            document_id=document_id,
-            service_id="audit-core",
-            stage_code="BOOKING",
-            initial_delay_seconds=confidence_policy.sync_stagger_seconds(index),
-        )
-
-    # Same safety net as PC Review Confirm (see confirm_booking_review_v2_
-    # confidence_policy): Submit is where the pre-submit loop above may have
-    # just synced a document that never made it through the async webhook
-    # path, so schedule checkpoint-rule evaluation here too -- raise_new=True
-    # (explicit; it's also the default), since Submit is PC declaring
-    # Booking complete, exactly the genuine-gap-check moment, not the
-    # async per-document trigger's self-heal-only pass.
-    background_tasks.add_task(
-        schedule_booking_checkpoint_rules,
-        get_engine(),
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        correlation_id=get_correlation_id(request),
-        trigger="BOOKING_SUBMIT",
-        raise_new=True,
-    )
-    return booking_capture.close_booking_ready(
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        request=request,
-        response=response,
-        idempotency_key=idempotency_key,
-        if_match=if_match,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        connection=connection,
-    )
-
-
-# install_uc03_post_extraction_materialization removed (Phase 0 monkeypatch
-# removal): its two jobs are both done directly now instead --
-# materialize_machine_booking_values is called inline from
-# uc03_confidence_review_policy._sync_booking_document (symmetric with how
-# Delivery's own materialization already ran inline there), and
-# close_booking_ready_with_lazy_v2_sync is decorated directly above instead
-# of being swapped in via _replace_route.

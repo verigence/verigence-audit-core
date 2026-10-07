@@ -70,7 +70,6 @@ jobs:
               "/v1/tenants/{tenant_id}/role-mappings",
               "/v1/tenants/{tenant_id}/mahindra-masters/segments/{segment_id}/imports",
               "/v1/tenants/{tenant_id}/mahindra-masters/discount-policy/imports",
-              "/v1/tenants/{tenant_id}/journeys/{journey_id}/booking/identity-context",
               "/p2/v1/tenants/{tenant_id}/journeys",
               "/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/documents",
               "/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/uploads/{batch_id}",
