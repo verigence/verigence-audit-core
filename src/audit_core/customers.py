@@ -13,7 +13,6 @@ from audit_core.security_authorization import (
     SecurityAuthorizationError,
 )
 
-
 _CUSTOMER_READ_PERMISSION = "audit.customer.read"
 _CUSTOMER_WRITE_PERMISSION = "audit.customer.write"
 _FULL_CONTACT_PERMISSION = "audit.customer.contact.full.read"

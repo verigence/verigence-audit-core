@@ -61,11 +61,9 @@ from audit_core.uc03_booking_capture import router as uc03_booking_capture_route
 from audit_core.uc03_booking_commands import router as uc03_booking_router
 from audit_core.uc03_booking_details import router as uc03_booking_details_router
 from audit_core.uc03_booking_evidence import router as uc03_booking_evidence_router
-from audit_core.uc03_booking_exchange import router as uc03_booking_exchange_router
 from audit_core.uc03_booking_integrations import (
     router as uc03_booking_integrations_router,
 )
-from audit_core.uc03_booking_part1 import router as uc03_booking_part1_router
 from audit_core.uc03_booking_v2 import router as uc03_booking_v2_router
 from audit_core.uc03_compliance_report import router as uc03_compliance_report_router
 from audit_core.uc03_create_booking import router as uc03_create_booking_router
@@ -105,7 +103,6 @@ from audit_core.uc03_duplicate_bookings_report import (
     router as uc03_duplicate_bookings_report_router,
 )
 from audit_core.uc03_fast_work_items import router as uc03_fast_work_items_router
-from audit_core.uc03_final_source import router as uc03_final_source_router
 from audit_core.uc03_identity_business_date import install_uc03_identity_business_date
 from audit_core.uc03_identity_business_date import (
     router as uc03_identity_business_date_router,
@@ -277,7 +274,6 @@ def create_app() -> FastAPI:
     application.include_router(uc03_nightly_reprocessing_reports_router)
     application.include_router(uc03_create_booking_router)
     application.include_router(uc03_booking_router)
-    application.include_router(uc03_booking_exchange_router)
     application.include_router(uc03_booking_integrations_router)
     application.include_router(uc03_pc_verification_router)
     application.include_router(uc03_booking_capture_router)
@@ -296,11 +292,9 @@ def create_app() -> FastAPI:
     application.include_router(uc03_document_capture_v2_router)
     application.include_router(uc03_unified_document_capture_router)
     application.include_router(uc03_document_review_v2_router)
-    application.include_router(uc03_final_source_router)
     application.include_router(uc03_pc_booking_documents_router)
     application.include_router(uc03_pc_direct_review_router)
     application.include_router(uc03_pc_generic_review_router)
-    application.include_router(uc03_booking_part1_router)
     application.include_router(uc03_identity_business_date_router)
     application.include_router(uc03_booking_evidence_router)
     application.include_router(uc03_booking_details_router)

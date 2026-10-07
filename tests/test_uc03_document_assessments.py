@@ -472,46 +472,6 @@ def test_unresolved_conditional_requirement_cannot_be_assessed(
     assert response.json()["errorCode"] == "VAC-CONFLICT-007"
 
 
-def test_booking_capture_recalculates_conditional_document_applicability(
-    booking_document_setup,
-) -> None:
-    setup = booking_document_setup
-    client = TestClient(app, raise_server_exceptions=False)
-    assert client.post(
-        _booking_url(setup, "start"),
-        headers=_headers("c1-app-start", 0),
-    ).status_code == 200
-
-    captured = client.put(
-        _journey_url(setup, "capture/EXCHANGE_TAKEN"),
-        headers=_headers("c1-app-capture", 1),
-        json={"value": True},
-    )
-    assert captured.status_code == 200, captured.text
-    assert captured.json()["aggregateVersion"] == 2
-    assert captured.json()["applicabilityChanges"][0]["requirementKey"] == "TRADE_IN_RC"
-    assert captured.json()["applicabilityChanges"][0]["applicabilityState"] == "APPLICABLE"
-
-    listed = client.get(_documents_url(setup))
-    assert listed.status_code == 200, listed.text
-    trade_in = next(item for item in listed.json() if item["requirementKey"] == "TRADE_IN_RC")
-    assert trade_in["applicabilityState"] == "APPLICABLE"
-    assert "exchangeTaken=Yes" in trade_in["applicabilityReason"]
-
-    with setup["engine"].begin() as connection:
-        details = connection.execute(
-            text(
-                """
-                SELECT details
-                FROM auditcore.trade_in_cases
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                """
-            ),
-            {"tenant_id": setup["tenant_id"], "journey_id": setup["journey_id"]},
-        ).scalar_one()
-    assert details["exchangeTaken"] is True
-
-
 # test_corrected_extraction_proposal_preserves_machine_original removed
 # (Phase 0 dead-code cleanup): it exercised POST .../extraction-proposals/
 # {id}/correct, deleted along with the rest of the V1 extraction-proposal
