@@ -13,15 +13,12 @@ the same UC03 Booking business attributes.
 """
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import text
 
 from audit_core import uc03_attribute_mapping as attribute_mapping
-from audit_core import uc03_booking_review_decisions as decisions
 from audit_core import uc03_v2_review_materialization as materialization
-from audit_core.uc03_di_core_persistence import ReviewedDiField, has_persistable_value
 
 _BOOKING_DOCKET_DOCUMENT_TYPE = "booking_docket"
 _DOCKET_ONLY_FIELDS = (
@@ -123,8 +120,6 @@ def _install_docket_typed_owner() -> None:
         return None
 
     materialization.reviewed_field_core_owner = reviewed_field_core_owner  # type: ignore[assignment]
-    # Booking Review imported the helper directly, so update that live binding too.
-    decisions.reviewed_field_core_owner = reviewed_field_core_owner  # type: ignore[assignment]
 
     original_materialize = materialization.materialize_reviewed_booking_form_values
 
@@ -186,52 +181,6 @@ def _install_docket_typed_owner() -> None:
     # so no second binding needs to be patched.
 
 
-def _install_owner_guard() -> None:
-    original_persist: Callable[..., int] = decisions.persist_reviewed_di_fields
-
-    def persist_reviewed_di_fields_with_owner_guard(
-        connection,
-        *,
-        tenant_id: str,
-        journey_id,
-        stage_code,
-        actor_id: str,
-        fields: list[ReviewedDiField],
-    ) -> int:
-        if stage_code == "BOOKING":
-            for field in fields:
-                # Rejected fields intentionally have no effective accepted value and
-                # are retained as immutable DI extraction history; they need no
-                # accepted-value owner.
-                if not field.effective_value_is_set or not has_persistable_value(
-                    field.effective_value
-                ):
-                    continue
-                owner = materialization.reviewed_field_core_owner(
-                    document_type_key=field.source_document_type_key,
-                    field_key=field.field_key,
-                    document_id=field.document_id,
-                )
-                if owner is None:
-                    spec = attribute_mapping.spec_for_field(field.field_key)
-                    raise decisions._missing_core_owner_error(
-                        field_key=field.field_key,
-                        document_type_key=field.source_document_type_key,
-                        attribute_key=spec.attribute_key if spec is not None else None,
-                    )
-
-        return original_persist(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            stage_code=stage_code,
-            actor_id=actor_id,
-            fields=fields,
-        )
-
-    decisions.persist_reviewed_di_fields = persist_reviewed_di_fields_with_owner_guard  # type: ignore[assignment]
-
-
 def install_uc03_strict_review_core_ownership() -> None:
     """Install typed owners plus the lossless reviewed-DI fallback owner."""
 
@@ -240,5 +189,4 @@ def install_uc03_strict_review_core_ownership() -> None:
         return
     _install_docket_attribute_specs()
     _install_docket_typed_owner()
-    _install_owner_guard()
     _installed = True

@@ -13,11 +13,6 @@ def test_v2_capture_authorization_does_not_take_stage_write_lock(monkeypatch) ->
         "audit_core.uc03_document_capture_v2._scope",
         lambda *args, **kwargs: {},
     )
-    monkeypatch.setattr(
-        "audit_core.uc03_document_capture_v2._require_active_booking",
-        lambda state: None,
-    )
-
     def fake_capture_phase_state(
         connection,
         *,

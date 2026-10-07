@@ -10,41 +10,26 @@ by NULL/manual placeholders.
 """
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import Depends, Header, Request, Response, status
+from fastapi import Depends, Header, status
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection
 
-from audit_core import uc03_booking_v2 as booking_v2
 from audit_core import uc03_create_booking as create_booking
 from audit_core.dependencies import get_connection, get_human_principal
-from audit_core.errors import ConflictError
-from audit_core.idempotency import execute_idempotent_json_command
-from audit_core.observability import get_correlation_id
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
-from audit_core.uc03_booking_capture import _require_active_booking, _scope
-from audit_core.uc03_booking_commands import (
-    _aggregate_lock,
-    _append_workflow_event,
-    _parse_if_match,
-)
 from audit_core.uc03_document_capture_v2 import (
     _base_requirements,
     _build_local_capture_response,
-    _capture_phase_state,
     _declarations,
     _linked_documents,
-)
-from audit_core.uc03_requirement_satisfaction import (
-    resolve_requirement_satisfaction,
-    unresolved_completion_blockers,
 )
 from audit_core.uc03_simplified_create_atomic import (
     execute_simplified_create_booking_atomic,
@@ -58,20 +43,6 @@ class SimplifiedCreateBookingCommand(BaseModel):
     # Compatibility only. The active 06-Sep flow never asks PC for this value and
     # any legacy value supplied here is deliberately ignored.
     customerName: str | None = None
-
-
-class SimplifiedBookingSubmitCommand(BaseModel):
-    # Old V2 clients may still send removed Booking Details fields during rollout.
-    # They are ignored rather than written, so they cannot overwrite DI-populated Core.
-    model_config = ConfigDict(extra="ignore")
-
-
-class SimplifiedBookingSubmitResponse(BaseModel):
-    journeyId: UUID
-    phase: Literal["BOOKING"] = "BOOKING"
-    status: Literal["IN_PROGRESS", "COMPLETED"]
-    pcVerificationStatus: Literal["PENDING", "VERIFIED"] | None = None
-    aggregateVersion: int
 
 
 def create_booking_journey_first_reference(
@@ -140,198 +111,6 @@ def create_booking_journey_first_reference(
     )
 
 
-def submit_booking_from_review(
-    tenant_id: str,
-    journey_id: UUID,
-    command: SimplifiedBookingSubmitCommand,
-    request: Request,
-    response: Response,
-    if_match: Annotated[str, Header(alias="If-Match", min_length=1, max_length=64)],
-    idempotency_key: Annotated[
-        str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
-    ],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient, Depends(get_security_authorization_client)
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> SimplifiedBookingSubmitResponse:
-    del command
-    context = _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    expected_version = _parse_if_match(if_match)
-
-    def execute() -> dict[str, Any]:
-        _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
-        state = _capture_phase_state(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            for_update=True,
-        )
-        _require_active_booking(state)
-        if int(state["version_no"]) != expected_version:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-005",
-                title="Booking version conflict",
-                detail="Booking changed since Review was loaded. Refresh Review and retry.",
-            )
-        if state["capture_completed_at_utc"] is not None:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-004",
-                title="Booking capture is complete",
-                detail="Booking V2 capture has already been completed.",
-            )
-
-        # Document completeness is the sole criterion for Booking to finish --
-        # confidence review is a separate, always-available concern (the
-        # Documents page) a PC or TL can act on any time, not a precondition
-        # for Submit. Previously this blocked Submit on any unreviewed <90%
-        # field (Condition 2); removed so PC can submit as soon as documents
-        # are uploaded and classified, exactly like Delivery already does.
-        requirements = _base_requirements(connection, tenant_id, journey_id)
-        documents = _linked_documents(connection, tenant_id, journey_id)
-        # Was booking_v2._mandatory_booking_documents_complete(requirements,
-        # documents) -- a sixth independent computation of the same fact
-        # resolve_requirement_satisfaction now answers everywhere else (this
-        # endpoint is the REAL, live "Submit Booking" action; complete_
-        # booking_capture_v2 has no frontend caller). Its own PAN-or-Aadhaar
-        # "identity requirement" special case is a no-op against today's
-        # catalog (pan_card/aadhaar are OPTIONAL since migration 0109/0110,
-        # so _is_identity_requirement's REQUIRED-only filter always finds
-        # customer_kyc instead) -- behaviorally equivalent to the shared
-        # function's own REQUIRED-satisfaction check, just via one canonical
-        # path instead of a second one to keep in sync. Booking has no
-        # CONDITIONAL requirements today either, so the shared function's
-        # extra CONDITIONAL check is a no-op here too, not a behavior
-        # change. Soft-downgrade-on-incomplete (business_status stays
-        # BOOKING_IN_PROGRESS rather than a hard 409) is this endpoint's own
-        # deliberate, already-documented design -- not touched.
-        satisfaction = resolve_requirement_satisfaction(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            stage_code="BOOKING",
-            requirements=requirements,
-            documents=documents,
-        )
-        mandatory_documents_complete = not unresolved_completion_blockers(satisfaction)
-        current_pc_status = connection.execute(
-            text(
-                """
-                SELECT pc_verification_status
-                FROM auditcore.journey_stage_states
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND stage_code='BOOKING'
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).scalar_one_or_none()
-        preserved_pc_status = (
-            "VERIFIED" if str(current_pc_status or "").upper() == "VERIFIED" else "PENDING"
-        ) if mandatory_documents_complete else None
-
-        next_version = expected_version + 1
-        business_status = (
-            "BOOKING_CLOSED" if mandatory_documents_complete else "BOOKING_IN_PROGRESS"
-        )
-        closure_disposition = (
-            "PROCEED_TO_DELIVERY" if mandatory_documents_complete else None
-        )
-
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.journey_stage_states
-                SET business_status=:business_status,
-                    closure_disposition=:closure_disposition,
-                    audit_state=CASE
-                        WHEN audit_state='NOT_STARTED' THEN 'IN_PROGRESS'
-                        ELSE audit_state
-                    END,
-                    capture_completed_at_utc=CASE
-                        WHEN :mandatory_documents_complete THEN now()
-                        ELSE NULL
-                    END,
-                    pc_verification_status=:pc_verification_status,
-                    business_completed_at_utc=CASE
-                        WHEN :mandatory_documents_complete THEN now()
-                        ELSE NULL
-                    END,
-                    closed_at_utc=CASE
-                        WHEN :mandatory_documents_complete THEN now()
-                        ELSE NULL
-                    END,
-                    closed_by_actor_id=CASE
-                        WHEN :mandatory_documents_complete THEN :actor_id
-                        ELSE NULL
-                    END,
-                    latest_activity_at_utc=now(),
-                    updated_at_utc=now(),
-                    version_no=:version
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                  AND stage_code='BOOKING'
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "actor_id": human_principal.subject,
-                "version": next_version,
-                "business_status": business_status,
-                "closure_disposition": closure_disposition,
-                "pc_verification_status": preserved_pc_status,
-                "mandatory_documents_complete": mandatory_documents_complete,
-            },
-        )
-        _append_workflow_event(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            event_type="PC_BOOKING_CAPTURE_SUBMITTED",
-            source_kind="HUMAN",
-            actor_id=human_principal.subject,
-            actor_role_snapshot=context["operating_role"],
-            idempotency_key=idempotency_key,
-            correlation_id=get_correlation_id(request),
-            safe_payload={
-                "capturePath": "V2_SIMPLIFIED_REVIEW_SUBMIT",
-                "mandatoryDocumentsComplete": mandatory_documents_complete,
-                "pcVerificationStatus": preserved_pc_status,
-                "manualBookingDetailsCaptured": False,
-                "bookingBusinessStatus": business_status,
-                "closureDisposition": closure_disposition,
-            },
-            aggregate_version=next_version,
-        )
-        return SimplifiedBookingSubmitResponse(
-            journeyId=journey_id,
-            status="COMPLETED" if mandatory_documents_complete else "IN_PROGRESS",
-            pcVerificationStatus=preserved_pc_status,
-            aggregateVersion=next_version,
-        ).model_dump(mode="json")
-
-    # The idempotency key is scoped to journey+action only — not to expectedVersion.
-    # Including the version in request_payload would cause retries with a refreshed
-    # version (after a Refresh Review) to bypass the cache and re-execute, producing
-    # a second VAC-CONFLICT-005 on the fresh version when the first execution had
-    # already committed. The If-Match check inside execute() is the sole concurrency
-    # guard; the stored payload is audit evidence only.
-    body, _ = execute_idempotent_json_command(
-        connection,
-        tenant_id=tenant_id,
-        operation_key=f"uc03.booking-v2.simplified-submit:{journey_id}",
-        idempotency_key=idempotency_key,
-        request_payload={"details": None},
-        execute=execute,
-    )
-    response.headers["ETag"] = f'"{body["aggregateVersion"]}"'
-    return SimplifiedBookingSubmitResponse.model_validate(body)
 
 
 def _replace_route(
@@ -362,7 +141,7 @@ def _replace_route(
 
 
 def install_uc03_simplified_booking_flow() -> None:
-    if getattr(booking_v2, "_simplified_booking_flow_installed", False):
+    if getattr(create_booking, "_simplified_booking_flow_installed", False):
         return
 
     _replace_route(
@@ -373,11 +152,4 @@ def install_uc03_simplified_booking_flow() -> None:
         response_model=create_booking.CreateBookingResponse,
         status_code=status.HTTP_201_CREATED,
     )
-    _replace_route(
-        booking_v2.router,
-        suffix="/booking/submit",
-        method="POST",
-        endpoint=submit_booking_from_review,
-        response_model=SimplifiedBookingSubmitResponse,
-    )
-    booking_v2._simplified_booking_flow_installed = True
+    create_booking._simplified_booking_flow_installed = True

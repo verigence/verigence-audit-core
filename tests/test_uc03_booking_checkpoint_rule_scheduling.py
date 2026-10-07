@@ -261,23 +261,6 @@ def test_schedule_booking_checkpoint_rules_is_a_clean_skip_with_no_stage_state()
     engine.dispose()
 
 
-def test_confirm_handler_schedules_checkpoint_rules_as_a_safety_net() -> None:
-    # Regression test for the bug this fix closes: confirm_booking_review_v2_
-    # confidence_policy is the actually-live handler for POST .../booking/
-    # review/confirm (confirmed by install order in uc03_document_capture_v2_
-    # rules.py), but until this fix it never called schedule_booking_
-    # checkpoint_rules (nor its predecessor) anywhere in its body -- the
-    # Booking checkpoint rules and the external rule-engine phase silently
-    # never ran on a live confirm. Source-inspected rather than exercised
-    # end-to-end because the full confirm flow needs a large fixture
-    # (attributes, documents, decisions) that adds nothing to this specific
-    # assertion.
-    source = inspect.getsource(confidence_policy.confirm_booking_review_v2_confidence_policy)
-    assert "background_tasks: BackgroundTasks" in source
-    assert "background_tasks.add_task(" in source
-    assert "schedule_booking_checkpoint_rules" in source
-
-
 def test_async_document_sync_schedules_checkpoint_rules_for_booking() -> None:
     # The primary trigger this fix adds: every Booking document confirming
     # through the DI webhook's background sync evaluates checkpoint rules on

@@ -1,16 +1,11 @@
 from uuid import uuid4
 
-from fastapi.routing import APIRoute
-
-from audit_core import uc03_booking_review_decisions as decisions
 from audit_core import uc03_document_review_v2 as review_v2
 from audit_core import uc03_v2_review_materialization as materialization
 from audit_core.uc03_booking_commercial_components import (
     install_uc03_booking_commercial_components,
 )
 from audit_core.uc03_booking_review_decisions import (
-    BookingReviewV2ConfirmWithDecisionsResponse,
-    _lossless_reviewed_fields,
     install_uc03_booking_review_decisions,
 )
 from audit_core.uc03_strict_review_core_ownership import (
@@ -50,20 +45,6 @@ def _document(
             )
         ],
     )
-
-
-def test_active_review_confirm_contract_is_decision_aware() -> None:
-    _install_contract()
-    confirm_routes = [
-        route
-        for route in review_v2.router.routes
-        if isinstance(route, APIRoute)
-        and route.path.endswith("/booking/review/confirm")
-        and "POST" in route.methods
-    ]
-
-    assert len(confirm_routes) == 1
-    assert confirm_routes[0].response_model is BookingReviewV2ConfirmWithDecisionsResponse
 
 
 def test_every_supported_booking_source_field_has_typed_core_owner() -> None:
@@ -111,51 +92,3 @@ def test_booking_docket_unique_fields_are_first_class_review_attributes() -> Non
         assert spec is not None
         assert spec.mapping_status == "SUPPORTED"
         assert "BOOKING" in spec.stages
-
-
-def test_unknown_accepted_booking_field_uses_lossless_audit_core_owner() -> None:
-    _install_contract()
-    document = _document("future_unowned_business_field")
-    reviewed = _lossless_reviewed_fields([document], rejected_keys=set())
-
-    assert len(reviewed) == 1
-    assert reviewed[0].effective_value_is_set is True
-    assert materialization.reviewed_field_core_owner(
-        document_type_key="booking_form",
-        field_key="future_unowned_business_field",
-        document_id=document.documentId,
-    ) == ("REVIEWED_DI_FIELD", str(document.documentId))
-
-
-def test_rejected_unknown_field_keeps_original_without_effective_value() -> None:
-    document = _document("future_unowned_business_field")
-
-    reviewed = _lossless_reviewed_fields(
-        [document],
-        rejected_keys={"raw:future_unowned_business_field"},
-    )
-
-    assert len(reviewed) == 1
-    field = reviewed[0]
-    assert field.extracted_value == "accepted-value"
-    assert field.effective_value_is_set is False
-
-
-def test_rejected_mapped_attribute_keeps_source_without_effective_value() -> None:
-    document = _document("customer_name")
-
-    reviewed = _lossless_reviewed_fields(
-        [document],
-        rejected_keys={"attribute:customer_name"},
-    )
-
-    assert len(reviewed) == 1
-    assert reviewed[0].extracted_value == "accepted-value"
-    assert reviewed[0].effective_value_is_set is False
-
-
-def test_booking_confirm_installs_strict_owner_guard() -> None:
-    _install_contract()
-    assert decisions.persist_reviewed_di_fields.__name__ == (
-        "persist_reviewed_di_fields_with_owner_guard"
-    )

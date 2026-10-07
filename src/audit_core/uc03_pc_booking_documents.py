@@ -7,7 +7,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, Depends, Header, Request
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Connection, Engine, text
 
@@ -33,8 +33,6 @@ from audit_core.evidence import (
     get_di_client,
     get_security_oauth_client,
 )
-from audit_core.idempotency import execute_idempotent_json_command
-from audit_core.observability import get_correlation_id
 from audit_core.security import (
     HumanPrincipal,
     SecurityTokenError,
@@ -51,16 +49,12 @@ from audit_core.uc03_booking_capture import (
     _SUPPORTED_PROPOSAL_FIELDS,
     _require_active_booking,
     _scope,
-    _write_typed_capture,
 )
 from audit_core.uc03_booking_commands import (
-    _aggregate_lock,
-    _append_workflow_event,
     _stage_state,
 )
 from audit_core.uc03_booking_receipt_capture import (
     _RECEIPT_CAPTURE_MAP,
-    _write_receipt_capture,
 )
 from audit_core.uc03_document_assessments import _effective_applicability
 from audit_core.uc03_document_registry import is_receipt_document_type
@@ -71,8 +65,6 @@ router = APIRouter(tags=["uc03-pc-booking-documents"])
 
 _DI_AUDIENCE = "di"
 _AUDIT_SERVICE_AUDIENCE = "audit"
-_DUPLICATE_DOCUMENT_WORKFLOW_TYPE = "UC03_DUPLICATE_DOCUMENT"
-_DUPLICATE_DOCUMENT_TASK_TYPE = "DUPLICATE_DOCUMENT_NOTICE"
 # Requirement keys that accept more than one active evidence row (partial
 # payments, multiple receipts, multi-page/multi-period bank statements)
 # rather than the newest superseding the last. Delivery's payment-receipt
@@ -124,41 +116,6 @@ class BookingDocumentLinkResponse(BaseModel):
     documentId: UUID
     evidenceId: UUID
     status: Literal["ACKNOWLEDGED"] = "ACKNOWLEDGED"
-
-
-class BookingExtractionFieldDecision(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    fieldKey: str = Field(min_length=1, max_length=160)
-    sourceFactRef: UUID
-    sourceFactVersion: Literal[1]
-    sourceConfidence: float | None = Field(default=None, ge=0.0, le=100.0)
-    decision: Literal["APPROVED", "CORRECTED"]
-    approvedValue: Any
-
-
-class BookingExtractionDecisionCommand(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    requirementRef: UUID
-    documentId: UUID
-    fields: list[BookingExtractionFieldDecision] = Field(min_length=1, max_length=100)
-
-
-class BookingExtractionDecisionResult(BaseModel):
-    fieldKey: str
-    decision: Literal["APPROVED", "CORRECTED"]
-    owningDomainKey: str
-    owningRecordReference: str
-    eventId: UUID
-
-
-class BookingExtractionDecisionResponse(BaseModel):
-    journeyId: UUID
-    requirementRef: UUID
-    documentId: UUID
-    aggregateVersion: int
-    decisions: list[BookingExtractionDecisionResult]
 
 
 @lru_cache
@@ -783,287 +740,3 @@ def acknowledge_booking_document_link(
     )
 
 
-def _current_linked_evidence(
-    connection: Connection,
-    *,
-    tenant_id: str,
-    journey_id: UUID,
-    requirement_ref: UUID,
-    document_id: UUID,
-):
-    requirement = connection.execute(
-        text(
-            """
-            SELECT requirement_key, document_type_key
-            FROM auditcore.journey_document_requirements
-            WHERE tenant_id=:tenant_id
-              AND journey_id=:journey_id
-              AND journey_document_requirement_id=:requirement_ref
-              AND upper(process_area)='BOOKING'
-            FOR UPDATE
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "requirement_ref": requirement_ref,
-        },
-    ).mappings().one_or_none()
-    if requirement is None:
-        raise NotFoundError(
-            error_code="VAC-NF-006",
-            title="Booking document requirement not found",
-            detail="The Booking document requirement is not linked to current evidence.",
-        )
-
-    if _is_repeatable_requirement(requirement["requirement_key"]):
-        evidence = connection.execute(
-            text(
-                """
-                SELECT evidence_id, di_document_id
-                FROM auditcore.evidence
-                WHERE tenant_id=:tenant_id
-                  AND journey_id=:journey_id
-                  AND journey_document_requirement_id=:requirement_ref
-                  AND di_document_id=:document_id
-                  AND association_status='ACTIVE'
-                FOR UPDATE
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "requirement_ref": requirement_ref,
-                "document_id": document_id,
-            },
-        ).mappings().one_or_none()
-    else:
-        evidence = connection.execute(
-            text(
-                """
-                SELECT e.evidence_id, e.di_document_id
-                FROM auditcore.journey_document_assessments jda
-                JOIN auditcore.evidence e
-                  ON e.tenant_id=jda.tenant_id
-                 AND e.evidence_id=jda.evidence_id
-                 AND e.association_status='ACTIVE'
-                WHERE jda.tenant_id=:tenant_id
-                  AND jda.journey_id=:journey_id
-                  AND jda.stage_code='BOOKING'
-                  AND jda.journey_document_requirement_id=:requirement_ref
-                  AND e.di_document_id=:document_id
-                FOR UPDATE OF jda, e
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "requirement_ref": requirement_ref,
-                "document_id": document_id,
-            },
-        ).mappings().one_or_none()
-
-    if evidence is None:
-        raise ConflictError(
-            error_code="VAC-CONFLICT-009",
-            title="Booking document changed",
-            detail=(
-                "The reviewed DI document is not an active document for this repeatable requirement."
-                if _is_repeatable_requirement(requirement["requirement_key"])
-                else "The reviewed DI document is no longer the current document for this requirement."
-            ),
-        )
-    return {
-        "requirement_key": requirement["requirement_key"],
-        "document_type_key": requirement["document_type_key"],
-        "evidence_id": evidence["evidence_id"],
-        "di_document_id": evidence["di_document_id"],
-    }
-
-
-def _validate_unique_decisions(fields: list[BookingExtractionFieldDecision]) -> None:
-    field_keys: set[str] = set()
-    fact_pairs: set[tuple[str, UUID]] = set()
-    for field in fields:
-        normalized_field = field.fieldKey.strip().lower()
-        if normalized_field in field_keys:
-            raise AuditCoreError(
-                error_code="VAC-VAL-002",
-                status_code=422,
-                title="Duplicate extraction decision",
-                detail="Each extracted field may be decided only once in a document batch.",
-            )
-        field_keys.add(normalized_field)
-        pair = (normalized_field, field.sourceFactRef)
-        if pair in fact_pairs:
-            raise AuditCoreError(
-                error_code="VAC-VAL-002",
-                status_code=422,
-                title="Duplicate extraction source fact",
-                detail="Each field/source fact pair may be submitted only once.",
-            )
-        fact_pairs.add(pair)
-
-
-@router.post(
-    "/v1/tenants/{tenant_id}/journeys/{journey_id}/booking/document-extraction-decisions",
-    response_model=BookingExtractionDecisionResponse,
-)
-def submit_booking_document_extraction_decisions(
-    tenant_id: str,
-    journey_id: UUID,
-    payload: BookingExtractionDecisionCommand,
-    request: Request,
-    idempotency_key: Annotated[
-        str,
-        Header(alias="Idempotency-Key", min_length=8, max_length=200),
-    ],
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient,
-        Depends(get_security_authorization_client),
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> BookingExtractionDecisionResponse:
-    context = _scope(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-    )
-    correlation_id = get_correlation_id(request)
-    _validate_unique_decisions(payload.fields)
-
-    def execute() -> dict[str, Any]:
-        _aggregate_lock(connection, tenant_id=tenant_id, journey_id=journey_id)
-        state = _stage_state(connection, tenant_id=tenant_id, journey_id=journey_id)
-        _require_active_booking(state)
-        linked = _current_linked_evidence(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            requirement_ref=payload.requirementRef,
-            document_id=payload.documentId,
-        )
-        document_type_key = str(linked["document_type_key"] or "").strip().lower()
-        allowed_source_fields = (
-            set(_RECEIPT_CAPTURE_MAP)
-            if is_receipt_document_type(document_type_key)
-            else _SUPPORTED_PROPOSAL_FIELDS.get(document_type_key, set())
-        )
-        evidence_id: UUID = linked["evidence_id"]
-        next_version = int(state["version_no"]) + 1
-        results: list[dict[str, Any]] = []
-
-        for index, field in enumerate(payload.fields):
-            source_field_key = field.fieldKey.strip().lower()
-            receipt_capture_key = (
-                _RECEIPT_CAPTURE_MAP.get(source_field_key)
-                if is_receipt_document_type(document_type_key)
-                else None
-            )
-            normal_capture_key = _PROPOSAL_CAPTURE_MAP.get(source_field_key)
-            capture_key = receipt_capture_key or normal_capture_key
-            if capture_key is None or source_field_key not in allowed_source_fields:
-                raise AuditCoreError(
-                    error_code="VAC-VAL-002",
-                    status_code=422,
-                    title="Unsupported extraction field",
-                    detail="This DI field does not have an approved Booking typed-domain mapping.",
-                )
-            if receipt_capture_key is not None:
-                domain, record_reference = _write_receipt_capture(
-                    connection,
-                    tenant_id=tenant_id,
-                    journey_id=journey_id,
-                    capture_key=receipt_capture_key,
-                    value=field.approvedValue,
-                    source_evidence_id=evidence_id,
-                )
-            else:
-                domain, record_reference = _write_typed_capture(
-                    connection,
-                    tenant_id=tenant_id,
-                    journey_id=journey_id,
-                    field_key=capture_key,
-                    value=field.approvedValue,
-                    source_evidence_id=evidence_id,
-                )
-            event_id = _append_workflow_event(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                event_type=(
-                    "BOOKING_EXTRACTION_APPROVED"
-                    if field.decision == "APPROVED"
-                    else "BOOKING_EXTRACTION_CORRECTED"
-                ),
-                source_kind="HUMAN",
-                actor_id=human_principal.subject,
-                actor_role_snapshot=context["operating_role"],
-                idempotency_key=f"{idempotency_key}:{index}",
-                correlation_id=correlation_id,
-                safe_payload={
-                    "requirementRef": str(payload.requirementRef),
-                    "documentId": str(payload.documentId),
-                    "fieldKey": source_field_key,
-                    "sourceFactRef": str(field.sourceFactRef),
-                    "sourceFactVersion": field.sourceFactVersion,
-                    "sourceConfidence": field.sourceConfidence,
-                    "decision": field.decision,
-                    "owningDomainKey": domain,
-                    "owningRecordReference": record_reference,
-                },
-                aggregate_version=next_version,
-            )
-            results.append(
-                {
-                    "fieldKey": source_field_key,
-                    "decision": field.decision,
-                    "owningDomainKey": domain,
-                    "owningRecordReference": record_reference,
-                    "eventId": str(event_id),
-                }
-            )
-
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.journey_stage_states
-                SET business_status='BOOKING_IN_PROGRESS',
-                    audit_state=CASE
-                        WHEN audit_state='NOT_STARTED' THEN 'IN_PROGRESS'
-                        ELSE audit_state
-                    END,
-                    latest_activity_at_utc=now(),
-                    updated_at_utc=now(),
-                    version_no=:version
-                WHERE tenant_id=:tenant_id
-                  AND journey_id=:journey_id
-                  AND stage_code='BOOKING'
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "version": next_version,
-            },
-        )
-        return {
-            "journeyId": str(journey_id),
-            "requirementRef": str(payload.requirementRef),
-            "documentId": str(payload.documentId),
-            "aggregateVersion": next_version,
-            "decisions": results,
-        }
-
-    body, _ = execute_idempotent_json_command(
-        connection,
-        tenant_id=tenant_id,
-        operation_key=f"uc03.booking.document-extraction-decisions:{journey_id}:{payload.documentId}",
-        idempotency_key=idempotency_key,
-        request_payload=payload.model_dump(mode="json"),
-        execute=execute,
-    )
-    return BookingExtractionDecisionResponse.model_validate(body)

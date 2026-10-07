@@ -6,7 +6,6 @@ import pytest
 from conftest import delete_tenant_data
 from sqlalchemy import create_engine, text
 
-from audit_core.main import app
 from audit_core.security import HumanPrincipal
 from audit_core.uc03_document_capture_v2 import (
     _authorize_booking,
@@ -247,10 +246,6 @@ def test_v2_actor_id_uses_human_principal_subject() -> None:
     principal = HumanPrincipal(subject="pc-user-123")
 
     assert _human_actor_id(principal) == "pc-user-123"
-
-
-def test_v2_completion_route_is_additive() -> None:
-    assert "/v2/tenants/{tenant_id}/journeys/{journey_id}/booking/complete" in app.openapi()["paths"]
 
 
 def test_booking_docket_requirement_sends_canonical_booking_form_to_di() -> None:

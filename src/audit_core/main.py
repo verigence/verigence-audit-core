@@ -52,12 +52,10 @@ from audit_core.uc03_backfill_document_sync_producers import (
 )
 from audit_core.uc03_booking_capture import router as uc03_booking_capture_router
 from audit_core.uc03_booking_commands import router as uc03_booking_router
-from audit_core.uc03_booking_details import router as uc03_booking_details_router
 from audit_core.uc03_booking_evidence import router as uc03_booking_evidence_router
 from audit_core.uc03_booking_integrations import (
     router as uc03_booking_integrations_router,
 )
-from audit_core.uc03_booking_v2 import router as uc03_booking_v2_router
 from audit_core.uc03_compliance_report import router as uc03_compliance_report_router
 from audit_core.uc03_create_booking import router as uc03_create_booking_router
 from audit_core.uc03_customer_mobile_pii import install_uc03_customer_mobile_pii
@@ -120,8 +118,6 @@ from audit_core.uc03_p2_vehicle_photos import router as uc03_p2_vehicle_photos_r
 from audit_core.uc03_pc_booking_documents import (
     router as uc03_pc_booking_documents_router,
 )
-from audit_core.uc03_pc_direct_review import router as uc03_pc_direct_review_router
-from audit_core.uc03_pc_generic_review import router as uc03_pc_generic_review_router
 from audit_core.uc03_pc_verification import router as uc03_pc_verification_router
 from audit_core.uc03_project_context import router as uc03_project_context_router
 from audit_core.uc03_review_queue import router as uc03_review_queue_router
@@ -131,7 +127,6 @@ from audit_core.uc03_review_value_normalization import (
 from audit_core.uc03_rule_registry import router as uc03_rule_registry_router
 from audit_core.uc03_rule_status_report import router as uc03_rule_status_report_router
 from audit_core.uc03_run_all_rules import router as uc03_run_all_rules_router
-from audit_core.uc03_sku_candidates import router as uc03_sku_candidates_router
 from audit_core.uc03_sku_standard import router as uc03_sku_standard_router
 from audit_core.uc03_tl_scope_alignment import install_tl_scope_alignment
 from audit_core.uc03_tl_supervisory import router as uc03_tl_supervisory_router
@@ -270,8 +265,6 @@ def create_app() -> FastAPI:
     application.include_router(uc03_booking_integrations_router)
     application.include_router(uc03_pc_verification_router)
     application.include_router(uc03_booking_capture_router)
-    application.include_router(uc03_booking_v2_router)
-    application.include_router(uc03_sku_candidates_router)
     application.include_router(uc03_model_resolution_router)
     application.include_router(uc03_model_selection_corrections_router)
     application.include_router(uc03_p2_router)
@@ -286,11 +279,8 @@ def create_app() -> FastAPI:
     application.include_router(uc03_unified_document_capture_router)
     application.include_router(uc03_document_review_v2_router)
     application.include_router(uc03_pc_booking_documents_router)
-    application.include_router(uc03_pc_direct_review_router)
-    application.include_router(uc03_pc_generic_review_router)
     application.include_router(uc03_identity_business_date_router)
     application.include_router(uc03_booking_evidence_router)
-    application.include_router(uc03_booking_details_router)
     # uc03_booking_review_router removed (Phase 0 dead-code cleanup): its one
     # route, POST .../booking/details/review/{evidence_id}/approve-editable,
     # gated the retired V1 proposal flow and had zero callers and zero tests.
