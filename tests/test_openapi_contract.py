@@ -4,12 +4,10 @@ import re
 from pathlib import Path
 
 import yaml
-from fastapi.testclient import TestClient
 
 from audit_core.main import create_app
 
 _HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
-_DELIVERY_PUT_PATH = "/v1/tenants/{}/journeys/{}/delivery"
 _UC02_ALLOWED_DELETE_PATHS = {
     # Phase-1 administrative hard-delete exceptions.
     "/v1/tenants/{}/dealers/{}",
@@ -121,19 +119,8 @@ def test_required_openapi_idempotency_headers_are_enforced() -> None:
     for method, path, operation in _operations_from_spec(spec):
         if not _requires_idempotency(operation.get("parameters", [])):
             continue
-        if method == "PUT" and path == _DELIVERY_PUT_PATH:
-            continue
-
         runtime_operation = implemented[(method, path)]
         assert _requires_idempotency(runtime_operation.get("parameters", [])), (
             method,
             path,
         )
-
-    client = TestClient(create_app(), raise_server_exceptions=False)
-    response = client.put(
-        "/v1/tenants/tenant-contract/journeys/00000000-0000-0000-0000-000000000001/delivery",
-        json={},
-    )
-    assert response.status_code == 400
-    assert response.json()["errorCode"] == "VAC-VAL-001"

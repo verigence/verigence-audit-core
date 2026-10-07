@@ -14,8 +14,6 @@ from fastapi.middleware.cors import CORSMiddleware
 # transitive import order.
 import audit_core.uc03_post_extraction_materialization  # noqa: F401
 from audit_core import mahindra_masters, role_mappings
-from audit_core.audit_review import router as audit_review_router
-from audit_core.bookings import router as booking_router
 from audit_core.config import load_settings
 from audit_core.contract_guards import install_contract_guards
 from audit_core.customers import router as customer_router
@@ -25,9 +23,7 @@ from audit_core.dependencies import get_engine
 from audit_core.di_project_master_proxy import router as di_project_master_proxy_router
 from audit_core.errors import install_error_handlers
 from audit_core.evidence import router as evidence_router
-from audit_core.evidence_read import router as evidence_read_router
 from audit_core.feedback import router as feedback_router
-from audit_core.findings import router as findings_router
 from audit_core.hr_work_context import router as hr_work_context_router
 from audit_core.insurance_tradein import router as insurance_tradein_router
 from audit_core.journey_housekeeping import router as journey_housekeeping_router
@@ -43,7 +39,6 @@ from audit_core.onboarding_imports import router as onboarding_router
 from audit_core.otel import configure_otlp, install_correlation_propagation
 from audit_core.outlet_geocoding import router as outlet_geocoding_router
 from audit_core.payments_finance import router as payments_finance_router
-from audit_core.pricing import router as pricing_router
 from audit_core.project_activation import router as project_activation_router
 from audit_core.project_master_admin import router as project_master_admin_router
 from audit_core.project_master_forms import router as project_master_form_router
@@ -159,7 +154,6 @@ from audit_core.uc03_work_item_enrichment import (
     router as uc03_work_item_enrichment_router,
 )
 from audit_core.user_project_history import router as user_project_history_router
-from audit_core.vehicle_delivery import router as vehicle_delivery_router
 from audit_core.workflow_stale_task_recovery import (
     DEFAULT_SWEEP_INTERVAL_SECONDS,
     run_stale_worker_task_recovery_loop,
@@ -345,17 +339,11 @@ def create_app() -> FastAPI:
     application.include_router(customer_router)
     application.include_router(journey_router)
     application.include_router(evidence_router)
-    application.include_router(evidence_read_router)
-    application.include_router(booking_router)
     application.include_router(payments_finance_router)
     application.include_router(insurance_tradein_router)
-    application.include_router(vehicle_delivery_router)
-    application.include_router(findings_router)
     application.include_router(uc03_compliance_report_router)
-    application.include_router(audit_review_router)
     application.include_router(task_router)
     application.include_router(daily_operations_router)
-    application.include_router(pricing_router)
     application.include_router(feedback_router)
     application.include_router(hr_work_context_router)
     application.include_router(user_project_history_router)

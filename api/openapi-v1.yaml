@@ -423,26 +423,6 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Journey'}
         default: {$ref: '#/components/responses/ProblemResponse'}
-  /tenants/{tenantId}/journeys/{journeyId}/delivery:
-    put:
-      operationId: upsertObservedDelivery
-      description: Records observed/actual delivery facts. Does not approve, block, stop or cancel dealer delivery.
-      parameters:
-        - $ref: '#/components/parameters/TenantId'
-        - $ref: '#/components/parameters/JourneyId'
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: {$ref: '#/components/schemas/DeliveryObservation'}
-      responses:
-        '200':
-          description: Delivery observation recorded
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/DeliveryObservation'}
-        default: {$ref: '#/components/responses/ProblemResponse'}
   /tenants/{tenantId}/journeys/{journeyId}/evidence:
     post:
       operationId: uploadJourneyEvidence
@@ -469,53 +449,6 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Evidence'}
-        default: {$ref: '#/components/responses/ProblemResponse'}
-    get:
-      operationId: listJourneyEvidence
-      parameters:
-        - $ref: '#/components/parameters/TenantId'
-        - $ref: '#/components/parameters/JourneyId'
-      responses:
-        '200':
-          description: Evidence list
-          content:
-            application/json:
-              schema:
-                type: array
-                items: {$ref: '#/components/schemas/Evidence'}
-        default: {$ref: '#/components/responses/ProblemResponse'}
-  /tenants/{tenantId}/journeys/{journeyId}/audit/submit:
-    post:
-      operationId: submitAuditWork
-      parameters:
-        - $ref: '#/components/parameters/TenantId'
-        - $ref: '#/components/parameters/JourneyId'
-        - $ref: '#/components/parameters/IdempotencyKey'
-      responses:
-        '200':
-          description: Audit work submitted; resulting review task is durable
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/AuditStatus'}
-        default: {$ref: '#/components/responses/ProblemResponse'}
-  /tenants/{tenantId}/journeys/{journeyId}/review-decisions:
-    post:
-      operationId: createReviewDecision
-      parameters:
-        - $ref: '#/components/parameters/TenantId'
-        - $ref: '#/components/parameters/JourneyId'
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: {$ref: '#/components/schemas/ReviewDecisionRequest'}
-      responses:
-        '201':
-          description: Review decision recorded
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/AuditStatus'}
         default: {$ref: '#/components/responses/ProblemResponse'}
   /tenants/{tenantId}/tasks/{taskId}/complete:
     post:
