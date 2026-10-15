@@ -102,6 +102,7 @@ from audit_core.uc03_journey_overview_projection import (
     router as uc03_journey_overview_projection_router,
 )
 from audit_core.uc03_journey_search import router as uc03_journey_search_router
+from audit_core.uc03_integration_api import router as uc03_integration_router
 from audit_core.uc03_model_resolution import router as uc03_model_resolution_router
 from audit_core.uc03_model_selection_corrections import (
     router as uc03_model_selection_corrections_router,
@@ -266,6 +267,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_pc_verification_router)
     application.include_router(uc03_booking_capture_router)
     application.include_router(uc03_model_resolution_router)
+    application.include_router(uc03_integration_router)
     application.include_router(uc03_model_selection_corrections_router)
     application.include_router(uc03_p2_router)
     application.include_router(uc03_p2_documents_router)
