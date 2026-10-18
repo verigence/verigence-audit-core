@@ -8,12 +8,18 @@ back, in one answer, what the masters of that tenant (project) say for it:
                    component with the date its figure has held since, and
                    the on-road total for the registration basis
   consumerScheme   the consumer scheme benefits the vehicle is entitled to
-  exchangeScheme   the exchange / scrappage / welcome benefits, each with
-                   the scenario it belongs to; the requested scenario picked
+  exchangeScheme   the exchange / scrappage / welcome benefits, grouped by
+                   every scenario they belong to -- not one chosen scenario
   corporate        the corporate privilege: exact for a named corporate, else
                    the range across privilege categories
   grid             the dealer discount grid line for the model
   unknown          the blocks no master answers on that date
+
+This is the master of what is POSSIBLE, not a quotation. The price is the
+price list's own figure, carried through untouched; every scheme sits
+beside it as a separate optional or conditional line with its own amount,
+and nothing is netted off (decision 2026-10-18). What a customer actually
+took is settled from the deal's invoice, elsewhere.
 
 Nothing is guessed: a vehicle the masters do not price says so, an
 ambiguous search lists its candidates, a block without a master is named
@@ -72,7 +78,7 @@ BENEFIT_LABELS: dict[str, str] = {
     "MANAGEMENT_REFERRAL": "Management referral (MR)",
 }
 _EXCHANGE_CATEGORIES = ("EXCHANGE", "SCRAPPAGE", "WELCOME")
-ExchangeScenario = Literal["NONE", "EXCHANGE", "SCRAPPAGE_DEALER", "SCRAPPAGE_COD", "WELCOME"]
+# Every scenario is answered, so the caller no longer names one.
 _SCENARIO_SECTIONS = {
     "EXCHANGE": ("EXCHANGE_PERSONAL", "EXCHANGE_COMMERCIAL"),
     "SCRAPPAGE_DEALER": ("SCRAPPAGE_DEALER",),
@@ -207,24 +213,54 @@ def _price_block(row: dict[str, Any], version: dict[str, Any], basis: str) -> di
 
 
 def _scheme_rows(connection: Connection, *, tenant_id: str, model_id: UUID, variant_id: UUID | None, on: date) -> list[dict[str, Any]]:
+    """Every scheme benefit standing for this vehicle on this date.
+
+    Only the NEWEST published version of each scheme is read. A new month's
+    bulletin replaces the last one outright -- the dealer is offered what
+    the current bulletin says and nothing else -- so once October's version
+    stands, September's benefits are no longer on offer.
+
+    Reading every still-open version instead (the previous behaviour) left
+    a withdrawn scheme on offer for ever: ``_tombstone_absent_schemes``
+    marks a withdrawal by publishing a version carrying no benefit rows, and
+    an empty version shadows nothing, so the superseded version's benefits
+    kept matching. The same held for a benefit dropped from a scheme that
+    otherwise continued. Versions are immutable once published
+    (``protect_published_version``), so the bound is applied on read rather
+    than by closing ``effective_to`` on the old row.
+
+    History still answers correctly: a September booking reads the version
+    standing in September, because the pick is the newest version effective
+    ON OR BEFORE the date asked for, not the newest version outright.
+    """
     rows = connection.execute(
         text(
             """
+            WITH standing AS (
+                SELECT DISTINCT ON (dsv.discount_scheme_id)
+                       dsv.discount_scheme_id, dsv.discount_scheme_version_id
+                FROM auditcore.discount_scheme_versions dsv
+                WHERE dsv.tenant_id = :t
+                  AND dsv.lifecycle_status = 'PUBLISHED'
+                  AND dsv.effective_from <= :on
+                  AND (dsv.effective_to IS NULL OR dsv.effective_to >= :on)
+                ORDER BY dsv.discount_scheme_id, dsv.effective_from DESC, dsv.version_no DESC
+            )
             SELECT b.benefit_key, b.benefit_type, b.amount_value, b.percentage_value,
                    ds.scheme_code, ds.scheme_name, ds.scheme_category,
                    dsv.discount_scheme_version_id, dsv.version_no, dsv.effective_from, dsv.effective_to,
                    dsv.combinability_code, e.customer_type_code, e.variant_id, e.criteria
-            FROM auditcore.discount_scheme_eligibility e
+            FROM standing
             JOIN auditcore.discount_scheme_versions dsv
-              ON dsv.tenant_id = e.tenant_id AND dsv.discount_scheme_version_id = e.discount_scheme_version_id
+              ON dsv.tenant_id = :t AND dsv.discount_scheme_version_id = standing.discount_scheme_version_id
+            JOIN auditcore.discount_scheme_eligibility e
+              ON e.tenant_id = dsv.tenant_id AND e.discount_scheme_version_id = dsv.discount_scheme_version_id
             JOIN auditcore.discount_schemes ds
               ON ds.tenant_id = dsv.tenant_id AND ds.discount_scheme_id = dsv.discount_scheme_id
             JOIN auditcore.discount_scheme_benefits b
               ON b.tenant_id = dsv.tenant_id AND b.discount_scheme_version_id = dsv.discount_scheme_version_id
-            WHERE e.tenant_id = :t AND e.model_id = :model_id
+            WHERE e.model_id = :model_id
               AND (e.variant_id IS NULL OR e.variant_id = :variant_id)
-              AND dsv.lifecycle_status = 'PUBLISHED'
-              AND dsv.effective_from <= :on AND (dsv.effective_to IS NULL OR dsv.effective_to >= :on)
             ORDER BY ds.scheme_category, b.benefit_key, dsv.effective_from DESC, e.variant_id DESC NULLS LAST
             """
         ),
@@ -272,7 +308,16 @@ def _consumer_block(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     return {"benefits": benefits, "total": _money(total)}
 
 
-def _exchange_block(rows: list[dict[str, Any]], scenario: str) -> dict[str, Any] | None:
+def _exchange_block(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Every exchange, scrappage and welcome benefit standing for the
+    vehicle, grouped by the scenario each belongs to.
+
+    All four scenarios are returned, not the one the caller named. This
+    answers what the customer COULD take; which one they did take is read
+    from the deal later. Previously a single ``exchange`` argument chose one
+    scenario, and the Deal tab only ever passed EXCHANGE or NONE -- so
+    scrappage and the welcome bonus could not be seen from a journey at all.
+    """
     seen: set[tuple[Any, ...]] = set()
     benefits = []
     for row in rows:
@@ -286,15 +331,18 @@ def _exchange_block(rows: list[dict[str, Any]], scenario: str) -> dict[str, Any]
         benefits.append(_benefit(row))
     if not benefits:
         return None
-    sections = _SCENARIO_SECTIONS.get(scenario, ())
-    applicable = [b for b in benefits if b["section"] in sections] if sections else []
-    return {
-        "scenario": scenario,
-        "benefits": benefits,
-        "applicable": applicable,
-        "applicableMax": _money(max((Decimal(b["amount"]) for b in applicable if b["amount"]), default=None))
-        if applicable else None,
-    }
+    by_scenario: dict[str, Any] = {}
+    for name, sections in _SCENARIO_SECTIONS.items():
+        matching = [b for b in benefits if b["section"] in sections]
+        by_scenario[name] = {
+            "benefits": matching,
+            # The scenario's own best line. Lines within one scenario are
+            # alternatives (one old vehicle, one bonus), so this is the most
+            # the scenario can be worth -- never a sum.
+            "best": _money(max((Decimal(b["amount"]) for b in matching if b["amount"]), default=None))
+            if matching else None,
+        }
+    return {"benefits": benefits, "byScenario": by_scenario}
 
 
 def _corporate_block(
@@ -375,21 +423,32 @@ def _oem_code(connection: Connection, tenant_id: str) -> str | None:
 def standard_for_sku(
     connection: Connection, *, tenant_id: str, on: date, row: dict[str, Any], version: dict[str, Any],
     basis: str = "INDIVIDUAL", corporate_code: str | None = None, corporate_name: str | None = None,
-    exchange: str = "NONE", quantity: int = 1,
+    quantity: int = 1,
 ) -> dict[str, Any]:
-    """Every block for one priced SKU; ``unknown`` names the blocks no master answers."""
+    """The master of everything possible for one priced SKU on one date.
+
+    The price is the price list's own figure, carried through untouched:
+    nothing is added to it and no benefit is netted off it. Every scheme,
+    privilege and grid line is listed beside it as a separate, optional or
+    conditional entry with its own amount. Which of them a customer
+    actually took is a question for the deal's invoice, not for the master,
+    and the two must not be confused -- so there is deliberately no "net"
+    figure here (decision 2026-10-18).
+
+    Note the price list's on-road is itself a fully loaded figure: Mahindra
+    prices both extended-warranty tiers, the accessories kit, RSA and
+    FASTag into it, and every October row reconciles to the OEM's own
+    on-road column on that basis. It is a ceiling, not an expected price.
+
+    ``unknown`` names the blocks no master answers on the date.
+    """
     scheme_rows = _scheme_rows(connection, tenant_id=tenant_id, model_id=row["model_id"], variant_id=row["variant_id"], on=on)
     price = _price_block(row, version, basis)
     consumer = _consumer_block(scheme_rows)
-    exchange_block = _exchange_block(scheme_rows, exchange)
+    exchange_block = _exchange_block(scheme_rows)
     corporate = _corporate_block(connection, scheme_rows, oem_code=_oem_code(connection, tenant_id),
                                  corporate_code=corporate_code, corporate_name=corporate_name)
     grid = _grid_block(connection, tenant_id=tenant_id, model_id=row["model_id"], on=on)
-    on_road = Decimal(price["onRoad"]["amount"])
-    consumer_total = Decimal(consumer["total"]) if consumer else Decimal(0)
-    exchange_amount = Decimal(exchange_block["applicableMax"]) if exchange_block and exchange_block.get("applicableMax") else Decimal(0)
-    corporate_amount = Decimal(corporate["exact"]["amount"]) if corporate and corporate.get("exact") and corporate["exact"]["amount"] else Decimal(0)
-    net = on_road - consumer_total - exchange_amount - corporate_amount
     return {
         "on": on,
         "sku": _sku_summary(row),
@@ -401,12 +460,9 @@ def standard_for_sku(
         "corporate": corporate,
         "grid": grid,
         "summary": {
-            "onRoad": _money(on_road),
-            "consumerBenefits": _money(consumer_total),
-            "exchangeBenefit": _money(exchange_amount) if exchange != "NONE" else None,
-            "corporateBenefit": _money(corporate_amount) if corporate and corporate.get("exact") else None,
-            "standardNet": _money(net),
-            "standardNetForQuantity": _money(net * quantity),
+            # The price as the price list states it, for the chosen
+            # registration basis. Nothing is deducted from it here.
+            "onRoad": price["onRoad"]["amount"],
         },
         "unknown": [name for name, block in (("consumerScheme", consumer), ("exchangeScheme", exchange_block),
                                               ("corporate", corporate), ("grid", grid)) if block is None],
@@ -457,7 +513,6 @@ def sku_standard(
     registrationBasis: RegistrationBasis = "INDIVIDUAL",
     corporateCode: str | None = Query(default=None, max_length=60),
     corporateName: str | None = Query(default=None, max_length=400),
-    exchange: ExchangeScenario = "NONE",
     quantity: int = Query(default=1, ge=1, le=1000),
 ) -> dict[str, Any]:
     _auth(connection, tenant_id, human_principal, authorization_client)
@@ -483,6 +538,6 @@ def sku_standard(
         "candidates": [],
         **standard_for_sku(
             connection, tenant_id=tenant_id, on=on, row=found["row"], version=version, basis=registrationBasis,
-            corporate_code=corporateCode, corporate_name=corporateName, exchange=exchange, quantity=quantity,
+            corporate_code=corporateCode, corporate_name=corporateName, quantity=quantity,
         ),
     }
