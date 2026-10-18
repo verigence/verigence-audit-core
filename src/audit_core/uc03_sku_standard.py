@@ -413,6 +413,42 @@ def _grid_block(connection: Connection, *, tenant_id: str, model_id: UUID, on: d
     }
 
 
+def _squash_model(value: str | None) -> str:
+    """A model name with its spacing and punctuation taken out, so the same
+    model spelt two ways across two books compares equal."""
+    return re.sub(r"[^A-Z0-9]+", "", (value or "").upper())
+
+
+def _previous_version(connection: Connection, *, tenant_id: str, version: dict[str, Any]) -> dict[str, Any] | None:
+    """The price-list version standing before this one, if any."""
+    row = connection.execute(
+        text(
+            """
+            SELECT v.price_list_version_id, v.version_no, v.effective_from, v.effective_to,
+                   l.price_list_name, l.price_list_code
+            FROM auditcore.price_list_versions v
+            JOIN auditcore.price_lists l
+              ON l.tenant_id = v.tenant_id AND l.price_list_id = v.price_list_id
+            WHERE v.tenant_id = :t
+              AND v.lifecycle_status IN ('PUBLISHED', 'RETIRED')
+              AND (v.effective_from, v.version_no) < (:eff, :no)
+            ORDER BY v.effective_from DESC, v.version_no DESC
+            LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "eff": version["effectiveFrom"], "no": version["version"]},
+    ).mappings().first()
+    if row is None:
+        return None
+    return {
+        "priceListVersionId": str(row["price_list_version_id"]),
+        "priceList": row["price_list_name"] or row["price_list_code"],
+        "version": row["version_no"],
+        "effectiveFrom": row["effective_from"],
+        "effectiveTo": row["effective_to"],
+    }
+
+
 def _oem_code(connection: Connection, tenant_id: str) -> str | None:
     return connection.execute(
         text("SELECT o.oem_code FROM auditcore.projects p JOIN auditcore.oems o ON o.oem_id = p.oem_id WHERE p.tenant_id = :t"),
@@ -493,6 +529,188 @@ def catalogue(
         entry = models.setdefault(str(row["model_id"]), {"modelId": str(row["model_id"]), "model": row["model_name"], "variants": []})
         entry["variants"].append(_sku_summary(row))
     return {"on": on, "priceList": version, "models": list(models.values())}
+
+
+@router.get("/price-master")
+def price_master(
+    tenant_id: str,
+    on: date,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    registrationBasis: RegistrationBasis = "INDIVIDUAL",
+) -> dict[str, Any]:
+    """The whole price book standing on a date: every priced vehicle with
+    its components and on-road figure, for reading a month's master.
+
+    ``previousName`` carries the name the same model was priced under in
+    the version before this one, where that differs. Mahindra respells
+    models between books -- September's XUV3XO is October's 'XUV 3XO' --
+    and the two are separate catalogue rows, so seeing the old name beside
+    the new one is how a reader tells a rename from a new model.
+    """
+    _auth(connection, tenant_id, human_principal, authorization_client)
+    version = price_version_on(connection, tenant_id=tenant_id, on=on)
+    if version is None:
+        return {"on": on, "priceList": None, "models": [], "previous": None}
+    rows = catalogue_rows(connection, tenant_id=tenant_id, price_list_version_id=version["priceListVersionId"])
+    previous = _previous_version(connection, tenant_id=tenant_id, version=version)
+    previous_names = (
+        {_squash_model(r["model_name"]): r["model_name"]
+         for r in catalogue_rows(connection, tenant_id=tenant_id,
+                                 price_list_version_id=previous["priceListVersionId"])}
+        if previous else {}
+    )
+    models: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        entry = models.setdefault(str(row["model_id"]), {
+            "modelId": str(row["model_id"]),
+            "model": row["model_name"],
+            "previousName": None,
+            "variants": [],
+        })
+        if entry["previousName"] is None:
+            was = previous_names.get(_squash_model(row["model_name"]))
+            if was and was != row["model_name"]:
+                entry["previousName"] = was
+        price = _price_block(row, version, registrationBasis)
+        entry["variants"].append({
+            **_sku_summary(row),
+            "components": price["components"],
+            "onRoad": price["onRoad"],
+        })
+    return {
+        "on": on,
+        "basis": registrationBasis,
+        "priceList": version,
+        "previous": previous,
+        "models": sorted(models.values(), key=lambda m: m["model"]),
+    }
+
+
+@router.get("/master-documents")
+def master_documents(
+    tenant_id: str,
+    month: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """The OEM master documents standing for one month, so anyone working a
+    deal can check what the figures were read from.
+
+    ``month`` is YYYY-MM and selects on the document's own effective date,
+    not when it was uploaded: a book is filed under the month it applies
+    to. The upload history endpoint beside the ingestion API answers the
+    same table but is SuperAdmin-only and tenant-wide; a PC checking why a
+    price looks wrong needs the month's documents and nothing more.
+
+    Read-only, and it never serves the file itself -- only what was
+    recorded about it. ``errorDetail`` is carried through because a
+    document that failed to publish is exactly what a reader is looking for
+    when the figures are missing.
+    """
+    _auth(connection, tenant_id, human_principal, authorization_client)
+    try:
+        first = date.fromisoformat(f"{month}-01")
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Name the month as YYYY-MM, for example 2026-10.") from None
+    nxt = date(first.year + (first.month == 12), 1 if first.month == 12 else first.month + 1, 1)
+    rows = connection.execute(
+        text(
+            """
+            SELECT upload_id, oem_code, master_kind, effective_from, source_filename, source_sha256,
+                   status, row_counts, error_detail, uploaded_by_actor_id, uploaded_at_utc,
+                   published_at_utc, source_object_key
+            FROM auditcore.oem_master_uploads
+            WHERE tenant_id = :t AND effective_from >= :first AND effective_from < :next
+            ORDER BY effective_from, master_kind, uploaded_at_utc
+            """
+        ),
+        {"t": tenant_id, "first": first, "next": nxt},
+    ).mappings().all()
+    documents = [
+        {
+            "uploadId": str(row["upload_id"]),
+            "oemCode": row["oem_code"],
+            "masterKind": row["master_kind"],
+            "effectiveFrom": row["effective_from"],
+            "fileName": row["source_filename"],
+            "sha256": row["source_sha256"],
+            "status": row["status"],
+            "rowCounts": row["row_counts"] or {},
+            "errorDetail": row["error_detail"],
+            "uploadedBy": row["uploaded_by_actor_id"],
+            "uploadedAtUtc": row["uploaded_at_utc"],
+            "publishedAtUtc": row["published_at_utc"],
+            # False for anything uploaded before the document itself was
+            # kept: those files were never stored and cannot be recovered.
+            "openable": bool(row["source_object_key"]),
+        }
+        for row in rows
+    ]
+    # The kinds a month is expected to carry. DISCOUNT_GRID is deliberately
+    # absent: oem_master_uploads' own CHECK does not allow it, so a grid
+    # upload is never recorded here and claiming it is missing would be a
+    # lie about the data rather than about the month.
+    expected = ("PRICE_LIST", "CONSUMER_SCHEME", "EXCHANGE_SCHEME", "CORPORATE_POLICY")
+    present = {d["masterKind"] for d in documents if d["status"] == "PUBLISHED"}
+    return {
+        "month": month,
+        "documents": documents,
+        "missingKinds": [kind for kind in expected if kind not in present],
+    }
+
+
+@router.get("/master-documents/{upload_id}/open")
+def open_master_document(
+    tenant_id: str,
+    upload_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """A short-lived link to the master document itself, to open or save.
+
+    The bytes are not served through here: a signed URL lets the browser
+    fetch them from object storage directly, the same way a Journey's
+    documents are read.
+    """
+    from audit_core.uc03_p2_storage import (
+        P2DocumentStorageError,
+        get_p2_document_storage,
+    )
+
+    _auth(connection, tenant_id, human_principal, authorization_client)
+    row = connection.execute(
+        text(
+            """
+            SELECT source_filename, source_object_key, master_kind, effective_from
+            FROM auditcore.oem_master_uploads
+            WHERE tenant_id = :t AND upload_id = :u
+            """
+        ),
+        {"t": tenant_id, "u": upload_id},
+    ).mappings().first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such master document.")
+    if not row["source_object_key"]:
+        raise HTTPException(
+            status_code=404,
+            detail="This document was uploaded before the file itself was kept, so it cannot be opened.",
+        )
+    try:
+        url = get_p2_document_storage().presign_get(row["source_object_key"])
+    except P2DocumentStorageError as exc:
+        raise HTTPException(status_code=502, detail="Document storage is unavailable.") from exc
+    return {
+        "uploadId": str(upload_id),
+        "fileName": row["source_filename"],
+        "masterKind": row["master_kind"],
+        "effectiveFrom": row["effective_from"],
+        "url": url,
+        "expiresInSeconds": 1800,
+    }
 
 
 @router.get("/sku")

@@ -531,3 +531,42 @@ def test_discount_grid_ingests_per_model_and_reports_unknown_models(connection) 
     assert row["booking_protection_days"] == 60 and Decimal(row["insurance_od_percent"]) == 60
     assert row["parameters"][0]["parameter"] == "Penalty Amount"
     assert grid_row_for_model(connection, tenant_id=tenant_id, model_id=thar_model, effective_on=date(2026, 8, 15)) is None
+
+
+def test_the_master_object_key_is_filed_by_effective_month() -> None:
+    """Where a master document is kept.
+
+    Filed under the month the document is EFFECTIVE for, not the day it
+    was uploaded: the August-named grid whose sheet says "Effective 1st
+    Sep" belongs to September. The upload id keeps a re-upload of the same
+    month from overwriting the file it supersedes, because uploads are not
+    idempotent and two files for one month is ordinary.
+    """
+    from datetime import date as _date
+    from uuid import UUID as _UUID
+
+    from audit_core.oem_price_masters import _master_content_type, _master_object_key
+
+    key = _master_object_key(
+        tenant_id="tenant-mahindraorissa", oem_code="mahindra", master_kind="PRICE_LIST",
+        effective_from=_date(2026, 10, 3),
+        upload_id=_UUID("11111111-2222-3333-4444-555555555555"),
+        filename="Mahindra Consolidated Price List Oct'26 (1).xlsx",
+    )
+    assert key == (
+        "tenant-mahindraorissa/oem-masters/MAHINDRA/2026-10/PRICE_LIST/"
+        "11111111-2222-3333-4444-555555555555_Mahindra_Consolidated_Price_List_Oct_26_1_.xlsx"
+    )
+
+    # A grid named for August but effective in September files under September.
+    september = _master_object_key(
+        tenant_id="t", oem_code="MAHINDRA", master_kind="DISCOUNT_GRID",
+        effective_from=_date(2026, 9, 1),
+        upload_id=_UUID("66666666-7777-8888-9999-000000000000"),
+        filename="Odisha PV & CV Discount Grid-1 Aug 2026.xlsx",
+    )
+    assert "/2026-09/DISCOUNT_GRID/" in september
+
+    assert _master_content_type("book.xlsx").endswith("spreadsheetml.sheet")
+    assert _master_content_type("scheme.PDF") == "application/pdf"
+    assert _master_content_type(None) == "application/octet-stream"
