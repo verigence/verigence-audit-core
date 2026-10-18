@@ -88,7 +88,7 @@ def test_the_standard_answers_every_block_for_one_vehicle_on_a_date(connection) 
 
     standard = standard_for_sku(
         connection, tenant_id=tenant_id, on=ON, row=found["row"], version=version, basis="INDIVIDUAL",
-        corporate_code="CORP-0001", exchange="EXCHANGE", quantity=2,
+        corporate_code="CORP-0001", quantity=2,
     )
     assert standard["unknown"] == []
     price = standard["priceList"]
@@ -98,27 +98,94 @@ def test_the_standard_answers_every_block_for_one_vehicle_on_a_date(connection) 
     assert price["onRoad"] == {"individual": "1006600.00", "corporate": "1006600.00", "basis": "INDIVIDUAL", "amount": "1006600.00"}
     assert standard["consumerScheme"]["total"] == "35000.00"
     assert {b["key"] for b in standard["consumerScheme"]["benefits"]} == {"CASH_DISCOUNT", "ACCESSORIES_KIT"}
+
+    # Every scenario is answered, not one the caller picked: scrappage is
+    # visible beside exchange without being asked for.
     exchange = standard["exchangeScheme"]
     assert {b["key"] for b in exchange["benefits"]} == {"EXCHANGE_BONUS", "SCRAPPAGE_BONUS_DEALER"}
-    assert [b["key"] for b in exchange["applicable"]] == ["EXCHANGE_BONUS"] and exchange["applicableMax"] == "25000.00"
+    by_scenario = exchange["byScenario"]
+    assert set(by_scenario) == {"EXCHANGE", "SCRAPPAGE_DEALER", "SCRAPPAGE_COD", "WELCOME"}
+    assert [b["key"] for b in by_scenario["EXCHANGE"]["benefits"]] == ["EXCHANGE_BONUS"]
+    assert by_scenario["EXCHANGE"]["best"] == "25000.00"
+    assert [b["key"] for b in by_scenario["SCRAPPAGE_DEALER"]["benefits"]] == ["SCRAPPAGE_BONUS_DEALER"]
+    assert by_scenario["SCRAPPAGE_DEALER"]["best"] == "35000.00"
+    assert by_scenario["WELCOME"] == {"benefits": [], "best": None}
+
     corporate = standard["corporate"]
     assert corporate["range"] == {"min": "6000.00", "max": "15000.00"}
     assert corporate["corporate"]["found"] is True and corporate["corporate"]["privilegeCategory"] == "Z"
     assert corporate["exact"]["amount"] == "15000.00"
     assert standard["grid"]["bookingProtectionDays"] == 60 and standard["grid"]["insuranceOdPercentMax"] == "60.0000"
-    assert standard["summary"] == {
-        "onRoad": "1006600.00", "consumerBenefits": "35000.00", "exchangeBenefit": "25000.00",
-        "corporateBenefit": "15000.00", "standardNet": "931600.00", "standardNetForQuantity": "1863200.00",
-    }
 
-    # No corporate named: the range stands and nothing is subtracted for it.
+    # The price stands exactly as the price list states it: no benefit is
+    # netted off and there is no "net" figure to mistake for one.
+    assert standard["summary"] == {"onRoad": "1006600.00"}
+
+    # No corporate named: the range still stands, and the price is unchanged.
     plain = standard_for_sku(connection, tenant_id=tenant_id, on=ON, row=found["row"], version=version)
-    assert plain["corporate"]["exact"] is None and plain["summary"]["corporateBenefit"] is None
-    assert plain["summary"]["standardNet"] == "971600.00" and plain["exchangeScheme"]["applicable"] == []
+    assert plain["corporate"]["exact"] is None and plain["corporate"]["range"] == {"min": "6000.00", "max": "15000.00"}
+    assert plain["summary"] == {"onRoad": "1006600.00"}
     # A model no scheme or grid names: the blocks are named unknown, never guessed.
     xuv = search_sku(rows, alias_map=aliases, model="XUV 3XO", variant="MX1")["row"]
     assert standard_for_sku(connection, tenant_id=tenant_id, on=ON, row=xuv, version=version)["unknown"] == [
         "consumerScheme", "exchangeScheme", "corporate", "grid"]
+
+
+def test_a_new_months_bulletin_replaces_the_last_one(connection) -> None:  # noqa: F811
+    """The dealer is offered what the current bulletin says and nothing
+    else: October's consumer scheme replaces September's outright, and a
+    scheme withdrawn in October stops being on offer.
+
+    Regression. A withdrawal is recorded by publishing a version carrying
+    no benefit rows (``_tombstone_absent_schemes``). Every still-open
+    published version used to be read, and an empty version shadows
+    nothing, so the withdrawn scheme's September benefits kept answering
+    for October dates -- for ever. September itself must keep answering
+    with September's figures.
+    """
+    tenant_id = _load_masters(connection)
+    project = _project_oem(connection, tenant_id)
+    common = {"connection": connection, "tenant_id": tenant_id, "oem_id": project["oem_id"], "actor_id": "admin"}
+
+    # September: Thar Roxx has a consumer scheme worth 35,000 (see _load_masters).
+    version = price_version_on(connection, tenant_id=tenant_id, on=ON)
+    rows = catalogue_rows(connection, tenant_id=tenant_id, price_list_version_id=version["priceListVersionId"])
+    aliases = _alias_map(connection, "MAHINDRA")
+    thar = search_sku(rows, alias_map=aliases, model="Thar Roxx", variant="mx1 pmt 2wd")["row"]
+    sep = standard_for_sku(connection, tenant_id=tenant_id, on=ON, row=thar, version=version)
+    assert sep["consumerScheme"]["total"] == "35000.00"
+
+    # October's bulletin prices the same vehicle lower: it REPLACES
+    # September's figure rather than standing beside it.
+    october = ParseResult(kind="CONSUMER_SCHEME")
+    october.discount_rows = [DiscountRow(1, "CONSUMER", "Thar Roxx", [], [("CASH_DISCOUNT", Decimal(20000))],
+                                         Decimal(20000), {"section": "CONSUMER"})]
+    ingest_discount_document(oem_code="MAHINDRA", master_kind="CONSUMER_SCHEME",
+                             effective_from=date(2026, 10, 1), parsed=october, **common)
+
+    on_october = date(2026, 10, 15)
+    oct_version = price_version_on(connection, tenant_id=tenant_id, on=on_october)
+    replaced = standard_for_sku(connection, tenant_id=tenant_id, on=on_october, row=thar, version=oct_version)
+    assert replaced["consumerScheme"]["total"] == "20000.00"
+    assert {b["key"] for b in replaced["consumerScheme"]["benefits"]} == {"CASH_DISCOUNT"}
+    # September's accessories benefit is gone, not carried alongside.
+    assert standard_for_sku(connection, tenant_id=tenant_id, on=ON, row=thar, version=version)["consumerScheme"]["total"] == "35000.00"
+
+    # November's bulletin names the vehicle nowhere: the scheme is withdrawn.
+    november = ParseResult(kind="CONSUMER_SCHEME")
+    november.discount_rows = []
+    ingest_discount_document(oem_code="MAHINDRA", master_kind="CONSUMER_SCHEME",
+                             effective_from=date(2026, 11, 1), parsed=november, **common)
+
+    on_november = date(2026, 11, 15)
+    nov_version = price_version_on(connection, tenant_id=tenant_id, on=on_november)
+    withdrawn = standard_for_sku(connection, tenant_id=tenant_id, on=on_november, row=thar, version=nov_version)
+    assert withdrawn["consumerScheme"] is None
+    assert "consumerScheme" in withdrawn["unknown"]
+
+    # Every earlier month still answers with its own figure.
+    assert standard_for_sku(connection, tenant_id=tenant_id, on=on_october, row=thar, version=oct_version)["consumerScheme"]["total"] == "20000.00"
+    assert standard_for_sku(connection, tenant_id=tenant_id, on=ON, row=thar, version=version)["consumerScheme"]["total"] == "35000.00"
 
 
 def test_the_standard_routes_answer_over_http(connection) -> None:  # noqa: F811
@@ -137,7 +204,10 @@ def test_the_standard_routes_answer_over_http(connection) -> None:  # noqa: F811
         assert answer.status_code == 200, answer.text
         body = answer.json()
         assert body["matched"] == "UNIQUE" and body["priceList"]["onRoad"]["basis"] == "CORPORATE"
-        assert body["summary"]["standardNet"] == "971600.00"
+        # The price list's own corporate on-road, with nothing netted off it.
+        assert body["summary"] == {"onRoad": "1006600.00"}
+        # Scrappage is answered without the caller naming a scenario.
+        assert body["exchangeScheme"]["byScenario"]["SCRAPPAGE_DEALER"]["best"] == "35000.00"
         nothing = client.get(f"{base}/sku", params={"on": "2026-01-15", "model": "Thar Roxx"})
         assert nothing.status_code == 200 and nothing.json()["matched"] == "NONE" and "No price list" in nothing.json()["reason"]
         assert client.get(f"{base}/sku", params={"on": "2026-09-15"}).status_code == 422

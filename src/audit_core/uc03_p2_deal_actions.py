@@ -481,10 +481,6 @@ def get_journey_standard(
                     if r["product_sku_id"] == row["product_sku_id"]), None)
     if sku_row is None:
         return {**base, "available": False, "reason": "The price list effective on the pricing date does not price this vehicle."}
-    exchange_taken = connection.execute(
-        text("SELECT details ->> 'exchangeTaken' FROM auditcore.trade_in_cases WHERE tenant_id=:t AND journey_id=:j"),
-        {"t": tenant_id, "j": journey_id},
-    ).scalar_one_or_none()
     basis = registration_basis(customer_type_code=row.get("customer_type_code"),
                                registration_type_code=row.get("registration_type_code"))
     return {
@@ -492,7 +488,6 @@ def get_journey_standard(
         **standard_for_sku(
             connection, tenant_id=tenant_id, on=on, row=sku_row, version=version, basis=basis,
             corporate_code=corporateCode, corporate_name=corporateName,
-            exchange="EXCHANGE" if str(exchange_taken).lower() == "true" else "NONE",
         ),
     }
 
