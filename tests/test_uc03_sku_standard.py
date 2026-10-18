@@ -131,6 +131,37 @@ def test_the_standard_answers_every_block_for_one_vehicle_on_a_date(connection) 
         "consumerScheme", "exchangeScheme", "corporate", "grid"]
 
 
+def test_a_scheme_reaches_a_model_the_oem_has_renamed(connection) -> None:  # noqa: F811
+    """A bulletin naming 'XUV 3XO' must reach the priced 'XUV 3XO'.
+
+    Regression. The seeded alias map canonicalises 'XUV 3XO' to the
+    September spelling 'XUV3XO', and the loaded model was looked up by
+    exact name -- so against an October price list, which spells it
+    'XUV 3XO', the scheme was reported "not in the loaded price list" and
+    dropped. Mahindra renamed nine models between September and October
+    (SCORPIO CLASSIC to SCORPIO, XEV9S to XEV 9S, and so on), so this hit
+    most of the book at once and the offers silently never appeared.
+    """
+    tenant_id = _load_masters(connection)
+    project = _project_oem(connection, tenant_id)
+    common = {"connection": connection, "tenant_id": tenant_id, "oem_id": project["oem_id"], "actor_id": "admin"}
+
+    scheme = ParseResult(kind="CONSUMER_SCHEME")
+    scheme.discount_rows = [DiscountRow(1, "CONSUMER", "XUV 3XO", [], [("CASH_DISCOUNT", Decimal(12000))],
+                                        Decimal(12000), {"section": "CONSUMER"})]
+    result = ingest_discount_document(oem_code="MAHINDRA", master_kind="CONSUMER_SCHEME",
+                                      effective_from=date(2026, 10, 1), parsed=scheme, **common)
+    assert result["unresolved"] == []
+
+    on_october = date(2026, 10, 15)
+    version = price_version_on(connection, tenant_id=tenant_id, on=on_october)
+    rows = catalogue_rows(connection, tenant_id=tenant_id, price_list_version_id=version["priceListVersionId"])
+    xuv = search_sku(rows, alias_map=_alias_map(connection, "MAHINDRA"), model="XUV 3XO", variant="MX1")["row"]
+    standard = standard_for_sku(connection, tenant_id=tenant_id, on=on_october, row=xuv, version=version)
+    assert standard["consumerScheme"] is not None, "the scheme never reached the renamed model"
+    assert standard["consumerScheme"]["total"] == "12000.00"
+
+
 def test_a_new_months_bulletin_replaces_the_last_one(connection) -> None:  # noqa: F811
     """The dealer is offered what the current bulletin says and nothing
     else: October's consumer scheme replaces September's outright, and a
