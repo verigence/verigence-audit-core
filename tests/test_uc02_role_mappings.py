@@ -421,6 +421,78 @@ def test_crm_supports_project_dealers_outlets_and_union(role_mapping_setup) -> N
     }
 
 
+def test_reviewer_covers_outlets_across_dealerships(role_mapping_setup) -> None:
+    """A Reviewer sits in one place and reviews several Outlets at once.
+
+    REVIEWER takes CRM's flexible scope shape, so the mapping stores one
+    assignment row per Outlet, each carrying its own Dealer. That is what lets
+    `resolve_p2_scope` authorise the Reviewer on a Journey in any covered
+    Outlet without a per-session Outlet pin -- a PC mapping cannot express a
+    scope that spans two dealerships.
+    """
+    setup = role_mapping_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    tenant = setup["tenant_a"]
+    outlets = sorted(
+        [
+            setup["outlet_onsite"],       # dealer_a
+            setup["outlet_onsite_2"],     # dealer_a2
+            setup["outlet_satellite_2"],  # dealer_a2
+        ]
+    )
+
+    response = client.put(
+        f"/v1/tenants/{tenant}/role-mappings/reviewer-multi",
+        headers={"Idempotency-Key": "reviewer-scope-0"},
+        json={"operatingRole": "REVIEWER", "dealerIds": [], "outletIds": outlets},
+    )
+    assert response.status_code == 200
+    assert response.json()["mapping"] == {
+        "userId": "reviewer-multi",
+        "operatingRole": "REVIEWER",
+        "dealerIds": [],
+        "outletIds": outlets,
+    }
+    read_back = client.get(f"/v1/tenants/{tenant}/role-mappings/reviewer-multi")
+    assert read_back.json() == response.json()["mapping"]
+
+    with setup["engine"].connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT dealer_id::text, outlet_id::text
+                FROM auditcore.business_assignments
+                WHERE tenant_id=:tenant_id AND security_actor_id='reviewer-multi'
+                  AND assignment_status='ACTIVE'
+                """
+            ),
+            {"tenant_id": tenant},
+        ).all()
+
+    assert {row[1] for row in rows} == set(outlets)
+    assert {row[0] for row in rows} == {setup["dealer_a"], setup["dealer_a2"]}
+
+
+def test_reviewer_may_be_project_wide(role_mapping_setup) -> None:
+    """An empty scope means every Outlet in the Project, as it does for CRM."""
+    setup = role_mapping_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    tenant = setup["tenant_a"]
+
+    response = client.put(
+        f"/v1/tenants/{tenant}/role-mappings/reviewer-wide",
+        headers={"Idempotency-Key": "reviewer-wide-0"},
+        json={"operatingRole": "REVIEWER", "dealerIds": [], "outletIds": []},
+    )
+    assert response.status_code == 200
+    assert response.json()["mapping"] == {
+        "userId": "reviewer-wide",
+        "operatingRole": "REVIEWER",
+        "dealerIds": [],
+        "outletIds": [],
+    }
+
+
 def test_role_mapping_security_failure_returns_error_without_local_state(role_mapping_setup) -> None:
     setup = role_mapping_setup
     client = TestClient(app, raise_server_exceptions=False)

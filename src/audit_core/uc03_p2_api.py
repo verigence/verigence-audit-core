@@ -41,6 +41,7 @@ from audit_core.uc03_p2_controls import control_statistics
 from audit_core.uc03_p2_dates import parse_extracted_date
 from audit_core.uc03_p2_document_health import journey_document_health
 from audit_core.uc03_p2_registry import get_registry
+from audit_core.uc03_p2_reviewer import page_stage_code, stage_is_reviewed
 from audit_core.uc03_p2_runtime import (
     enqueue_work,
     request_page_recovery,
@@ -1670,6 +1671,12 @@ def reread_page(
     return {"queueId": str(queue_id), "status": "REREAD_REQUESTED"}
 
 
+class ResyncPageCommand(BaseModel):
+    """Only used to override a resync of a stage already marked reviewed."""
+
+    reason: str | None = Field(default=None, max_length=500)
+
+
 @router.post("/journeys/{journey_id}/pages/{queue_id}:resync", status_code=202)
 def resync_page(
     tenant_id: str,
@@ -1681,17 +1688,60 @@ def resync_page(
         SecurityAuthorizationClient, Depends(get_security_authorization_client)
     ],
     connection: Annotated[Connection, Depends(get_connection)],
+    payload: ResyncPageCommand | None = None,
 ) -> dict[str, Any]:
     """Copy this page's values from Document Intelligence into Audit Core
     once more (decision 2026-10-01): a read of what DI already holds, no
-    new reading. The journey reconcile does the copy and refreshes the card."""
-    _authorize(
+    new reading. The journey reconcile does the copy and refreshes the card.
+
+    A re-copy overwrites a hand-corrected value in place -- same fact version,
+    so the field upsert replaces the modified value and its attribution rather
+    than superseding them. Once a stage's documents are marked reviewed, that
+    would quietly undo the figures the review attests to, so the stage is no
+    longer re-read. A Team Lead or Project Manager may still force it with a
+    reason, because a stage reviewed in error must not be stuck with bad data
+    and nothing else can pull DI's values back.
+    """
+    access = _authorize(
         connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
         authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
     )
     unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id)
     if unit["queue_status"] not in _RESYNCABLE_PAGE_STATES or unit["di_document_id"] is None:
         raise HTTPException(status_code=409, detail="This page has nothing to sync yet.")
+    stage_code = page_stage_code(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        di_document_id=UUID(str(unit["di_document_id"])),
+    )
+    if stage_code is None:
+        # Fail closed: without a stage there is no way to tell whether this
+        # page sits under a review that a re-copy would silently undo.
+        raise HTTPException(
+            status_code=409,
+            detail="This page is not yet classified to a stage, so it cannot be re-read.",
+        )
+    override_reason: str | None = None
+    if stage_is_reviewed(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage_code
+    ):
+        reason = ((payload.reason if payload else None) or "").strip()
+        if (access.operating_role or "").upper() not in {"TL", "PM"}:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"The {stage_code.title()} documents are marked reviewed, so this "
+                    "page is not re-read from Document Intelligence. A Team Lead or "
+                    "Project Manager can override this with a reason."
+                ),
+            )
+        if not reason:
+            raise HTTPException(
+                status_code=422,
+                detail="A reason is required to re-read a stage that is marked reviewed.",
+            )
+        override_reason = reason
     connection.execute(
         text(
             """
@@ -1709,7 +1759,14 @@ def resync_page(
     )
     _activity(
         connection, tenant_id=tenant_id, journey_id=journey_id, event_type="PAGE_RESYNC_REQUESTED",
-        subject_type="DOCUMENT_PAGE", subject_id=str(queue_id), details={"by": human_principal.subject},
+        subject_type="DOCUMENT_PAGE", subject_id=str(queue_id),
+        # An override carries its reason into the journey's own history, where
+        # it sits next to the review it overrode.
+        details={
+            "by": human_principal.subject,
+            "stageCode": stage_code,
+            **({"overrideReason": override_reason} if override_reason else {}),
+        },
         correlation_id=get_correlation_id(request),
     )
     return {"queueId": str(queue_id), "status": "SYNCING_TO_AUDIT_CORE"}

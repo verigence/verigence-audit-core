@@ -9,7 +9,14 @@ from audit_core.db import set_tenant_context
 from audit_core.errors import BusinessValidationError
 
 _PROJECT_WIDE_ONLY_ROLES = frozenset({"TL", "PM", "Executive"})
-_SUPPORTED_ROLES = frozenset({"PC", "TL", "PM", "CRM", "Executive"})
+# CRM and REVIEWER share one scope shape: Project-wide, Dealer-scoped,
+# Outlet-scoped, or a union of selected Dealers and Outlets. A Reviewer sits at
+# one physical location and covers several Outlets at once, so the union is the
+# only shape that fits. What separates a Reviewer from a CRM operator is the
+# permission bundle Security resolves -- `audit.journey.update` -- not the
+# business scope (AUDIT_CORE_DEFAULT_ROLE_BUNDLES_v1.1 section 8).
+_FLEXIBLE_SCOPE_ROLES = frozenset({"CRM", "REVIEWER"})
+_SUPPORTED_ROLES = frozenset({"PC", "TL", "PM", "CRM", "Executive", "REVIEWER"})
 
 
 def install_role_mapping_policy(role_mappings: Any) -> None:
@@ -21,6 +28,10 @@ def install_role_mapping_policy(role_mappings: Any) -> None:
     - CRM is intentionally flexible: Project-wide, Dealer-scoped, Outlet-scoped,
       or a union of selected Dealers and Outlets.
     - TL, PM and Executive remain Project-wide.
+
+    Owner clarification (18-Oct-2026):
+    - REVIEWER takes the same flexible scope as CRM, because one Reviewer sits
+      at a single location and reviews across several Outlets at once.
     """
 
     def mapping_from_rows(user_id: str, rows: list[Any]):
@@ -59,7 +70,7 @@ def install_role_mapping_policy(role_mappings: Any) -> None:
                 raise RuntimeError("Project-wide business assignment scope is inconsistent")
             response_dealers = []
             response_outlets = []
-        elif role == "CRM":
+        elif role in _FLEXIBLE_SCOPE_ROLES:
             project_wide = all(
                 row["dealer_id"] is None and row["outlet_id"] is None for row in rows
             )
@@ -71,7 +82,9 @@ def install_role_mapping_policy(role_mappings: Any) -> None:
                 response_dealers = direct_dealer_ids
                 response_outlets = outlet_ids
             else:
-                raise RuntimeError("CRM business assignment scope is inconsistent")
+                raise RuntimeError(
+                    f"{role} business assignment scope is inconsistent"
+                )
         else:  # pragma: no cover - guarded by _SUPPORTED_ROLES
             raise RuntimeError("Unsupported operating role")
 
@@ -105,7 +118,7 @@ def install_role_mapping_policy(role_mappings: Any) -> None:
                 raise BusinessValidationError(
                     detail=f"{body.operatingRole} Role Mapping is Project-wide and does not accept Dealer or Outlet IDs."
                 )
-        elif body.operatingRole != "CRM":
+        elif body.operatingRole not in _FLEXIBLE_SCOPE_ROLES:
             raise BusinessValidationError(detail="Unsupported operating role.")
 
         with role_mappings._runtime_transaction(engine) as connection:
@@ -116,10 +129,14 @@ def install_role_mapping_policy(role_mappings: Any) -> None:
             if body.operatingRole in _PROJECT_WIDE_ONLY_ROLES:
                 return [], [], [(None, None)]
 
-            if body.operatingRole == "CRM" and not dealer_ids and not outlet_ids:
+            if (
+                body.operatingRole in _FLEXIBLE_SCOPE_ROLES
+                and not dealer_ids
+                and not outlet_ids
+            ):
                 return [], [], [(None, None)]
 
-            if body.operatingRole == "CRM":
+            if body.operatingRole in _FLEXIBLE_SCOPE_ROLES:
                 for dealer_id in dealer_ids:
                     exists = connection.execute(
                         text(
@@ -130,7 +147,7 @@ def install_role_mapping_policy(role_mappings: Any) -> None:
                     ).scalar_one_or_none()
                     if exists is None:
                         raise BusinessValidationError(
-                            detail="Each CRM Dealer scope must belong to the requested Project."
+                            detail="Each Dealer scope must belong to the requested Project."
                         )
 
             outlet_scopes: list[tuple[UUID | None, UUID | None]] = []

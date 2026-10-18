@@ -127,7 +127,11 @@ def list_my_projects(
                         p.project_status,
                         p.timezone_name
                 ),
-                pc_outlet_rows AS (
+                -- Outlet-scoped roles: a PC covers Outlets and works one at a
+                -- time, a REVIEWER covers several at once and works across all
+                -- of them. Both need their assigned Outlets named here; the
+                -- Project-wide roles (TL, PM, Executive) carry no Outlet rows.
+                assigned_outlet_rows AS (
                     SELECT DISTINCT
                         a.tenant_id,
                         a.dealer_id,
@@ -143,13 +147,13 @@ def list_my_projects(
                       ON o.tenant_id = a.tenant_id
                      AND o.dealer_id = a.dealer_id
                      AND o.outlet_id = a.outlet_id
-                    WHERE a.business_role_code = 'PC'
+                    WHERE a.business_role_code IN ('PC', 'REVIEWER')
                       AND a.dealer_id IS NOT NULL
                       AND a.outlet_id IS NOT NULL
                       AND d.status = 'ACTIVE'
                       AND o.status = 'ACTIVE'
                 ),
-                pc_outlets AS (
+                assigned_outlets AS (
                     SELECT
                         tenant_id,
                         jsonb_agg(
@@ -162,7 +166,7 @@ def list_my_projects(
                             )
                             ORDER BY lower(dealer_name), lower(outlet_name), outlet_id
                         ) AS outlets
-                    FROM pc_outlet_rows
+                    FROM assigned_outlet_rows
                     GROUP BY tenant_id
                 )
                 SELECT
@@ -178,7 +182,7 @@ def list_my_projects(
                     ps.outlet_count,
                     COALESCE(po.outlets, '[]'::jsonb) AS outlets
                 FROM project_scope ps
-                LEFT JOIN pc_outlets po
+                LEFT JOIN assigned_outlets po
                   ON po.tenant_id = ps.tenant_id
                 ORDER BY lower(ps.project_name), ps.project_code, ps.tenant_id
                 """
