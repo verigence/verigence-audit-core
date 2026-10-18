@@ -1264,29 +1264,32 @@ document_types:
     - CUSTOMER
     - DEAL
   debit_note:
-    # A Debit Note is a commercial instrument the dealership may or may not
-    # raise. It is not evidence that insurance was taken, nor that the
-    # vehicle was registered, and insurance and registration are separate
-    # processes that share no document.
+    # Insurance through the dealership is normally billed to the customer by
+    # a debit note, so when `insuranceByDealer` holds the debit note is
+    # expected and belongs on the Delivery checklist. Insurance the customer
+    # arranged themselves is billed by their own insurer, so nothing is
+    # expected from the dealership and the entry does not appear at all.
     #
-    # This was CONDITIONAL on `insuranceByDealer|registrationByDealer` -- an
-    # OR -- so dealer-arranged insurance on its own made the Debit Note
-    # mandatory and raised a HIGH "Document Missing" task (see
-    # uc03_p2_task_producer.sync_document_missing_tasks). That sat on top of
-    # two requirements that already cover both processes properly:
-    #   insurance_cover (REQUIRED, always)        -- the insurance copy
-    #   rto_challan     (CONDITIONAL, registrationByDealer) -- registration
-    # so the deal was asked for a third document neither process produces.
+    # Expected is not the same as demanded. `raises_missing_task: false`
+    # keeps it off the PC's task list: the dealership may legitimately not
+    # have raised one, and a HIGH overdue "Document Missing" card is the
+    # wrong weight for a document whose absence is not itself a finding.
+    # The checklist entry carries it instead.
     #
-    # OPTIONAL keeps it classifiable by DI, extracted, and still compared
-    # against the cover note by INSURANCE_PREMIUM_VS_DEBIT_NOTE whenever one
-    # is actually uploaded -- without ever demanding it.
-    display_name: Debit Note
+    # Registration is deliberately not a condition here. It was previously
+    # `insuranceByDealer|registrationByDealer` -- an OR -- which fused two
+    # unrelated processes into one requirement and made dealer-arranged
+    # insurance alone demand the document. Registration is evidenced by
+    # `rto_challan` (CONDITIONAL on registrationByDealer); insurance by
+    # `insurance_cover` (REQUIRED). This document evidences neither -- it is
+    # the commercial instrument that bills them.
+    display_name: Debit Note (insurance)
     di_types:
     - debit_note
     stage: DELIVERY
-    requirement: OPTIONAL
-    condition: null
+    requirement: CONDITIONAL
+    condition: insuranceByDealer
+    raises_missing_task: false
     accepted_early: true
     pages:
       shape: MULTI_PAGE

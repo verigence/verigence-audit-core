@@ -532,13 +532,17 @@ def requirement_items(
         item = items.setdefault(key, {
             "key": key, "templates": [], "labels": [], "required": required,
             "requirement": template.requirement, "received": False, "readyCount": 0,
-            "conditions": [], "reason": None,
+            "conditions": [], "reason": None, "raisesMissingTask": False,
         })
         item["templates"].append(template.key)
         item["labels"].append(template.display_name)
         item["readyCount"] += ready
         item["received"] = item["received"] or ready > 0
         item["required"] = item["required"] or required
+        # Grouped templates satisfy one requirement with any one of them, so
+        # the group is worth a task if any member is: a member that stays off
+        # the task list never silences one its sibling would have raised.
+        item["raisesMissingTask"] = item["raisesMissingTask"] or template.raises_missing_task
         for condition in triggered:
             if condition not in item["conditions"]:
                 item["conditions"].append(condition)

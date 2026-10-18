@@ -849,7 +849,12 @@ def sync_document_missing_tasks(
     evidence made mandatory and that is not in yet -- e.g. a corporate
     discount on the booking form or invoice asks for the Corporate ID. The
     task closes itself when the document is read, or when the evidence no
-    longer applies."""
+    longer applies.
+
+    A template may set ``raises_missing_task: false`` to stay on the stage
+    checklist as expected without ever becoming a task -- for a document the
+    dealership may legitimately not have raised, whose absence is not itself
+    a finding."""
     from audit_core.uc03_p2_stage import condition_reasons, requirement_items
 
     registry = registry or get_registry()
@@ -860,6 +865,8 @@ def sync_document_missing_tasks(
         for item in requirement_items(connection, registry, tenant_id=tenant_id, journey_id=journey_id,
                                       stage=stage, reasons=reasons):
             if item["requirement"] != "CONDITIONAL" or not item["required"] or item["received"]:
+                continue
+            if not item.get("raisesMissingTask", True):
                 continue
             key = f"document-missing:{journey_id}:{item['key']}"
             wanted.add(key)

@@ -82,6 +82,12 @@ class DocumentTemplate:
     # Templates sharing a group satisfy one requirement with any one of them
     # (PAN or Aadhaar; transfer letter or authorization letter).
     group: str | None = None
+    # A CONDITIONAL document whose evidence applies is expected, and shows on
+    # the stage checklist as such -- but setting this false stops it raising
+    # a "Document Missing" task for the PC. For a document the dealership
+    # may legitimately not have raised, the checklist entry is the right
+    # weight and a HIGH overdue task is not.
+    raises_missing_task: bool = True
 
     @property
     def conditions(self) -> tuple[str, ...]:
@@ -325,6 +331,7 @@ def build_registry(
             persistence=dict(raw.get("persistence") or {}),
             notes=raw.get("notes"),
             group=raw.get("group"),
+            raises_missing_task=bool(raw.get("raises_missing_task", True)),
         )
 
     stages: dict[str, StageTemplate] = {}

@@ -23,7 +23,7 @@ from sqlalchemy import text
 from audit_core import uc03_p2_worker as worker
 from audit_core.db import set_tenant_context
 from audit_core.uc03_p2_registry import get_registry
-from audit_core.uc03_p2_stage import condition_reasons
+from audit_core.uc03_p2_stage import condition_reasons, requirement_items
 from audit_core.uc03_p2_tasks import submit_action
 
 
@@ -123,6 +123,70 @@ def test_invoice_evidence_makes_conditional_documents_mandatory(journey):
     assert {t["task_status"] for t in _tasks(journey, "DOCUMENT_MISSING")} == {"VERIFIED_COMPLETE"}
     assert result["delivery"]["gates"]["REQUIRED_DOCUMENTS"]["passed"] is True
     assert "DELIVERY_DOCUMENTS_COMPLETE" in result["transitions"]
+
+
+def _delivery_requirements(journey):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        reasons = condition_reasons(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        items = requirement_items(
+            connection, get_registry(), tenant_id=journey.tenant_id,
+            journey_id=journey.journey_id, stage="DELIVERY", reasons=reasons,
+        )
+    return reasons, {item["key"]: item for item in items}
+
+
+def test_dealer_insurance_expects_the_debit_note_without_raising_a_task(journey):
+    """Insurance through the dealership is billed to the customer by a debit
+    note, so the debit note is expected and belongs on the Delivery
+    checklist -- but it raises no Document Missing task. The dealership may
+    legitimately not have raised one, and its absence is not itself a
+    finding, so a HIGH overdue card is the wrong weight.
+
+    It was CONDITIONAL on `insuranceByDealer|registrationByDealer`, an OR,
+    so dealer-arranged insurance alone both made it mandatory and raised a
+    HIGH card that cited registration as well."""
+    add_ready_document(journey, "booking_form", customer_name="A", booking_date="2026-09-01",
+                       insurance_by="Dealer")
+    _settle(journey)
+
+    reasons, items = _delivery_requirements(journey)
+    assert "insuranceByDealer" in reasons
+    # the insurance fact says nothing about who registers the vehicle
+    assert "registrationByDealer" not in reasons
+
+    # expected on the checklist ...
+    assert items["debit_note"]["required"] is True
+    assert items["debit_note"]["raisesMissingTask"] is False
+    assert items["debit_note"]["conditions"] == ["insuranceByDealer"]
+    # ... and never a task
+    raised = {t["reference"]["requirementKey"] for t in _tasks(journey, "DOCUMENT_MISSING")}
+    assert "debit_note" not in raised
+
+
+def test_self_insurance_does_not_expect_the_debit_note_at_all(journey):
+    """Insurance the customer arranged is billed by their own insurer, so
+    the dealership owes no debit note and the entry does not appear."""
+    add_ready_document(journey, "booking_form", customer_name="A", booking_date="2026-09-01",
+                       insurance_by="Self")
+    _settle(journey)
+
+    reasons, items = _delivery_requirements(journey)
+    assert "insuranceByDealer" not in reasons
+    assert "debit_note" not in items
+
+
+def test_a_conditional_document_without_the_flag_still_raises_its_task(journey):
+    """Guard for the raises_missing_task default: suppression is opt-in, so
+    an ordinary CONDITIONAL document still produces its Document Missing
+    task."""
+    add_ready_document(journey, "customer_invoice_dms", rsa_amount="1500")
+    _settle(journey)
+
+    _, items = _delivery_requirements(journey)
+    assert items["rsa_invoice"]["raisesMissingTask"] is True
+    raised = {t["reference"]["requirementKey"] for t in _tasks(journey, "DOCUMENT_MISSING")}
+    assert "rsa_invoice" in raised
 
 
 def test_a_task_closes_when_the_evidence_no_longer_applies(journey):
