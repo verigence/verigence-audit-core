@@ -1642,6 +1642,16 @@ def _page_unit(connection: Connection, *, tenant_id: str, journey_id: UUID, queu
     return dict(row)
 
 
+class ReReadPageCommand(BaseModel):
+    """Only carries the reason for overriding a stage already marked reviewed."""
+
+    reason: str | None = Field(default=None, max_length=500)
+
+
+# The resync endpoint takes the same one field, for the same reason.
+ResyncPageCommand = ReReadPageCommand
+
+
 @router.post("/journeys/{journey_id}/pages/{queue_id}:reread", status_code=202)
 def reread_page(
     tenant_id: str,
@@ -1653,28 +1663,53 @@ def reread_page(
         SecurityAuthorizationClient, Depends(get_security_authorization_client)
     ],
     connection: Annotated[Connection, Depends(get_connection)],
+    payload: ReReadPageCommand | None = None,
 ) -> dict[str, Any]:
     """The PC asks Document Intelligence to read this page again (decision
     2026-10-01): one more reading of the document DI already holds, never
-    a re-upload. A page DI never received goes through Retry's recovery."""
-    _authorize(
+    a re-upload. A page DI never received goes through Retry's recovery.
+
+    A fresh reading replaces the stored values with DI's, so it loses a
+    hand-made correction exactly as a resync does. It is therefore refused on a
+    stage whose documents are marked reviewed, with the same TL/PM override.
+    """
+    access = _authorize(
         connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
         authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
     )
     unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id)
     if unit["queue_status"] not in _REREADABLE_PAGE_STATES:
         raise HTTPException(status_code=409, detail="This page is already read, or cannot be read again.")
+    if unit["di_document_id"] is not None:
+        reread_stage = page_stage_code(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            di_document_id=UUID(str(unit["di_document_id"])),
+        )
+        if reread_stage and stage_is_reviewed(
+            connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=reread_stage
+        ):
+            reason = ((payload.reason if payload else None) or "").strip()
+            if (access.operating_role or "").upper() not in {"TL", "PM"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"The {reread_stage.title()} documents are marked reviewed, so this "
+                        "page is not read again. A Team Lead or Project Manager can "
+                        "override this with a reason."
+                    ),
+                )
+            if not reason:
+                raise HTTPException(
+                    status_code=422,
+                    detail="A reason is required to read a reviewed stage again.",
+                )
     request_page_reread(
         connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id,
         requested_by=human_principal.subject, correlation_id=get_correlation_id(request),
     )
     return {"queueId": str(queue_id), "status": "REREAD_REQUESTED"}
-
-
-class ResyncPageCommand(BaseModel):
-    """Only used to override a resync of a stage already marked reviewed."""
-
-    reason: str | None = Field(default=None, max_length=500)
 
 
 @router.post("/journeys/{journey_id}/pages/{queue_id}:resync", status_code=202)

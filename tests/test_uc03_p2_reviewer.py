@@ -23,7 +23,12 @@ from sqlalchemy import text
 from starlette.requests import Request
 
 from audit_core.db import set_tenant_context
-from audit_core.uc03_p2_api import ResyncPageCommand, resync_page
+from audit_core.uc03_p2_api import (
+    ReReadPageCommand,
+    ResyncPageCommand,
+    reread_page,
+    resync_page,
+)
 from audit_core.uc03_p2_documents import (
     P2FieldCorrectionCommand,
     correct_p2_document_field,
@@ -274,6 +279,45 @@ def test_resync_is_refused_once_the_stage_is_reviewed_and_a_tl_needs_a_reason(jo
         ).scalar_one()
     assert details["overrideReason"] == "Wrong document was reviewed"
     assert details["stageCode"] == "BOOKING"
+
+
+def test_reading_a_page_again_is_refused_once_the_stage_is_reviewed(journey):
+    """Read again asks DI for a fresh reading, which replaces the stored values
+    just as a resync does, so a reviewed stage is protected from both."""
+    reviewer = _actor(journey, "REVIEWER")
+    team_lead = _actor(journey, "TL")
+    _, queue_id, document = add_page(journey, page_number=1, status="NEEDS_REVIEW")
+
+    _open(journey, document, reviewer)
+    _mark(journey, reviewer)
+
+    with journey.engine.begin() as connection, pytest.raises(HTTPException) as refused:
+        reread_page(
+            tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=queue_id,
+            request=_request(), human_principal=SimpleNamespace(subject=reviewer),
+            authorization_client=AllowAllAuthorization(role_key="REVIEWER"),
+            connection=connection, payload=None,
+        )
+    assert refused.value.status_code == 409
+    assert "marked reviewed" in refused.value.detail
+
+    with journey.engine.begin() as connection, pytest.raises(HTTPException) as no_reason:
+        reread_page(
+            tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=queue_id,
+            request=_request(), human_principal=SimpleNamespace(subject=team_lead),
+            authorization_client=AllowAllAuthorization(role_key="TL"),
+            connection=connection, payload=ReReadPageCommand(reason=""),
+        )
+    assert no_reason.value.status_code == 422
+
+    with journey.engine.begin() as connection:
+        overridden = reread_page(
+            tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=queue_id,
+            request=_request(), human_principal=SimpleNamespace(subject=team_lead),
+            authorization_client=AllowAllAuthorization(role_key="TL"),
+            connection=connection, payload=ReReadPageCommand(reason="Scan was upside down"),
+        )
+    assert overridden["status"] == "REREAD_REQUESTED"
 
 
 def _correct(journey, document_id, actor_id, role_key, *, value, remarks=None):

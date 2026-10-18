@@ -10,17 +10,18 @@
 
 ## 1. Purpose
 
-This document defines the five default operational role templates used when a Verigence Tenant is onboarded to Audit Core and Document Intelligence (DI):
+This document defines the six default operational role templates used when a Verigence Tenant is onboarded to Audit Core and Document Intelligence (DI):
 
 - `PC` — Process Consultant
 - `TL` — Team Lead
 - `PM` — Project Manager / PMO operating role
 - `CRM` — CRM operator
 - `REVIEWER` — document reviewer and validator (added in v1.1)
+- `Executive` — every audit privilege, Project-wide (bundle stated in v1.1)
 
 These are **default Security role templates**, not hard-coded authorization rules inside Audit Core or DI. Security resolves the Tenant's current role templates into the authoritative `permissions[]` claim.
 
-The existing Audit Core `Executive` role remains a separate special tenant-wide Audit Core role under `VAC-SD-003`; it is not one of these five onboarding operational templates. `SUPER_ADMIN` and `TENANT_ADMIN` are Security administration roles, not Audit Core operating roles.
+`Executive` remains the special Project-wide Audit Core role under `VAC-SD-003`; v1.1 states its bundle here so that Security has something to register, rather than leaving the role defined everywhere except where its privileges are listed. `SUPER_ADMIN` and `TENANT_ADMIN` are Security administration roles, not Audit Core operating roles.
 
 ## 2. Default-template and override rule
 
@@ -251,21 +252,47 @@ The Reviewer's capability boundary is set by what this bundle withholds, not by 
 
 This bundle introduces no new permission names. Every permission listed is already registered for PC, TL, PM or CRM above.
 
-## 9. Hard safety constraints on editable operational templates
+## 9. Default Executive bundle
 
-Even when a Tenant Admin or Super Admin customizes these five role templates:
+Executive holds **every** registered Audit Core privilege, across the whole Project (project-owner decision 2026-10-18). It is the one bundle stated as a rule rather than a list: it is the module's active permission set, so a permission added to Audit Core belongs to Executive from the moment it is registered, and no list has to be kept in step.
+
+### Audit Core
+
+- every `audit.*` permission registered in the module catalogue, which at catalogue version 2.2 is all 44, `audit.customer.contact.full.read` included.
+
+### DI
+
+- `di.subject.read`
+- `di.document.read`
+- `di.document.content.read`
+- `di.document.fields.read`
+- `di.document.quality.read`
+- `di.verification.read`
+- `di.operations.read`
+
+### Scope
+
+Project-wide, and only Project-wide: an Executive mapping carries no Dealer or Outlet rows, which is what "across all the Project" means in the business-scope model. Audit Core enforces that in `role_mapping_policy._PROJECT_WIDE_ONLY_ROLES` alongside TL and PM.
+
+### Guard
+
+Holding every Audit Core privilege is a capability ceiling, not an instruction: Audit Core still applies its own business policy over when an operation is available, exactly as it does for a PM's verification permissions. Executive remains an *Audit Core* role — it carries no `security.*` administration permission and no DI platform-administration permission, and `SUPER_ADMIN` and `TENANT_ADMIN` remain Security administration roles rather than operating roles.
+
+## 10. Hard safety constraints on editable operational templates
+
+Even when a Tenant Admin or Super Admin customizes these six role templates:
 
 1. only permissions registered in the Security platform permission catalogue may be assigned;
 2. Tenant Admin changes are limited to the Tenant in the authenticated token;
-3. `security.*` administrative permissions may not be placed into PC/TL/PM/CRM/REVIEWER templates;
+3. `security.*` administrative permissions may not be placed into PC/TL/PM/CRM/REVIEWER/Executive templates;
 4. `di.platform.whatsapp.admin` may not be placed into Tenant operational templates;
-5. `di.document.delete` is excluded from these five default/tenant operational templates because Audit Core evidence is audit-relevant and destructive removal is outside the approved Audit Core operating model;
+5. `di.document.delete` is excluded from these six default/tenant operational templates because Audit Core evidence is audit-relevant and destructive removal is outside the approved Audit Core operating model;
 6. every role-template change records actor, Tenant, previous permission set, new permission set, time and correlation/request identifier where available.
 
-## 10. Canonical Audit Core permission catalogue
+## 11. Canonical Audit Core permission catalogue
 
 The Audit Core-owned permission names used by these defaults are registered in `design/AUDIT_CORE_SECURITY_CATALOG_v2.1.json`. The former v1.0 catalogue remains historical/on hold and SHALL NOT be registered where it conflicts with this decision.
 
-## 11. Implementation dependency
+## 12. Implementation dependency
 
 Security owns default-template seeding, Tenant overrides, Super Admin/Tenant Admin authorization, effective permission resolution and change audit. Those capabilities are implemented/tracked in the Security module.
