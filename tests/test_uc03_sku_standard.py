@@ -266,6 +266,52 @@ def test_the_price_master_reads_a_months_book_and_names_a_rename(connection) -> 
     assert {c["key"] for c in variant["components"]} >= {"EX_SHOWROOM", "TCS", "INSURANCE"}
 
 
+def test_master_documents_lists_a_months_documents_and_what_is_missing(connection) -> None:  # noqa: F811
+    """What a month's figures were read from, for anyone checking a deal."""
+    from sqlalchemy import text as sql
+
+    from audit_core.uc03_sku_standard import master_documents
+
+    tenant_id = _load_masters(connection)
+    for kind, name, eff, status, err in (
+        ("PRICE_LIST", "Mahindra_Consolidated_Price_List_Oct2026.xlsx", "2026-10-03", "PUBLISHED", None),
+        ("CONSUMER_SCHEME", "Consumer Scheme Oct'26.pdf", "2026-10-03", "PUBLISHED", None),
+        ("EXCHANGE_SCHEME", "Exchange scheme Oct'26.pdf", "2026-10-03", "FAILED", "row 4: cash + other != total"),
+        ("PRICE_LIST", "Mahindra_Consolidated_Price_List_01Sep2026.xlsx", "2026-09-01", "PUBLISHED", None),
+    ):
+        connection.execute(
+            sql("""INSERT INTO auditcore.oem_master_uploads
+                     (tenant_id, oem_code, master_kind, source_filename, source_sha256,
+                      effective_from, status, row_counts, error_detail, uploaded_by_actor_id)
+                   VALUES (:t, 'MAHINDRA', :k, :n, :sha, :eff, :st, '{"rows": 12}'::jsonb, :err, 'admin')"""),
+            {"t": tenant_id, "k": kind, "n": name, "sha": f"{abs(hash(name)):064x}"[:64],
+             "eff": eff, "st": status, "err": err},
+        )
+
+    book = master_documents(
+        tenant_id=tenant_id, month="2026-10", human_principal=HumanPrincipal(subject="pc-1"),
+        authorization_client=AllowAllAuthorization(), connection=connection,
+    )
+    # The month is chosen on the document's own effective date, so
+    # September's book does not appear under October.
+    assert [d["masterKind"] for d in book["documents"]] == ["CONSUMER_SCHEME", "EXCHANGE_SCHEME", "PRICE_LIST"]
+    assert all(d["effectiveFrom"] == date(2026, 10, 3) for d in book["documents"])
+
+    # A document that failed to publish is exactly what a reader is after.
+    failed = next(d for d in book["documents"] if d["masterKind"] == "EXCHANGE_SCHEME")
+    assert failed["status"] == "FAILED" and "cash + other" in failed["errorDetail"]
+
+    # Only PUBLISHED counts as present, so the failed exchange scheme and
+    # the corporate policy nobody loaded both read as missing.
+    assert book["missingKinds"] == ["EXCHANGE_SCHEME", "CORPORATE_POLICY"]
+
+    september = master_documents(
+        tenant_id=tenant_id, month="2026-09", human_principal=HumanPrincipal(subject="pc-1"),
+        authorization_client=AllowAllAuthorization(), connection=connection,
+    )
+    assert [d["fileName"] for d in september["documents"]] == ["Mahindra_Consolidated_Price_List_01Sep2026.xlsx"]
+
+
 def test_the_standard_routes_answer_over_http(connection) -> None:  # noqa: F811
     tenant_id = _load_masters(connection)
     connection.commit()  # the API answers over its own connection

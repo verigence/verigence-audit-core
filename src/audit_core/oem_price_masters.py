@@ -28,6 +28,7 @@ from decimal import Decimal
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import Connection, text
@@ -57,8 +58,46 @@ from audit_core.price_lists import (
     create_price_list_version,
     publish_price_list_version,
 )
+from audit_core.uc03_p2_storage import get_p2_document_storage
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/v1/admin/oem-masters", tags=["admin-oem-masters"])
+
+_MASTER_CONTENT_TYPES = {
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
+    ".pdf": "application/pdf",
+}
+
+
+def _master_content_type(filename: str | None) -> str:
+    for suffix, content_type in _MASTER_CONTENT_TYPES.items():
+        if (filename or "").lower().endswith(suffix):
+            return content_type
+    return "application/octet-stream"
+
+
+def _master_object_key(
+    *, tenant_id: str, oem_code: str, master_kind: str, effective_from: date,
+    upload_id: UUID, filename: str | None,
+) -> str:
+    """Where a master document is kept.
+
+        {tenant_id}/oem-masters/{OEM}/{YYYY-MM}/{KIND}/{upload_id}_{filename}
+
+    Filed under the month the document is effective for, not the day it was
+    uploaded -- an August-named grid whose sheet says "Effective 1st Sep"
+    belongs to September, and the parsed date is the one to trust. The
+    upload id keeps a re-upload of the same month from overwriting the file
+    it supersedes: uploads are not idempotent, so two files for one month
+    is ordinary.
+    """
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", (filename or "upload").strip())[:160] or "upload"
+    return (
+        f"{tenant_id}/oem-masters/{oem_code.upper()}/{effective_from:%Y-%m}/"
+        f"{master_kind}/{upload_id}_{safe}"
+    )
 
 MasterKind = Literal["PRICE_LIST", "CONSUMER_SCHEME", "EXCHANGE_SCHEME", "CORPORATE_POLICY", "DISCOUNT_GRID"]
 _MAX_BYTES = 25 * 1024 * 1024
@@ -1489,6 +1528,34 @@ async def upload_oem_master(
                 "actor": actor_id,
             },
         ).scalar_one()
+
+        # Keep the document itself, so the figures can be checked against
+        # what was actually sent. Storage failing must not cost the month's
+        # prices: the upload still publishes, with no key and a warning, and
+        # a reader is told the source was not stored rather than handed a
+        # broken link.
+        object_key = _master_object_key(
+            tenant_id=tenant_id, oem_code=project["oem_code"], master_kind=master_kind,
+            effective_from=effective_from, upload_id=upload_id, filename=file.filename,
+        )
+        try:
+            get_p2_document_storage().put_object(
+                object_key, content, content_type=_master_content_type(file.filename)
+            )
+        except Exception as exc:  # noqa: BLE001 - archiving must never block publishing
+            preview["warnings"].append(
+                f"The document itself could not be stored ({exc.__class__.__name__}); "
+                "the figures were published but the file cannot be opened later."
+            )
+            logger.warning("oem_master_source_not_stored", upload_id=str(upload_id), key=object_key)
+        else:
+            connection.execute(
+                text(
+                    "UPDATE auditcore.oem_master_uploads SET source_object_key = :key "
+                    "WHERE tenant_id = :t AND upload_id = :u"
+                ),
+                {"key": object_key, "t": tenant_id, "u": upload_id},
+            )
 
         if master_kind == "PRICE_LIST":
             price_version_id, _ = ingest_price_list(

@@ -588,6 +588,131 @@ def price_master(
     }
 
 
+@router.get("/master-documents")
+def master_documents(
+    tenant_id: str,
+    month: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """The OEM master documents standing for one month, so anyone working a
+    deal can check what the figures were read from.
+
+    ``month`` is YYYY-MM and selects on the document's own effective date,
+    not when it was uploaded: a book is filed under the month it applies
+    to. The upload history endpoint beside the ingestion API answers the
+    same table but is SuperAdmin-only and tenant-wide; a PC checking why a
+    price looks wrong needs the month's documents and nothing more.
+
+    Read-only, and it never serves the file itself -- only what was
+    recorded about it. ``errorDetail`` is carried through because a
+    document that failed to publish is exactly what a reader is looking for
+    when the figures are missing.
+    """
+    _auth(connection, tenant_id, human_principal, authorization_client)
+    try:
+        first = date.fromisoformat(f"{month}-01")
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Name the month as YYYY-MM, for example 2026-10.") from None
+    nxt = date(first.year + (first.month == 12), 1 if first.month == 12 else first.month + 1, 1)
+    rows = connection.execute(
+        text(
+            """
+            SELECT upload_id, oem_code, master_kind, effective_from, source_filename, source_sha256,
+                   status, row_counts, error_detail, uploaded_by_actor_id, uploaded_at_utc,
+                   published_at_utc, source_object_key
+            FROM auditcore.oem_master_uploads
+            WHERE tenant_id = :t AND effective_from >= :first AND effective_from < :next
+            ORDER BY effective_from, master_kind, uploaded_at_utc
+            """
+        ),
+        {"t": tenant_id, "first": first, "next": nxt},
+    ).mappings().all()
+    documents = [
+        {
+            "uploadId": str(row["upload_id"]),
+            "oemCode": row["oem_code"],
+            "masterKind": row["master_kind"],
+            "effectiveFrom": row["effective_from"],
+            "fileName": row["source_filename"],
+            "sha256": row["source_sha256"],
+            "status": row["status"],
+            "rowCounts": row["row_counts"] or {},
+            "errorDetail": row["error_detail"],
+            "uploadedBy": row["uploaded_by_actor_id"],
+            "uploadedAtUtc": row["uploaded_at_utc"],
+            "publishedAtUtc": row["published_at_utc"],
+            # False for anything uploaded before the document itself was
+            # kept: those files were never stored and cannot be recovered.
+            "openable": bool(row["source_object_key"]),
+        }
+        for row in rows
+    ]
+    # The kinds a month is expected to carry. DISCOUNT_GRID is deliberately
+    # absent: oem_master_uploads' own CHECK does not allow it, so a grid
+    # upload is never recorded here and claiming it is missing would be a
+    # lie about the data rather than about the month.
+    expected = ("PRICE_LIST", "CONSUMER_SCHEME", "EXCHANGE_SCHEME", "CORPORATE_POLICY")
+    present = {d["masterKind"] for d in documents if d["status"] == "PUBLISHED"}
+    return {
+        "month": month,
+        "documents": documents,
+        "missingKinds": [kind for kind in expected if kind not in present],
+    }
+
+
+@router.get("/master-documents/{upload_id}/open")
+def open_master_document(
+    tenant_id: str,
+    upload_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """A short-lived link to the master document itself, to open or save.
+
+    The bytes are not served through here: a signed URL lets the browser
+    fetch them from object storage directly, the same way a Journey's
+    documents are read.
+    """
+    from audit_core.uc03_p2_storage import (
+        P2DocumentStorageError,
+        get_p2_document_storage,
+    )
+
+    _auth(connection, tenant_id, human_principal, authorization_client)
+    row = connection.execute(
+        text(
+            """
+            SELECT source_filename, source_object_key, master_kind, effective_from
+            FROM auditcore.oem_master_uploads
+            WHERE tenant_id = :t AND upload_id = :u
+            """
+        ),
+        {"t": tenant_id, "u": upload_id},
+    ).mappings().first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such master document.")
+    if not row["source_object_key"]:
+        raise HTTPException(
+            status_code=404,
+            detail="This document was uploaded before the file itself was kept, so it cannot be opened.",
+        )
+    try:
+        url = get_p2_document_storage().presign_get(row["source_object_key"])
+    except P2DocumentStorageError as exc:
+        raise HTTPException(status_code=502, detail="Document storage is unavailable.") from exc
+    return {
+        "uploadId": str(upload_id),
+        "fileName": row["source_filename"],
+        "masterKind": row["master_kind"],
+        "effectiveFrom": row["effective_from"],
+        "url": url,
+        "expiresInSeconds": 1800,
+    }
+
+
 @router.get("/sku")
 def sku_standard(
     tenant_id: str,
