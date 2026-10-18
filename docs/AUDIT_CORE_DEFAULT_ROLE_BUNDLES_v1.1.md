@@ -17,11 +17,11 @@ This document defines the six default operational role templates used when a Ver
 - `PM` — Project Manager / PMO operating role
 - `CRM` — CRM operator
 - `REVIEWER` — document reviewer and validator (added in v1.1)
-- `Executive` — every audit privilege, Project-wide (bundle stated in v1.1)
+- `Executive` — Project-wide oversight: reads everything, corrects ordinary business data, neither captures nor verifies (bundle stated in v1.1)
 
 These are **default Security role templates**, not hard-coded authorization rules inside Audit Core or DI. Security resolves the Tenant's current role templates into the authoritative `permissions[]` claim.
 
-`Executive` remains the special Project-wide Audit Core role under `VAC-SD-003`; v1.1 states its bundle here so that Security has something to register, rather than leaving the role defined everywhere except where its privileges are listed. `SUPER_ADMIN` and `TENANT_ADMIN` are Security administration roles, not Audit Core operating roles.
+`Executive` remains the special Project-wide Audit Core role under `VAC-SD-003`; v1.1 records its bundle here because the role was previously defined everywhere except where its privileges are listed. Security's seeded defaults are authoritative for it, and section 9 reproduces them rather than restating an intent. `SUPER_ADMIN` and `TENANT_ADMIN` are Security administration roles, not Audit Core operating roles.
 
 ## 2. Default-template and override rule
 
@@ -254,13 +254,45 @@ This bundle introduces no new permission names. Every permission listed is alrea
 
 ## 9. Default Executive bundle
 
-Executive holds **every** registered Audit Core privilege, across the whole Project (project-owner decision 2026-10-18). It is the one bundle stated as a rule rather than a list: it is the module's active permission set, so a permission added to Audit Core belongs to Executive from the moment it is registered, and no list has to be kept in step.
+Executive is Project-wide and read-broad: it sees every part of a deal and may
+correct ordinary business data, but it does not capture evidence, verify, or
+adjudicate. It is a curated bundle, not "every privilege" -- the distinction
+matters, because the permissions it withholds are the ones that would let an
+Executive do a PC's or a TL's job rather than oversee it.
 
-### Audit Core
+The authoritative definition is Security's own, seeded by
+`migrations/0013_v2_operating_role_defaults.sql`; the lists below are that
+bundle, not a restatement of intent.
 
-- every `audit.*` permission registered in the module catalogue, which at catalogue version 2.2 is all 44, `audit.customer.contact.full.read` included.
+### Audit Core (25)
 
-### DI
+- `audit.project.read`
+- `audit.master.read`
+- `audit.customer.read`
+- `audit.journey.read`
+- `audit.evidence.read`
+- `audit.payment.read`
+- `audit.delivery.read`
+- `audit.trade_in.read`
+- `audit.finding.read`
+- `audit.review.read`
+- `audit.work.read`
+- `audit.daily_ops.read`
+- `audit.crm.read`
+- `audit.escalation.read`
+- `audit.analytics.read`
+- `audit.audit_trail.read`
+- `audit.project.update`
+- `audit.master.write`
+- `audit.customer.write`
+- `audit.journey.update`
+- `audit.payment.write`
+- `audit.delivery.write`
+- `audit.trade_in.write`
+- `audit.finding.update`
+- `audit.work.update`
+
+### DI (13)
 
 - `di.subject.read`
 - `di.document.read`
@@ -268,15 +300,61 @@ Executive holds **every** registered Audit Core privilege, across the whole Proj
 - `di.document.fields.read`
 - `di.document.quality.read`
 - `di.verification.read`
+- `di.entity_link.read`
 - `di.operations.read`
+- `di.unassigned_document.read`
+- `di.requirement_profile.read`
+- `di.extraction_config.read`
+- `di.quality_config.read`
+- `di.tenant_config.read`
+
+### Deliberately withheld (18)
+
+Recorded because a bundle is defined as much by what it leaves out, and
+because an Executive asking why they cannot do one of these should find the
+answer here rather than in a migration:
+
+- `audit.crm.execute`
+- `audit.crm.manage`
+- `audit.daily_ops.execute`
+- `audit.daily_ops.review`
+- `audit.delivery.verify`
+- `audit.escalation.manage`
+- `audit.evidence.refresh`
+- `audit.evidence.upload`
+- `audit.finding.create`
+- `audit.finding.resolve`
+- `audit.journey.create`
+- `audit.journey.submit`
+- `audit.master.publish`
+- `audit.payment.verify`
+- `audit.project.assignment.manage`
+- `audit.review.decide`
+- `audit.trade_in.verify`
+- `audit.work.manage`
+
+No `audit.*.verify`, so formal verification stays with TL and PM. No
+`audit.evidence.upload` or `audit.evidence.refresh`, so capture stays with the
+PC. No `audit.review.decide`, `audit.finding.create` or `audit.finding.resolve`,
+so adjudication stays where the finding routing puts it. No
+`audit.work.manage`, `audit.crm.manage`, `audit.escalation.manage`,
+`audit.master.publish` or `audit.project.assignment.manage`.
 
 ### Scope
 
-Project-wide, and only Project-wide: an Executive mapping carries no Dealer or Outlet rows, which is what "across all the Project" means in the business-scope model. Audit Core enforces that in `role_mapping_policy._PROJECT_WIDE_ONLY_ROLES` alongside TL and PM.
+Project-wide, and only Project-wide: an Executive mapping carries no Dealer or
+Outlet rows. Audit Core enforces that in
+`role_mapping_policy._PROJECT_WIDE_ONLY_ROLES` alongside TL and PM.
 
 ### Guard
 
-Holding every Audit Core privilege is a capability ceiling, not an instruction: Audit Core still applies its own business policy over when an operation is available, exactly as it does for a PM's verification permissions. Executive remains an *Audit Core* role — it carries no `security.*` administration permission and no DI platform-administration permission, and `SUPER_ADMIN` and `TENANT_ADMIN` remain Security administration roles rather than operating roles.
+Holding a write permission is a capability ceiling, not an instruction: Audit
+Core still applies its own business policy over when an operation is
+available, exactly as it does for a PM's verification permissions. Executive
+remains an *Audit Core* role -- it carries no `security.*` administration
+permission and no DI platform-administration permission, and `SUPER_ADMIN` and
+`TENANT_ADMIN` remain Security administration roles rather than operating
+roles.
 
 ## 10. Hard safety constraints on editable operational templates
 
