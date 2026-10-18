@@ -413,6 +413,42 @@ def _grid_block(connection: Connection, *, tenant_id: str, model_id: UUID, on: d
     }
 
 
+def _squash_model(value: str | None) -> str:
+    """A model name with its spacing and punctuation taken out, so the same
+    model spelt two ways across two books compares equal."""
+    return re.sub(r"[^A-Z0-9]+", "", (value or "").upper())
+
+
+def _previous_version(connection: Connection, *, tenant_id: str, version: dict[str, Any]) -> dict[str, Any] | None:
+    """The price-list version standing before this one, if any."""
+    row = connection.execute(
+        text(
+            """
+            SELECT v.price_list_version_id, v.version_no, v.effective_from, v.effective_to,
+                   l.price_list_name, l.price_list_code
+            FROM auditcore.price_list_versions v
+            JOIN auditcore.price_lists l
+              ON l.tenant_id = v.tenant_id AND l.price_list_id = v.price_list_id
+            WHERE v.tenant_id = :t
+              AND v.lifecycle_status IN ('PUBLISHED', 'RETIRED')
+              AND (v.effective_from, v.version_no) < (:eff, :no)
+            ORDER BY v.effective_from DESC, v.version_no DESC
+            LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "eff": version["effectiveFrom"], "no": version["version"]},
+    ).mappings().first()
+    if row is None:
+        return None
+    return {
+        "priceListVersionId": str(row["price_list_version_id"]),
+        "priceList": row["price_list_name"] or row["price_list_code"],
+        "version": row["version_no"],
+        "effectiveFrom": row["effective_from"],
+        "effectiveTo": row["effective_to"],
+    }
+
+
 def _oem_code(connection: Connection, tenant_id: str) -> str | None:
     return connection.execute(
         text("SELECT o.oem_code FROM auditcore.projects p JOIN auditcore.oems o ON o.oem_id = p.oem_id WHERE p.tenant_id = :t"),
@@ -493,6 +529,63 @@ def catalogue(
         entry = models.setdefault(str(row["model_id"]), {"modelId": str(row["model_id"]), "model": row["model_name"], "variants": []})
         entry["variants"].append(_sku_summary(row))
     return {"on": on, "priceList": version, "models": list(models.values())}
+
+
+@router.get("/price-master")
+def price_master(
+    tenant_id: str,
+    on: date,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    registrationBasis: RegistrationBasis = "INDIVIDUAL",
+) -> dict[str, Any]:
+    """The whole price book standing on a date: every priced vehicle with
+    its components and on-road figure, for reading a month's master.
+
+    ``previousName`` carries the name the same model was priced under in
+    the version before this one, where that differs. Mahindra respells
+    models between books -- September's XUV3XO is October's 'XUV 3XO' --
+    and the two are separate catalogue rows, so seeing the old name beside
+    the new one is how a reader tells a rename from a new model.
+    """
+    _auth(connection, tenant_id, human_principal, authorization_client)
+    version = price_version_on(connection, tenant_id=tenant_id, on=on)
+    if version is None:
+        return {"on": on, "priceList": None, "models": [], "previous": None}
+    rows = catalogue_rows(connection, tenant_id=tenant_id, price_list_version_id=version["priceListVersionId"])
+    previous = _previous_version(connection, tenant_id=tenant_id, version=version)
+    previous_names = (
+        {_squash_model(r["model_name"]): r["model_name"]
+         for r in catalogue_rows(connection, tenant_id=tenant_id,
+                                 price_list_version_id=previous["priceListVersionId"])}
+        if previous else {}
+    )
+    models: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        entry = models.setdefault(str(row["model_id"]), {
+            "modelId": str(row["model_id"]),
+            "model": row["model_name"],
+            "previousName": None,
+            "variants": [],
+        })
+        if entry["previousName"] is None:
+            was = previous_names.get(_squash_model(row["model_name"]))
+            if was and was != row["model_name"]:
+                entry["previousName"] = was
+        price = _price_block(row, version, registrationBasis)
+        entry["variants"].append({
+            **_sku_summary(row),
+            "components": price["components"],
+            "onRoad": price["onRoad"],
+        })
+    return {
+        "on": on,
+        "basis": registrationBasis,
+        "priceList": version,
+        "previous": previous,
+        "models": sorted(models.values(), key=lambda m: m["model"]),
+    }
 
 
 @router.get("/sku")

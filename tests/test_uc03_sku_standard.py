@@ -219,6 +219,53 @@ def test_a_new_months_bulletin_replaces_the_last_one(connection) -> None:  # noq
     assert standard_for_sku(connection, tenant_id=tenant_id, on=ON, row=thar, version=version)["consumerScheme"]["total"] == "35000.00"
 
 
+def test_the_price_master_reads_a_months_book_and_names_a_rename(connection) -> None:  # noqa: F811
+    """The whole book standing on a date, and the name a model was priced
+    under in the version before, so a reader can tell a respelling from a
+    genuinely new model."""
+    from audit_core.uc03_sku_standard import price_master
+
+    tenant_id = _load_masters(connection)
+    project = _project_oem(connection, tenant_id)
+    # A second book, a month on, respelling XUV 3XO the way October does.
+    ingest_price_list(
+        connection=connection, tenant_id=tenant_id, oem_id=project["oem_id"], actor_id="admin",
+        effective_from=date(2026, 10, 1),
+        parsed=parse_price_list(_price_bytes(("THAR ROXX", "MX1 PMT 2WD", 1_050_000),
+                                             ("XUV3XO", "MX1", 820_000))),
+    )
+
+    app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject="tl-1")
+    app.dependency_overrides[get_security_authorization_client] = lambda: AllowAllAuthorization()
+    try:
+        book = price_master(
+            tenant_id=tenant_id, on=date(2026, 10, 15), human_principal=HumanPrincipal(subject="tl-1"),
+            authorization_client=AllowAllAuthorization(), connection=connection,
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert book["priceList"]["effectiveFrom"] == date(2026, 10, 1)
+    assert book["previous"]["effectiveFrom"] == date(2026, 9, 1)
+    by_model = {m["model"]: m for m in book["models"]}
+
+    # A respelt model appears TWICE in the month's book: the new spelling
+    # the OEM sent, and the old spelling carried forward because a partial
+    # book keeps every SKU it does not mention. Both are priced, so the
+    # reader has to be able to see they are one model -- which is what
+    # previousName is for.
+    assert set(by_model) == {"THAR ROXX", "XUV 3XO", "XUV3XO"}
+    assert by_model["XUV3XO"]["previousName"] == "XUV 3XO"
+    # Carried forward under the name it already had: nothing to report.
+    assert by_model["XUV 3XO"]["previousName"] is None
+    # Unchanged between books: nothing to report.
+    assert by_model["THAR ROXX"]["previousName"] is None
+    # Every variant carries its priced components and the on-road figure.
+    variant = by_model["THAR ROXX"]["variants"][0]
+    assert variant["onRoad"]["basis"] == "INDIVIDUAL"
+    assert {c["key"] for c in variant["components"]} >= {"EX_SHOWROOM", "TCS", "INSURANCE"}
+
+
 def test_the_standard_routes_answer_over_http(connection) -> None:  # noqa: F811
     tenant_id = _load_masters(connection)
     connection.commit()  # the API answers over its own connection
