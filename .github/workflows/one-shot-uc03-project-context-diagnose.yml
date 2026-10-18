@@ -11,6 +11,14 @@ on:
         description: 'Match on project_name (case-insensitive, substring)'
         required: true
         default: 'orissa'
+      railway_project:
+        description: 'Railway project id holding the Audit Core database'
+        required: true
+        default: '62c22163-78d0-4a86-a2f7-dbf39e64aa4d'
+      railway_environment:
+        description: 'Railway environment id'
+        required: true
+        default: '3e696b3a-1128-4970-b6c0-5a8c25d8fcb0'
 
 permissions:
   contents: read
@@ -32,21 +40,61 @@ jobs:
 
       - name: Resolve DEV database
         shell: bash
+        env:
+          RW_PROJECT: ${{ inputs.railway_project }}
+          RW_ENV: ${{ inputs.railway_environment }}
         run: |
           set -euo pipefail
           npm install --global @railway/cli
-          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
-          railway variable list --service "$DB_SERVICE" --json >/tmp/db-vars.json
-          python - <<'PY'
-          import json
+          railway link --project "$RW_PROJECT" --environment "$RW_ENV" --json >/tmp/link.json 2>/tmp/link.err || cat /tmp/link.err
+          # The database service is not always called "Postgres", and the
+          # previous hard-coded project pointed at a database with no auditcore
+          # schema at all. Try every candidate and keep the one that has it.
+          : > /tmp/services.txt
+          for cmd in "railway service list --json" "railway status --json"; do
+            $cmd >/tmp/svc.json 2>/dev/null && break || true
+          done
+          python - <<'PY2'
+          import json, os, subprocess
           from pathlib import Path
-          data = json.loads(Path('/tmp/db-vars.json').read_text())
-          raw = (data.get('DATABASE_PUBLIC_URL') or data.get('DATABASE_URL') or '').strip()
-          if not raw:
-              raise SystemExit('DEV Postgres URL is unavailable')
-          Path('/tmp/db-url').write_text(raw)
-          print('resolved DEV database url')
-          PY
+          names = []
+          try:
+              raw = json.loads(Path('/tmp/svc.json').read_text())
+              def walk(node):
+                  if isinstance(node, dict):
+                      n = node.get('name')
+                      if isinstance(n, str):
+                          names.append(n)
+                      for v in node.values():
+                          walk(v)
+                  elif isinstance(node, list):
+                      for v in node:
+                          walk(v)
+              walk(raw)
+          except Exception as exc:
+              print('could not list services:', exc)
+          seen, ordered = set(), []
+          for n in names + ['Postgres', 'postgres', 'Postgres-dev', 'database', 'db']:
+              if n not in seen:
+                  seen.add(n)
+                  ordered.append(n)
+          print('candidate services:', ordered)
+          Path('/tmp/services.txt').write_text('\n'.join(ordered))
+          PY2
+          found=""
+          while read -r svc; do
+            [ -n "$svc" ] || continue
+            if railway variable list --service "$svc" --json >/tmp/db-vars.json 2>/dev/null; then
+              url="$(python -c "import json,sys;d=json.load(open('/tmp/db-vars.json'));print((d.get('DATABASE_PUBLIC_URL') or d.get('DATABASE_URL') or '').strip())" 2>/dev/null || true)"
+              if [ -n "$url" ]; then
+                printf '%s' "$url" > /tmp/db-url
+                echo "service '$svc' exposes a database url"
+                found="$svc"
+                break
+              fi
+            fi
+          done < /tmp/services.txt
+          [ -n "$found" ] || { echo '::error::No service in this project exposes a database url.'; exit 1; }
 
       - name: Read project context (SELECT only)
         shell: bash
@@ -62,7 +110,12 @@ jobs:
 
           like = f"%{os.environ.get('NAME_LIKE','').strip()}%"
           queries = [
-            ("server time", "SELECT now() AS now_utc, (now() AT TIME ZONE 'Asia/Kolkata') AS now_ist", ()),
+            ("which database this is",
+             """SELECT current_database() AS db, now() AS now_utc,
+                       (now() AT TIME ZONE 'Asia/Kolkata') AS now_ist,
+                       (SELECT string_agg(nspname, ', ' ORDER BY nspname)
+                        FROM pg_namespace
+                        WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema') AS schemas""", ()),
             ("projects matching the name",
              """SELECT tenant_id, project_code, project_name, project_status, timezone_name
                 FROM auditcore.projects WHERE project_name ILIKE %s ORDER BY project_name""", (like,)),
