@@ -977,9 +977,16 @@ def _insurance_decided(insurance: dict[str, Any]) -> str:
 
 def insurance_invoice_missing(facts: _Facts) -> RuleOutcome:
     """The vehicle is invoiced but nothing bills the insurance premium: the
-    PC uploads the insurance invoice, or admits the customer arranged their
+    PC uploads the insurance document, or admits the customer arranged their
     own insurance (which keeps the premium out of the deal and flags the
-    Team Lead). Decision 2026-09-30; the cover-note reading follows."""
+    Team Lead). Decision 2026-09-30; the cover-note reading follows.
+
+    This asked for a ``debit_note`` -- a commercial instrument the
+    dealership may never raise -- as the proof. Dealer-arranged insurance is
+    evidenced by the insurance copy, so the ask is ``insurance_cover``, the
+    document the PC actually has (and which is REQUIRED for Delivery
+    anyway). A debit note, when one exists, is still read and still checked
+    against the cover note by INSURANCE_PREMIUM_VS_DEBIT_NOTE."""
     code = "INSURANCE_INVOICE_MISSING"
     insurance = facts.sheet["insurance"]
     if insurance["source"] == "SELF":
@@ -989,13 +996,13 @@ def insurance_invoice_missing(facts: _Facts) -> RuleOutcome:
     if not insurance["vehicleInvoiced"]:
         return RuleOutcome(code, "PASS", "The vehicle is not invoiced yet; the insurance invoice is due with it.")
     return RuleOutcome(code, "FAIL", (
-        "The vehicle is invoiced but no invoice for the insurance premium is on file. Upload the insurance "
-        "invoice (debit note), or confirm that the customer arranged their own insurance."
+        "The vehicle is invoiced but nothing on file bills the insurance premium. Upload the insurance "
+        "cover note, or confirm that the customer arranged their own insurance."
     ), {
         "findingTitle": "Insurance invoice missing",
-        "question": "Is the insurance through the dealership? Upload its invoice; if the customer arranged their own, say so.",
+        "question": "Is the insurance through the dealership? Upload the insurance cover note; if the customer arranged their own, say so.",
         "answers": [{"value": "SELF", "label": "Self insurance: the customer arranged it", "requiresComment": True}],
-        "uploadFirst": True, "documentTypes": ["debit_note"],
+        "uploadFirst": True, "documentTypes": ["insurance_cover"],
     })
 
 

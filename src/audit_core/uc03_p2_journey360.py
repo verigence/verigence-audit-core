@@ -987,10 +987,28 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
                 # or Self (opted out), as the PC confirms it.
                 row["opted"] = {"taken": not self_insured, "source": "insurance"}
     counted_rows = [r for r in all_rows if not r.get("excluded")]
+    # The premium is accounted for when a billing document carries it -- an
+    # invoice-type document with an insurance_amount source, or an invoice
+    # line in the INSURANCE category -- OR when the insurance cover note
+    # itself states the premium.
+    #
+    # The cover note clause is new. `_INVOICE_TYPES` contains `debit_note`
+    # but not `insurance_cover`, so the only document that could ever close
+    # INSURANCE_INVOICE_MISSING was a debit note -- a commercial instrument
+    # the dealership may never raise. The cover note is what a dealer-
+    # arranged policy actually produces (it is already
+    # `_ADDON_DOCUMENTS["insurance"]`, the document that proves the add-on
+    # was taken) and it is REQUIRED for every Delivery. Keyed on the premium
+    # figure rather than the file's presence, so this stays evidence of an
+    # accounted premium and not merely of an upload.
     insurance["invoiceOnFile"] = any(
         s["line_kind"] == "COMMERCIAL" and s["component_key"] in _ADDON_COMPONENTS["insurance"]
         and str(s["source_document_type"]) in _INVOICE_TYPES for s in sources
-    ) or bool(_line_items(invoice_documents, _LINE_CATEGORIES["insurance"]))
+    ) or bool(_line_items(invoice_documents, _LINE_CATEGORIES["insurance"])) or any(
+        d["documentType"] in _ADDON_DOCUMENTS["insurance"]
+        and _dec(d["fields"].get("premium_amount")) is not None
+        for d in documents
+    )
     insurance["vehicleInvoiced"] = any(d["documentType"] in _VEHICLE_INVOICE_TYPES for d in documents)
     std_total, bk_total, cur_total, bl_total, lg_total = (
         _column_total(counted_rows, c) for c in ("standard", "booking", "current", "billed", "ledger")

@@ -567,7 +567,10 @@ def test_insurance_invoice_is_asked_for_once_the_vehicle_is_invoiced(journey):
     assert _states(journey)["INSURANCE_INVOICE_MISSING"]["control_status"] == "FAIL"
     task = _task(journey, "INSURANCE_INVOICE_MISSING")
     assert task["task_type"] == "PC_CONFIRMATION" and task["assigned_role_code"] == "PC"
-    assert task["reference"]["uploadFirst"] is True and task["reference"]["documentTypes"] == ["debit_note"]
+    # The ask is the insurance cover note, not a debit note: a dealer-
+    # arranged policy produces a cover note, while a debit note is a
+    # commercial instrument the dealership may never raise.
+    assert task["reference"]["uploadFirst"] is True and task["reference"]["documentTypes"] == ["insurance_cover"]
     assert [a["value"] for a in task["reference"]["answers"]] == ["SELF"]
     priority = _sql(journey, "SELECT priority FROM auditcore.p2_tasks WHERE tenant_id=:t AND task_id=:k",
                     k=task["task_id"]).scalar_one()
@@ -578,6 +581,34 @@ def test_insurance_invoice_is_asked_for_once_the_vehicle_is_invoiced(journey):
     _evaluate(journey, "NATIVE:BOOKING")
     assert _states(journey)["INSURANCE_INVOICE_MISSING"]["control_status"] == "PASS"
     assert _task(journey, "INSURANCE_INVOICE_MISSING")["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_insurance_cover_note_premium_closes_the_insurance_invoice_rule(journey):
+    """The cover note is what a dealer-arranged policy produces, so a cover
+    note stating the premium accounts for it.
+
+    `_INVOICE_TYPES` carries `debit_note` but not `insurance_cover`, so the
+    rule could previously only ever be closed by a debit note -- a
+    commercial instrument the dealership may never raise -- while the
+    document the PC actually holds did nothing. The ask and the way to
+    satisfy it are now the same document."""
+    add_ready_document(journey, "tax_invoice_tally", invoice_number="INV-1")
+    _evaluate(journey, "NATIVE:BOOKING")
+    assert _states(journey)["INSURANCE_INVOICE_MISSING"]["control_status"] == "FAIL"
+
+    add_ready_document(journey, "insurance_cover", premium_amount="40000")
+    _evaluate(journey, "NATIVE:BOOKING")
+    assert _states(journey)["INSURANCE_INVOICE_MISSING"]["control_status"] == "PASS"
+    assert _task(journey, "INSURANCE_INVOICE_MISSING")["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_cover_note_without_a_premium_does_not_account_for_it(journey):
+    """Evidence of an accounted premium, not of an upload: a cover note that
+    carries no premium figure leaves the rule failing."""
+    add_ready_document(journey, "tax_invoice_tally", invoice_number="INV-1")
+    add_ready_document(journey, "insurance_cover", policy_number="POL-9")
+    _evaluate(journey, "NATIVE:BOOKING")
+    assert _states(journey)["INSURANCE_INVOICE_MISSING"]["control_status"] == "FAIL"
 
 
 def test_self_insurance_admission_drops_the_premium_and_flags_the_team_lead(journey):
