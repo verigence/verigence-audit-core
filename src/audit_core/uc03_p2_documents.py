@@ -40,6 +40,11 @@ from audit_core.uc03_p2_access import (
     resolve_p2_scope,
 )
 from audit_core.uc03_p2_registry import get_registry
+from audit_core.uc03_p2_reviewer import (
+    log_field_change,
+    page_stage_code,
+    record_document_open,
+)
 from audit_core.uc03_p2_runtime import note_facts_changed, record_activity
 from audit_core.uc03_p2_stage import field_review_reasons
 from audit_core.uc03_p2_tasks import create_p2_task
@@ -739,6 +744,22 @@ def get_p2_document_content(
         raise DependencyUnavailableError(
             detail="Source document content is temporarily unavailable."
         ) from exc
+    # The document has now actually been served, so note that this person has
+    # seen it. This is the only place Audit Core can say that: the bytes pass
+    # through here rather than via a presigned URL, and the response is
+    # no-store so the browser never satisfies a later view from cache. A
+    # failed fetch above never reaches this line and so never counts as an
+    # open. The Reviewer's documents-reviewed gate reads this ledger, and the
+    # opens may be spread over days, which is why they are durable.
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        record_document_open(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            document_id=document_id,
+            actor_id=human_principal.subject,
+        )
     headers = {"Cache-Control": "private, no-store"}
     if content_disposition:
         headers["Content-Disposition"] = content_disposition
@@ -930,7 +951,18 @@ def correct_p2_document_field(
         else machine_value
     )
 
-    if requires_pc_review(confidence):
+    # Below 90% confidence a correction is self-serve. At or above it, a PC's
+    # correction goes to a Team Lead to adjudicate, because overriding a value
+    # DI was confident about is where a mistake hides.
+    #
+    # A Reviewer is the person brought in to do exactly that overriding -- the
+    # role exists because an extraction above 90% can still be plainly wrong --
+    # so the band does not apply to them and nothing is raised for anyone else
+    # to approve (owner decision 2026-10-18). Nobody checks the Reviewer
+    # afterwards, which is why every apply below writes the change log: that
+    # trail, not a second approver, is what makes the change answerable for.
+    reviewer = (access.operating_role or "").upper() == "REVIEWER"
+    if reviewer or requires_pc_review(confidence):
         _apply_field_value(
             connection,
             tenant_id=tenant_id,
@@ -949,6 +981,37 @@ def correct_p2_document_field(
             original_value=machine_value,
             new_value=command.newValue,
             actor_id=human_principal.subject,
+        )
+        log_field_change(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            # The authoritative stage, not `_document_context`'s, which prefers
+            # the nullable `business_stage` copy. The trail has to agree with
+            # the reviewed marks and the resync guard, and those read the NOT
+            # NULL capture column (RVW-AC-01).
+            stage_code=(
+                page_stage_code(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    di_document_id=document_id,
+                )
+                or str(context["stage_code"])
+            ),
+            document_id=document_id,
+            field_key=command.fieldKey,
+            canonical_field_id=command.canonicalFieldId,
+            source_fact_version=command.sourceFactVersion,
+            previous_value=json.dumps(current_effective),
+            new_value=json.dumps(command.newValue),
+            confidence_score=confidence,
+            change_reason="CORRECTION",
+            actor_id=human_principal.subject,
+            actor_role_code=(
+                access.operating_role or access.functional_role or "USER"
+            ),
+            remarks=(command.remarks or "").strip() or None,
         )
         note_facts_changed(
             connection,

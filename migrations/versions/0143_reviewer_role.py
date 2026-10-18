@@ -32,16 +32,13 @@ along with the value. Reviewers correct high-confidence values without a
 second person approving, so this log is the control rather than a convenience;
 the grants withhold UPDATE and DELETE accordingly.
 
-Sibling revision: `0142_oem_master_source_object` is on the master-documents
-branch. Both descend from 0141, so whichever branch merges second re-points its
-`down_revision` at the other to keep a single Alembic head.
 """
 from __future__ import annotations
 
 from alembic import op
 
 revision = "0143_reviewer_role"
-down_revision = "0141_p2_runtime_price_variance"
+down_revision = "0142_oem_master_source_object"
 branch_labels = None
 depends_on = None
 
