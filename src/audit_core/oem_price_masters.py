@@ -715,6 +715,82 @@ def _model_lookup(connection: Connection, oem_id: UUID) -> dict[str, tuple[UUID,
     return out
 
 
+def _squash(value: str | None) -> str:
+    """A model name with its spacing and punctuation taken out.
+
+    'XUV 3XO' and 'XUV3XO' are one model; the spaces and hyphens in OEM
+    model names move between bulletins and carry no meaning.
+    """
+    return re.sub(r"[^A-Z0-9]+", "", (value or "").upper())
+
+
+def _model_rows(connection: Connection, oem_id: UUID) -> list[tuple[str, UUID, list[tuple[str, UUID]]]]:
+    """Every model the OEM carries, as (name, model_id, variants).
+
+    ``_model_lookup`` keys by name and so keeps only one row per name. A
+    model is keyed on its slug (``_slug_model``), which preserves spacing --
+    'XUV 3XO' slugs to XUV_3XO and 'XUV3XO' to XUV3XO -- so a model the OEM
+    has respelt genuinely exists twice, and a scheme has to be able to find
+    both. Nothing is collapsed here.
+    """
+    rows = connection.execute(
+        text(
+            """
+            SELECT m.model_id, m.model_name, v.variant_id, v.variant_name
+            FROM auditcore.product_models m
+            LEFT JOIN auditcore.product_variants v ON v.model_id = m.model_id
+            WHERE m.oem_id = :oem_id
+            ORDER BY m.model_name, m.model_id
+            """
+        ),
+        {"oem_id": oem_id},
+    ).mappings().all()
+    out: dict[UUID, tuple[str, UUID, list[tuple[str, UUID]]]] = {}
+    for row in rows:
+        entry = out.setdefault(row["model_id"], (row["model_name"], row["model_id"], []))
+        if row["variant_id"] is not None:
+            entry[2].append((_norm(row["variant_name"]), row["variant_id"]))
+    return list(out.values())
+
+
+def _model_targets(
+    models: list[tuple[str, UUID, list[tuple[str, UUID]]]],
+    alias_map: dict[str, str],
+    model_alias: str,
+) -> tuple[list[tuple[UUID, list[tuple[str, UUID]]]], list[str], list[str]]:
+    """The loaded models a scheme's model cell names, how each was matched,
+    and the parts nothing could resolve.
+
+    The alias map canonicalises to the naming of the month it was seeded
+    in, and Mahindra renames models between bulletins: September's XUV3XO
+    is October's 'XUV 3XO', SCORPIO CLASSIC is 'SCORPIO', XEV9S is
+    'XEV 9S'. A canonical name can therefore name a model the current price
+    list no longer carries -- in which case the scheme was reported "not in
+    the loaded price list" and dropped, or silently attached to the old
+    month's model row where one survived, so the new month's offers never
+    reached the new month's vehicles.
+
+    One rule: a model matches when its name, with spacing and punctuation
+    taken out, equals the canonical name OR the cell's own wording. The
+    cell's wording is what rescues a renamed model, and both names are
+    tried because a book carrying two months can hold the model under both
+    -- the offer should reach the vehicle whichever row it sits on. The
+    scheme version is dated, so an older row picking the new month's offer
+    up only ever answers for dates that offer actually stands on.
+    """
+    canonical, unresolved = _resolve_models(alias_map, model_alias)
+    literal = [part.strip() for part in re.split(r"[|/]", model_alias or "") if part.strip()]
+    wanted = {_squash(name) for name in (*canonical, *literal) if _squash(name)}
+
+    targets: list[tuple[UUID, list[tuple[str, UUID]]]] = []
+    matched: list[str] = []
+    for name, model_id, variants in models:
+        if _squash(name) in wanted:
+            targets.append((model_id, variants))
+            matched.append(name)
+    return targets, matched, (unresolved if not targets else [])
+
+
 def ingest_discount_document(
     connection: Connection,
     *,
@@ -727,34 +803,40 @@ def ingest_discount_document(
     actor_id: str,
 ) -> dict[str, Any]:
     alias_map = _alias_map(connection, oem_code)
-    models = _model_lookup(connection, oem_id)
+    models = _model_rows(connection, oem_id)
     categories = _SCHEME_CATEGORY_BY_KIND[master_kind]
     summary: dict[str, Any] = {"published": 0, "tombstoned": 0, "unresolved": [], "warnings": []}
     live_codes: set[str] = set()
 
     for drow in parsed.discount_rows:
-        resolved_names, unresolved = _resolve_models(alias_map, drow.model_alias)
+        model_targets, matched_names, unresolved = _model_targets(models, alias_map, drow.model_alias)
         if unresolved:
             summary["unresolved"].append(
                 f"{drow.scheme_category} row {drow.row_no}: unresolved model(s) "
                 f"{unresolved} in '{drow.model_alias}'"
             )
-        if not resolved_names:
-            continue
-
-        model_targets = [models[name.upper()] for name in resolved_names if name.upper() in models]
         if not model_targets:
-            summary["unresolved"].append(
-                f"{drow.scheme_category} row {drow.row_no}: model(s) {resolved_names} "
-                "not in the loaded price list — load the price list first"
-            )
+            if not unresolved:
+                summary["unresolved"].append(
+                    f"{drow.scheme_category} row {drow.row_no}: '{drow.model_alias}' "
+                    "is not in the loaded price list — load the price list first"
+                )
             continue
+        # A model matched under a name other than the one the bulletin used
+        # has been renamed between months: say so rather than leave it to be
+        # noticed when the offer fails to appear against a deal.
+        renamed = [n for n in matched_names if _squash(n) != _squash(drow.model_alias)]
+        if renamed and len(model_targets) == 1:
+            summary["warnings"].append(
+                f"{drow.scheme_category} row {drow.row_no}: '{drow.model_alias}' "
+                f"matched the loaded model '{renamed[0]}'"
+            )
 
         code = _scheme_code(
             "MAH",
             drow.scheme_category,
             drow.config.get("section", ""),
-            "_".join(_slug_model(n) for n in resolved_names),
+            "_".join(_slug_model(n) for n in matched_names),
             drow.config.get("schemeType", ""),
             "-".join(sorted(v.upper() for v in drow.variant_texts))[:40],
         )
