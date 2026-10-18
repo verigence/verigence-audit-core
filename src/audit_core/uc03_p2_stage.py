@@ -368,8 +368,16 @@ _AMOUNT_EVIDENCE = {
                         "EXCHANGE_BONUS", "EXCHANGE"),
     "financeCase": ("loan_credit", "financed_amount", "loan_amount", "loan_disbursement_amount"),
     "insuranceByDealer": ("inhouse_insurance_discount_amount",),
-    "registrationByDealer": ("registration_charges", "road_tax_amount", "road_tax_registration", "rto_amount",
-                             "registration_amount"),
+    # registrationByDealer is deliberately NOT inferred from an amount.
+    # Road tax, RTO and registration charges are collected on virtually every
+    # docket -- they are statutory costs of the sale, not evidence of who
+    # does the RTO work -- so keying off ("registration_charges",
+    # "road_tax_amount", "road_tax_registration", "rto_amount",
+    # "registration_amount") made the condition true for nearly every deal,
+    # including self-registered ones. It is read from the explicit
+    # registration_by fact below, matching the DB-side resolver
+    # uc03_delivery_documents._registration_by_dealer, which has always read
+    # only that field. The two had drifted apart.
     "rsaSold": ("rsa_amount",),
     "ewSold": ("additional_warranty_amount", "extended_warranty_amount", "ew_amount"),
     "accessoriesSold": ("accessories_cost", "essential_kit_amount", "genuine_accessories_amount",

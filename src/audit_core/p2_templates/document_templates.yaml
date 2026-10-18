@@ -1264,12 +1264,29 @@ document_types:
     - CUSTOMER
     - DEAL
   debit_note:
-    display_name: Debit Note (insurance / registration)
+    # A Debit Note is a commercial instrument the dealership may or may not
+    # raise. It is not evidence that insurance was taken, nor that the
+    # vehicle was registered, and insurance and registration are separate
+    # processes that share no document.
+    #
+    # This was CONDITIONAL on `insuranceByDealer|registrationByDealer` -- an
+    # OR -- so dealer-arranged insurance on its own made the Debit Note
+    # mandatory and raised a HIGH "Document Missing" task (see
+    # uc03_p2_task_producer.sync_document_missing_tasks). That sat on top of
+    # two requirements that already cover both processes properly:
+    #   insurance_cover (REQUIRED, always)        -- the insurance copy
+    #   rto_challan     (CONDITIONAL, registrationByDealer) -- registration
+    # so the deal was asked for a third document neither process produces.
+    #
+    # OPTIONAL keeps it classifiable by DI, extracted, and still compared
+    # against the cover note by INSURANCE_PREMIUM_VS_DEBIT_NOTE whenever one
+    # is actually uploaded -- without ever demanding it.
+    display_name: Debit Note
     di_types:
     - debit_note
     stage: DELIVERY
-    requirement: CONDITIONAL
-    condition: insuranceByDealer|registrationByDealer
+    requirement: OPTIONAL
+    condition: null
     accepted_early: true
     pages:
       shape: MULTI_PAGE
@@ -1283,11 +1300,11 @@ document_types:
     persistence:
       typed: generic reviewed field store
       canonical:
-      - dealership insurance / registration evidence
+      - dealership debit note evidence
     processors:
     - Requirement applicability
     controls: []
-    control_notes: dealership insurance / registration evidence
+    control_notes: dealership debit note evidence
     task_effects:
     - Low-confidence review
     - upload/re-upload
