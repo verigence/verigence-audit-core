@@ -374,7 +374,7 @@ components:
         timezoneName: {type: string}
         operatingRole:
           type: string
-          enum: [PC, TL, PM, CRM, Executive]
+          enum: [PC, TL, PM, CRM, Executive, REVIEWER]
         scope: {$ref: '#/components/schemas/ProjectScopeSummary'}
     ProjectScopeSummary:
       type: object

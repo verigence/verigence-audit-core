@@ -36,7 +36,7 @@ from audit_core.security_integration import SecurityAdminClient, SecurityAdminEr
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["role-mapping"])
 
-OperatingRole = Literal["PC", "TL", "PM", "CRM", "Executive"]
+OperatingRole = Literal["PC", "TL", "PM", "CRM", "Executive", "REVIEWER"]
 _OPERATION_TYPE = "ROLE_MAPPING"
 _RUNTIME_ROLE = "audit_core_runtime"
 
@@ -136,7 +136,11 @@ def _mapping_from_rows(user_id: str, rows: list[Any]) -> RoleMappingResponse:
     if len(roles) != 1:
         raise RuntimeError("Active business assignments have inconsistent operating roles")
     role = next(iter(roles))
-    if role not in {"PC", "TL", "PM", "CRM", "Executive"}:
+    # `role_mapping_policy.install_role_mapping_policy` replaces this function at
+    # import time and owns the authoritative per-role scope shapes; the set here
+    # stays in step with it so a REVIEWER assignment can never 500 a read of the
+    # Tenant's whole role-mapping list through either implementation.
+    if role not in {"PC", "TL", "PM", "CRM", "Executive", "REVIEWER"}:
         raise RuntimeError("Active business assignment has unsupported operating role")
 
     dealer_ids = sorted(
