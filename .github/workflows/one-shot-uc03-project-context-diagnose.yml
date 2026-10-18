@@ -2,8 +2,8 @@ name: One-shot UC03 project-context diagnose
 
 # Read-only. Prints exactly what /v1/me/projects evaluates for a Project, so an
 # employee who is mapped but sees no workspace can be traced to the condition
-# that excludes them (assignment status, effective window, Project status,
-# Outlet status, or two role codes in one Project). SELECT only; no writes.
+# that excludes them. SELECT only; no writes. Results are posted as a repo
+# issue because Actions logs are not readable from the agent session.
 on:
   workflow_dispatch:
     inputs:
@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   diagnose:
@@ -44,6 +45,7 @@ jobs:
           if not raw:
               raise SystemExit('DEV Postgres URL is unavailable')
           Path('/tmp/db-url').write_text(raw)
+          print('resolved DEV database url')
           PY
 
       - name: Read project context (SELECT only)
@@ -52,45 +54,85 @@ jobs:
           NAME_LIKE: ${{ inputs.project_name_like }}
         run: |
           set -euo pipefail
-          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
-          DB="$(cat /tmp/db-url)"
-          run() { echo; echo "----- $1"; psql "$DB" -X -v ON_ERROR_STOP=1 -v nm="%${NAME_LIKE}%" -c "$2"; }
+          python -m pip install -q "psycopg[binary]"
+          python - <<'PY'
+          import os, traceback
+          from pathlib import Path
+          import psycopg
 
-          run "server time" "SELECT now() AS now_utc, now() AT TIME ZONE 'Asia/Kolkata' AS now_ist;"
+          like = f"%{os.environ.get('NAME_LIKE','').strip()}%"
+          queries = [
+            ("server time", "SELECT now() AS now_utc, (now() AT TIME ZONE 'Asia/Kolkata') AS now_ist", ()),
+            ("projects matching the name",
+             """SELECT tenant_id, project_code, project_name, project_status, timezone_name
+                FROM auditcore.projects WHERE project_name ILIKE %s ORDER BY project_name""", (like,)),
+            ("assignments, each condition of the /v1/me/projects predicate evaluated",
+             """SELECT ba.security_actor_id, p.project_name, ba.business_role_code AS role,
+                       ba.assignment_status AS status, ba.effective_from, ba.effective_to,
+                       (ba.assignment_status='ACTIVE') AS ok_status,
+                       (ba.effective_from <= now()) AS ok_started,
+                       (ba.effective_to IS NULL OR ba.effective_to >= now()) AS ok_not_ended,
+                       (ba.dealer_id IS NOT NULL) AS has_dealer,
+                       (ba.outlet_id IS NOT NULL) AS has_outlet
+                FROM auditcore.business_assignments ba
+                JOIN auditcore.projects p ON p.tenant_id = ba.tenant_id
+                WHERE p.project_name ILIKE %s
+                ORDER BY ba.security_actor_id, p.project_name, ba.business_role_code""", (like,)),
+            ("distinct role codes per actor per project (2+ raises the 500)",
+             """SELECT ba.security_actor_id, p.project_name,
+                       count(DISTINCT ba.business_role_code) AS role_codes,
+                       string_agg(DISTINCT ba.business_role_code, ',') AS codes
+                FROM auditcore.business_assignments ba
+                JOIN auditcore.projects p ON p.tenant_id = ba.tenant_id
+                WHERE p.project_name ILIKE %s
+                  AND ba.assignment_status='ACTIVE'
+                  AND ba.effective_from <= now()
+                  AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+                GROUP BY 1,2 ORDER BY 3 DESC""", (like,)),
+            ("dealers and outlets (an inactive one is dropped from the payload)",
+             """SELECT p.project_name, d.dealer_name, d.status AS dealer_status,
+                       o.outlet_name, o.outlet_classification, o.status AS outlet_status
+                FROM auditcore.projects p
+                JOIN auditcore.dealers d ON d.tenant_id = p.tenant_id
+                LEFT JOIN auditcore.dealer_outlets o
+                       ON o.tenant_id = d.tenant_id AND o.dealer_id = d.dealer_id
+                WHERE p.project_name ILIKE %s
+                ORDER BY p.project_name, d.dealer_name, o.outlet_name""", (like,)),
+          ]
 
-          run "projects" "
-            SELECT tenant_id, project_code, project_name, project_status, timezone_name
-            FROM auditcore.projects WHERE project_name ILIKE :'nm' ORDER BY project_name;"
+          out = [f"Read-only diagnose for project_name ILIKE `{like}`", ""]
+          with psycopg.connect(Path('/tmp/db-url').read_text().strip(), autocommit=True) as conn:
+              for title, sql, params in queries:
+                  out += [f"### {title}", ""]
+                  try:
+                      with conn.cursor() as cur:
+                          cur.execute(sql, params)
+                          cols = [c.name for c in (cur.description or [])]
+                          rows = cur.fetchall()
+                      if not rows:
+                          out += ["_no rows_", ""]
+                          continue
+                      out += ["| " + " | ".join(cols) + " |",
+                              "|" + "|".join(["---"] * len(cols)) + "|"]
+                      for r in rows[:200]:
+                          out.append("| " + " | ".join("" if v is None else str(v) for v in r) + " |")
+                      out.append("")
+                  except Exception:
+                      out += ["```", traceback.format_exc().strip()[-1500:], "```", ""]
+          body = "\n".join(out)
+          Path('/tmp/report.md').write_text(body)
+          print(body[:4000])
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as fh:
+              fh.write(body)
+          PY
 
-          run "assignments, with the /me/projects predicate evaluated per row" "
-            SELECT ba.security_actor_id, p.project_name, ba.business_role_code AS role,
-                   ba.assignment_status AS status, ba.effective_from, ba.effective_to,
-                   (ba.assignment_status='ACTIVE') AS ok_status,
-                   (ba.effective_from <= now()) AS ok_started,
-                   (ba.effective_to IS NULL OR ba.effective_to >= now()) AS ok_not_ended,
-                   ba.dealer_id IS NOT NULL AS has_dealer, ba.outlet_id IS NOT NULL AS has_outlet
-            FROM auditcore.business_assignments ba
-            JOIN auditcore.projects p ON p.tenant_id = ba.tenant_id
-            WHERE p.project_name ILIKE :'nm'
-            ORDER BY ba.security_actor_id, p.project_name, ba.business_role_code;"
-
-          run "role codes per actor per project (2+ raises the 500 at uc03_project_context.py:196)" "
-            SELECT ba.security_actor_id, p.project_name,
-                   count(DISTINCT ba.business_role_code) AS role_codes,
-                   string_agg(DISTINCT ba.business_role_code, ',') AS codes
-            FROM auditcore.business_assignments ba
-            JOIN auditcore.projects p ON p.tenant_id = ba.tenant_id
-            WHERE p.project_name ILIKE :'nm'
-              AND ba.assignment_status='ACTIVE'
-              AND ba.effective_from <= now()
-              AND (ba.effective_to IS NULL OR ba.effective_to >= now())
-            GROUP BY 1,2 ORDER BY 3 DESC;"
-
-          run "dealers and outlets (an inactive one drops the outlet from the payload)" "
-            SELECT p.project_name, d.dealer_name, d.status AS dealer_status,
-                   o.outlet_name, o.outlet_classification, o.status AS outlet_status
-            FROM auditcore.projects p
-            JOIN auditcore.dealers d ON d.tenant_id = p.tenant_id
-            LEFT JOIN auditcore.dealer_outlets o ON o.tenant_id = d.tenant_id AND o.dealer_id = d.dealer_id
-            WHERE p.project_name ILIKE :'nm'
-            ORDER BY p.project_name, d.dealer_name, o.outlet_name;"
+      - name: Publish report
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -f /tmp/report.md || echo 'The query step produced no report.' > /tmp/report.md
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "UC03 project-context diagnose (run $GITHUB_RUN_ID)" \
+            --body-file /tmp/report.md
