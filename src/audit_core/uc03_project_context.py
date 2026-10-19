@@ -5,6 +5,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends
 from pydantic import BaseModel
 from sqlalchemy import Connection, text
 
+from audit_core.db import set_security_actor_context
 from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
@@ -76,12 +77,26 @@ def list_my_projects(
 ) -> MyProjectsResponse:
     """Return active operational Projects and the actor's concrete working scope.
 
-    Actor RLS context, Project, role and PC Outlet scope are deliberately resolved in
-    one PostgreSQL statement. The MATERIALIZED runtime_context CTE is a dependency of
-    every protected read, so the validated Security actor is established before RLS
-    evaluates Projects, assignments, Dealers or Outlets. No cross-Tenant write access
-    or broad Dealer/Outlet visibility is introduced.
+    Project, role and PC Outlet scope are resolved in one PostgreSQL statement, but the
+    validated Security actor is set for RLS in its OWN statement first. It used to be
+    set only by the runtime_context CTE inside the query, on the assumption that a
+    MATERIALIZED CTE joined into every read would always run before RLS evaluated
+    Projects, assignments, Dealers or Outlets. PostgreSQL does not promise that order:
+    it depends on the plan, and the plan changes with table statistics. On 2026-10-19
+    the live DEV database returned no rows for a person whose assignment was active
+    and visible to that same actor (verified in Neon: the statement as written
+    returned nothing; the same read with the actor set beforehand returned the
+    Project), after a bulk assign-and-remove of 22 outlets changed the statistics.
+    Every sign-in then read an empty list and the person was told they had no
+    assignment. The set_config in the CTE is kept; it now repeats the same value and
+    cannot disagree. No cross-Tenant write access or broad Dealer/Outlet visibility
+    is introduced.
     """
+
+    # Transaction-local (set_config ..., true), on the connection get_connection
+    # already opened a transaction on, so it applies to the statement below and to
+    # nothing after the request.
+    set_security_actor_context(connection, human_principal.subject)
 
     rows = list(
         connection.execute(
