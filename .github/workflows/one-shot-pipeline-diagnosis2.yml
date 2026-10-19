@@ -1,10 +1,10 @@
-name: One-shot upload-to-extraction pipeline diagnosis (read-only)
+name: One-shot pipeline diagnosis 2 (read-only)
 
 # Runs when this branch is pushed. READ-ONLY: SELECT queries on a read-only DB session, and Railway log reads.
 # Posts a redacted report as an issue.
 on:
   push:
-    branches: [claude/pipeline-diagnosis]
+    branches: [claude/pipeline-diagnosis2]
 
 permissions:
   contents: read
@@ -71,11 +71,11 @@ jobs:
             railway logs --service "$n" --lines 3000 >"/tmp/logs/$n.log" 2>>/tmp/logs.err || true
           done < /tmp/service-names.txt
           railway logs --service "$AUDIT_SERVICE" --http --since 6h --lines 4000 --json >/tmp/audit-http.json 2>>/tmp/logs.err || true
-      - run: python .github/one-shot/pipeline_diagnosis.py
+      - run: python .github/one-shot/pipeline_diagnosis2.py
       - name: Post report
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           test -f /tmp/report.md || echo 'No report produced.' > /tmp/report.md
-          gh issue create --repo "$GITHUB_REPOSITORY" --title "Pipeline diagnosis (run $GITHUB_RUN_ID)" --body-file /tmp/report.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "Pipeline diagnosis 2 (run $GITHUB_RUN_ID)" --body-file /tmp/report.md
