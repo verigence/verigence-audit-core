@@ -272,3 +272,16 @@ def test_sku_resolution_backfill_lists_a_failing_journey_and_carries_on(seeded_t
     assert result["journeysConsidered"] == 1
     assert result["journeysProcessed"] == 0
     assert result["journeysFailed"] == [str(journey_id)]
+
+
+def test_sku_resolution_backfill_pages_through_journeys(seeded_tenant) -> None:
+    engine, tenant_id = seeded_tenant["engine"], seeded_tenant["tenant_id"]
+
+    only = backfill.backfill_sku_resolution_for_tenant(engine, tenant_id=tenant_id, offset=0, limit=1)
+    assert only["journeysTotal"] == 1
+    assert only["journeysConsidered"] == 1
+    assert only["nextOffset"] is None
+
+    past_end = backfill.backfill_sku_resolution_for_tenant(engine, tenant_id=tenant_id, offset=1, limit=1)
+    assert past_end["journeysConsidered"] == 0
+    assert past_end["nextOffset"] is None
