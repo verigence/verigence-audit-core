@@ -1965,3 +1965,58 @@ def test_integration_an_open_finding_follows_the_latest_run(mahindra_journey) ->
     third = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     assert third.get("resolved") is True and _pinned(c) == lx_17l
     assert _open_model_flags(c) == 0
+
+
+# ---------------------------------------------------------------- without a journey
+# The same ladder, reached by a service that holds the booking itself (VINeeti,
+# a dealership application) and only wants to know which SKU the Booking Form's
+# text names. Nothing is pinned and no finding is raised -- there is no journey
+# for either to hang on -- but the matching must be the matching, not a second
+# implementation that drifts from the one the Booking flow runs.
+
+def test_resolve_model_text_finds_one_sku_without_any_journey(journey) -> None:
+    from datetime import date
+
+    c = journey
+    _seed_price_list(
+        c,
+        [
+            {"model": "SCORPIO N", "variant": "Z8L", "components": {"EX_SHOWROOM": "1800000"}},
+            {"model": "THAR ROXX", "variant": "AX7L", "components": {"EX_SHOWROOM": "1600000"}},
+        ],
+    )
+    result = mr.resolve_model_text(
+        c, tenant_id=c.tenant_id, effective_on=date.today(), model_name="SCORPIO N", variant_name="Z8L"
+    )
+    assert result.get("skipped") is None
+    assert len(result["matched"]) == 1
+    assert result["matched"][0]["model_name"] == "SCORPIO N"
+
+
+def test_resolve_model_text_reports_every_candidate_when_the_text_does_not_say_which(journey) -> None:
+    from datetime import date
+
+    c = journey
+    # Two colours of the same variant: the model and variant alone cannot choose.
+    _seed_price_list(
+        c,
+        [
+            {"model": "SCORPIO N", "variant": "Z8L", "colour": "EVEREST WHITE", "components": {"EX_SHOWROOM": "1800000"}},
+            {"model": "SCORPIO N", "variant": "Z8L", "colour": "STEALTH BLACK", "components": {"EX_SHOWROOM": "1800000"}},
+        ],
+    )
+    result = mr.resolve_model_text(
+        c, tenant_id=c.tenant_id, effective_on=date.today(), model_name="SCORPIO N", variant_name="Z8L"
+    )
+    # Reported, not guessed between.
+    assert len(result["matched"]) > 1
+
+
+def test_resolve_model_text_says_so_when_the_tenant_has_no_price_list(journey) -> None:
+    from datetime import date
+
+    c = journey
+    result = mr.resolve_model_text(
+        c, tenant_id=c.tenant_id, effective_on=date.today(), model_name="SCORPIO N"
+    )
+    assert result == {"skipped": True, "reason": "no_effective_price_list"}

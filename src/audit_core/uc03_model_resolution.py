@@ -55,6 +55,7 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.price_lists import find_effective_price_plan
 from audit_core.uc03_booking_capture import _scope
 from audit_core.uc03_delivery_commands import _machine_flag
 from audit_core.uc03_manual_verification import _resolve_finding
@@ -1417,6 +1418,22 @@ def _current_match(
     if not rows:
         return {"skipped": True, "reason": "empty_price_list"}
 
+    return _resolve_against_rows(connection, tenant_id=tenant_id, rows=rows, inputs=inputs)
+
+
+def _resolve_against_rows(
+    connection: Connection, *, tenant_id: str, rows: list[dict[str, Any]], inputs: dict[str, Any]
+) -> dict[str, Any]:
+    """The ladder itself, over price-list rows that are already in hand.
+
+    Split out of ``_current_match`` so a caller that has no journey -- the
+    machine-facing resolve endpoint in ``uc03_sku_resolution_api.py``, which
+    is handed the model text directly -- runs this exact sequence rather than
+    a second implementation of it. ``_current_match`` keeps the part that is
+    genuinely about a journey (which business date applies, and which price
+    list that journey selected); everything from here down only ever looked
+    at ``rows`` and ``inputs``.
+    """
     # Attribute decomposition first, always attempted -- not only once a
     # price-based match has already failed. A fuel/transmission/drive/
     # seater token the Booking Form actually states is a literal fact
@@ -1533,6 +1550,57 @@ def _price_pick(rows: list[dict[str, Any]], inputs: dict[str, Any]) -> tuple[lis
     if by_ex and by_total and by_ex[0][0]["product_sku_id"] != by_total[0][0]["product_sku_id"]:
         return None
     return by_ex or by_total
+
+
+def resolve_model_text(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    effective_on: date,
+    model_name: str,
+    variant_name: str | None = None,
+    colour_name: str | None = None,
+    offered_total: Decimal | None = None,
+    offered_ex_showroom: Decimal | None = None,
+    registration_basis_code: str = "INDIVIDUAL",
+) -> dict[str, Any]:
+    """Resolve model / variant / colour text to a SKU without a journey.
+
+    The same ladder the Booking flow runs -- alias-mapped nameplate, attribute
+    decomposition, price arbitration, a controlled fuzzy trim pass, catalogue
+    search -- against whichever price list stands for this tenant on
+    ``effective_on``. Read-only: nothing is pinned, no finding is raised and no
+    Task is spawned, because the caller has no journey for any of that to hang
+    on.
+
+    Returns ``{"skipped": True, "reason": ...}`` when the tenant has no price
+    list to resolve against, else ``{"matched": [...], "matchStage": ...}``.
+    An empty ``matched`` means the masters do not hold this vehicle; more than
+    one means the text does not say which of them it is. Neither is an error,
+    and neither is guessed past -- the caller decides what to do about it.
+    """
+    plan = find_effective_price_plan(connection, tenant_id=tenant_id, effective_on=effective_on)
+    if plan is None:
+        return {"skipped": True, "reason": "no_effective_price_list"}
+    rows = _sku_rows_for_version(
+        connection, tenant_id=tenant_id, price_list_version_id=plan["price_list_version_id"]
+    )
+    if not rows:
+        return {"skipped": True, "reason": "empty_price_list"}
+    inputs = {
+        # Not a journey's selection, so there is nothing already pinned and no
+        # selection state; the ladder reads neither, and saying so here keeps a
+        # later reader from hunting for where they were meant to come from.
+        "product_sku_id": None,
+        "selection_status": None,
+        "model_name": model_name,
+        "variant_name": variant_name,
+        "colour_name": colour_name,
+        "offered_total": offered_total,
+        "offered_ex_showroom": offered_ex_showroom,
+        "registration_basis": registration_basis_code,
+    }
+    return _resolve_against_rows(connection, tenant_id=tenant_id, rows=rows, inputs=inputs)
 
 
 def _settle(
