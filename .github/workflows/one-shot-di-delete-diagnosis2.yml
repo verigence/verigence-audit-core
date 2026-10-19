@@ -1,9 +1,9 @@
-name: One-shot DI delete 500 diagnosis (read-only)
+name: One-shot DI deploy and Postgres history (read-only)
 
 # READ-ONLY: Railway variable/log reads and SELECTs on a read-only session. Posts a redacted report as an issue.
 on:
   push:
-    branches: [claude/di-delete-diagnosis]
+    branches: [claude/di-delete-diagnosis2]
 
 permissions:
   contents: read
@@ -22,6 +22,17 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -q "psycopg[binary]" && npm install --global @railway/cli
+      - name: Collect deployments and logs
+        shell: bash
+        run: |
+          set -uo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service di-api --json >/tmp/link.json
+          for s in di-api di-worker di-worker-v2 Postgres; do
+            railway deployment list --service "$s" --limit 8 --json >"/tmp/dep-$s.json" 2>/tmp/dep-$s.err || echo '[]' >"/tmp/dep-$s.json"
+          done
+          railway logs --service Postgres --since 24h --lines 30000 >/tmp/pg.log 2>/tmp/pg.err || railway logs --service Postgres --lines 8000 >/tmp/pg.log 2>>/tmp/pg.err || true
+          railway logs --service di-api --since 24h --lines 15000 >/tmp/di-api.log 2>/tmp/di.err || railway logs --service di-api --lines 6000 >/tmp/di-api.log 2>>/tmp/di.err || true
+      - run: python -m pip install -q "psycopg[binary]" && npm install --global @railway/cli
       - name: Collect DI settings and logs
         shell: bash
         run: |
@@ -32,11 +43,11 @@ jobs:
           done
           railway logs --service di-api --lines 4000 >/tmp/di-api.log 2>/dev/null || true
           railway logs --service Postgres --lines 4000 >/tmp/pg.log 2>/dev/null || true
-      - run: python .github/one-shot/di_delete_diagnosis.py
+      - run: python .github/one-shot/di_deploy_history.py
       - name: Post report
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           test -f /tmp/report.md || echo 'No report produced.' > /tmp/report.md
-          gh issue create --repo "$GITHUB_REPOSITORY" --title "DI delete 500 diagnosis (run $GITHUB_RUN_ID)" --body-file /tmp/report.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "DI deploy and Postgres history (run $GITHUB_RUN_ID)" --body-file /tmp/report.md
