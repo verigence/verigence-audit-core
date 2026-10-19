@@ -1,0 +1,81 @@
+name: One-shot upload-to-extraction pipeline diagnosis (read-only)
+
+# Runs when this branch is pushed. READ-ONLY: SELECT queries on a read-only DB session, and Railway log reads.
+# Posts a redacted report as an issue.
+on:
+  push:
+    branches: [claude/pipeline-diagnosis]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -q "psycopg[binary]" && npm install --global @railway/cli
+      - name: Resolve the DEV database and read service logs
+        shell: bash
+        run: |
+          set -uo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway status --json >/tmp/status.json 2>/tmp/status.err || true
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          raw="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          v = json.loads(Path('/tmp/audit-vars.json').read_text())
+          print(v.get('DATABASE_PUBLIC_URL') or v.get('DATABASE_URL') or '')
+          PY
+          )"
+          [[ -n "$raw" ]] || { echo '::error::no DATABASE_URL on the DEV service.'; exit 1; }
+          echo "::add-mask::$raw"
+          echo "DATABASE_URL=$raw" >> "$GITHUB_ENV"
+          mkdir -p /tmp/logs
+          names="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          try:
+              d = json.loads(Path('/tmp/status.json').read_text())
+          except Exception:
+              d = {}
+          found = set()
+          def walk(x):
+              if isinstance(x, dict):
+                  n = x.get('serviceName') or x.get('name')
+                  if isinstance(n, str) and x.get('id') and ('service' in str(x.get('__typename', 'service')).lower() or 'serviceName' in x):
+                      found.add(n)
+                  for v in x.values():
+                      walk(v)
+              elif isinstance(x, list):
+                  for v in x:
+                      walk(v)
+          walk(d)
+          print('\n'.join(sorted(found)))
+          PY
+          )"
+          echo "$names" > /tmp/service-names.txt
+          while IFS= read -r n; do
+            [ -n "$n" ] || continue
+            case "$n" in *ostgres*|*edis*) continue;; esac
+            railway logs --service "$n" --lines 3000 >"/tmp/logs/$n.log" 2>>/tmp/logs.err || true
+          done < /tmp/service-names.txt
+          railway logs --service "$AUDIT_SERVICE" --http --since 6h --lines 4000 --json >/tmp/audit-http.json 2>>/tmp/logs.err || true
+      - run: python .github/one-shot/pipeline_diagnosis.py
+      - name: Post report
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          test -f /tmp/report.md || echo 'No report produced.' > /tmp/report.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "Pipeline diagnosis (run $GITHUB_RUN_ID)" --body-file /tmp/report.md
