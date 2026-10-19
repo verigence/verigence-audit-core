@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from sqlalchemy import text
+from test_uc03_backfill_document_sync_producers import (
+    seeded_tenant,  # noqa: F401  (fixture)
+)
 
 from audit_core import uc03_tl_supervisory as tl
 from audit_core.db import set_tenant_context
 from audit_core.security import HumanPrincipal
-from tests.test_uc03_backfill_document_sync_producers import (
-    seeded_tenant,  # noqa: F401  (fixture)
-)
 
 
 def test_new_style_booking_shows_its_pc_on_the_tl_list(seeded_tenant, monkeypatch) -> None:  # noqa: F811
