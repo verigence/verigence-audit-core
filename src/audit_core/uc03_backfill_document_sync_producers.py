@@ -34,7 +34,7 @@ import logging
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import Engine, text
 
@@ -194,15 +194,67 @@ def _sku_counts(engine: Engine, *, tenant_id: str) -> tuple[int, int]:
     return int(row[0] or 0), int(row[1] or 0)
 
 
+def _journey_sku_state(connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    row = connection.execute(
+        text(
+            """
+            SELECT jp.product_sku_id IS NOT NULL AS has_sku,
+                   sku.sku_code,
+                   NULLIF(concat_ws(' · ', NULLIF(jp.model_name_snapshot, ''),
+                                    NULLIF(jp.variant_name_snapshot, ''),
+                                    NULLIF(jp.colour_name_snapshot, '')), '') AS model_label,
+                   COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS journey_label,
+                   (SELECT f.title FROM auditcore.audit_findings f
+                     WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
+                       AND f.finding_type_code = 'MODEL_NOT_IDENTIFIED'
+                       AND f.finding_status IN ('OPEN', 'ACKNOWLEDGED')
+                     ORDER BY f.created_at_utc DESC LIMIT 1) AS open_finding
+            FROM auditcore.journeys j
+            LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+            LEFT JOIN auditcore.journey_products jp ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
+            LEFT JOIN auditcore.product_skus sku ON sku.product_sku_id = jp.product_sku_id
+            WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
+            ORDER BY jp.created_at_utc NULLS LAST
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
+    return dict(row) if row else {}
+
+
+def _record_item(
+    connection, *, tenant_id: str, run_id: UUID, journey_id: UUID, label: str | None,
+    model_label: str | None, outcome: str, sku_code: str | None, detail: str | None,
+) -> None:
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.sku_resolution_run_items
+              (tenant_id, run_id, journey_id, journey_label, model_label, outcome, sku_code, detail)
+            VALUES (:t, :r, :j, :label, :model, :outcome, :sku, :detail)
+            ON CONFLICT (tenant_id, run_id, journey_id) DO UPDATE
+              SET journey_label = EXCLUDED.journey_label, model_label = EXCLUDED.model_label,
+                  outcome = EXCLUDED.outcome, sku_code = EXCLUDED.sku_code, detail = EXCLUDED.detail,
+                  recorded_at_utc = now()
+            """
+        ),
+        {"t": tenant_id, "r": run_id, "j": journey_id, "label": label, "model": model_label,
+         "outcome": outcome, "sku": sku_code, "detail": (detail or None) and detail[:500]},
+    )
+
+
 def backfill_sku_resolution_for_tenant(
-    engine: Engine, *, tenant_id: str, offset: int = 0, limit: int | None = None
+    engine: Engine, *, tenant_id: str, offset: int = 0, limit: int | None = None,
+    run_id: UUID | None = None, actor_id: str | None = None,
 ) -> dict[str, Any]:
     """Run SKU resolution (booking model/price match, then the Delivery-invoice fallback) for
     the Project's Journeys, in a stable order, ``limit`` at a time starting at ``offset`` (all of
     them when ``limit`` is None). These are the same idempotent producers the app runs when a
     document is confirmed or "Run All Rules" is pressed; each Journey is its own transaction and
-    a failure is listed, never fatal to the rest. Callers loop on ``nextOffset`` so no single
-    request runs long enough for the edge proxy to time out."""
+    a failure is recorded, never fatal to the rest. Callers loop on ``nextOffset`` so no single
+    request runs long enough for the edge proxy to time out. Every Journey's outcome is kept
+    against a run (``runId``) so the summary can be read afterwards."""
     from audit_core.uc03_async_sync_tasks import (
         sync_model_resolution_from_invoice_with_escalation,
         sync_model_resolution_with_escalation,
@@ -228,16 +280,37 @@ def backfill_sku_resolution_for_tenant(
                 {"tenant_id": tenant_id, "offset": offset, "limit": limit},
             ).scalars().all()
         )
+        if run_id is None:
+            run_id = connection.execute(
+                text(
+                    """
+                    INSERT INTO auditcore.sku_resolution_runs
+                      (tenant_id, started_by_actor_id, journeys_total)
+                    VALUES (:t, :actor, :total) RETURNING run_id
+                    """
+                ),
+                {"t": tenant_id, "actor": actor_id, "total": journeys_total},
+            ).scalar_one()
+            first_batch = True
+        else:
+            first_batch = False
+    if first_batch:
+        with_before, _ = _sku_counts(engine, tenant_id=tenant_id)
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            connection.execute(
+                text("UPDATE auditcore.sku_resolution_runs SET with_sku_before=:n WHERE tenant_id=:t AND run_id=:r"),
+                {"n": with_before, "t": tenant_id, "r": run_id},
+            )
     next_offset = offset + len(journey_ids)
-    with_sku_before, without_sku_before = _sku_counts(engine, tenant_id=tenant_id)
 
-    processed = 0
     failed: list[str] = []
-    errors = 0
     for journey_id in journey_ids:
         try:
             with engine.begin() as connection:
                 set_tenant_context(connection, tenant_id)
+                before = _journey_sku_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+                step_error = None
                 for resolve in (
                     sync_model_resolution_with_escalation,
                     sync_model_resolution_from_invoice_with_escalation,
@@ -247,34 +320,82 @@ def backfill_sku_resolution_for_tenant(
                         correlation_id=_SKU_CORRELATION_ID,
                     )
                     if result.get("error"):
-                        errors += 1
-            processed += 1
-        except Exception:
+                        step_error = "An internal step reported an error."
+                after = _journey_sku_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+                had, has = bool(before.get("has_sku")), bool(after.get("has_sku"))
+                outcome = (
+                    "ALREADY_HAD_SKU" if had else "NEWLY_MATCHED" if has else "STILL_UNMATCHED"
+                )
+                detail = (
+                    step_error
+                    or (None if has else after.get("open_finding") or "No matching SKU was found in the price masters.")
+                )
+                _record_item(
+                    connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id,
+                    label=after.get("journey_label"), model_label=after.get("model_label"),
+                    outcome=outcome, sku_code=after.get("sku_code"), detail=detail,
+                )
+        except Exception as exc:
             logger.warning(
                 "uc03_sku_backfill_journey_failed",
                 extra={"tenant_id": tenant_id, "journey_id": str(journey_id)},
                 exc_info=True,
             )
             failed.append(str(journey_id))
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                _record_item(
+                    connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id,
+                    label=None, model_label=None, outcome="FAILED", sku_code=None,
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
 
-    with_sku_after, without_sku_after = _sku_counts(engine, tenant_id=tenant_id)
+    finished = next_offset >= journeys_total or not journey_ids
+    with_after, without_after = _sku_counts(engine, tenant_id=tenant_id)
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.sku_resolution_runs r SET
+                  journeys_processed = c.processed, newly_matched = c.newly, already_had_sku = c.already,
+                  still_unmatched = c.unmatched, failed = c.failed, with_sku_after = :after,
+                  status = CASE WHEN :finished THEN 'COMPLETE' ELSE r.status END,
+                  finished_at_utc = CASE WHEN :finished THEN now() ELSE r.finished_at_utc END
+                FROM (
+                  SELECT count(*) FILTER (WHERE outcome <> 'FAILED') AS processed,
+                         count(*) FILTER (WHERE outcome = 'NEWLY_MATCHED') AS newly,
+                         count(*) FILTER (WHERE outcome = 'ALREADY_HAD_SKU') AS already,
+                         count(*) FILTER (WHERE outcome = 'STILL_UNMATCHED') AS unmatched,
+                         count(*) FILTER (WHERE outcome = 'FAILED') AS failed
+                  FROM auditcore.sku_resolution_run_items WHERE tenant_id = :t AND run_id = :r
+                ) c
+                WHERE r.tenant_id = :t AND r.run_id = :r
+                """
+            ),
+            {"t": tenant_id, "r": run_id, "after": with_after, "finished": finished},
+        )
+        run = connection.execute(
+            text("SELECT * FROM auditcore.sku_resolution_runs WHERE tenant_id=:t AND run_id=:r"),
+            {"t": tenant_id, "r": run_id},
+        ).mappings().one()
     return {
         "tenantId": tenant_id,
+        "runId": run_id,
         "journeysTotal": journeys_total,
         "journeysConsidered": len(journey_ids),
-        "journeysProcessed": processed,
+        "journeysProcessed": len(journey_ids) - len(failed),
         "journeysFailed": failed,
-        "nextOffset": next_offset if next_offset < journeys_total else None,
-        "withSkuBefore": with_sku_before,
-        "withSkuAfter": with_sku_after,
-        "withoutSkuBefore": without_sku_before,
-        "withoutSkuAfter": without_sku_after,
-        "stepErrors": errors,
+        "nextOffset": None if finished else next_offset,
+        "withSkuBefore": int(run["with_sku_before"]),
+        "withSkuAfter": with_after,
+        "withoutSkuAfter": without_after,
     }
 
 
 class SkuResolutionBackfillResult(BaseModel):
     tenantId: str
+    runId: UUID
     journeysTotal: int
     nextOffset: int | None
     journeysConsidered: int
@@ -282,9 +403,47 @@ class SkuResolutionBackfillResult(BaseModel):
     journeysFailed: list[str]
     withSkuBefore: int
     withSkuAfter: int
-    withoutSkuBefore: int
     withoutSkuAfter: int
-    stepErrors: int
+
+
+class SkuResolutionRunSummary(BaseModel):
+    runId: UUID
+    status: str
+    startedAtUtc: str
+    finishedAtUtc: str | None
+    journeysTotal: int
+    journeysProcessed: int
+    newlyMatched: int
+    alreadyHadSku: int
+    stillUnmatched: int
+    failed: int
+    withSkuBefore: int
+    withSkuAfter: int
+
+
+class SkuResolutionRunItem(BaseModel):
+    journeyId: UUID
+    journeyLabel: str | None
+    modelLabel: str | None
+    outcome: str
+    skuCode: str | None
+    detail: str | None
+
+
+class SkuResolutionRunDetail(SkuResolutionRunSummary):
+    items: list[SkuResolutionRunItem]
+
+
+def _run_summary(row) -> dict[str, Any]:
+    return {
+        "runId": row["run_id"], "status": row["status"],
+        "startedAtUtc": row["started_at_utc"].isoformat(),
+        "finishedAtUtc": row["finished_at_utc"].isoformat() if row["finished_at_utc"] else None,
+        "journeysTotal": row["journeys_total"], "journeysProcessed": row["journeys_processed"],
+        "newlyMatched": row["newly_matched"], "alreadyHadSku": row["already_had_sku"],
+        "stillUnmatched": row["still_unmatched"], "failed": row["failed"],
+        "withSkuBefore": row["with_sku_before"], "withSkuAfter": row["with_sku_after"],
+    }
 
 
 @router.post("/sku-resolution", response_model=SkuResolutionBackfillResult)
@@ -294,12 +453,73 @@ def backfill_sku_resolution(
     engine: Annotated[Engine, Depends(get_engine)],
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=25)] = 3,
+    runId: UUID | None = None,
 ) -> SkuResolutionBackfillResult:
-    """One batch of Journeys; repeat with ``nextOffset`` until it is null."""
-    del admin_request
+    """One batch of Journeys; repeat with ``nextOffset`` (and the returned ``runId``) until it is null."""
     return SkuResolutionBackfillResult.model_validate(
-        backfill_sku_resolution_for_tenant(engine, tenant_id=tenant_id, offset=offset, limit=limit)
+        backfill_sku_resolution_for_tenant(
+            engine, tenant_id=tenant_id, offset=offset, limit=limit, run_id=runId,
+            actor_id=admin_request.user_id,
+        )
     )
+
+
+@router.get("/sku-resolution/runs", response_model=list[SkuResolutionRunSummary])
+def list_sku_resolution_runs(
+    tenant_id: str,
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    engine: Annotated[Engine, Depends(get_engine)],
+) -> list[dict[str, Any]]:
+    """The most recent runs for the Project, newest first."""
+    del admin_request
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        rows = connection.execute(
+            text(
+                "SELECT * FROM auditcore.sku_resolution_runs WHERE tenant_id=:t "
+                "ORDER BY started_at_utc DESC LIMIT 20"
+            ),
+            {"t": tenant_id},
+        ).mappings().all()
+    return [_run_summary(r) for r in rows]
+
+
+@router.get("/sku-resolution/runs/{run_id}", response_model=SkuResolutionRunDetail)
+def get_sku_resolution_run(
+    tenant_id: str,
+    run_id: UUID,
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    engine: Annotated[Engine, Depends(get_engine)],
+) -> dict[str, Any]:
+    """One run with what happened to each Journey (problems first)."""
+    del admin_request
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        run = connection.execute(
+            text("SELECT * FROM auditcore.sku_resolution_runs WHERE tenant_id=:t AND run_id=:r"),
+            {"t": tenant_id, "r": run_id},
+        ).mappings().one_or_none()
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        items = connection.execute(
+            text(
+                """
+                SELECT journey_id, journey_label, model_label, outcome, sku_code, detail
+                FROM auditcore.sku_resolution_run_items WHERE tenant_id=:t AND run_id=:r
+                ORDER BY CASE outcome WHEN 'FAILED' THEN 0 WHEN 'STILL_UNMATCHED' THEN 1
+                                      WHEN 'NEWLY_MATCHED' THEN 2 ELSE 3 END, journey_label
+                """
+            ),
+            {"t": tenant_id, "r": run_id},
+        ).mappings().all()
+    return {
+        **_run_summary(run),
+        "items": [
+            {"journeyId": i["journey_id"], "journeyLabel": i["journey_label"], "modelLabel": i["model_label"],
+             "outcome": i["outcome"], "skuCode": i["sku_code"], "detail": i["detail"]}
+            for i in items
+        ],
+    }
 
 
 __all__ = ["backfill_document_sync_producers_for_tenant", "backfill_sku_resolution_for_tenant", "router"]

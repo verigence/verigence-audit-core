@@ -243,22 +243,35 @@ def test_one_journeys_failure_does_not_block_the_rest(seeded_tenant, monkeypatch
     assert result["journeysFailed"] == [str(journey_id)]
 
 
-def test_sku_resolution_backfill_runs_every_journey_and_is_repeatable(seeded_tenant) -> None:
-    engine, tenant_id = seeded_tenant["engine"], seeded_tenant["tenant_id"]
+def _run_detail(engine, tenant_id, run_id):
+    return backfill.get_sku_resolution_run(tenant_id, run_id, None, engine)
 
-    first = backfill.backfill_sku_resolution_for_tenant(engine, tenant_id=tenant_id)
-    assert first["journeysConsidered"] == 1
+
+def test_sku_resolution_backfill_keeps_a_summary_of_the_run(seeded_tenant) -> None:
+    engine, tenant_id, journey_id = (
+        seeded_tenant["engine"], seeded_tenant["tenant_id"], seeded_tenant["journey_id"],
+    )
+
+    first = backfill.backfill_sku_resolution_for_tenant(engine, tenant_id=tenant_id, actor_id="admin-1")
+    assert first["journeysTotal"] == 1
     assert first["journeysProcessed"] == 1
     assert first["journeysFailed"] == []
-    assert first["stepErrors"] == 0
-    assert first["withSkuAfter"] >= first["withSkuBefore"]
+    assert first["nextOffset"] is None
 
+    detail = _run_detail(engine, tenant_id, first["runId"])
+    assert detail["status"] == "COMPLETE"
+    assert detail["journeysTotal"] == 1 and detail["journeysProcessed"] == 1 and detail["failed"] == 0
+    assert detail["newlyMatched"] + detail["alreadyHadSku"] + detail["stillUnmatched"] == 1
+    assert [i["journeyId"] for i in detail["items"]] == [journey_id]
+
+    # A second run is a new, separate record; the first one is still there.
     second = backfill.backfill_sku_resolution_for_tenant(engine, tenant_id=tenant_id)
-    assert second["journeysProcessed"] == 1
-    assert (second["withSkuBefore"], second["withoutSkuBefore"]) == (first["withSkuAfter"], first["withoutSkuAfter"])
+    assert second["runId"] != first["runId"]
+    listed = backfill.list_sku_resolution_runs(tenant_id, None, engine)
+    assert {r["runId"] for r in listed} == {first["runId"], second["runId"]}
 
 
-def test_sku_resolution_backfill_lists_a_failing_journey_and_carries_on(seeded_tenant, monkeypatch) -> None:
+def test_sku_resolution_backfill_records_a_failing_journey_and_carries_on(seeded_tenant, monkeypatch) -> None:
     engine, tenant_id, journey_id = (
         seeded_tenant["engine"], seeded_tenant["tenant_id"], seeded_tenant["journey_id"],
     )
@@ -269,19 +282,23 @@ def test_sku_resolution_backfill_lists_a_failing_journey_and_carries_on(seeded_t
     monkeypatch.setattr("audit_core.uc03_async_sync_tasks.sync_model_resolution_with_escalation", _boom)
 
     result = backfill.backfill_sku_resolution_for_tenant(engine, tenant_id=tenant_id)
-    assert result["journeysConsidered"] == 1
     assert result["journeysProcessed"] == 0
     assert result["journeysFailed"] == [str(journey_id)]
+    detail = _run_detail(engine, tenant_id, result["runId"])
+    assert detail["failed"] == 1
+    assert detail["items"][0]["outcome"] == "FAILED"
+    assert "simulated failure" in detail["items"][0]["detail"]
 
 
-def test_sku_resolution_backfill_pages_through_journeys(seeded_tenant) -> None:
+def test_sku_resolution_backfill_pages_through_journeys_into_one_run(seeded_tenant) -> None:
     engine, tenant_id = seeded_tenant["engine"], seeded_tenant["tenant_id"]
 
     only = backfill.backfill_sku_resolution_for_tenant(engine, tenant_id=tenant_id, offset=0, limit=1)
-    assert only["journeysTotal"] == 1
-    assert only["journeysConsidered"] == 1
-    assert only["nextOffset"] is None
+    assert only["journeysTotal"] == 1 and only["journeysConsidered"] == 1 and only["nextOffset"] is None
 
-    past_end = backfill.backfill_sku_resolution_for_tenant(engine, tenant_id=tenant_id, offset=1, limit=1)
-    assert past_end["journeysConsidered"] == 0
-    assert past_end["nextOffset"] is None
+    past_end = backfill.backfill_sku_resolution_for_tenant(
+        engine, tenant_id=tenant_id, offset=1, limit=1, run_id=only["runId"]
+    )
+    assert past_end["runId"] == only["runId"]
+    assert past_end["journeysConsidered"] == 0 and past_end["nextOffset"] is None
+    assert _run_detail(engine, tenant_id, only["runId"])["journeysProcessed"] == 1
