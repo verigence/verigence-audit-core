@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from uuid import UUID
 
+from sqlalchemy import Connection
+
+from audit_core import uc03_booking_capture as booking_capture
 from audit_core import uc03_document_review_v2 as review_v2
+from audit_core.db import set_security_actor_context
 from audit_core.uc03_document_registry import is_receipt_document_type
 from audit_core.uc03_review_confidence import requires_pc_review
 from audit_core.uc03_v2_review_materialization import (
@@ -14,6 +18,27 @@ from audit_core.uc03_v2_review_materialization import (
 )
 
 ReviewKind = Literal["ATTRIBUTE", "RAW_FIELD"]
+
+
+def _scope(connection: Connection, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    """uc03_booking_capture._scope, plus the authenticated Review actor in the
+    transaction-local DB context.
+
+    The unified document review and the delivery review confirm both call
+    ``booking_review._scope``. It used to be uc03_di_core_persistence.
+    scope_with_actor_context imported under this name. The 2026-10-07 Booking
+    route cleanup deleted that helper as unused -- it was not: those two routes
+    still called it -- and from then on both answered 500 (AttributeError: module
+    has no attribute '_scope'), which blocked document review after an upload.
+    Restored with the same behaviour.
+    """
+
+    context = booking_capture._scope(connection, *args, **kwargs)
+    human_principal = kwargs.get("human_principal")
+    if human_principal is None:
+        raise RuntimeError("UC03 Review scope requires an authenticated human principal")
+    set_security_actor_context(connection, human_principal.subject)
+    return context
 
 
 @dataclass(frozen=True)
