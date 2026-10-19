@@ -241,3 +241,34 @@ def test_one_journeys_failure_does_not_block_the_rest(seeded_tenant, monkeypatch
     assert result["journeysConsidered"] == 1
     assert result["journeysProcessed"] == 0
     assert result["journeysFailed"] == [str(journey_id)]
+
+
+def test_sku_resolution_backfill_runs_every_journey_and_is_repeatable(seeded_tenant) -> None:
+    engine, tenant_id = seeded_tenant["engine"], seeded_tenant["tenant_id"]
+
+    first = backfill.backfill_sku_resolution_for_tenant(engine, tenant_id=tenant_id)
+    assert first["journeysConsidered"] == 1
+    assert first["journeysProcessed"] == 1
+    assert first["journeysFailed"] == []
+    assert first["stepErrors"] == 0
+    assert first["withSkuAfter"] >= first["withSkuBefore"]
+
+    second = backfill.backfill_sku_resolution_for_tenant(engine, tenant_id=tenant_id)
+    assert second["journeysProcessed"] == 1
+    assert (second["withSkuBefore"], second["withoutSkuBefore"]) == (first["withSkuAfter"], first["withoutSkuAfter"])
+
+
+def test_sku_resolution_backfill_lists_a_failing_journey_and_carries_on(seeded_tenant, monkeypatch) -> None:
+    engine, tenant_id, journey_id = (
+        seeded_tenant["engine"], seeded_tenant["tenant_id"], seeded_tenant["journey_id"],
+    )
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr("audit_core.uc03_async_sync_tasks.sync_model_resolution_with_escalation", _boom)
+
+    result = backfill.backfill_sku_resolution_for_tenant(engine, tenant_id=tenant_id)
+    assert result["journeysConsidered"] == 1
+    assert result["journeysProcessed"] == 0
+    assert result["journeysFailed"] == [str(journey_id)]
