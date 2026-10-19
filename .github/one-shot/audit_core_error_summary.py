@@ -21,6 +21,9 @@ def redact(s: str) -> str:
 
 lines = raw.splitlines()
 out.append(f"runtime log lines read: {len(lines)}")
+err_text = Path("/tmp/audit.err").read_text(errors="replace")[:600] if Path("/tmp/audit.err").exists() else ""
+if err_text.strip():
+    out += ["cli stderr: `" + redact(err_text).replace("`", "") + "`"]
 errs = [l for l in lines if re.search(r"\b(ERROR|CRITICAL|Traceback|Exception|Error:)\b|\"level\": ?\"(error|critical)\"", l)]
 out.append(f"error-looking lines: {len(errs)}")
 out.append("")
