@@ -34,7 +34,7 @@ import logging
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy import Engine, text
 
@@ -194,11 +194,15 @@ def _sku_counts(engine: Engine, *, tenant_id: str) -> tuple[int, int]:
     return int(row[0] or 0), int(row[1] or 0)
 
 
-def backfill_sku_resolution_for_tenant(engine: Engine, *, tenant_id: str) -> dict[str, Any]:
+def backfill_sku_resolution_for_tenant(
+    engine: Engine, *, tenant_id: str, offset: int = 0, limit: int | None = None
+) -> dict[str, Any]:
     """Run SKU resolution (booking model/price match, then the Delivery-invoice fallback) for
-    every Journey in the Project. These are the same idempotent producers the app runs when a
+    the Project's Journeys, in a stable order, ``limit`` at a time starting at ``offset`` (all of
+    them when ``limit`` is None). These are the same idempotent producers the app runs when a
     document is confirmed or "Run All Rules" is pressed; each Journey is its own transaction and
-    a failure is listed, never fatal to the rest."""
+    a failure is listed, never fatal to the rest. Callers loop on ``nextOffset`` so no single
+    request runs long enough for the edge proxy to time out."""
     from audit_core.uc03_async_sync_tasks import (
         sync_model_resolution_from_invoice_with_escalation,
         sync_model_resolution_with_escalation,
@@ -206,12 +210,25 @@ def backfill_sku_resolution_for_tenant(engine: Engine, *, tenant_id: str) -> dic
 
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
+        journeys_total = int(
+            connection.execute(
+                text("SELECT count(*) FROM auditcore.journeys WHERE tenant_id = :tenant_id"),
+                {"tenant_id": tenant_id},
+            ).scalar_one()
+        )
         journey_ids = list(
             connection.execute(
-                text("SELECT journey_id FROM auditcore.journeys WHERE tenant_id = :tenant_id ORDER BY created_at_utc"),
-                {"tenant_id": tenant_id},
+                text(
+                    """
+                    SELECT journey_id FROM auditcore.journeys WHERE tenant_id = :tenant_id
+                    ORDER BY created_at_utc, journey_id
+                    OFFSET :offset LIMIT :limit
+                    """
+                ),
+                {"tenant_id": tenant_id, "offset": offset, "limit": limit},
             ).scalars().all()
         )
+    next_offset = offset + len(journey_ids)
     with_sku_before, without_sku_before = _sku_counts(engine, tenant_id=tenant_id)
 
     processed = 0
@@ -243,9 +260,11 @@ def backfill_sku_resolution_for_tenant(engine: Engine, *, tenant_id: str) -> dic
     with_sku_after, without_sku_after = _sku_counts(engine, tenant_id=tenant_id)
     return {
         "tenantId": tenant_id,
+        "journeysTotal": journeys_total,
         "journeysConsidered": len(journey_ids),
         "journeysProcessed": processed,
         "journeysFailed": failed,
+        "nextOffset": next_offset if next_offset < journeys_total else None,
         "withSkuBefore": with_sku_before,
         "withSkuAfter": with_sku_after,
         "withoutSkuBefore": without_sku_before,
@@ -256,6 +275,8 @@ def backfill_sku_resolution_for_tenant(engine: Engine, *, tenant_id: str) -> dic
 
 class SkuResolutionBackfillResult(BaseModel):
     tenantId: str
+    journeysTotal: int
+    nextOffset: int | None
     journeysConsidered: int
     journeysProcessed: int
     journeysFailed: list[str]
@@ -271,10 +292,13 @@ def backfill_sku_resolution(
     tenant_id: str,
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     engine: Annotated[Engine, Depends(get_engine)],
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=25)] = 3,
 ) -> SkuResolutionBackfillResult:
+    """One batch of Journeys; repeat with ``nextOffset`` until it is null."""
     del admin_request
     return SkuResolutionBackfillResult.model_validate(
-        backfill_sku_resolution_for_tenant(engine, tenant_id=tenant_id)
+        backfill_sku_resolution_for_tenant(engine, tenant_id=tenant_id, offset=offset, limit=limit)
     )
 
 
