@@ -366,6 +366,18 @@ def create_p2_journey(
             ),
             {"tenant_id": tenant_id, "journey_id": journey_id, "name": created_by_name},
         )
+        # Earlier bookings by this same PC were saved before their real name was known
+        # ("PC not recorded"). Now that it is, fill those in.
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.journeys SET created_by_display_name=:name
+                WHERE tenant_id=:tenant_id AND created_by_actor_id=:actor_id
+                  AND created_by_display_name IS NULL
+                """
+            ),
+            {"tenant_id": tenant_id, "actor_id": human_principal.subject, "name": created_by_name},
+        )
     _assign_readable_reference(
         connection, tenant_id=tenant_id, journey_id=journey_id, created_by_name=created_by_name,
     )
