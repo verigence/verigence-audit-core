@@ -198,7 +198,7 @@ def _payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> li
         text(
             """
             SELECT payment_id, amount, payment_method_code, payment_reference,
-                   receipt_date, receipt_number, payment_stage
+                   receipt_date, receipt_number
             FROM auditcore.payments
             WHERE tenant_id = :tenant_id AND journey_id = :journey_id
             ORDER BY created_at_utc, payment_id
@@ -209,13 +209,40 @@ def _payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> li
     return [dict(row) for row in rows]
 
 
-def _stage_for_payment(payment: dict[str, Any]) -> str:
-    """auditcore.payments.payment_stage is 'UNSPECIFIED'|'BOOKING'|'DELIVERY'
-    -- only the latter two are valid audit_findings.stage_code values, so an
-    UNSPECIFIED (or missing) payment falls back to _STAGE, same as before
-    this was tracked at all."""
-    stage = payment.get("payment_stage")
-    return stage if stage in ("BOOKING", "DELIVERY") else _STAGE
+def _stage_for_payment(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, payment_id: Any,
+    derived: dict[str, str],
+) -> str:
+    """The stage a PAYMENT_UNVERIFIED finding for this payment is filed under.
+
+    Receipts carry no stage (decision 2026-10-19), but audit_findings needs
+    one. A finding already on file keeps its stage (its de-duplication key
+    includes stage_code, so moving it would file a second copy); otherwise
+    the derived split decides -- receipts up to the minimum booking amount,
+    in receipt-date order, are Booking, later ones Delivery -- and anything
+    the split does not list falls back to _STAGE, as before."""
+    existing = connection.execute(
+        text(
+            """
+            SELECT stage_code FROM auditcore.audit_findings
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND rule_key=:rule_key
+              AND stage_code IN ('BOOKING','DELIVERY')
+            ORDER BY created_at_utc DESC
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "rule_key": f"{_RULE_PREFIX}:{payment_id}"},
+    ).scalar_one_or_none()
+    if existing:
+        return str(existing)
+    return derived.get(str(payment_id), _STAGE)
+
+
+def _derived_stages(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, str]:
+    from audit_core.uc03_p2_stage import receipt_split
+
+    split = receipt_split(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return {entry["paymentId"]: stage for stage in ("BOOKING", "DELIVERY") for entry in split[stage]}
 
 
 def _bank_lines(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
@@ -425,6 +452,7 @@ def _raise_flag(
     journey_id: UUID,
     payment: dict[str, Any],
     correlation_id: str,
+    derived: dict[str, str],
 ) -> None:
     from audit_core.uc03_delivery_commands import _machine_flag
 
@@ -432,7 +460,10 @@ def _raise_flag(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
-        stage_code=_stage_for_payment(payment),
+        stage_code=_stage_for_payment(  # type: ignore[arg-type]
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            payment_id=payment["payment_id"], derived=derived,
+        ),
         rule_key=f"{_RULE_PREFIX}:{payment['payment_id']}",
         finding_type=_FINDING_TYPE,
         severity="HIGH",
@@ -485,6 +516,7 @@ def _reconcile_payments(
     # this producer (see is_reconciliation_trigger_document_type) and
     # matches it against every payment on file at that point.
     no_bank_statement_yet = not lines
+    derived = _derived_stages(connection, tenant_id=tenant_id, journey_id=journey_id)
 
     matched = unmatched = not_applicable = ambiguous = pending_bank_statement = 0
     for payment in payments:
@@ -554,7 +586,7 @@ def _reconcile_payments(
             )
             _raise_flag(
                 connection, tenant_id=tenant_id, journey_id=journey_id,
-                payment=payment, correlation_id=correlation_id,
+                payment=payment, correlation_id=correlation_id, derived=derived,
             )
             unmatched += 1
 

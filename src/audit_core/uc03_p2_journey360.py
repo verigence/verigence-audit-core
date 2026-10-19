@@ -40,7 +40,7 @@ from audit_core.uc03_masters_alignment import (
 from audit_core.uc03_p2_controls import control_statistics
 from audit_core.uc03_p2_dates import parse_extracted_date
 from audit_core.uc03_p2_registry import get_registry
-from audit_core.uc03_p2_stage import read_booking_stage
+from audit_core.uc03_p2_stage import read_booking_stage, receipt_split
 
 # The tabs Journey 360 shows. "delivery", "activity" and "timeline" stay
 # servable for older clients but are no longer advertised: the Vehicle tab
@@ -1359,7 +1359,7 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
             """
             SELECT p.payment_id, p.amount, p.receipt_number, p.receipt_date, p.payment_at_utc,
                    COALESCE(p.payment_mode_code, p.payment_method_code) AS mode,
-                   p.payment_stage, p.source_di_document_id, p.receipt_bank_name,
+                   p.source_di_document_id, p.receipt_bank_name,
                    p.payment_reference, p.status_source, p.created_at_utc,
                    e.association_status, e.document_type_key
             FROM auditcore.payments p
@@ -1395,6 +1395,14 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
 
     lines = _bank_lines(connection, tenant_id=tenant_id, journey_id=journey_id)
     by_document = {line["documentId"]: line for line in lines}
+    # Receipts carry no stage (decision 2026-10-19). Which ones are the
+    # Booking payment is derived: in receipt-date order, the receipts that
+    # first reach the minimum booking amount; every later one is shown under
+    # Delivery -- the stage engine's own split, never a stored stamp.
+    split = receipt_split(connection, tenant_id=tenant_id, journey_id=journey_id)
+    derived_stage = {
+        entry["paymentId"]: stage for stage in ("BOOKING", "DELIVERY") for entry in split[stage]
+    }
     items = []
     by_stage: dict[str, Decimal] = {}
     for r in rows:
@@ -1402,8 +1410,8 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
         evidenced = r["status_source"] == "EVIDENCE" and r["association_status"] == "ACTIVE"
         original = duplicate_of.get(r["payment_id"])
         counted = evidenced and original is None
-        stage = str(r["payment_stage"] or "BOOKING")
-        if counted:
+        stage = derived_stage.get(payment_id) if counted else None
+        if counted and stage is not None:
             by_stage[stage] = by_stage.get(stage, Decimal(0)) + Decimal(r["amount"])
         if original is not None:
             reason = "Duplicate: the same receipt number, amount and date as " + (

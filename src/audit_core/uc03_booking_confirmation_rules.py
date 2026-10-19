@@ -343,12 +343,20 @@ def evaluate_minimum_booking_payment(
     journey_id: UUID,
     correlation_id: str,
 ) -> None:
-    """Runs once any Booking payment receipt confirms. Never raises.
+    """Runs once any payment receipt confirms. Never raises.
 
-    Recomputes from every currently-durable Booking payment every time it
-    runs -- safe to call redundantly, and correctly handles a receipt that
-    arrives out of chronological order (a backdated receipt inserted earlier
-    in the sequence can move the confirming receipt to an earlier date).
+    Recomputes from every currently-durable receipt of the Journey every
+    time it runs -- safe to call redundantly, and correctly handles a
+    receipt that arrives out of chronological order (a backdated receipt
+    inserted earlier in the sequence can move the confirming receipt to an
+    earlier date).
+
+    Decision 2026-10-19 (product owner): receipts carry no Booking or
+    Delivery stage. The minimum booking amount is checked against every
+    receipt, taken first by receipt date -- the receipt at which the running
+    total first reaches the minimum sets the booking confirm date. This used
+    to count only rows stamped payment_stage='BOOKING', so a receipt the
+    Delivery writer had stamped never counted toward Booking.
     """
 
     payments = connection.execute(
@@ -357,7 +365,6 @@ def evaluate_minimum_booking_payment(
             SELECT payment_id, amount, receipt_date, receipt_number
             FROM auditcore.payments
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND payment_stage='BOOKING'
               AND amount IS NOT NULL AND receipt_date IS NOT NULL
             ORDER BY receipt_date ASC, payment_id ASC
             """
@@ -460,7 +467,7 @@ def evaluate_minimum_booking_payment(
         severity="HIGH",
         title="Booking without minimum payment",
         description=(
-            f"Total Booking payments received (₹{running_total:,.2f}) are below "
+            f"Total payments received (₹{running_total:,.2f}) are below "
             f"the minimum booking amount (₹{minimum:,.2f})."
         ),
         correlation_id=correlation_id,

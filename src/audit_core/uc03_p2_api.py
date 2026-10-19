@@ -51,6 +51,7 @@ from audit_core.uc03_p2_stage import (
     condition_reasons,
     read_booking_stage,
     ready_document_counts,
+    receipt_split,
     requirement_items,
 )
 from audit_core.uc03_p2_storage import (
@@ -575,14 +576,18 @@ def list_p2_journeys(
             LEFT JOIN auditcore.deliveries dl
               ON dl.tenant_id=p.tenant_id AND dl.journey_id=p.journey_id
             LEFT JOIN LATERAL (
+              -- Every receipt (receipts carry no stage, decision 2026-10-19).
+              -- Only a fallback: the stage engine's derived booking total
+              -- (pr.booking_receipt_total) is used when it has run.
               SELECT COALESCE(SUM(amount) FILTER (WHERE amount > 0), 0) AS booking_total
               FROM auditcore.payments
               WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id
-                AND COALESCE(payment_stage, 'BOOKING')='BOOKING'
             ) pay ON true
             LEFT JOIN LATERAL (
-              -- The first receipt date at which the booking receipts (one per
-              -- receipt number, amount and date) reach the minimum booking amount.
+              -- The first receipt date at which the receipts (one per receipt
+              -- number, amount and date), taken in receipt-date order, reach the
+              -- minimum booking amount. Every receipt counts: receipts carry no
+              -- stage (decision 2026-10-19).
               SELECT MIN(receipt_date) AS confirmed_on
               FROM (
                 SELECT receipt_date,
@@ -593,7 +598,6 @@ def list_p2_journeys(
                   FROM auditcore.payments
                   WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id
                     AND amount > 0 AND receipt_date IS NOT NULL
-                    AND COALESCE(payment_stage, 'BOOKING')='BOOKING'
                   ORDER BY COALESCE(receipt_number, payment_id::text), amount, receipt_date, payment_id
                 ) receipts
               ) running
@@ -2475,27 +2479,16 @@ def overview_summary(
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().one()
 
-    payments = connection.execute(
-        text(
-            """
-            SELECT COALESCE(SUM(amount) FILTER (
-                     WHERE payment_stage='BOOKING'
-                   ),0) AS booking_total,
-                   COALESCE(SUM(amount) FILTER (
-                     WHERE payment_stage='DELIVERY'
-                   ),0) AS delivery_total,
-                   COUNT(*) FILTER (
-                     WHERE payment_stage='BOOKING'
-                   ) AS booking_receipts,
-                   COUNT(*) FILTER (
-                     WHERE payment_stage='DELIVERY'
-                   ) AS delivery_receipts
-            FROM auditcore.payments
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one()
+    # Receipts carry no stage (decision 2026-10-19): which ones are the
+    # Booking payment is derived -- in receipt-date order, the receipts that
+    # first reach the minimum booking amount; every later receipt is shown
+    # under Delivery (the same split the stage engine uses).
+    split = receipt_split(connection, tenant_id=tenant_id, journey_id=journey_id)
+    payments = {
+        "booking_total": split["bookingTotal"],
+        "booking_receipts": len(split["BOOKING"]),
+        "delivery_receipts": len(split["DELIVERY"]),
+    }
 
 
     booking_required, booking_received = _p2_requirement_statistics(

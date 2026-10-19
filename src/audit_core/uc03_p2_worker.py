@@ -1491,6 +1491,8 @@ def classify_page_outcome(
             return PageOutcome("NEEDS_REVIEW", _NOTHING_READ_REASON)
         if facts_copy == "UNLINKED":
             return PageOutcome("SUPPORTING", _EXTRA_COPY_REASON)
+        if facts_copy == FACTS_COPY_GAVE_UP:
+            return PageOutcome("FAILED", _FACTS_COPY_GAVE_UP_REASON)
         return PageOutcome("SYNCING_TO_AUDIT_CORE", None)
     if state == "CLASSIFIED":
         if di_item.get("extractionQueued") is False and processing in ("", "PENDING", "NOT_STARTED"):
@@ -1588,15 +1590,105 @@ def _copy_page_facts(
         return "COPIED"
     except DocumentSyncLockBusyError:
         return None
-    except Exception:
+    except Exception as exc:
+        transient = _is_transient_copy_failure(exc)
         logger.warning(
             "p2_page_facts_copy_failed",
             tenant_id=work.tenant_id,
             journey_id=str(work.journey_id),
             di_document_id=str(document_id),
+            transient=transient,
             exc_info=True,
         )
+        if transient:
+            return None
+        failures = _count_facts_copy_failure(engine, work=work, queue_id=page["queue_id"], exc=exc)
+        if failures >= _FACTS_COPY_MAX_FAILURES:
+            logger.error(
+                "p2_page_facts_copy_gave_up",
+                tenant_id=work.tenant_id,
+                journey_id=str(work.journey_id),
+                di_document_id=str(document_id),
+                failures=failures,
+                exc_type=type(exc).__name__,
+            )
+            return FACTS_COPY_GAVE_UP
         return None
+
+
+# Decision 2026-10-19: a facts copy that fails for a reason that will not go
+# away by waiting (a database rule refusing the write, a data error) used to
+# be treated like "DI not finished yet": the page never settled, the
+# reconcile rescheduled itself every five minutes for ever (a reschedule
+# never counts toward the dead-letter limit) and held a worker slot for one
+# to three minutes each time -- found live 2026-10-19, three Journeys, 47
+# rounds in under three hours. After this many such failures in a row the
+# page settles as FAILED with a plain reason instead; a PC's Retry resets
+# the count (uc03_p2_runtime resets attempt_count).
+_FACTS_COPY_MAX_FAILURES = 3
+FACTS_COPY_GAVE_UP = "GAVE_UP"
+_FACTS_COPY_GAVE_UP_REASON = (
+    "Audit Core could not save this page's values (a system error, not a problem with the scan). "
+    "Use Retry once it has been fixed."
+)
+
+
+def _is_transient_copy_failure(exc: BaseException) -> bool:
+    """Failures that waiting can fix: a dependency (DI, Security) unreachable,
+    the database busy or timing out. These keep the old "look again shortly"
+    behaviour and never count toward giving up."""
+    import httpx
+    from sqlalchemy.exc import OperationalError
+
+    from audit_core.di_client import DiClientError
+    from audit_core.errors import DependencyUnavailableError
+    from audit_core.security import SecurityTokenError as SecurityTokenErrorA
+    from audit_core.security_integration import (
+        SecurityTokenError as SecurityTokenErrorB,
+    )
+
+    return isinstance(
+        exc,
+        (
+            OperationalError,
+            DependencyUnavailableError,
+            DiClientError,
+            SecurityTokenErrorA,
+            SecurityTokenErrorB,
+            httpx.HTTPError,
+            TimeoutError,
+            ConnectionError,
+        ),
+    )
+
+
+def _count_facts_copy_failure(engine: Engine, *, work: WorkItem, queue_id: Any, exc: BaseException) -> int:
+    """One more consecutive non-transient facts-copy failure on this page;
+    returns the count. Its own short transaction: the copy's own one has
+    already rolled back."""
+    try:
+        with engine.begin() as connection:
+            set_tenant_context(connection, work.tenant_id)
+            return int(
+                connection.execute(
+                    text(
+                        """
+                        UPDATE auditcore.p2_document_queue
+                        SET attempt_count = attempt_count + 1,
+                            last_error = :error,
+                            updated_at_utc = now()
+                        WHERE tenant_id=:t AND queue_id=:q
+                        RETURNING attempt_count
+                        """
+                    ),
+                    {"t": work.tenant_id, "q": queue_id,
+                     "error": f"FACTS_COPY_FAILED: {type(exc).__name__}"},
+                ).scalar_one_or_none()
+                or 0
+            )
+    except Exception:
+        logger.warning("p2_page_facts_copy_failure_not_counted", tenant_id=work.tenant_id, exc_info=True)
+        return 0
 
 
 def _reconcile_delay(oldest_submitted: datetime | None, now: datetime) -> int:

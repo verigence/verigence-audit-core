@@ -361,20 +361,42 @@ def test_idempotent(journey) -> None:
     assert _verified(c, pid) == 1
 
 
-def test_unmatched_delivery_payment_flag_stamped_with_delivery_stage(journey) -> None:
-    """Regression: _raise_flag used to hardcode stage_code=_STAGE ('BOOKING')
-    for every payment regardless of its own payment_stage -- a Delivery
-    payment's PAYMENT_BANK_UNMATCHED finding was silently mislabeled under
-    the Booking stage. Fixed so a Delivery-stage payment's finding actually
-    carries stage_code='DELIVERY', which is also what lets
-    _delivery_audit_gaps's own unverified-payment check dedupe against this
-    rule instead of raising a second, separate finding for the same fact."""
-    c = journey
+def _add_evidenced_receipt(c, *, amount, ref, number, day):
+    """A receipt-backed payment on an ACTIVE document -- what the derived
+    Booking/Delivery split (uc03_p2_stage.receipt_split) counts."""
+    from uuid import uuid4
+
+    document_id = uuid4()
     c.execute(
-        text("INSERT INTO auditcore.deliveries (tenant_id, journey_id) VALUES (:t, :j)"),
-        {"t": c.tenant_id, "j": c.journey_id},
+        text("""INSERT INTO auditcore.evidence
+            (tenant_id, journey_id, customer_id, di_subject_id, di_document_id,
+             document_type_key, evidence_purpose, process_area, association_status)
+            SELECT j.tenant_id, j.journey_id, j.customer_id, :s, :d,
+                   'dealer_receipt', 'JOURNEY_DOCUMENT', 'BOOKING', 'ACTIVE'
+            FROM auditcore.journeys j WHERE j.tenant_id=:t AND j.journey_id=:j"""),
+        {"t": c.tenant_id, "j": c.journey_id, "s": uuid4(), "d": document_id},
     )
-    pid = _add_payment(c, amount=60000, ref="UTR-DELIVERY-1", stage="DELIVERY")
+    return c.execute(
+        text("""INSERT INTO auditcore.payments
+            (tenant_id, journey_id, amount, payment_method_code, payment_reference,
+             receipt_number, receipt_date, status_source, source_di_document_id)
+            VALUES (:t, :j, :a, 'UPI', :r, :n, DATE '2026-09-01' + :day, 'EVIDENCE', :d)
+            RETURNING payment_id"""),
+        {"t": c.tenant_id, "j": c.journey_id, "a": amount, "r": ref, "n": number,
+         "day": day, "d": document_id},
+    ).scalar_one()
+
+
+def test_unmatched_payment_flag_filed_under_the_derived_stage(journey) -> None:
+    """Receipts carry no stage (decision 2026-10-19), but a PAYMENT_BANK_UNMATCHED
+    finding needs one. It follows the derived split: in receipt-date order,
+    the receipts that reach the minimum booking amount (default Rs 11,000)
+    are Booking, every later receipt is Delivery. This replaces the old
+    stamped-stage version of this test (payment_stage='DELIVERY' -> finding
+    under DELIVERY); the stamp is no longer written or read."""
+    c = journey
+    booking_pid = _add_evidenced_receipt(c, amount=11000, ref="UTR-BOOKING-1", number="R-1", day=1)
+    delivery_pid = _add_evidenced_receipt(c, amount=60000, ref="UTR-DELIVERY-1", number="R-2", day=5)
     # A non-matching bank statement must already exist for this to actually
     # raise -- see test_receipt_with_no_bank_statement_yet_does_not_raise
     # for the "no bank statement at all yet" case, which no longer raises.
@@ -385,9 +407,22 @@ def test_unmatched_delivery_payment_flag_stamped_with_delivery_stage(journey) ->
         })],
     )
     pr.reconcile_payments(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
-    stage = c.execute(
-        text("SELECT stage_code FROM auditcore.audit_findings "
-             "WHERE tenant_id=:t AND journey_id=:j AND rule_key=:rk"),
-        {"t": c.tenant_id, "j": c.journey_id, "rk": f"PAYMENT_BANK_UNMATCHED:{pid}"},
-    ).scalar_one()
-    assert stage == "DELIVERY"
+
+    def stage_of(pid):
+        return c.execute(
+            text("SELECT stage_code FROM auditcore.audit_findings "
+                 "WHERE tenant_id=:t AND journey_id=:j AND rule_key=:rk"),
+            {"t": c.tenant_id, "j": c.journey_id, "rk": f"PAYMENT_BANK_UNMATCHED:{pid}"},
+        ).scalar_one()
+
+    assert stage_of(booking_pid) == "BOOKING"
+    assert stage_of(delivery_pid) == "DELIVERY"
+
+    # Re-running keeps each finding under the stage it was filed with (the
+    # finding's de-duplication key includes stage_code): still one each.
+    pr.reconcile_payments(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert c.execute(
+        text("SELECT count(*) FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND journey_id=:j AND rule_key LIKE 'PAYMENT_BANK_UNMATCHED:%'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one() == 2
