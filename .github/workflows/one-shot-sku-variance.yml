@@ -1,0 +1,49 @@
+name: One-shot SKU run comparison (read-only)
+
+# READ-ONLY: SELECTs on a read-only session and Railway log reads. Posts a redacted report as an issue.
+on:
+  push:
+    branches: [claude/sku-variance-diagnosis]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -q "psycopg[binary]" && npm install --global @railway/cli
+      - name: Resolve the DEV database and read logs
+        shell: bash
+        run: |
+          set -uo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service verigence-audit-core --json >/tmp/link.json
+          railway variable list --service verigence-audit-core --json >/tmp/audit-vars.json
+          raw="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          v = json.loads(Path('/tmp/audit-vars.json').read_text())
+          print(v.get('DATABASE_PUBLIC_URL') or v.get('DATABASE_URL') or '')
+          PY
+          )"
+          [[ -n "$raw" ]] || { echo '::error::no DATABASE_URL'; exit 1; }
+          echo "::add-mask::$raw"
+          echo "DATABASE_URL=$raw" >> "$GITHUB_ENV"
+          railway logs --service verigence-audit-core --lines 6000 >/tmp/audit.log 2>/dev/null || true
+      - run: python .github/one-shot/sku_variance.py
+      - name: Post report
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          test -f /tmp/report.md || echo 'No report produced.' > /tmp/report.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "SKU run comparison (run $GITHUB_RUN_ID)" --body-file /tmp/report.md
