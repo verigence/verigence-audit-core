@@ -9,6 +9,7 @@ and answer the questions a manual deal audit asks:
   Excess discount          EXCESS_DISCOUNT             per discount + total
   Short payment            DELIVERED_ON_SHORT_PAYMENT, PAYMENT_AFTER_DELIVERY_WITHIN_GRACE,
                            PAYMENT_AFTER_DELIVERY_BEYOND_GRACE
+  Receipts vs invoices     RECEIPTS_EQUAL_INVOICES     all receipts = all invoices, within Rs 1
   Financier (DO)           DO_PAYMENT_NOT_RECEIVED, DO_SHORT_PAYMENT
   Trade-in                 TRADE_IN_NOT_RESOLD, TRADE_IN_SOLD_AT_LOSS
   Refund                   POST_DELIVERY_REFUND
@@ -580,6 +581,103 @@ def delivered_on_short_payment(facts: _Facts) -> RuleOutcome:
                                      f"{_rupees(state['payable'])} payable.")
 
 
+# --------------------------------------------- receipts equal all invoices
+#
+# Decision 2026-10-19 (product owner): receipts carry no Booking or Delivery
+# stage, and once the deal is settled every receipt together equals every
+# invoice together -- to within Rs 1. A bank loan is paid to the dealer
+# against a dealer receipt, so it is already a receipt (no finance figure is
+# added); an exchange appears on the invoice as a discount or a line item, so
+# it is already in the invoice total.
+#
+# Invoices counted: the customer's vehicle, accessory, extended-warranty and
+# RSA invoices, generic invoices and debit notes, less credit notes. The
+# dealer's wholesale (OEM) invoice is the dealer's purchase, not the
+# customer's bill, and is left out. The same sale billed in both DMS and
+# Tally is one bill: when a DMS invoice of a kind is on file, the Tally one of
+# that kind is not counted again. The same invoice uploaded twice counts once
+# (same kind and invoice number; same kind, date and total without a number).
+_INVOICE_TOLERANCE = Decimal(1)
+_INVOICE_FAMILIES: dict[str, tuple[str, ...]] = {
+    # family -> its document types, DMS first (the one that counts when both are on file)
+    "VEHICLE": ("customer_invoice_dms", "tax_invoice_tally"),
+    "ACCESSORIES": ("accessory_invoice_dms", "accessory_invoice_tally"),
+    "EXTENDED_WARRANTY": ("ew_invoice",),
+    "RSA": ("rsa_invoice",),
+    "OTHER": ("invoice_generic",),
+    "DEBIT_NOTE": ("debit_note",),
+    "CREDIT_NOTE": ("credit_note",),
+}
+_INVOICE_TOTAL_FIELDS = ("grand_total_amount", "total_amount")
+
+
+def _invoice_bills(facts: _Facts) -> tuple[list[dict[str, Any]], list[str]]:
+    """The invoices that count toward the bill, each with its signed amount,
+    and the names of any counted invoice whose total could not be read."""
+    bills: list[dict[str, Any]] = []
+    unreadable: list[str] = []
+    for family, types in _INVOICE_FAMILIES.items():
+        documents = facts.documents(*types)
+        if not documents:
+            continue
+        preferred = next(t for t in types if any(d["documentType"] == t for d in documents))
+        seen: set[tuple[Any, ...]] = set()
+        for doc in documents:
+            if doc["documentType"] != preferred:
+                continue
+            fields = doc["fields"]
+            amount = next((_dec(fields.get(k)) for k in _INVOICE_TOTAL_FIELDS if _dec(fields.get(k)) is not None), None)
+            label = doc["documentType"].replace("_", " ")
+            number = " ".join(str(fields.get("invoice_number") or fields.get("debit_note_number") or "").split()).upper()
+            if amount is None:
+                unreadable.append(f"{label}{f' {number}' if number else ''}")
+                continue
+            key = (family, number) if number else (family, str(fields.get("invoice_date") or ""), amount)
+            if key in seen:
+                continue
+            seen.add(key)
+            signed = -abs(amount) if family == "CREDIT_NOTE" else amount
+            bills.append({"documentId": doc["documentId"], "documentType": doc["documentType"],
+                          "number": number or None, "amount": signed})
+    return bills, unreadable
+
+
+def receipts_equal_invoices(facts: _Facts) -> RuleOutcome:
+    code = "RECEIPTS_EQUAL_INVOICES"
+    bills, unreadable = _invoice_bills(facts)
+    if not any(b["documentType"] in _INVOICE_FAMILIES["VEHICLE"] for b in bills):
+        return RuleOutcome(code, "SKIPPED", "No vehicle invoice has been read yet.")
+    if unreadable:
+        return RuleOutcome(code, "SKIPPED", "The total could not be read on: " + ", ".join(unreadable) + ".")
+    delivered = facts.delivery_date
+    if delivered is None:
+        return RuleOutcome(code, "SKIPPED", _NO_DELIVERY_DATE)
+    settles = delivered + timedelta(days=_SETTLEMENT_DAYS)
+    if facts.today <= settles:
+        return RuleOutcome(code, "SKIPPED", (
+            f"Receipts are compared with the invoices once the settlement window closes on {_when(settles)} "
+            f"({_SETTLEMENT_DAYS} days after delivery on {_when(delivered)})."
+        ))
+    invoiced = sum((b["amount"] for b in bills), Decimal(0))
+    received = sum((r["amount"] for r in facts.receipts), Decimal(0))
+    refunded = sum((abs(r["amount"]) for r in facts.refunds), Decimal(0))
+    net = received - refunded
+    gap = net - invoiced
+    counted = f"{len(bills)} invoice{'s' if len(bills) != 1 else ''}"
+    refund_text = f" less {_rupees(refunded)} refunded" if refunded else ""
+    details = {"invoiced": str(invoiced), "received": str(received), "refunded": str(refunded),
+               "difference": str(gap), "invoices": [{**b, "amount": str(b["amount"])} for b in bills]}
+    if abs(gap) <= _INVOICE_TOLERANCE:
+        return RuleOutcome(code, "PASS", (
+            f"Receipts {_rupees(received)}{refund_text} match the {counted} totalling {_rupees(invoiced)}."
+        ), details)
+    direction = "short of" if gap < 0 else "more than"
+    return RuleOutcome(code, "FAIL", (
+        f"Receipts {_rupees(received)}{refund_text} are {_rupees(abs(gap))} {direction} the {counted} "
+        f"totalling {_rupees(invoiced)}."
+    ), {**details, "findingTitle": "Receipts do not equal the invoices"})
+
+
 def _late_receipts(facts: _Facts, start: date, end: date | None) -> list[dict[str, Any]]:
     return [r for r in facts.receipts if r["date"] and r["date"] > start and (end is None or r["date"] <= end)]
 
@@ -1026,7 +1124,7 @@ _BOOKING_RULES = (
     insurance_invoice_missing, self_insurance_declared,
 )
 _DELIVERY_RULES = (
-    delivered_on_short_payment, payment_after_delivery_within_grace, payment_after_delivery_beyond_grace,
+    delivered_on_short_payment, receipts_equal_invoices, payment_after_delivery_within_grace, payment_after_delivery_beyond_grace,
     do_payment_not_received, do_short_payment,
     trade_in_not_resold, trade_in_sold_at_loss, post_delivery_refund,
     ndc_signature_unconfirmed, ndc_not_signed, accessories_fitted_unconfirmed, accessory_fitted_unbilled,

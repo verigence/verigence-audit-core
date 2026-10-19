@@ -1,8 +1,10 @@
-# Phase 2 control catalog: 25 active Audit Core controls, 22 deal-audit Audit Core
-# checks (uc03_p2_audit_rules.py; the "Manual Observations" ones are answered by a
-# PC, TL or PM rather than read from documents) and 41 enabled Rule Engine rules
+# Phase 2 control catalog: 51 Audit Core controls (26 active controls and 25 deal-audit
+# checks in uc03_p2_audit_rules.py; the "Manual Observations" ones are answered by a
+# PC, TL or PM rather than read from documents) and 40 enabled Rule Engine rules
 # (blueprint v2.2 sections 9-10; six master-total rules retired on 28 Sep 2026 in favour of
-# the per-line DEAL_UNDERCHARGED / EXCESS_DISCOUNT and DELIVERED_ON_SHORT_PAYMENT checks). Audit Core owns execution state for both.
+# the per-line DEAL_UNDERCHARGED / EXCESS_DISCOUNT and DELIVERED_ON_SHORT_PAYMENT checks;
+# BOOKING_RECEIPT_SUM_VS_BOOKING_FORM retired on 19 Oct 2026: receipts carry no stage, and
+# RECEIPTS_EQUAL_INVOICES compares all receipts with all invoices). Audit Core owns execution state for both.
 # mode: RERUN (native runner) | EXTERNAL (Rule Engine) | GATE (P2 stage gates)
 #       | PAGES (P2 page outcomes) | SYNC (existing document sync) | EVENT (process event)
 version: 1
@@ -557,23 +559,6 @@ controls:
       left: booking_docket.booking_amount_paid
       right: '-'
     depends_on_documents:
-    - booking_docket
-    task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
-  BOOKING_RECEIPT_SUM_VS_BOOKING_FORM:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
-    category: PRICE
-    phases:
-    - BOOKING
-    rule_engine_phases:
-    - BOOKING
-    operands:
-      left: dealer_receipt.amount_paid
-      right: booking_form.booking_amount_paid
-    depends_on_documents:
-    - dealer_receipt
     - booking_docket
     task:
       type: RULE_DISCREPANCY_REVIEW
@@ -1209,6 +1194,28 @@ controls:
       type: FINDING_REVIEW
       owner: TL
   DELIVERED_ON_SHORT_PAYMENT:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - DELIVERY
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    - DELIVERY_COMPLETED
+    - SCHEDULED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
+  # Decision 2026-10-19: all receipts together equal all invoices together,
+  # within Rs 1, once the settlement window after delivery has closed
+  # (uc03_p2_audit_rules.receipts_equal_invoices). Replaces the stage-split
+  # BOOKING_RECEIPT_SUM_VS_BOOKING_FORM Rule Engine rule: receipts carry no stage.
+  RECEIPTS_EQUAL_INVOICES:
     executor: NATIVE
     mode: RERUN
     phases:

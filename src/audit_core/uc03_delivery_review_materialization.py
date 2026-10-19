@@ -1124,40 +1124,6 @@ def materialize_delivery_commercial_lines(
     return written
 
 
-def _same_delivery_payment_state(
-    row: Any,
-    *,
-    document_id: UUID,
-    evidence_id: UUID | None,
-    values: dict[str, Any],
-) -> bool:
-    columns = (
-        "receipt_number",
-        "receipt_date",
-        "amount",
-        "payment_method_code",
-        "payment_mode_code",
-        "payment_reference",
-        "receipt_dealer_name",
-        "receipt_dealer_gstin",
-        "receipt_customer_name",
-        "receipt_customer_phone",
-        "payment_reference_date",
-        "receipt_bank_name",
-        "receipt_bank_location",
-        "receipt_booking_reference",
-        "receipt_remarks",
-        "receipt_amount_in_words",
-    )
-    return (
-        row["source_di_document_id"] == document_id
-        and row["source_evidence_id"] == evidence_id
-        and all(row[column] == values.get(column) for column in columns)
-        and row["payment_stage"] == "DELIVERY"
-        and row["status_source"] == "EVIDENCE"
-    )
-
-
 def materialize_delivery_receipts(
     connection: Connection,
     *,
@@ -1205,84 +1171,23 @@ def materialize_delivery_receipts(
             skipped += 1
             continue
 
-        existing = booking_materialization._existing_payment(
+        # The same single writer as the Booking side (decision 2026-10-19):
+        # a receipt carries no stage, so this never stamps 'DELIVERY' nor
+        # links a delivery_id -- see upsert_receipt_payment.
+        outcome = booking_materialization.upsert_receipt_payment(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
             document_id=document.documentId,
             evidence_id=document.evidenceId,
-        )
-        params = {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "document_id": document.documentId,
-            "evidence_id": document.evidenceId,
-            **values,
-        }
-        payment_columns = (
-            "amount",
-            "payment_method_code",
-            "payment_mode_code",
-            "payment_reference",
-            "receipt_number",
-            "receipt_date",
-            "receipt_dealer_name",
-            "receipt_dealer_gstin",
-            "receipt_customer_name",
-            "receipt_customer_phone",
-            "payment_reference_date",
-            "receipt_bank_name",
-            "receipt_bank_location",
-            "receipt_booking_reference",
-            "receipt_remarks",
-            "receipt_amount_in_words",
-        )
-        if existing is None:
-            connection.execute(
-                text(
-                    f"""
-                    INSERT INTO auditcore.payments (
-                        tenant_id, journey_id, {', '.join(payment_columns)},
-                        status_source, source_evidence_id, source_di_document_id,
-                        payment_stage
-                    ) VALUES (
-                        :tenant_id, :journey_id,
-                        {', '.join(f':{column}' for column in payment_columns)},
-                        'EVIDENCE', :evidence_id, :document_id, 'DELIVERY'
-                    )
-                    """
-                ),
-                params,
-            )
-            created += 1
-            continue
-        if _same_delivery_payment_state(
-            existing,
-            document_id=document.documentId,
-            evidence_id=document.evidenceId,
             values=values,
-        ):
-            unchanged += 1
-            continue
-
-        assignments = [f"{column}=:{column}" for column in payment_columns]
-        connection.execute(
-            text(
-                f"""
-                UPDATE auditcore.payments
-                SET {', '.join(assignments)},
-                    status_source='EVIDENCE',
-                    source_evidence_id=:evidence_id,
-                    source_di_document_id=:document_id,
-                    payment_stage='DELIVERY',
-                    updated_at_utc=now(),
-                    version_no=version_no+1
-                WHERE tenant_id=:tenant_id AND payment_id=:payment_id
-                """
-            ),
-            {**params, "payment_id": existing["payment_id"]},
         )
-        updated += 1
+        if outcome == "created":
+            created += 1
+        elif outcome == "updated":
+            updated += 1
+        else:
+            unchanged += 1
 
     return {
         "reviewRowsWritten": review_rows,
