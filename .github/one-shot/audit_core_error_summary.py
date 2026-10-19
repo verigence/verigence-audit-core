@@ -28,6 +28,20 @@ errs = [l for l in lines if re.search(r"\b(ERROR|CRITICAL|Traceback|Exception|Er
 out.append(f"error-looking lines: {len(errs)}")
 out.append("")
 
+out += ["## Log format and levels", "", "```"]
+out += [redact(l) for l in lines[:3]] + ["..."] + [redact(l) for l in lines[-3:]]
+lv = collections.Counter()
+for l in lines:
+    m = re.search(r"\b(debug|info|warning|warn|error|critical|exception)\b", l, re.I)
+    lv[m.group(1).lower() if m else "none"] += 1
+out += ["```", "", "level word counts: " + ", ".join(f"{k}={v}" for k, v in lv.most_common()), ""]
+ev = collections.Counter()
+for l in lines:
+    if re.search(r"warning|error|critical|exception|fail|refused|timeout|denied|\b5\d\d\b", l, re.I):
+        ev[re.sub(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "{id}", redact(l))[:220]] += 1
+out += ["## Warning / failure-looking lines (count, line)", ""]
+out += [f"- {n} x `{k.replace(chr(96), '')}`" for k, n in ev.most_common(40)] or ["_none_"]
+out.append("")
 # exception types
 types = collections.Counter()
 for l in lines:
