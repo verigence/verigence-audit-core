@@ -1,0 +1,49 @@
+name: One-shot JBR-01 masters (read-only)
+
+# Runs when this branch is pushed. SELECT only (read-only session). Posts the result as an issue.
+on:
+  push:
+    branches: [claude/jbr01-masters-readonly2]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  report:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -q "psycopg[binary]" && npm install --global @railway/cli
+      - name: Resolve the DEV database from the Audit Core service
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          raw="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          v = json.loads(Path('/tmp/audit-vars.json').read_text())
+          print(v.get('DATABASE_PUBLIC_URL') or v.get('DATABASE_URL') or '')
+          PY
+          )"
+          [[ -n "$raw" ]] || { echo '::error::no DATABASE_URL on the DEV service.'; exit 1; }
+          echo "::add-mask::$raw"
+          echo "DATABASE_URL=$raw" >> "$GITHUB_ENV"
+      - run: python .github/one-shot/jbr01_masters_readonly.py
+      - name: Post report
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          test -f /tmp/report.md || echo 'No report produced.' > /tmp/report.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "JBR-01 masters read-only (run $GITHUB_RUN_ID)" --body-file /tmp/report.md
