@@ -1,0 +1,42 @@
+name: One-shot Audit Core error log summary (read-only)
+
+# Runs when this branch is pushed. Reads the last 6 hours of the Railway DEV Audit Core log,
+# summarises the errors (secrets and emails redacted) and posts the summary as an issue.
+on:
+  push:
+    branches: [claude/audit-core-error-logs]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  logs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: npm install --global @railway/cli
+      - name: Read logs
+        shell: bash
+        run: |
+          set -uo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway logs --service "$AUDIT_SERVICE" --since 6h --lines 6000 >/tmp/audit.log 2>/tmp/audit.err || true
+          railway logs --service "$AUDIT_SERVICE" --http --since 6h --lines 3000 --json >/tmp/audit-http.json 2>>/tmp/audit.err || true
+          python .github/one-shot/audit_core_error_summary.py
+      - name: Post report
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          test -f /tmp/report.md || echo 'No report produced.' > /tmp/report.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "Audit Core DEV error summary (run $GITHUB_RUN_ID)" --body-file /tmp/report.md
