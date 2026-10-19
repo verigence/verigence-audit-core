@@ -30,9 +30,9 @@ jobs:
           set -uo pipefail
           [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
-          railway logs --service "$AUDIT_SERVICE" --lines 8000 >/tmp/audit.log 2>/tmp/audit.err || true
-          railway deployment list --service "$AUDIT_SERVICE" --limit 4 --json >/tmp/dep.json 2>>/tmp/audit.err || true
-          for dep in $(python -c "import json;print(' '.join(str(r.get('id')) for r in json.load(open('/tmp/dep.json'))[1:4]))" 2>/dev/null); do railway logs --service "$AUDIT_SERVICE" "$dep" --lines 6000 >>/tmp/audit.log 2>>/tmp/audit.err || true; done
+          railway logs --service "$AUDIT_SERVICE" --lines 4000 >/tmp/audit.log 2>/tmp/audit.err || true
+          railway deployment list --service "$AUDIT_SERVICE" --limit 3 --json >/tmp/dep.json 2>>/tmp/audit.err || true
+          for dep in $(python -c "import json;print(' '.join(str(r.get('id')) for r in json.load(open('/tmp/dep.json'))[1:3]))" 2>/dev/null); do railway logs --service "$AUDIT_SERVICE" "$dep" --lines 4000 >>/tmp/audit.log 2>>/tmp/audit.err || true; done
           railway logs --service "$AUDIT_SERVICE" --http --since 6h --lines 3000 --json >/tmp/audit-http.json 2>>/tmp/audit.err || true
           python .github/one-shot/audit_core_error_summary.py
       - name: Post report
