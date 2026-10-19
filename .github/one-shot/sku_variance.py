@@ -24,7 +24,7 @@ def table(title, cols, rows, limit=80):
     out.append("| " + " | ".join(cols) + " |")
     out.append("|" + "|".join(["---"] * len(cols)) + "|")
     for r in rows[:limit]:
-        out.append("| " + " | ".join("" if v is None else rd(v) for v in r) + " |")
+        out.append("| " + " | ".join("" if v is None else rd(v, 60) if len(str(v)) < 60 else rd(v) for v in r) + " |")
     out.append("")
 
 
@@ -57,12 +57,11 @@ Q = [
      """SELECT count(*), count(*) FILTER (WHERE jp.product_sku_id IS NOT NULL), count(*) FILTER (WHERE jp.product_sku_id IS NULL)
         FROM auditcore.journeys j LEFT JOIN auditcore.journey_products jp ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
         WHERE j.tenant_id=(SELECT tenant_id FROM auditcore.sku_resolution_runs ORDER BY started_at_utc DESC LIMIT 1)""", ()),
-    ("Open model findings on this Project by match stage", ["stage", "candidates", "journeys"],
-     """SELECT coalesce(safe_payload->>'matchStage','?'), coalesce(safe_payload->>'candidateCount','?'), count(*)
-        FROM auditcore.audit_findings
-        WHERE tenant_id=(SELECT tenant_id FROM auditcore.sku_resolution_runs ORDER BY started_at_utc DESC LIMIT 1)
-          AND finding_type='MODEL_NOT_IDENTIFIED' AND coalesce(status,'OPEN') NOT IN ('RESOLVED','CLOSED')
-        GROUP BY 1,2 ORDER BY 3 DESC""", ()),
+    ("Which tenant id is which Project (name as shown in the app)", ["tenant", "project name", "code", "status", "journeys", "SKU runs"],
+     """SELECT p.tenant_id, p.project_name, p.project_code, p.project_status,
+               (SELECT count(*) FROM auditcore.journeys j WHERE j.tenant_id=p.tenant_id),
+               (SELECT count(*) FROM auditcore.sku_resolution_runs r WHERE r.tenant_id=p.tenant_id)
+        FROM auditcore.projects p ORDER BY 5 DESC""", ()),
 ]
 try:
     url = re.sub(r"^postgresql\+\w+://", "postgresql://", os.environ["DATABASE_URL"])
