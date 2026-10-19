@@ -1,0 +1,42 @@
+name: One-shot DI delete 500 diagnosis (read-only)
+
+# READ-ONLY: Railway variable/log reads and SELECTs on a read-only session. Posts a redacted report as an issue.
+on:
+  push:
+    branches: [claude/di-delete-diagnosis]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -q "psycopg[binary]" && npm install --global @railway/cli
+      - name: Collect DI settings and logs
+        shell: bash
+        run: |
+          set -uo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service di-api --json >/tmp/link.json
+          for s in di-api di-worker di-worker-v2 verigence-audit-core Postgres; do
+            railway variable list --service "$s" --json >"/tmp/vars-$s.json" 2>/dev/null || echo '{}' >"/tmp/vars-$s.json"
+          done
+          railway logs --service di-api --lines 4000 >/tmp/di-api.log 2>/dev/null || true
+          railway logs --service Postgres --lines 4000 >/tmp/pg.log 2>/dev/null || true
+      - run: python .github/one-shot/di_delete_diagnosis.py
+      - name: Post report
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          test -f /tmp/report.md || echo 'No report produced.' > /tmp/report.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "DI delete 500 diagnosis (run $GITHUB_RUN_ID)" --body-file /tmp/report.md
