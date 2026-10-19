@@ -173,4 +173,109 @@ def backfill_document_sync_producers(
     return BackfillResult.model_validate(result)
 
 
-__all__ = ["backfill_document_sync_producers_for_tenant", "router"]
+_SKU_CORRELATION_ID = "backfill:sku-resolution"
+
+
+def _sku_counts(engine: Engine, *, tenant_id: str) -> tuple[int, int]:
+    """(journeys with a pinned SKU, journeys without one) among Journeys that have a product row."""
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        row = connection.execute(
+            text(
+                """
+                SELECT count(DISTINCT journey_id) FILTER (WHERE product_sku_id IS NOT NULL),
+                       count(DISTINCT journey_id) FILTER (WHERE product_sku_id IS NULL)
+                FROM auditcore.journey_products
+                WHERE tenant_id = :tenant_id
+                """
+            ),
+            {"tenant_id": tenant_id},
+        ).one()
+    return int(row[0] or 0), int(row[1] or 0)
+
+
+def backfill_sku_resolution_for_tenant(engine: Engine, *, tenant_id: str) -> dict[str, Any]:
+    """Run SKU resolution (booking model/price match, then the Delivery-invoice fallback) for
+    every Journey in the Project. These are the same idempotent producers the app runs when a
+    document is confirmed or "Run All Rules" is pressed; each Journey is its own transaction and
+    a failure is listed, never fatal to the rest."""
+    from audit_core.uc03_async_sync_tasks import (
+        sync_model_resolution_from_invoice_with_escalation,
+        sync_model_resolution_with_escalation,
+    )
+
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        journey_ids = list(
+            connection.execute(
+                text("SELECT journey_id FROM auditcore.journeys WHERE tenant_id = :tenant_id ORDER BY created_at_utc"),
+                {"tenant_id": tenant_id},
+            ).scalars().all()
+        )
+    with_sku_before, without_sku_before = _sku_counts(engine, tenant_id=tenant_id)
+
+    processed = 0
+    failed: list[str] = []
+    errors = 0
+    for journey_id in journey_ids:
+        try:
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                for resolve in (
+                    sync_model_resolution_with_escalation,
+                    sync_model_resolution_from_invoice_with_escalation,
+                ):
+                    result = resolve(
+                        connection, tenant_id=tenant_id, journey_id=journey_id,
+                        correlation_id=_SKU_CORRELATION_ID,
+                    )
+                    if result.get("error"):
+                        errors += 1
+            processed += 1
+        except Exception:
+            logger.warning(
+                "uc03_sku_backfill_journey_failed",
+                extra={"tenant_id": tenant_id, "journey_id": str(journey_id)},
+                exc_info=True,
+            )
+            failed.append(str(journey_id))
+
+    with_sku_after, without_sku_after = _sku_counts(engine, tenant_id=tenant_id)
+    return {
+        "tenantId": tenant_id,
+        "journeysConsidered": len(journey_ids),
+        "journeysProcessed": processed,
+        "journeysFailed": failed,
+        "withSkuBefore": with_sku_before,
+        "withSkuAfter": with_sku_after,
+        "withoutSkuBefore": without_sku_before,
+        "withoutSkuAfter": without_sku_after,
+        "stepErrors": errors,
+    }
+
+
+class SkuResolutionBackfillResult(BaseModel):
+    tenantId: str
+    journeysConsidered: int
+    journeysProcessed: int
+    journeysFailed: list[str]
+    withSkuBefore: int
+    withSkuAfter: int
+    withoutSkuBefore: int
+    withoutSkuAfter: int
+    stepErrors: int
+
+
+@router.post("/sku-resolution", response_model=SkuResolutionBackfillResult)
+def backfill_sku_resolution(
+    tenant_id: str,
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    engine: Annotated[Engine, Depends(get_engine)],
+) -> SkuResolutionBackfillResult:
+    del admin_request
+    return SkuResolutionBackfillResult.model_validate(
+        backfill_sku_resolution_for_tenant(engine, tenant_id=tenant_id)
+    )
+
+
+__all__ = ["backfill_document_sync_producers_for_tenant", "backfill_sku_resolution_for_tenant", "router"]
