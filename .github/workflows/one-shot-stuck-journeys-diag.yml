@@ -1,0 +1,40 @@
+name: One-shot stuck journeys diagnosis (DEV, read-only)
+
+# READ-ONLY. Railway logs since this morning for DI + Audit Core services, Railway
+# deployments, and the DI queue state (classification + extraction jobs, documents,
+# audit links). Prints aggregated, redacted output only. Never writes to any database.
+on:
+  push:
+    branches: [claude/stuck-journeys-diag]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -q "psycopg[binary]" && npm install --global @railway/cli
+      - name: Collect Railway logs, deployments and variables
+        shell: bash
+        run: |
+          set -uo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service di-api --json >/tmp/link.json
+          mkdir -p /tmp/rw
+          for s in di-api di-worker di-worker-v2 verigence-audit-core verigence-p2-worker; do
+            railway variable list --service "$s" --json >"/tmp/rw/vars-$s.json" 2>/dev/null || echo '{}' >"/tmp/rw/vars-$s.json"
+            railway deployment list --service "$s" --limit 15 --json >"/tmp/rw/dep-$s.json" 2>/dev/null || echo '[]' >"/tmp/rw/dep-$s.json"
+            railway logs --service "$s" --since 17h --lines 20000 >"/tmp/rw/log-$s.txt" 2>"/tmp/rw/logerr-$s.txt" || true
+            echo "$s: $(wc -l <"/tmp/rw/log-$s.txt") log lines; $(head -c 200 "/tmp/rw/logerr-$s.txt")"
+          done
+      - name: Summarise (read-only)
+        run: python .github/one-shot/stuck_journeys_diag.py
