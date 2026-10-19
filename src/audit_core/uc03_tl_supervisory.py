@@ -62,6 +62,7 @@ class TlSupervisoryCase(BaseModel):
     deliveryBusinessStatus: str | None
     deliveryBusinessDate: date | None
     responsiblePcActorId: str | None
+    responsiblePcName: str | None = None
     openFlagCount: int
     highestOpenSeverity: str | None
     latestActivityAtUtc: datetime
@@ -366,7 +367,8 @@ def list_tl_supervisory_cases(
                     (ds.first_started_at_utc AT TIME ZONE project.timezone_name)::date,
                     (delivery.created_at_utc AT TIME ZONE project.timezone_name)::date
                 ) AS delivery_business_date,
-                pc_submit.actor_id AS responsible_pc_actor_id,
+                COALESCE(pc_submit.actor_id, j.created_by_actor_id) AS responsible_pc_actor_id,
+                j.created_by_display_name AS responsible_pc_name,
                 COALESCE(findings.open_flag_count, 0) AS open_flag_count,
                 findings.highest_open_severity,
                 GREATEST(
@@ -451,6 +453,7 @@ def list_tl_supervisory_cases(
                 deliveryBusinessStatus=row["delivery_business_status"],
                 deliveryBusinessDate=row["delivery_business_date"],
                 responsiblePcActorId=row["responsible_pc_actor_id"],
+                responsiblePcName=row["responsible_pc_name"],
                 openFlagCount=int(row["open_flag_count"]),
                 highestOpenSeverity=row["highest_open_severity"],
                 latestActivityAtUtc=row["latest_activity_at_utc"],
