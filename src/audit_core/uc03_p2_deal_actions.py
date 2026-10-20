@@ -282,6 +282,8 @@ def set_pricing(
                    pricing_reason=EXCLUDED.pricing_reason,
                    pricing_set_by_actor_id=EXCLUDED.pricing_set_by_actor_id,
                    pricing_set_at_utc=now(),
+                   -- A booking/invoice-date choice replaces any TL-approved list.
+                   pricing_price_list_version_id=NULL,
                    updated_at_utc=now()
             """
         ),

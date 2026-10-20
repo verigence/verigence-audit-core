@@ -84,16 +84,25 @@ def _price_plan_for_journey(
     journey_id: UUID,
     effective_on: date,
 ) -> dict[str, Any]:
-    selected_price_list_id = connection.execute(
+    booking = connection.execute(
         text(
             """
-            SELECT price_list_id
+            SELECT price_list_id, pricing_price_list_version_id
             FROM auditcore.bookings
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).scalar_one_or_none()
+    ).mappings().one_or_none() or {}
+    selected_price_list_id = booking.get("price_list_id")
+    approved_version_id = booking.get("pricing_price_list_version_id")
+    if approved_version_id is not None:
+        # A Team Lead approved pricing this Journey on one specific version
+        # (another month's list, or another version of the same day): that
+        # version, whatever the date says.
+        approved = _plan_row(connection, tenant_id=tenant_id, version_id=approved_version_id)
+        if approved is not None:
+            return approved
 
     if selected_price_list_id is None:
         try:
@@ -124,6 +133,12 @@ def _price_plan_for_journey(
         if fallback is None:
             raise
         return fallback
+    row = _plan_row(connection, tenant_id=tenant_id, version_id=version_id)
+    assert row is not None
+    return row
+
+
+def _plan_row(connection: Connection, *, tenant_id: str, version_id: Any) -> dict[str, Any] | None:
     row = connection.execute(
         text(
             """
@@ -145,7 +160,7 @@ def _price_plan_for_journey(
             """
         ),
         {"tenant_id": tenant_id, "version_id": version_id},
-    ).mappings().one()
-    return dict(row)
+    ).mappings().one_or_none()
+    return dict(row) if row else None
 
 
