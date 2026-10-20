@@ -115,6 +115,7 @@ from audit_core.uc03_p2_deal_actions import router as uc03_p2_deal_router
 from audit_core.uc03_p2_documents import router as uc03_p2_documents_router
 from audit_core.uc03_p2_journey360_api import router as uc03_p2_journey360_router
 from audit_core.uc03_p2_live import router as uc03_p2_live_router
+from audit_core.uc03_p2_resplit import router as uc03_p2_resplit_router
 from audit_core.uc03_p2_reviewer import router as uc03_p2_reviewer_router
 from audit_core.uc03_p2_vehicle_photos import router as uc03_p2_vehicle_photos_router
 from audit_core.uc03_pc_booking_documents import (
@@ -271,6 +272,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_model_selection_corrections_router)
     application.include_router(uc03_p2_router)
     application.include_router(uc03_p2_documents_router)
+    application.include_router(uc03_p2_resplit_router)
     application.include_router(uc03_p2_journey360_router)
     application.include_router(uc03_p2_live_router)
     application.include_router(uc03_p2_reviewer_router)
