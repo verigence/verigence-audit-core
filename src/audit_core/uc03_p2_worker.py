@@ -3288,8 +3288,24 @@ def refresh_journey_dates(engine: Engine) -> None:
                     ).all()
                 for journey_id, _ in cleared:
                     logger.info("delivery_date_before_floor_cleared", tenant_id=tenant_id, journey_id=str(journey_id))
+            # Date reviews for documents still filed under an old DI key
+            # (booking_docket / payment_receipt) were never raised.
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                legacy = connection.execute(
+                    text("SELECT DISTINCT journey_id FROM auditcore.evidence WHERE tenant_id=:t "
+                         "AND association_status='ACTIVE' AND document_type_key IN ('booking_docket','payment_receipt')"),
+                    {"t": tenant_id},
+                ).scalars().all()
+            reviews_raised = 0
+            for journey_id in legacy:
+                with engine.begin() as connection:
+                    set_tenant_context(connection, tenant_id)
+                    outcome = sync_field_review_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
+                reviews_raised += int((outcome or {}).get("RAISED", 0))
             logger.info("journey_dates_refreshed", tenant_id=tenant_id, journeys=len(journeys),
-                        booking_dates_changed=changed)
+                        booking_dates_changed=changed, legacy_type_journeys=len(legacy),
+                        date_reviews_raised=reviews_raised)
         except Exception:
             logger.warning("journey_dates_refresh_failed", tenant_id=tenant_id, exc_info=True)
 
