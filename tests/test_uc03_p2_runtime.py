@@ -232,7 +232,7 @@ def test_failures_back_off_then_dead_letter_and_fail_the_page(journey, monkeypat
     assert task["task_type"] == "PC_UPLOAD_STATUS" and task["assigned_role_code"] == "PC"
     assert task["severity"] == "HIGH" and task["task_status"] == "READY"
     assert task["title"] == "scan.pdf: 1 page could not be processed"
-    assert "Upload page 1 of scan.pdf on its own" in task["description"]
+    assert "Page 1 could not be processed: upload it on its own" in task["description"]
     assert task["reference"]["pageNumbers"] == [1] and task["reference"]["retrying"] is False
 
 

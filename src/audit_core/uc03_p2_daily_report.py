@@ -134,6 +134,7 @@ def _empty_counts() -> dict[str, Any]:
         "files": 0, "pages": 0, "duplicateFiles": 0,
         "documents": {"extracted": 0, "readNoValues": 0, "notRead": 0, "waiting": 0, "failed": 0, "rejectedScans": 0},
         "rejections": dict.fromkeys(_REJECTION_REASONS, 0),
+        "pageMath": {"multiPageDocuments": 0, "pagesInMultiPage": 0, "repeatPages": 0},
         "tasksOpened": 0, "tasksOpenedPc": 0, "tasksOpenedTl": 0, "tasksReopened": 0,
         "autoRetries": 0, "retriesExhausted": 0, "pcRetries": 0, "readAgain": 0, "resyncs": 0,
         "nightRequests": 0, "nightFixed": 0,
@@ -179,10 +180,11 @@ def build_daily_processing_report(
     units = connection.execute(
         text(
             """
-            SELECT q.batch_id, q.queue_status, q.last_error
+            SELECT q.batch_id, q.queue_status, q.last_error, q.unit_kind,
+                   COALESCE(cardinality(q.page_numbers), 1) AS unit_pages
             FROM auditcore.p2_document_queue q
             WHERE q.tenant_id=:t AND q.batch_id = ANY(:batches)
-              AND q.queue_status NOT IN ('MERGED','CANCELLED')
+              AND q.queue_status <> 'MERGED'
             """
         ),
         {"t": tenant_id, "batches": batch_ids},
@@ -330,6 +332,16 @@ def build_daily_processing_report(
             for unit in by_batch.get(batch_id, []):
                 status = str(unit["queue_status"])
                 docs = row["documents"]
+                # How the pages became documents (2026-10-20: "48 pages but
+                # 41 documents, where are the other pages?"): the pages of
+                # a multi-page document make one document, and a page
+                # repeated within the upload is dropped.
+                if status == "CANCELLED":
+                    row["pageMath"]["repeatPages"] += 1
+                    continue
+                if str(unit["unit_kind"]) == "GROUP":
+                    row["pageMath"]["multiPageDocuments"] += 1
+                    row["pageMath"]["pagesInMultiPage"] += int(unit["unit_pages"] or 1)
                 if status == "READY":
                     docs["extracted"] += 1
                 elif status == "NEEDS_REVIEW":

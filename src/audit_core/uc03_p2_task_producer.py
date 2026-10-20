@@ -589,6 +589,57 @@ def _pages_text(pages: list[int]) -> str:
     return "pages " + ", ".join(str(p) for p in pages[:-1]) + f" and {pages[-1]}"
 
 
+_REASON_WORDS = {"faded": "too faded", "blurred": "blurred", "tooSmall": "too small",
+                 "unreadable": "unreadable", "other": "not clear enough"}
+
+
+def _failed_pages_text(filename: str, failed_errors: list[str], failed_pages: list[int],
+                       failed_reason: str | None) -> tuple[str, str]:
+    """The task for a file with pages that were not read, saying which were
+    rejected at upload by the scan-quality check (and why) and which failed
+    otherwise (product owner 2026-10-20: the task must say the document was
+    rejected, not leave the PC to find out on the card)."""
+    from audit_core.uc03_p2_daily_report import rejection_reason
+
+    rejected: dict[str, list[int]] = {}
+    other: list[int] = []
+    for item in failed_errors:
+        page_text, _, error = str(item).partition("|")
+        page = int(page_text)
+        reason = rejection_reason(error)
+        if reason is None:
+            if page not in other:
+                other.append(page)
+        elif page not in rejected.setdefault(reason, []):
+            rejected[reason].append(page)
+    if not failed_errors:
+        other = list(failed_pages)
+    n_rejected = sum(len(v) for v in rejected.values())
+    parts = []
+    if n_rejected:
+        parts.append(f"{n_rejected} page{'' if n_rejected == 1 else 's'} rejected at upload")
+    if other:
+        parts.append(f"{len(other)} page{'' if len(other) == 1 else 's'} could not be processed")
+    title = f"{filename}: " + ", ".join(parts)
+    sentences = []
+    if n_rejected:
+        why = "; ".join(f"{_pages_text(pages).capitalize()} {'is' if len(pages) == 1 else 'are'} "
+                        f"{_REASON_WORDS.get(reason, 'not clear enough')}"
+                        for reason, pages in rejected.items())
+        sentences.append(f"Rejected by the scan-quality check and not read: {why}. Scan "
+                         f"{'it' if n_rejected == 1 else 'them'} again in good light, flat and in focus, and "
+                         "upload from Upload / Edit Documents.")
+    if other:
+        reason = (failed_reason or "").strip() if not n_rejected else ""
+        sentences.append((f"{reason} " if reason else "")
+                         + f"{_pages_text(other).capitalize()} could not be processed: upload "
+                         f"{'it' if len(other) == 1 else 'them'} on {'its' if len(other) == 1 else 'their'} own "
+                         "from Upload / Edit Documents (or retry from the card).")
+    sentences.append("This task closes itself once the pages are processed; delete this booking if nothing on "
+                     "it can be used.")
+    return title, " ".join(sentences)
+
+
 def sync_processing_failure_tasks(
     connection: Connection,
     *,
@@ -623,7 +674,10 @@ def sync_processing_failure_tasks(
                      AS working,
                    COALESCE(array_agg(DISTINCT p.page ORDER BY p.page)
                             FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')), ARRAY[]::int[]) AS failed_pages,
-                   MIN(q.status_reason) FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')) AS failed_reason
+                   MIN(q.status_reason) FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')) AS failed_reason,
+                   COALESCE(array_agg(p.page::text || '|' || COALESCE(q.last_error, '') ORDER BY p.page)
+                            FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')), ARRAY[]::text[])
+                     AS failed_errors
             FROM auditcore.p2_upload_batches b
             LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id=b.tenant_id AND q.batch_id=b.batch_id
             LEFT JOIN LATERAL unnest(COALESCE(q.page_numbers, ARRAY[q.page_number])) AS p(page) ON true
@@ -651,14 +705,8 @@ def sync_processing_failure_tasks(
                                "again from Upload / Edit Documents, or delete this booking if nothing on it can be "
                                "used. This task closes itself once the file is processed.")
             else:
-                n = len(failed_pages)
-                title = f"{filename}: {n} page{'' if n == 1 else 's'} could not be processed"
-                reason = (row["failed_reason"] or "").strip()
-                description = ((f"{reason} " if reason else "")
-                               + f"Upload {_pages_text(failed_pages)} of {filename} on "
-                               f"{'its' if n == 1 else 'their'} own as {'a separate file' if n == 1 else 'separate files'} "
-                               "from Upload / Edit Documents (or retry each from its card). This task closes itself "
-                               "once the pages are processed; delete this booking if nothing on it can be used.")
+                title, description = _failed_pages_text(filename, row["failed_errors"] or [],
+                                                        failed_pages, row["failed_reason"])
         elif in_progress and age >= _UPLOAD_STATUS_AFTER_SECONDS:
             severity = "INFO"
             title = f"{filename}: {done} of {total} pages read, still working"
