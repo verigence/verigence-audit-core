@@ -41,6 +41,14 @@ from audit_core.uc03_p2_access import (
 from audit_core.uc03_p2_controls import control_statistics
 from audit_core.uc03_p2_dates import parse_extracted_date, programme_date_floor
 from audit_core.uc03_p2_document_health import journey_document_health
+from audit_core.uc03_p2_journey_views import (
+    ALL_VIEWS,
+    BREAKDOWN_SQL,
+    COUNTS_SQL,
+    SCOPED_SQL,
+    counts_from_row,
+    view_sql,
+)
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_reviewer import page_stage_code, stage_is_reviewed
 from audit_core.uc03_p2_runtime import (
@@ -434,6 +442,13 @@ def cancel_p2_journey(
     return {"journeyId": str(journey_id), "status": "BOOKING_CANCELLED"}
 
 
+def _project_timezone(connection: Connection, tenant_id: str) -> str:
+    return connection.execute(
+        text("SELECT COALESCE(MAX(timezone_name), 'Asia/Kolkata') FROM auditcore.projects WHERE tenant_id=:t"),
+        {"t": tenant_id},
+    ).scalar_one()
+
+
 @router.get("/journeys")
 def list_p2_journeys(
     tenant_id: str,
@@ -443,11 +458,19 @@ def list_p2_journeys(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
     q: str | None = None,
-    limit: int = 100,
+    limit: int = 50,
     state: str = "all",
+    view: str | None = None,
+    offset: int = 0,
+    month: str | None = None,
+    outlet_id: UUID | None = None,
+    pc_actor_id: str | None = None,
 ) -> dict[str, Any]:
-    """Bookings / Journey 360 list. ``state``: open (not yet delivered),
-    closed (delivered or cancelled) or all."""
+    """Bookings / Journey 360 list, one page of one tab (uc03_p2_journey_views):
+    ``view`` names the tab (``state`` open / closed / all is the older
+    spelling), ``offset`` / ``limit`` the page (50 by default), and ``month``
+    (YYYY-MM, the month the journey was started), ``outlet_id`` and
+    ``pc_actor_id`` narrow it. ``nextOffset`` is set when there is more."""
     _authorize(
         connection,
         tenant_id=tenant_id,
@@ -457,76 +480,20 @@ def list_p2_journeys(
         permission_key=_READ_PERMISSION,
     )
     search = (q or "").strip()
-    # Page first, then count: the page of journeys is chosen from indexed
-    # columns (newest activity first) and every count below is an indexed
-    # per-journey lookup for just that page -- never a tenant-wide
-    # aggregation, which is what timed the list out on real data.
+    chosen = view if view in ALL_VIEWS else (state if state in {"open", "closed", "all"} else "all")
+    where, order = view_sql(chosen)
+    page_size = min(max(limit, 1), 250)
+    # The tab's page is chosen from small flag sets joined to the journeys in
+    # scope (uc03_p2_journey_views); every figure below is an indexed
+    # per-journey lookup for just that page.
     rows = connection.execute(
         text(
-            """
-            WITH page AS (
-                SELECT j.tenant_id, j.journey_id, j.journey_reference, j.customer_id, j.dealer_id,
-                       j.outlet_id, j.created_at_utc, j.updated_at_utc,
-                       COALESCE(c.legal_name, c.display_name) AS customer_name, c.mobile_last4,
-                       d.dealer_name, o.outlet_name, o.outlet_code,
-                       NULLIF(concat_ws(' · ',
-                         NULLIF(jp.model_name_snapshot,''),
-                         NULLIF(jp.variant_name_snapshot,''),
-                         NULLIF(jp.colour_name_snapshot,'')
-                       ), '') AS vehicle,
-                       j.created_by_display_name AS pc_name
-                FROM auditcore.journeys j
-                JOIN auditcore.customers c
-                  ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
-                JOIN auditcore.dealers d
-                  ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
-                JOIN auditcore.dealer_outlets o
-                  ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id AND o.outlet_id=j.outlet_id
-                LEFT JOIN auditcore.journey_products jp
-                  ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
-                WHERE j.tenant_id=:tenant_id
-                  AND EXISTS (
-                    SELECT 1
-                    FROM auditcore.business_assignments ba
-                    WHERE ba.tenant_id=j.tenant_id
-                      AND ba.security_actor_id=:actor_id
-                      AND ba.assignment_status='ACTIVE'
-                      AND ba.effective_from <= now()
-                      AND (ba.effective_to IS NULL OR ba.effective_to >= now())
-                      AND (
-                        ba.dealer_id IS NULL
-                        OR (
-                          ba.dealer_id=j.dealer_id
-                          AND (ba.outlet_id IS NULL OR ba.outlet_id=j.outlet_id)
-                        )
-                      )
-                  )
-                  AND (
-                    CAST(:state AS varchar) = 'all'
-                    -- Closed means the stage engine completed the Delivery (or the
-                    -- Booking was cancelled). The Gate Pass date in deliveries is
-                    -- the day the vehicle went out, never completion.
-                    OR (CAST(:state AS varchar) = 'closed') = (
-                      EXISTS (SELECT 1 FROM auditcore.journey_stage_states st
-                              WHERE st.tenant_id=j.tenant_id AND st.journey_id=j.journey_id
-                                AND ((st.stage_code='DELIVERY' AND st.business_completed_at_utc IS NOT NULL)
-                                     OR (st.stage_code='BOOKING'
-                                         AND (st.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING')
-                                              OR st.closure_disposition='NO_DELIVERY'))))
-                    )
-                  )
-                  AND (
-                    :search = ''
-                    OR c.display_name ILIKE '%' || :search || '%'
-                    OR COALESCE(c.legal_name,'') ILIKE '%' || :search || '%'
-                    OR d.dealer_name ILIKE '%' || :search || '%'
-                    OR o.outlet_name ILIKE '%' || :search || '%'
-                    OR COALESCE(jp.model_name_snapshot,'') ILIKE '%' || :search || '%'
-                    OR COALESCE(j.journey_reference,'') ILIKE '%' || :search || '%'
-                    OR j.journey_id::text ILIKE '%' || :search || '%'
-                  )
-                ORDER BY j.updated_at_utc DESC, j.journey_id DESC
-                LIMIT :limit
+            "WITH " + SCOPED_SQL + f""",
+            page AS (
+                SELECT s.*, ROW_NUMBER() OVER (ORDER BY {order}) AS page_order FROM scoped s
+                WHERE {where}
+                ORDER BY {order}
+                LIMIT :limit OFFSET :offset
             )
             SELECT p.journey_id, p.journey_reference, p.customer_name, p.mobile_last4,
                    p.dealer_name, p.outlet_name, p.outlet_code, p.vehicle, p.created_at_utc, p.updated_at_utc,
@@ -733,7 +700,7 @@ def list_p2_journeys(
                 AND f.effective_value <> '""'::jsonb
               ORDER BY e.linked_at_utc DESC LIMIT 1
             ) gp ON true
-            ORDER BY p.updated_at_utc DESC, p.journey_id DESC
+            ORDER BY p.page_order
             """
         ),
         {
@@ -741,10 +708,16 @@ def list_p2_journeys(
             "actor_id": human_principal.subject,
             "search": search,
             "date_floor": programme_date_floor() or date(1900, 1, 1),
-            "limit": min(max(limit, 1), 250),
-            "state": state if state in {"open", "closed", "all"} else "all",
+            "limit": page_size + 1,
+            "offset": max(offset, 0),
+            "outlet_id": str(outlet_id) if outlet_id else None,
+            "pc_actor_id": (pc_actor_id or "").strip() or None,
+            "month": month if month and re.fullmatch(r"\d{4}-\d{2}", month) else None,
+            "timezone": _project_timezone(connection, tenant_id),
         },
     ).mappings().all()
+    more = len(rows) > page_size
+    rows = rows[:page_size]
 
     items: list[dict[str, Any]] = []
     for row in rows:
@@ -764,8 +737,63 @@ def list_p2_journeys(
         gate_pass = parse_extracted_date(item.pop("gate_pass_date", None))
         if gate_pass is not None:
             item["delivered_at"] = gate_pass.isoformat()
+        item.pop("page_order", None)
         items.append(item)
-    return {"items": items}
+    return {"items": items, "view": chosen, "offset": max(offset, 0),
+            "nextOffset": max(offset, 0) + page_size if more else None}
+
+
+@router.get("/journeys:counts")
+def journey_view_counts(
+    tenant_id: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+    q: str | None = None,
+    month: str | None = None,
+    outlet_id: UUID | None = None,
+    pc_actor_id: str | None = None,
+    breakdown: bool = False,
+) -> dict[str, Any]:
+    """How many journeys each list tab holds, under the same filters as the
+    list. ``breakdown`` adds open / needs TL / overdue / high-risk / stuck
+    per outlet and per PC (the TL / PM strip)."""
+    _authorize(
+        connection, tenant_id=tenant_id, journey_id=None, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_READ_PERMISSION,
+    )
+    params = {
+        "tenant_id": tenant_id,
+        "actor_id": human_principal.subject,
+        "search": (q or "").strip(),
+        "outlet_id": str(outlet_id) if outlet_id else None,
+        "pc_actor_id": (pc_actor_id or "").strip() or None,
+        "month": month if month and re.fullmatch(r"\d{4}-\d{2}", month) else None,
+        "timezone": _project_timezone(connection, tenant_id),
+    }
+    counts = counts_from_row(connection.execute(text(COUNTS_SQL), params).mappings().one())
+    result: dict[str, Any] = {"counts": counts}
+    if breakdown:
+        def rows(key_columns: str, group_by: str) -> list[dict[str, Any]]:
+            sql = BREAKDOWN_SQL.format(key_columns=key_columns, group_by=group_by)
+            out = []
+            for row in connection.execute(text(sql), params).mappings().all():
+                item = dict(row)
+                for key in ("open", "needs_tl", "overdue", "high_risk", "stuck", "closed"):
+                    item[key] = int(item[key] or 0)
+                out.append(item)
+            return out
+
+        result["byOutlet"] = [
+            {**r, "outlet_id": str(r["outlet_id"])}
+            for r in rows("s.outlet_id, MAX(s.outlet_name) AS outlet_name, MAX(s.outlet_code) AS outlet_code",
+                          "s.outlet_id")
+        ]
+        result["byPc"] = rows("s.created_by_actor_id AS pc_actor_id, MAX(s.pc_name) AS pc_name",
+                              "s.created_by_actor_id")
+    return result
 
 
 @router.get("/journeys:summary")
