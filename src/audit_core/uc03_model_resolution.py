@@ -1931,6 +1931,13 @@ def _settle(
     if len(matched) == 1:
         return {"matched": matched, "matchStage": stage, "guess": fuzzy}
     if matched:
+        by_words = _variant_words_pick(matched, inputs)
+        if by_words is not None:
+            logger.info(
+                "model_resolution_variant_words_settled tenant=%s shortlist=%d stage=%s sku=%s",
+                tenant_id, len(matched), stage, by_words["sku_code"],
+            )
+            return {"matched": [by_words], "matchStage": "VARIANT_WORDS", "guess": False}
         picked = _price_pick(matched, inputs)
         if picked is not None:
             logger.info(
@@ -1942,6 +1949,41 @@ def _settle(
         return {"matched": matched, "matchStage": stage, "guess": fuzzy or stage == _CATALOGUE_STAGE}
     matched, stage = _catalogue_search(rows, inputs, oem_code=_oem_code_for_tenant(connection, tenant_id=tenant_id))
     return {"matched": matched, "matchStage": stage, "guess": True}
+
+
+# Words a price-list variant name carries that a document never repeats:
+# the emission norm, the refresh tag, the registration it is priced for.
+_VARIANT_NOISE = frozenset({"BS6", "BS6.2", "BSVI", "BS-VI", "VI", "REFRESH", "E", "PRIVATE", "COMMERCIAL"})
+
+
+def _literal_words(value: str | None) -> set[str]:
+    """The words as printed, kept literal: "1.7" and "1.7L" are different
+    words here (in the Maxx HD price list they are different vehicles)."""
+    return {w for w in re.split(r"[^A-Z0-9.+]+", str(value or "").upper()) if w and w != "."}
+
+
+def _variant_words_pick(rows: list[dict[str, Any]], inputs: dict[str, Any]) -> dict[str, Any] | None:
+    """The one row of a shortlist every word of whose variant name the
+    document itself prints (2026-10-20: invoices reading "BOL MAXX PUP HD 1.7
+    LX" were left with 11 Maxx HD rows to pick from although only "MAXX HD
+    1.7 LX BS6.2" is named by every word). Model words and price-list noise
+    (BS6.2, Refresh, Private/Commercial) are set aside; the row naming the
+    most words wins, and only when no other row names as many: a tie (the
+    Private and Commercial lines of one variant) is left to the PC."""
+    said = _literal_words(f"{inputs.get('model_name') or ''} {inputs.get('variant_name') or ''}")
+    if not said:
+        return None
+    best: list[tuple[int, dict[str, Any]]] = []
+    for row in rows:
+        words = _literal_words(row.get("variant_name")) - _literal_words(row.get("model_name")) - _VARIANT_NOISE
+        if not words or not words <= said:
+            continue
+        best.append((len(words), row))
+    if not best:
+        return None
+    top = max(n for n, _ in best)
+    winners = [row for n, row in best if n == top]
+    return winners[0] if len(winners) == 1 else None
 
 
 _DISPLACEMENT = re.compile(r"(\d+\.\d+)\s*L?\b", re.IGNORECASE)

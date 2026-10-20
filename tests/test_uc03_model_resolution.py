@@ -2003,7 +2003,9 @@ def test_integration_a_wide_fuzzy_shortlist_is_settled_by_the_ex_showroom_price(
     not an on-road total and must not drag the pick to the CBC row."""
     c = mahindra_journey
     lx_17l, *_ = _seed_maxx_hd(c)
-    _set_journey_product(c, "MAXX HD 1.7L LX", "LX")
+    # A reading that does not name the variant word for word (since
+    # 2026-10-20 "MAXX HD 1.7L LX" itself is settled by its words, below).
+    _set_journey_product(c, "MAXX HD", "LX")
     _set_commercial(c, "ex_showroom_price", "996500.00")
     _set_commercial(c, "total_price", "996500.00")
 
@@ -2019,13 +2021,28 @@ def test_integration_a_wide_shortlist_stays_a_task_when_no_price_singles_one_out
     reported as before, nothing is guessed."""
     c = mahindra_journey
     _seed_maxx_hd(c)
-    _set_journey_product(c, "MAXX HD 1.7L LX", "LX")
+    _set_journey_product(c, "MAXX HD", "LX")
     _set_commercial(c, "ex_showroom_price", "985000.00")
 
     result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     assert result.get("raised") is True, result
     assert result["candidateCount"] > 1
     assert _open_model_flags(c) == 1
+
+
+def test_integration_the_invoice_wording_pins_the_variant_it_names(mahindra_journey) -> None:
+    """2026-10-20: invoices printing "BOL MAXX PUP HD 1.7 LX" were left with
+    every Maxx HD row. Only "MAXX HD 1.7 LX BS6.2" is named by every word
+    ("1.7L" is a different vehicle), with no price to help."""
+    c = mahindra_journey
+    _lx_17l, lx_17, *_ = _seed_maxx_hd(c)
+    _set_journey_product(c, "BOL MAXX PUP HD 1.7 LX", "HD 1.7 LX")
+
+    result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert result.get("resolved") is True, result
+    assert result["matchStage"] == "VARIANT_WORDS"
+    assert _pinned(c) == lx_17
+    assert _open_model_flags(c) == 0
 
 
 def test_integration_an_open_finding_follows_the_latest_run(mahindra_journey) -> None:
@@ -2050,7 +2067,7 @@ def test_integration_an_open_finding_follows_the_latest_run(mahindra_journey) ->
 
     # The Booking Form is read: the model resolves, the price is between rows.
     c.execute(
-        text("UPDATE auditcore.journey_products SET model_name_snapshot='MAXX HD 1.7L LX', variant_name_snapshot='LX' "
+        text("UPDATE auditcore.journey_products SET model_name_snapshot='MAXX HD', variant_name_snapshot='LX' "
              "WHERE tenant_id=:t AND journey_id=:j"),
         {"t": c.tenant_id, "j": c.journey_id},
     )
@@ -2063,7 +2080,7 @@ def test_integration_an_open_finding_follows_the_latest_run(mahindra_journey) ->
         {"t": c.tenant_id, "f": finding_id},
     ).mappings().one()
     assert after["title"] == "Vehicle model matched multiple price-master SKUs"
-    assert "MAXX HD 1.7L LX" in after["description"] and f"matched {second['candidateCount']}" in after["description"]
+    assert "MAXX HD" in after["description"] and f"matched {second['candidateCount']}" in after["description"]
     events = c.execute(
         text("SELECT event_type, safe_payload FROM auditcore.audit_finding_events "
              "WHERE tenant_id=:t AND audit_finding_id=:f ORDER BY occurred_at_utc"),
