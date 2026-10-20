@@ -158,3 +158,27 @@ def test_tasks_on_a_journey_not_uploaded_that_day_are_reported_apart(journey):
     assert pc["tasksOpened"] == 0
     assert pc["earlier"]["journeys"] == 1 and pc["earlier"]["tasksOpened"] == 1
     assert report["journeys"][0]["uploadedOnDay"] is False
+
+
+def test_rejections_at_upload_are_counted_by_reason_and_by_day(journey):
+    """2026-10-20: the daily report shows how many pages the scan-quality check
+    rejected, why, and the last 14 days, to judge what is being uploaded."""
+    tl = _tl(journey)
+    _b1, faded, _ = add_page(journey, page_number=1, status="FAILED")
+    _b2, blurred, _ = add_page(journey, page_number=2, status="FAILED")
+    add_page(journey, page_number=3, status="READY")
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        for queue_id, code in ((faded, "DI_QUALITY_IMAGE_CONTRAST"), (blurred, "DI_QUALITY_IMAGE_BLUR_SCORE")):
+            c.execute(text("UPDATE auditcore.p2_document_queue SET last_error=:e WHERE queue_id=:q"),
+                      {"e": code, "q": queue_id})
+
+    report = _report(journey, tl)
+    quality = report["quality"]
+    assert quality["documents"] == 3 and quality["rejected"] == 2
+    assert quality["rejectedPct"] == 66.7
+    assert quality["byReason"]["faded"] == 1 and quality["byReason"]["blurred"] == 1
+    assert report["pcs"][0]["rejections"]["faded"] == 1
+    assert len(report["trend"]) == 14
+    today = report["trend"][-1]
+    assert today["day"] == report["day"] and today["rejected"] == 2 and today["documents"] == 3
