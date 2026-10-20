@@ -660,6 +660,13 @@ def list_p2_journeys(
               SELECT COALESCE((
                 SELECT SUM(cur.current - cl.standard_amount)
                 FROM auditcore.commercial_lines cl
+                CROSS JOIN LATERAL (
+                  SELECT EXISTS (
+                    SELECT 1 FROM auditcore.commercial_line_source_values s
+                    WHERE s.tenant_id=p.tenant_id AND s.journey_id=p.journey_id
+                      AND s.source_document_type IN ('customer_invoice_dms','tax_invoice_tally')
+                  ) AS invoiced
+                ) vi
                 LEFT JOIN LATERAL (
                   SELECT COALESCE(
                     (SELECT s.amount FROM auditcore.commercial_line_source_values s
@@ -668,12 +675,15 @@ def list_p2_journeys(
                         AND s.source_document_type NOT IN ('booking_form','booking_docket','order_taking_form',
                                                            'customer_ledger','cost_sheet')
                       ORDER BY s.updated_at_utc DESC LIMIT 1),
-                    (SELECT s.amount FROM auditcore.commercial_line_source_values s
-                      WHERE s.tenant_id=cl.tenant_id AND s.journey_id=cl.journey_id
-                        AND s.line_kind='COMMERCIAL' AND s.component_key=cl.component_key
-                        AND s.source_document_type IN ('booking_form','booking_docket','order_taking_form')
-                      ORDER BY s.updated_at_utc DESC LIMIT 1),
-                    cl.actual_amount) AS current
+                    -- Once the vehicle invoice is on file it alone prices
+                    -- the deal: no booking-form fallback.
+                    CASE WHEN NOT vi.invoiced THEN COALESCE(
+                      (SELECT s.amount FROM auditcore.commercial_line_source_values s
+                        WHERE s.tenant_id=cl.tenant_id AND s.journey_id=cl.journey_id
+                          AND s.line_kind='COMMERCIAL' AND s.component_key=cl.component_key
+                          AND s.source_document_type IN ('booking_form','booking_docket','order_taking_form')
+                        ORDER BY s.updated_at_utc DESC LIMIT 1),
+                      cl.actual_amount) END) AS current
                 ) cur ON true
                 WHERE cl.tenant_id=p.tenant_id AND cl.journey_id=p.journey_id
                   AND cl.standard_amount IS NOT NULL AND cur.current IS NOT NULL

@@ -257,28 +257,75 @@ def test_compliance_report_extends_legacy_with_ledger_and_verdict(journey):
     assert client.get(f"{base}/duplicates").json() == {"pairs": []}
 
 
-def test_partly_invoiced_deal_is_not_reported_short(journey):
-    """A component not billed yet keeps its booking value in the current
-    total, and variances compare only lines present on both sides."""
+def test_before_the_vehicle_invoice_a_component_keeps_its_booking_value(journey):
+    """Only an accessory invoice on file: a component not billed yet keeps its
+    booking value in the current total, and variances compare only lines
+    present on both sides."""
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
             text(
                 """
                 INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, standard_amount, actual_amount)
-                VALUES (:t, :j, 'ex_showroom_price', 1000000, 1000000), (:t, :j, 'registration_charges', 90000, 90000)
+                VALUES (:t, :j, 'ex_showroom_price', 1000000, 1000000), (:t, :j, 'accessories_cost', 20000, 20000)
                 """
             ),
             {"t": journey.tenant_id, "j": journey.journey_id},
         )
         _source(connection, journey, "COMMERCIAL", "ex_showroom_price", "booking_form", "1000000")
-        _source(connection, journey, "COMMERCIAL", "registration_charges", "booking_form", "90000")
-        _source(connection, journey, "COMMERCIAL", "ex_showroom_price", "tax_invoice_tally", "1000000")
+        _source(connection, journey, "COMMERCIAL", "accessories_cost", "booking_form", "20000")
+        _source(connection, journey, "COMMERCIAL", "accessories_cost", "accessory_invoice_dms", "20000")
         summary = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)["summary"]
-    assert Decimal(summary["net"]["current"]) == 1090000
+    assert summary["invoiceIsSourceOfTruth"] is False
+    assert Decimal(summary["net"]["current"]) == 1020000
     assert Decimal(summary["variance"]["currentVsStandard"]) == 0
-    assert Decimal(summary["variance"]["billedVsBooking"]) == 0
     assert summary["invoicedComponents"] == 1 and summary["components"] == 2
+
+
+def test_once_the_vehicle_invoice_is_on_file_only_the_invoice_counts(journey):
+    """Invoice is the source of truth: the booking form's figures no longer
+    price the deal or its variance. Here the booking quoted the vehicle
+    20,000 over standard; the invoice bills it at standard, so the variance
+    is zero, and the booking-only line drops out of the current total."""
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, standard_amount, actual_amount)
+                VALUES (:t, :j, 'ex_showroom_price', 1000000, 1000000), (:t, :j, 'registration_charges', 90000, 95000)
+                """
+            ),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+        _source(connection, journey, "COMMERCIAL", "ex_showroom_price", "booking_form", "1020000")
+        _source(connection, journey, "COMMERCIAL", "registration_charges", "booking_form", "95000")
+        _source(connection, journey, "COMMERCIAL", "ex_showroom_price", "tax_invoice_tally", "1000000")
+        _source(connection, journey, "DISCOUNT", "CORPORATE_PRIVILEGE", "booking_form", "5000")
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.discount_applications (
+                    tenant_id, journey_id, discount_key, standard_eligible_amount, actual_discount_amount,
+                    eligibility_result, actual_source_kind
+                ) VALUES (:t, :j, 'CORPORATE_PRIVILEGE', 0, 5000, 'NOT_ELIGIBLE', 'EVIDENCE')
+                """
+            ),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+        view = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    summary = view["summary"]
+    assert summary["invoiceIsSourceOfTruth"] is True
+    # Booking still shown for comparison, never used for the current figure.
+    assert Decimal(summary["net"]["booking"]) == 1110000
+    assert Decimal(summary["net"]["current"]) == 1000000
+    assert Decimal(summary["variance"]["currentVsStandard"]) == 0
+    rows = {r["key"]: r for g in view["categories"] for r in g["components"]}
+    assert rows["registration_charges"]["current"] is None
+    assert rows["registration_charges"]["variance"] is None
+    assert Decimal(rows["ex_showroom_price"]["variance"]) == 0
+    corporate = next(d for d in view["discounts"] if d["key"] == "CORPORATE_PRIVILEGE")
+    assert corporate["current"] is None and corporate["variance"] is None
 
 
 def test_discount_without_entitlement_is_an_over_grant(journey):

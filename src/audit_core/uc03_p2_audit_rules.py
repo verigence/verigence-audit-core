@@ -1340,7 +1340,8 @@ def queue_nightly_review(connection: Connection, *, tenant_id: str, today: date 
 
 def queue_nightly_sku_retry(connection: Connection, *, tenant_id: str, today: date | None = None) -> int:
     """Every night, run SKU resolution again for each open Journey that has a
-    vehicle model read but no confirmed SKU.
+    vehicle model read (off the Booking Form or the vehicle invoice) but no
+    confirmed SKU.
 
     Found 2026-10-20: SKU resolution ran only when a Booking document was
     first copied or the Booking checks re-ran because a document changed.
@@ -1355,9 +1356,17 @@ def queue_nightly_sku_retry(connection: Connection, *, tenant_id: str, today: da
         text(
             """
             SELECT j.journey_id FROM auditcore.journeys j
-            JOIN auditcore.journey_products jp ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
+            LEFT JOIN auditcore.journey_products jp ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
             WHERE j.tenant_id=:t AND j.review_completed_at_utc IS NULL
-              AND NULLIF(btrim(COALESCE(jp.model_name_snapshot,'')),'') IS NOT NULL
+              AND (NULLIF(btrim(COALESCE(jp.model_name_snapshot,'')),'') IS NOT NULL
+                   -- or no model off the Booking Form, but the vehicle
+                   -- invoice names one (the resolution reads it).
+                   OR EXISTS (SELECT 1 FROM auditcore.journey_document_extracted_fields f
+                               WHERE f.tenant_id=j.tenant_id AND f.journey_id=j.journey_id
+                                 AND f.source_document_type_key IN ('customer_invoice_dms','tax_invoice_tally',
+                                                                    'invoice_generic','wholesale_invoice')
+                                 AND f.field_key IN ('sku_code','model_name_raw','vehicle_description_raw')
+                                 AND f.effective_value IS NOT NULL))
               AND jp.selection_status IS DISTINCT FROM 'CONFIRMED'
               AND NOT EXISTS (SELECT 1 FROM auditcore.journey_stage_states s
                                WHERE s.tenant_id=j.tenant_id AND s.journey_id=j.journey_id AND s.stage_code='BOOKING'

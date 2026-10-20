@@ -71,3 +71,24 @@ def test_no_model_read_is_not_retried(journey):
     """Nothing to match: resolution would only skip again."""
     _product(journey, model=None, status=None)
     assert _queue(journey, date(2026, 10, 20)) == 0
+
+
+def test_no_booking_model_but_a_vehicle_invoice_model_is_retried(journey):
+    """Rule 2026-10-20: the resolution reads the vehicle invoice when the
+    Booking Form named no model, so such a Journey is retried too -- with or
+    without a journey_products row."""
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(
+            text(
+                """
+                INSERT INTO auditcore.journey_document_extracted_fields (
+                    tenant_id, journey_id, di_document_id, source_fact_version, stage_code,
+                    source_document_type_key, field_key, extracted_value, effective_value, is_modified
+                ) VALUES (:t, :j, gen_random_uuid(), 1, 'DELIVERY', 'customer_invoice_dms', 'model_name_raw',
+                          '"XUV 3XO"'::jsonb, '"XUV 3XO"'::jsonb, false)
+                """
+            ),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+    assert _queue(journey, date(2026, 10, 20)) == 1
