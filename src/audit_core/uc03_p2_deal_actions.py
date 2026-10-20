@@ -108,7 +108,7 @@ def _pricing_row(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
             SELECT b.booking_date, b.pricing_effective_on, b.pricing_basis, b.pricing_reason,
                    b.pricing_set_by_actor_id, b.pricing_set_at_utc,
                    jp.product_sku_id, jp.selection_status, jp.model_name_snapshot, jp.variant_name_snapshot,
-                   jp.colour_name_snapshot, s.sku_code, s.model_id, s.variant_id,
+                   jp.colour_name_snapshot, jp.vehicle_category, s.sku_code, s.model_id, s.variant_id,
                    cu.customer_type_code, rr.registration_type_code
             FROM auditcore.journeys j
             LEFT JOIN auditcore.bookings b ON b.tenant_id=j.tenant_id AND b.journey_id=j.journey_id
@@ -177,6 +177,7 @@ def pricing_summary(connection: Connection, *, tenant_id: str, journey_id: UUID)
         "sku": {
             "productSkuId": str(row["product_sku_id"]) if row["product_sku_id"] else None,
             "skuCode": row["sku_code"],
+            "category": row["vehicle_category"],
             "model": row["model_name_snapshot"],
             "variant": row["variant_name_snapshot"],
             "colour": row["colour_name_snapshot"],

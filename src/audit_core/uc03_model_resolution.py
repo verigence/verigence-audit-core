@@ -581,13 +581,30 @@ def _pin_sku(
             "method": method,
         },
     )
+    _close_sku_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
+
+
+def _close_sku_tasks(connection: Connection, *, tenant_id: str, journey_id: UUID) -> None:
+    from audit_core.uc03_sku_tasks import resolve_sku_tasks
+
+    sku_code = connection.execute(
+        text(
+            "SELECT s.sku_code FROM auditcore.journey_products jp "
+            "JOIN auditcore.product_skus s ON s.product_sku_id = jp.product_sku_id "
+            "WHERE jp.tenant_id = :t AND jp.journey_id = :j"
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one_or_none()
+    if sku_code is not None:
+        resolve_sku_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, sku_code=str(sku_code))
 
 
 _CORRECTION_SELECTION_METHOD = "MODEL_SELECTION_CORRECTION_V1"
 
 
 def reassign_confirmed_sku(
-    connection: Connection, *, tenant_id: str, journey_id: UUID, product_sku_id: UUID
+    connection: Connection, *, tenant_id: str, journey_id: UUID, product_sku_id: UUID,
+    method: str = _CORRECTION_SELECTION_METHOD,
 ) -> None:
     """Deliberately overwrite an already-CONFIRMED SKU selection.
 
@@ -640,9 +657,10 @@ def reassign_confirmed_sku(
             "tenant_id": tenant_id,
             "journey_id": journey_id,
             "product_sku_id": product_sku_id,
-            "method": _CORRECTION_SELECTION_METHOD,
+            "method": method,
         },
     )
+    _close_sku_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
 
 
 def _resolve_open_flag(
@@ -1376,6 +1394,7 @@ def _other_price_list_hits(
         if not found:
             continue
         hits.append({
+            "priceListVersionId": str(version["price_list_version_id"]),
             "priceList": _plan_label(dict(version)),
             "effectiveFrom": str(version["effective_from"]) if version["effective_from"] else None,
             "effectiveTo": str(version["effective_to"]) if version["effective_to"] else None,
@@ -1405,15 +1424,9 @@ def _sync_model_resolution_from_invoice_unguarded(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
 ) -> dict[str, Any]:
     """Delivery-side entry: a Journey with no SKU yet goes through the full
-    resolution (Booking Form first, then the vehicle invoice, raising
-    MODEL_NOT_IDENTIFIED when neither names one SKU); a Journey that already
-    has one gets the invoice cross-check.
-
-    The cross-check never re-pins a SKU already on the Journey (CONFIRMED or
-    merely tentative) -- it computes what the invoice itself implies and
-    hands it to ``check_invoice_sku_mismatch`` so a genuine disagreement is
-    never silently dropped. Idempotent, never raises.
-    """
+    resolution (Booking Form first, then the vehicle invoice); a Journey that
+    already has one is checked against the invoice, which wins (see
+    ``_invoice_cross_check``). Idempotent, never raises."""
     try:
         already_resolved = connection.execute(
             text(
@@ -1428,38 +1441,99 @@ def _sync_model_resolution_from_invoice_unguarded(
             return _sync_model_resolution_unguarded(
                 connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
             )
-
-        reading = _invoice_reading(connection, tenant_id=tenant_id, journey_id=journey_id)
-        if reading is None:
-            return {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False, "crossChecked": False}
-        inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id, require_model=False)
-        outcome = _invoice_candidates(
-            connection, tenant_id=tenant_id, journey_id=journey_id,
-            inputs=_invoice_inputs(inputs, reading), reading=reading,
+        return _invoice_cross_check(
+            connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+            current_sku_id=already_resolved,
         )
-        matched = [] if outcome.get("skipped") else outcome["matched"]
-        mismatch_flagged = False
-        implied = _invoice_implied_vehicle(matched, already_resolved)
-        if implied is not None:
-            invoice_sku_id, invoice_sku_code, invoice_label = implied
-            mismatch_flagged = invoice_sku_id != already_resolved
-            check_invoice_sku_mismatch(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                confirmed_sku_id=already_resolved,
-                invoice_sku_id=invoice_sku_id,
-                invoice_sku_code=invoice_sku_code,
-                correlation_id=correlation_id,
-                invoice_label=invoice_label,
-            )
-        return {
-            "skipped": True, "reason": "already_resolved",
-            "mismatchFlagged": mismatch_flagged, "crossChecked": implied is not None,
-        }
     except Exception as exc:
         logger.warning("sync_model_resolution_from_invoice failed", exc_info=True)
         return {"error": True, "errorType": type(exc).__name__, "errorMessage": str(exc)[:300]}
+
+
+_INVOICE_OVERRIDE_METHOD = "MODEL_RESOLUTION_INVOICE_OVERRIDE_V1"
+
+
+def _invoice_cross_check(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, current_sku_id: UUID,
+) -> dict[str, Any]:
+    """The Journey has a SKU; the vehicle invoice is the source of truth
+    (decision 2026-10-20). When the invoice names a different vehicle -- one
+    SKU, by name, never a closest-match guess -- the Journey takes the
+    invoice's SKU, is re-priced on it, and a Team Lead is told the model
+    changed. When the invoice names a model and variant but not which
+    colour, the colour on the Journey settles it; otherwise the PC is asked
+    for the reason (INVOICE_SKU_MISMATCH), as before."""
+    reading = _invoice_reading(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if reading is None:
+        return {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False, "crossChecked": False}
+    inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id, require_model=False)
+    outcome = _invoice_candidates(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+        inputs=_invoice_inputs(inputs, reading), reading=reading,
+    )
+    if outcome.get("skipped") or outcome["matchStage"] == _CATALOGUE_STAGE:
+        return {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False, "crossChecked": False}
+    matched = outcome["matched"]
+    if len(matched) > 1 and all(r["product_sku_id"] != current_sku_id for r in matched) and inputs["colour_name"]:
+        same_colour = _narrow(matched, variant=None, colour=inputs["colour_name"])
+        if len(same_colour) == 1:
+            matched = same_colour
+    implied = _invoice_implied_vehicle(matched, current_sku_id)
+    if implied is None:
+        return {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False, "crossChecked": False}
+    invoice_sku_id, invoice_sku_code, invoice_label = implied
+    if invoice_sku_id != current_sku_id and invoice_label is None:
+        before = _vehicle_snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
+        reassign_confirmed_sku(
+            connection, tenant_id=tenant_id, journey_id=journey_id, product_sku_id=invoice_sku_id,
+            method=_INVOICE_OVERRIDE_METHOD,
+        )
+        after = _vehicle_snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
+        # The disagreement is settled by the invoice: any open mismatch closes.
+        check_invoice_sku_mismatch(
+            connection, tenant_id=tenant_id, journey_id=journey_id, confirmed_sku_id=invoice_sku_id,
+            invoice_sku_id=invoice_sku_id, invoice_sku_code=invoice_sku_code, correlation_id=correlation_id,
+        )
+        _resolve_open_flag(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id)
+        _run_deal_reconciliation(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id)
+        from audit_core.uc03_sku_tasks import raise_model_changed_observation
+
+        raise_model_changed_observation(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                        before=before, after=after)
+        return {"resolved": True, "changed": True, "source": "INVOICE", "skuCode": invoice_sku_code,
+                "matchStage": outcome["matchStage"]}
+    mismatch_flagged = invoice_sku_id != current_sku_id
+    check_invoice_sku_mismatch(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        confirmed_sku_id=current_sku_id,
+        invoice_sku_id=invoice_sku_id,
+        invoice_sku_code=invoice_sku_code,
+        correlation_id=correlation_id,
+        invoice_label=invoice_label,
+    )
+    return {"skipped": True, "reason": "already_resolved", "mismatchFlagged": mismatch_flagged, "crossChecked": True}
+
+
+def _vehicle_snapshot(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    row = connection.execute(
+        text(
+            """
+            SELECT jp.product_sku_id, s.sku_code, jp.model_name_snapshot AS model,
+                   jp.variant_name_snapshot AS variant, jp.colour_name_snapshot AS colour
+            FROM auditcore.journey_products jp
+            LEFT JOIN auditcore.product_skus s ON s.product_sku_id = jp.product_sku_id
+            WHERE jp.tenant_id = :t AND jp.journey_id = :j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one_or_none() or {}
+    return {
+        "skuId": str(row.get("product_sku_id")) if row.get("product_sku_id") else None,
+        "skuCode": row.get("sku_code"), "model": row.get("model"), "variant": row.get("variant"),
+        "colour": row.get("colour"),
+    }
 
 
 def _current_match(
@@ -2248,6 +2322,15 @@ def _sync_model_resolution_unguarded(
         inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id, require_model=False)
 
         if inputs["product_sku_id"] is not None:
+            if raise_findings:
+                # The invoice is the source of truth: a SKU already on the
+                # Journey gives way to the one the invoice names.
+                checked = _invoice_cross_check(
+                    connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                    current_sku_id=inputs["product_sku_id"],
+                )
+                if checked.get("changed"):
+                    return checked
             resolved = _resolve_open_flag(
                 connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
             )
@@ -2276,7 +2359,9 @@ def _sync_model_resolution_unguarded(
             booking = _current_match(connection, tenant_id=tenant_id, journey_id=journey_id, inputs=inputs)
             if booking.get("skipped"):
                 return booking
-            if len(booking["matched"]) == 1:
+            # A closest-match guess (the catalogue search) is never pinned on
+            # its own: the PC accepts or rejects it (decision 2026-10-20).
+            if len(booking["matched"]) == 1 and booking["matchStage"] != _CATALOGUE_STAGE:
                 return pin(booking["matched"][0], booking["matchStage"], "BOOKING", _SELECTION_METHOD)
 
         reading = _invoice_reading(connection, tenant_id=tenant_id, journey_id=journey_id)
@@ -2291,7 +2376,7 @@ def _sync_model_resolution_unguarded(
                 if booking is None:
                     return invoice
                 invoice = None
-            elif len(invoice["matched"]) == 1:
+            elif len(invoice["matched"]) == 1 and invoice["matchStage"] != _CATALOGUE_STAGE:
                 return pin(invoice["matched"][0], invoice["matchStage"], "INVOICE", _INVOICE_SELECTION_METHOD)
 
         if booking is None and invoice is None:
@@ -2300,8 +2385,13 @@ def _sync_model_resolution_unguarded(
             return {"skipped": True, "reason": "no_vehicle_model_read"}
 
         # The invoice's shortlist when it has one (it is the source of
-        # truth), else the booking's.
-        use_invoice = invoice is not None and (booking is None or bool(invoice["matched"]) or not booking["matched"])
+        # truth), else the booking's -- a name match over a closest guess.
+        def named(o: dict[str, Any] | None) -> bool:
+            return o is not None and bool(o["matched"]) and o["matchStage"] != _CATALOGUE_STAGE
+
+        use_invoice = invoice is not None and (
+            booking is None or named(invoice) or (not named(booking) and (bool(invoice["matched"]) or not booking["matched"]))
+        )
         source = "INVOICE" if use_invoice else "BOOKING"
         outcome = invoice if use_invoice else booking
         report = invoice_inputs if use_invoice else inputs
@@ -2412,6 +2502,25 @@ def _sync_model_resolution_unguarded(
             title=title, description=description, safe_payload=safe_payload,
             task_payload_extra=task_payload_extra, correlation_id=correlation_id,
         )
+        # Model in another month's list: a Team Lead approves pricing on it
+        # first, nothing is suggested or resolved until then. Otherwise a
+        # closest-match guess goes to the PC to accept or reject.
+        from audit_core.uc03_sku_tasks import (
+            raise_closest_match_task,
+            raise_other_month_task,
+        )
+
+        if other_lists:
+            raise_other_month_task(
+                connection, tenant_id=tenant_id, journey_id=journey_id, source=source,
+                read_model=report["model_name"], price_list=outcome.get("priceList"), hits=other_lists,
+            )
+        elif stage == _CATALOGUE_STAGE and matched:
+            raise_closest_match_task(
+                connection, tenant_id=tenant_id, journey_id=journey_id, source=source,
+                read_model=report["model_name"], read_variant=report["variant_name"], suggestion=matched[0],
+                price_list=outcome.get("priceList"),
+            )
         return {
             "raised": True, "matchStage": stage, "candidateCount": len(matched), "source": source,
             "otherPriceLists": len(other_lists),

@@ -664,7 +664,9 @@ def list_p2_journeys(
                   SELECT EXISTS (
                     SELECT 1 FROM auditcore.commercial_line_source_values s
                     WHERE s.tenant_id=p.tenant_id AND s.journey_id=p.journey_id
-                      AND s.source_document_type IN ('customer_invoice_dms','tax_invoice_tally')
+                      AND s.source_document_type IN ('customer_invoice_dms','tax_invoice_tally',
+                        'accessory_invoice_dms','accessory_invoice_tally','ew_invoice','rsa_invoice',
+                        'invoice_generic','credit_note','debit_note')
                   ) AS invoiced
                 ) vi
                 LEFT JOIN LATERAL (
@@ -675,15 +677,19 @@ def list_p2_journeys(
                         AND s.source_document_type NOT IN ('booking_form','booking_docket','order_taking_form',
                                                            'customer_ledger','cost_sheet')
                       ORDER BY s.updated_at_utc DESC LIMIT 1),
-                    -- Once the vehicle invoice is on file it alone prices
-                    -- the deal: no booking-form fallback.
+                    -- Once any customer invoice is on file invoices alone
+                    -- price the deal: no booking-form fallback, and a
+                    -- mandatory master line no invoice bills counts at nil.
                     CASE WHEN NOT vi.invoiced THEN COALESCE(
                       (SELECT s.amount FROM auditcore.commercial_line_source_values s
                         WHERE s.tenant_id=cl.tenant_id AND s.journey_id=cl.journey_id
                           AND s.line_kind='COMMERCIAL' AND s.component_key=cl.component_key
                           AND s.source_document_type IN ('booking_form','booking_docket','order_taking_form')
                         ORDER BY s.updated_at_utc DESC LIMIT 1),
-                      cl.actual_amount) END) AS current
+                      cl.actual_amount)
+                    WHEN cl.component_key NOT IN ('accessories_cost','essential_kit_amount',
+                        'genuine_accessories_amount','non_genuine_accessories_amount',
+                        'additional_warranty_amount','extended_warranty_amount') THEN 0 END) AS current
                 ) cur ON true
                 WHERE cl.tenant_id=p.tenant_id AND cl.journey_id=p.journey_id
                   AND cl.standard_amount IS NOT NULL AND cur.current IS NOT NULL

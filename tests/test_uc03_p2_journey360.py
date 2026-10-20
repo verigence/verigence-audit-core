@@ -257,10 +257,8 @@ def test_compliance_report_extends_legacy_with_ledger_and_verdict(journey):
     assert client.get(f"{base}/duplicates").json() == {"pairs": []}
 
 
-def test_before_the_vehicle_invoice_a_component_keeps_its_booking_value(journey):
-    """Only an accessory invoice on file: a component not billed yet keeps its
-    booking value in the current total, and variances compare only lines
-    present on both sides."""
+def test_before_any_invoice_the_booking_prices_the_deal(journey):
+    """No invoice yet: the booking form's figures are the current ones."""
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
@@ -274,19 +272,50 @@ def test_before_the_vehicle_invoice_a_component_keeps_its_booking_value(journey)
         )
         _source(connection, journey, "COMMERCIAL", "ex_showroom_price", "booking_form", "1000000")
         _source(connection, journey, "COMMERCIAL", "accessories_cost", "booking_form", "20000")
-        _source(connection, journey, "COMMERCIAL", "accessories_cost", "accessory_invoice_dms", "20000")
         summary = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)["summary"]
     assert summary["invoiceIsSourceOfTruth"] is False
     assert Decimal(summary["net"]["current"]) == 1020000
     assert Decimal(summary["variance"]["currentVsStandard"]) == 0
-    assert summary["invoicedComponents"] == 1 and summary["components"] == 2
+
+
+def test_any_invoice_switches_the_deal_to_invoices_only(journey):
+    """Decision 2026-10-20: the moment any invoice is uploaded -- here only
+    the accessory invoice -- the booking no longer prices anything. The
+    vehicle price, a mandatory price-master line no invoice bills yet, is a
+    variance at nil against its standard; nothing optional is."""
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text(
+                """
+                INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, standard_amount, actual_amount)
+                VALUES (:t, :j, 'ex_showroom_price', 1000000, 1000000), (:t, :j, 'accessories_cost', 20000, 20000),
+                       (:t, :j, 'extended_warranty_amount', 15000, 15000)
+                """
+            ),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+        _source(connection, journey, "COMMERCIAL", "ex_showroom_price", "booking_form", "1000000")
+        _source(connection, journey, "COMMERCIAL", "accessories_cost", "booking_form", "20000")
+        _source(connection, journey, "COMMERCIAL", "extended_warranty_amount", "booking_form", "15000")
+        _source(connection, journey, "COMMERCIAL", "accessories_cost", "accessory_invoice_dms", "22000")
+        view = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    summary = view["summary"]
+    assert summary["invoiceIsSourceOfTruth"] is True
+    rows = {r["key"]: r for g in view["categories"] for r in g["components"]}
+    assert Decimal(rows["accessories_cost"]["variance"]) == 2000
+    assert Decimal(rows["ex_showroom_price"]["variance"]) == -1000000
+    assert "NOT_INVOICED" in rows["ex_showroom_price"]["flags"]
+    assert rows["extended_warranty_amount"]["variance"] is None
+    assert "NOT_INVOICED" not in rows["extended_warranty_amount"]["flags"]
+    assert Decimal(summary["variance"]["currentVsStandard"]) == 2000 - 1000000
 
 
 def test_once_the_vehicle_invoice_is_on_file_only_the_invoice_counts(journey):
     """Invoice is the source of truth: the booking form's figures no longer
-    price the deal or its variance. Here the booking quoted the vehicle
-    20,000 over standard; the invoice bills it at standard, so the variance
-    is zero, and the booking-only line drops out of the current total."""
+    price the deal or its variance. The booking quoted the vehicle 20,000
+    over standard; the invoice bills it at standard. Registration, a
+    mandatory master line no invoice bills, is a variance at nil."""
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
@@ -319,10 +348,10 @@ def test_once_the_vehicle_invoice_is_on_file_only_the_invoice_counts(journey):
     # Booking still shown for comparison, never used for the current figure.
     assert Decimal(summary["net"]["booking"]) == 1110000
     assert Decimal(summary["net"]["current"]) == 1000000
-    assert Decimal(summary["variance"]["currentVsStandard"]) == 0
+    assert Decimal(summary["variance"]["currentVsStandard"]) == -90000
     rows = {r["key"]: r for g in view["categories"] for r in g["components"]}
-    assert rows["registration_charges"]["current"] is None
-    assert rows["registration_charges"]["variance"] is None
+    assert Decimal(rows["registration_charges"]["variance"]) == -90000
+    assert "NOT_INVOICED" in rows["registration_charges"]["flags"]
     assert Decimal(rows["ex_showroom_price"]["variance"]) == 0
     corporate = next(d for d in view["discounts"] if d["key"] == "CORPORATE_PRIVILEGE")
     assert corporate["current"] is None and corporate["variance"] is None

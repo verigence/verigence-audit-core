@@ -16,6 +16,7 @@ from sqlalchemy import Connection, text
 
 from audit_core.uc03_document_field_corrections import _apply_field_value
 from audit_core.uc03_p2_runtime import note_facts_changed
+from audit_core.uc03_sku_tasks import SKU_TASK_TYPES, handle_sku_task_action
 
 # Phase 2-only task code. Deliberately not named *TASK_TYPE: the legacy
 # UC03 review-queue classifier must not treat isolated p2_tasks as legacy
@@ -440,6 +441,14 @@ def submit_action(
         return _apply_verdict(connection, tenant_id=tenant_id, task=task, action=action, actor_id=actor_id,
                               actor_role_code=actor_role_code, comment=comment, details=details)
 
+    if task["task_type"] in SKU_TASK_TYPES:
+        handled = handle_sku_task_action(
+            connection, tenant_id=tenant_id, task=task, action=action, actor_id=actor_id,
+            actor_role_code=actor_role_code, comment=comment,
+        )
+        if handled is not None:
+            return handled
+
     if task["task_type"] == "TL_MANAGEMENT_REFERRAL" and action == "COMPLETE_ACTION":
         return _enable_management_referral(
             connection, tenant_id=tenant_id, task=task, actor_id=actor_id, actor_role_code=actor_role_code,
@@ -847,7 +856,7 @@ def _apply_verdict(
 _MANUAL_VERIFICATION_TASKS = frozenset({
     "MANUAL_VERIFICATION_REVIEW", "FIELD_CORRECTION_REVIEW", "FIELD_CORRECTION_REVIEW_P2", "PC_CORRECTION",
     "DELIVERY_VIN_MANUAL_ENTRY_REVIEW", "MODEL_SELECTION_CORRECTION_REVIEW", "PC_CONFIRMATION",
-    "TL_MANUAL_VERIFICATION",
+    "TL_MANUAL_VERIFICATION", "SKU_CLOSEST_MATCH_CONFIRM", "SKU_OTHER_MONTH_PRICE_LIST",
 })
 _DOCUMENT_TASKS = frozenset({
     "PC_DOCUMENT_REUPLOAD", "DOCUMENT_REMEDIATION", "WRONG_DOCUMENT_REVIEW", "WRONG_DOCUMENT_DEALER_NOTICE",
