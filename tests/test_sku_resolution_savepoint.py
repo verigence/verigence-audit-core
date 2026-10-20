@@ -37,7 +37,7 @@ def _failing_inputs(connection, **_kwargs):
 
 
 def test_a_database_error_is_contained_and_escalated(journey, monkeypatch):
-    monkeypatch.setattr(resolution, "_resolution_inputs", _failing_inputs)
+    monkeypatch.setattr(resolution, "_pin_state", _failing_inputs)
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         # Something the caller wrote before resolution ran in the same transaction.

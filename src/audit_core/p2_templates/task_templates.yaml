@@ -203,6 +203,41 @@ task_types:
     actions:
     - COMPLETE_ACTION
     - ADD_COMMENT
+  # SKU price check (2026-10-20 product owner rules R3): the documents'
+  # words name one SKU but its master ex-showroom differs from the booking
+  # form's (or a vehicle invoice's). The SKU stays on the Journey as an
+  # automatic match; the PC keeps it (Accept) or picks the right one.
+  SKU_PRICE_MISMATCH:
+    category: CORRECTION_APPROVAL
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - ACCEPT
+    - ADD_COMMENT
+  # Two vehicle invoices on one Journey name different vehicles: the PC
+  # picks the SKU (nothing is set from either).
+  SKU_INVOICES_DISAGREE:
+    category: CORRECTION_APPROVAL
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - ADD_COMMENT
+  # The vehicle invoice names a different SKU (at its master price) from
+  # the one a PC or Team Lead set: never overwritten, the Team Lead decides.
+  SKU_INVOICE_REVIEW:
+    category: CORRECTION_APPROVAL
+    owner: TL
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - ACCEPT
+    - REJECT
+    - ADD_COMMENT
   MODEL_SELECTION_CORRECTION_REVIEW:
     category: CORRECTION_APPROVAL
     owner: TL

@@ -1,6 +1,11 @@
 """uc03_model_selection_corrections.py — correct an already-CONFIRMED SKU
 selection (2026-09-16, real user-reported gap).
 
+2026-10-20 (product owner rule R3): only a SKU a PC or Team Lead decided is
+CONFIRMED. A SKU the resolver matched automatically is TENTATIVE and the PC
+replaces it directly (``confirm_model_resolution_sku``) -- no proposal and
+no Team Lead needed. This proposal flow is for changing a human decision.
+
 ``uc03_model_resolution._pin_sku`` (used by both the automatic resolver and
 the PC's own manual "confirm SKU" picker, ``confirm_model_resolution_sku``)
 refuses to overwrite a ``journey_products`` row whose ``selection_status``
@@ -27,7 +32,6 @@ actual SKU reassignment, on Complete only) is hooked in -- see
 """
 from __future__ import annotations
 
-from datetime import date
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -49,6 +53,8 @@ from audit_core.uc03_model_resolution import (
     _resolution_inputs,
     _run_deal_reconciliation,
     _sku_rows_for_version,
+    is_human_decision,
+    journey_pricing_date,
     reassign_confirmed_sku,
 )
 from audit_core.workflow import create_workflow_task
@@ -82,20 +88,15 @@ class ModelSelectionCorrectionTaskResponse(BaseModel):
 def _current_effective_rows(
     connection: Connection, *, tenant_id: str, journey_id: UUID
 ) -> list[dict[str, Any]]:
-    effective_on = date.fromisoformat(
-        connection.execute(
-            text(
-                """
-                SELECT COALESCE(b.pricing_effective_on, b.booking_date, CURRENT_DATE)
-                FROM auditcore.journeys j
-                LEFT JOIN auditcore.bookings b
-                  ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
-                WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).scalar_one().isoformat()
-    )
+    # The Journey's one pricing date (2026-10-20: never today).
+    effective_on = journey_pricing_date(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if effective_on is None:
+        raise AuditCoreError(
+            error_code="VAC-SKU-006",
+            status_code=422,
+            title="No pricing date",
+            detail="The Journey has no booking date yet, so no price list applies. Enter the booking date first.",
+        )
     try:
         plan = _price_plan_for_journey(
             connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on
@@ -178,14 +179,14 @@ def submit_model_selection_correction(
             detail="The Booking Form has not been reviewed yet -- nothing to correct.",
         )
     previous_product_sku_id = inputs["product_sku_id"]
-    if previous_product_sku_id is None or inputs["selection_status"] != "CONFIRMED":
+    if not is_human_decision(inputs):
         raise AuditCoreError(
             error_code="VAC-SKU-004",
             status_code=422,
             title="No confirmed SKU to correct",
             detail=(
-                "This Journey has no confirmed SKU selection yet -- use the model-resolution "
-                "candidates/confirm-sku flow instead of proposing a correction."
+                "This Journey's SKU was not confirmed by a PC or Team Lead (none, or an automatic match) -- "
+                "pick the SKU directly with the model-resolution confirm-sku flow instead of proposing a correction."
             ),
         )
     if str(previous_product_sku_id) == str(payload.productSkuId):

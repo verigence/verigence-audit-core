@@ -201,7 +201,7 @@ def _journey_sku_state(connection, *, tenant_id: str, journey_id: UUID) -> dict[
         text(
             """
             SELECT jp.product_sku_id IS NOT NULL AS has_sku,
-                   sku.sku_code,
+                   sku.sku_code, jp.match_basis,
                    NULLIF(concat_ws(' · ', NULLIF(jp.model_name_snapshot, ''),
                                     NULLIF(jp.variant_name_snapshot, ''),
                                     NULLIF(jp.colour_name_snapshot, '')), '') AS model_label,
@@ -254,6 +254,7 @@ def _record_item(
 def backfill_sku_resolution_for_tenant(
     engine: Engine, *, tenant_id: str, offset: int = 0, limit: int | None = None,
     run_id: UUID | None = None, actor_id: str | None = None, only_without_sku: bool = False,
+    clear_automatic: bool = False,
 ) -> dict[str, Any]:
     """Run SKU resolution (booking model/price match, then the Delivery-invoice fallback) for
     the Project's Journeys, in a stable order, ``limit`` at a time starting at ``offset`` (all of
@@ -261,11 +262,14 @@ def backfill_sku_resolution_for_tenant(
     document is confirmed or "Run All Rules" is pressed; each Journey is its own transaction and
     a failure is recorded, never fatal to the rest. Callers loop on ``nextOffset`` so no single
     request runs long enough for the edge proxy to time out. Every Journey's outcome is kept
-    against a run (``runId``) so the summary can be read afterwards."""
-    from audit_core.uc03_async_sync_tasks import (
-        sync_model_resolution_from_invoice_with_escalation,
-        sync_model_resolution_with_escalation,
-    )
+    against a run (``runId``) so the summary can be read afterwards.
+
+    ``clear_automatic`` (the "reresolve" run, 2026-10-20): each Journey's
+    automatic SKU is taken off first and resolved again from its documents
+    by the words-first ladder; a SKU a PC or Team Lead set is left as it is.
+    Each Journey logs its old SKU, new SKU and how the new one was set."""
+    from audit_core.uc03_async_sync_tasks import sync_model_resolution_with_escalation
+    from audit_core.uc03_model_resolution import clear_automatic_pin
 
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
@@ -327,25 +331,28 @@ def backfill_sku_resolution_for_tenant(
                     continue
                 step_error = None
                 reasons: list[str] = []
-                for resolve in (
-                    sync_model_resolution_with_escalation,
-                    sync_model_resolution_from_invoice_with_escalation,
-                ):
-                    result = resolve(
-                        connection, tenant_id=tenant_id, journey_id=journey_id,
-                        correlation_id=_SKU_CORRELATION_ID,
+                if clear_automatic:
+                    clear_automatic_pin(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                        reason=f"reresolve run {run_id}")
+                # One pass: the ladder reads the booking form and every vehicle
+                # invoice itself (the Booking and Delivery entries are the same
+                # resolution since 2026-10-20).
+                result = sync_model_resolution_with_escalation(
+                    connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=_SKU_CORRELATION_ID,
+                )
+                if result.get("error"):
+                    step_error = (
+                        f"An internal step reported an error: {result.get('errorType')}: "
+                        f"{result.get('errorMessage')}"
                     )
-                    if result.get("error"):
-                        step_error = (
-                            f"An internal step reported an error: {result.get('errorType')}: "
-                            f"{result.get('errorMessage')}"
-                        )
-                    elif result.get("reason") and result.get("reason") != "already_resolved":
-                        reasons.append(str(result["reason"]))
+                elif result.get("reason") and result.get("reason") != "already_resolved":
+                    reasons.append(str(result["reason"]))
                 after = _journey_sku_state(connection, tenant_id=tenant_id, journey_id=journey_id)
                 had, has = bool(before.get("has_sku")), bool(after.get("has_sku"))
+                same = had and has and before.get("sku_code") == after.get("sku_code")
                 outcome = (
-                    "ALREADY_HAD_SKU" if had else "NEWLY_MATCHED" if has else "STILL_UNMATCHED"
+                    "ALREADY_HAD_SKU" if same or (had and has and not clear_automatic)
+                    else "NEWLY_MATCHED" if has else "STILL_UNMATCHED"
                 )
                 detail = (
                     step_error
@@ -354,6 +361,18 @@ def backfill_sku_resolution_for_tenant(
                         else "No matching SKU was found in the price masters."
                     ))
                 )
+                if clear_automatic:
+                    change = (
+                        f"{before.get('sku_code') or 'no SKU'} ({before.get('match_basis') or '-'}) -> "
+                        f"{after.get('sku_code') or 'no SKU'} ({after.get('match_basis') or '-'})"
+                    )
+                    detail = change + (f". {detail}" if detail else "")
+                    _run_log.info(
+                        "sku_reresolve_item", tenant_id=tenant_id, run_id=str(run_id), journey_id=str(journey_id),
+                        old_sku=before.get("sku_code"), old_basis=before.get("match_basis"),
+                        new_sku=after.get("sku_code"), new_basis=after.get("match_basis"),
+                        price_check=result.get("priceCheck"), word_status=result.get("wordStatus"),
+                    )
                 _record_item(
                     connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id,
                     label=after.get("journey_label"), model_label=after.get("model_label"),
@@ -415,6 +434,30 @@ def backfill_sku_resolution_for_tenant(
         "withSkuAfter": with_after,
         "withoutSkuAfter": without_after,
     }
+
+
+def reresolve_all_skus(engine: Engine, tenant_id: str, *, actor_id: str | None = None,
+                       batch: int = 10) -> dict[str, Any]:
+    """Re-run SKU resolution for every Journey of the Project under the
+    2026-10-20 product owner rules: each automatic SKU (including the ones
+    pinned before the rules, possibly chosen by price) is taken off and
+    resolved again from the Journey's documents, words first; a SKU a PC or
+    Team Lead set is never touched. Journeys left without exactly one
+    clearly named SKU get the PC's MODEL_NOT_IDENTIFIED task (with the
+    shortlist), and a word-named SKU whose master price differs from the
+    booking gets its price task. Each Journey logs old SKU, new SKU and how
+    it was set (``sku_reresolve_item``) and is kept against the run."""
+    offset: int | None = 0
+    run_id = None
+    result: dict[str, Any] = {}
+    while offset is not None:
+        result = backfill_sku_resolution_for_tenant(
+            engine, tenant_id=tenant_id, offset=offset, limit=batch, run_id=run_id, actor_id=actor_id,
+            clear_automatic=True,
+        )
+        run_id = result["runId"]
+        offset = result["nextOffset"]
+    return result
 
 
 class SkuResolutionBackfillResult(BaseModel):
@@ -546,4 +589,9 @@ def get_sku_resolution_run(
     }
 
 
-__all__ = ["backfill_document_sync_producers_for_tenant", "backfill_sku_resolution_for_tenant", "router"]
+__all__ = [
+    "backfill_document_sync_producers_for_tenant",
+    "backfill_sku_resolution_for_tenant",
+    "reresolve_all_skus",
+    "router",
+]

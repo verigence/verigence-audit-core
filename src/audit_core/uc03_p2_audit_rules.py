@@ -1341,7 +1341,8 @@ def queue_nightly_review(connection: Connection, *, tenant_id: str, today: date 
 def queue_nightly_sku_retry(connection: Connection, *, tenant_id: str, today: date | None = None) -> int:
     """Every night, run SKU resolution again for each open Journey that has a
     vehicle model read (off the Booking Form or the vehicle invoice) but no
-    confirmed SKU.
+    SKU a PC or Team Lead confirmed -- an automatic match is re-checked too,
+    so later evidence or a newly loaded price master can replace it.
 
     Found 2026-10-20: SKU resolution ran only when a Booking document was
     first copied or the Booking checks re-ran because a document changed.
@@ -1363,10 +1364,16 @@ def queue_nightly_sku_retry(connection: Connection, *, tenant_id: str, today: da
                    -- invoice names one (the resolution reads it).
                    OR EXISTS (SELECT 1 FROM auditcore.journey_document_extracted_fields f
                                WHERE f.tenant_id=j.tenant_id AND f.journey_id=j.journey_id
-                                 AND f.source_document_type_key IN ('customer_invoice_dms','tax_invoice_tally',
-                                                                    'invoice_generic','wholesale_invoice')
+                                 -- the customer's vehicle invoices (2026-10-20: never the
+                                 -- OEM's wholesale invoice; DMS "tax_invoice_dms" included)
+                                 AND f.source_document_type_key IN ('customer_invoice_dms','tax_invoice_dms',
+                                                                    'tax_invoice_tally','tax_invoice',
+                                                                    'invoice_generic')
                                  AND f.field_key IN ('sku_code','model_name_raw','vehicle_description_raw')
                                  AND f.effective_value IS NOT NULL))
+              -- A SKU a PC or Team Lead confirmed stays; an automatic match
+              -- (TENTATIVE since 2026-10-20) is re-checked against the
+              -- documents and the masters like a Journey with no SKU.
               AND jp.selection_status IS DISTINCT FROM 'CONFIRMED'
               AND NOT EXISTS (SELECT 1 FROM auditcore.journey_stage_states s
                                WHERE s.tenant_id=j.tenant_id AND s.journey_id=j.journey_id AND s.stage_code='BOOKING'
