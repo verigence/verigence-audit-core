@@ -146,3 +146,45 @@ def authorize_p2(
         human_principal=human_principal,
         decision=decision,
     )
+
+
+def check_p2_any_permission(
+    *,
+    tenant_id: str,
+    human_principal: HumanPrincipal,
+    authorization_client: SecurityAuthorizationClient,
+    permission_keys: tuple[str, ...],
+):
+    """The first of ``permission_keys`` Security allows; refused only when it
+    allows none. For an action a PC does with audit.journey.update and a
+    Team Lead does with audit.work.update (2026-10-20: the TL bundle has no
+    journey.update, so every TL override on these was refused)."""
+    denied: AuthorizationError | None = None
+    for key in permission_keys:
+        try:
+            return check_p2_permission(
+                tenant_id=tenant_id, human_principal=human_principal,
+                authorization_client=authorization_client, permission_key=key,
+            )
+        except AuthorizationError as exc:
+            denied = exc
+    assert denied is not None
+    raise denied
+
+
+def authorize_p2_any(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID | None,
+    human_principal: HumanPrincipal,
+    authorization_client: SecurityAuthorizationClient,
+    permission_keys: tuple[str, ...],
+) -> P2AccessContext:
+    decision = check_p2_any_permission(
+        tenant_id=tenant_id, human_principal=human_principal,
+        authorization_client=authorization_client, permission_keys=permission_keys,
+    )
+    return resolve_p2_scope(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal, decision=decision,
+    )
