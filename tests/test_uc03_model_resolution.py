@@ -1965,3 +1965,53 @@ def test_integration_an_open_finding_follows_the_latest_run(mahindra_journey) ->
     third = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     assert third.get("resolved") is True and _pinned(c) == lx_17l
     assert _open_model_flags(c) == 0
+
+
+def test_confirm_pins_a_sku_on_a_journey_whose_model_was_never_read(journey) -> None:
+    """Found live 2026-10-20: a journey whose Booking Form model was never
+    read (no journey_products row) could not be given a SKU at all -- the
+    PC's pick answered 404 "No reviewed booking model". A pick from the
+    catalogue now pins the SKU and writes the master's model/variant/colour."""
+    c = journey
+    _sku_a, sku_b = _seed_ambiguous_thar(c)
+    assert c.execute(
+        text("SELECT COUNT(*) FROM auditcore.journey_products WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one() == 0
+    catalog = mr.get_model_catalog(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    assert catalog["confirmedProductSkuId"] is None
+
+    result = mr.confirm_model_resolution_sku(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, product_sku_id=sku_b,
+        actor_id="pc-test-actor", correlation_id="",
+    )
+
+    assert result["productSkuId"] == sku_b
+    row = c.execute(
+        text("SELECT product_sku_id, selection_status, model_name_snapshot FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one()
+    assert row["product_sku_id"] == sku_b
+    assert row["selection_status"] == "CONFIRMED"
+    assert row["model_name_snapshot"]
+    catalog = mr.get_model_catalog(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    assert catalog["confirmedProductSkuId"] == sku_b
+
+
+def test_confirm_refuses_to_replace_a_confirmed_sku(journey) -> None:
+    """A confirmed SKU changes only through a Team Lead reviewed proposal."""
+    from audit_core.errors import AuditCoreError
+
+    c = journey
+    sku_a, sku_b = _seed_ambiguous_thar(c)
+    mr.confirm_model_resolution_sku(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, product_sku_id=sku_a,
+        actor_id="pc-test-actor", correlation_id="",
+    )
+    with pytest.raises(AuditCoreError) as refused:
+        mr.confirm_model_resolution_sku(
+            c, tenant_id=c.tenant_id, journey_id=c.journey_id, product_sku_id=sku_b,
+            actor_id="pc-test-actor", correlation_id="",
+        )
+    assert refused.value.error_code == "VAC-SKU-005"

@@ -1338,5 +1338,47 @@ def queue_nightly_review(connection: Connection, *, tenant_id: str, today: date 
     return len(rows)
 
 
-__all__ = ["RULE_CODES", "RuleOutcome", "queue_nightly_review", "run_p2_audit_rules",
+def queue_nightly_sku_retry(connection: Connection, *, tenant_id: str, today: date | None = None) -> int:
+    """Every night, run SKU resolution again for each open Journey that has a
+    vehicle model read but no confirmed SKU.
+
+    Found 2026-10-20: SKU resolution ran only when a Booking document was
+    first copied or the Booking checks re-ran because a document changed.
+    A price master loaded or corrected later never re-ran it (the checks'
+    fingerprint does not include the masters), and nothing ran it again at
+    night -- the nightly review re-runs Delivery checks only. One work item
+    per Journey per night (NATIVE:BOOKING, forced); safe to call more than
+    once. Returns how many were queued."""
+    today = today or datetime.now(UTC).date()
+    key_prefix = f"nightly-sku:{today.isoformat()}:"
+    rows = connection.execute(
+        text(
+            """
+            SELECT j.journey_id FROM auditcore.journeys j
+            JOIN auditcore.journey_products jp ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
+            WHERE j.tenant_id=:t AND j.review_completed_at_utc IS NULL
+              AND NULLIF(btrim(COALESCE(jp.model_name_snapshot,'')),'') IS NOT NULL
+              AND jp.selection_status IS DISTINCT FROM 'CONFIRMED'
+              AND NOT EXISTS (SELECT 1 FROM auditcore.journey_stage_states s
+                               WHERE s.tenant_id=j.tenant_id AND s.journey_id=j.journey_id AND s.stage_code='BOOKING'
+                                 AND (s.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING')
+                                      OR s.closure_disposition='NO_DELIVERY'))
+              AND NOT EXISTS (SELECT 1 FROM auditcore.p2_work_queue w
+                               WHERE w.tenant_id=j.tenant_id AND w.journey_id=j.journey_id
+                                 AND w.work_type='CONTROL_EVALUATE' AND w.work_key=:key_prefix || j.journey_id::text)
+            """
+        ),
+        {"t": tenant_id, "key_prefix": key_prefix},
+    ).scalars().all()
+    for journey_id in rows:
+        enqueue_work(
+            connection, tenant_id=tenant_id, journey_id=journey_id, work_type="CONTROL_EVALUATE",
+            work_key=f"{key_prefix}{journey_id}",
+            payload={"unit": "NATIVE:BOOKING", "force": True, "reason": f"nightly SKU retry {today.isoformat()}"},
+            correlation_id=None,
+        )
+    return len(rows)
+
+
+__all__ = ["RULE_CODES", "RuleOutcome", "queue_nightly_review", "queue_nightly_sku_retry", "run_p2_audit_rules",
            "schedule_delivery_completion_check"]

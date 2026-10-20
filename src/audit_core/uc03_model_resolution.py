@@ -43,6 +43,7 @@ from difflib import SequenceMatcher
 from typing import Annotated, Any
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Connection, text
@@ -79,6 +80,9 @@ from audit_core.uc03_v2_review_materialization import (
 from audit_core.workflow import create_workflow_task
 
 logger = logging.getLogger(__name__)
+# One structured line per resolution attempt (Railway shows structlog lines;
+# the stdlib logger above is kept for the existing tracebacks).
+_outcome_log = structlog.get_logger(__name__)
 
 _FINDING_TYPE = "MODEL_NOT_IDENTIFIED"
 _RULE_KEY = "MODEL_NOT_IDENTIFIED:BOOKING"
@@ -1222,6 +1226,18 @@ def _invoice_implied_vehicle(
 def sync_model_resolution_from_invoice(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
 ) -> dict[str, Any]:
+    """The invoice fallback inside a savepoint (see sync_model_resolution)."""
+    savepoint = connection.begin_nested()
+    result = _sync_model_resolution_from_invoice_unguarded(
+        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+    )
+    _close_savepoint(savepoint, result, tenant_id=tenant_id, journey_id=journey_id, source="INVOICE")
+    return result
+
+
+def _sync_model_resolution_from_invoice_unguarded(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
+) -> dict[str, Any]:
     """Delivery-side fallback for a Booking that never pinned a SKU, and a
     cross-check for one that already has.
 
@@ -1372,9 +1388,9 @@ def sync_model_resolution_from_invoice(
         # extra chance to resolve, not a new alerting path. If Booking already
         # raised the finding, it stays open until a human resolves it.
         return {"skipped": True, "reason": "unresolved_from_invoice", "matchStage": stage, "candidateCount": len(matched)}
-    except Exception:
+    except Exception as exc:
         logger.warning("sync_model_resolution_from_invoice failed", exc_info=True)
-        return {"error": True}
+        return {"error": True, "errorType": type(exc).__name__, "errorMessage": str(exc)[:300]}
 
 
 def _current_match(
@@ -1775,8 +1791,21 @@ def get_model_catalog(
             "totalPrice": _master_total(r, basis),
         }
 
+    confirmed = connection.execute(
+        text(
+            """
+            SELECT product_sku_id FROM auditcore.journey_products
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+              AND selection_status='CONFIRMED' AND product_sku_id IS NOT NULL
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalar_one_or_none()
     return {
         "journeyId": journey_id,
+        # Set when the Journey already has a confirmed SKU: a change is then a
+        # Team Lead reviewed proposal; otherwise a pick pins the SKU directly.
+        "confirmedProductSkuId": confirmed,
         "skus": [_catalog_entry(r) for r in rows],
     }
 
@@ -1798,12 +1827,26 @@ def confirm_model_resolution_sku(
     finding, completes its linked Task, and runs deal reconciliation -- the
     same closing sequence an automatic match runs.
     """
-    inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if inputs is None:
-        raise NotFoundError(
-            error_code="VAC-NF-010",
-            title="No reviewed booking model",
-            detail="The Booking Form has not been reviewed yet -- nothing to confirm.",
+    # A pick from the catalogue defines the vehicle by itself: it no longer
+    # needs a model already read from the Booking Form (found live
+    # 2026-10-20: a journey whose model was never read could not be given a
+    # SKU at all -- every pick path answered 404 "No reviewed booking
+    # model"). _pin_sku writes the master's own model/variant/colour.
+    already = connection.execute(
+        text(
+            """
+            SELECT product_sku_id FROM auditcore.journey_products
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND selection_status='CONFIRMED'
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalar_one_or_none()
+    if already is not None and str(already) != str(product_sku_id):
+        raise AuditCoreError(
+            error_code="VAC-SKU-005",
+            status_code=409,
+            title="SKU already confirmed",
+            detail="This Journey already has a confirmed SKU. Propose a correction for the Team Lead instead.",
         )
 
     effective_on = date.fromisoformat(
@@ -1909,6 +1952,7 @@ class ModelCatalogSkuOut(BaseModel):
 
 class ModelCatalogResponse(BaseModel):
     journeyId: UUID
+    confirmedProductSkuId: UUID | None = None
     skus: list[ModelCatalogSkuOut]
 
 
@@ -2016,6 +2060,57 @@ def sync_model_resolution(
     correlation_id: str,
     raise_findings: bool = True,
 ) -> dict[str, Any]:
+    """Resolve the SKU or raise MODEL_NOT_IDENTIFIED, inside a savepoint.
+
+    Found live 2026-10-19 (journey 8c632a40, admin SKU run): an error inside
+    the resolution -- e.g. a statement timeout while another reconcile held
+    the customer row -- left the caller's whole transaction aborted, so the
+    escalation that followed failed with InFailedSqlTransaction and the
+    attempt vanished without a trace. The savepoint undoes only this attempt;
+    the caller's transaction stays usable, the failure is escalated, and one
+    structured line says what happened."""
+    savepoint = connection.begin_nested()
+    result = _sync_model_resolution_unguarded(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+        correlation_id=correlation_id, raise_findings=raise_findings,
+    )
+    _close_savepoint(savepoint, result, tenant_id=tenant_id, journey_id=journey_id, source="BOOKING")
+    return result
+
+
+def _close_savepoint(savepoint: Any, result: dict[str, Any], *, tenant_id: str, journey_id: UUID, source: str) -> None:
+    if result.get("error"):
+        savepoint.rollback()
+    else:
+        savepoint.commit()
+    _outcome_log.info(
+        "sku_resolution_outcome",
+        tenant_id=tenant_id,
+        journey_id=str(journey_id),
+        source=source,
+        outcome=(
+            "ERROR" if result.get("error")
+            else "RESOLVED" if result.get("resolved") or result.get("pinned")
+            else "NOT_MATCHED" if result.get("raised")
+            else "SKIPPED" if result.get("skipped")
+            else "OTHER"
+        ),
+        reason=result.get("reason"),
+        match_stage=result.get("matchStage"),
+        candidate_count=result.get("candidateCount"),
+        error_type=result.get("errorType"),
+        error=result.get("errorMessage"),
+    )
+
+
+def _sync_model_resolution_unguarded(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    correlation_id: str,
+    raise_findings: bool = True,
+) -> dict[str, Any]:
     """Resolve the SKU or raise MODEL_NOT_IDENTIFIED. Idempotent; never raises.
 
     ``raise_findings=False`` is for the read-only self-heal on every Journey
@@ -2029,7 +2124,8 @@ def sync_model_resolution(
     try:
         inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id)
         if inputs is None:
-            return {"skipped": True}
+            # No vehicle model has been read onto the journey (journey_products).
+            return {"skipped": True, "reason": "no_vehicle_model_read"}
 
         if inputs["product_sku_id"] is not None:
             resolved = _resolve_open_flag(
@@ -2135,9 +2231,9 @@ def sync_model_resolution(
             task_payload_extra=task_payload_extra, correlation_id=correlation_id,
         )
         return {"raised": True, "matchStage": stage, "candidateCount": len(matched)}
-    except Exception:
+    except Exception as exc:
         logger.warning("sync_model_resolution failed", exc_info=True)
-        return {"error": True}
+        return {"error": True, "errorType": type(exc).__name__, "errorMessage": str(exc)[:300]}
 
 
 __all__ = [
