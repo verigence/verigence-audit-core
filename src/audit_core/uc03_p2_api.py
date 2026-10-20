@@ -500,6 +500,7 @@ def list_p2_journeys(
                    p.pc_name, COALESCE(pr.price_variance, pv.price_variance) AS price_variance,
                    gt.kyc_status, gt.docs_required, gt.docs_received,
                    gp.gate_pass_date, op.opened_at, op.last_upload_at,
+                   up.processing_now, up.upload_started_at, up.upload_finished_at,
                    -- The stage is the Phase 2 stage record's, nothing else: a delivery
                    -- or booking date from an older record never makes a journey
                    -- "complete" (a gate pass date once showed Delivery complete before
@@ -694,6 +695,32 @@ def list_p2_journeys(
                 (SELECT MAX(e.linked_at_utc) FROM auditcore.evidence e
                   WHERE e.tenant_id=p.tenant_id AND e.journey_id=p.journey_id)) AS last_upload_at
             ) op ON true
+            LEFT JOIN LATERAL (
+              -- How long the PC's latest upload took to read (product owner
+              -- 2026-10-20): the uploads of the last upload's day (IST), from
+              -- the first of them to the last page settled. "Currently
+              -- processing" while any page of the journey is still in flight.
+              SELECT EXISTS (
+                       SELECT 1 FROM auditcore.p2_document_queue q
+                       WHERE q.tenant_id=p.tenant_id AND q.journey_id=p.journey_id
+                         AND q.queue_status IN ('QUEUED','PREPARING_PAGE','DI_UPLOAD_PREPARING','DI_UPLOADING',
+                                                'DI_FINALIZING','CLASSIFYING','EXTRACTING',
+                                                'SYNCING_TO_AUDIT_CORE','RETRY_WAIT')) AS processing_now,
+                     MIN(sb.created_at_utc) AS upload_started_at,
+                     (SELECT MAX(e.created_at_utc) FROM auditcore.p2_activity_events e
+                       WHERE e.tenant_id=p.tenant_id AND e.journey_id=p.journey_id
+                         AND e.event_type='DOCUMENT_STATUS_CHANGED'
+                         AND e.details->>'status' IN ('READY','SUPPORTING','NEEDS_REVIEW','FAILED','DEAD_LETTER')
+                         AND e.details->>'batchId' = ANY(array_agg(sb.batch_id::text))) AS upload_finished_at
+              FROM auditcore.p2_upload_batches sb
+              WHERE sb.tenant_id=p.tenant_id AND sb.journey_id=p.journey_id
+                AND sb.batch_status <> 'AWAITING_UPLOAD'
+                AND (sb.created_at_utc AT TIME ZONE 'Asia/Kolkata')::date = (
+                      SELECT (MAX(b2.created_at_utc) AT TIME ZONE 'Asia/Kolkata')::date
+                      FROM auditcore.p2_upload_batches b2
+                      WHERE b2.tenant_id=p.tenant_id AND b2.journey_id=p.journey_id
+                        AND b2.batch_status <> 'AWAITING_UPLOAD')
+            ) up ON true
             LEFT JOIN LATERAL (
               -- The delivery date is the one printed on the gate pass.
               SELECT f.effective_value AS gate_pass_date
