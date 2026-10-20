@@ -2608,6 +2608,19 @@ def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
     that follow from it, and recompute once more (closing tasks can pass
     the last Delivery gate). Returns the settled result with every
     transition seen on the way."""
+    # The booking date follows the receipts still on file: a receipt deleted,
+    # re-read or replaced since the last pass no longer sets it (2026-10-20).
+    from audit_core.uc03_booking_confirmation_rules import (
+        evaluate_minimum_booking_payment,
+    )
+
+    try:
+        with connection.begin_nested():
+            evaluate_minimum_booking_payment(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                             correlation_id="")
+    except Exception:
+        logger.warning("p2_booking_date_refresh_failed", tenant_id=tenant_id, journey_id=str(journey_id),
+                       exc_info=True)
     # The engine records STAGE_CHANGED only when the stage actually moves.
     named = sync_customer_name(connection, tenant_id=tenant_id, journey_id=journey_id)
     if named == "VERIFIED":

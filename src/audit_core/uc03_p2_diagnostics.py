@@ -101,6 +101,88 @@ REPORTS: dict[str, str] = {
         GROUP BY pl.price_list_code, plv.version_no, plv.effective_from, pm.model_name
         ORDER BY plv.effective_from, plv.version_no, pm.model_name
     """,
+    # Every date before the 2026-07-01 floor that a Journey carries, where it
+    # came from, whether its document is still on file and what task (if any)
+    # asked the PC to review it (2026-10-20: SU-261020-001 "Booked 2020-10-13").
+    "old_dates": """
+        SELECT j.journey_id, j.journey_reference, 'booking_confirm_date' AS what,
+               ss.booking_confirm_date::text AS value, NULL AS document_type, NULL AS document_status,
+               NULL::numeric AS confidence, NULL AS review_task
+        FROM auditcore.journeys j
+        JOIN auditcore.journey_stage_states ss
+          ON ss.tenant_id = j.tenant_id AND ss.journey_id = j.journey_id AND ss.stage_code = 'BOOKING'
+        WHERE j.tenant_id = :t AND ss.booking_confirm_date < DATE '2026-07-01'
+        UNION ALL
+        SELECT j.journey_id, j.journey_reference, 'bookings.booking_date', b.booking_date::text,
+               NULL, NULL, NULL, NULL
+        FROM auditcore.journeys j
+        JOIN auditcore.bookings b ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
+        WHERE j.tenant_id = :t AND b.booking_date < DATE '2026-07-01'
+        UNION ALL
+        SELECT p.journey_id, j.journey_reference, 'payments.receipt_date', p.receipt_date::text,
+               e.document_type_key, e.association_status, NULL,
+               (SELECT string_agg(t.task_status, ',') FROM auditcore.p2_tasks t
+                 WHERE t.tenant_id = p.tenant_id AND t.journey_id = p.journey_id
+                   AND t.dedupe_key LIKE 'field-review:%' || p.source_di_document_id::text || '%')
+        FROM auditcore.payments p
+        JOIN auditcore.journeys j ON j.tenant_id = p.tenant_id AND j.journey_id = p.journey_id
+        LEFT JOIN auditcore.evidence e
+          ON e.tenant_id = p.tenant_id AND e.journey_id = p.journey_id
+         AND e.di_document_id = p.source_di_document_id
+        WHERE p.tenant_id = :t AND p.receipt_date < DATE '2026-07-01'
+        UNION ALL
+        SELECT f.journey_id, j.journey_reference, 'field:' || f.field_key, f.effective_value #>> '{}',
+               f.source_document_type_key, e.association_status, f.confidence_score,
+               (SELECT string_agg(t.task_status, ',') FROM auditcore.p2_tasks t
+                 WHERE t.tenant_id = f.tenant_id AND t.journey_id = f.journey_id
+                   AND t.dedupe_key LIKE 'field-review:%' || f.di_document_id::text || '%')
+        FROM auditcore.journey_document_extracted_fields f
+        JOIN auditcore.journeys j ON j.tenant_id = f.tenant_id AND j.journey_id = f.journey_id
+        LEFT JOIN auditcore.evidence e
+          ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id AND e.di_document_id = f.di_document_id
+        WHERE f.tenant_id = :t
+          AND f.field_key IN ('booking_date', 'receipt_date', 'delivery_date', 'invoice_date', 'gate_pass_date')
+          AND (f.effective_value #>> '{}') !~ '2026'
+        UNION ALL
+        SELECT j.journey_id, j.journey_reference, 'deliveries.actual_delivered_at',
+               dl.actual_delivered_at::date::text, dl.status_source, e.association_status, NULL,
+               (SELECT string_agg(t.dedupe_key || '=' || t.task_status, ',') FROM auditcore.p2_tasks t
+                 WHERE t.tenant_id = dl.tenant_id AND t.journey_id = dl.journey_id
+                   AND t.dedupe_key LIKE 'field-review:%')
+        FROM auditcore.deliveries dl
+        JOIN auditcore.journeys j ON j.tenant_id = dl.tenant_id AND j.journey_id = dl.journey_id
+        LEFT JOIN auditcore.evidence e
+          ON e.tenant_id = dl.tenant_id AND e.evidence_id = dl.source_evidence_id
+        WHERE dl.tenant_id = :t AND dl.actual_delivered_at < DATE '2026-07-01'
+    """,
+    # Uploads per PC per day, last 5 days (2026-10-20: the daily report showed
+    # one PC uploading and the rest with only tasks).
+    "uploads_by_day": """
+        SELECT (ub.created_at_utc AT TIME ZONE 'Asia/Kolkata')::date AS day, ub.uploaded_by_actor_id,
+               count(DISTINCT ub.journey_id) AS journeys, count(*) AS files, sum(ub.page_count) AS pages,
+               string_agg(DISTINCT ub.batch_status, ',') AS statuses
+        FROM auditcore.p2_upload_batches ub
+        WHERE ub.tenant_id = :t AND ub.created_at_utc > now() - interval '5 days'
+        GROUP BY 1, 2 ORDER BY 1, 2
+    """,
+    # Tasks created / reopened today (IST) by type, source and hour.
+    "tasks_today": """
+        SELECT 'OPENED' AS kind, tk.task_type, tk.source_type, tk.assigned_role_code,
+               to_char(tk.created_at_utc AT TIME ZONE 'Asia/Kolkata', 'HH24') AS hour_ist, count(*) AS n
+        FROM auditcore.p2_tasks tk
+        WHERE tk.tenant_id = :t
+          AND tk.created_at_utc >= ((now() AT TIME ZONE 'Asia/Kolkata')::date)::timestamp AT TIME ZONE 'Asia/Kolkata'
+        GROUP BY 1, 2, 3, 4, 5
+        UNION ALL
+        SELECT 'REOPENED', tk.task_type, tk.source_type, tk.assigned_role_code,
+               to_char(te.created_at_utc AT TIME ZONE 'Asia/Kolkata', 'HH24'), count(*)
+        FROM auditcore.p2_task_events te
+        JOIN auditcore.p2_tasks tk ON tk.tenant_id = te.tenant_id AND tk.task_id = te.task_id
+        WHERE te.tenant_id = :t AND te.event_type = 'REOPENED'
+          AND te.created_at_utc >= ((now() AT TIME ZONE 'Asia/Kolkata')::date)::timestamp AT TIME ZONE 'Asia/Kolkata'
+        GROUP BY 1, 2, 3, 4, 5
+        ORDER BY 1, 5, 2
+    """,
     # The candidates on each open MODEL_NOT_IDENTIFIED finding.
     "open_sku_candidates": """
         SELECT f.journey_id, f.title, e.safe_payload -> 'candidates' AS candidates,

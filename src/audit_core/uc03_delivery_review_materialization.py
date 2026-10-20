@@ -335,6 +335,25 @@ def materialize_delivery_date(
         correlation_id=correlation_id,
     )
 
+    from audit_core.uc03_p2_dates import before_floor
+
+    if before_floor(parsed):
+        # A gate-pass date before the programme's floor is a misread (the PC
+        # gets a High date review for it). It never becomes the Journey's
+        # delivery date; one it set earlier is taken back (2026-10-20).
+        cleared = connection.execute(
+            text(
+                """
+                UPDATE auditcore.deliveries
+                SET actual_delivered_at=NULL, updated_at_utc=now(), version_no=version_no+1
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+                  AND status_source='EVIDENCE' AND actual_delivered_at IS NOT NULL
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        )
+        return int(cleared.rowcount or 0)
+
     existing = connection.execute(
         text(
             """

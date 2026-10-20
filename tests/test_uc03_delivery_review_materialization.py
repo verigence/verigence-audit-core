@@ -459,6 +459,13 @@ def test_materialize_delivery_finance_fills_provider_then_hp_charges(journey) ->
         {"t": tenant_id, "j": journey_id},
     ).scalar_one()
     assert count == 1
+    # 2026-10-20: a date before the programme's floor is never the Journey's
+    # delivery date ("Delivery 06 Oct 2020" on the Journey list).
+    delivered = journey.execute(
+        text("SELECT actual_delivered_at FROM auditcore.deliveries WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one_or_none()
+    assert delivered is None
 
 
 def test_materialize_delivery_finance_no_financed_by_creates_no_row(journey) -> None:

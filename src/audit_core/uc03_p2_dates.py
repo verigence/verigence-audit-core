@@ -91,6 +91,27 @@ def date_floor_verdict(value: Any, floor: date | None) -> str | None:
     return None
 
 
+def programme_date_floor() -> date | None:
+    """The registry's date floor (document_templates.yaml), or None."""
+    from audit_core.uc03_p2_registry import RegistryError, get_registry
+
+    try:
+        return get_registry().extraction_rules.date_floor
+    except (RegistryError, OSError):
+        return None
+
+
+def before_floor(value: date | datetime | None) -> bool:
+    """A date earlier than the programme's floor is a misread, never a fact
+    to build on (2026-10-20: "Delivery 06 Oct 2020" against "Booking 07 Oct
+    2026" on the Journey list)."""
+    floor = programme_date_floor()
+    if value is None or floor is None:
+        return False
+    day = value.date() if isinstance(value, datetime) else value
+    return day < floor
+
+
 def booking_form_date(connection: Any, *, tenant_id: str, journey_id: Any) -> dict[str, Any] | None:
     """The booking date as the booking form (or docket) carries it, the
     PC's correction winning over the reading: {"documentId", "documentType",
