@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
+from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_human_principal
 from audit_core.main import app
 from audit_core.security import HumanPrincipal
@@ -144,89 +145,35 @@ def uc03_create_booking_setup():
         engine.dispose()
 
 
-def test_create_booking_folds_in_the_same_checklist_a_separate_capture_local_call_would_return(
-    uc03_create_booking_setup,
-) -> None:
-    """The workspace used to need a second, separate round trip
-    (GET /booking/capture-local) after POST /bookings just to paint its
-    checklist/counters -- reported live as a visible lag on a brand-new
-    booking ("it takes some seconds for the above counters to appear").
-    create_booking now computes and returns that same snapshot inline. This
-    proves the folded-in value is exactly what a separate read would still
-    independently compute for the same journey -- the fold changes when the
-    read happens, not what it returns.
+def _journey_count(setup) -> int:
+    engine = create_engine(os.environ["DATABASE_URL"])
+    try:
+        with engine.begin() as connection:
+            set_tenant_context(connection, setup["tenant_id"])
+            return int(connection.execute(
+                text("SELECT COUNT(*) FROM auditcore.journeys WHERE tenant_id=:t"), {"t": setup["tenant_id"]},
+            ).scalar_one())
+    finally:
+        engine.dispose()
 
-    GET /booking/capture-local no longer exists (Phase 4 unification --
-    replaced by GET /uc03/documents/capture-local, which covers both
-    stages). declarations/canContinue don't exist on that unified response
-    either -- confirmed dead in every frontend consumer (no caller of
-    setBookingCaptureV2Declaration, no reader of canContinue/declarations),
-    so the comparison here is narrowed to what still exists on both sides:
-    each BOOKING-stage requirement's shared fields.
-    """
+
+def test_the_old_create_booking_is_refused_and_creates_nothing(uc03_create_booking_setup) -> None:
+    """Closed 2026-10-20 (uc03_legacy_capture_guard). Found live 19 Oct: the old
+    Web Overview's "Capture new booking" created journey 9d1c307c here and the
+    old whole-file upload then sent a 5-page PDF to DI as ONE document, so its
+    PAN and Aadhaar were never read. Bookings start on Booking & Delivery
+    (POST /p2/.../journeys) only."""
     setup = uc03_create_booking_setup
     client = TestClient(app, raise_server_exceptions=False)
+    before = _journey_count(setup)
 
-    created = client.post(
+    refused = client.post(
         f"/v1/tenants/{setup['tenant_id']}/uc03/bookings",
-        headers={"Idempotency-Key": "create-booking-fold-001"},
-        json={"outletId": str(setup["outlet_id"]), "customerName": "Fold Test Customer"},
-    )
-    assert created.status_code == 201, created.text
-    body = created.json()
-    journey_id = UUID(body["journeyId"])
-
-    assert "booking" in body
-    booking = body["booking"]
-    assert booking["journeyId"] == str(journey_id)
-    assert booking["phase"] == "BOOKING"
-    assert booking["uploads"] == []
-    assert isinstance(booking["requirements"], list)
-    assert len(booking["requirements"]) > 0
-    assert isinstance(booking["canContinue"], bool)
-
-    separate_read = client.get(
-        f"/v2/tenants/{setup['tenant_id']}/journeys/{journey_id}/uc03/documents/capture-local",
-    )
-    assert separate_read.status_code == 200, separate_read.text
-    shared_fields = (
-        "requirementKey", "label", "documentTypeKey", "requirementLevel",
-        "conditionKey", "applicabilityState", "state", "document", "canView", "canDelete",
+        headers={"Idempotency-Key": "create-booking-closed-001"},
+        json={"outletId": str(setup["outlet_id"])},
     )
 
-    def _shared(requirement: dict) -> dict:
-        return {key: requirement[key] for key in shared_fields}
-
-    booking_requirements = [_shared(item) for item in booking["requirements"]]
-    unified_booking_requirements = [
-        _shared(item)
-        for item in separate_read.json()["requirements"]
-        if item["stageCode"] == "BOOKING"
-    ]
-    assert booking_requirements == unified_booking_requirements
-
-
-def test_create_booking_replay_still_returns_the_booking_snapshot(
-    uc03_create_booking_setup,
-) -> None:
-    """An idempotent replay's stored response_body predates this field for
-    any request recorded before this change -- the snapshot must be computed
-    fresh on every call, not read back from the stored idempotency record."""
-    setup = uc03_create_booking_setup
-    client = TestClient(app, raise_server_exceptions=False)
-
-    first = client.post(
-        f"/v1/tenants/{setup['tenant_id']}/uc03/bookings",
-        headers={"Idempotency-Key": "create-booking-fold-002"},
-        json={"outletId": str(setup["outlet_id"]), "customerName": "Replay Test Customer"},
-    )
-    assert first.status_code == 201, first.text
-
-    replay = client.post(
-        f"/v1/tenants/{setup['tenant_id']}/uc03/bookings",
-        headers={"Idempotency-Key": "create-booking-fold-002"},
-        json={"outletId": str(setup["outlet_id"]), "customerName": "Replay Test Customer"},
-    )
-    assert replay.status_code == 201, replay.text
-    assert replay.json() == first.json()
-    assert "booking" in replay.json()
+    assert refused.status_code == 410, refused.text
+    assert refused.json()["errorCode"] == "VAC-UC03-LEGACY-CAPTURE-CLOSED"
+    assert "Booking & Delivery" in refused.json()["detail"]
+    assert _journey_count(setup) == before
