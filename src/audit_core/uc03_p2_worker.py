@@ -3200,6 +3200,12 @@ def _sku_run_once(engine: Engine, tag: str) -> None:
 def main() -> None:
     _configure_worker_observability()
     engine = get_engine()
+    diag_reports = [r.strip() for r in os.environ.get("AUDIT_CORE_DIAG_REPORTS", "").split(",") if r.strip()]
+    if diag_reports:
+        from audit_core.uc03_p2_diagnostics import run_diagnostics
+
+        threading.Thread(target=run_diagnostics, args=(engine, diag_reports), name="diagnostics",
+                         daemon=True).start()
     sku_run_tag = os.environ.get("AUDIT_CORE_SKU_RUN_TAG", "").strip()
     if sku_run_tag:
         threading.Thread(target=_sku_run_once, args=(engine, sku_run_tag), name="sku-run", daemon=True).start()
