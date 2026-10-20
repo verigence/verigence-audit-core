@@ -97,6 +97,35 @@ REPORTS: dict[str, str] = {
         WHERE tenant_id = :t
         ORDER BY uploaded_at_utc
     """,
+    # Every Journey: the date it should be priced on, the price-list version
+    # it is actually priced from, and whether that version was in force on
+    # that date (2026-10-20: "prices are not being picked as per dates").
+    "pricing_dates": """
+        SELECT j.journey_reference, j.journey_id, b.booking_date, b.pricing_effective_on, b.pricing_basis,
+               s.sku_code, jp.selection_method, jp.selection_status, jp.vehicle_category,
+               used.effective_from AS used_from, used.effective_to AS used_to, used.version_no AS used_version,
+               pl.price_list_code AS used_list,
+               (SELECT string_agg(pl2.price_list_code || ' v' || v2.version_no || ' ' || v2.effective_from::text, '; ')
+                FROM auditcore.price_list_versions v2
+                JOIN auditcore.price_lists pl2 ON pl2.tenant_id = v2.tenant_id AND pl2.price_list_id = v2.price_list_id
+                WHERE v2.tenant_id = j.tenant_id AND v2.lifecycle_status = 'PUBLISHED'
+                  AND v2.effective_from <= coalesce(b.pricing_effective_on, b.booking_date)
+                  AND (v2.effective_to IS NULL OR v2.effective_to >= coalesce(b.pricing_effective_on, b.booking_date))
+               ) AS in_force_on_date,
+               (SELECT pli.standard_amount::text FROM auditcore.price_list_items pli
+                WHERE pli.tenant_id = j.tenant_id AND pli.price_list_version_id = j.price_list_version_id
+                  AND pli.product_sku_id = jp.product_sku_id AND pli.component_key = 'ex_showroom_price'
+                LIMIT 1) AS used_ex_showroom
+        FROM auditcore.journeys j
+        LEFT JOIN auditcore.bookings b ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
+        LEFT JOIN auditcore.journey_products jp ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
+        LEFT JOIN auditcore.product_skus s ON s.product_sku_id = jp.product_sku_id
+        LEFT JOIN auditcore.price_list_versions used
+          ON used.tenant_id = j.tenant_id AND used.price_list_version_id = j.price_list_version_id
+        LEFT JOIN auditcore.price_lists pl ON pl.tenant_id = used.tenant_id AND pl.price_list_id = used.price_list_id
+        WHERE j.tenant_id = :t
+        ORDER BY b.booking_date NULLS FIRST, j.journey_reference
+    """,
     "price_list_models": """
         SELECT pl.price_list_code, plv.version_no, plv.effective_from, pm.model_name,
                count(DISTINCT pli.product_sku_id) AS skus,
