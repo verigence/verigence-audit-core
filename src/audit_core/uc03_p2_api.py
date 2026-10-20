@@ -499,7 +499,7 @@ def list_p2_journeys(
                    p.dealer_name, p.outlet_name, p.outlet_code, p.vehicle, p.created_at_utc, p.updated_at_utc,
                    p.pc_name, COALESCE(pr.price_variance, pv.price_variance) AS price_variance,
                    gt.kyc_status, gt.docs_required, gt.docs_received,
-                   gp.gate_pass_date, op.opened_at,
+                   gp.gate_pass_date, op.opened_at, op.last_upload_at,
                    -- The stage is the Phase 2 stage record's, nothing else: a delivery
                    -- or booking date from an older record never makes a journey
                    -- "complete" (a gate pass date once showed Delivery complete before
@@ -686,7 +686,13 @@ def list_p2_journeys(
                 (SELECT MIN(b.created_at_utc) FROM auditcore.p2_upload_batches b
                   WHERE b.tenant_id=p.tenant_id AND b.journey_id=p.journey_id),
                 (SELECT MIN(e.linked_at_utc) FROM auditcore.evidence e
-                  WHERE e.tenant_id=p.tenant_id AND e.journey_id=p.journey_id)) AS opened_at
+                  WHERE e.tenant_id=p.tenant_id AND e.journey_id=p.journey_id)) AS opened_at,
+                COALESCE(
+                (SELECT MAX(b.created_at_utc) FROM auditcore.p2_upload_batches b
+                  WHERE b.tenant_id=p.tenant_id AND b.journey_id=p.journey_id
+                    AND b.batch_status <> 'AWAITING_UPLOAD'),
+                (SELECT MAX(e.linked_at_utc) FROM auditcore.evidence e
+                  WHERE e.tenant_id=p.tenant_id AND e.journey_id=p.journey_id)) AS last_upload_at
             ) op ON true
             LEFT JOIN LATERAL (
               -- The delivery date is the one printed on the gate pass.
@@ -781,7 +787,8 @@ def journey_view_counts(
             out = []
             for row in connection.execute(text(sql), params).mappings().all():
                 item = dict(row)
-                for key in ("open", "needs_tl", "overdue", "high_risk", "stuck", "closed"):
+                for key in ("total", "open", "booking_open", "delivery_open", "needs_tl", "overdue",
+                            "high_risk", "stuck", "closed"):
                     item[key] = int(item[key] or 0)
                 out.append(item)
             return out
@@ -875,8 +882,12 @@ def journeys_summary(
                 AND w.task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT')
             )
             SELECT
-              COUNT(*) FILTER (WHERE booking_completed IS NULL AND NOT cancelled) AS open_bookings,
-              COUNT(*) FILTER (WHERE in_delivery AND delivery_completed IS NULL AND NOT cancelled) AS open_deliveries,
+              -- An open journey is a booking or a delivery, never both, so the two
+              -- add up to the open journeys the list shows (2026-10-20: a journey
+              -- in its delivery stage with the booking not yet marked complete
+              -- counted in both).
+              COUNT(*) FILTER (WHERE NOT closed AND NOT in_delivery) AS open_bookings,
+              COUNT(*) FILTER (WHERE NOT closed AND in_delivery) AS open_deliveries,
               COUNT(*) FILTER (WHERE booking_completed IS NOT NULL) AS closed_bookings,
               COUNT(*) FILTER (WHERE delivery_completed IS NOT NULL) AS closed_deliveries,
               (SELECT COUNT(*) FROM open_task_rows) AS open_tasks,

@@ -65,7 +65,15 @@ def test_tabs_page_and_count_the_journeys_in_scope(uc03_create_booking_setup):  
     assert counts["counts"]["needs_action"] == 3 and counts["counts"]["with_tl"] == 1
     assert counts["counts"]["overdue"] == 1 and counts["counts"]["high_risk"] == 1
     assert counts["counts"]["closed"] == 1 and counts["counts"]["all"] == 5
+    # The headline numbers add up: open = bookings open + deliveries open,
+    # the same split the Booking & Delivery summary shows.
+    c = counts["counts"]
+    assert c["booking_open"] + c["delivery_open"] == c["open"] == 4
+    summary = client.get(f"{base}/journeys:summary").json()
+    assert summary["open"]["bookings"] == c["booking_open"]
+    assert summary["open"]["deliveries"] == c["delivery_open"]
     (outlet,) = counts["byOutlet"]
+    assert outlet["total"] == 5 and outlet["booking_open"] + outlet["delivery_open"] == outlet["open"]
     assert outlet["open"] == 4 and outlet["overdue"] == 1 and outlet["closed"] == 1
     assert sum(pc["open"] for pc in counts["byPc"]) == 4
 
