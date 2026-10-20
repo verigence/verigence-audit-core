@@ -13,25 +13,37 @@ import audit_core.uc03_invoice_materialization as im
 
 # ── unit: deterministic derivation ──────────────────────────────────────────
 def test_derive_commercials_vehicle_tax_invoice() -> None:
+    # 2026-10-20 (R1): ex-showroom = this invoice's selling price x (1 + its
+    # own GST rate). Add-on lines on the same invoice are their own lines, and
+    # then the vehicle is read from its own VEHICLE line.
     out = im.derive_commercials(
         {
             "invoice_purpose": "VEHICLE_SALE",
-            "taxable_amount": "1600000",
+            "taxable_amount": "1655593.22",
+            "cgst_amount": "149003.39",
+            "sgst_amount": "149003.39",
             "tcs_amount": "16000",
-            "grand_total_amount": "1596000",
             "line_items": [
                 {"line_category": "ACCESSORY_GENUINE", "net_amount": "25000"},
                 {"line_category": "EXTENDED_WARRANTY", "net_amount": "12000"},
-                {"line_category": "VEHICLE", "net_amount": "1600000"},
+                {"line_category": "VEHICLE", "gross_amount": "1600000", "taxable_amount": "1600000",
+                 "tax_rate": "18"},
             ],
         }
     )
     assert out == {
-        "ex_showroom_price": Decimal(1600000),
+        "ex_showroom_price": Decimal("1888000.00"),
         "tcs_amount": Decimal(16000),
         "accessories_cost": Decimal(25000),
         "additional_warranty_amount": Decimal(12000),
     }
+
+
+def test_derive_commercials_vehicle_without_taxes_has_no_ex_showroom() -> None:
+    # Taxes not read on this invoice: never borrowed, never guessed.
+    out = im.read_invoice("tax_invoice_tally", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000"})
+    assert "ex_showroom_price" not in out["lines"]
+    assert [i["code"] for i in out["issues"]] == ["TAXES_NOT_READ"]
 
 
 def test_derive_commercials_accessory_invoice_from_grand_total() -> None:
@@ -58,31 +70,39 @@ def test_derive_commercials_lines_win_over_grand_total() -> None:
     assert out == {"accessories_cost": Decimal(40000)}
 
 
-def test_derive_commercials_vehicle_line_fallback_when_no_taxable() -> None:
+def test_derive_commercials_vehicle_line_fallback_when_no_header_figures() -> None:
     out = im.derive_commercials(
         {
             "invoice_purpose": "VEHICLE_SALE",
-            "line_items": [{"line_category": "VEHICLE", "net_amount": "1450000"}],
+            "line_items": [{"line_category": "VEHICLE", "gross_amount": "1450000", "taxable_amount": "1450000",
+                            "tax_rate": "28"}],
         }
     )
-    assert out == {"ex_showroom_price": Decimal(1450000)}
+    assert out == {"ex_showroom_price": Decimal("1856000.00")}
 
 
-def test_derive_discounts_invoice_level() -> None:
-    assert im.derive_discounts({"invoice_discount_amount": "20000"}) == {"CASH_DISCOUNT": Decimal(20000)}
+def test_derive_discounts_invoice_level_is_unclassified_and_gst_inclusive() -> None:
+    # A header discount names no scheme: its own key, not the consumer offer.
+    out = im.derive_discounts({"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1000000",
+                               "igst_amount": "180000", "invoice_discount_amount": "20000"})
+    assert out == {"UNCLASSIFIED_DISCOUNT": Decimal("23600.00")}
 
 
-def test_derive_discounts_adds_discount_line_items() -> None:
+def test_derive_discounts_header_and_lines_are_one_discount_by_type() -> None:
     out = im.derive_discounts(
         {
-            "invoice_discount_amount": "10000",
+            "invoice_purpose": "VEHICLE_SALE",
+            "taxable_amount": "1000000",
+            "igst_amount": "180000",
+            "invoice_discount_amount": "15000",
             "line_items": [
-                {"line_category": "DISCOUNT_LINE", "net_amount": "-5000"},
+                {"line_category": "DISCOUNT_LINE", "description_raw": "Exchange Bonus", "net_amount": "-10000"},
+                {"line_category": "DISCOUNT_LINE", "description_raw": "Consumer Offer", "net_amount": "-5000"},
                 {"line_category": "VEHICLE", "net_amount": "1600000"},
             ],
         }
     )
-    assert out == {"CASH_DISCOUNT": Decimal(15000)}
+    assert out == {"EXCHANGE_BONUS": Decimal("11800.00"), "CASH_DISCOUNT": Decimal("5900.00")}
 
 
 def test_derive_discounts_empty() -> None:
@@ -245,9 +265,10 @@ def test_tax_invoice_persisted_and_projected(journey) -> None:
             "invoice_date": "2026-09-01",
             "seller_name": "Aditya Motors",
             "taxable_amount": "1600000",
+            "cgst_rate": "9", "cgst_amount": "144000", "sgst_rate": "9", "sgst_amount": "144000",
             "tcs_amount": "16000",
             "invoice_discount_amount": "20000",
-            "grand_total_amount": "1596000",
+            "grand_total_amount": "1904000",
             "line_items": [{"line_category": "EXTENDED_WARRANTY", "net_amount": "12000"}],
         })],
     )
@@ -264,21 +285,25 @@ def test_tax_invoice_persisted_and_projected(journey) -> None:
     assert row["taxable_amount"] == Decimal(1600000)
     assert row["document_type_key"] == "tax_invoice_tally"
 
+    # 2026-10-20 (R1): (taxable 16,00,000 + its own discount 20,000) x 1.18.
     ex = _commercial(c, "ex_showroom_price")
-    assert ex["actual_amount"] == Decimal(1600000)
+    assert ex["actual_amount"] == Decimal("1911600.00")
     assert ex["source_reference"].startswith("tax_invoice_tally:")
     assert ex["actual_source_kind"] == "EVIDENCE"
     assert _commercial(c, "tcs_amount")["actual_amount"] == Decimal(16000)
     assert _commercial(c, "additional_warranty_amount")["actual_amount"] == Decimal(12000)
 
+    # A header discount names no scheme: its own key, GST-inclusive, the
+    # printed pre-GST figure kept.
     disc = c.execute(
         text("SELECT actual_discount_amount, actual_source_kind, details "
              "FROM auditcore.discount_applications "
-             "WHERE tenant_id=:t AND journey_id=:j AND discount_key='CASH_DISCOUNT'"),
+             "WHERE tenant_id=:t AND journey_id=:j AND discount_key='UNCLASSIFIED_DISCOUNT'"),
         {"t": c.tenant_id, "j": c.journey_id},
     ).mappings().one()
-    assert disc["actual_discount_amount"] == Decimal(20000)
+    assert disc["actual_discount_amount"] == Decimal(23600)
     assert disc["details"]["origin"] == "INVOICE_MATERIALIZATION"
+    assert disc["details"]["printedBeforeGst"] == "20000.00"
 
 
 def test_accessory_invoice_line_items_persist_and_round_trip(journey) -> None:
@@ -406,28 +431,28 @@ def test_invoice_replaces_booking_form_commercial(journey) -> None:
     im.materialize_reviewed_invoices(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
         documents=[_doc("tax_invoice_tally", {
-            "invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000",
+            "invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000", "cgst_amount": "144000", "sgst_amount": "144000",
         })],
     )
     ex = _commercial(c, "ex_showroom_price")
-    assert ex["actual_amount"] == Decimal(1600000)
+    assert ex["actual_amount"] == Decimal("1888000.00")
     assert ex["source_reference"].startswith("tax_invoice_tally:")
 
 
-def test_weaker_invoice_does_not_override_stronger(journey) -> None:
+def test_copies_of_one_invoice_count_once_and_each_keeps_its_own_source_row(journey) -> None:
+    """2026-10-20 (R2): the Tally and a generic copy of one invoice (same
+    number) are one invoice; the Tally copy stands for it (canonical type
+    priority). Each copy's own figure is still recorded per document."""
     c = journey
-    strong = _doc("tax_invoice_tally", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000"})
-    weak = _doc("invoice_generic", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "999999"})
+    strong = _doc("tax_invoice_tally", {"invoice_purpose": "VEHICLE_SALE", "invoice_number": "INV-9",
+                                        "taxable_amount": "1600000", "cgst_amount": "144000", "sgst_amount": "144000"})
+    weak = _doc("invoice_generic", {"invoice_purpose": "VEHICLE_SALE", "invoice_number": "INV-9",
+                                    "taxable_amount": "999999", "igst_amount": "179999.82"})
     im.materialize_reviewed_invoices(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester", documents=[strong, weak],
     )
-    assert _commercial(c, "ex_showroom_price")["actual_amount"] == Decimal(1600000)
+    assert _commercial(c, "ex_showroom_price")["actual_amount"] == Decimal("1888000.00")
 
-    # Real user report: the Journey Line panel silently collapsed to whichever
-    # source currently wins, so a disagreement between sources was invisible.
-    # The canonical row still shows one winner (above) -- but the *weaker*,
-    # losing invoice's own reported value must still survive for the
-    # comparison panel to show, not just the winner's.
     rows = c.execute(
         text("SELECT source_document_type, amount FROM auditcore.commercial_line_source_values "
              "WHERE tenant_id=:t AND journey_id=:j AND line_kind='COMMERCIAL' AND component_key='ex_showroom_price'"),
@@ -435,8 +460,8 @@ def test_weaker_invoice_does_not_override_stronger(journey) -> None:
     ).mappings().all()
     by_source = {r["source_document_type"]: r["amount"] for r in rows}
     assert by_source == {
-        "tax_invoice_tally": Decimal(1600000),
-        "invoice_generic": Decimal(999999),
+        "tax_invoice_tally": Decimal("1888000.00"),
+        "invoice_generic": Decimal("1179998.82"),
     }
 
 
@@ -450,20 +475,24 @@ def _finding(c, rule_key):
     ).mappings().one_or_none()
 
 
-def test_cross_invoice_disagreement_raises_high_finding_and_tl_task(journey) -> None:
-    """Two of the dealer's own invoices disagreeing on the same field is a red
-    flag distinct from the ordinary booking-form-vs-invoice comparison --
+def _vehicle(document_type: str, taxable: str, number: str = "INV-9"):
+    gst = str(Decimal(taxable) * Decimal("0.09"))
+    return _doc(document_type, {"invoice_purpose": "VEHICLE_SALE", "invoice_number": number,
+                                "taxable_amount": taxable, "cgst_amount": gst, "sgst_amount": gst})
+
+
+def test_copies_of_one_invoice_disagreeing_raise_a_high_finding_and_tl_task(journey) -> None:
+    """Two copies of the dealer's own invoice disagreeing is a red flag --
     explicit instruction: never silently pick a winner, always raise a HIGH
-    finding + a Team Lead task to validate."""
+    finding + a Team Lead task to validate. 2026-10-20 (R2): copies are
+    compared with each other (same invoice number), never two different
+    invoices as if they were one."""
     c = journey
     im.materialize_reviewed_invoices(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
-        documents=[
-            _doc("tax_invoice_tally", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000"}),
-            _doc("invoice_generic", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "999999"}),
-        ],
+        documents=[_vehicle("tax_invoice_tally", "1600000"), _vehicle("invoice_generic", "999999")],
     )
-    rule_key = "INVOICE_FIELD_DISAGREEMENT:COMMERCIAL:ex_showroom_price"
+    rule_key = "INVOICE_COPIES_DISAGREE:VEHICLE|N|INV9"
     finding = _finding(c, rule_key)
     assert finding is not None
     assert finding["finding_class"] == "VIOLATION"
@@ -481,49 +510,68 @@ def test_cross_invoice_disagreement_raises_high_finding_and_tl_task(journey) -> 
     assert task["related_finding_id"] == finding["audit_finding_id"]
 
 
+def test_two_different_vehicle_invoices_are_flagged_not_compared(journey) -> None:
+    c = journey
+    im.materialize_reviewed_invoices(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[_vehicle("tax_invoice_tally", "1600000", "INV-1"), _vehicle("tax_invoice_tally", "1500000", "INV-2")],
+    )
+    assert _finding(c, "MULTIPLE_VEHICLE_INVOICES")["finding_status"] == "OPEN"
+    assert _finding(c, "INVOICE_COPIES_DISAGREE:VEHICLE|N|INV1") is None
+
+
+def test_an_invoice_that_does_not_add_up_is_a_pc_review_task(journey) -> None:
+    c = journey
+    im.materialize_reviewed_invoices(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[_doc("customer_invoice_dms", {"invoice_purpose": "VEHICLE_SALE", "invoice_number": "D-1",
+                                                 "taxable_amount": "1600000"})],
+    )
+    task = c.execute(
+        text("SELECT task_type, assigned_role_code FROM auditcore.workflow_tasks WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one()
+    assert task["task_type"] == "INVOICE_FIELD_REVIEW" and task["assigned_role_code"] == "PC"
+    assert _commercial(c, "ex_showroom_price") is None  # taxes not read: never guessed
+
+
 def test_agreeing_invoices_do_not_raise_a_discrepancy(journey) -> None:
     c = journey
     im.materialize_reviewed_invoices(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
-        documents=[
-            _doc("tax_invoice_tally", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000"}),
-            _doc("customer_invoice_dms", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000"}),
-        ],
+        documents=[_vehicle("tax_invoice_tally", "1600000"), _vehicle("customer_invoice_dms", "1600000")],
     )
-    assert _finding(c, "INVOICE_FIELD_DISAGREEMENT:COMMERCIAL:ex_showroom_price") is None
+    assert _finding(c, "INVOICE_COPIES_DISAGREE:VEHICLE|N|INV9") is None
 
 
 def test_wholesale_invoice_excluded_from_discrepancy_check(journey) -> None:
     """Wholesale (dealer<->OEM) invoices are a different transaction entirely
     -- comparing their figures against a customer-facing invoice would just
-    manufacture a false discrepancy."""
+    manufacture a false discrepancy, and they never bill the customer."""
     c = journey
     im.materialize_reviewed_invoices(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
-        documents=[
-            _doc("tax_invoice_tally", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000"}),
-            _doc("wholesale_invoice", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1450000"}),
-        ],
+        documents=[_vehicle("tax_invoice_tally", "1600000"), _vehicle("wholesale_invoice", "1450000")],
     )
-    assert _finding(c, "INVOICE_FIELD_DISAGREEMENT:COMMERCIAL:ex_showroom_price") is None
+    assert _finding(c, "INVOICE_COPIES_DISAGREE:VEHICLE|N|INV9") is None
+    assert _finding(c, "MULTIPLE_VEHICLE_INVOICES") is None
+    assert _commercial(c, "ex_showroom_price")["source_reference"].startswith("tax_invoice_tally:")
 
 
 def test_discrepancy_resolves_once_invoices_agree(journey) -> None:
     c = journey
+    tally, generic = _vehicle("tax_invoice_tally", "1600000"), _vehicle("invoice_generic", "999999")
     im.materialize_reviewed_invoices(
-        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
-        documents=[
-            _doc("tax_invoice_tally", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000"}),
-            _doc("invoice_generic", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "999999"}),
-        ],
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester", documents=[tally, generic],
     )
-    rule_key = "INVOICE_FIELD_DISAGREEMENT:COMMERCIAL:ex_showroom_price"
+    rule_key = "INVOICE_COPIES_DISAGREE:VEHICLE|N|INV9"
     assert _finding(c, rule_key)["finding_status"] == "OPEN"
 
-    # A corrected "invoice_generic" document now reports the same value.
+    # The corrected generic copy now reports the same value.
+    corrected = _vehicle("invoice_generic", "1600000")
+    corrected.documentId = generic.documentId
     im.materialize_reviewed_invoices(
-        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
-        documents=[_doc("invoice_generic", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000"})],
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester", documents=[corrected],
     )
     assert _finding(c, rule_key)["finding_status"] == "RESOLVED"
 
@@ -531,7 +579,7 @@ def test_discrepancy_resolves_once_invoices_agree(journey) -> None:
 def test_idempotent(journey) -> None:
     c = journey
     docs = [_doc("tax_invoice_tally", {
-        "invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000",
+        "invoice_purpose": "VEHICLE_SALE", "taxable_amount": "1600000", "cgst_amount": "144000", "sgst_amount": "144000",
         "invoice_discount_amount": "20000",
     })]
     for _ in range(3):

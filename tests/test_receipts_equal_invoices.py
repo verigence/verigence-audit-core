@@ -50,11 +50,12 @@ def _check(journey) -> rules.RuleOutcome:
 
 
 def _bill(journey) -> None:
-    """Rs 5,15,000 billed: vehicle 5,00,000 (DMS and Tally of the same sale),
-    accessories 20,000 (uploaded twice), less a 5,000 credit note. The
-    dealer's own wholesale invoice is on file too and is not the customer's."""
-    add_ready_document(journey, "customer_invoice_dms", invoice_number="DMS-1", grand_total_amount="500000")
-    add_ready_document(journey, "tax_invoice_tally", invoice_number="TL-1", grand_total_amount="500000")
+    """Rs 5,15,000 billed: vehicle 5,00,000 (the DMS and Tally copies of one
+    invoice number), accessories 20,000 (uploaded twice), less a 5,000
+    credit note. The dealer's own wholesale invoice is on file too and is
+    not the customer's."""
+    add_ready_document(journey, "customer_invoice_dms", invoice_number="INV-1", grand_total_amount="500000")
+    add_ready_document(journey, "tax_invoice_tally", invoice_number="INV 1", grand_total_amount="500000")
     add_ready_document(journey, "accessory_invoice_dms", invoice_number="ACC-1", grand_total_amount="20000")
     add_ready_document(journey, "accessory_invoice_dms", invoice_number="ACC-1", grand_total_amount="20000")
     add_ready_document(journey, "credit_note", invoice_number="CN-1", grand_total_amount="5000")
@@ -72,9 +73,13 @@ def test_receipts_matching_all_invoices_within_one_rupee_pass(journey):
     assert result.outcome == "PASS", result.reason
     assert Decimal(result.details["invoiced"]) == Decimal(515000)
     assert Decimal(result.details["difference"]) == Decimal("-0.50")
+    # One copy stands for the vehicle invoice (the canonical type priority:
+    # Tally, then DMS); the other is listed as its copy.
     assert {i["documentType"] for i in result.details["invoices"]} == {
-        "customer_invoice_dms", "accessory_invoice_dms", "credit_note",
+        "tax_invoice_tally", "accessory_invoice_dms", "credit_note",
     }
+    vehicle = next(i for i in result.details["invoices"] if i["vehicle"])
+    assert len(vehicle["copies"]) == 1
 
 
 def test_receipts_short_of_the_invoices_fail_with_the_gap(journey):
@@ -86,6 +91,19 @@ def test_receipts_short_of_the_invoices_fail_with_the_gap(journey):
     assert result.outcome == "FAIL"
     assert Decimal(result.details["difference"]) == Decimal(-104000)
     assert "short of the 3 invoices" in result.reason
+
+
+def test_a_tally_invoice_with_its_own_number_is_a_separate_invoice(journey):
+    """2026-10-20 (R2): different invoice numbers are different invoices; a
+    Tally accessory invoice is no longer dropped because a DMS one exists."""
+    add_ready_document(journey, "customer_invoice_dms", invoice_number="INV-1", grand_total_amount="500000")
+    add_ready_document(journey, "accessory_invoice_dms", invoice_number="ACC-1", grand_total_amount="7457.01")
+    add_ready_document(journey, "accessory_invoice_tally", invoice_number="ACC-2", grand_total_amount="4746.01")
+    _delivered(journey, days_ago=30)
+    add_receipt_payment(journey, amount="512203.02", receipt_number="R-1", receipt_date="2026-09-01")
+    result = _check(journey)
+    assert result.outcome == "PASS", result.reason
+    assert Decimal(result.details["invoiced"]) == Decimal("512203.02")
 
 
 def test_two_rupees_apart_is_not_within_tolerance(journey):
