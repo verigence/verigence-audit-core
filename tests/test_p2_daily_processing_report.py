@@ -135,3 +135,26 @@ def test_only_tl_pm_or_executive_may_read_it(journey):
             {"t": journey.tenant_id},
         )
         _require_report_role(c, tenant_id=journey.tenant_id, actor_id="exec-1", functional_role=None)
+
+
+def test_tasks_on_a_journey_not_uploaded_that_day_are_reported_apart(journey):
+    """2026-10-20: PCs who uploaded nothing showed 32, 111, 65 "tasks opened"
+    -- tasks the system's own re-checks raised on their earlier journeys.
+    Those are reported apart, never as the PC's work of the day."""
+    tl = _tl(journey)
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(
+            text("INSERT INTO auditcore.p2_tasks (tenant_id, journey_id, task_type, category, origin_kind, "
+                 "source_type, title, description, dedupe_key, assigned_role_code, task_status, completion_protocol) "
+                 "VALUES (:t, :j, 'PC_UPLOAD_STATUS', 'DOCUMENT', 'SYSTEM', 'DOCUMENT', 'Check', 'x', :k, "
+                 "'PC', 'READY', 'MACHINE_VERIFIED')"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "k": f"k-{uuid4().hex}"},
+        )
+
+    report = _report(journey, tl)
+    pc = report["pcs"][0]
+    assert pc["journeysUploaded"] == 0
+    assert pc["tasksOpened"] == 0
+    assert pc["earlier"]["journeys"] == 1 and pc["earlier"]["tasksOpened"] == 1
+    assert report["journeys"][0]["uploadedOnDay"] is False

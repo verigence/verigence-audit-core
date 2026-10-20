@@ -370,9 +370,19 @@ def build_daily_processing_report(
         summary = pcs.setdefault(pc, {
             "pcActorId": row["pcActorId"], "pcName": row["pcName"], "journeys": 0, "journeysUploaded": 0,
             "firstUploadAt": None, "lastFinishedAt": None, "stillProcessing": 0, **_empty_counts(),
+            "earlier": {"journeys": 0, **_empty_counts()},
         })
         summary["journeys"] += 1
-        _add(summary, {k: v for k, v in row.items() if k in _empty_counts()})
+        counts = {k: v for k, v in row.items() if k in _empty_counts()}
+        row["uploadedOnDay"] = row["uploadStartedAt"] is not None
+        if row["uploadStartedAt"] is None:
+            # 2026-10-20: a journey the PC did not upload on the day (tasks the
+            # system's own re-checks raised, night fixes) is not the PC's work
+            # of the day -- it is reported apart, never added to the day's row.
+            summary["earlier"]["journeys"] += 1
+            _add(summary["earlier"], counts)
+            continue
+        _add(summary, counts)
         if row["uploadStartedAt"] is not None:
             summary["journeysUploaded"] += 1
             if summary["firstUploadAt"] is None or row["uploadStartedAt"] < summary["firstUploadAt"]:
@@ -393,11 +403,15 @@ def build_daily_processing_report(
     return {
         "day": day.isoformat(),
         "timezone": timezone_name,
-        "pcs": sorted(pcs.values(), key=lambda s: (s["pcName"] or s["pcActorId"] or "~")),
+        # PCs who uploaded on the day first, the busiest first.
+        "pcs": sorted(pcs.values(), key=lambda s: (-s["journeysUploaded"], s["pcName"] or s["pcActorId"] or "~")),
         "journeys": journeys,
         "notes": [
             "Documents are the units the uploads became after splitting and grouping, in their state now.",
             "Finished is the last document settling; it stays blank while any document of that day's uploads is in flight.",
+            "A PC's row counts only the journeys they uploaded on the day. Tasks the system's own re-checks "
+            "raised that day on their earlier journeys (night re-sync, SKU re-runs, rule changes) are shown "
+            "apart as 'Earlier journeys'.",
             "Re-sync counts the journey's 'Re-sync with Document Intelligence'; who pressed it is not stored.",
             "Night jobs run at about 02:00 local time; night-fixed counts pages the sweep asked for that were read afterwards.",
             "Document Intelligence's own nightly re-processing keeps its per-document results in DI and is not counted here.",
