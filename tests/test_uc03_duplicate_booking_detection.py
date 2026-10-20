@@ -495,3 +495,22 @@ def test_a_failure_while_refreshing_leaves_the_finding_and_never_raises(two_jour
     monkeypatch.setattr(c, "execute", original)
     [only] = _findings_with_basis(c)
     assert only["audit_finding_id"] == first["audit_finding_id"] and only["finding_status"] == "OPEN"
+
+
+def test_a_pair_carries_one_finding_after_the_booking_dates_change(two_journeys) -> None:
+    """DEV 2026-10-20 (UTK-SU-261020-004 / -001): each side named the other as
+    the original -- the first finding was raised when the other side's (misread)
+    booking date was earlier, and stayed open after the dates changed."""
+    c = two_journeys
+    _set_field(c, journey_id=c.journey_a, document_type_key="pan_card", field_key="pan_number", value="HHHHH8888H")
+    _set_field(c, journey_id=c.journey_b, document_type_key="pan_card", field_key="pan_number", value="HHHHH8888H")
+    _set_booking_confirm_date(c, journey_id=c.journey_b, confirm_date="2020-10-13")
+    _set_booking_confirm_date(c, journey_id=c.journey_a, confirm_date="2026-10-10")
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="")
+    assert len(_open_findings(c, c.journey_a)) == 1
+
+    # journey_b's misread date is taken back: journey_a now holds the booking.
+    _set_booking_confirm_date(c, journey_id=c.journey_b, confirm_date=None)
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="")
+    assert len(_open_findings(c, c.journey_b)) == 1
+    assert _open_findings(c, c.journey_a) == []

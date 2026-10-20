@@ -3297,6 +3297,27 @@ def refresh_journey_dates(engine: Engine) -> None:
                          "AND association_status='ACTIVE' AND document_type_key IN ('booking_docket','payment_receipt')"),
                     {"t": tenant_id},
                 ).scalars().all()
+            # Booking dates decide which side of a duplicate pair holds the
+            # booking: re-check every pair once the dates are recomputed.
+            from audit_core.uc03_duplicate_booking_detection import (
+                sync_duplicate_booking_detection,
+            )
+
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                paired = connection.execute(
+                    text("SELECT DISTINCT journey_id FROM auditcore.audit_findings WHERE tenant_id=:t "
+                         "AND finding_type_code='DUPLICATE_BOOKING' AND finding_status IN ('OPEN','ACKNOWLEDGED') "
+                         "UNION SELECT DISTINCT CAST(split_part(rule_key, ':', 2) AS uuid) "
+                         "FROM auditcore.audit_findings WHERE tenant_id=:t "
+                         "AND finding_type_code='DUPLICATE_BOOKING' AND finding_status IN ('OPEN','ACKNOWLEDGED')"),
+                    {"t": tenant_id},
+                ).scalars().all()
+            for journey_id in paired:
+                with engine.begin() as connection:
+                    set_tenant_context(connection, tenant_id)
+                    sync_duplicate_booking_detection(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                                     correlation_id="refresh-journey-dates")
             reviews_raised = 0
             for journey_id in legacy:
                 with engine.begin() as connection:

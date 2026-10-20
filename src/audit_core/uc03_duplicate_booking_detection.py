@@ -494,6 +494,30 @@ def _void_open_finding_with_stale_basis(
         return False
 
 
+def _resolve_reverse_finding(
+    connection: Connection, *, tenant_id: str, holder_journey_id: UUID, duplicate_journey_id: UUID,
+    correlation_id: str,
+) -> int:
+    rows = connection.execute(
+        text(
+            """
+            SELECT audit_finding_id FROM auditcore.audit_findings
+            WHERE tenant_id=:tenant_id AND journey_id=:holder AND finding_type_code=:finding_type
+              AND rule_key=:rule_key AND finding_status IN ('OPEN','ACKNOWLEDGED')
+            """
+        ),
+        {"tenant_id": tenant_id, "holder": holder_journey_id, "finding_type": _FINDING_TYPE,
+         "rule_key": f"{_RULE_PREFIX}:{duplicate_journey_id}"},
+    ).scalars().all()
+    for finding_id in rows:
+        _resolve_finding(
+            connection, tenant_id=tenant_id, journey_id=holder_journey_id, stage_code=_STAGE,
+            finding_id=finding_id, actor_id=None, correlation_id=correlation_id,
+            note="This booking holds the booking; the other one is flagged as the duplicate.",
+        )
+    return len(rows)
+
+
 def sync_duplicate_booking_detection(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
 ) -> dict[str, Any]:
@@ -560,6 +584,14 @@ def sync_duplicate_booking_detection(
 
             rule_key = f"{_RULE_PREFIX}:{candidate['journey_id']}"
             current_rule_keys.add(rule_key)
+            # A pair carries one finding, on the side that does not hold the
+            # booking. The other side may still carry the reverse one from
+            # before the booking dates changed (2026-10-20: UTK-SU-261020-004
+            # and -001 each named the other as the original).
+            _resolve_reverse_finding(
+                connection, tenant_id=tenant_id, holder_journey_id=candidate["journey_id"],
+                duplicate_journey_id=journey_id, correlation_id=correlation_id,
+            )
             _void_open_finding_with_stale_basis(
                 connection, tenant_id=tenant_id, journey_id=journey_id,
                 rule_key=rule_key, basis=basis, correlation_id=correlation_id,
