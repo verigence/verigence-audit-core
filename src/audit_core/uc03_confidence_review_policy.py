@@ -1189,7 +1189,11 @@ def _sync_booking_document(
     # Booking Confirmed is data-driven off cumulative payments, independent of
     # PC Submit/Review -- must run after materialize_machine_booking_values
     # above, which is what freshly upserts this receipt into auditcore.payments.
-    if stage_code == "BOOKING" and is_reconciliation_trigger_document_type(document_type_key):
+    # Every receipt counts, whichever stage its document was filed under:
+    # receipts carry no Booking or Delivery stage (decision 2026-10-19). This
+    # used to run only for a Booking-stage receipt, so a receipt filed under
+    # Delivery never moved the booking date (Subrat Kumar Mallick, 2026-10-20).
+    if is_reconciliation_trigger_document_type(document_type_key):
         from audit_core.uc03_booking_confirmation_rules import (
             evaluate_minimum_booking_payment,
         )
