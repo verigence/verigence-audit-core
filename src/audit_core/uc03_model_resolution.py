@@ -1944,7 +1944,7 @@ def _settle(
     return {"matched": matched, "matchStage": stage, "guess": True}
 
 
-_DISPLACEMENT = re.compile(r"(\d+\.\d+)\s*L?\b", re.I)
+_DISPLACEMENT = re.compile(r"(\d+\.\d+)\s*L?\b", re.IGNORECASE)
 
 
 def _tokens(value: str | None) -> set[str]:
