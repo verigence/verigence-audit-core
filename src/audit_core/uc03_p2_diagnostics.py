@@ -155,6 +155,26 @@ REPORTS: dict[str, str] = {
           ON e.tenant_id = dl.tenant_id AND e.evidence_id = dl.source_evidence_id
         WHERE dl.tenant_id = :t AND dl.actual_delivered_at < DATE '2026-07-01'
     """,
+    # Why a date before the floor on a document still on file has (or has
+    # not) a PC review task: who reviewed / corrected it, the document's
+    # stage and every task on that document (2026-10-20).
+    "date_review_state": """
+        SELECT f.journey_id, j.journey_reference, f.stage_code, f.source_document_type_key AS document_type,
+               e.document_type_key AS evidence_type, f.field_key, f.effective_value #>> '{}' AS value,
+               f.reviewed_by_actor_id, f.reviewed_at_utc, f.is_modified, f.modified_by_actor_id,
+               (SELECT string_agg(t.task_type || ':' || t.task_status || ':' || left(t.title, 60), ' | ')
+                  FROM auditcore.p2_tasks t
+                 WHERE t.tenant_id = f.tenant_id AND t.journey_id = f.journey_id
+                   AND (t.dedupe_key LIKE '%' || f.di_document_id::text || '%'
+                        OR t.task_type ILIKE '%DATE%')) AS tasks
+        FROM auditcore.journey_document_extracted_fields f
+        JOIN auditcore.journeys j ON j.tenant_id = f.tenant_id AND j.journey_id = f.journey_id
+        JOIN auditcore.evidence e
+          ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id AND e.di_document_id = f.di_document_id
+        WHERE f.tenant_id = :t AND e.association_status = 'ACTIVE'
+          AND f.field_key IN ('booking_date', 'receipt_date', 'delivery_date', 'invoice_date')
+          AND (f.effective_value #>> '{}') !~ '2026'
+    """,
     # Uploads per PC per day, last 5 days (2026-10-20: the daily report showed
     # one PC uploading and the rest with only tasks).
     "uploads_by_day": """

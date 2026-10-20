@@ -268,3 +268,25 @@ def test_a_receipt_date_before_the_floor_never_becomes_the_booking_date(journey)
     add_receipt_payment(journey, amount="25000", receipt_number="R-1", receipt_date="2020-10-13")
     _evaluate(journey)
     assert _booking_confirm_date(journey) is None
+
+
+def test_the_worker_start_refreshes_a_stale_booking_date(journey, monkeypatch):
+    """Subrat Kumar Mallick on DEV: 21,000 received 05 Oct (the minimum), yet
+    "Booking 07 Oct 2026" -- the date was set before the 05 Oct receipt
+    counted and never recomputed. Every worker start recomputes it."""
+    from audit_core import uc03_p2_worker as worker
+
+    set_minimum_booking_amount(journey, "21000")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.journey_stage_states (tenant_id, journey_id, stage_code, booking_confirm_date) "
+                 "VALUES (:t, :j, 'BOOKING', DATE '2026-10-07')"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+    add_receipt_payment(journey, amount="21000", receipt_number="BRBM/04365", receipt_date="2026-10-05")
+    add_receipt_payment(journey, amount="50000", receipt_number="RBM/04455", receipt_date="2026-10-07")
+    monkeypatch.setattr(worker, "_active_tenants", lambda engine: [journey.tenant_id])
+
+    worker.refresh_journey_dates(journey.engine)
+    assert _booking_confirm_date(journey) == date(2026, 10, 5)
