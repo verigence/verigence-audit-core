@@ -3156,9 +3156,53 @@ def _configure_worker_observability() -> None:
     install_correlation_propagation()
 
 
+def _sku_run_once(engine: Engine, tag: str) -> None:
+    """A full SKU resolution run over every Journey of every active Project,
+    started from outside by setting AUDIT_CORE_SKU_RUN_TAG on the worker (no
+    browser session to expire part-way). Runs once per tag: a restart with
+    the same tag does not run it again. Each Journey's outcome is logged
+    (``sku_run_item``) and kept against the run."""
+    from audit_core.uc03_backfill_document_sync_producers import (
+        backfill_sku_resolution_for_tenant,
+    )
+
+    actor = f"worker:{tag}"[:120]
+    for tenant_id in _active_tenants(engine):
+        try:
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                done = connection.execute(
+                    text("SELECT 1 FROM auditcore.sku_resolution_runs WHERE tenant_id=:t AND started_by_actor_id=:a"),
+                    {"t": tenant_id, "a": actor},
+                ).first()
+            if done:
+                logger.info("sku_run_already_done", tenant_id=tenant_id, tag=tag)
+                continue
+            offset: int | None = 0
+            run_id = None
+            result: dict[str, Any] = {}
+            while offset is not None:
+                result = backfill_sku_resolution_for_tenant(
+                    engine, tenant_id=tenant_id, offset=offset, limit=10, run_id=run_id, actor_id=actor,
+                )
+                run_id = result["runId"]
+                offset = result["nextOffset"]
+            logger.info(
+                "sku_run_finished", tenant_id=tenant_id, tag=tag, run_id=str(run_id),
+                journeys=result.get("journeysTotal"), with_sku_before=result.get("withSkuBefore"),
+                with_sku_after=result.get("withSkuAfter"), without_sku_after=result.get("withoutSkuAfter"),
+                failed=len(result.get("journeysFailed") or []),
+            )
+        except Exception:
+            logger.warning("sku_run_failed", tenant_id=tenant_id, tag=tag, exc_info=True)
+
+
 def main() -> None:
     _configure_worker_observability()
     engine = get_engine()
+    sku_run_tag = os.environ.get("AUDIT_CORE_SKU_RUN_TAG", "").strip()
+    if sku_run_tag:
+        threading.Thread(target=_sku_run_once, args=(engine, sku_run_tag), name="sku-run", daemon=True).start()
     logger.info(
         "p2_worker_started",
         worker_id=_WORKER_ID,

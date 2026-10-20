@@ -34,6 +34,7 @@ import logging
 from typing import Annotated, Any
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import Engine, text
@@ -54,6 +55,7 @@ from audit_core.uc03_duplicate_receipt_detection import sync_duplicate_receipt_d
 from audit_core.uc03_model_resolution import sync_model_resolution_from_invoice
 
 logger = logging.getLogger(__name__)
+_run_log = structlog.get_logger(__name__)
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/admin/backfill",
@@ -204,7 +206,7 @@ def _journey_sku_state(connection, *, tenant_id: str, journey_id: UUID) -> dict[
                                     NULLIF(jp.variant_name_snapshot, ''),
                                     NULLIF(jp.colour_name_snapshot, '')), '') AS model_label,
                    COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS journey_label,
-                   (SELECT f.title FROM auditcore.audit_findings f
+                   (SELECT f.title || COALESCE(': ' || f.description, '') FROM auditcore.audit_findings f
                      WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
                        AND f.finding_type_code = 'MODEL_NOT_IDENTIFIED'
                        AND f.finding_status IN ('OPEN', 'ACKNOWLEDGED')
@@ -241,6 +243,11 @@ def _record_item(
         ),
         {"t": tenant_id, "r": run_id, "j": journey_id, "label": label, "model": model_label,
          "outcome": outcome, "sku": sku_code, "detail": (detail or None) and detail[:500]},
+    )
+    # One line per Journey, readable from the logs without database access.
+    _run_log.info(
+        "sku_run_item", tenant_id=tenant_id, run_id=str(run_id), journey_id=str(journey_id), journey=label,
+        model=model_label, outcome=outcome, sku_code=sku_code, detail=(detail or None) and detail[:500],
     )
 
 
@@ -311,6 +318,7 @@ def backfill_sku_resolution_for_tenant(
                 set_tenant_context(connection, tenant_id)
                 before = _journey_sku_state(connection, tenant_id=tenant_id, journey_id=journey_id)
                 step_error = None
+                reasons: list[str] = []
                 for resolve in (
                     sync_model_resolution_with_escalation,
                     sync_model_resolution_from_invoice_with_escalation,
@@ -320,7 +328,12 @@ def backfill_sku_resolution_for_tenant(
                         correlation_id=_SKU_CORRELATION_ID,
                     )
                     if result.get("error"):
-                        step_error = "An internal step reported an error."
+                        step_error = (
+                            f"An internal step reported an error: {result.get('errorType')}: "
+                            f"{result.get('errorMessage')}"
+                        )
+                    elif result.get("reason") and result.get("reason") != "already_resolved":
+                        reasons.append(str(result["reason"]))
                 after = _journey_sku_state(connection, tenant_id=tenant_id, journey_id=journey_id)
                 had, has = bool(before.get("has_sku")), bool(after.get("has_sku"))
                 outcome = (
@@ -328,7 +341,10 @@ def backfill_sku_resolution_for_tenant(
                 )
                 detail = (
                     step_error
-                    or (None if has else after.get("open_finding") or "No matching SKU was found in the price masters.")
+                    or (None if has else after.get("open_finding") or (
+                        "Skipped: " + ", ".join(dict.fromkeys(reasons)) if reasons
+                        else "No matching SKU was found in the price masters."
+                    ))
                 )
                 _record_item(
                     connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id,
