@@ -1232,8 +1232,21 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
     )
     uploads = intent.get("uploads") or []
     if len(uploads) != 1:
-        failures = intent.get("failures") or []
-        raise RuntimeError(f"DI did not create one upload intent: {failures!r}")
+        failures = [f for f in (intent.get("failures") or []) if isinstance(f, dict)]
+        codes = {str(f.get("errorCode") or "") for f in failures}
+        # A refusal of the request itself (DI's CONFLICT: this page's intent
+        # already holds a stored file under another mapping) answers the same
+        # on every retry; only a technical failure is worth trying again
+        # (2026-10-20: 83 CONFLICT retries on 21 pages in one day).
+        business = bool(codes) and codes <= {"CONFLICT", "INVALID_REQUEST", "VALIDATION_ERROR"}
+        raise DiCaptureV2Error(
+            status_code=409 if business else 503,
+            detail=json.dumps({
+                "detail": "The document service refused this page's upload intent ("
+                          + ", ".join(sorted(c for c in codes if c) or ["no reason given"]) + ").",
+                "retryable": not business,
+            }),
+        )
     upload = uploads[0]
     di_document_id = UUID(str(upload["documentId"]))
 
