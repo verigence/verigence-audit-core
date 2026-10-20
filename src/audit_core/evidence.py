@@ -58,7 +58,7 @@ def _journey_context(connection: Connection, tenant_id: str, journey_id: UUID):
         text(
             """
             SELECT j.customer_id, j.dealer_id, j.outlet_id,
-                   c.display_name AS customer_name,
+                   CASE WHEN c.legal_name_status = 'VERIFIED' AND btrim(COALESCE(c.legal_name, '')) <> '' THEN c.legal_name ELSE c.display_name END AS customer_name,
                    p.project_name,
                    d.dealer_name,
                    o.outlet_name

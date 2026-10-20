@@ -138,7 +138,7 @@ _DUPLICATE_BOOKINGS_SQL = f"""
 
         dj.journey_id AS duplicate_journey_id,
         dj.journey_reference AS duplicate_journey_reference,
-        dj_c.display_name AS duplicate_customer_name,
+        CASE WHEN dj_c.legal_name_status = 'VERIFIED' AND btrim(COALESCE(dj_c.legal_name, '')) <> '' THEN dj_c.legal_name ELSE dj_c.display_name END AS duplicate_customer_name,
         dj_d.dealer_name AS duplicate_dealer_name,
         dj_o.outlet_name AS duplicate_outlet_name,
         dj_b.booking_reference AS duplicate_booking_reference,
@@ -148,7 +148,7 @@ _DUPLICATE_BOOKINGS_SQL = f"""
 
         hj.journey_id AS holder_journey_id,
         hj.journey_reference AS holder_journey_reference,
-        hj_c.display_name AS holder_customer_name,
+        CASE WHEN hj_c.legal_name_status = 'VERIFIED' AND btrim(COALESCE(hj_c.legal_name, '')) <> '' THEN hj_c.legal_name ELSE hj_c.display_name END AS holder_customer_name,
         hj_d.dealer_name AS holder_dealer_name,
         hj_o.outlet_name AS holder_outlet_name,
         hj_b.booking_reference AS holder_booking_reference,

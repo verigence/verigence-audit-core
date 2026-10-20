@@ -248,7 +248,7 @@ def search_journeys(
                     dl.delivery_id,
                     j.dealer_id,
                     j.outlet_id,
-                    c.display_name AS customer_display_name,
+                    CASE WHEN c.legal_name_status = 'VERIFIED' AND btrim(COALESCE(c.legal_name, '')) <> '' THEN c.legal_name ELSE c.display_name END AS customer_display_name,
                     c.legal_name AS customer_legal_name,
                     c.mobile_number AS customer_mobile_number,
                     c.mobile_last4 AS customer_mobile_last4,

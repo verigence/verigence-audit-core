@@ -294,7 +294,7 @@ def list_work_items(
                         j.journey_id,
                         j.dealer_id,
                         j.outlet_id,
-                        c.display_name AS customer_display_name,
+                        CASE WHEN c.legal_name_status = 'VERIFIED' AND btrim(COALESCE(c.legal_name, '')) <> '' THEN c.legal_name ELSE c.display_name END AS customer_display_name,
                         c.mobile_last4 AS customer_mobile_last4,
                         d.dealer_name,
                         o.outlet_name,

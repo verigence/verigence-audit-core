@@ -263,7 +263,7 @@ def _header(connection: Connection, tenant_id: str, journey_id: UUID) -> Complia
         text(
             """
             SELECT j.journey_id, j.journey_reference,
-                   c.display_name AS customer_display_name,
+                   CASE WHEN c.legal_name_status = 'VERIFIED' AND btrim(COALESCE(c.legal_name, '')) <> '' THEN c.legal_name ELSE c.display_name END AS customer_display_name,
                    d.dealer_name, o.outlet_name,
                    b.booking_reference, b.booking_date, b.deal_type_code,
                    NULLIF(concat_ws(' · ',

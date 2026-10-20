@@ -203,3 +203,29 @@ def test_a_new_booking_gets_a_readable_reference_numbered_per_outlet_pc_and_day(
     assert _reference(setup, first) == refs[0]
     listed = client.get(url, params={"state": "open"}).json()["items"]
     assert next(i for i in listed if i["journey_id"] == first)["journey_reference"] == refs[0]
+
+
+def test_the_customer_name_follows_the_kyc_on_file(uc03_create_booking_setup):  # noqa: F811
+    """UTK-SU-261020-001 on DEV (2026-10-20): the name stayed "Brajesh Chandra
+    Bhoi" from an Aadhaar since replaced, while the PAN and Aadhaar on file
+    were Sarbeswar Pradhan's, so two journeys with one PAN showed two names."""
+    setup = uc03_create_booking_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    url = f"/p2/v1/tenants/{setup['tenant_id']}/journeys"
+    created = client.post(url, headers={"Idempotency-Key": "p2-new-journey-kyc-follow"},
+                          json={"outletId": str(setup["outlet_id"])}).json()
+    journey = _journey(setup, created["journeyId"], created["customerId"])
+    first = add_ready_document(journey, "aadhaar", aadhaar_number="1111", aadhaar_name="BRAJESH CHANDRA BHOI")
+    assert _sync(journey) == "VERIFIED"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.evidence SET association_status='SUPERSEDED' "
+                 "WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:d"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "d": first},
+        )
+    add_ready_document(journey, "pan_card", pan_number="AZVPP9738J", pan_name="SARBESWAR PRADHAN")
+    assert _sync(journey) == "VERIFIED"
+    assert _customer(setup, created["customerId"])["legal_name"] == "SARBESWAR PRADHAN"
+    listed = client.get(url, params={"state": "open"}).json()["items"]
+    assert next(i for i in listed if i["journey_id"] == created["journeyId"])["customer_name"] == "SARBESWAR PRADHAN"

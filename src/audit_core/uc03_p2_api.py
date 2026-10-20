@@ -2405,7 +2405,7 @@ def overview_summary(
         text(
             """
             SELECT j.journey_id, j.created_at_utc, j.updated_at_utc,
-                   c.display_name AS customer_name,
+                   CASE WHEN c.legal_name_status = 'VERIFIED' AND btrim(COALESCE(c.legal_name, '')) <> '' THEN c.legal_name ELSE c.display_name END AS customer_name,
                    d.dealer_name, o.outlet_name,
                    NULLIF(concat_ws(' · ',
                        NULLIF(jp.model_name_snapshot, ''),
