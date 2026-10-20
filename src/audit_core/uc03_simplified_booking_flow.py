@@ -31,6 +31,7 @@ from audit_core.uc03_document_capture_v2 import (
     _declarations,
     _linked_documents,
 )
+from audit_core.uc03_legacy_capture_guard import refuse_legacy_booking_create
 from audit_core.uc03_simplified_create_atomic import (
     execute_simplified_create_booking_atomic,
 )
@@ -121,6 +122,7 @@ def _replace_route(
     endpoint: Any,
     response_model: Any,
     status_code: int | None = None,
+    dependencies: list[Any] | None = None,
 ) -> None:
     router.routes[:] = [
         route
@@ -137,6 +139,8 @@ def _replace_route(
     }
     if status_code is not None:
         kwargs["status_code"] = status_code
+    if dependencies:
+        kwargs["dependencies"] = dependencies
     router.add_api_route(suffix, endpoint, **kwargs)
 
 
@@ -151,5 +155,7 @@ def install_uc03_simplified_booking_flow() -> None:
         endpoint=create_booking_journey_first_reference,
         response_model=create_booking.CreateBookingResponse,
         status_code=status.HTTP_201_CREATED,
+        # Closed 2026-10-20: bookings start on Booking & Delivery (uc03_legacy_capture_guard).
+        dependencies=[Depends(refuse_legacy_booking_create)],
     )
     create_booking._simplified_booking_flow_installed = True

@@ -102,6 +102,7 @@ from audit_core.uc03_document_capture_v2 import (
     get_di_client,
     get_security_oauth_client,
 )
+from audit_core.uc03_legacy_capture_guard import refuse_legacy_whole_file_upload
 from audit_core.uc03_requirement_satisfaction import linked_documents_for_journey
 
 router = APIRouter(
@@ -130,7 +131,12 @@ def _merged_candidate_requirements(
     return booking_requirements, delivery_requirements
 
 
-@router.post("/upload-intents", response_model=UploadIntentResponse)
+# Closed 2026-10-20: a whole-file upload, never split into pages (uc03_legacy_capture_guard).
+@router.post(
+    "/upload-intents",
+    response_model=UploadIntentResponse,
+    dependencies=[Depends(refuse_legacy_whole_file_upload)],
+)
 def create_unified_upload_intents(
     tenant_id: str,
     journey_id: UUID,
