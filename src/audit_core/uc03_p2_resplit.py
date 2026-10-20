@@ -48,7 +48,9 @@ router = APIRouter(
     tags=["uc03-phase2-documents"],
 )
 
-_UPDATE_PERMISSION = "audit.journey.update"
+# Re-reading a document: PC and TL both hold audit.evidence.refresh (the TL
+# bundle has no audit.journey.update).
+_UPDATE_PERMISSION = "audit.evidence.refresh"
 _ALLOWED_TYPES = {"application/pdf", "image/jpeg", "image/png"}
 
 

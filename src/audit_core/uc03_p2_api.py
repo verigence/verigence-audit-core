@@ -34,6 +34,7 @@ from audit_core.security_authorization import (
 from audit_core.uc03_p2_access import (
     P2AccessContext,
     authorize_p2,
+    authorize_p2_any,
     check_p2_permission,
     resolve_p2_scope,
 )
@@ -80,6 +81,7 @@ router = APIRouter(
 
 _READ_PERMISSION = "audit.journey.read"
 _UPDATE_PERMISSION = "audit.journey.update"
+_WORK_UPDATE_PERMISSION = "audit.work.update"
 _DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 _ALLOWED_CONTENT_TYPES = {
     "application/pdf",
@@ -1715,9 +1717,9 @@ def reread_page(
     hand-made correction exactly as a resync does. It is therefore refused on a
     stage whose documents are marked reviewed, with the same TL/PM override.
     """
-    access = _authorize(
+    access = authorize_p2_any(
         connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
-        authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
+        authorization_client=authorization_client, permission_keys=(_UPDATE_PERMISSION, _WORK_UPDATE_PERMISSION),
     )
     unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id)
     if unit["queue_status"] not in _REREADABLE_PAGE_STATES:
@@ -1779,9 +1781,9 @@ def resync_page(
     reason, because a stage reviewed in error must not be stuck with bad data
     and nothing else can pull DI's values back.
     """
-    access = _authorize(
+    access = authorize_p2_any(
         connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
-        authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
+        authorization_client=authorization_client, permission_keys=(_UPDATE_PERMISSION, _WORK_UPDATE_PERMISSION),
     )
     unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id)
     if unit["queue_status"] not in _RESYNCABLE_PAGE_STATES or unit["di_document_id"] is None:
@@ -2728,7 +2730,7 @@ def create_human_task(
         journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
-        permission_key=_UPDATE_PERMISSION,
+        permission_key=_WORK_UPDATE_PERMISSION,
     )
     template = get_registry().tasks.get(command.taskType)
     category, assigned_role, allowed = command.category, command.assignedRoleCode, command.allowedActions
@@ -3231,7 +3233,12 @@ def task_action(
         tenant_id=tenant_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
-        permission_key=_UPDATE_PERMISSION,
+        # A task action is work on the queue: Security's TL bundle carries
+        # audit.work.update but not audit.journey.update, so every Team Lead
+        # action on a Phase 2 task was refused (2026-10-20, "Approve
+        # correction" -> VAC-AUTH-002). PC, PM and Executive hold both; the
+        # Reviewer holds neither work permission by design.
+        permission_key=_WORK_UPDATE_PERMISSION,
     )
     set_tenant_context(connection, tenant_id)
     task_journey_id = connection.execute(

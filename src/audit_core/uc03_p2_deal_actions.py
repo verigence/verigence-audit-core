@@ -428,7 +428,8 @@ def put_management_referral(
     authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
-    access = _auth(connection, tenant_id, journey_id, human_principal, authorization_client, _UPDATE)
+    # Team Lead work: the TL bundle has audit.work.update, not journey.update.
+    access = _auth(connection, tenant_id, journey_id, human_principal, authorization_client, "audit.work.update")
     roles = {str(r or "").upper() for r in (access.operating_role, access.functional_role)}
     role = next((r for r in ("TL", "PM") if r in roles), None)
     if role is None:

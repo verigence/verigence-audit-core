@@ -894,16 +894,12 @@ def test_integration_fuzzy_resolves_a_mid_string_ocr_misread_trim(mahindra_journ
     result = mr.sync_model_resolution(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
-    assert result.get("resolved") is True
+    # A fuzzy reading is the closest match, not the vehicle named: it is
+    # suggested to the PC to accept or reject (decision 2026-10-20).
+    assert result.get("raised") is True
     assert result.get("matchStage") == "FUZZY_ATTRIBUTE_DECOMPOSITION"
-
-    pinned = c.execute(
-        text("SELECT product_sku_id FROM auditcore.journey_products "
-             "WHERE tenant_id=:t AND journey_id=:j"),
-        {"t": c.tenant_id, "j": c.journey_id},
-    ).scalar_one()
-    assert pinned == z8s
-    assert _open_model_flags(c) == 0
+    assert _vehicle(c)["product_sku_id"] is None
+    assert _sku_task(c, "SKU_CLOSEST_MATCH_CONFIRM")["reference"]["suggestedSkuId"] == str(z8s)
 
 
 def test_integration_still_raises_when_decomposition_also_ambiguous(mahindra_journey) -> None:
@@ -1962,11 +1958,11 @@ def test_integration_an_emptied_attribute_filter_still_reaches_the_catalogue_sea
     _set_commercial(c, "ex_showroom_price", "1496000.00")
 
     result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
-    # Suggested to the PC, never pinned on its own (decision 2026-10-20).
-    assert result.get("raised") is True, result
-    assert result["matchStage"] == "CATALOGUE_SEARCH"
-    assert _pinned(c) is None
-    assert _sku_task(c, "SKU_CLOSEST_MATCH_CONFIRM")["reference"]["suggestedSkuId"] == str(skus["ev_ax7l"])
+    # 2026-10-20: an EV variant of a model the list keeps as its own EV model
+    # is read as that EV model, so the exact ex-showroom names the vehicle.
+    assert result.get("resolved") is True, result
+    assert result["matchStage"] == "EX_SHOWROOM"
+    assert _pinned(c) == skus["ev_ax7l"]
 
 
 def test_integration_an_emptied_attribute_filter_without_a_price_shortlists_the_siblings(mahindra_journey) -> None:
@@ -1978,7 +1974,7 @@ def test_integration_an_emptied_attribute_filter_without_a_price_shortlists_the_
 
     result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     assert result.get("raised") is True, result
-    assert result["matchStage"] == "CATALOGUE_SEARCH"
+    assert result["matchStage"] in {"CATALOGUE_SEARCH", "FUZZY_ATTRIBUTE_DECOMPOSITION"}
     shortlist = mr.get_model_resolution_candidates(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
     offered = {str(item["productSkuId"]) for item in shortlist["candidates"]}
     assert str(skus["ev_ax7l"]) in offered
@@ -2040,7 +2036,9 @@ def test_integration_an_open_finding_follows_the_latest_run(mahindra_journey) ->
     itself once the price settles the shortlist."""
     c = mahindra_journey
     lx_17l, *_ = _seed_maxx_hd(c)
-    _set_journey_product(c, "BOL MAXX PUP HD 1.7L LX", None)
+    # (0150 now names "BOL MAXX PUP HD" as the Maxx HD; an unreadable model
+    # text keeps this test's first run without candidates.)
+    _set_journey_product(c, "BLR MXX PUP 1.7L LX", None)
     first = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     assert first.get("raised") is True and first["candidateCount"] == 0
     finding_id = _open_model_finding_id(c)
@@ -2217,3 +2215,108 @@ def test_an_approved_price_list_version_is_used_whatever_the_date(journey) -> No
     plan = _price_plan_for_journey(c, tenant_id=c.tenant_id, journey_id=c.journey_id,
                                    effective_on=datetime.now(UTC).date())
     assert plan["price_list_version_id"] == old_version
+
+
+def test_a_price_never_picks_a_row_the_document_contradicts(mahindra_journey) -> None:
+    """Rasmi Ranjan Biswal on DEV (2026-10-20): "MAHINDRA/BOLERO/MAXX PUP HD
+    2.0L VXI DIESEL" / "VXi" was pinned as "MAXX HD 1.7 LX CBC" because the
+    form's ex-showroom was within 0.5% of that row. The document says 2.0L
+    and VXi: the row is only suggested, never pinned."""
+    c = mahindra_journey
+    _seed_maxx_hd(c)
+    _set_journey_product(c, "MAXX HD 2.0L VXI DIESEL", "VXi")
+    _set_commercial(c, "ex_showroom_price", "947600.00")
+
+    result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert result.get("resolved") is not True, result
+    assert _pinned(c) is None
+
+
+def test_the_oem_name_in_front_of_the_model_is_ignored() -> None:
+    assert mr.clean_model_text("MAHINDRA BOLERO NEO+") == "BOLERO NEO+"
+    assert mr.clean_model_text("MAHINDRA & MAHINDRA MAXX HD BOL MAXX PUP HD 1.7 LX") == "MAXX HD BOL MAXX PUP HD 1.7 LX"
+    assert mr.clean_model_text("MAHINDRA/BOLERO/MAXX PUP HD 2.0L VXI DIESEL/OPEN") == "BOLERO MAXX PUP HD 2.0L VXI DIESEL OPEN"
+    assert mr.clean_model_text("XUV 7XO") == "XUV 7XO"
+
+
+def test_registration_type_reads_private_or_commercial() -> None:
+    assert mr.registration_category("Personal") == "PRIVATE"
+    assert mr.registration_category("Private") == "PRIVATE"
+    assert mr.registration_category("Motor Car") == "PRIVATE"
+    assert mr.registration_category("Commercial") == "COMMERCIAL"
+    assert mr.registration_category("Fresh Permit") == "COMMERCIAL"
+    assert mr.registration_category("NEW") is None
+    assert mr.registration_category("New Registration (RTO Side)") is None
+    assert mr.registration_category(None) is None
+
+
+def test_the_registration_type_picks_the_private_or_commercial_row(journey) -> None:
+    """The price list holds Bolero Neo N11 twice, (Private) and (Commercial);
+    the Journey's registration type picks one (2026-10-20)."""
+    c = journey
+    pri, com = _seed_price_list(c, [
+        {"model": "BOLERO NEO", "variant": "N11 BS6.2 (Private)", "components": {"EX_SHOWROOM": "1030000"}},
+        {"model": "BOLERO NEO", "variant": "N11 BS6.2 (Commercial)", "components": {"EX_SHOWROOM": "1030000"}},
+    ])
+    _set_journey_product(c, "BOLERO NEO", "N11 BS6.2")
+    first = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert first.get("resolved") is not True  # nothing says which registration
+
+    c.execute(
+        text("INSERT INTO auditcore.registration_records (tenant_id, journey_id, registration_type_code) "
+             "VALUES (:t, :j, 'Commercial')"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    )
+    second = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert second.get("resolved") is True, second
+    assert _pinned(c) == com and pri != com
+
+
+def test_a_model_split_across_the_two_boxes_is_read_together(journey) -> None:
+    """Susama Naik on DEV: model box "Maxx", variant box "HD 1.7 LX"."""
+    c = journey
+    hd, _city = _seed_price_list(c, [
+        {"model": "MAXX HD", "variant": "MAXX HD 1.7 LX BS6.2", "components": {"EX_SHOWROOM": "971500"}},
+        {"model": "MAXX CITY", "variant": "MAXX CITY 1.3 LX BS6.2", "components": {"EX_SHOWROOM": "800000"}},
+    ])
+    _set_journey_product(c, "Maxx", "HD 1.7 LX")
+    _set_commercial(c, "ex_showroom_price", "971500")
+    result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert result.get("resolved") is True, result
+    assert _pinned(c) == hd
+
+
+def test_the_retail_invoice_colour_replaces_a_different_booked_colour(journey) -> None:
+    """Rule 2026-10-20: the DMS / Tally invoice decides model, variant,
+    transmission and colour. The price list has no colours, so the invoiced
+    colour replaces the booked one on the Journey and the TL is told."""
+    c = journey
+    (thar,) = _seed_price_list(c, [{"model": "THAR", "variant": "LX", "components": {"EX_SHOWROOM": "1400000"}}])
+    _set_journey_product(c, "THAR", "LX")
+    c.execute(text("UPDATE auditcore.journey_products SET colour_name_snapshot='Red' WHERE tenant_id=:t AND journey_id=:j"),
+              {"t": c.tenant_id, "j": c.journey_id})
+    mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert _pinned(c) == thar
+    _set_invoice_field(c, "model_name_raw", "THAR")
+    _set_invoice_field(c, "vehicle_color", "Stealth Black")
+    mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert _vehicle(c)["product_sku_id"] == thar
+    colour = c.execute(
+        text("SELECT colour_name_snapshot FROM auditcore.journey_products WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert colour == "Stealth Black"
+    assert _sku_task(c, "MODEL_CHANGED_BY_INVOICE") is not None
+
+
+def test_dealer_spellings_of_the_pickups_and_the_neo_name_the_list_model(mahindra_journey) -> None:
+    """2026-10-20 DEV: "BOL MAXX PUP HD 1.7 LX" and "BOLERO MAXX PUP HD" are
+    the Maxx HD (the longest alias used to be "BOLERO" -> the Bolero Neo);
+    "Bol Neo N10 R" is the Bolero Neo."""
+    from audit_core.uc03_model_attribute_matching import resolve_model_via_aliases
+
+    c = mahindra_journey
+    aliases = mr._oem_model_aliases(c, oem_code="MAHINDRA")
+    assert resolve_model_via_aliases(model_name="BOL MAXX PUP HD 1.7 LX", oem_aliases=aliases)[0] == "MAXX HD"
+    assert resolve_model_via_aliases(model_name="BOLERO MAXX PUP HD 2.0L VXI", oem_aliases=aliases)[0] == "MAXX HD"
+    assert resolve_model_via_aliases(model_name="Bol Neo N10 R", oem_aliases=aliases)[0] == "THE BOSS- BOLERO+NEO"
