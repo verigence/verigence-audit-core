@@ -595,9 +595,14 @@ def list_p2_journeys(
                 FROM (
                   SELECT DISTINCT ON (COALESCE(receipt_number, payment_id::text), amount, receipt_date)
                          payment_id, receipt_date, amount
-                  FROM auditcore.payments
-                  WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id
-                    AND amount > 0 AND receipt_date IS NOT NULL
+                  FROM auditcore.payments py
+                  WHERE py.tenant_id=p.tenant_id AND py.journey_id=p.journey_id
+                    AND py.amount > 0 AND py.receipt_date IS NOT NULL
+                    AND (py.source_di_document_id IS NULL OR EXISTS (
+                          SELECT 1 FROM auditcore.evidence ev
+                          WHERE ev.tenant_id=py.tenant_id AND ev.journey_id=py.journey_id
+                            AND ev.di_document_id=py.source_di_document_id
+                            AND ev.association_status='ACTIVE'))
                   ORDER BY COALESCE(receipt_number, payment_id::text), amount, receipt_date, payment_id
                 ) receipts
               ) running

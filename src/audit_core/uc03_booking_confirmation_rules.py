@@ -362,11 +362,21 @@ def evaluate_minimum_booking_payment(
     payments = connection.execute(
         text(
             """
-            SELECT payment_id, amount, receipt_date, receipt_number
-            FROM auditcore.payments
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND amount IS NOT NULL AND receipt_date IS NOT NULL
-            ORDER BY receipt_date ASC, payment_id ASC
+            SELECT p.payment_id, p.amount, p.receipt_date, p.receipt_number
+            FROM auditcore.payments p
+            WHERE p.tenant_id=:tenant_id AND p.journey_id=:journey_id
+              AND p.amount IS NOT NULL AND p.amount > 0 AND p.receipt_date IS NOT NULL
+              -- 2026-10-20: only receipts on a document still on file count.
+              -- A receipt deleted, re-read or replaced kept its payment row,
+              -- and a misread date on it (SU-261020-001: "2020-10-13") stayed
+              -- the booking date with no task to review it -- the review
+              -- only looks at documents on file.
+              AND (p.source_di_document_id IS NULL OR EXISTS (
+                    SELECT 1 FROM auditcore.evidence e
+                    WHERE e.tenant_id=p.tenant_id AND e.journey_id=p.journey_id
+                      AND e.di_document_id=p.source_di_document_id
+                      AND e.association_status='ACTIVE'))
+            ORDER BY p.receipt_date ASC, p.payment_id ASC
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
@@ -440,9 +450,25 @@ def evaluate_minimum_booking_payment(
         return
 
     if not payments:
-        # Nothing to evaluate yet -- this trigger only fires from a receipt's
-        # own confirmation, so an empty set means the payment materializer
-        # hasn't caught up in this same pass yet, not a genuine shortfall.
+        # Nothing to evaluate yet -- an empty set usually means the payment
+        # materializer hasn't caught up in this same pass, not a genuine
+        # shortfall. But a booking date set from receipts that are no longer
+        # on file is cleared: it was taken from a document nobody can see.
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.journey_stage_states ss
+                SET booking_confirm_date=NULL, booking_confirmed_at_utc=NULL, updated_at_utc=now()
+                WHERE ss.tenant_id=:tenant_id AND ss.journey_id=:journey_id AND ss.stage_code='BOOKING'
+                  AND ss.booking_confirm_date IS NOT NULL
+                  AND EXISTS (SELECT 1 FROM auditcore.payments p
+                              WHERE p.tenant_id=ss.tenant_id AND p.journey_id=ss.journey_id
+                                AND p.receipt_date = ss.booking_confirm_date
+                                AND p.source_di_document_id IS NOT NULL)
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        )
         return
 
     connection.execute(
