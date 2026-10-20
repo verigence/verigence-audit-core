@@ -350,8 +350,10 @@ def test_once_the_vehicle_invoice_is_on_file_only_the_invoice_counts(journey):
     assert Decimal(summary["net"]["current"]) == 1000000
     assert Decimal(summary["variance"]["currentVsStandard"]) == -90000
     rows = {r["key"]: r for g in view["categories"] for r in g["components"]}
-    assert Decimal(rows["registration_charges"]["variance"]) == -90000
-    assert "NOT_INVOICED" in rows["registration_charges"]["flags"]
+    # Registration is compared as "Road tax + registration" (2026-10-20).
+    assert Decimal(rows["road_tax_registration"]["variance"]) == -90000
+    assert "NOT_INVOICED" in rows["road_tax_registration"]["flags"]
+    assert rows["registration_charges"]["partOf"] == "road_tax_registration"
     assert Decimal(rows["ex_showroom_price"]["variance"]) == 0
     corporate = next(d for d in view["discounts"] if d["key"] == "CORPORATE_PRIVILEGE")
     assert corporate["current"] is None and corporate["variance"] is None

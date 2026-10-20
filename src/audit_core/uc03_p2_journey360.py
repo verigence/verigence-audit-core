@@ -73,8 +73,9 @@ _COMPONENT_LABELS = {
     "ex_showroom_price": "Ex-showroom price",
     "tcs_amount": "TCS",
     "insurance_amount": "Insurance premium",
-    "registration_charges": "Registration",
+    "road_tax_registration": "Road tax + registration",
     "road_tax_amount": "Road tax",
+    "registration_charges": "Registration",
     "green_tax_amount": "Green tax",
     "accessories_cost": "Accessories kit",
     "essential_kit_amount": "Essential kit",
@@ -682,6 +683,89 @@ def _source_list(per_source: list[Any]) -> list[dict[str, Any]]:
     return out
 
 
+_RTO_COMBINED = "road_tax_registration"
+_RTO_PARTS = ("road_tax_amount", "registration_charges")
+
+
+def _fold_registration(rows: list[dict[str, Any]], *, invoice_on_file: bool) -> list[dict[str, Any]]:
+    """Road tax and registration compared as one figure, "Road tax +
+    registration", with the two shown beneath it as its breakdown.
+
+    Registration is a few thousand rupees, road tax is in lakhs (less for an
+    electric vehicle) (product owner 2026-10-20: they were "mapped wrongly
+    and twice"). The OEM price list's registration figure is the whole RTO
+    amount, a booking form usually prints one road tax / registration
+    figure (read both as the combined value and as registration), and the
+    RTO challan splits it into road tax and registration. Set against each
+    other line by line the price list's lakhs sat on the registration line
+    against the challan's few thousand, and the booking form's figure was
+    counted twice. Compared as one figure they agree; the parts are shown
+    but never counted again.
+    """
+    by_key = {r["key"]: r for r in rows}
+    parts = [by_key[k] for k in _RTO_PARTS if k in by_key]
+    combined = by_key.get(_RTO_COMBINED)
+    if not parts:
+        return rows
+
+    def total(column: str) -> Decimal | None:
+        values = [_dec(r[column]) for r in parts if r.get(column) is not None]
+        present = [v for v in values if v is not None]
+        return sum(present, Decimal(0)) if present else None
+
+    def first(*values: Any) -> Any:
+        return next((v for v in values if v is not None), None)
+
+    # The price list's registration figure is the whole RTO amount.
+    standard = first(combined["standard"] if combined else None, *(r["standard"] for r in parts))
+    booking_combined = combined["booking"] if combined else None
+    if booking_combined is not None:
+        booking = booking_combined
+    else:
+        # Both parts on the form are added; a lone figure is the whole amount.
+        booking = _money(total("booking"))
+    billed = first(_money(total("billed")), combined["billed"] if combined else None)
+    ledger = first(_money(total("ledger")), combined["ledger"] if combined else None)
+    reference = _reference({"booking": booking, "billed": billed}, invoice_on_file)
+    flags = _flags("COMMERCIAL", standard, booking, billed, ledger)
+    sources = [*(combined["sources"] if combined else []), *(src for r in parts for src in r["sources"])]
+    folded = {
+        "key": _RTO_COMBINED,
+        "label": component_label(_RTO_COMBINED),
+        "opted": None,
+        "standard": standard,
+        "booking": booking,
+        "billed": billed,
+        "ledger": ledger,
+        "quote": first(combined["quote"] if combined else None, _money(total("quote"))),
+        "effective": None,
+        "effectiveSource": None,
+        "variance": _minus(reference, standard),
+        "bookingVsBilled": _minus(billed, booking),
+        "flags": flags,
+        "sources": sources,
+    }
+    breakdown = []
+    for row in parts:
+        # A booking value equal to the combined figure is that figure again.
+        part_booking = row["booking"]
+        if part_booking is not None and booking_combined is not None and _dec(part_booking) == _dec(booking_combined):
+            part_booking = None
+        if part_booking is not None and booking_combined is None and len([r for r in parts if r["booking"] is not None]) == 1:
+            part_booking = None
+        breakdown.append({
+            **row,
+            "standard": None,
+            "booking": part_booking,
+            "variance": None,
+            "bookingVsBilled": None,
+            "flags": [f for f in row["flags"] if f == "INVOICES_DISAGREE"],
+            "partOf": _RTO_COMBINED,
+        })
+    others = [r for r in rows if r["key"] not in (_RTO_COMBINED, *_RTO_PARTS)]
+    return [folded, *breakdown, *others]
+
+
 def _column_total(rows: list[dict[str, Any]], column: str) -> str | None:
     values = [Decimal(r[column]) for r in rows if r.get(column) is not None]
     return str(sum(values, Decimal(0))) if values else None
@@ -892,6 +976,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             "sources": _source_list(per_source),
         })
 
+    categories["REGISTRATION"] = _fold_registration(categories["REGISTRATION"], invoice_on_file=invoice_on_file)
+
     order = list(_COMPONENT_LABELS)
     groups = []
     for code, label in _CATEGORIES:
@@ -901,7 +987,10 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
                 "code": code,
                 "label": label,
                 "components": rows,
-                "totals": {c: _column_total(rows, c) for c in ("standard", "booking", "billed", "ledger", "effective")},
+                "totals": {
+                    c: _column_total([r for r in rows if not r.get("partOf")], c)
+                    for c in ("standard", "booking", "billed", "ledger", "effective")
+                },
             })
     all_rows = [r for g in groups for r in g["components"]]
 
@@ -1009,7 +1098,9 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
                 # Insurance is optional too: Inhouse (opted in, the default)
                 # or Self (opted out), as the PC confirms it.
                 row["opted"] = {"taken": not self_insured, "source": "insurance"}
-    counted_rows = [r for r in all_rows if not r.get("excluded")]
+    # Road tax and registration on their own are the breakdown of the
+    # "Road tax + registration" line, which alone counts.
+    counted_rows = [r for r in all_rows if not r.get("excluded") and not r.get("partOf")]
     # A mandatory price-master line no invoice bills is a variance in its own
     # right (decision 2026-10-20): it counts at nil against its standard.
     # Optional lines (accessories, extended warranty) the customer may not
