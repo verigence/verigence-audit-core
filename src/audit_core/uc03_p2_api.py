@@ -588,10 +588,15 @@ def list_p2_journeys(
             ) ev ON true
             LEFT JOIN LATERAL (
               -- pages whose processing failed for good, and pages waiting for a retry
-              SELECT COUNT(*) FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER'))
+              -- (a page left for DI's night attempt after an AI failure is waiting,
+              -- not failed: product owner's rule 2026-10-20)
+              SELECT COUNT(*) FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')
+                                        AND COALESCE(q.last_error, '') NOT LIKE 'AI_RETRY_TONIGHT%')
                      + (SELECT COUNT(*) FROM auditcore.p2_upload_batches b
                          WHERE b.tenant_id=p.tenant_id AND b.journey_id=p.journey_id AND b.batch_status='FAILED') AS failed_pages,
-                     COUNT(*) FILTER (WHERE q.queue_status='RETRY_WAIT') AS retrying_pages
+                     COUNT(*) FILTER (WHERE q.queue_status='RETRY_WAIT'
+                                        OR (q.queue_status='FAILED'
+                                            AND COALESCE(q.last_error, '') LIKE 'AI_RETRY_TONIGHT%')) AS retrying_pages
               FROM auditcore.p2_document_queue q
               WHERE q.tenant_id=p.tenant_id AND q.journey_id=p.journey_id
             ) pq ON true

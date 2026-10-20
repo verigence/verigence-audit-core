@@ -239,7 +239,7 @@ def test_a_page_rejected_for_scan_quality_is_final(journey, monkeypatch):
         di_item={"state": "FAILED", "failureCode": "INVALID_FILE_CONTENT", "failureDetail": "not a PDF"},
         extracted_count=0, submitted_at=None, facts_copy=None, now=worker.datetime.now(worker.UTC),
     )
-    assert unreadable.reason == "The file could not be read: not a PDF. Upload it again."
+    assert unreadable.reason == "File couldn't be scanned — please reload it (not a PDF)."
 
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)

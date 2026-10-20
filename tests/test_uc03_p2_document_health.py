@@ -78,6 +78,9 @@ def _unit(hours_old: float = 1.0, **fields):
         (_unit(queue_status="FAILED", last_error="DI_QUALITY_BLUR"), "FAILED", "REJECTED", "UPLOAD_AGAIN"),
         (_unit(queue_status="DEAD_LETTER", last_error="FILE_EMPTY"), None, "REJECTED", "UPLOAD_AGAIN"),
         (_unit(queue_status="DEAD_LETTER", last_error="boom"), None, "FAILED", "RETRY"),
+        # Left for DI's night attempt after an AI failure (2026-10-20): nothing for the PC to do.
+        (_unit(queue_status="FAILED", last_error="AI_RETRY_TONIGHT:DOCUMENT_AI_UNAVAILABLE"), "CLASSIFIED",
+         "WAITING", None),
         (_unit(queue_status="NEEDS_REVIEW"), "CLASSIFIED", "NOTHING_READ", "READ_AGAIN"),
         (_unit(queue_status="SUPPORTING", template_key=None), "UNKNOWN", "UNCLASSIFIED", "SET_TYPE"),
         (_unit(queue_status="SUPPORTING", template_key="supporting_document",

@@ -12,7 +12,8 @@ nightly sweep, so all four agree.
 States and the one action each offers:
 
   READ          values are in Audit Core                       -
-  WAITING       in hand (classifying, reading, copying), < 8h  -
+  WAITING       in hand (classifying, reading, copying), < 8h,  -
+                or left for DI's night attempt after an AI failure
   STUCK         in hand for 8h or more                          READ_AGAIN
   NOT_READ      classified, settled without being read          READ_AGAIN
   NOTHING_READ  read, but no values came back                   READ_AGAIN
@@ -34,6 +35,20 @@ from sqlalchemy import Connection, text
 
 STUCK_AFTER_SECONDS = 8 * 3600
 TL_AFTER_SECONDS = 24 * 3600
+
+# Product owner's rule 2026-10-20: a page whose AI reading (Gemini) failed at
+# the first try and at the retries 10 and 20 minutes later, and that passed
+# DI's upload scan, is left for DI's one night attempt without troubling the
+# PC. It is kept FAILED (settled, nothing polls it) with last_error starting
+# with this marker: the file's status task leaves it out, the health below
+# shows it WAITING, and the nightly sweep looks at it again after the night
+# attempt.
+AI_RETRY_TONIGHT = "AI_RETRY_TONIGHT"
+
+
+def waits_for_night_attempt(last_error: str | None) -> bool:
+    """True for a FAILED page left for DI's night attempt (AI_RETRY_TONIGHT)."""
+    return str(last_error or "").startswith(AI_RETRY_TONIGHT)
 
 _IN_HAND = frozenset({
     "QUEUED", "PREPARING_PAGE", "DI_UPLOAD_PREPARING", "DI_UPLOADING", "DI_FINALIZING",
@@ -71,6 +86,9 @@ def page_health(
     if status == "READY":
         return result("READ", None)
     if status in ("FAILED", "DEAD_LETTER"):
+        if waits_for_night_attempt(unit.get("last_error")):
+            # Left for DI's night attempt (2026-10-20): nothing for the PC to do.
+            return result("WAITING", None)
         code = str(unit.get("last_error") or "").upper()
         if code.startswith(_QUALITY_PREFIX) or code in _UNREADABLE_CODES:
             return result("REJECTED", "UPLOAD_AGAIN")

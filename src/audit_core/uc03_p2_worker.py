@@ -64,7 +64,7 @@ from audit_core.uc03_p2_controls import (
     request_control_evaluation,
 )
 from audit_core.uc03_p2_customer import sync_customer_name
-from audit_core.uc03_p2_document_health import STUCK_AFTER_SECONDS
+from audit_core.uc03_p2_document_health import AI_RETRY_TONIGHT, STUCK_AFTER_SECONDS
 from audit_core.uc03_p2_grouping import (
     PageFact,
     merge_pdf_pages,
@@ -116,6 +116,26 @@ logger = structlog.get_logger(__name__)
 # refused the request, an unreadable file) is told at once.
 _RETRY_DELAYS_SECONDS = (900, 1800, 3600, 7200)
 _MAX_ATTEMPTS = int(os.environ.get("P2_WORKER_MAX_ATTEMPTS", str(len(_RETRY_DELAYS_SECONDS) + 1)))
+# A document's own processing steps -- splitting the upload into pages and
+# sending a page to Document Intelligence -- follow the product owner's
+# rule of 2026-10-20 instead: a technical failure (the document service or
+# storage not answering, a timeout, a 5xx) gets two attempts in all, the
+# second two minutes after the first, and then the PC is told plainly.
+# The ladder above stays for the background steps (reconcile, recompute,
+# control evaluation), which only poll or recompute.
+_DOCUMENT_WORK_TYPES = frozenset({"DOCUMENT_INGEST", "SPLIT_BATCH"})
+_DOCUMENT_RETRY_DELAYS_SECONDS = (120,)
+_DOCUMENT_MAX_ATTEMPTS = len(_DOCUMENT_RETRY_DELAYS_SECONDS) + 1
+
+
+def _max_attempts(work_type: str) -> int:
+    return _DOCUMENT_MAX_ATTEMPTS if work_type in _DOCUMENT_WORK_TYPES else _MAX_ATTEMPTS
+
+
+def _retry_delay(work_type: str, attempts: int) -> int:
+    """Seconds to wait after failed attempt ``attempts`` (numbered from 1)."""
+    delays = _DOCUMENT_RETRY_DELAYS_SECONDS if work_type in _DOCUMENT_WORK_TYPES else _RETRY_DELAYS_SECONDS
+    return delays[min(attempts, len(delays)) - 1]
 _POLL_SECONDS = float(os.environ.get("P2_WORKER_POLL_SECONDS", "1.0"))
 _MAX_PDF_PAGES = int(os.environ.get("P2_MAX_PDF_PAGES", "100"))
 _WORKER_CONCURRENCY = max(1, int(os.environ.get("P2_WORKER_CONCURRENCY", "6")))
@@ -254,7 +274,7 @@ def _claim_for_tenant(engine: Engine, tenant_id: str, limit: int) -> list[WorkIt
             # looping item eventually dead-letters instead of cycling forever.
             attempts = int(row["attempt_count"] or 0) + (1 if row["reclaimed"] else 0)
             item = _work_item(row, attempts=attempts, token=token)
-            if row["reclaimed"] and attempts >= _MAX_ATTEMPTS:
+            if row["reclaimed"] and attempts >= _max_attempts(str(row["work_type"])):
                 connection.execute(
                     text(
                         """
@@ -474,12 +494,29 @@ def _delay_text(seconds: int) -> str:
     return f"{max(1, seconds // 60)} minute" + ("" if seconds < 120 else "s")
 
 
+def _technical_cause(exc: Exception) -> str:
+    """What failed, in the PC's words, for a fault that trying again can fix
+    (product owner's rule 2026-10-20: say which case it is)."""
+    if isinstance(exc, (DiCaptureV2Error, TransportError, HTTPStatusError)):
+        return "Document service didn't respond"
+    return "A system problem stopped this page"
+
+
+_ATTEMPT_WORDS = {1: "once", 2: "twice"}
+
+
 def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
     attempts = work.attempt_count + 1
     retryable = _is_retryable(exc)
-    terminal = (not retryable) or attempts >= _MAX_ATTEMPTS
-    delay = _RETRY_DELAYS_SECONDS[min(attempts, len(_RETRY_DELAYS_SECONDS)) - 1]
-    cause = _plain_cause(exc)
+    terminal = (not retryable) or attempts >= _max_attempts(work.work_type)
+    delay = _retry_delay(work.work_type, attempts)
+    # A technical fault on a document's own step is told as such once its
+    # two attempts are spent (2026-10-20); a refusal keeps its own reason.
+    cause = (
+        f"{_technical_cause(exc)} — tried {_ATTEMPT_WORDS.get(attempts, f'{attempts} times')}."
+        if retryable and work.work_type in _DOCUMENT_WORK_TYPES
+        else _plain_cause(exc)
+    )
     summary = exception_summary(exc)
     # Stored and shown in the batch view: class + redacted message + where it failed.
     error = summary["exc_type"] + (f": {summary['exc_message']}" if "exc_message" in summary else "")
@@ -529,13 +566,12 @@ def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
                     tenant_id=work.tenant_id,
                     queue_id=UUID(work.work_key),
                     status="RETRY_WAIT",
-                    reason=(f"{cause} Retrying automatically in {_delay_text(delay)} (attempt {attempts} of "
-                            f"{_MAX_ATTEMPTS}). You can leave this page and check back later."),
+                    reason=(f"{_technical_cause(exc)} — trying once more in {_delay_text(delay)} "
+                            f"(attempt {attempts} of {_max_attempts(work.work_type)}). Nothing to do yet."),
                     last_error=error,
                 )
-                # The PC is told at once: check back in an hour; the same
-                # task turns into "upload this page on its own" if the
-                # retries run out, and closes itself if one succeeds.
+                # The same task turns into "upload this page on its own" if
+                # the second attempt fails too, and closes itself if it works.
                 sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
             return
         _mark_dead(connection, work, attempts=attempts, retryable=retryable, cause=cause, error=error)
@@ -562,8 +598,8 @@ def _mark_dead(connection, work: WorkItem, *, attempts: int, retryable: bool, ca
             tenant_id=work.tenant_id,
             queue_id=UUID(work.work_key),
             status="FAILED",
-            reason=(f"{cause} " + (f"Not processed after {attempts} attempts. " if retryable else "")
-                    + "Retry the page, remove the upload, or delete this booking."),
+            reason=(f"{cause} " + ("Retry the page from the card, or upload it again."
+                                   if retryable else "Retry the page, remove the upload, or delete this booking.")),
             last_error=error,
         )
         sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
@@ -1338,10 +1374,83 @@ def _enqueue_journey_reconcile(connection, *, work: WorkItem, delay_seconds: int
 class PageOutcome:
     status: str
     reason: str | None
+    # What to store as the page's last_error when it settles FAILED (the
+    # failure code, or the AI_RETRY_TONIGHT marker); None: DI's failureCode.
+    last_error: str | None = None
 
 
 _QUALITY_FAILURE_PREFIX = "DI_QUALITY_"
 _UNREADABLE_FAILURE_CODES = frozenset({"FILE_EMPTY", "INVALID_FILE_CONTENT", "CORRUPT", "UPLOAD_FAILED"})
+
+# Product owner's retry rule (2026-10-20). Document Intelligence makes every
+# retry itself (verigence-di retry_policy.py) and reports, per page, what
+# failed (failureKind: AI / TECHNICAL / DOCUMENT / CONFIGURATION), whether
+# the page passed its upload scan (scanPassed) and whether its one night
+# attempt is still to come (retryTonight). Audit Core never stacks retries
+# of its own on top; it only says, in plain words, which case the page is in:
+# - AI (Gemini) failure: DI tries again 10 and 20 minutes later, then once
+#   that night when the page passed the scan. Until then the PC is not
+#   troubled; a page that did not pass the scan is the PC's to reload.
+# - technical failure inside DI: two attempts, then the PC is told.
+# - a refusal (scan rejection, unreadable file, refused content): at once.
+# DI codes for an AI failure that a later attempt can fix (DI's
+# AI_RETRYABLE_FAILURE_CODES).
+_AI_RETRYABLE_CODES = frozenset({
+    "DOCUMENT_AI_RATE_LIMITED", "DOCUMENT_AI_UNAVAILABLE", "DOCUMENT_AI_RESPONSE_INVALID",
+    "CLASSIFICATION_PROVIDER_ERROR", "EXTRACTION_PROVIDER_ERROR",
+})
+_AI_RETRYING_REASON = ("AI reading failed — will retry at 10 and 20 minutes, then overnight. "
+                       "Nothing to do now.")
+_AI_TONIGHT_REASON = ("AI reading failed — tried 3 times today (at once, after 10 and after 20 minutes); "
+                      "it will be tried again overnight. Nothing to do now.")
+_AI_GAVE_UP_REASON = ("AI reading failed again overnight — please upload this page again "
+                      "(or retry it from the card).")
+_AI_REFUSED_REASON = "AI couldn't read this page — please upload it again."
+_NOT_SCANNED_REASON = "File couldn't be scanned — please reload it."
+_TECHNICAL_RETRYING_REASON = ("Document service had a problem with this page — trying once more in 2 minutes. "
+                              "Nothing to do yet.")
+_TECHNICAL_GAVE_UP_REASON = ("Document service couldn't process this page — tried twice. "
+                             "Retry the page from the card, or upload it again.")
+
+
+def _di_failure_code(di_item: dict[str, Any]) -> str:
+    """The code behind DI's verdict on a page: the reading failure's when
+    reading failed, else the upload / classification failure's."""
+    if str(di_item.get("processingStatus") or "") in ("FAILED", "RETRY_PENDING"):
+        code = di_item.get("processingFailureCode") or di_item.get("failureCode")
+    else:
+        code = di_item.get("failureCode") or di_item.get("processingFailureCode")
+    return str(code or "").upper()
+
+
+def _failed_page_outcome(di_item: dict[str, Any]) -> PageOutcome:
+    """A page DI has FAILED, told as the product owner's rule says
+    (2026-10-20): left for the night attempt without troubling the PC, or
+    the PC told plainly what to do. A DI that does not report failureKind
+    yet keeps the earlier wording."""
+    kind = di_item.get("failureKind")
+    code = _di_failure_code(di_item)
+    if kind == "AI":
+        if di_item.get("scanPassed") is not True:
+            return PageOutcome("FAILED", _NOT_SCANNED_REASON, code or None)
+        if di_item.get("retryTonight"):
+            return PageOutcome("FAILED", _AI_TONIGHT_REASON, f"{AI_RETRY_TONIGHT}:{code}")
+        return PageOutcome("FAILED", _AI_GAVE_UP_REASON if code in _AI_RETRYABLE_CODES else _AI_REFUSED_REASON,
+                           code or None)
+    if kind == "TECHNICAL":
+        return PageOutcome("FAILED", _TECHNICAL_GAVE_UP_REASON, code or None)
+    return PageOutcome("FAILED", _di_failure_reason(di_item), code or None)
+
+
+def _in_hand_reason(di_item: dict[str, Any] | None) -> str | None:
+    """Why a page DI still has in hand is waiting, when an attempt already
+    failed and DI has scheduled the next (2026-10-20)."""
+    kind = (di_item or {}).get("failureKind")
+    if kind == "AI":
+        return _AI_RETRYING_REASON
+    if kind == "TECHNICAL":
+        return _TECHNICAL_RETRYING_REASON
+    return None
 
 
 def recovery_decision(
@@ -1356,13 +1465,23 @@ def recovery_decision(
     for it: a page state to poll from ("SYNCING_TO_AUDIT_CORE" when DI has
     read it, so the worker copies; "EXTRACTING" or "CLASSIFYING" while DI
     still has it in hand), "REUPLOAD" when DI has given it up or no longer
-    knows it, or "LEAVE" for the nightly sweep meeting a technical
-    extraction failure DI's own nightly reprocessing is still going to
-    retry (for _RECOVERY_REUPLOAD_AFTER_SECONDS after submission)."""
+    knows it, "LEAVE" for the nightly sweep meeting a failure DI's own
+    night attempt is still going to retry, or "TELL_PC" for the nightly
+    sweep meeting a failure no attempt is left for (2026-10-20). A DI that
+    does not report failureKind yet keeps the earlier rule: a technical
+    extraction failure is left for _RECOVERY_REUPLOAD_AFTER_SECONDS."""
     if di_item is None:
         return "REUPLOAD"
     state = str(di_item.get("state") or "")
     processing = str(di_item.get("processingStatus") or "")
+    failed = state == "FAILED" or (state == "CLASSIFIED" and processing == "FAILED")
+    if failed and marker == "n" and di_item.get("failureKind"):
+        # Product owner's rule (2026-10-20): the nightly sweep never sends a
+        # page again. A page whose night attempt is still to come is left;
+        # any other failed page is now the PC's (TELL_PC).
+        if di_item.get("failureKind") == "AI" and di_item.get("retryTonight") and di_item.get("scanPassed") is True:
+            return "LEAVE"
+        return "TELL_PC"
     if state in ("FAILED", "DELETED"):
         return "REUPLOAD"
     if state == "CLASSIFIED":
@@ -1417,11 +1536,17 @@ def _recover_page(engine: Engine, work: WorkItem, row: dict[str, Any]) -> None:
                 client_upload_id=str(row["client_upload_id"]), marker=marker,
                 requested_by=str(work.payload.get("uploadedBy") or "SYSTEM"), correlation_id=work.correlation_id,
             )
-        elif decision == "LEAVE":
+        elif decision in ("LEAVE", "TELL_PC"):
+            # Settled FAILED either way: left for DI's night attempt (the
+            # AI_RETRY_TONIGHT marker keeps the PC's task away), or told to
+            # the PC by the file's status task the sweep refreshes next.
+            outcome = _failed_page_outcome(di_item or {})
             _settle_page(
                 connection, tenant_id=work.tenant_id, queue_id=queue_id, status="FAILED",
-                reason=_di_failure_reason(di_item),
+                reason=outcome.reason, last_error=outcome.last_error,
             )
+            if decision == "TELL_PC":
+                sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
         else:
             connection.execute(
                 text(
@@ -1439,13 +1564,16 @@ def _recover_page(engine: Engine, work: WorkItem, row: dict[str, Any]) -> None:
 def _di_failure_reason(di_item: dict[str, Any] | None) -> str:
     """Why the document service failed a page, as the PC should read it: a
     scan-quality rejection is final and needs a re-scan, not a retry."""
-    code = str((di_item or {}).get("failureCode") or "").upper()
+    code = _di_failure_code(di_item or {})
     detail = str((di_item or {}).get("failureDetail") or "").strip().rstrip(".")
     if code.startswith(_QUALITY_FAILURE_PREFIX):
         return (f"Page rejected: {detail or 'it did not pass the scan quality check'}. "
                 "Re-scan this page and upload it again; retrying will not help.")
     if code in _UNREADABLE_FAILURE_CODES:
-        return f"The file could not be read{': ' + detail if detail else ''}. Upload it again."
+        # The file failed DI's upload scan (2026-10-20 wording).
+        return f"{_NOT_SCANNED_REASON[:-1]}{' (' + detail + ')' if detail else ''}."
+    if code == "DOCUMENT_AI_CONTENT_BLOCKED":
+        return "AI declined to read this page's content — check the page and upload it again."
     return "Document Intelligence could not read this page. Retry or re-upload it." + (f" ({detail})" if detail else "")
 
 
@@ -1492,7 +1620,7 @@ def classify_page_outcome(
     if state == "DELETED":
         return PageOutcome("CANCELLED", "The page was removed from Document Intelligence.")
     if state == "FAILED" or processing == "FAILED":
-        return PageOutcome("FAILED", _di_failure_reason(di_item))
+        return _failed_page_outcome(di_item)
     if state == "UNKNOWN":
         # Docket covers, letters, e-mails, printouts: evidence, never a blocker.
         return PageOutcome(
@@ -1515,8 +1643,8 @@ def classify_page_outcome(
             # going to read it: settle it now rather than show "reading"
             # for ever (seen live 2026-10-01, a file stuck for 12 hours).
             return PageOutcome("SUPPORTING", _NOT_QUEUED_REASON)
-        return PageOutcome("EXTRACTING", None)
-    return PageOutcome("CLASSIFYING", None)
+        return PageOutcome("EXTRACTING", _in_hand_reason(di_item))
+    return PageOutcome("CLASSIFYING", _in_hand_reason(di_item))
 
 
 def _copy_page_facts(
@@ -2306,7 +2434,9 @@ def _reconcile_page(
             "di_state": (di_item or {}).get("state"),
             "di_processing_status": (di_item or {}).get("processingStatus"),
             "processed_seen_at": processed_seen_at,
-            "failure_code": (di_item or {}).get("failureCode") if outcome.status == "FAILED" else None,
+            "failure_code": (
+                (outcome.last_error or (di_item or {}).get("failureCode")) if outcome.status == "FAILED" else None
+            ),
         },
     )
 
@@ -2557,12 +2687,15 @@ def _refresh_batch_status(connection, tenant_id: str, batch_id: UUID) -> None:
             """
             SELECT COUNT(*) FILTER (WHERE queue_status NOT IN ('CANCELLED','MERGED')) AS total,
                    COUNT(*) FILTER (WHERE queue_status IN ('READY','SUPPORTING','NEEDS_REVIEW')) AS usable,
-                   COUNT(*) FILTER (WHERE queue_status IN ('FAILED','DEAD_LETTER')) AS failed
+                   -- a page left for DI's night attempt (2026-10-20) is still
+                   -- in progress for the file, not failed
+                   COUNT(*) FILTER (WHERE queue_status IN ('FAILED','DEAD_LETTER')
+                                      AND COALESCE(last_error, '') NOT LIKE :tonight) AS failed
             FROM auditcore.p2_document_queue
             WHERE tenant_id=:tenant_id AND batch_id=:batch_id
             """
         ),
-        {"tenant_id": tenant_id, "batch_id": batch_id},
+        {"tenant_id": tenant_id, "batch_id": batch_id, "tonight": f"{AI_RETRY_TONIGHT}%"},
     ).mappings().one()
     total, usable, failed = int(counts["total"]), int(counts["usable"]), int(counts["failed"])
     if total > 0 and usable == total:
@@ -2653,19 +2786,24 @@ def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
     return {**settled, "transitions": transitions}
 
 
-# A page still not settled this long after its last change is re-driven
-# once by the nightly sweep; after that only the PC's own Retry moves it.
+# A page still in flight this long after its last change is reconciled by
+# the nightly sweep (a status read, never a new attempt: 2026-10-20).
 _NIGHTLY_SWEEP_AFTER_SECONDS = int(os.environ.get("P2_NIGHTLY_SWEEP_AFTER_SECONDS", str(24 * 60 * 60)))
 
 
 def queue_nightly_upload_sweep(connection, *, tenant_id: str, now: datetime | None = None) -> dict[str, int]:
-    """Every night, give every page that has been stuck for a day one more
-    go, then refresh the file's status task so the PC sees the morning
-    state: a failed page (other than a scan-quality rejection, which a
-    retry cannot fix) is recovered through what Document Intelligence
-    already holds for it (_recover_page), and sent again only if DI gave it
-    up, once; a page still in flight after a day is reconciled so it settles
-    one way or the other. Safe to call more than once."""
+    """Every night, look again at every page left for Document
+    Intelligence's night attempt, then refresh the file's status task so
+    the PC sees the morning state, and reconcile any page still in flight
+    after a day so it settles one way or the other. Safe to call more than
+    once.
+
+    Product owner's rule (2026-10-20): a failed page is never sent again by
+    the sweep. A page whose AI reading failed (AI_RETRY_TONIGHT) is looked
+    up at DI (_recover_page): copied when DI's night attempt read it, left
+    when that attempt is still to come, and told to the PC when it failed
+    too. A technical failure has had its two attempts and a refusal its
+    answer: both are already with the PC, whose Retry stays available."""
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(seconds=_NIGHTLY_SWEEP_AFTER_SECONDS)
     failed = connection.execute(
@@ -2674,12 +2812,10 @@ def queue_nightly_upload_sweep(connection, *, tenant_id: str, now: datetime | No
             SELECT queue_id, journey_id, client_upload_id
             FROM auditcore.p2_document_queue
             WHERE tenant_id=:t AND queue_status IN ('FAILED','DEAD_LETTER')
-              AND updated_at_utc < :cutoff
-              AND COALESCE(last_error, '') NOT LIKE 'DI_QUALITY_%'
-              AND client_upload_id NOT LIKE '%~n%'
+              AND last_error LIKE :tonight
             """
         ),
-        {"t": tenant_id, "cutoff": cutoff},
+        {"t": tenant_id, "tonight": f"{AI_RETRY_TONIGHT}%"},
     ).mappings().all()
     journeys: set[UUID] = set()
     for row in failed:

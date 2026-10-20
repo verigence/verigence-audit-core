@@ -46,6 +46,7 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_p2_access import authorize_p2
+from audit_core.uc03_p2_document_health import waits_for_night_attempt
 
 router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-daily-report"])
 
@@ -348,7 +349,9 @@ def build_daily_processing_report(
                     docs["readNoValues"] += 1
                 elif status == "SUPPORTING":
                     docs["notRead"] += 1
-                elif status in _WAITING:
+                elif status in _WAITING or waits_for_night_attempt(unit["last_error"]):
+                    # a page left for DI's night attempt after an AI failure
+                    # is waiting, not failed (product owner's rule 2026-10-20)
                     docs["waiting"] += 1
                     in_flight = True
                 elif status in ("FAILED", "DEAD_LETTER"):

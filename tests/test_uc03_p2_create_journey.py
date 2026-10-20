@@ -229,3 +229,25 @@ def test_the_customer_name_follows_the_kyc_on_file(uc03_create_booking_setup):  
     assert _customer(setup, created["customerId"])["legal_name"] == "SARBESWAR PRADHAN"
     listed = client.get(url, params={"state": "open"}).json()["items"]
     assert next(i for i in listed if i["journey_id"] == created["journeyId"])["customer_name"] == "SARBESWAR PRADHAN"
+
+
+def test_a_page_left_for_the_night_attempt_counts_as_retrying_not_failed(uc03_create_booking_setup):  # noqa: F811
+    """Product owner's rule (2026-10-20): a page whose AI reading failed and
+    that waits for DI's night attempt is not shown to the PC as failed."""
+    setup = uc03_create_booking_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    url = f"/p2/v1/tenants/{setup['tenant_id']}/journeys"
+    created = client.post(url, headers={"Idempotency-Key": "p2-new-journey-ai-night"},
+                          json={"outletId": str(setup["outlet_id"])}).json()
+    journey = _journey(setup, created["journeyId"], created["customerId"])
+    _, queue_id, _ = add_page(journey, status="FAILED")
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        connection.execute(
+            text("UPDATE auditcore.p2_document_queue SET last_error='AI_RETRY_TONIGHT:DOCUMENT_AI_UNAVAILABLE' "
+                 "WHERE queue_id=:q"),
+            {"q": queue_id},
+        )
+    listed = next(i for i in client.get(url, params={"state": "open"}).json()["items"]
+                  if i["journey_id"] == created["journeyId"])
+    assert listed["failed_pages"] == 0 and listed["retrying_pages"] == 1

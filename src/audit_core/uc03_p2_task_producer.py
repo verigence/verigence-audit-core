@@ -27,7 +27,11 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import Connection, text
 
-from audit_core.uc03_p2_document_health import STUCK_AFTER_SECONDS, TL_AFTER_SECONDS
+from audit_core.uc03_p2_document_health import (
+    AI_RETRY_TONIGHT,
+    STUCK_AFTER_SECONDS,
+    TL_AFTER_SECONDS,
+)
 from audit_core.uc03_p2_names import display_name, same_organisation, same_person
 from audit_core.uc03_p2_registry import ControlTemplate, Registry, get_registry
 from audit_core.uc03_p2_stage import unreviewed_fields
@@ -656,7 +660,9 @@ def sync_processing_failure_tasks(
     after 1 hour". High once the retries are spent (or the document service
     refused a page): which pages to upload on their own. The task refreshes
     its counts as they change and closes itself when the file is done or
-    removed."""
+    removed. A page left for Document Intelligence's night attempt after an
+    AI failure raises nothing on its own (product owner's rule 2026-10-20);
+    it is only mentioned when the file has a task for another reason."""
     registry = registry or get_registry()
     now = now or datetime.now(UTC)
     wanted: set[str] = set()
@@ -672,11 +678,21 @@ def sync_processing_failure_tasks(
                    COUNT(q.queue_id) FILTER (WHERE q.queue_status NOT IN
                      ('READY','SUPPORTING','NEEDS_REVIEW','CANCELLED','MERGED','RETRY_WAIT','FAILED','DEAD_LETTER'))
                      AS working,
+                   -- left for DI's night attempt after an AI failure (2026-10-20):
+                   -- neither failed nor a reason to raise the task
                    COALESCE(array_agg(DISTINCT p.page ORDER BY p.page)
-                            FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')), ARRAY[]::int[]) AS failed_pages,
-                   MIN(q.status_reason) FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')) AS failed_reason,
+                            FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')
+                                      AND COALESCE(q.last_error, '') LIKE :tonight), ARRAY[]::int[])
+                     AS overnight_pages,
+                   COALESCE(array_agg(DISTINCT p.page ORDER BY p.page)
+                            FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')
+                                      AND COALESCE(q.last_error, '') NOT LIKE :tonight), ARRAY[]::int[])
+                     AS failed_pages,
+                   MIN(q.status_reason) FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')
+                                                  AND COALESCE(q.last_error, '') NOT LIKE :tonight) AS failed_reason,
                    COALESCE(array_agg(p.page::text || '|' || COALESCE(q.last_error, '') ORDER BY p.page)
-                            FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')), ARRAY[]::text[])
+                            FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')
+                                      AND COALESCE(q.last_error, '') NOT LIKE :tonight), ARRAY[]::text[])
                      AS failed_errors
             FROM auditcore.p2_upload_batches b
             LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id=b.tenant_id AND q.batch_id=b.batch_id
@@ -687,13 +703,20 @@ def sync_processing_failure_tasks(
             ORDER BY b.created_at_utc
             """
         ),
-        {"t": tenant_id, "j": journey_id},
+        {"t": tenant_id, "j": journey_id, "tonight": f"{AI_RETRY_TONIGHT}%"},
     ).mappings().all()
     for row in batches:
         filename = row["original_filename"]
         total, done = int(row["total"] or 0), int(row["done"] or 0)
         retrying, working = int(row["retrying"] or 0), int(row["working"] or 0)
         failed_pages = [int(p) for p in (row["failed_pages"] or [])]
+        overnight_pages = [int(p) for p in (row["overnight_pages"] or [])]
+        overnight_text = (
+            f"{_pages_text(overnight_pages).capitalize()} {'is' if len(overnight_pages) == 1 else 'are'} "
+            "waiting for tonight's AI retry; nothing to do for "
+            f"{'it' if len(overnight_pages) == 1 else 'them'}."
+            if overnight_pages else ""
+        )
         split_failed = row["batch_status"] == "FAILED" and int(row["page_count"] or 0) == 0
         in_progress = retrying + working > 0 or row["batch_status"] in ("AWAITING_UPLOAD", "UPLOADED", "SPLITTING")
         age = (now - row["created_at_utc"]).total_seconds() if row["created_at_utc"] else 0.0
@@ -707,6 +730,8 @@ def sync_processing_failure_tasks(
             else:
                 title, description = _failed_pages_text(filename, row["failed_errors"] or [],
                                                         failed_pages, row["failed_reason"])
+                if overnight_text:
+                    description = f"{description} {overnight_text}"
         elif in_progress and age >= _UPLOAD_STATUS_AFTER_SECONDS:
             severity = "INFO"
             title = f"{filename}: {done} of {total} pages read, still working"
@@ -717,6 +742,8 @@ def sync_processing_failure_tasks(
                 parts.append(f"{retrying} waiting for an automatic retry")
             if failed_pages:
                 parts.append(f"{_pages_text(failed_pages)} could not be processed so far")
+            if overnight_pages:
+                parts.append(f"{len(overnight_pages)} waiting for tonight's AI retry")
             if age >= STUCK_AFTER_SECONDS:
                 # Decision 2026-10-01: after eight hours the PC is told the
                 # truth, and what will happen next, instead of "check back".
@@ -761,7 +788,7 @@ def sync_processing_failure_tasks(
                        "sourceCode": "DOCUMENT_PROCESSING_FAILED" if severity == "HIGH" else "DOCUMENT_PROCESSING_SLOW",
                        "batchId": str(row["batch_id"]), "filename": filename, "pageNumbers": failed_pages,
                        "pages": {"total": total, "read": done, "working": working, "retrying": retrying,
-                                 "failed": len(failed_pages)},
+                                 "failed": len(failed_pages), "overnight": len(overnight_pages)},
                        "retrying": severity != "HIGH"},
             severity=severity, registry=registry, evaluation_started_at=evaluation_started_at,
         )
