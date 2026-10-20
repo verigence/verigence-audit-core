@@ -74,9 +74,6 @@ from audit_core.uc03_sku_candidates import (
     _normalize_label,
     _price_plan_for_journey,
 )
-from audit_core.uc03_v2_review_materialization import (
-    _INVOICE_DOCUMENT_TYPES as _DELIVERY_INVOICE_DOCUMENT_TYPES,
-)
 from audit_core.workflow import create_workflow_task
 
 logger = logging.getLogger(__name__)
@@ -129,10 +126,19 @@ def _closest_within_tolerance(
 # this module still does that resolution, deterministically, the same way it
 # already does for the Booking Form.
 _INVOICE_SKU_CODE_FIELD_KEYS = ("sku_code",)
-_INVOICE_MODEL_FIELD_KEYS = ("model_name_raw",)
+# The model name printed on its own first; the full printed vehicle
+# description ("XUV 3XO AX5 L 1.2 TGDi MT Everest White") when the invoice
+# has no separate model box -- DI reads it as vehicle_description_raw.
+_INVOICE_MODEL_FIELD_KEYS = ("model_name_raw", "vehicle_description_raw")
 _INVOICE_VARIANT_FIELD_KEYS = ("variant_raw",)
 _INVOICE_COLOUR_FIELD_KEYS = ("vehicle_color",)
 _INVOICE_SELECTION_METHOD = "MODEL_RESOLUTION_INVOICE_FALLBACK_V1"
+# Only the invoices that bill the vehicle itself name it: the retail (DMS)
+# and tax (Tally) invoices first, then a generic invoice, then the OEM's
+# wholesale invoice for the same chassis. An accessory, extended-warranty
+# or RSA invoice's "model" text is never read as the vehicle (it once could
+# be: the field was read off every invoice type, highest confidence first).
+_VEHICLE_INVOICE_TYPES = ("customer_invoice_dms", "tax_invoice_tally", "invoice_generic", "wholesale_invoice")
 
 # A SKU already on the journey (CONFIRMED or merely tentative) is never
 # re-pinned from the invoice -- but the invoice's own implied vehicle can
@@ -526,7 +532,12 @@ def _price_disambiguate(
 
 
 # ── persistence ───────────────────────────────────────────────────────────────
-def _pin_sku(connection: Connection, *, tenant_id: str, journey_id: UUID, product_sku_id: UUID) -> None:
+def _pin_sku(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, product_sku_id: UUID,
+    method: str = _SELECTION_METHOD,
+) -> None:
+    """Pin the SKU and refresh the Journey's vehicle snapshot (model, variant,
+    colour) from the price master, whichever document named it."""
     connection.execute(
         text(
             """
@@ -567,7 +578,7 @@ def _pin_sku(connection: Connection, *, tenant_id: str, journey_id: UUID, produc
             "tenant_id": tenant_id,
             "journey_id": journey_id,
             "product_sku_id": product_sku_id,
-            "method": _SELECTION_METHOD,
+            "method": method,
         },
     )
 
@@ -1061,26 +1072,35 @@ def _catalogue_search(
 def _latest_invoice_field(
     connection: Connection, *, tenant_id: str, journey_id: UUID, field_keys: tuple[str, ...]
 ) -> str | None:
-    """Highest-confidence, most-recent value for ``field_keys`` off any Delivery
-    invoice document, read from durable storage (never DI directly)."""
+    """The value for ``field_keys`` off the vehicle invoice, read from durable
+    storage (never DI directly): the first key in ``field_keys`` that has a
+    value wins, then the retail/tax invoice over the others, then the
+    highest-confidence, most recent reading.
+
+    Not filtered on stage: the unified upload copies a page's facts before
+    its classification moves it to Delivery, so an invoice can sit under
+    BOOKING for a while (or for good, when that move failed) -- it is the
+    vehicle invoice all the same."""
     value = connection.execute(
         text(
             """
             SELECT effective_value
             FROM auditcore.journey_document_extracted_fields
             WHERE tenant_id = :tenant_id AND journey_id = :journey_id
-              AND stage_code = 'DELIVERY'
               AND source_document_type_key = ANY(:document_types)
               AND field_key = ANY(:field_keys)
               AND effective_value IS NOT NULL
-            ORDER BY confidence_score DESC NULLS LAST, updated_at_utc DESC
+              AND effective_value NOT IN ('null'::jsonb, '""'::jsonb)
+            ORDER BY array_position(CAST(:field_keys AS text[]), field_key::text),
+                     array_position(CAST(:document_types AS text[]), source_document_type_key::text),
+                     confidence_score DESC NULLS LAST, updated_at_utc DESC
             LIMIT 1
             """
         ),
         {
             "tenant_id": tenant_id,
             "journey_id": journey_id,
-            "document_types": list(_DELIVERY_INVOICE_DOCUMENT_TYPES),
+            "document_types": list(_VEHICLE_INVOICE_TYPES),
             "field_keys": list(field_keys),
         },
     ).scalar_one_or_none()
@@ -1222,6 +1242,152 @@ def _invoice_implied_vehicle(
     return row["product_sku_id"], str(row["sku_code"]), label
 
 
+# ── the vehicle invoice as the source of the model ─────────────────────────────
+def _invoice_reading(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
+    """What the vehicle invoice says the vehicle is: printed SKU code, model
+    text (the model box, else the full vehicle description), variant,
+    colour, and the ex-showroom price it bills. None when no vehicle invoice
+    names the vehicle at all."""
+    def field(keys: tuple[str, ...]) -> str | None:
+        return _latest_invoice_field(connection, tenant_id=tenant_id, journey_id=journey_id, field_keys=keys)
+
+    sku_code = field(_INVOICE_SKU_CODE_FIELD_KEYS)
+    model = field(_INVOICE_MODEL_FIELD_KEYS)
+    if sku_code is None and model is None:
+        return None
+    ex_showroom = connection.execute(
+        text(
+            """
+            SELECT amount FROM auditcore.commercial_line_source_values
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+              AND line_kind = 'COMMERCIAL' AND component_key = 'ex_showroom_price'
+              AND source_document_type = ANY(:types) AND amount IS NOT NULL
+            ORDER BY array_position(CAST(:types AS text[]), source_document_type::text), updated_at_utc DESC
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "types": list(_VEHICLE_INVOICE_TYPES)},
+    ).scalar_one_or_none()
+    return {
+        "sku_code": sku_code,
+        "model_name": model,
+        "variant_name": field(_INVOICE_VARIANT_FIELD_KEYS),
+        "colour_name": field(_INVOICE_COLOUR_FIELD_KEYS),
+        "ex_showroom": _to_decimal(ex_showroom),
+    }
+
+
+def _invoice_inputs(inputs: dict[str, Any], reading: dict[str, Any]) -> dict[str, Any]:
+    """The resolution inputs with the invoice standing in for the Booking
+    Form. The invoice is the source of truth: its model, and its billed
+    ex-showroom price when it prints one (the booking's offered on-road
+    total then says nothing about the vehicle that was actually billed).
+    A variant or colour the invoice does not print falls back to the
+    booking's reading."""
+    out = dict(inputs)
+    out["model_name"] = reading["model_name"]
+    out["variant_name"] = reading["variant_name"] or inputs["variant_name"]
+    out["colour_name"] = reading["colour_name"] or inputs["colour_name"]
+    if reading["ex_showroom"] is not None:
+        out["offered_ex_showroom"] = reading["ex_showroom"]
+        out["offered_total"] = None
+    return out
+
+
+def _invoice_candidates(
+    connection: Connection, *, tenant_id: str, journey_id: UUID,
+    inputs: dict[str, Any], reading: dict[str, Any],
+) -> dict[str, Any]:
+    """The same ladder the Booking Form gets, run on the invoice's reading;
+    a printed SKU code that is exactly one master row decides on its own."""
+    if reading["sku_code"] is not None:
+        current = _current_rows(connection, tenant_id=tenant_id, journey_id=journey_id)
+        if current.get("skipped"):
+            return current
+        by_code = [
+            r for r in current["rows"]
+            if str(r["sku_code"]).strip().casefold() == reading["sku_code"].casefold()
+        ]
+        if len(by_code) == 1 or reading["model_name"] is None:
+            return {
+                "matched": by_code, "matchStage": "INVOICE_SKU_CODE",
+                "priceListVersionId": current["plan"]["price_list_version_id"],
+                "priceList": _plan_label(current["plan"]),
+            }
+    return _current_match(connection, tenant_id=tenant_id, journey_id=journey_id, inputs=inputs)
+
+
+# ── a model in another month's price list ──────────────────────────────────────
+_OTHER_LIST_VERSIONS = 12
+_OTHER_LIST_HITS = 3
+
+
+def _model_rows_by_name(rows: list[dict[str, Any]], model: str) -> list[dict[str, Any]]:
+    """Rows whose model name is the text, or the start of it ("XUV 3XO" in
+    "XUV 3XO AX5 L 1.2 TGDi MT"); the longest such name wins."""
+    key = normalized_model_key(model)
+    if not key:
+        return []
+    best: list[dict[str, Any]] = []
+    best_len = 0
+    for row in rows:
+        name = normalized_model_key(str(row["model_name"] or ""))
+        if len(name) < 3 or not key.startswith(name):
+            continue
+        if len(name) > best_len:
+            best, best_len = [row], len(name)
+        elif len(name) == best_len:
+            best.append(row)
+    return best
+
+
+def _other_price_list_hits(
+    connection: Connection, *, tenant_id: str, inputs: dict[str, Any], current_version_id: Any,
+) -> list[dict[str, Any]]:
+    """Model names change between months ("XUV300" became "XUV 3XO"). When
+    the Journey's own price list does not hold the model, say which other
+    published price list does -- for the PC and TL to see; nothing is
+    pinned from it, the Journey stays priced on its own month's list."""
+    model = inputs.get("model_name")
+    if not model:
+        return []
+    versions = connection.execute(
+        text(
+            """
+            SELECT plv.price_list_version_id, pl.price_list_name, pl.price_list_code,
+                   plv.version_no, plv.effective_from, plv.effective_to
+            FROM auditcore.price_list_versions plv
+            JOIN auditcore.price_lists pl
+              ON pl.tenant_id = plv.tenant_id AND pl.price_list_id = plv.price_list_id
+            WHERE plv.tenant_id = :tenant_id AND plv.lifecycle_status = 'PUBLISHED'
+              AND plv.price_list_version_id IS DISTINCT FROM :current
+            ORDER BY plv.effective_from DESC, plv.version_no DESC
+            LIMIT :limit
+            """
+        ),
+        {"tenant_id": tenant_id, "current": current_version_id, "limit": _OTHER_LIST_VERSIONS},
+    ).mappings().all()
+    hits: list[dict[str, Any]] = []
+    for version in versions:
+        rows = _sku_rows_for_version(
+            connection, tenant_id=tenant_id, price_list_version_id=version["price_list_version_id"]
+        )
+        found = _narrow(_model_rows_by_name(rows, model), variant=inputs.get("variant_name"), colour=None)
+        if not found:
+            continue
+        hits.append({
+            "priceList": _plan_label(dict(version)),
+            "effectiveFrom": str(version["effective_from"]) if version["effective_from"] else None,
+            "effectiveTo": str(version["effective_to"]) if version["effective_to"] else None,
+            "modelName": str(found[0]["model_name"]),
+            "skuCount": len(found),
+            "skuCodes": [str(r["sku_code"]) for r in found[:5]],
+        })
+        if len(hits) >= _OTHER_LIST_HITS:
+            break
+    return hits
+
+
 # ── producer ──────────────────────────────────────────────────────────────────
 def sync_model_resolution_from_invoice(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
@@ -1238,22 +1404,15 @@ def sync_model_resolution_from_invoice(
 def _sync_model_resolution_from_invoice_unguarded(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
 ) -> dict[str, Any]:
-    """Delivery-side fallback for a Booking that never pinned a SKU, and a
-    cross-check for one that already has.
+    """Delivery-side entry: a Journey with no SKU yet goes through the full
+    resolution (Booking Form first, then the vehicle invoice, raising
+    MODEL_NOT_IDENTIFIED when neither names one SKU); a Journey that already
+    has one gets the invoice cross-check.
 
-    ``sync_model_resolution`` already covers the Booking Form, including using
-    its ex-showroom price to break a tie when the model text alone matches
-    more than one price-master SKU. When that still leaves no SKU pinned by
-    the time a Delivery invoice is confirmed, this reads the invoice's own
-    ``sku_code`` (an explicit master code, when the invoice prints one -- the
-    strongest possible signal) or, failing that, its ``model_name_raw`` /
-    ``variant_raw`` free text, and resolves against the same price masters
-    the Booking resolver uses. Idempotent, self-heals on read, never raises.
-
-    When a SKU is already on the journey (CONFIRMED or merely tentative),
-    this never re-pins it -- but it still computes what the invoice itself
-    implies and hands it to ``check_invoice_sku_mismatch`` so a genuine
-    disagreement is never silently dropped.
+    The cross-check never re-pins a SKU already on the Journey (CONFIRMED or
+    merely tentative) -- it computes what the invoice itself implies and
+    hands it to ``check_invoice_sku_mismatch`` so a genuine disagreement is
+    never silently dropped. Idempotent, never raises.
     """
     try:
         already_resolved = connection.execute(
@@ -1265,129 +1424,39 @@ def _sync_model_resolution_from_invoice_unguarded(
             ),
             {"tenant_id": tenant_id, "journey_id": journey_id},
         ).scalar_one_or_none()
+        if already_resolved is None:
+            return _sync_model_resolution_unguarded(
+                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+            )
 
-        sku_code = _latest_invoice_field(
+        reading = _invoice_reading(connection, tenant_id=tenant_id, journey_id=journey_id)
+        if reading is None:
+            return {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False, "crossChecked": False}
+        inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id, require_model=False)
+        outcome = _invoice_candidates(
             connection, tenant_id=tenant_id, journey_id=journey_id,
-            field_keys=_INVOICE_SKU_CODE_FIELD_KEYS,
+            inputs=_invoice_inputs(inputs, reading), reading=reading,
         )
-        invoice_model = _latest_invoice_field(
-            connection, tenant_id=tenant_id, journey_id=journey_id,
-            field_keys=_INVOICE_MODEL_FIELD_KEYS,
-        )
-        if sku_code is None and invoice_model is None:
-            return {"skipped": True, "reason": "no_invoice_model_data"}
-
-        # require_model=False: this function's whole purpose is resolving a
-        # SKU when the Booking side never captured a usable model at all --
-        # requiring one here first would defeat it. See _resolution_inputs'
-        # own docstring for the bug this fixes.
-        inputs = _resolution_inputs(
-            connection, tenant_id=tenant_id, journey_id=journey_id, require_model=False
-        )
-        if inputs is None:
-            return {"skipped": True, "reason": "no_booking_snapshot"}
-
-        effective_on = date.fromisoformat(
-            connection.execute(
-                text(
-                    """
-                    SELECT COALESCE(b.pricing_effective_on, b.booking_date, CURRENT_DATE)
-                    FROM auditcore.journeys j
-                    LEFT JOIN auditcore.bookings b
-                      ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
-                    WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
-                    """
-                ),
-                {"tenant_id": tenant_id, "journey_id": journey_id},
-            ).scalar_one().isoformat()
-        )
-        try:
-            plan = _price_plan_for_journey(
-                connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on
-            )
-        except AuditCoreError:  # no effective price list yet
-            return {"skipped": True, "reason": "no_effective_price_list"}
-
-        rows = _sku_rows_for_version(
-            connection, tenant_id=tenant_id, price_list_version_id=plan["price_list_version_id"]
-        )
-        if not rows:
-            return {"skipped": True, "reason": "empty_price_list"}
-
-        matched: list[dict[str, Any]] = []
-        stage = "NONE"
-        if sku_code is not None:
-            matched = [
-                r for r in rows if str(r["sku_code"]).strip().casefold() == sku_code.casefold()
-            ]
-            stage = "INVOICE_SKU_CODE"
-
-        if len(matched) != 1 and invoice_model is not None:
-            invoice_variant = _latest_invoice_field(
-                connection, tenant_id=tenant_id, journey_id=journey_id,
-                field_keys=_INVOICE_VARIANT_FIELD_KEYS,
-            )
-            invoice_colour = _latest_invoice_field(
-                connection, tenant_id=tenant_id, journey_id=journey_id,
-                field_keys=_INVOICE_COLOUR_FIELD_KEYS,
-            )
-            invoice_inputs = dict(inputs)
-            invoice_inputs["model_name"] = invoice_model
-            invoice_inputs["variant_name"] = invoice_variant or inputs["variant_name"]
-            invoice_inputs["colour_name"] = invoice_colour or inputs["colour_name"]
-            # The same ladder the Booking Form gets (exact name, attribute
-            # decomposition, fuzzy trim, price, catalogue search): an
-            # invoice spelled differently from the master is no longer
-            # silently skipped (rule 2026-10-01).
-            outcome = _current_match(connection, tenant_id=tenant_id, journey_id=journey_id, inputs=invoice_inputs)
-            if outcome.get("skipped"):
-                matched, stage = [], "NONE"
-            else:
-                matched, stage = outcome["matched"], outcome["matchStage"]
-
-        if already_resolved is not None:
-            # Never re-pin an already-resolved SKU (CONFIRMED or merely
-            # tentative) -- but what the invoice implies is exactly the
-            # signal that must be cross-checked against it, not dropped.
-            mismatch_flagged = False
-            implied = _invoice_implied_vehicle(matched, already_resolved)
-            if implied is not None:
-                invoice_sku_id, invoice_sku_code, invoice_label = implied
-                mismatch_flagged = invoice_sku_id != already_resolved
-                check_invoice_sku_mismatch(
-                    connection,
-                    tenant_id=tenant_id,
-                    journey_id=journey_id,
-                    confirmed_sku_id=already_resolved,
-                    invoice_sku_id=invoice_sku_id,
-                    invoice_sku_code=invoice_sku_code,
-                    correlation_id=correlation_id,
-                    invoice_label=invoice_label,
-                )
-            return {
-                "skipped": True, "reason": "already_resolved",
-                "mismatchFlagged": mismatch_flagged, "crossChecked": implied is not None,
-            }
-
-        if len(matched) == 1:
-            _pin_sku(
+        matched = [] if outcome.get("skipped") else outcome["matched"]
+        mismatch_flagged = False
+        implied = _invoice_implied_vehicle(matched, already_resolved)
+        if implied is not None:
+            invoice_sku_id, invoice_sku_code, invoice_label = implied
+            mismatch_flagged = invoice_sku_id != already_resolved
+            check_invoice_sku_mismatch(
                 connection,
                 tenant_id=tenant_id,
                 journey_id=journey_id,
-                product_sku_id=matched[0]["product_sku_id"],
+                confirmed_sku_id=already_resolved,
+                invoice_sku_id=invoice_sku_id,
+                invoice_sku_code=invoice_sku_code,
+                correlation_id=correlation_id,
+                invoice_label=invoice_label,
             )
-            _resolve_open_flag(
-                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
-            )
-            _run_deal_reconciliation(
-                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
-            )
-            return {"resolved": True, "skuCode": matched[0]["sku_code"], "matchStage": stage}
-
-        # Deliberately does not raise MODEL_NOT_IDENTIFIED here -- this is an
-        # extra chance to resolve, not a new alerting path. If Booking already
-        # raised the finding, it stays open until a human resolves it.
-        return {"skipped": True, "reason": "unresolved_from_invoice", "matchStage": stage, "candidateCount": len(matched)}
+        return {
+            "skipped": True, "reason": "already_resolved",
+            "mismatchFlagged": mismatch_flagged, "crossChecked": implied is not None,
+        }
     except Exception as exc:
         logger.warning("sync_model_resolution_from_invoice failed", exc_info=True)
         return {"error": True, "errorType": type(exc).__name__, "errorMessage": str(exc)[:300]}
@@ -1406,6 +1475,18 @@ def _current_match(
     endpoint (``get_model_resolution_candidates``, which never mutates
     anything) -- one matching implementation, not two that could drift.
     """
+    current = _current_rows(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if current.get("skipped"):
+        return current
+    out = _ladder(connection, tenant_id=tenant_id, rows=current["rows"], inputs=inputs)
+    out["priceListVersionId"] = current["plan"]["price_list_version_id"]
+    out["priceList"] = _plan_label(current["plan"])
+    return out
+
+
+def _current_rows(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """The Journey's effective price list (by its pricing date) and its SKU
+    rows, or ``{"skipped": True, "reason": ...}``."""
     effective_on = date.fromisoformat(
         connection.execute(
             text(
@@ -1432,6 +1513,20 @@ def _current_match(
     )
     if not rows:
         return {"skipped": True, "reason": "empty_price_list"}
+    return {"plan": plan, "rows": rows}
+
+
+def _plan_label(plan: dict[str, Any]) -> str:
+    name = plan.get("price_list_name") or plan.get("price_list_code") or "Price list"
+    version = plan.get("version_no")
+    start = plan.get("effective_from")
+    return f"{name}" + (f" v{version}" if version is not None else "") + (f" (from {start})" if start else "")
+
+
+def _ladder(
+    connection: Connection, *, tenant_id: str, rows: list[dict[str, Any]], inputs: dict[str, Any]
+) -> dict[str, Any]:
+    """The matching ladder over one price list's SKU rows."""
 
     # Attribute decomposition first, always attempted -- not only once a
     # price-based match has already failed. A fuel/transmission/drive/
@@ -1595,31 +1690,40 @@ def _format_candidate_line(row: dict[str, Any], basis: str) -> str:
 
 
 def _candidate_task_payload(
-    inputs: dict[str, Any], matched: list[dict[str, Any]], *, multiple: bool, stage: str = ""
+    inputs: dict[str, Any], matched: list[dict[str, Any]], *, multiple: bool, stage: str = "",
+    source: str = "BOOKING", other_lists: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """The PC-facing shortlist for the auto-spawned Task: business-readable
     comment text naming each candidate model/variant/colour with its
     ex-showroom price, plus the same list structured for a UI picker."""
     basis = inputs["registration_basis"]
     shortlist = matched[:5]
+    text_of = "vehicle invoice" if source == "INVOICE" else "booking"
+    scan = "vehicle invoice" if source == "INVOICE" else "Booking Form"
     if stage == _CATALOGUE_STAGE:
         intro = (
-            "The booking model text did not match any SKU name in the current price masters "
+            f"The {text_of} model text did not match any SKU name in the current price masters "
             "(the scan may have been misread). The closest SKUs on fuel, price, model and trim "
-            "are listed. Open the scanned Booking Form on the Journey Documents page and "
+            f"are listed. Open the scanned {scan} on the Journey Documents page and "
             "select the one that matches it:"
         )
     elif multiple:
         intro = (
-            f"The booking model text matched {len(matched)} possible vehicle SKUs and "
-            "could not be narrowed to one automatically. Open the scanned Booking Form "
+            f"The {text_of} model text matched {len(matched)} possible vehicle SKUs and "
+            f"could not be narrowed to one automatically. Open the scanned {scan} "
             "on the Journey Documents page and select the SKU that matches it:"
         )
     else:
         intro = (
-            "The booking model text did not match any SKU in the current price masters. "
-            "Open the scanned Booking Form on the Journey Documents page, check the exact "
+            f"The {text_of} model text did not match any SKU in the current price masters. "
+            f"Open the scanned {scan} on the Journey Documents page, check the exact "
             "model/variant/colour printed on it, and select the matching SKU there."
+        )
+    if other_lists:
+        intro = (
+            "This model is not in the Journey's own price list but is in "
+            + "; ".join(f"{h['priceList']} as '{h['modelName']}'" for h in other_lists)
+            + ". " + intro
         )
     lines = [f"{i}. {_format_candidate_line(r, basis)}" for i, r in enumerate(shortlist, start=1)]
     comment = intro if not lines else intro + "\n" + "\n".join(lines)
@@ -1671,15 +1775,22 @@ def get_model_resolution_candidates(
             detail="There is no open vehicle-model gap to resolve for this Journey.",
         )
 
-    inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if inputs is None:
+    inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id, require_model=False)
+    reading = _invoice_reading(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if inputs["model_name"] is None and reading is None:
         raise NotFoundError(
             error_code="VAC-NF-010",
-            title="No reviewed booking model",
-            detail="The Booking Form has not been reviewed yet -- nothing to shortlist.",
+            title="No vehicle model read",
+            detail="Neither the Booking Form nor a vehicle invoice names the model yet -- nothing to shortlist.",
         )
 
-    outcome = _current_match(connection, tenant_id=tenant_id, journey_id=journey_id, inputs=inputs)
+    if inputs["model_name"] is not None:
+        outcome = _current_match(connection, tenant_id=tenant_id, journey_id=journey_id, inputs=inputs)
+    if inputs["model_name"] is None or (reading is not None and not outcome.get("matched")):
+        inputs = _invoice_inputs(inputs, reading)
+        outcome = _invoice_candidates(
+            connection, tenant_id=tenant_id, journey_id=journey_id, inputs=inputs, reading=reading,
+        )
     matched = outcome.get("matched", [])
     stage = outcome.get("matchStage", "NONE")
     basis = inputs["registration_basis"]
@@ -2113,6 +2224,18 @@ def _sync_model_resolution_unguarded(
 ) -> dict[str, Any]:
     """Resolve the SKU or raise MODEL_NOT_IDENTIFIED. Idempotent; never raises.
 
+    The Booking Form's model is tried first. When it names no single SKU --
+    or no model was read off it at all -- the vehicle invoice, once
+    uploaded, names the vehicle instead (rule 2026-10-20: "if you are not
+    able to find model variant from Booking ... find it from Invoice"). It
+    used to run only from Delivery-side events, and only on the invoice's
+    model box, so a Journey whose Booking Form had no readable model never
+    tried its invoice from the Booking checks or the nightly retry.
+
+    When neither names one SKU the finding says what each document read and,
+    when the Journey's own price list does not hold the model, which other
+    month's published price list does.
+
     ``raise_findings=False`` is for the read-only self-heal on every Journey
     Overview page view: still pins/resolves the SKU itself (cheap, and
     genuinely needed so the Deal panel reflects it), but skips the deal
@@ -2122,10 +2245,7 @@ def _sync_model_resolution_unguarded(
     why running those on every page view was a measured regression.
     """
     try:
-        inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id)
-        if inputs is None:
-            # No vehicle model has been read onto the journey (journey_products).
-            return {"skipped": True, "reason": "no_vehicle_model_read"}
+        inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id, require_model=False)
 
         if inputs["product_sku_id"] is not None:
             resolved = _resolve_open_flag(
@@ -2137,17 +2257,10 @@ def _sync_model_resolution_unguarded(
             )
             return {"resolved": True, "flagsResolved": resolved}
 
-        outcome = _current_match(connection, tenant_id=tenant_id, journey_id=journey_id, inputs=inputs)
-        if outcome.get("skipped"):
-            return outcome
-        matched, stage = outcome["matched"], outcome["matchStage"]
-
-        if len(matched) == 1:
+        def pin(row: dict[str, Any], stage: str, source: str, method: str) -> dict[str, Any]:
             _pin_sku(
-                connection,
-                tenant_id=tenant_id,
-                journey_id=journey_id,
-                product_sku_id=matched[0]["product_sku_id"],
+                connection, tenant_id=tenant_id, journey_id=journey_id,
+                product_sku_id=row["product_sku_id"], method=method,
             )
             _resolve_open_flag(
                 connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
@@ -2156,37 +2269,104 @@ def _sync_model_resolution_unguarded(
                 connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
                 raise_findings=raise_findings,
             )
-            return {"resolved": True, "skuCode": matched[0]["sku_code"], "matchStage": stage}
+            return {"resolved": True, "skuCode": row["sku_code"], "matchStage": stage, "source": source}
+
+        booking: dict[str, Any] | None = None
+        if inputs["model_name"] is not None:
+            booking = _current_match(connection, tenant_id=tenant_id, journey_id=journey_id, inputs=inputs)
+            if booking.get("skipped"):
+                return booking
+            if len(booking["matched"]) == 1:
+                return pin(booking["matched"][0], booking["matchStage"], "BOOKING", _SELECTION_METHOD)
+
+        reading = _invoice_reading(connection, tenant_id=tenant_id, journey_id=journey_id)
+        invoice: dict[str, Any] | None = None
+        invoice_inputs: dict[str, Any] | None = None
+        if reading is not None:
+            invoice_inputs = _invoice_inputs(inputs, reading)
+            invoice = _invoice_candidates(
+                connection, tenant_id=tenant_id, journey_id=journey_id, inputs=invoice_inputs, reading=reading,
+            )
+            if invoice.get("skipped"):
+                if booking is None:
+                    return invoice
+                invoice = None
+            elif len(invoice["matched"]) == 1:
+                return pin(invoice["matched"][0], invoice["matchStage"], "INVOICE", _INVOICE_SELECTION_METHOD)
+
+        if booking is None and invoice is None:
+            # No vehicle model read off the Booking Form, no vehicle invoice
+            # naming one.
+            return {"skipped": True, "reason": "no_vehicle_model_read"}
+
+        # The invoice's shortlist when it has one (it is the source of
+        # truth), else the booking's.
+        use_invoice = invoice is not None and (booking is None or bool(invoice["matched"]) or not booking["matched"])
+        source = "INVOICE" if use_invoice else "BOOKING"
+        outcome = invoice if use_invoice else booking
+        report = invoice_inputs if use_invoice else inputs
+        matched, stage = outcome["matched"], outcome["matchStage"]
+        document = "Vehicle invoice" if use_invoice else "Booking"
 
         multiple = len(matched) > 1 and stage != _CATALOGUE_STAGE
+        not_in_list = not matched or stage == _CATALOGUE_STAGE
+        other_lists = (
+            _other_price_list_hits(
+                connection, tenant_id=tenant_id, inputs=report,
+                current_version_id=outcome.get("priceListVersionId"),
+            )
+            if not_in_list else []
+        )
         title = (
             "Vehicle model matched multiple price-master SKUs"
             if multiple
+            else "Vehicle model is in another month's price list, not this Journey's"
+            if other_lists
             else "Vehicle model could not be matched to the price masters"
-            )
+        )
         description = (
-            f"Booking model '{inputs['model_name']}'"
-            + (f" / '{inputs['variant_name']}'" if inputs["variant_name"] else "")
+            f"{document} model '{report['model_name']}'"
+            + (f" / '{report['variant_name']}'" if report["variant_name"] else "")
             + (
                 f" matched {len(matched)} price-master SKUs"
                 if multiple
                 else " did not match any price-master SKU"
             )
+            + (f" in {outcome['priceList']}" if outcome.get("priceList") else "")
             + " on model, on-road total or ex-showroom price. "
+            + (
+                f"Booking model '{inputs['model_name']}' did not settle it either. "
+                if use_invoice and booking is not None
+                else "No model was read off the Booking Form. " if use_invoice
+                else ""
+            )
+            + (
+                "The model is in "
+                + "; ".join(f"{h['priceList']} as '{h['modelName']}' ({h['skuCount']} SKUs)" for h in other_lists)
+                + " -- check the Journey's pricing date or the model name in this month's price list. "
+                if other_lists
+                else ""
+            )
             + (
                 f"The {len(matched)} closest SKUs are listed on the task. "
                 if stage == _CATALOGUE_STAGE
                 else ""
             )
             + "Confirm the model so the deal can be checked against the price and discount masters."
-            )
+        )
         safe_payload = {
-            "modelName": inputs["model_name"],
-            "variantName": inputs["variant_name"],
-            "colourName": inputs["colour_name"],
-            "offeredTotal": str(inputs["offered_total"]) if inputs["offered_total"] is not None else None,
+            "source": source,
+            "modelName": report["model_name"],
+            "variantName": report["variant_name"],
+            "colourName": report["colour_name"],
+            "bookingModelName": inputs["model_name"],
+            "invoiceModelName": reading["model_name"] if reading else None,
+            "invoiceSkuCode": reading["sku_code"] if reading else None,
+            "priceList": outcome.get("priceList"),
+            "otherPriceLists": other_lists,
+            "offeredTotal": str(report["offered_total"]) if report["offered_total"] is not None else None,
             "offeredExShowroom": (
-                str(inputs["offered_ex_showroom"]) if inputs["offered_ex_showroom"] is not None else None
+                str(report["offered_ex_showroom"]) if report["offered_ex_showroom"] is not None else None
             ),
             "matchStage": stage,
             "candidateCount": len(matched),
@@ -2197,8 +2377,8 @@ def _sync_model_resolution_unguarded(
                     "variantName": r["variant_name"],
                     "colourName": r["colour_name"],
                     "masterTotal": (
-                        str(_master_total(r, inputs["registration_basis"]))
-                        if _master_total(r, inputs["registration_basis"]) is not None
+                        str(_master_total(r, report["registration_basis"]))
+                        if _master_total(r, report["registration_basis"]) is not None
                         else None
                     ),
                     "exShowroom": (
@@ -2209,8 +2389,10 @@ def _sync_model_resolution_unguarded(
                 }
                 for r in matched[:10]
             ],
-            }
-        task_payload_extra = _candidate_task_payload(inputs, matched, multiple=multiple, stage=stage)
+        }
+        task_payload_extra = _candidate_task_payload(
+            report, matched, multiple=multiple, stage=stage, source=source, other_lists=other_lists,
+        )
         finding_id = _machine_flag(
             connection,
             tenant_id=tenant_id,
@@ -2230,7 +2412,10 @@ def _sync_model_resolution_unguarded(
             title=title, description=description, safe_payload=safe_payload,
             task_payload_extra=task_payload_extra, correlation_id=correlation_id,
         )
-        return {"raised": True, "matchStage": stage, "candidateCount": len(matched)}
+        return {
+            "raised": True, "matchStage": stage, "candidateCount": len(matched), "source": source,
+            "otherPriceLists": len(other_lists),
+        }
     except Exception as exc:
         logger.warning("sync_model_resolution failed", exc_info=True)
         return {"error": True, "errorType": type(exc).__name__, "errorMessage": str(exc)[:300]}

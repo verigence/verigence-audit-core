@@ -501,6 +501,15 @@ def _columns(per_source: list[Any]) -> dict[str, Any]:
     return out
 
 
+def _reference(cols: dict[str, Any], vehicle_invoiced: bool) -> Any:
+    """The figure a component's variance is measured on: the invoiced value
+    once the vehicle invoice is on file, else billed falling back to the
+    booking offer."""
+    if vehicle_invoiced:
+        return cols["billed"]
+    return cols["billed"] if cols["billed"] is not None else cols["booking"]
+
+
 def _billed_disagree(per_source: list[Any]) -> bool:
     """Two invoices (say the DMS retail invoice and the Tally tax invoice)
     printing different amounts for the same component."""
@@ -804,6 +813,14 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     )
     invoice_documents = [d for d in documents if d["documentType"] in _INVOICE_TYPES]
     invoiced_deal = bool(invoice_documents) or any(str(s["source_document_type"]) in _INVOICE_TYPES for s in sources)
+    # Once the vehicle invoice is on file it is the deal's source of truth:
+    # every "current" figure and every variance is the invoiced one, and a
+    # component the invoices do not carry is no longer priced from the
+    # booking form (2026-10-20, Amit: "if invoice is uploaded then all
+    # calculation from the invoice").
+    vehicle_invoiced = any(
+        d["documentType"] in _VEHICLE_INVOICE_TYPES for d in documents
+    ) or any(str(s["source_document_type"]) in _VEHICLE_INVOICE_TYPES for s in sources)
     present = {(str(s["component_key"]), _norm_type(s["source_document_type"])) for s in sources}
     sources = list(sources) + [
         s for s in _document_billed(documents)
@@ -851,7 +868,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             # still shows it in the right column.
             if line["actual_amount"] is not None and cols[_column_for(effective_type)] is None:
                 cols[_column_for(effective_type)] = line["actual_amount"]
-        reference = cols["billed"] if cols["billed"] is not None else cols["booking"]
+        reference = _reference(cols, vehicle_invoiced)
         flags = _flags("COMMERCIAL", standard, cols["booking"], cols["billed"], cols["ledger"])
         if _billed_disagree(per_source):
             flags.append("INVOICES_DISAGREE")
@@ -901,8 +918,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         # entitlement is zero, so the whole amount is the over-grant.
         if entitled is None and (row.get("eligibility_result") == "NOT_ELIGIBLE" or key == "ADDITIONAL_DISCOUNT"):
             entitled = Decimal(0)
-        reference = cols["billed"] if cols["billed"] is not None else cols["booking"]
-        if reference is None:
+        reference = _reference(cols, vehicle_invoiced)
+        if reference is None and not vehicle_invoiced:
             reference = row.get("actual_discount_amount")
         proof_type = CONDITIONAL_DISCOUNT_EVIDENCE_DOCUMENT.get(key)
         discount_rows.append({
@@ -944,7 +961,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     mr_sources = [s for s in sources if s["line_kind"] == "DISCOUNT" and s["component_key"] == mr_key]
     mr_cols = _columns(mr_sources)
     mr_entitled = Decimal(referral["amount"]) if referral["opted"] and referral["amount"] else Decimal(0)
-    mr_reference = mr_cols["billed"] if mr_cols["billed"] is not None else mr_cols["booking"]
+    mr_reference = _reference(mr_cols, vehicle_invoiced)
     discount_rows = [r for r in discount_rows if r["key"] != mr_key]
     discount_rows.append({
         "key": mr_key,
@@ -965,13 +982,16 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         "sources": _source_list(mr_sources),
     })
 
-    # "Current" is what the deal stands at now: the billed value where the
-    # component has been invoiced, else what the booking offered. Totals of a
-    # partly-invoiced deal therefore never look short.
+    # "Current" is what the deal stands at now. Before the vehicle invoice it
+    # is the billed value where a component has been invoiced, else what the
+    # booking offered. Once the vehicle invoice is on file it is the billed
+    # value only: the booking form no longer prices anything.
     for row in all_rows:
-        row["current"] = row["billed"] if row["billed"] is not None else row["booking"]
+        row["current"] = row["billed"] if vehicle_invoiced else (
+            row["billed"] if row["billed"] is not None else row["booking"]
+        )
     for row in discount_rows:
-        row["current"] = next(
+        row["current"] = row["billed"] if vehicle_invoiced else next(
             (row[c] for c in ("billed", "booking", "effective") if row[c] is not None), None,
         )
     # Insurance: Inhouse premium is part of the deal; Self (the customer
@@ -1078,6 +1098,9 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
                 "billedVsBooking": matched("billed", "booking"),
             },
             "invoicedComponents": invoiced,
+            # True once the vehicle invoice is on file: current and every
+            # variance are then the invoice's figures only.
+            "invoiceIsSourceOfTruth": vehicle_invoiced,
             "components": len(counted_rows),
             "paid": {"receipts": str(paid["receipts"]), "loan": str(paid["loan"]), "total": str(paid["total"])},
             "payable": payable,

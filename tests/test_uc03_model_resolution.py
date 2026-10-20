@@ -1164,7 +1164,7 @@ def test_integration_falls_back_to_latest_master_when_booking_predates_it(journe
 
 
 # ── Delivery-invoice fallback ────────────────────────────────────────────────
-def _set_invoice_field(c, field_key, value, *, document_type_key="customer_invoice_dms"):
+def _set_invoice_field(c, field_key, value, *, document_type_key="customer_invoice_dms", stage_code="DELIVERY"):
     c.execute(
         text(
             """
@@ -1175,14 +1175,14 @@ def _set_invoice_field(c, field_key, value, *, document_type_key="customer_invoi
                 extracted_value, effective_value, is_modified
             ) VALUES (
                 :t, :j, NULL, :doc,
-                NULL, 1, 'DELIVERY',
+                NULL, 1, :stage,
                 :dtk, NULL, :fk,
                 CAST(:v AS jsonb), CAST(:v AS jsonb), false
             )
             """
         ),
         {"t": c.tenant_id, "j": c.journey_id, "doc": uuid4(), "dtk": document_type_key,
-         "fk": field_key, "v": json.dumps(value)},
+         "fk": field_key, "v": json.dumps(value), "stage": stage_code},
     )
 
 
@@ -1462,15 +1462,128 @@ def test_invoice_cross_check_flags_a_different_variant_whatever_the_colour(journ
     assert "XUV700 AX7L (any colour)" in description
 
 
-def test_invoice_fallback_skips_without_any_invoice_data(journey) -> None:
+def test_invoice_fallback_skips_without_any_model_read(journey) -> None:
     c = journey
-    _set_journey_product(c, "ILLEGIBLE SCAN TEXT", None)
+    _seed_price_list(c, [{"model": "THAR", "variant": "LX", "components": {"EX_SHOWROOM": "1400000"}}])
+    _set_journey_product(c, None, None)
 
     result = mr.sync_model_resolution_from_invoice(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
 
-    assert result == {"skipped": True, "reason": "no_invoice_model_data"}
+    assert result == {"skipped": True, "reason": "no_vehicle_model_read"}
+
+
+def _vehicle(c):
+    return c.execute(
+        text("SELECT product_sku_id, model_name_snapshot, variant_name_snapshot, selection_method "
+             "FROM auditcore.journey_products WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one_or_none()
+
+
+def test_booking_checks_take_the_model_from_the_invoice_when_the_booking_form_has_none(journey) -> None:
+    """Rule 2026-10-20: no model read off the Booking Form (no journey_products
+    row at all, "Vehicle not identified yet") -- the Booking-side resolution
+    itself reads the vehicle invoice, and the vehicle snapshot is refreshed
+    from the master."""
+    c = journey
+    z8, z8l = _seed_price_list(c, [
+        {"model": "SCORPIO N", "variant": "Z8", "components": {"EX_SHOWROOM": "1500000"}},
+        {"model": "SCORPIO N", "variant": "Z8L", "components": {"EX_SHOWROOM": "1600000"}},
+    ])
+    _set_invoice_field(c, "model_name_raw", "Scorpio N")
+    _set_invoice_field(c, "variant_raw", "Z8L")
+
+    result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    assert result.get("resolved") is True and result.get("source") == "INVOICE"
+    row = _vehicle(c)
+    assert row["product_sku_id"] == z8l
+    assert (row["model_name_snapshot"], row["variant_name_snapshot"]) == ("SCORPIO N", "Z8L")
+    assert row["selection_method"] == "MODEL_RESOLUTION_INVOICE_FALLBACK_V1"
+    assert z8 != z8l
+
+
+def test_invoice_vehicle_description_is_read_when_there_is_no_model_box(journey) -> None:
+    c = journey
+    (thar,) = _seed_price_list(c, [{"model": "THAR", "variant": "LX", "components": {"EX_SHOWROOM": "1400000"}}])
+    _set_invoice_field(c, "vehicle_description_raw", "THAR")
+    _set_invoice_field(c, "variant_raw", "LX")
+
+    result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    assert result.get("resolved") is True and _vehicle(c)["product_sku_id"] == thar
+
+
+def test_invoice_still_under_booking_stage_is_read(journey) -> None:
+    """The unified upload copies facts before the page is moved to Delivery."""
+    c = journey
+    (thar,) = _seed_price_list(c, [{"model": "THAR", "variant": "LX", "components": {"EX_SHOWROOM": "1400000"}}])
+    _set_invoice_field(c, "model_name_raw", "THAR", stage_code="BOOKING")
+
+    result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    assert result.get("resolved") is True and _vehicle(c)["product_sku_id"] == thar
+
+
+def test_an_accessory_invoice_never_names_the_vehicle(journey) -> None:
+    c = journey
+    _seed_price_list(c, [{"model": "THAR", "variant": "LX", "components": {"EX_SHOWROOM": "1400000"}}])
+    _set_invoice_field(c, "model_name_raw", "THAR", document_type_key="accessory_invoice_dms")
+
+    result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    assert result == {"skipped": True, "reason": "no_vehicle_model_read"}
+    assert _vehicle(c) is None
+
+
+def test_booking_model_unmatched_then_the_invoice_settles_it_and_closes_the_gap(journey) -> None:
+    c = journey
+    thar, _scorpio = _seed_price_list(c, [
+        {"model": "THAR", "variant": "LX", "components": {"EX_SHOWROOM": "1400000"}},
+        {"model": "SCORPIO N", "variant": "Z8", "components": {"EX_SHOWROOM": "1500000"}},
+    ])
+    _set_journey_product(c, "ZZZZ NOT A MODEL", None)
+    first = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert first.get("resolved") is not True
+
+    _set_invoice_field(c, "model_name_raw", "THAR")
+    result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    assert result.get("resolved") is True and result.get("source") == "INVOICE"
+    assert _vehicle(c)["product_sku_id"] == thar
+    assert _open_model_flags(c) == 0
+
+
+def test_model_only_in_another_months_price_list_is_reported(journey) -> None:
+    """Model names change between months: the Journey's own list carries
+    "XUV 3XO", an older one still "XUV300". Nothing is pinned from the other
+    list; the finding says which list has it."""
+    c = journey
+    _seed_price_list(c, [{"model": "XUV300", "variant": "W8", "components": {"EX_SHOWROOM": "1200000"}}],
+                     effective_from="CURRENT_DATE - 400")
+    _seed_price_list(c, [
+        {"model": "XUV 3XO", "variant": "AX5", "components": {"EX_SHOWROOM": "1100000"}},
+        {"model": "XUV 3XO", "variant": "AX7", "components": {"EX_SHOWROOM": "1300000"}},
+    ])
+    _set_journey_product(c, "XUV300", "W8")
+
+    result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    assert result.get("raised") is True and result.get("otherPriceLists") == 1
+    assert _vehicle(c)["product_sku_id"] is None
+    finding = c.execute(
+        text("SELECT f.title, f.description, e.safe_payload FROM auditcore.audit_findings f "
+             "JOIN auditcore.audit_finding_events e ON e.tenant_id=f.tenant_id "
+             " AND e.audit_finding_id=f.audit_finding_id AND e.event_type='RAISED' "
+             "WHERE f.tenant_id=:t AND f.journey_id=:j AND f.finding_type_code='MODEL_NOT_IDENTIFIED'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one()
+    assert finding["title"] == "Vehicle model is in another month's price list, not this Journey's"
+    assert "as 'XUV300' (1 SKUs)" in finding["description"]
+    [hit] = finding["safe_payload"]["otherPriceLists"]
+    assert hit["modelName"] == "XUV300" and hit["skuCount"] == 1
 
 
 def test_invoice_fallback_resolves_with_no_model_snapshot_at_all(journey) -> None:
