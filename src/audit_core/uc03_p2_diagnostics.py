@@ -292,6 +292,55 @@ REPORTS: dict[str, str] = {
         WHERE f.tenant_id = :t AND f.finding_type_code = 'MODEL_NOT_IDENTIFIED'
           AND f.finding_status IN ('OPEN', 'ACKNOWLEDGED')
     """,
+    # Registration / road tax: every value read, every source row and the
+    # line the deal shows, per Journey (2026-10-20: road tax and
+    # registration mapped wrongly and twice).
+    "registration_sources": """
+        SELECT 'READ' AS kind, f.journey_id, f.source_document_type_key AS document_type, f.field_key AS key,
+               left(f.effective_value #>> '{}', 400) AS value, NULL AS standard
+        FROM auditcore.journey_document_extracted_fields f
+        WHERE f.tenant_id = :t AND f.effective_value IS NOT NULL
+          AND f.field_key ~ '(registration|road_tax|rto|green_tax|hsrp|line_items)'
+          AND f.field_key NOT IN ('vehicle_registration_number', 'registration_number', 'old_vehicle_registration')
+          AND f.journey_id IN (SELECT journey_id FROM auditcore.journeys WHERE tenant_id = :t
+                               AND updated_at_utc > now() - interval '4 days')
+        UNION ALL
+        SELECT 'SOURCE', sv.journey_id, sv.source_document_type, sv.component_key, sv.amount::text, NULL
+        FROM auditcore.commercial_line_source_values sv
+        WHERE sv.tenant_id = :t AND sv.component_key ~ '(registration|road_tax|rto|green_tax|hsrp)'
+        UNION ALL
+        SELECT 'LINE', cl.journey_id, cl.source_reference, cl.component_key, cl.actual_amount::text,
+               cl.standard_amount::text
+        FROM auditcore.commercial_lines cl
+        WHERE cl.tenant_id = :t AND cl.component_key ~ '(registration|road_tax|rto|green_tax|hsrp)'
+        ORDER BY 2, 1, 4, 3
+    """,
+    # One Journey's vehicle reads and SKU state, for every Journey with an
+    # open model finding or no SKU (2026-10-20: "still SKU are not getting
+    # resolved").
+    "sku_unresolved": """
+        SELECT j.journey_id, COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
+               jp.selection_status, jp.selection_method, jp.model_name_snapshot AS model,
+               jp.variant_name_snapshot AS variant, jp.updated_at_utc,
+               (SELECT string_agg(f.source_document_type_key || '.' || f.field_key || '=' ||
+                                  left(f.effective_value #>> '{}', 120), ' | ' ORDER BY f.field_key)
+                  FROM auditcore.journey_document_extracted_fields f
+                 WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
+                   AND f.effective_value IS NOT NULL
+                   AND f.field_key IN ('model_name_raw', 'vehicle_description_raw', 'variant_raw', 'sku_code',
+                                       'vehicle_color', 'model_name', 'variant_name', 'vehicle_model', 'model',
+                                       'fuel_type', 'transmission')) AS reads
+        FROM auditcore.journeys j
+        LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+        LEFT JOIN auditcore.journey_products jp ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
+        WHERE j.tenant_id = :t
+          AND (jp.product_sku_id IS NULL OR EXISTS (
+                SELECT 1 FROM auditcore.audit_findings af
+                WHERE af.tenant_id = j.tenant_id AND af.journey_id = j.journey_id
+                  AND af.finding_type_code = 'MODEL_NOT_IDENTIFIED'
+                  AND af.finding_status IN ('OPEN', 'ACKNOWLEDGED')))
+        ORDER BY j.updated_at_utc DESC
+    """,
 }
 
 

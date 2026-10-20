@@ -156,32 +156,6 @@ def _document_context(
     }
 
 
-def _awaits_set_type(
-    engine: Engine, *, tenant_id: str, journey_id: UUID, document_id: UUID,
-) -> bool:
-    """The page is one DI could not classify and the PC has not typed yet:
-    the "Set type" case of the page health (uc03_p2_document_health)."""
-    with engine.begin() as connection:
-        set_tenant_context(connection, tenant_id)
-        return bool(
-            connection.execute(
-                text(
-                    """
-                    SELECT EXISTS (
-                        SELECT 1 FROM auditcore.p2_document_queue
-                        WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-                          AND di_document_id=:document_id
-                          AND queue_status='SUPPORTING'
-                          AND (template_key IS NULL OR template_key IN ('', 'supporting_document'))
-                          AND type_overridden_by_actor_id IS NULL
-                    )
-                    """
-                ),
-                {"tenant_id": tenant_id, "journey_id": journey_id, "document_id": document_id},
-            ).scalar_one()
-        )
-
-
 def _durable_fields(
     connection: Connection,
     *,
@@ -391,12 +365,13 @@ def get_p2_document_review(
             document_id=str(document_id),
         )
     except DiClientError as exc:
-        # DI answers E008 ("not yet confirmed") for a page it never classified:
-        # there are no fields to read, which is not an outage. Such a page is
-        # shown as uploaded, with its preview, so the PC can set its type.
-        if exc.code == "E008" and not durable and _awaits_set_type(
-            engine, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
-        ):
+        # DI answers E008 ("not yet confirmed") for a page it has not read: one
+        # it never classified, one still being read, or one whose reading
+        # failed and waits for a retry. There are no fields to read, which is
+        # not an outage: the page is shown with its preview and its status
+        # (product owner 2026-10-20: opening such a receipt said "could not be
+        # loaded ... VAC-SYS-002").
+        if exc.code == "E008":
             di_facts = ()
         else:
             di_error = exc.code

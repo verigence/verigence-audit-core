@@ -1001,20 +1001,31 @@ def test_a_page_awaiting_its_type_opens_with_its_preview_instead_of_an_error(jou
     assert review["diReadError"] is None
 
 
-def test_every_other_facts_failure_still_reports_the_dependency_error(journey, monkeypatch):
+def test_a_page_not_read_yet_opens_with_its_preview_instead_of_an_error(journey, monkeypatch):
+    # Product owner 2026-10-20: a receipt whose reading failed (waiting for a
+    # retry) said "could not be loaded ... VAC-SYS-002" when opened.
+    for queue_status, template_key, overridden in (
+        ("SUPPORTING", "booking_form", False),          # classified, not read yet
+        ("SUPPORTING", "supporting_document", True),    # PC already typed it (Others)
+        ("READY", "dealer_receipt", False),             # reading failed, retry pending
+    ):
+        review = _review_with_facts_error(
+            journey, monkeypatch, queue_status=queue_status, template_key=template_key,
+            overridden=overridden, code="E008",
+        )
+        assert review["fields"] == []
+        assert review["contentAvailable"] is True
+        assert review["diReadError"] is None
+
+
+def test_a_real_di_failure_still_reports_the_dependency_error(journey, monkeypatch):
     from audit_core.errors import DependencyUnavailableError
 
-    for queue_status, template_key, overridden, code in (
-        ("SUPPORTING", "supporting_document", False, "DI_UNAVAILABLE"),  # DI really failing
-        ("SUPPORTING", "booking_form", False, "E008"),                    # classified page
-        ("SUPPORTING", "supporting_document", True, "E008"),              # PC already typed it (Others)
-        ("READY", None, False, "E008"),                                   # not a Set type page
-    ):
-        with pytest.raises(DependencyUnavailableError):
-            _review_with_facts_error(
-                journey, monkeypatch, queue_status=queue_status, template_key=template_key,
-                overridden=overridden, code=code,
-            )
+    with pytest.raises(DependencyUnavailableError):
+        _review_with_facts_error(
+            journey, monkeypatch, queue_status="READY", template_key="dealer_receipt",
+            overridden=False, code="DI_UNAVAILABLE",
+        )
 
 
 def test_a_normal_document_review_returns_fields_with_the_correction_waiting_for_the_team_lead(journey, monkeypatch):
