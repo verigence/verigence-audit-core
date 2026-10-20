@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 from conftest import delete_tenant_data
 from fastapi.testclient import TestClient
-from p2_support import AllowAllAuthorization, add_page, create_p2_journey, database_engine
+from p2_support import (
+    AllowAllAuthorization,
+    add_page,
+    create_p2_journey,
+    database_engine,
+)
 from sqlalchemy import text
 
 from audit_core.db import set_tenant_context
