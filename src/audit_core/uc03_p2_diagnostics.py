@@ -229,6 +229,28 @@ REPORTS: dict[str, str] = {
         LEFT JOIN ids idf ON idf.journey_id = f.journey_id
         LEFT JOIN ids idh ON idh.journey_id = jh.journey_id
     """,
+    # Where each Journey's customer name came from (2026-10-20: journeys
+    # holding the same PAN showed different customer names).
+    "customer_names": """
+        SELECT j.journey_id, j.journey_reference, c.display_name, c.legal_name, c.legal_name_status,
+               c.legal_name_verified_by_actor_id, c.legal_name_verified_at_utc::text AS verified_at,
+               e.document_type_key AS source_type, e.association_status AS source_status,
+               (SELECT string_agg(k.document_type_key || ':' || k.association_status || ':' ||
+                                  COALESCE(f.effective_value #>> '{}', ''), ' | ' ORDER BY k.linked_at_utc)
+                  FROM auditcore.evidence k
+                  JOIN auditcore.journey_document_extracted_fields f
+                    ON f.tenant_id = k.tenant_id AND f.journey_id = k.journey_id
+                   AND f.di_document_id = k.di_document_id
+                 WHERE k.tenant_id = j.tenant_id AND k.journey_id = j.journey_id
+                   AND k.document_type_key IN ('pan_card', 'aadhaar', 'customer_kyc')
+                   AND f.field_key IN ('pan_name', 'aadhaar_name', 'customer_name')) AS kyc_names
+        FROM auditcore.journeys j
+        JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+        LEFT JOIN auditcore.evidence e
+          ON e.tenant_id = c.tenant_id AND e.evidence_id = c.legal_name_source_evidence_id
+        WHERE j.tenant_id = :t
+        ORDER BY j.journey_reference
+    """,
     # Uploads per PC per day, last 5 days (2026-10-20: the daily report showed
     # one PC uploading and the rest with only tasks).
     "uploads_by_day": """
