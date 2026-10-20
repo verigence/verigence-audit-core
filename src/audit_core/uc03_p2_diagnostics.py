@@ -175,6 +175,22 @@ REPORTS: dict[str, str] = {
           AND f.field_key IN ('booking_date', 'receipt_date', 'delivery_date', 'invoice_date')
           AND (f.effective_value #>> '{}') !~ '2026'
     """,
+    # The booking and delivery dates each Journey shows now, and where from.
+    "booking_state": """
+        SELECT j.journey_id, j.journey_reference, COALESCE(c.legal_name, c.display_name) AS customer,
+               ss.business_status, ss.booking_confirm_date::text AS booking_confirm_date,
+               ss.booking_confirmed_at_utc::text AS booking_confirmed_at_utc,
+               b.booking_date::text AS booking_form_date,
+               dl.actual_delivered_at::date::text AS delivered_on, dl.status_source AS delivery_source
+        FROM auditcore.journeys j
+        LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+        LEFT JOIN auditcore.journey_stage_states ss
+          ON ss.tenant_id = j.tenant_id AND ss.journey_id = j.journey_id AND ss.stage_code = 'BOOKING'
+        LEFT JOIN auditcore.bookings b ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
+        LEFT JOIN auditcore.deliveries dl ON dl.tenant_id = j.tenant_id AND dl.journey_id = j.journey_id
+        WHERE j.tenant_id = :t
+        ORDER BY j.journey_reference
+    """,
     # Uploads per PC per day, last 5 days (2026-10-20: the daily report showed
     # one PC uploading and the rest with only tasks).
     "uploads_by_day": """
