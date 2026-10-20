@@ -3210,6 +3210,8 @@ def _sku_run_once(engine: Engine, tag: str) -> None:
             while offset is not None:
                 result = backfill_sku_resolution_for_tenant(
                     engine, tenant_id=tenant_id, offset=offset, limit=10, run_id=run_id, actor_id=actor,
+                    # A tag starting "unresolved" leaves every pinned SKU as it is.
+                    only_without_sku=tag.lower().startswith("unresolved"),
                 )
                 run_id = result["runId"]
                 offset = result["nextOffset"]

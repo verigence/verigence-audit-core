@@ -253,7 +253,7 @@ def _record_item(
 
 def backfill_sku_resolution_for_tenant(
     engine: Engine, *, tenant_id: str, offset: int = 0, limit: int | None = None,
-    run_id: UUID | None = None, actor_id: str | None = None,
+    run_id: UUID | None = None, actor_id: str | None = None, only_without_sku: bool = False,
 ) -> dict[str, Any]:
     """Run SKU resolution (booking model/price match, then the Delivery-invoice fallback) for
     the Project's Journeys, in a stable order, ``limit`` at a time starting at ``offset`` (all of
@@ -317,6 +317,14 @@ def backfill_sku_resolution_for_tenant(
             with engine.begin() as connection:
                 set_tenant_context(connection, tenant_id)
                 before = _journey_sku_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+                if only_without_sku and before.get("has_sku"):
+                    # A run over the unresolved only: a pinned SKU is left as it is.
+                    _record_item(
+                        connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id,
+                        label=before.get("journey_label"), model_label=before.get("model_label"),
+                        outcome="ALREADY_HAD_SKU", sku_code=before.get("sku_code"), detail=None,
+                    )
+                    continue
                 step_error = None
                 reasons: list[str] = []
                 for resolve in (

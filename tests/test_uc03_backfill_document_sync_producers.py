@@ -302,3 +302,27 @@ def test_sku_resolution_backfill_pages_through_journeys_into_one_run(seeded_tena
     assert past_end["runId"] == only["runId"]
     assert past_end["journeysConsidered"] == 0 and past_end["nextOffset"] is None
     assert _run_detail(engine, tenant_id, only["runId"])["journeysProcessed"] == 1
+
+
+def test_an_unresolved_only_run_leaves_a_pinned_sku_alone(seeded_tenant, monkeypatch) -> None:
+    engine, tenant_id, journey_id = (
+        seeded_tenant["engine"], seeded_tenant["tenant_id"], seeded_tenant["journey_id"],
+    )
+    calls: list[str] = []
+
+    def _resolve(*args, **kwargs):
+        calls.append("resolve")
+        return {}
+
+    monkeypatch.setattr("audit_core.uc03_async_sync_tasks.sync_model_resolution_with_escalation", _resolve)
+    monkeypatch.setattr(
+        "audit_core.uc03_async_sync_tasks.sync_model_resolution_from_invoice_with_escalation", _resolve,
+    )
+    monkeypatch.setattr(backfill, "_journey_sku_state", lambda connection, **_: {
+        "has_sku": True, "sku_code": "PINNED", "journey_label": "J", "model_label": "M",
+    })
+    result = backfill.backfill_sku_resolution_for_tenant(engine, tenant_id=tenant_id, only_without_sku=True)
+    assert calls == []
+    detail = _run_detail(engine, tenant_id, result["runId"])
+    assert [i["outcome"] for i in detail["items"]] == ["ALREADY_HAD_SKU"]
+    assert detail["items"][0]["journeyId"] == journey_id

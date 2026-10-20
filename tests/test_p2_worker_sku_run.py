@@ -12,8 +12,12 @@ def test_the_run_pages_until_done_and_does_not_repeat_for_the_same_tag(monkeypat
     calls: list[tuple[str, int]] = []
     run_id = uuid4()
 
-    def fake_backfill(engine, *, tenant_id, offset, limit, run_id: object = None, actor_id=None):
+    flags: list[bool] = []
+
+    def fake_backfill(engine, *, tenant_id, offset, limit, run_id: object = None, actor_id=None,
+                      only_without_sku=False):
         calls.append((tenant_id, offset))
+        flags.append(only_without_sku)
         return {"runId": run_id or run_ids[0], "nextOffset": None if offset >= 20 else offset + limit,
                 "journeysTotal": 25, "withSkuBefore": 1, "withSkuAfter": 2, "withoutSkuAfter": 3,
                 "journeysFailed": []}
@@ -45,6 +49,13 @@ def test_the_run_pages_until_done_and_does_not_repeat_for_the_same_tag(monkeypat
     worker._sku_run_once(_Engine(), "2026-10-20a")
     assert calls == [("t1", 0), ("t1", 10), ("t1", 20)]
 
+    assert not any(flags)
+
     done.add("t1")
     worker._sku_run_once(_Engine(), "2026-10-20a")
     assert len(calls) == 3
+
+    # A tag starting "unresolved" leaves every pinned SKU alone.
+    done.clear()
+    worker._sku_run_once(_Engine(), "unresolved-2026-10-20")
+    assert flags[-1] is True
