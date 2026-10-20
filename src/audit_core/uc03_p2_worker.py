@@ -2990,15 +2990,20 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
         return
     # Re-run the Delivery checks for every delivery in progress: the
     # time-based checks fire without a document event. Idempotent per night.
-    from audit_core.uc03_p2_audit_rules import queue_nightly_review
+    from audit_core.uc03_p2_audit_rules import (
+        queue_nightly_review,
+        queue_nightly_sku_retry,
+    )
 
     try:
         with engine.begin() as connection:
             set_tenant_context(connection, tenant_id)
             queued = queue_nightly_review(connection, tenant_id=tenant_id)
+            sku_retries = queue_nightly_sku_retry(connection, tenant_id=tenant_id)
             swept = queue_nightly_upload_sweep(connection, tenant_id=tenant_id)
         _last_nightly_review[tenant_id] = due
-        logger.info("p2_nightly_review_queued", tenant_id=tenant_id, night=due, journeys=queued, **swept)
+        logger.info("p2_nightly_review_queued", tenant_id=tenant_id, night=due, journeys=queued,
+                    sku_retries=sku_retries, **swept)
     except Exception:
         logger.warning("p2_nightly_review_failed", tenant_id=tenant_id, exc_info=True)
 
