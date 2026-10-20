@@ -133,8 +133,12 @@ CANONICAL_DISCOUNT_KEYS: frozenset[str] = frozenset(
         "EXT_WARRANTY_4TH_5TH_YR",
         "INSURANCE",
         "OTHER_SCHEME",
-        # discretionary dealer discount with no scheme entitlement (over-grant)
+        # the dealer's own discount; its entitlement is the dealer discount
+        # grid's buffer (2026-10-20), an over-grant when no grid line allows it
         "ADDITIONAL_DISCOUNT",
+        # Management Referral, kept as its own line (2026-10-20 product owner
+        # rules): never folded into "Other scheme"
+        "MANAGEMENT_REFERRAL",
     }
 )
 
@@ -150,9 +154,8 @@ DISCOUNT_ACTUAL_FIELD_TO_CANONICAL_KEY: dict[str, str] = {
     "cash_discount_amount":   "ADDITIONAL_DISCOUNT",
     # vehicle tax / retail invoice
     "oem_discount_amount":    "CASH_DISCOUNT",
-    # booking form (fallback)
-    "discount_amount":        "CASH_DISCOUNT",
-    "bonus_amount":           "EXCHANGE_BONUS",
+    # booking form (fallback). Its declared totals (discount_amount,
+    # bonus_amount) are never a discount line of their own (2026-10-20).
     "exchange_discount_amount": "EXCHANGE_BONUS",
     "corporate_discount_amount": "CORPORATE_PRIVILEGE",
     "loyalty_discount_amount": "WELCOME_BONUS",
@@ -171,20 +174,22 @@ LEGACY_DISCOUNT_KEY_TO_CANONICAL: dict[str, str] = {
     "INHOUSE_INSURANCE": "INSURANCE",
     "FREE_ACCESSORY":    "ACCESSORIES_KIT",
     "OTHER":             "OTHER_SCHEME",
-    "MR":               "OTHER_SCHEME",
+    "MR":                "MANAGEMENT_REFERRAL",
     "OEM_REFERRAL":      "OTHER_SCHEME",
 }
 
 # reviewed *actual* discount field -> the OEM benefit_key it corresponds to.
 # The full set of booking-form discount fields that the DI schema extracts.
+# 2026-10-20 product owner rules: the form's declared totals -- discount_amount
+# (total discount) and bonus_amount (total bonus) -- are not here. They
+# already contain the components below, and adding them to those components
+# counted the same rupees twice.
 DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY: dict[str, str] = {
-    "discount_amount":                  "CASH_DISCOUNT",
     "sales_discount_amount":            "CASH_DISCOUNT",
     "consumer_offer_amount":            "CASH_DISCOUNT",
     "oem_discount_amount":              "CASH_DISCOUNT",
     "exchange_discount_amount":         "EXCHANGE_BONUS",
     "exchange_claim_amount":            "EXCHANGE_BONUS",
-    "bonus_amount":                     "EXCHANGE_BONUS",
     "corporate_discount_amount":        "CORPORATE_PRIVILEGE",
     "corporate_offer_amount":           "CORPORATE_PRIVILEGE",
     "loyalty_discount_amount":          "WELCOME_BONUS",
@@ -192,7 +197,7 @@ DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY: dict[str, str] = {
     "free_accessory_discount_amount":   "ACCESSORIES_KIT",
     "buffer_discount_amount":           "ADDITIONAL_DISCOUNT",
     "cash_discount_amount":             "ADDITIONAL_DISCOUNT",
-    "mr_discount_amount":               "OTHER_SCHEME",
+    "mr_discount_amount":               "MANAGEMENT_REFERRAL",
     "oem_referral_discount_amount":     "OTHER_SCHEME",
     "other_discount_amount":            "OTHER_SCHEME",
     # Confirmed bug (2026-09-16): this field was never mapped at all, so a
@@ -218,6 +223,9 @@ CONDITIONAL_DISCOUNT_EVIDENCE_DOCUMENT: dict[str, str] = {
     "EXCHANGE_BONUS": "vehicle_rc",
     "SCRAPPAGE_BONUS_DEALER": "scrappage_certificate_of_deposit",
     "SCRAPPAGE_BONUS_COD": "scrappage_certificate_of_deposit",
+    # The welcome bonus is against a named old vehicle ("Tata Ace Family"),
+    # proven by its RC like an exchange (2026-10-20).
+    "WELCOME_BONUS": "vehicle_rc",
 }
 
 # The exact label strings uc03_booking_confirmation_rules.py's
