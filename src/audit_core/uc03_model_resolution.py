@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
@@ -278,13 +279,130 @@ def _resolution_inputs(
     return {
         "product_sku_id": jp["product_sku_id"],
         "selection_status": jp["selection_status"],
-        "model_name": jp["model_name"],
+        "model_name": clean_model_text(jp["model_name"]),
         "variant_name": jp["variant_name"],
         "colour_name": jp["colour_name"],
         "offered_total": offered_total,
         "offered_ex_showroom": offered_ex_showroom,
         "registration_basis": basis,
+        "registration_category": registration_category(reg.get("registration_type_code")),
     }
+
+
+# ── reading the model text the way the price list names it ─────────────────────
+_BRAND_PREFIX = re.compile(r"^\s*(?:MAHINDRA\s*(?:&|AND)\s*MAHINDRA|M\s*&\s*M|MAHINDRA)\b[\s/\-:.,]*", re.IGNORECASE)
+
+
+def clean_model_text(value: str | None) -> str | None:
+    """The model as printed, without the OEM's own name in front ("MAHINDRA
+    BOLERO NEO+", "MAHINDRA & MAHINDRA MAXX HD", "MAHINDRA/BOLERO/MAXX PUP
+    HD ...": DMS documents print it) and with "/" read as a space. Nothing
+    else is changed (2026-10-20)."""
+    if value is None:
+        return None
+    text_value = str(value)
+    while True:
+        stripped = _BRAND_PREFIX.sub("", text_value, count=1)
+        if stripped == text_value:
+            break
+        text_value = stripped
+    text_value = re.sub(r"\s+", " ", text_value.replace("/", " ")).strip()
+    return text_value or None
+
+
+# Registration type as DI reads it (values seen 2026-10-20: Personal,
+# Private, Motor Car, Commercial, Fresh Permit, NEW, "New Registration (RTO
+# Side)"). Only a stated private or commercial registration decides; the
+# rest say nothing about it.
+_COMMERCIAL_REGISTRATION = ("COMMERCIAL", "TRANSPORT", "TAXI", "GOODS", "PERMIT", "YELLOW")
+_PRIVATE_REGISTRATION = ("PERSONAL", "PRIVATE", "MOTOR CAR", "NON TRANSPORT", "NON-TRANSPORT", "WHITE")
+
+
+def registration_category(value: str | None) -> str | None:
+    token = str(value or "").strip().upper()
+    if not token:
+        return None
+    if any(word in token for word in ("NON TRANSPORT", "NON-TRANSPORT")):
+        return "PRIVATE"
+    if any(word in token for word in _COMMERCIAL_REGISTRATION):
+        return "COMMERCIAL"
+    if any(word in token for word in _PRIVATE_REGISTRATION):
+        return "PRIVATE"
+    return None
+
+
+def _row_registration(row: dict[str, Any]) -> str | None:
+    """The registration a price-list row is for, when the list prices the
+    same vehicle twice (variant "(Private)" / "(Commercial)", code ending
+    ::PRI / ::COM)."""
+    code = str(row.get("sku_code") or "").upper()
+    variant = str(row.get("variant_name") or "").upper()
+    if code.endswith("::COM") or variant.endswith("(COMMERCIAL)"):
+        return "COMMERCIAL"
+    if code.endswith("::PRI") or variant.endswith("(PRIVATE)"):
+        return "PRIVATE"
+    return None
+
+
+def _rows_for_registration(rows: list[dict[str, Any]], category: str | None) -> list[dict[str, Any]]:
+    """Drop the rows priced for the other registration when the Journey's
+    registration type says private or commercial (2026-10-20)."""
+    if category is None:
+        return rows
+    return [r for r in rows if _row_registration(r) in (None, category)]
+
+
+def _model_names(rows: list[dict[str, Any]]) -> dict[str, str]:
+    return {normalized_model_key(str(r["model_name"] or "")): str(r["model_name"]) for r in rows}
+
+
+def _normalise_inputs(
+    connection: Connection, *, tenant_id: str, rows: list[dict[str, Any]], inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Two readings the price list cannot match as printed (2026-10-20):
+
+    * the model split across the two boxes ("Maxx" + "HD 1.7 LX"): when the
+      model box alone names no model of the list (by name or alias) but the
+      two together do, the two together are the model text;
+    * an EV variant of a model the list keeps as its own EV model ("XUV
+      3XO" + "AX5 EV" -> "XUV3XO EV"): the EV model.
+    """
+    model = inputs.get("model_name")
+    if not model:
+        return inputs
+    out = dict(inputs)
+    names = _model_names(rows)
+    oem_code = _oem_code_for_tenant(connection, tenant_id=tenant_id)
+    aliases = _oem_model_aliases(connection, oem_code=oem_code) if oem_code else []
+
+    def named(text_value: str) -> str | None:
+        key = normalized_model_key(text_value)
+        if key in names:
+            return names[key]
+        resolved = resolve_model_via_aliases(model_name=text_value, oem_aliases=aliases)
+        if resolved is not None and normalized_model_key(resolved[0]) in names:
+            return names[normalized_model_key(resolved[0])]
+        prefixes = [n for k, n in names.items() if len(k) >= 3 and key.startswith(k)]
+        return max(prefixes, key=len) if prefixes else None
+
+    variant = inputs.get("variant_name")
+    base = named(model)
+    if base is None and variant:
+        combined = f"{model} {variant}"
+        base = named(combined)
+        if base is not None:
+            # "Maxx" + "HD 1.7 LX": the model is the list's "MAXX HD"; the
+            # variant box keeps what it says.
+            out["model_name"] = base
+    if base is not None:
+        words = set(re.findall(r"[A-Z0-9]+", f"{model} {variant or ''}".upper()))
+        ev_key = normalized_model_key(f"{base} EV")
+        if ("EV" in words or "ELECTRIC" in words) and not normalized_model_key(base).endswith("EV") \
+                and ev_key in names:
+            out["model_name"] = names[ev_key]
+            if variant:
+                out["variant_name"] = re.sub(r"\bEV\b", "", str(variant), flags=re.IGNORECASE).strip() or variant
+    return out
 
 
 def _sku_rows_for_version(
@@ -566,8 +684,12 @@ def _pin_sku(
                 model_name_snapshot = EXCLUDED.model_name_snapshot,
                 variant_code_snapshot = EXCLUDED.variant_code_snapshot,
                 variant_name_snapshot = EXCLUDED.variant_name_snapshot,
-                colour_code_snapshot = EXCLUDED.colour_code_snapshot,
-                colour_name_snapshot = EXCLUDED.colour_name_snapshot,
+                -- A price-list SKU without a colour keeps the colour the
+                -- documents gave (2026-10-20: pinning used to blank it).
+                colour_code_snapshot = COALESCE(EXCLUDED.colour_code_snapshot,
+                                                auditcore.journey_products.colour_code_snapshot),
+                colour_name_snapshot = COALESCE(EXCLUDED.colour_name_snapshot,
+                                                auditcore.journey_products.colour_name_snapshot),
                 selection_source = 'EVIDENCE',
                 selection_status = 'CONFIRMED',
                 selection_method = :method,
@@ -646,8 +768,12 @@ def reassign_confirmed_sku(
                 model_name_snapshot = EXCLUDED.model_name_snapshot,
                 variant_code_snapshot = EXCLUDED.variant_code_snapshot,
                 variant_name_snapshot = EXCLUDED.variant_name_snapshot,
-                colour_code_snapshot = EXCLUDED.colour_code_snapshot,
-                colour_name_snapshot = EXCLUDED.colour_name_snapshot,
+                -- A price-list SKU without a colour keeps the colour the
+                -- documents gave (2026-10-20: pinning used to blank it).
+                colour_code_snapshot = COALESCE(EXCLUDED.colour_code_snapshot,
+                                                auditcore.journey_products.colour_code_snapshot),
+                colour_name_snapshot = COALESCE(EXCLUDED.colour_name_snapshot,
+                                                auditcore.journey_products.colour_name_snapshot),
                 selection_source = 'EVIDENCE',
                 selection_status = 'CONFIRMED',
                 selection_method = :method,
@@ -1271,7 +1397,7 @@ def _invoice_reading(connection: Connection, *, tenant_id: str, journey_id: UUID
         return _latest_invoice_field(connection, tenant_id=tenant_id, journey_id=journey_id, field_keys=keys)
 
     sku_code = field(_INVOICE_SKU_CODE_FIELD_KEYS)
-    model = field(_INVOICE_MODEL_FIELD_KEYS)
+    model = clean_model_text(field(_INVOICE_MODEL_FIELD_KEYS))
     if sku_code is None and model is None:
         return None
     ex_showroom = connection.execute(
@@ -1287,7 +1413,22 @@ def _invoice_reading(connection: Connection, *, tenant_id: str, journey_id: UUID
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id, "types": list(_VEHICLE_INVOICE_TYPES)},
     ).scalar_one_or_none()
+    retail = connection.execute(
+        text(
+            """
+            SELECT EXISTS (
+              SELECT 1 FROM auditcore.journey_document_extracted_fields
+              WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+                AND source_document_type_key IN ('customer_invoice_dms', 'tax_invoice_tally')
+                AND field_key = ANY(:keys) AND effective_value IS NOT NULL
+            )
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id,
+         "keys": list(_INVOICE_SKU_CODE_FIELD_KEYS + _INVOICE_MODEL_FIELD_KEYS)},
+    ).scalar_one()
     return {
+        "retail": bool(retail),
         "sku_code": sku_code,
         "model_name": model,
         "variant_name": field(_INVOICE_VARIANT_FIELD_KEYS),
@@ -1370,6 +1511,14 @@ def _other_price_list_hits(
     model = inputs.get("model_name")
     if not model:
         return []
+    if current_version_id is not None:
+        current_rows = _sku_rows_for_version(
+            connection, tenant_id=tenant_id, price_list_version_id=current_version_id
+        )
+        if _model_rows_by_name(current_rows, model):
+            # The Journey's own list has this model: it is the variant that
+            # did not match, not the month (2026-10-20, journey 9d1c307c).
+            return []
     versions = connection.execute(
         text(
             """
@@ -1467,12 +1616,14 @@ def _invoice_cross_check(
     reading = _invoice_reading(connection, tenant_id=tenant_id, journey_id=journey_id)
     if reading is None:
         return {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False, "crossChecked": False}
+    if reading.get("retail"):
+        _apply_invoice_colour(connection, tenant_id=tenant_id, journey_id=journey_id, colour=reading["colour_name"])
     inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id, require_model=False)
     outcome = _invoice_candidates(
         connection, tenant_id=tenant_id, journey_id=journey_id,
         inputs=_invoice_inputs(inputs, reading), reading=reading,
     )
-    if outcome.get("skipped") or outcome["matchStage"] == _CATALOGUE_STAGE:
+    if outcome.get("skipped") or outcome.get("guess"):
         return {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False, "crossChecked": False}
     matched = outcome["matched"]
     if len(matched) > 1 and all(r["product_sku_id"] != current_sku_id for r in matched) and inputs["colour_name"]:
@@ -1483,7 +1634,7 @@ def _invoice_cross_check(
     if implied is None:
         return {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False, "crossChecked": False}
     invoice_sku_id, invoice_sku_code, invoice_label = implied
-    if invoice_sku_id != current_sku_id and invoice_label is None:
+    if invoice_sku_id != current_sku_id and invoice_label is None and reading.get("retail"):
         before = _vehicle_snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
         reassign_confirmed_sku(
             connection, tenant_id=tenant_id, journey_id=journey_id, product_sku_id=invoice_sku_id,
@@ -1515,6 +1666,42 @@ def _invoice_cross_check(
         invoice_label=invoice_label,
     )
     return {"skipped": True, "reason": "already_resolved", "mismatchFlagged": mismatch_flagged, "crossChecked": True}
+
+
+def _apply_invoice_colour(connection: Connection, *, tenant_id: str, journey_id: UUID, colour: str | None) -> None:
+    """Rule 2026-10-20: the DMS / Tally invoice decides the vehicle's model,
+    variant, transmission -- and colour. The price list carries no colours,
+    so the colour lives on the Journey's vehicle; the invoiced one replaces
+    a different booked one, and the Team Lead is told."""
+    if not colour:
+        return
+    row = connection.execute(
+        text(
+            "SELECT colour_name_snapshot FROM auditcore.journey_products "
+            "WHERE tenant_id = :t AND journey_id = :j"
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one_or_none()
+    if row is None:
+        return
+    booked = row["colour_name_snapshot"]
+    if booked and normalized_model_key(booked) == normalized_model_key(colour):
+        return
+    before = _vehicle_snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
+    connection.execute(
+        text(
+            "UPDATE auditcore.journey_products SET colour_name_snapshot = :c, updated_at_utc = now() "
+            "WHERE tenant_id = :t AND journey_id = :j"
+        ),
+        {"c": colour[:200], "t": tenant_id, "j": journey_id},
+    )
+    if booked:
+        from audit_core.uc03_sku_tasks import raise_model_changed_observation
+
+        after = _vehicle_snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
+        after["skuId"] = after.get("skuId") or "colour"
+        raise_model_changed_observation(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                        before=before, after={**after, "skuId": f"{after['skuId']}:{colour}"})
 
 
 def _vehicle_snapshot(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
@@ -1602,6 +1789,8 @@ def _ladder(
     connection: Connection, *, tenant_id: str, rows: list[dict[str, Any]], inputs: dict[str, Any]
 ) -> dict[str, Any]:
     """The matching ladder over one price list's SKU rows."""
+    rows = _rows_for_registration(rows, inputs.get("registration_category"))
+    inputs = _normalise_inputs(connection, tenant_id=tenant_id, rows=rows, inputs=inputs)
 
     # Attribute decomposition first, always attempted -- not only once a
     # price-based match has already failed. A fuel/transmission/drive/
@@ -1732,8 +1921,15 @@ def _settle(
     attribute filter emptied ("XUV3XO" + "AX7L EV" against the petrol and
     diesel XUV3XO rows, a real DEV case) still names the vehicle the price
     list holds under a sibling nameplate."""
+    # Only a reading that names the vehicle pins it (2026-10-20). The
+    # closest-match search and a single fuzzy trim reading are guesses: the
+    # PC accepts or rejects them. A price that singles one row out of a fuzzy
+    # shortlist pins it only when nothing the document says contradicts that
+    # row ("MAXX PUP HD 2.0L VXi" was pinned as "MAXX HD 1.7 LX CBC" because
+    # the form's price was within 0.5% of it).
+    fuzzy = stage.startswith("FUZZY")
     if len(matched) == 1:
-        return {"matched": matched, "matchStage": stage}
+        return {"matched": matched, "matchStage": stage, "guess": fuzzy}
     if matched:
         picked = _price_pick(matched, inputs)
         if picked is not None:
@@ -1741,10 +1937,38 @@ def _settle(
                 "model_resolution_price_settled_shortlist tenant=%s shortlist=%d stage=%s price_stage=%s sku=%s",
                 tenant_id, len(matched), stage, picked[1], picked[0][0]["sku_code"],
             )
-            return {"matched": picked[0], "matchStage": picked[1]}
-        return {"matched": matched, "matchStage": stage}
+            guess = _text_contradicts(picked[0][0], inputs, matched)
+            return {"matched": picked[0], "matchStage": picked[1], "guess": guess}
+        return {"matched": matched, "matchStage": stage, "guess": fuzzy or stage == _CATALOGUE_STAGE}
     matched, stage = _catalogue_search(rows, inputs, oem_code=_oem_code_for_tenant(connection, tenant_id=tenant_id))
-    return {"matched": matched, "matchStage": stage}
+    return {"matched": matched, "matchStage": stage, "guess": True}
+
+
+_DISPLACEMENT = re.compile(r"(\d+\.\d+)\s*L?\b", re.I)
+
+
+def _tokens(value: str | None) -> set[str]:
+    text_value = str(value or "").upper()
+    found = set(_DISPLACEMENT.findall(text_value))
+    found |= set(re.findall(r"[A-Z][A-Z0-9]*|\d+(?!\.)", _DISPLACEMENT.sub(" ", text_value)))
+    return found
+
+
+def _text_contradicts(row: dict[str, Any], inputs: dict[str, Any], shortlist: list[dict[str, Any]]) -> bool:
+    """Something the document states (an engine size, a trim word) that the
+    shortlist uses to tell its rows apart, and that the row lacks."""
+    said_text = f"{inputs.get('model_name') or ''} {inputs.get('variant_name') or ''}"
+    row_text = f"{row['model_name']} {row['variant_name'] or ''}"
+    said = _tokens(said_text)
+    telling = set().union(*(_tokens(f"{r['model_name']} {r['variant_name'] or ''}") for r in shortlist))
+    has = _tokens(row_text)
+    if (said & telling) - has:
+        return True
+    # An engine size the document states and the row does not have ("2.0L"
+    # against "1.7 LX CBC"), even when no row of the shortlist has it.
+    said_size = set(_DISPLACEMENT.findall(said_text.upper()))
+    row_size = set(_DISPLACEMENT.findall(row_text.upper()))
+    return bool(said_size and row_size and not said_size & row_size)
 
 
 def _format_candidate_line(row: dict[str, Any], basis: str) -> str:
@@ -2365,7 +2589,7 @@ def _sync_model_resolution_unguarded(
                 return booking
             # A closest-match guess (the catalogue search) is never pinned on
             # its own: the PC accepts or rejects it (decision 2026-10-20).
-            if len(booking["matched"]) == 1 and booking["matchStage"] != _CATALOGUE_STAGE:
+            if len(booking["matched"]) == 1 and not booking.get("guess"):
                 return pin(booking["matched"][0], booking["matchStage"], "BOOKING", _SELECTION_METHOD)
 
         reading = _invoice_reading(connection, tenant_id=tenant_id, journey_id=journey_id)
@@ -2380,7 +2604,7 @@ def _sync_model_resolution_unguarded(
                 if booking is None:
                     return invoice
                 invoice = None
-            elif len(invoice["matched"]) == 1 and invoice["matchStage"] != _CATALOGUE_STAGE:
+            elif len(invoice["matched"]) == 1 and not invoice.get("guess"):
                 return pin(invoice["matched"][0], invoice["matchStage"], "INVOICE", _INVOICE_SELECTION_METHOD)
 
         if booking is None and invoice is None:
@@ -2391,7 +2615,7 @@ def _sync_model_resolution_unguarded(
         # The invoice's shortlist when it has one (it is the source of
         # truth), else the booking's -- a name match over a closest guess.
         def named(o: dict[str, Any] | None) -> bool:
-            return o is not None and bool(o["matched"]) and o["matchStage"] != _CATALOGUE_STAGE
+            return o is not None and bool(o["matched"]) and not o.get("guess")
 
         use_invoice = invoice is not None and (
             booking is None or named(invoice) or (not named(booking) and (bool(invoice["matched"]) or not booking["matched"]))
@@ -2514,12 +2738,18 @@ def _sync_model_resolution_unguarded(
             raise_other_month_task,
         )
 
+        if not other_lists:
+            from audit_core.uc03_p2_task_producer import resolve_if_open
+
+            resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id,
+                            dedupe_key=f"sku-other-month:{journey_id}",
+                            evidence={"reason": "The Journey's own price list has the model"})
         if other_lists:
             raise_other_month_task(
                 connection, tenant_id=tenant_id, journey_id=journey_id, source=source,
                 read_model=report["model_name"], price_list=outcome.get("priceList"), hits=other_lists,
             )
-        elif stage == _CATALOGUE_STAGE and matched:
+        elif outcome.get("guess") and matched:
             raise_closest_match_task(
                 connection, tenant_id=tenant_id, journey_id=journey_id, source=source,
                 read_model=report["model_name"], read_variant=report["variant_name"], suggestion=matched[0],
