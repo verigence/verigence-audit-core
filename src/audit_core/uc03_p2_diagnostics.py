@@ -342,6 +342,50 @@ REPORTS: dict[str, str] = {
                   AND af.finding_status IN ('OPEN', 'ACKNOWLEDGED')))
         ORDER BY j.updated_at_utc DESC
     """,
+    # One Journey's discount entitlements and every discount-master row that
+    # could apply to its vehicle (2026-10-20: a Rs 2,50,000 cash discount on
+    # an XUV 3XO). AUDIT_CORE_DIAG_CUSTOMER matches the customer, the journey
+    # id or the journey reference.
+    "discount_journey": """
+        WITH js AS (
+            SELECT j.journey_id, j.journey_reference, jp.product_sku_id, s.model_id, s.variant_id,
+                   pv.variant_name
+            FROM auditcore.journeys j
+            JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+            LEFT JOIN auditcore.journey_products jp ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
+            LEFT JOIN auditcore.product_skus s ON s.product_sku_id = jp.product_sku_id
+            LEFT JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id
+            WHERE j.tenant_id = :t
+              AND (c.display_name ILIKE :c OR j.journey_id::text ILIKE :c OR j.journey_reference ILIKE :c)
+        )
+        SELECT 'APPLIED' AS kind, js.journey_reference AS ref, da.discount_key AS a,
+               da.standard_eligible_amount::text AS b, da.actual_discount_amount::text AS c,
+               da.eligibility_result || ' ' || coalesce(da.details::text, '') AS d,
+               js.variant_name AS e, NULL AS f
+        FROM js JOIN auditcore.discount_applications da
+          ON da.tenant_id = :t AND da.journey_id = js.journey_id
+        UNION ALL
+        SELECT 'MASTER', js.journey_reference, b.benefit_key, b.amount_value::text,
+               ds.scheme_code || ' / ' || coalesce(ds.scheme_category, '') || ' / ' || ds.scheme_name,
+               'v' || dsv.version_no || ' ' || dsv.lifecycle_status || ' ' || dsv.effective_from::text
+                   || '..' || coalesce(dsv.effective_to::text, '') || ' cust=' || coalesce(e.customer_type_code, '*')
+                   || ' criteria=' || e.criteria::text,
+               'variant=' || coalesce(pv.variant_name, '*') || ' sku=' || coalesce(e.product_sku_id::text, '*')
+                   || ' dealer=' || coalesce(e.dealer_id::text, '*'),
+               b.benefit_config::text
+        FROM js
+        JOIN auditcore.discount_scheme_eligibility e
+          ON e.tenant_id = :t AND e.model_id = js.model_id
+        JOIN auditcore.discount_scheme_versions dsv
+          ON dsv.tenant_id = e.tenant_id AND dsv.discount_scheme_version_id = e.discount_scheme_version_id
+        JOIN auditcore.discount_schemes ds
+          ON ds.tenant_id = dsv.tenant_id AND ds.discount_scheme_id = dsv.discount_scheme_id
+        JOIN auditcore.discount_scheme_benefits b
+          ON b.tenant_id = dsv.tenant_id AND b.discount_scheme_version_id = dsv.discount_scheme_version_id
+        LEFT JOIN auditcore.product_variants pv ON pv.variant_id = e.variant_id
+        WHERE e.variant_id IS NULL OR e.variant_id = js.variant_id
+        ORDER BY 2, 1, 3
+    """,
     # One customer's deal, every figure and where it came from
     # (AUDIT_CORE_DIAG_CUSTOMER, an ILIKE pattern; 2026-10-20: "how the SKU
     # cost is arrived at and how the billing data is arrived").
