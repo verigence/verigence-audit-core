@@ -4,6 +4,8 @@ from typing import Any, Self
 
 import httpx
 
+_UPLOAD_INTENT_TIMEOUT_SECONDS = 60.0
+
 
 class DiCaptureV2Error(RuntimeError):
     def __init__(self, *, status_code: int, detail: str) -> None:
@@ -70,6 +72,10 @@ class DiCaptureV2Client:
             f"{external_context_ref}/capture-documents:init",
             token=token,
             json=body,
+            # DI answers this in well under a second, but after its database
+            # reconnects it took 10-26 s (2026-10-20). Giving up at 15 s left
+            # the intent created on DI's side and the page retried for hours.
+            timeout=_UPLOAD_INTENT_TIMEOUT_SECONDS,
         )
 
     def finalize_document(
@@ -146,6 +152,7 @@ class DiCaptureV2Client:
         json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
         expect_body: bool = True,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         try:
             response = self._client.request(
@@ -154,6 +161,7 @@ class DiCaptureV2Client:
                 headers={"Authorization": f"Bearer {token}"},
                 json=json,
                 params=params,
+                **({"timeout": timeout} if timeout is not None else {}),
             )
         except httpx.HTTPError as exc:
             # A slow/unreachable DI (e.g. a large multi-file upload-intents

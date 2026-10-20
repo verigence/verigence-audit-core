@@ -361,3 +361,52 @@ def test_a_two_page_booking_form_is_read_once_and_never_classified_twice(pipelin
     assert sorted(di.extractions) == ["booking_form", "dealer_receipt"]
     trusted = [d for d in di.by_client.values() if d["trusted"]]
     assert len(trusted) == 1 and trusted[0]["type"] == "booking_form"
+
+
+def test_a_refused_upload_intent_is_not_retried_for_hours(pipeline, monkeypatch):
+    """2026-10-20: DI refused 21 pages' intents as CONFLICT and each was retried
+    four times over hours. A refusal answers the same every time: the page
+    settles at once and the PC's task says so; a technical failure still
+    retries."""
+    journey, storage, di = pipeline
+
+    def refuse(**kwargs):
+        return {"uploads": [], "failures": [
+            {"clientUploadId": f["clientUploadId"], "errorCode": "CONFLICT", "detail": "mapping"}
+            for f in kwargs["files"]]}
+
+    monkeypatch.setattr(di, "create_upload_intents", refuse)
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}"
+    pdf = _three_page_pdf()
+    init = client.post(f"{base}/uploads:init", json={"files": [{
+        "filename": "refused.pdf", "contentType": "application/pdf", "sizeBytes": len(pdf),
+        "clientUploadId": "e2e-refused-0001"}]})
+    [upload] = init.json()["uploads"]
+    storage.objects[upload["uploadUrl"].split("https://storage.test/", 1)[1]] = pdf
+    assert client.post(f"{base}/uploads/{upload['batchId']}:finalize").status_code == 202
+
+    _drain(journey)
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        attempts = connection.execute(
+            text("SELECT max(attempt_count) FROM auditcore.p2_work_queue "
+                 "WHERE tenant_id=:t AND work_type='DOCUMENT_INGEST'"), {"t": journey.tenant_id},
+        ).scalar_one()
+        retry_waits = connection.execute(
+            text("SELECT count(*) FROM auditcore.p2_activity_events WHERE tenant_id=:t "
+                 "AND event_type='DOCUMENT_STATUS_CHANGED' AND details->>'status'='RETRY_WAIT'"),
+            {"t": journey.tenant_id},
+        ).scalar_one()
+    assert attempts == 1
+    assert retry_waits == 0
+
+
+def test_a_technical_intent_failure_still_retries():
+    from audit_core.di_capture_v2_client import DiCaptureV2Error
+
+    technical = DiCaptureV2Error(status_code=503, detail='{"detail": "x", "retryable": true}')
+    refused = DiCaptureV2Error(status_code=409, detail='{"detail": "x", "retryable": false}')
+    assert worker._is_retryable(technical) is True
+    assert worker._is_retryable(refused) is False
