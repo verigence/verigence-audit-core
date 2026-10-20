@@ -59,8 +59,14 @@ def test_missing_project_wide_tl_assignment_is_denied() -> None:
         )
 
 
-def test_case_query_scope_is_project_wide_and_keeps_submission_boundary() -> None:
+def test_case_query_scope_is_project_wide_and_marks_the_submission_boundary() -> None:
+    """Decision 2026-10-20: the TL list shows every journey in scope; the
+    submission boundary marks each row (``submitted``) instead of hiding the
+    journeys still with the PC."""
+    from audit_core.uc03_tl_supervisory import _SUBMITTED_SQL
+
     assert "tl.dealer_id IS NULL" in TL_SCOPE_WHERE_SQL
     assert "tl.outlet_id IS NULL" in TL_SCOPE_WHERE_SQL
     assert "tl.dealer_id=j.dealer_id" not in TL_SCOPE_WHERE_SQL
-    assert "bs.capture_completed_at_utc IS NOT NULL" in TL_SCOPE_WHERE_SQL
+    assert "bs.capture_completed_at_utc IS NOT NULL" not in TL_SCOPE_WHERE_SQL
+    assert "bs.capture_completed_at_utc IS NOT NULL" in _SUBMITTED_SQL
