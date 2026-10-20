@@ -2186,3 +2186,34 @@ def test_vehicle_category_follows_the_sku(journey) -> None:
         {"t": c.tenant_id, "j": c.journey_id},
     ).mappings().one()
     assert category["product_sku_id"] == ev and category["vehicle_category"] == "EV"
+
+
+def test_an_approved_price_list_version_is_used_whatever_the_date(journey) -> None:
+    """Found on the full SKU run (2026-10-20): two versions take effect the
+    same day and the date always picks the higher one. A Team Lead's approval
+    names the version itself, and the price plan uses it."""
+    from audit_core.uc03_sku_candidates import _price_plan_for_journey
+    from audit_core.uc03_sku_tasks import approve_other_month_price_list
+
+    c = journey
+    (xuv,) = _seed_price_list(c, [{"model": "XUV3XO", "variant": "AX5", "components": {"EX_SHOWROOM": "1200000"}}],
+                              effective_from="CURRENT_DATE - 400")
+    _seed_price_list(c, [
+        {"model": "THAR", "variant": "LX", "components": {"EX_SHOWROOM": "1400000"}},
+        {"model": "THAR", "variant": "AX", "components": {"EX_SHOWROOM": "1300000"}},
+    ])
+    old_version = c.execute(
+        text("SELECT price_list_version_id FROM auditcore.price_list_items WHERE tenant_id=:t AND product_sku_id=:s "
+             "LIMIT 1"),
+        {"t": c.tenant_id, "s": xuv},
+    ).scalar_one()
+    _set_journey_product(c, "XUV 3XO", "AX5")
+    outcome = approve_other_month_price_list(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, price_list_version_id=old_version, actor_id="tl-1",
+        reason="Model is in that version",
+    )
+    assert outcome["skuResolved"] is True and _vehicle(c)["product_sku_id"] == xuv
+    from datetime import UTC, datetime
+    plan = _price_plan_for_journey(c, tenant_id=c.tenant_id, journey_id=c.journey_id,
+                                   effective_on=datetime.now(UTC).date())
+    assert plan["price_list_version_id"] == old_version

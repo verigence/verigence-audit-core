@@ -299,8 +299,9 @@ def approve_other_month_price_list(
         text(
             """
             INSERT INTO auditcore.bookings (tenant_id, journey_id, pricing_effective_on, pricing_basis,
-                                            pricing_reason, pricing_set_by_actor_id, pricing_set_at_utc)
-            VALUES (:t, :j, :on, :basis, :reason, :actor, now())
+                                            pricing_reason, pricing_set_by_actor_id, pricing_set_at_utc,
+                                            pricing_price_list_version_id)
+            VALUES (:t, :j, :on, :basis, :reason, :actor, now(), :version)
             ON CONFLICT (tenant_id, journey_id) DO UPDATE
                SET pricing_effective_on=EXCLUDED.pricing_effective_on,
                    pricing_basis=EXCLUDED.pricing_basis,
@@ -309,11 +310,13 @@ def approve_other_month_price_list(
                    pricing_set_at_utc=now(),
                    price_list_id=CASE WHEN auditcore.bookings.price_list_id IS NULL THEN NULL
                                       ELSE :price_list END,
+                   pricing_price_list_version_id=EXCLUDED.pricing_price_list_version_id,
                    updated_at_utc=now()
             """
         ),
         {"t": tenant_id, "j": journey_id, "on": version["effective_from"], "basis": _PRICING_BASIS,
-         "reason": reason[:1000], "actor": actor_id, "price_list": version["price_list_id"]},
+         "reason": reason[:1000], "actor": actor_id, "price_list": version["price_list_id"],
+         "version": price_list_version_id},
     )
     try:
         plan = _price_plan_for_journey(
