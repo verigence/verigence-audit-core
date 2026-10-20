@@ -1106,7 +1106,18 @@ def test_integration_catalogue_search_lists_the_closest_skus_when_the_model_was_
     assert sorted(str(item["productSkuId"]) for item in shortlist["candidates"]) == sorted([str(ax5l), str(ax7l)])
 
 
-def test_integration_catalogue_search_pins_when_the_ex_showroom_price_settles_it(mahindra_journey) -> None:
+def _sku_task(c, task_type):
+    return c.execute(
+        text("SELECT * FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j AND task_type=:k"),
+        {"t": c.tenant_id, "j": c.journey_id, "k": task_type},
+    ).mappings().one_or_none()
+
+
+def test_integration_catalogue_search_suggests_and_the_pc_accepts(mahindra_journey) -> None:
+    """Decision 2026-10-20: the closest price-master SKU is never pinned on its
+    own -- the PC gets a task to accept or reject it."""
+    from audit_core.uc03_sku_tasks import handle_sku_task_action
+
     c = mahindra_journey
     _, ax7l, *_ = _seed_price_list(c, [
         {"model": "XUV 3XO EV", "variant": "AX5L", "fuel": "ELECTRIC", "trim": "AX5L",
@@ -1120,14 +1131,46 @@ def test_integration_catalogue_search_pins_when_the_ex_showroom_price_settles_it
     result = mr.sync_model_resolution(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
-    assert result.get("resolved") is True
-    assert result.get("matchStage") == "CATALOGUE_SEARCH"
-    pinned = c.execute(
-        text("SELECT product_sku_id FROM auditcore.journey_products WHERE tenant_id=:t AND journey_id=:j"),
-        {"t": c.tenant_id, "j": c.journey_id},
-    ).scalar_one()
-    assert pinned == ax7l
+    assert result.get("raised") is True and result.get("matchStage") == "CATALOGUE_SEARCH"
+    assert _vehicle(c)["product_sku_id"] is None
+    task = _sku_task(c, "SKU_CLOSEST_MATCH_CONFIRM")
+    assert task["assigned_role_code"] == "PC" and task["task_status"] == "READY"
+    assert task["reference"]["suggestedSkuId"] == str(ax7l)
+
+    outcome = handle_sku_task_action(
+        c, tenant_id=c.tenant_id, task=dict(task), action="ACCEPT", actor_id="pc-1", actor_role_code="PC",
+        comment=None,
+    )
+    assert outcome["outcome"] == "SKU_ACCEPTED"
+    assert _vehicle(c)["product_sku_id"] == ax7l
     assert _open_model_flags(c) == 0
+    assert _sku_task(c, "SKU_CLOSEST_MATCH_CONFIRM")["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_rejecting_the_closest_match_leaves_the_pc_to_pick_and_never_resuggests_it(mahindra_journey) -> None:
+    from audit_core.uc03_sku_tasks import handle_sku_task_action
+
+    c = mahindra_journey
+    _seed_price_list(c, [
+        {"model": "XUV 3XO EV", "variant": "AX5L", "fuel": "ELECTRIC", "trim": "AX5L",
+         "components": {"EX_SHOWROOM": "1500000"}},
+        {"model": "XUV 3XO EV", "variant": "AX7L", "fuel": "ELECTRIC", "trim": "AX7L",
+         "components": {"EX_SHOWROOM": "1700000"}},
+    ])
+    _set_journey_product(c, "XUV300", "W7L EV")
+    _set_commercial(c, "ex_showroom_price", "1700000")
+    mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    task = _sku_task(c, "SKU_CLOSEST_MATCH_CONFIRM")
+    outcome = handle_sku_task_action(
+        c, tenant_id=c.tenant_id, task=dict(task), action="REJECT", actor_id="pc-1", actor_role_code="PC",
+        comment="Not this one",
+    )
+    assert outcome["outcome"] == "SUGGESTION_REJECTED"
+    assert _vehicle(c)["product_sku_id"] is None
+    assert _open_model_flags(c) == 1  # still to pick by hand
+
+    mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert _sku_task(c, "SKU_CLOSEST_MATCH_CONFIRM")["task_status"] == "VERIFIED_COMPLETE"
 
 
 def test_integration_falls_back_to_latest_master_when_booking_predates_it(journey) -> None:
@@ -1271,10 +1314,11 @@ def test_invoice_fallback_is_noop_once_already_resolved(journey) -> None:
     assert pinned == sku_id
 
 
-def test_invoice_mismatch_raises_finding_and_pc_task_without_repinning(journey) -> None:
-    """The invoice implies a real, matched SKU that disagrees with the one
-    already on the journey -- must raise a finding + PC task, per explicit
-    instruction, without ever repinning journey_products itself."""
+def test_invoice_naming_a_different_vehicle_replaces_the_sku_and_tells_the_tl(journey) -> None:
+    """Decision 2026-10-20: the invoice is the source of truth. The Journey
+    takes the invoice's SKU (even over a confirmed one) and a Team Lead gets
+    an information observation that the model changed -- no mismatch for
+    the PC to explain."""
     c = journey
     confirmed_sku_id, invoice_sku_id = _seed_price_list(c, [
         {"model": "XUV700", "variant": "AX7L", "components": {"EX_SHOWROOM": "2000000"}},
@@ -1295,81 +1339,43 @@ def test_invoice_mismatch_raises_finding_and_pc_task_without_repinning(journey) 
     result = mr.sync_model_resolution_from_invoice(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
-    assert result == {"skipped": True, "reason": "already_resolved", "mismatchFlagged": True, "crossChecked": True}
+    assert result.get("changed") is True and result.get("source") == "INVOICE"
+    row = _vehicle(c)
+    assert row["product_sku_id"] == invoice_sku_id
+    assert (row["model_name_snapshot"], row["variant_name_snapshot"]) == ("SCORPIO N", "Z8L")
+    assert row["selection_method"] == "MODEL_RESOLUTION_INVOICE_OVERRIDE_V1"
+    assert _open_mismatch(c) == 0
+    task = _sku_task(c, "MODEL_CHANGED_BY_INVOICE")
+    assert task["assigned_role_code"] == "TL" and task["severity"] == "INFO"
+    assert "XUV700 AX7L" in task["description"] and "SCORPIO N Z8L" in task["description"]
 
-    # journey_products itself is untouched -- this never repins.
-    pinned = c.execute(
-        text("SELECT product_sku_id FROM auditcore.journey_products "
-             "WHERE tenant_id=:t AND journey_id=:j"),
-        {"t": c.tenant_id, "j": c.journey_id},
-    ).scalar_one()
-    assert pinned == confirmed_sku_id
-
-    finding = c.execute(
-        text("SELECT audit_finding_id, finding_class, severity, finding_status "
-             "FROM auditcore.audit_findings "
-             "WHERE tenant_id=:t AND journey_id=:j AND rule_key='INVOICE_SKU_MISMATCH'"),
-        {"t": c.tenant_id, "j": c.journey_id},
-    ).mappings().one()
-    assert finding["finding_class"] == "VIOLATION"
-    assert finding["severity"] == "HIGH"
-    assert finding["finding_status"] == "OPEN"
-
-    task = c.execute(
-        text("SELECT task_type, assigned_role_code, related_finding_id "
-             "FROM auditcore.workflow_tasks WHERE tenant_id=:t AND journey_id=:j"),
-        {"t": c.tenant_id, "j": c.journey_id},
-    ).mappings().one()
-    assert task["task_type"] == "INVOICE_SKU_MISMATCH_REASON"
-    assert task["assigned_role_code"] == "PC"
-    assert task["related_finding_id"] == finding["audit_finding_id"]
+    # Run again on the same invoice: nothing changes twice.
+    again = mr.sync_model_resolution_from_invoice(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
+    )
+    assert again.get("changed") is None and _vehicle(c)["product_sku_id"] == invoice_sku_id
 
 
-def test_invoice_mismatch_resolves_once_invoice_matches_confirmed_sku(journey) -> None:
+def test_booking_side_checks_also_apply_the_invoice_over_the_sku(journey) -> None:
+    """The Booking checks (and the nightly retry) apply the same rule, not
+    only Delivery-side events."""
     c = journey
-    confirmed_sku_id, other_sku_id = _seed_price_list(c, [
+    confirmed_sku_id, invoice_sku_id = _seed_price_list(c, [
         {"model": "XUV700", "variant": "AX7L", "components": {"EX_SHOWROOM": "2000000"}},
         {"model": "SCORPIO N", "variant": "Z8L", "components": {"EX_SHOWROOM": "1600000"}},
     ])
-    other_sku_code = c.execute(
-        text("SELECT sku_code FROM auditcore.product_skus WHERE product_sku_id=:s"),
-        {"s": other_sku_id},
-    ).scalar_one()
-    confirmed_sku_code = c.execute(
-        text("SELECT sku_code FROM auditcore.product_skus WHERE product_sku_id=:s"),
-        {"s": confirmed_sku_id},
-    ).scalar_one()
     _set_journey_product(c, "XUV700", "AX7L")
     c.execute(
         text("UPDATE auditcore.journey_products SET product_sku_id=:s, selection_status='CONFIRMED' "
              "WHERE tenant_id=:t AND journey_id=:j"),
         {"s": confirmed_sku_id, "t": c.tenant_id, "j": c.journey_id},
     )
-    _set_invoice_field(c, "sku_code", other_sku_code)
-    mr.sync_model_resolution_from_invoice(
-        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
-    )
-    assert c.execute(
-        text("SELECT finding_status FROM auditcore.audit_findings "
-             "WHERE tenant_id=:t AND journey_id=:j AND rule_key='INVOICE_SKU_MISMATCH'"),
-        {"t": c.tenant_id, "j": c.journey_id},
-    ).scalar_one() == "OPEN"
+    _set_invoice_field(c, "model_name_raw", "SCORPIO N")
+    _set_invoice_field(c, "variant_raw", "Z8L")
 
-    # A corrected invoice now shows the confirmed vehicle's own code.
-    c.execute(
-        text("DELETE FROM auditcore.journey_document_extracted_fields "
-             "WHERE tenant_id=:t AND journey_id=:j AND field_key='sku_code'"),
-        {"t": c.tenant_id, "j": c.journey_id},
-    )
-    _set_invoice_field(c, "sku_code", confirmed_sku_code)
-    mr.sync_model_resolution_from_invoice(
-        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
-    )
-    assert c.execute(
-        text("SELECT finding_status FROM auditcore.audit_findings "
-             "WHERE tenant_id=:t AND journey_id=:j AND rule_key='INVOICE_SKU_MISMATCH'"),
-        {"t": c.tenant_id, "j": c.journey_id},
-    ).scalar_one() == "RESOLVED"
+    result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert result.get("changed") is True
+    assert _vehicle(c)["product_sku_id"] == invoice_sku_id
 
 
 def _confirm_sku(c, sku_id) -> None:
@@ -1390,7 +1396,7 @@ def _open_mismatch(c) -> int:
 
 def test_invoice_cross_check_reads_a_differently_spelled_invoice_through_the_full_ladder(mahindra_journey) -> None:
     """Rule 2026-10-01: the invoice's vehicle is checked even when the Booking
-    Form already pinned one. The invoice spells the vehicle the way real
+    Form already pinned one (and since 2026-10-20 it wins). The invoice spells the vehicle the way real
     DMS invoices do, not the way the master does; the plain name match
     used to find nothing and the check was silently skipped."""
     c = mahindra_journey
@@ -1410,13 +1416,11 @@ def test_invoice_cross_check_reads_a_differently_spelled_invoice_through_the_ful
     result = mr.sync_model_resolution_from_invoice(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
-    assert result == {"skipped": True, "reason": "already_resolved", "mismatchFlagged": True, "crossChecked": True}
-    assert _open_mismatch(c) == 1
-    pinned = c.execute(
-        text("SELECT product_sku_id FROM auditcore.journey_products WHERE tenant_id=:t AND journey_id=:j"),
-        {"t": c.tenant_id, "j": c.journey_id},
-    ).scalar_one()
-    assert pinned == ax7t  # never re-pinned; the PC explains, the TL decides
+    # The invoice is the source of truth (decision 2026-10-20): the Journey
+    # takes the invoiced AX7L and the TL is told.
+    assert result.get("changed") is True
+    assert _open_mismatch(c) == 0
+    assert _vehicle(c)["product_sku_id"] == ax7l
     assert ax7l != ax7t
 
 
@@ -1958,10 +1962,11 @@ def test_integration_an_emptied_attribute_filter_still_reaches_the_catalogue_sea
     _set_commercial(c, "ex_showroom_price", "1496000.00")
 
     result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
-    assert result.get("resolved") is True, result
+    # Suggested to the PC, never pinned on its own (decision 2026-10-20).
+    assert result.get("raised") is True, result
     assert result["matchStage"] == "CATALOGUE_SEARCH"
-    assert _pinned(c) == skus["ev_ax7l"]
-    assert _open_model_flags(c) == 0
+    assert _pinned(c) is None
+    assert _sku_task(c, "SKU_CLOSEST_MATCH_CONFIRM")["reference"]["suggestedSkuId"] == str(skus["ev_ax7l"])
 
 
 def test_integration_an_emptied_attribute_filter_without_a_price_shortlists_the_siblings(mahindra_journey) -> None:
@@ -2128,3 +2133,56 @@ def test_confirm_refuses_to_replace_a_confirmed_sku(journey) -> None:
             actor_id="pc-test-actor", correlation_id="",
         )
     assert refused.value.error_code == "VAC-SKU-005"
+
+
+def test_other_month_list_waits_for_tl_approval_then_resolves_there(journey) -> None:
+    """Decision 2026-10-20: the model only in another month's list raises a
+    Team Lead task; no SKU (and no closest-match suggestion) until approved;
+    on approval the Journey is priced on that list and the SKU resolves."""
+    from audit_core.uc03_p2_tasks import TaskPermissionError
+    from audit_core.uc03_sku_tasks import handle_sku_task_action
+
+    c = journey
+    (old_w8,) = _seed_price_list(
+        c, [{"model": "XUV300", "variant": "W8", "components": {"EX_SHOWROOM": "1200000"}}],
+        effective_from="CURRENT_DATE - 400",
+    )
+    _seed_price_list(c, [
+        {"model": "XUV 3XO", "variant": "AX5", "components": {"EX_SHOWROOM": "1100000"}},
+        {"model": "XUV 3XO", "variant": "AX7", "components": {"EX_SHOWROOM": "1300000"}},
+    ])
+    _set_journey_product(c, "XUV300", "W8")
+
+    mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    task = _sku_task(c, "SKU_OTHER_MONTH_PRICE_LIST")
+    assert task["assigned_role_code"] == "TL" and task["task_status"] == "READY"
+    assert _sku_task(c, "SKU_CLOSEST_MATCH_CONFIRM") is None
+    assert _vehicle(c)["product_sku_id"] is None
+
+    with pytest.raises(TaskPermissionError):
+        handle_sku_task_action(c, tenant_id=c.tenant_id, task=dict(task), action="ACCEPT", actor_id="pc-1",
+                               actor_role_code="PC", comment=None)
+    outcome = handle_sku_task_action(c, tenant_id=c.tenant_id, task=dict(task), action="ACCEPT", actor_id="tl-1",
+                                     actor_role_code="TL", comment="Model renamed this month")
+    assert outcome["outcome"] == "PRICE_LIST_APPROVED"
+    assert _vehicle(c)["product_sku_id"] == old_w8
+    basis = c.execute(
+        text("SELECT pricing_basis FROM auditcore.bookings WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+    assert basis == "TL_PRICE_LIST"
+    assert _sku_task(c, "SKU_OTHER_MONTH_PRICE_LIST")["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_vehicle_category_follows_the_sku(journey) -> None:
+    c = journey
+    (ev,) = _seed_price_list(c, [{"model": "BE 6", "variant": "PACK ONE", "fuel": "ELECTRIC",
+                                  "components": {"EX_SHOWROOM": "1900000"}}])
+    _set_journey_product(c, "BE 6", "PACK ONE")
+    mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    category = c.execute(
+        text("SELECT product_sku_id, vehicle_category FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).mappings().one()
+    assert category["product_sku_id"] == ev and category["vehicle_category"] == "EV"

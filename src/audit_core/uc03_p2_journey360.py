@@ -384,7 +384,7 @@ def summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
                    c.display_name AS customer_name, c.legal_name, c.customer_type_code, c.mobile_last4,
                    d.dealer_name, o.outlet_name, o.city,
                    jp.model_name_snapshot AS model, jp.variant_name_snapshot AS variant,
-                   jp.colour_name_snapshot AS colour, jp.selection_status,
+                   jp.colour_name_snapshot AS colour, jp.selection_status, jp.vehicle_category,
                    sku.sku_code,
                    (SELECT COALESCE(v.vin, v.chassis_number) FROM auditcore.vehicle_records v
                      WHERE v.tenant_id=j.tenant_id AND v.journey_id=j.journey_id
@@ -449,6 +449,8 @@ def summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
             "vehicle": vehicle_text,
             "skuCode": head["sku_code"],
             "vehicleResolution": head["selection_status"],
+            # PV / CV / EV, from the price master (None when it does not say).
+            "vehicleCategory": head["vehicle_category"],
             "vin": head["vin"],
             "registrationNumber": head["registration_number"],
             "financier": head["financier"],
@@ -501,11 +503,11 @@ def _columns(per_source: list[Any]) -> dict[str, Any]:
     return out
 
 
-def _reference(cols: dict[str, Any], vehicle_invoiced: bool) -> Any:
+def _reference(cols: dict[str, Any], invoice_on_file: bool) -> Any:
     """The figure a component's variance is measured on: the invoiced value
-    once the vehicle invoice is on file, else billed falling back to the
-    booking offer."""
-    if vehicle_invoiced:
+    once an invoice is on file, else billed falling back to the booking
+    offer."""
+    if invoice_on_file:
         return cols["billed"]
     return cols["billed"] if cols["billed"] is not None else cols["booking"]
 
@@ -778,7 +780,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             SELECT pl.price_list_name, plv.version_no, plv.effective_from,
                    jp.model_name_snapshot AS model, jp.variant_name_snapshot AS variant,
                    jp.colour_name_snapshot AS colour, jp.selection_status, jp.selection_method,
-                   sku.sku_code
+                   jp.vehicle_category, sku.sku_code
             FROM auditcore.journeys j
             LEFT JOIN auditcore.price_list_versions plv
               ON plv.tenant_id=j.tenant_id AND plv.price_list_version_id=j.price_list_version_id
@@ -813,14 +815,15 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     )
     invoice_documents = [d for d in documents if d["documentType"] in _INVOICE_TYPES]
     invoiced_deal = bool(invoice_documents) or any(str(s["source_document_type"]) in _INVOICE_TYPES for s in sources)
-    # Once the vehicle invoice is on file it is the deal's source of truth:
-    # every "current" figure and every variance is the invoiced one, and a
-    # component the invoices do not carry is no longer priced from the
-    # booking form (2026-10-20, Amit: "if invoice is uploaded then all
-    # calculation from the invoice").
-    vehicle_invoiced = any(
-        d["documentType"] in _VEHICLE_INVOICE_TYPES for d in documents
-    ) or any(str(s["source_document_type"]) in _VEHICLE_INVOICE_TYPES for s in sources)
+    # The moment any customer invoice is on file it is the deal's source of
+    # truth: every "current" figure and every variance is the invoiced one,
+    # and nothing is priced from the booking form any more (decision
+    # 2026-10-20: "Moment any invoice get updated, variance needs to be from
+    # the uploaded" invoice). The OEM's wholesale invoice is the dealer's
+    # purchase, not the customer's bill, and does not switch it.
+    invoice_on_file = any(
+        d["documentType"] in _CUSTOMER_INVOICE_TYPES for d in documents
+    ) or any(str(s["source_document_type"]) in _CUSTOMER_INVOICE_TYPES for s in sources)
     present = {(str(s["component_key"]), _norm_type(s["source_document_type"])) for s in sources}
     sources = list(sources) + [
         s for s in _document_billed(documents)
@@ -868,7 +871,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             # still shows it in the right column.
             if line["actual_amount"] is not None and cols[_column_for(effective_type)] is None:
                 cols[_column_for(effective_type)] = line["actual_amount"]
-        reference = _reference(cols, vehicle_invoiced)
+        reference = _reference(cols, invoice_on_file)
         flags = _flags("COMMERCIAL", standard, cols["booking"], cols["billed"], cols["ledger"])
         if _billed_disagree(per_source):
             flags.append("INVOICES_DISAGREE")
@@ -918,8 +921,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         # entitlement is zero, so the whole amount is the over-grant.
         if entitled is None and (row.get("eligibility_result") == "NOT_ELIGIBLE" or key == "ADDITIONAL_DISCOUNT"):
             entitled = Decimal(0)
-        reference = _reference(cols, vehicle_invoiced)
-        if reference is None and not vehicle_invoiced:
+        reference = _reference(cols, invoice_on_file)
+        if reference is None and not invoice_on_file:
             reference = row.get("actual_discount_amount")
         proof_type = CONDITIONAL_DISCOUNT_EVIDENCE_DOCUMENT.get(key)
         discount_rows.append({
@@ -961,7 +964,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     mr_sources = [s for s in sources if s["line_kind"] == "DISCOUNT" and s["component_key"] == mr_key]
     mr_cols = _columns(mr_sources)
     mr_entitled = Decimal(referral["amount"]) if referral["opted"] and referral["amount"] else Decimal(0)
-    mr_reference = _reference(mr_cols, vehicle_invoiced)
+    mr_reference = _reference(mr_cols, invoice_on_file)
     discount_rows = [r for r in discount_rows if r["key"] != mr_key]
     discount_rows.append({
         "key": mr_key,
@@ -982,16 +985,16 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         "sources": _source_list(mr_sources),
     })
 
-    # "Current" is what the deal stands at now. Before the vehicle invoice it
-    # is the billed value where a component has been invoiced, else what the
-    # booking offered. Once the vehicle invoice is on file it is the billed
-    # value only: the booking form no longer prices anything.
+    # "Current" is what the deal stands at now. Before any invoice it is the
+    # billed value where a component has been invoiced, else what the
+    # booking offered. Once an invoice is on file it is the billed value
+    # only: the booking form no longer prices anything.
     for row in all_rows:
-        row["current"] = row["billed"] if vehicle_invoiced else (
+        row["current"] = row["billed"] if invoice_on_file else (
             row["billed"] if row["billed"] is not None else row["booking"]
         )
     for row in discount_rows:
-        row["current"] = row["billed"] if vehicle_invoiced else next(
+        row["current"] = row["billed"] if invoice_on_file else next(
             (row[c] for c in ("billed", "booking", "effective") if row[c] is not None), None,
         )
     # Insurance: Inhouse premium is part of the deal; Self (the customer
@@ -1007,6 +1010,16 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
                 # or Self (opted out), as the PC confirms it.
                 row["opted"] = {"taken": not self_insured, "source": "insurance"}
     counted_rows = [r for r in all_rows if not r.get("excluded")]
+    # A mandatory price-master line no invoice bills is a variance in its own
+    # right (decision 2026-10-20): it counts at nil against its standard.
+    # Optional lines (accessories, extended warranty) the customer may not
+    # have taken, and Self insurance, are not.
+    if invoice_on_file:
+        for row in counted_rows:
+            if row["billed"] is None and row["standard"] is not None and row["key"] not in _OPTED_COMPONENTS:
+                row["current"] = "0"
+                row["variance"] = _minus("0", row["standard"])
+                row["flags"] = [*row["flags"], "NOT_INVOICED"]
     # The premium is accounted for when a billing document carries it -- an
     # invoice-type document with an insurance_amount source, or an invoice
     # line in the INSURANCE category -- OR when the insurance cover note
@@ -1070,6 +1083,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             "model": sku["model"] if sku else None,
             "variant": sku["variant"] if sku else None,
             "colour": sku["colour"] if sku else None,
+            "category": sku["vehicle_category"] if sku else None,
             "resolution": sku["selection_status"] if sku else None,
             "method": sku["selection_method"] if sku else None,
             "priceList": sku["price_list_name"] if sku else None,
@@ -1100,7 +1114,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             "invoicedComponents": invoiced,
             # True once the vehicle invoice is on file: current and every
             # variance are then the invoice's figures only.
-            "invoiceIsSourceOfTruth": vehicle_invoiced,
+            "invoiceIsSourceOfTruth": invoice_on_file,
             "components": len(counted_rows),
             "paid": {"receipts": str(paid["receipts"]), "loan": str(paid["loan"]), "total": str(paid["total"])},
             "payable": payable,
@@ -1811,7 +1825,7 @@ def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
                    jp.colour_name_snapshot AS colour, jp.model_code_snapshot AS model_code,
                    jp.variant_code_snapshot AS variant_code, jp.colour_code_snapshot AS colour_code,
                    jp.selection_status, jp.selection_method, jp.selection_score,
-                   jp.sku_resolution_remarks, sku.sku_code
+                   jp.sku_resolution_remarks, jp.vehicle_category, sku.sku_code
             FROM auditcore.journey_products jp
             LEFT JOIN auditcore.product_skus sku ON sku.product_sku_id=jp.product_sku_id
             WHERE jp.tenant_id=:t AND jp.journey_id=:j
@@ -2015,6 +2029,9 @@ _INVOICE_TYPES = (
     "customer_invoice_dms", "tax_invoice_tally", "accessory_invoice_dms", "accessory_invoice_tally",
     "ew_invoice", "rsa_invoice", "wholesale_invoice", "invoice_generic", "credit_note", "debit_note",
 )
+# Every invoice that bills the customer: the moment one is on file the deal
+# is priced from invoices only (see deal()).
+_CUSTOMER_INVOICE_TYPES = frozenset(_INVOICE_TYPES) - {"wholesale_invoice"}
 _INVOICE_HEADER_KEYS = (
     "invoice_number", "invoice_date", "invoice_nature", "invoice_purpose", "source_system", "seller_name",
     "seller_gstin", "buyer_name", "buyer_gstin", "financed_by", "model_name_raw", "variant_raw", "vin_number",

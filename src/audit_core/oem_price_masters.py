@@ -254,6 +254,42 @@ def _chunked_insert_returning(
     return out
 
 
+_SEGMENT_BY_CATEGORY = {"PV": "PASSENGER_VEHICLE", "CV": "COMMERCIAL", "BEV": "BATTERY_ELECTRIC", "EV": "BATTERY_ELECTRIC"}
+
+
+def _row_segment(row: PriceRow) -> str | None:
+    """The segment a price row states: its PV / CV / BEV category, or an
+    electric fuel. A dealer per-model sheet says only ICE -- not whether it
+    is a passenger or commercial vehicle -- and is left unstated."""
+    if str(row.fuel or "").strip().upper() in {"ELECTRIC", "EV", "BEV"}:
+        return "BATTERY_ELECTRIC"
+    return _SEGMENT_BY_CATEGORY.get(str(row.category or "").strip().upper())
+
+
+def _set_model_segments(connection: Connection, *, rows: list[PriceRow], model_id_by_name: dict[str, UUID]) -> None:
+    """The vehicle category (PV / CV / EV) on each model, from the rows'
+    own Category column (decision 2026-10-20). Set only where every row of
+    the model agrees; a model already in a segment is never moved."""
+    stated: dict[UUID, set[str]] = {}
+    for row in rows:
+        segment = _row_segment(row)
+        if segment is not None:
+            stated.setdefault(model_id_by_name[row.model_name], set()).add(segment)
+    for model_id, segments in stated.items():
+        if len(segments) != 1:
+            continue
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.product_models pm SET segment_id = s.segment_id, updated_at_utc = now()
+                FROM auditcore.segments s
+                WHERE s.segment_code = :code AND pm.model_id = :model_id AND pm.segment_id IS NULL
+                """
+            ),
+            {"code": next(iter(segments)), "model_id": model_id},
+        )
+
+
 def _bulk_ensure_models(
     connection: Connection, *, oem_id: UUID, model_names: list[str]
 ) -> dict[str, UUID]:
@@ -525,6 +561,7 @@ def ingest_price_list(
     model_id_by_name = _bulk_ensure_models(
         connection, oem_id=oem_id, model_names=[row.model_name for row in rows]
     )
+    _set_model_segments(connection, rows=rows, model_id_by_name=model_id_by_name)
 
     # 2) variants — same shape, scoped to the models involved.
     def _variant_code(row: PriceRow) -> str:

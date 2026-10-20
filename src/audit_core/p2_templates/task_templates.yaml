@@ -156,6 +156,41 @@ task_types:
     - APPROVE_CORRECTION
     - REJECT_CORRECTION
     - ADD_COMMENT
+  # SKU resolution (decision 2026-10-20). The closest price-master SKU is
+  # only suggested: the PC accepts it or rejects it and picks one by hand.
+  SKU_CLOSEST_MATCH_CONFIRM:
+    category: CORRECTION_APPROVAL
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - ACCEPT
+    - REJECT
+    - ADD_COMMENT
+  # The model is only in another month's price list: a Team Lead approves
+  # pricing the Journey on it before any SKU is resolved.
+  SKU_OTHER_MONTH_PRICE_LIST:
+    category: CORRECTION_APPROVAL
+    owner: TL
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - ACCEPT
+    - REJECT
+    - ADD_COMMENT
+  # Information: the invoice named a different vehicle and the Journey now
+  # carries it (the invoice is the source of truth).
+  MODEL_CHANGED_BY_INVOICE:
+    category: OBSERVATION
+    owner: TL
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - COMPLETE_ACTION
+    - ADD_COMMENT
   MODEL_SELECTION_CORRECTION_REVIEW:
     category: CORRECTION_APPROVAL
     owner: TL
