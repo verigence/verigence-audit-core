@@ -182,3 +182,22 @@ def test_rejections_at_upload_are_counted_by_reason_and_by_day(journey):
     assert len(report["trend"]) == 14
     today = report["trend"][-1]
     assert today["day"] == report["day"] and today["rejected"] == 2 and today["documents"] == 3
+
+
+def test_how_the_pages_became_documents_is_shown(journey):
+    """2026-10-20: "48 pages but 41 documents, where are the other pages?"
+    A multi-page document is one document; a repeated page is dropped."""
+    tl = _tl(journey)
+    _b1, grouped, _ = add_page(journey, page_number=1, status="READY")
+    _b2, repeated, _ = add_page(journey, page_number=4, status="READY")
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(text("UPDATE auditcore.p2_document_queue SET unit_kind='GROUP', page_numbers=ARRAY[1,2,3] "
+                       "WHERE queue_id=:q"), {"q": grouped})
+        c.execute(text("UPDATE auditcore.p2_document_queue SET queue_status='CANCELLED' WHERE queue_id=:q"),
+                  {"q": repeated})
+    row = _report(journey, tl)["journeys"][0]
+    assert row["pageMath"] == {"multiPageDocuments": 1, "pagesInMultiPage": 3, "repeatPages": 1}
+    assert row["documents"]["extracted"] == 1
+    pc = _report(journey, tl)["pcs"][0]
+    assert pc["pageMath"]["pagesInMultiPage"] == 3
