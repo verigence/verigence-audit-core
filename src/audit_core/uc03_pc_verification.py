@@ -149,7 +149,7 @@ def list_review_pending(
     rows = connection.execute(
         text(
             """
-            SELECT bs.journey_id, b.booking_reference, c.display_name AS customer_display_name,
+            SELECT bs.journey_id, b.booking_reference, CASE WHEN c.legal_name_status = 'VERIFIED' AND btrim(COALESCE(c.legal_name, '')) <> '' THEN c.legal_name ELSE c.display_name END AS customer_display_name,
                    NULLIF(
                        concat_ws(
                            ' · ',

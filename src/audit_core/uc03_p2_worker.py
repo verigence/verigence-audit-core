@@ -3297,6 +3297,20 @@ def refresh_journey_dates(engine: Engine) -> None:
                          "AND association_status='ACTIVE' AND document_type_key IN ('booking_docket','payment_receipt')"),
                     {"t": tenant_id},
                 ).scalars().all()
+            # The customer's name follows the KYC on file (2026-10-20).
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                all_journeys = connection.execute(
+                    text("SELECT journey_id FROM auditcore.journeys WHERE tenant_id=:t"), {"t": tenant_id},
+                ).scalars().all()
+            renamed = 0
+            for journey_id in all_journeys:
+                with engine.begin() as connection:
+                    set_tenant_context(connection, tenant_id)
+                    if sync_customer_name(connection, tenant_id=tenant_id, journey_id=journey_id) == "VERIFIED":
+                        renamed += 1
+                        logger.info("customer_name_refreshed", tenant_id=tenant_id, journey_id=str(journey_id))
+            logger.info("customer_names_refreshed", tenant_id=tenant_id, renamed=renamed)
             # Booking dates decide which side of a duplicate pair holds the
             # booking: re-check every pair once the dates are recomputed.
             from audit_core.uc03_duplicate_booking_detection import (
