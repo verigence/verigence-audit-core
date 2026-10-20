@@ -409,9 +409,9 @@ def build_daily_processing_report(
         "notes": [
             "Documents are the units the uploads became after splitting and grouping, in their state now.",
             "Finished is the last document settling; it stays blank while any document of that day's uploads is in flight.",
-            "A PC's row counts only the journeys they uploaded on the day. Tasks the system's own re-checks "
-            "raised that day on their earlier journeys (night re-sync, SKU re-runs, rule changes) are shown "
-            "apart as 'Earlier journeys'.",
+            ("A PC's row counts only the journeys they uploaded on the day. Tasks the system's own re-checks "
+             "raised that day on their earlier journeys (night re-sync, SKU re-runs, rule changes) are shown "
+             "apart as 'Earlier journeys'."),
             "Re-sync counts the journey's 'Re-sync with Document Intelligence'; who pressed it is not stored.",
             "Night jobs run at about 02:00 local time; night-fixed counts pages the sweep asked for that were read afterwards.",
             "Document Intelligence's own nightly re-processing keeps its per-document results in DI and is not counted here.",
