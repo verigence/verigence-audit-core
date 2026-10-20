@@ -88,6 +88,6 @@ def test_p2_journey_list_query_compiles_against_migrated_schema(monkeypatch: pyt
                 q=None,
                 limit=100,
             )
-            assert result == {"items": []}
+            assert result["items"] == [] and result["nextOffset"] is None
     finally:
         engine.dispose()
