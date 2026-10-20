@@ -109,10 +109,31 @@ def _bounds(connection: Connection, *, tenant_id: str, day: date) -> tuple[str, 
     return str(row["tz"]), row["s"], row["e"]
 
 
+# Why a page was rejected at upload, from the document service's failure code
+# (2026-10-20: rejections per day show the quality of what is uploaded).
+_REJECTION_REASONS = ("faded", "blurred", "tooSmall", "unreadable", "other")
+
+
+def rejection_reason(error: str | None) -> str | None:
+    code = str(error or "").upper()
+    if code == "DI_QUALITY_IMAGE_CONTRAST":
+        return "faded"
+    if code == "DI_QUALITY_IMAGE_BLUR_SCORE":
+        return "blurred"
+    if code == "DI_QUALITY_IMAGE_MIN_DIMENSIONS":
+        return "tooSmall"
+    if code in _REJECTED_ERRORS or code == "DI_QUALITY_FILE_NOT_EMPTY":
+        return "unreadable"
+    if code.startswith("DI_QUALITY_"):
+        return "other"
+    return None
+
+
 def _empty_counts() -> dict[str, Any]:
     return {
         "files": 0, "pages": 0, "duplicateFiles": 0,
         "documents": {"extracted": 0, "readNoValues": 0, "notRead": 0, "waiting": 0, "failed": 0, "rejectedScans": 0},
+        "rejections": dict.fromkeys(_REJECTION_REASONS, 0),
         "tasksOpened": 0, "tasksOpenedPc": 0, "tasksOpenedTl": 0, "tasksReopened": 0,
         "autoRetries": 0, "retriesExhausted": 0, "pcRetries": 0, "readAgain": 0, "resyncs": 0,
         "nightRequests": 0, "nightFixed": 0,
@@ -321,8 +342,10 @@ def build_daily_processing_report(
                 elif status in ("FAILED", "DEAD_LETTER"):
                     docs["failed"] += 1
                     error = str(unit["last_error"] or "")
-                    if error.startswith("DI_QUALITY_") or error in _REJECTED_ERRORS:
+                    reason = rejection_reason(error)
+                    if reason is not None:
                         docs["rejectedScans"] += 1
+                        row["rejections"][reason] += 1
             at = settled_at.get(batch_id)
             if at is not None and (finished is None or at > finished):
                 finished = at
@@ -400,9 +423,24 @@ def build_daily_processing_report(
             if start_at is not None and finish_at is not None and not summary["stillProcessing"] else None
         )
 
+    day_total = _empty_counts()
+    for row in journeys:
+        if row["uploadStartedAt"] is not None:
+            _add(day_total, {k: v for k, v in row.items() if k in _empty_counts()})
+    docs = day_total["documents"]
+    documents = docs["extracted"] + docs["readNoValues"] + docs["notRead"] + docs["waiting"] + docs["failed"]
     return {
         "day": day.isoformat(),
         "timezone": timezone_name,
+        "quality": {
+            "files": day_total["files"],
+            "pages": day_total["pages"],
+            "documents": documents,
+            "rejected": docs["rejectedScans"],
+            "rejectedPct": round(100.0 * docs["rejectedScans"] / documents, 1) if documents else None,
+            "byReason": day_total["rejections"],
+        },
+        "trend": _rejection_trend(connection, params=params, timezone_name=timezone_name, day=day),
         # PCs who uploaded on the day first, the busiest first.
         "pcs": sorted(pcs.values(), key=lambda s: (-s["journeysUploaded"], s["pcName"] or s["pcActorId"] or "~")),
         "journeys": journeys,
@@ -412,11 +450,56 @@ def build_daily_processing_report(
             ("A PC's row counts only the journeys they uploaded on the day. Tasks the system's own re-checks "
              "raised that day on their earlier journeys (night re-sync, SKU re-runs, rule changes) are shown "
              "apart as 'Earlier journeys'."),
+            ("Rejected at upload: pages the scan-quality check refused (faded, blurred, too small or "
+             "unreadable) -- never read, the PC is asked to re-scan. The trend counts the last 14 days."),
             "Re-sync counts the journey's 'Re-sync with Document Intelligence'; who pressed it is not stored.",
             "Night jobs run at about 02:00 local time; night-fixed counts pages the sweep asked for that were read afterwards.",
             "Document Intelligence's own nightly re-processing keeps its per-document results in DI and is not counted here.",
         ],
     }
+
+
+def _rejection_trend(
+    connection: Connection, *, params: dict[str, Any], timezone_name: str, day: date, days: int = 14,
+) -> list[dict[str, Any]]:
+    """Pages uploaded and rejected at upload per day, the ``days`` days up to
+    and including ``day``, by the day of the upload in the Project's timezone."""
+    rows = connection.execute(
+        text(
+            f"""
+            SELECT (ub.created_at_utc AT TIME ZONE :tz)::date AS day,
+                   q.queue_status, q.last_error, count(*) AS n
+            FROM auditcore.p2_upload_batches ub
+            JOIN auditcore.journeys j ON j.tenant_id=ub.tenant_id AND j.journey_id=ub.journey_id
+            JOIN auditcore.p2_document_queue q ON q.tenant_id=ub.tenant_id AND q.batch_id=ub.batch_id
+            WHERE ub.tenant_id=:t AND ub.batch_status <> 'AWAITING_UPLOAD'
+              AND ub.created_at_utc < :e
+              AND ub.created_at_utc >= :e - make_interval(days => :days)
+              AND q.queue_status NOT IN ('MERGED','CANCELLED')
+              AND {_SCOPE}
+            GROUP BY 1, 2, 3
+            """
+        ),
+        {**params, "tz": timezone_name, "days": days},
+    ).mappings().all()
+    by_day: dict[str, dict[str, Any]] = {}
+    for offset in range(days - 1, -1, -1):
+        key = date.fromordinal(day.toordinal() - offset).isoformat()
+        by_day[key] = {"day": key, "documents": 0, "rejected": 0, "byReason": dict.fromkeys(_REJECTION_REASONS, 0)}
+    for row in rows:
+        entry = by_day.get(row["day"].isoformat())
+        if entry is None:
+            continue
+        n = int(row["n"])
+        entry["documents"] += n
+        reason = (rejection_reason(row["last_error"])
+                  if row["queue_status"] in ("FAILED", "DEAD_LETTER") else None)
+        if reason is not None:
+            entry["rejected"] += n
+            entry["byReason"][reason] += n
+    for entry in by_day.values():
+        entry["rejectedPct"] = round(100.0 * entry["rejected"] / entry["documents"], 1) if entry["documents"] else None
+    return list(by_day.values())
 
 
 @router.get("/reports/daily-processing")
