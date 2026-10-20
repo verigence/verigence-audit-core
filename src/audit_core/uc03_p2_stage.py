@@ -36,7 +36,13 @@ from audit_core.uc03_duplicate_receipt_detection import (
     normalize_receipt_number,
 )
 from audit_core.uc03_p2_dates import date_floor_verdict
-from audit_core.uc03_p2_registry import DocumentTemplate, Gate, Registry, get_registry
+from audit_core.uc03_p2_registry import (
+    DocumentTemplate,
+    Gate,
+    Registry,
+    canonical_di_type,
+    get_registry,
+)
 from audit_core.uc03_p2_runtime import record_activity
 
 _OPEN_LEGACY_TASK_STATUSES = ("PENDING", "READY", "CLAIMED", "IN_PROGRESS", "RETRY_WAIT")
@@ -312,7 +318,8 @@ def unreviewed_fields(
     pending: list[dict[str, Any]] = []
     for row in rows:
         area = str(row["process_area"] or "").upper() or None
-        template = registry.template_for_di_type(row["document_type_key"], stage=area)
+        di_type = canonical_di_type(row["document_type_key"])
+        template = registry.template_for_di_type(di_type, stage=area)
         if template.is_supporting:
             continue
         if stage is not None and template.stage not in (stage, "ANY"):
@@ -320,7 +327,7 @@ def unreviewed_fields(
         confidence = float(row["confidence_score"]) if row["confidence_score"] is not None else None
         field_key = str(row["field_key"])
         reasons = field_review_reasons(
-            registry, template, di_type=row["document_type_key"], field_key=field_key,
+            registry, template, di_type=di_type, field_key=field_key,
             value=row["effective_value"], confidence=confidence,
         )
         if not reasons:

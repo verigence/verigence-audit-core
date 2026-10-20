@@ -270,3 +270,18 @@ def test_a_booking_form_without_a_booking_date_raises_a_medium_task_that_opens_t
         )
     assert run() == {"VERIFIED": 1}
     assert task()["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_a_booking_form_filed_under_its_old_key_still_gets_its_dates_checked(journey):
+    """DEV 2026-10-20: ten Booking Forms read as 2020-2024 had no review task.
+    Their evidence carried the pre-canonical key "booking_docket", which
+    resolved to the supporting template, so the date floor never ran."""
+    form = add_ready_document(journey, "booking_docket", confidence=92.0, booking_date="2024-09-25")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {"RAISED": 1}
+    task = _task(journey, f"field-review:{form}")
+    assert task["severity"] == "HIGH" and task["assigned_role_code"] == "PC"
+    (field,) = task["reference"]["fields"]
+    assert field["fieldKey"] == "booking_date" and "DATE_BEFORE_FLOOR" in field["reasons"]
