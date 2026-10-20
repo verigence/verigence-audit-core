@@ -95,13 +95,24 @@ SCOPED_SQL = f"""
                ot.pc_due, ot.tl_due,
                COALESCE(pg.processing, false) AS processing,
                COALESCE(pg.stuck, false) AS stuck,
-               (rk.journey_id IS NOT NULL) AS high_risk
+               (rk.journey_id IS NOT NULL) AS high_risk,
+               -- In delivery as the row's own Delivery chip and the Booking &
+               -- Delivery headline count it (journeys:summary): a Phase 2
+               -- journey by its stage record, a Phase 1 one by a delivery row.
+               CASE WHEN pr.journey_id IS NOT NULL
+                    THEN (pr.current_stage = 'BOOKING_COMPLETE' OR pr.current_stage LIKE 'DELIVERY%')
+                    ELSE EXISTS (SELECT 1 FROM auditcore.deliveries dl
+                                 WHERE dl.tenant_id = j.tenant_id AND dl.journey_id = j.journey_id)
+                         OR EXISTS (SELECT 1 FROM auditcore.journey_stage_states ds
+                                    WHERE ds.tenant_id = j.tenant_id AND ds.journey_id = j.journey_id
+                                      AND ds.stage_code = 'DELIVERY') END AS in_delivery
         FROM auditcore.journeys j
         JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
         JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
         JOIN auditcore.dealer_outlets o
           ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id AND o.outlet_id=j.outlet_id
         LEFT JOIN auditcore.journey_products jp ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
+        LEFT JOIN auditcore.p2_journey_runtime pr ON pr.tenant_id=j.tenant_id AND pr.journey_id=j.journey_id
         LEFT JOIN finished fin ON fin.journey_id = j.journey_id
         LEFT JOIN open_tasks ot ON ot.journey_id = j.journey_id
         LEFT JOIN (SELECT journey_id, bool_or(processing) AS processing, bool_or(stuck) AS stuck
@@ -166,6 +177,8 @@ COUNTS_SQL = "WITH " + SCOPED_SQL + """
       COUNT(*) AS all_count,
       COUNT(*) FILTER (WHERE s.is_closed) AS closed,
       COUNT(*) FILTER (WHERE NOT s.is_closed) AS open,
+      COUNT(*) FILTER (WHERE NOT s.is_closed AND NOT s.in_delivery) AS booking_open,
+      COUNT(*) FILTER (WHERE NOT s.is_closed AND s.in_delivery) AS delivery_open,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.pc_task) AS needs_action,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.processing AND NOT s.pc_task) AS processing,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.tl_task AND NOT s.pc_task) AS with_tl,
@@ -178,7 +191,10 @@ COUNTS_SQL = "WITH " + SCOPED_SQL + """
 
 BREAKDOWN_SQL = "WITH " + SCOPED_SQL + """
     SELECT {key_columns},
+      COUNT(*) AS total,
       COUNT(*) FILTER (WHERE NOT s.is_closed) AS open,
+      COUNT(*) FILTER (WHERE NOT s.is_closed AND NOT s.in_delivery) AS booking_open,
+      COUNT(*) FILTER (WHERE NOT s.is_closed AND s.in_delivery) AS delivery_open,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.tl_task) AS needs_tl,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.overdue) AS overdue,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.high_risk) AS high_risk,
