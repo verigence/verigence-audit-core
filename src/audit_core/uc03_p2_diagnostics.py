@@ -142,6 +142,34 @@ REPORTS: dict[str, str] = {
           ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id AND e.di_document_id = f.di_document_id
         WHERE f.tenant_id = :t AND f.field_key IN ('booking_date', 'receipt_date')
     """,
+    # Uploads per PC per day, last 5 days (2026-10-20: the daily report showed
+    # one PC uploading and the rest with only tasks).
+    "uploads_by_day": """
+        SELECT (ub.created_at_utc AT TIME ZONE 'Asia/Kolkata')::date AS day, ub.uploaded_by_actor_id,
+               count(DISTINCT ub.journey_id) AS journeys, count(*) AS files, sum(ub.page_count) AS pages,
+               string_agg(DISTINCT ub.batch_status, ',') AS statuses
+        FROM auditcore.p2_upload_batches ub
+        WHERE ub.tenant_id = :t AND ub.created_at_utc > now() - interval '5 days'
+        GROUP BY 1, 2 ORDER BY 1, 2
+    """,
+    # Tasks created / reopened today (IST) by type, source and hour.
+    "tasks_today": """
+        SELECT 'OPENED' AS kind, tk.task_type, tk.source_type, tk.assigned_role_code,
+               to_char(tk.created_at_utc AT TIME ZONE 'Asia/Kolkata', 'HH24') AS hour_ist, count(*) AS n
+        FROM auditcore.p2_tasks tk
+        WHERE tk.tenant_id = :t
+          AND tk.created_at_utc >= ((now() AT TIME ZONE 'Asia/Kolkata')::date)::timestamp AT TIME ZONE 'Asia/Kolkata'
+        GROUP BY 1, 2, 3, 4, 5
+        UNION ALL
+        SELECT 'REOPENED', tk.task_type, tk.source_type, tk.assigned_role_code,
+               to_char(te.created_at_utc AT TIME ZONE 'Asia/Kolkata', 'HH24'), count(*)
+        FROM auditcore.p2_task_events te
+        JOIN auditcore.p2_tasks tk ON tk.tenant_id = te.tenant_id AND tk.task_id = te.task_id
+        WHERE te.tenant_id = :t AND te.event_type = 'REOPENED'
+          AND te.created_at_utc >= ((now() AT TIME ZONE 'Asia/Kolkata')::date)::timestamp AT TIME ZONE 'Asia/Kolkata'
+        GROUP BY 1, 2, 3, 4, 5
+        ORDER BY 1, 5, 2
+    """,
     # The candidates on each open MODEL_NOT_IDENTIFIED finding.
     "open_sku_candidates": """
         SELECT f.journey_id, f.title, e.safe_payload -> 'candidates' AS candidates,
