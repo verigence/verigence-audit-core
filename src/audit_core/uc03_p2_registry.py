@@ -169,6 +169,19 @@ class TaskTemplate:
     actions: tuple[str, ...]
 
 
+# Pre-canonical DI keys still on older evidence rows for the same document.
+# 2026-10-20: evidence typed "booking_docket" resolved to the supporting
+# template, so its Booking Form dates (2020-2024 misreads on DEV) were never
+# checked and no PC review task was raised.
+LEGACY_DI_TYPES = {"booking_docket": "booking_form", "payment_receipt": "dealer_receipt"}
+
+
+def canonical_di_type(di_type: str | None) -> str | None:
+    if not di_type:
+        return di_type
+    return LEGACY_DI_TYPES.get(di_type, di_type)
+
+
 @dataclass(frozen=True)
 class ExtractionRules:
     """Checks every extracted value gets besides its confidence.
@@ -222,6 +235,7 @@ class Registry:
     def templates_for_di_type(self, di_type: str | None) -> list[DocumentTemplate]:
         if not di_type:
             return []
+        di_type = canonical_di_type(di_type)
         return [t for t in self.documents.values() if di_type in t.di_types]
 
     def template_for_di_type(self, di_type: str | None, *, stage: str | None = None) -> DocumentTemplate:
