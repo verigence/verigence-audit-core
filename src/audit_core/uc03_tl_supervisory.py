@@ -66,6 +66,8 @@ class TlSupervisoryCase(BaseModel):
     openFlagCount: int
     highestOpenSeverity: str | None
     latestActivityAtUtc: datetime
+    # False while the journey is still with the PC (not submitted / progressed).
+    submitted: bool = True
 
 
 class TlSupervisoryCasePage(BaseModel):
@@ -272,6 +274,17 @@ _BASE_FROM_SQL = """
      AND ds.stage_code='DELIVERY'
 """
 
+# The TL overview lists EVERY journey in the TL's project-wide scope
+# (decision 2026-10-20): a journey still with the PC -- not named yet, pages
+# failed or retrying, stuck -- is what a TL most needs to see. Each row says
+# whether the PC has submitted it (``submitted``); the TL's own review of a
+# case (_require_tl_case_scope) still needs a submitted case.
+_SUBMITTED_SQL = """(
+            bs.capture_completed_at_utc IS NOT NULL
+            OR delivery.delivery_id IS NOT NULL
+            OR ds.business_status IS NOT NULL
+      )"""
+
 _SCOPE_WHERE_SQL = """
     WHERE j.tenant_id=:tenant_id
       AND EXISTS (
@@ -285,11 +298,6 @@ _SCOPE_WHERE_SQL = """
               AND (tl.effective_to IS NULL OR tl.effective_to >= now())
               AND tl.dealer_id IS NULL
               AND tl.outlet_id IS NULL
-      )
-      AND (
-            bs.capture_completed_at_utc IS NOT NULL
-            OR delivery.delivery_id IS NOT NULL
-            OR ds.business_status IS NOT NULL
       )
 """
 
@@ -306,7 +314,7 @@ def list_tl_supervisory_cases(
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> TlSupervisoryCasePage:
-    """Return submitted/progressed cases across the TL's project-wide scope."""
+    """Every journey across the TL's project-wide scope, each marked submitted or still with the PC."""
 
     _authorize_workspace(
         authorization_client,
@@ -337,7 +345,8 @@ def list_tl_supervisory_cases(
             SELECT
                 j.journey_id,
                 b.booking_reference,
-                c.display_name AS customer_display_name,
+                -- The KYC name once the customer is named (as Booking & Delivery shows it).
+                COALESCE(c.legal_name, c.display_name) AS customer_display_name,
                 c.mobile_last4 AS customer_mobile_last4,
                 NULLIF(
                     concat_ws(
@@ -379,7 +388,10 @@ def list_tl_supervisory_cases(
                     delivery.updated_at_utc,
                     findings.latest_finding_activity,
                     pc_submit.occurred_at_utc
-                ) AS latest_activity_at_utc
+                ) AS latest_activity_at_utc,
+                """
+            + _SUBMITTED_SQL
+            + """ AS submitted
             """
             + _BASE_FROM_SQL
             + """
@@ -457,6 +469,7 @@ def list_tl_supervisory_cases(
                 openFlagCount=int(row["open_flag_count"]),
                 highestOpenSeverity=row["highest_open_severity"],
                 latestActivityAtUtc=row["latest_activity_at_utc"],
+                submitted=bool(row["submitted"]),
             )
             for row in rows
         ],

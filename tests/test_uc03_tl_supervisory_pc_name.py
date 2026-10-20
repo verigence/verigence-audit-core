@@ -43,3 +43,44 @@ def test_new_style_booking_shows_its_pc_on_the_tl_list(seeded_tenant, monkeypatc
     assert page.totalCount == 1
     assert page.items[0].responsiblePcName == "Priya Sharma"
     assert page.items[0].responsiblePcActorId == "pc-actor-1"
+
+
+def test_a_journey_still_with_the_pc_is_on_the_tl_list_marked_not_submitted(seeded_tenant, monkeypatch) -> None:  # noqa: F811
+    """Decision 2026-10-20: the TL overview lists every journey in scope. A
+    journey the PC has not submitted -- e.g. its customer not named yet
+    because the KYC was never read -- is exactly what the TL must see. It
+    comes back marked submitted=False (the TL's own review still needs a
+    submitted case)."""
+    engine, tenant_id, journey_id = (
+        seeded_tenant["engine"], seeded_tenant["tenant_id"], seeded_tenant["journey_id"],
+    )
+    with engine.begin() as c:
+        set_tenant_context(c, tenant_id)
+        c.execute(
+            text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code) "
+                 "VALUES (:t, 'tl-actor-2', 'TL')"),
+            {"t": tenant_id},
+        )
+    monkeypatch.setattr(tl, "_authorize_workspace", lambda *a, **k: None)
+
+    with engine.begin() as c:
+        page = tl.list_tl_supervisory_cases(
+            tenant_id, HumanPrincipal(subject="tl-actor-2"), object(), c, limit=10, offset=0,
+        )
+
+    assert page.totalCount == 1
+    assert str(page.items[0].journeyId) == str(journey_id)
+    assert page.items[0].submitted is False
+
+    with engine.begin() as c:
+        set_tenant_context(c, tenant_id)
+        c.execute(
+            text("INSERT INTO auditcore.journey_stage_states (tenant_id, journey_id, stage_code, capture_completed_at_utc) "
+                 "VALUES (:t, :j, 'BOOKING', now())"),
+            {"t": tenant_id, "j": journey_id},
+        )
+    with engine.begin() as c:
+        page = tl.list_tl_supervisory_cases(
+            tenant_id, HumanPrincipal(subject="tl-actor-2"), object(), c, limit=10, offset=0,
+        )
+    assert page.items[0].submitted is True
