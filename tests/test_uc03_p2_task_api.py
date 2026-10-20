@@ -239,3 +239,31 @@ def test_a_delivery_date_from_a_gate_pass_never_makes_the_list_show_delivery_com
         )
     [row] = client.get(f"/p2/v1/tenants/{journey.tenant_id}/journeys").json()["items"]
     assert row["current_stage"] == "DELIVERY_DOCUMENT_UPLOAD"
+
+
+def test_a_task_action_asks_security_for_work_update_not_journey_update(journey):
+    """2026-10-20: Security's TL bundle has audit.work.update but not
+    audit.journey.update, so a Team Lead's "Approve correction" was refused
+    with VAC-AUTH-002. A task action is queue work: audit.work.update."""
+    from p2_support import AllowAllAuthorization
+
+    from audit_core.security_authorization import get_security_authorization_client
+
+    recorder = AllowAllAuthorization()
+    app.dependency_overrides[get_security_authorization_client] = lambda: recorder
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        task_id = create_p2_task(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+            task_type="MANUAL_VERIFICATION_REVIEW", category="DOCUMENT_VERIFICATION", origin_kind="SYSTEM",
+            source_type="DOCUMENT_FIELD", source_code="MANUAL_VERIFICATION", dedupe_key=f"t:{uuid4()}",
+            title="A task", description="", reference={}, severity="MEDIUM", priority="NORMAL",
+            assigned_role_code="PC", assigned_actor_id=None, raised_by_actor_id=None,
+            raised_by_role_code=None, allowed_actions=["ADD_COMMENT"], completion_protocol="MACHINE_VERIFIED",
+        )
+    response = TestClient(app).post(
+        f"/p2/v1/tenants/{journey.tenant_id}/tasks/{task_id}/actions",
+        json={"action": "ADD_COMMENT", "comment": "noted"},
+    )
+    assert response.status_code == 200, response.text
+    assert recorder.calls == ["audit.work.update"]
