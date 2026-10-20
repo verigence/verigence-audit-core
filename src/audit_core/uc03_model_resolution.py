@@ -85,6 +85,7 @@ _FINDING_TYPE = "MODEL_NOT_IDENTIFIED"
 _RULE_KEY = "MODEL_NOT_IDENTIFIED:BOOKING"
 _STAGE = "BOOKING"
 _SELECTION_METHOD = "MODEL_RESOLUTION_SYNC_V1"
+_PC_PICK_METHOD = "MODEL_RESOLUTION_PC_PICK_V1"
 _EX_SHOWROOM_COMPONENT = "EX_SHOWROOM"
 
 # Confirmed against a real live case: "Scorpio Classic" / "S MT 7S" already
@@ -2072,7 +2073,10 @@ def confirm_model_resolution_sku(
             detail="The selected SKU is not in this Journey's current effective price list.",
         )
 
-    _pin_sku(connection, tenant_id=tenant_id, journey_id=journey_id, product_sku_id=product_sku_id)
+    # Recorded as a person's pick, not the resolver's (2026-10-20: the two
+    # were indistinguishable when checking which SKUs the system chose).
+    _pin_sku(connection, tenant_id=tenant_id, journey_id=journey_id, product_sku_id=product_sku_id,
+             method=_PC_PICK_METHOD)
     resolved = _resolve_open_flag(
         connection,
         tenant_id=tenant_id,
