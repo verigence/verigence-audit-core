@@ -422,6 +422,26 @@ def evaluate_minimum_booking_payment(
             confirming_date = payment["receipt_date"]
 
     rule_key = "BK_MIN_BOOKING_AMOUNT_NOT_MET"
+    from audit_core.uc03_p2_dates import before_floor
+
+    if confirming_date is not None and before_floor(confirming_date):
+        # The minimum is met, but on a receipt date before the programme's
+        # floor -- a misread the PC is asked to check. No booking date until
+        # it is corrected (2026-10-20: "Booked 2020-10-13").
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.journey_stage_states
+                SET booking_confirm_date=NULL, booking_confirmed_at_utc=NULL, updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND stage_code='BOOKING'
+                  AND (booking_confirm_date IS NOT NULL OR booking_confirmed_at_utc IS NOT NULL)
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id},
+        )
+        _resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, rule_key=rule_key,
+                         correlation_id=correlation_id)
+        return
     if confirming_date is not None:
         connection.execute(
             text(

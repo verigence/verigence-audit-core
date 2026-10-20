@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
@@ -38,7 +38,7 @@ from audit_core.uc03_p2_access import (
     resolve_p2_scope,
 )
 from audit_core.uc03_p2_controls import control_statistics
-from audit_core.uc03_p2_dates import parse_extracted_date
+from audit_core.uc03_p2_dates import parse_extracted_date, programme_date_floor
 from audit_core.uc03_p2_document_health import journey_document_health
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_reviewer import page_stage_code, stage_is_reviewed
@@ -544,10 +544,14 @@ def list_p2_journeys(
                    COALESCE(pr.manual_verification_pending_count,0) AS manual_verification_pending_count,
                    -- Booking confirmed = the day the receipts reached the minimum
                    -- booking amount (a Phase 1 journey carries the date itself).
-                   COALESCE(bs.booking_confirm_date, bs.booking_confirmed_at_utc::date, bc.confirmed_on,
+                   COALESCE(bs.booking_confirm_date,
+                            CASE WHEN bs.booking_confirmed_at_utc::date >= :date_floor
+                                 THEN bs.booking_confirmed_at_utc::date END,
+                            CASE WHEN bc.confirmed_on >= :date_floor THEN bc.confirmed_on END,
                             CASE WHEN bs.business_status='BOOKING_CLOSED' THEN bs.business_completed_at_utc::date END)
                      AS booking_confirm_date,
-                   dl.actual_delivered_at AS delivered_at,
+                   CASE WHEN dl.actual_delivered_at::date >= :date_floor THEN dl.actual_delivered_at END
+                     AS delivered_at,
                    dl.planned_delivery_at AS planned_delivery_at,
                    (pr.journey_id IS NOT NULL) AS phase2,
                    COALESCE(ds.business_completed_at_utc IS NOT NULL
@@ -734,6 +738,7 @@ def list_p2_journeys(
             "tenant_id": tenant_id,
             "actor_id": human_principal.subject,
             "search": search,
+            "date_floor": programme_date_floor() or date(1900, 1, 1),
             "limit": min(max(limit, 1), 250),
             "state": state if state in {"open", "closed", "all"} else "all",
         },

@@ -140,7 +140,20 @@ REPORTS: dict[str, str] = {
         JOIN auditcore.journeys j ON j.tenant_id = f.tenant_id AND j.journey_id = f.journey_id
         LEFT JOIN auditcore.evidence e
           ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id AND e.di_document_id = f.di_document_id
-        WHERE f.tenant_id = :t AND f.field_key IN ('booking_date', 'receipt_date')
+        WHERE f.tenant_id = :t
+          AND f.field_key IN ('booking_date', 'receipt_date', 'delivery_date', 'invoice_date', 'gate_pass_date')
+          AND (f.effective_value #>> '{}') !~ '2026'
+        UNION ALL
+        SELECT j.journey_id, j.journey_reference, 'deliveries.actual_delivered_at',
+               dl.actual_delivered_at::date::text, dl.status_source, e.association_status, NULL,
+               (SELECT string_agg(t.dedupe_key || '=' || t.task_status, ',') FROM auditcore.p2_tasks t
+                 WHERE t.tenant_id = dl.tenant_id AND t.journey_id = dl.journey_id
+                   AND t.dedupe_key LIKE 'field-review:%')
+        FROM auditcore.deliveries dl
+        JOIN auditcore.journeys j ON j.tenant_id = dl.tenant_id AND j.journey_id = dl.journey_id
+        LEFT JOIN auditcore.evidence e
+          ON e.tenant_id = dl.tenant_id AND e.evidence_id = dl.source_evidence_id
+        WHERE dl.tenant_id = :t AND dl.actual_delivered_at < DATE '2026-07-01'
     """,
     # Uploads per PC per day, last 5 days (2026-10-20: the daily report showed
     # one PC uploading and the rest with only tasks).

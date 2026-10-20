@@ -233,9 +233,9 @@ def test_a_receipt_no_longer_on_file_never_sets_the_booking_date(journey):
                  "VALUES (:t, :j, 'BOOKING')"),
             {"t": journey.tenant_id, "j": journey.journey_id},
         )
-    misread = add_receipt_payment(journey, amount="25000", receipt_number="R-1", receipt_date="2020-10-13")
+    misread = add_receipt_payment(journey, amount="25000", receipt_number="R-1", receipt_date="2026-07-13")
     _evaluate(journey)
-    assert _booking_confirm_date(journey) == date(2020, 10, 13)
+    assert _booking_confirm_date(journey) == date(2026, 7, 13)
 
     # The misread receipt is replaced by its re-read.
     _void(journey, misread)
@@ -250,5 +250,21 @@ def test_a_receipt_no_longer_on_file_never_sets_the_booking_date(journey):
             text("UPDATE auditcore.evidence SET association_status='SUPERSEDED' WHERE tenant_id=:t AND journey_id=:j"),
             {"t": journey.tenant_id, "j": journey.journey_id},
         )
+    _evaluate(journey)
+    assert _booking_confirm_date(journey) is None
+
+
+def test_a_receipt_date_before_the_floor_never_becomes_the_booking_date(journey):
+    """The minimum is met on a receipt read as 2020: no booking date until the
+    PC corrects it (the date review asks them)."""
+    set_minimum_booking_amount(journey, "21000")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.journey_stage_states (tenant_id, journey_id, stage_code) "
+                 "VALUES (:t, :j, 'BOOKING')"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+    add_receipt_payment(journey, amount="25000", receipt_number="R-1", receipt_date="2020-10-13")
     _evaluate(journey)
     assert _booking_confirm_date(journey) is None
