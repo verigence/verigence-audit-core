@@ -2036,7 +2036,9 @@ def test_integration_an_open_finding_follows_the_latest_run(mahindra_journey) ->
     itself once the price settles the shortlist."""
     c = mahindra_journey
     lx_17l, *_ = _seed_maxx_hd(c)
-    _set_journey_product(c, "BOL MAXX PUP HD 1.7L LX", None)
+    # (0150 now names "BOL MAXX PUP HD" as the Maxx HD; an unreadable model
+    # text keeps this test's first run without candidates.)
+    _set_journey_product(c, "BLR MXX PUP 1.7L LX", None)
     first = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     assert first.get("raised") is True and first["candidateCount"] == 0
     finding_id = _open_model_finding_id(c)
