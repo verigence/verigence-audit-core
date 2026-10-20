@@ -57,10 +57,21 @@ class TlSupervisoryCase(BaseModel):
     outletName: str
     bookingBusinessStatus: str | None
     bookingBusinessDate: date | None
+    # The audit's own time (decision 2026-10-20: system times are shown as
+    # audit times, never as the PC's): the Booking checks all passed.
     bookingSubmittedAtUtc: datetime | None
     pcVerificationStatus: str | None
     deliveryBusinessStatus: str | None
+    # The vehicle's delivery date (gate pass / actual delivery) -- not when
+    # the audit opened the Delivery stage.
     deliveryBusinessDate: date | None
+    # When the PC uploaded: first and last upload batch (Phase 1 journeys:
+    # first and last document linked).
+    pcFirstUploadAtUtc: datetime | None = None
+    pcLastUploadAtUtc: datetime | None = None
+    # Audit times: Booking checks passed, Delivery checks started.
+    auditBookingCompleteAtUtc: datetime | None = None
+    auditDeliveryStartedAtUtc: datetime | None = None
     responsiblePcActorId: str | None
     responsiblePcName: str | None = None
     openFlagCount: int
@@ -368,14 +379,14 @@ def list_tl_supervisory_cases(
                     (b.created_at_utc AT TIME ZONE project.timezone_name)::date
                 ) AS booking_business_date,
                 bs.capture_completed_at_utc AS booking_submitted_at_utc,
+                bs.capture_completed_at_utc AS audit_booking_complete_at_utc,
+                ds.first_started_at_utc AS audit_delivery_started_at_utc,
+                uploads.first_upload_at_utc,
+                uploads.last_upload_at_utc,
                 bs.pc_verification_status,
                 COALESCE(ds.business_status, delivery.actual_delivery_status_code)
                     AS delivery_business_status,
-                COALESCE(
-                    (delivery.actual_delivered_at AT TIME ZONE project.timezone_name)::date,
-                    (ds.first_started_at_utc AT TIME ZONE project.timezone_name)::date,
-                    (delivery.created_at_utc AT TIME ZONE project.timezone_name)::date
-                ) AS delivery_business_date,
+                (delivery.actual_delivered_at AT TIME ZONE project.timezone_name)::date AS delivery_business_date,
                 COALESCE(pc_submit.actor_id, j.created_by_actor_id) AS responsible_pc_actor_id,
                 j.created_by_display_name AS responsible_pc_name,
                 COALESCE(findings.open_flag_count, 0) AS open_flag_count,
@@ -407,6 +418,20 @@ def list_tl_supervisory_cases(
                 ORDER BY e.occurred_at_utc DESC, e.event_id DESC
                 LIMIT 1
             ) pc_submit ON true
+            LEFT JOIN LATERAL (
+                SELECT COALESCE(
+                           (SELECT min(ub.created_at_utc) FROM auditcore.p2_upload_batches ub
+                             WHERE ub.tenant_id=j.tenant_id AND ub.journey_id=j.journey_id),
+                           (SELECT min(ev.linked_at_utc) FROM auditcore.evidence ev
+                             WHERE ev.tenant_id=j.tenant_id AND ev.journey_id=j.journey_id)
+                       ) AS first_upload_at_utc,
+                       COALESCE(
+                           (SELECT max(ub.created_at_utc) FROM auditcore.p2_upload_batches ub
+                             WHERE ub.tenant_id=j.tenant_id AND ub.journey_id=j.journey_id),
+                           (SELECT max(ev.linked_at_utc) FROM auditcore.evidence ev
+                             WHERE ev.tenant_id=j.tenant_id AND ev.journey_id=j.journey_id)
+                       ) AS last_upload_at_utc
+            ) uploads ON true
             LEFT JOIN LATERAL (
                 SELECT
                     count(*) FILTER (
@@ -464,6 +489,10 @@ def list_tl_supervisory_cases(
                 pcVerificationStatus=row["pc_verification_status"],
                 deliveryBusinessStatus=row["delivery_business_status"],
                 deliveryBusinessDate=row["delivery_business_date"],
+                pcFirstUploadAtUtc=row["first_upload_at_utc"],
+                pcLastUploadAtUtc=row["last_upload_at_utc"],
+                auditBookingCompleteAtUtc=row["audit_booking_complete_at_utc"],
+                auditDeliveryStartedAtUtc=row["audit_delivery_started_at_utc"],
                 responsiblePcActorId=row["responsible_pc_actor_id"],
                 responsiblePcName=row["responsible_pc_name"],
                 openFlagCount=int(row["open_flag_count"]),
