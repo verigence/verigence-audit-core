@@ -191,6 +191,44 @@ REPORTS: dict[str, str] = {
         WHERE j.tenant_id = :t
         ORDER BY j.journey_reference
     """,
+    # Each open duplicate-booking finding with the identity values both
+    # sides were compared on (2026-10-20: Keshab vs Sarbeswar Pradhan,
+    # "customer name matches a relative"). PAN / Aadhaar only as present or not.
+    "duplicate_pairs": """
+        WITH f AS (
+            SELECT fi.journey_id, fi.audit_finding_id, fi.finding_status, fi.created_at_utc,
+                   (SELECT ev.safe_payload FROM auditcore.audit_finding_events ev
+                     WHERE ev.tenant_id = fi.tenant_id AND ev.audit_finding_id = fi.audit_finding_id
+                     ORDER BY ev.occurred_at_utc DESC LIMIT 1) AS payload
+            FROM auditcore.audit_findings fi
+            WHERE fi.tenant_id = :t AND fi.finding_type_code = 'DUPLICATE_BOOKING'
+              AND fi.finding_status IN ('OPEN', 'ACKNOWLEDGED')
+        ), ids AS (
+            SELECT x.journey_id,
+                   string_agg(DISTINCT x.field_key || '=' ||
+                       CASE WHEN x.field_key IN ('pan_number', 'aadhaar_number')
+                            THEN 'present' ELSE COALESCE(x.effective_value #>> '{}', '') END
+                       || ' [' || x.source_document_type_key || ']', ' | ') AS identity
+            FROM auditcore.journey_document_extracted_fields x
+            JOIN auditcore.evidence e ON e.tenant_id = x.tenant_id AND e.journey_id = x.journey_id
+             AND e.di_document_id = x.di_document_id AND e.association_status = 'ACTIVE'
+            WHERE x.tenant_id = :t AND x.field_key IN (
+                'pan_number', 'aadhaar_number', 'aadhaar_name', 'pan_name', 'customer_name',
+                'aadhaar_relationship_name', 'pan_relationship_name', 'address_pincode')
+              AND x.effective_value IS NOT NULL
+            GROUP BY x.journey_id
+        )
+        SELECT f.journey_id AS flagged_journey, jf.journey_reference AS flagged_ref,
+               f.payload ->> 'matchBasis' AS basis, f.payload ->> 'believedOriginalJourneyId' AS holder_journey,
+               jh.journey_reference AS holder_ref, idf.identity AS flagged_identity, idh.identity AS holder_identity,
+               f.payload::text AS payload
+        FROM f
+        JOIN auditcore.journeys jf ON jf.tenant_id = :t AND jf.journey_id = f.journey_id
+        LEFT JOIN auditcore.journeys jh
+          ON jh.tenant_id = :t AND jh.journey_id::text = f.payload ->> 'believedOriginalJourneyId'
+        LEFT JOIN ids idf ON idf.journey_id = f.journey_id
+        LEFT JOIN ids idh ON idh.journey_id = jh.journey_id
+    """,
     # Uploads per PC per day, last 5 days (2026-10-20: the daily report showed
     # one PC uploading and the rest with only tasks).
     "uploads_by_day": """
