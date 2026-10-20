@@ -87,6 +87,16 @@ REPORTS: dict[str, str] = {
         ORDER BY plv.effective_from, plv.version_no
     """,
     # Models per price list version (to compare versions and Projects).
+    # Every OEM master upload in any state (2026-10-20: "we have price master
+    # for Oct as well" but only September shows).
+    "master_uploads": """
+        SELECT upload_id, oem_code, master_kind, effective_from, source_filename, status,
+               row_counts::text AS row_counts, left(error_detail::text, 900) AS error_detail,
+               uploaded_by_actor_id, uploaded_at_utc, published_at_utc
+        FROM auditcore.oem_master_uploads
+        WHERE tenant_id = :t
+        ORDER BY uploaded_at_utc
+    """,
     "price_list_models": """
         SELECT pl.price_list_code, plv.version_no, plv.effective_from, pm.model_name,
                count(DISTINCT pli.product_sku_id) AS skus,
