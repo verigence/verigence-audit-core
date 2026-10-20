@@ -50,8 +50,11 @@ from audit_core.uc03_masters_alignment import (
     commercial_key_for_price_component,
     registration_basis,
 )
-from audit_core.uc03_p2_dates import booking_form_date
-from audit_core.uc03_sku_candidates import _price_plan_for_journey
+from audit_core.uc03_sku_candidates import (
+    _price_plan_for_journey,
+    journey_pricing_date,
+    sync_price_master_in_force_task,
+)
 from audit_core.workflow import create_workflow_task
 
 logger = logging.getLogger(__name__)
@@ -112,10 +115,9 @@ def _context(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     # The pricing date: the date applied by hand, else the booking date on
     # the booking form, else the booking date entered by hand. Never today
     # (decision 2026-09-30): with none of them the deal is not priced yet.
-    form = booking_form_date(connection, tenant_id=tenant_id, journey_id=journey_id)
-    data["effective_on"] = (
-        data.pop("pricing_effective_on") or (form["date"] if form else None) or data.pop("manual_booking_date")
-    )
+    # One function for that date everywhere (2026-10-20 product owner rules).
+    data["effective_on"] = journey_pricing_date(connection, tenant_id=tenant_id, journey_id=journey_id)
+    data.pop("pricing_effective_on", None)
     data.pop("manual_booking_date", None)
     data["basis"] = registration_basis(
         customer_type_code=data["customer_type_code"],
@@ -810,6 +812,11 @@ def sync_deal_reconciliation(
     live 23s overview load -- not a hypothetical one.
     """
     try:
+        if raise_findings:
+            # No book in force on the pricing date: a task says so (R5),
+            # whether or not a SKU is resolved yet; it closes itself once a
+            # book covers the date. Event-driven runs only (not page views).
+            sync_price_master_in_force_task(connection, tenant_id=tenant_id, journey_id=journey_id)
         ctx = _context(connection, tenant_id=tenant_id, journey_id=journey_id)
         if ctx is None:
             return {"skipped": True, "reason": "no_resolved_sku"}

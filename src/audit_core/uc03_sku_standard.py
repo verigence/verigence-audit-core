@@ -106,7 +106,8 @@ def price_version_on(connection: Connection, *, tenant_id: str, on: date) -> dic
         "priceList": plan.get("price_list_name") or plan.get("price_list_code"),
         "version": plan.get("version_no"),
         "effectiveFrom": plan.get("effective_from"),
-        "effectiveTo": plan.get("effective_to"),
+        # In force until the day before the next version starts (2026-10-20).
+        "effectiveTo": plan.get("in_force_to"),
     }
 
 
@@ -432,11 +433,17 @@ def _previous_version(connection: Connection, *, tenant_id: str, version: dict[s
             WHERE v.tenant_id = :t
               AND v.lifecycle_status IN ('PUBLISHED', 'RETIRED')
               AND (v.effective_from, v.version_no) < (:eff, :no)
+              -- the same book only (2026-10-20, defect 14)
+              AND v.price_list_id = (
+                  SELECT cur.price_list_id FROM auditcore.price_list_versions cur
+                  WHERE cur.tenant_id = :t AND cur.price_list_version_id = CAST(:vid AS uuid)
+              )
             ORDER BY v.effective_from DESC, v.version_no DESC
             LIMIT 1
             """
         ),
-        {"t": tenant_id, "eff": version["effectiveFrom"], "no": version["version"]},
+        {"t": tenant_id, "eff": version["effectiveFrom"], "no": version["version"],
+         "vid": str(version["priceListVersionId"])},
     ).mappings().first()
     if row is None:
         return None

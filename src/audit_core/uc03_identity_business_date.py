@@ -68,6 +68,17 @@ def _effective_versions_for_business_date(
                       AND v.lifecycle_status IN ('PUBLISHED', 'RETIRED')
                       AND v.effective_from <= :business_date
                       AND (v.effective_to IS NULL OR v.effective_to >= :business_date)
+                      -- the OEM's own book when the tenant has one (2026-10-20, defect 14)
+                      AND (
+                          v.price_list_id IN (
+                              SELECT pl.price_list_id FROM auditcore.price_lists pl
+                              WHERE pl.tenant_id = :tenant_id AND pl.price_list_code = 'OEM_NATIVE_PRICE_LIST'
+                          )
+                          OR NOT EXISTS (
+                              SELECT 1 FROM auditcore.price_lists pl
+                              WHERE pl.tenant_id = :tenant_id AND pl.price_list_code = 'OEM_NATIVE_PRICE_LIST'
+                          )
+                      )
                     ORDER BY v.effective_from DESC, v.version_no DESC,
                              v.price_list_version_id DESC
                     LIMIT 1
