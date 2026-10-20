@@ -26,7 +26,7 @@ def test_every_report_runs_read_only(journey, name):
     with journey.engine.begin() as connection:
         connection.execute(text("SET TRANSACTION READ ONLY"))
         set_tenant_context(connection, journey.tenant_id)
-        connection.execute(text(REPORTS[name]), {"t": journey.tenant_id}).mappings().all()
+        connection.execute(text(REPORTS[name]), {"t": journey.tenant_id, "c": "%"}).mappings().all()
 
 
 def test_run_logs_without_failing(journey, monkeypatch):

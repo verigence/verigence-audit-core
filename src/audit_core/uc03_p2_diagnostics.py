@@ -9,6 +9,7 @@ does not work in the database). Unset the variable when done.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 import structlog
@@ -341,6 +342,50 @@ REPORTS: dict[str, str] = {
                   AND af.finding_status IN ('OPEN', 'ACKNOWLEDGED')))
         ORDER BY j.updated_at_utc DESC
     """,
+    # One customer's deal, every figure and where it came from
+    # (AUDIT_CORE_DIAG_CUSTOMER, an ILIKE pattern; 2026-10-20: "how the SKU
+    # cost is arrived at and how the billing data is arrived").
+    "deal_journey": """
+        WITH js AS (
+            SELECT j.journey_id, j.price_list_version_id, jp.product_sku_id
+            FROM auditcore.journeys j
+            JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+            LEFT JOIN auditcore.journey_products jp ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
+            WHERE j.tenant_id = :t AND c.display_name ILIKE :c
+        )
+        SELECT 'SKU' AS kind, js.journey_id, s.sku_code AS a, jp.selection_method AS b,
+               plv.version_no::text || ' from ' || plv.effective_from::text AS c, jp.vehicle_category AS d
+        FROM js
+        LEFT JOIN auditcore.product_skus s ON s.product_sku_id = js.product_sku_id
+        LEFT JOIN auditcore.journey_products jp ON jp.tenant_id = :t AND jp.journey_id = js.journey_id
+        LEFT JOIN auditcore.price_list_versions plv
+          ON plv.tenant_id = :t AND plv.price_list_version_id = js.price_list_version_id
+        UNION ALL
+        SELECT 'PRICE_LIST_ITEM', js.journey_id, pli.component_key, pli.standard_amount::text, NULL, NULL
+        FROM js JOIN auditcore.price_list_items pli
+          ON pli.tenant_id = :t AND pli.price_list_version_id = js.price_list_version_id
+         AND pli.product_sku_id = js.product_sku_id
+        UNION ALL
+        SELECT 'LINE', cl.journey_id, cl.component_key, cl.standard_amount::text, cl.actual_amount::text,
+               cl.source_reference
+        FROM js JOIN auditcore.commercial_lines cl ON cl.tenant_id = :t AND cl.journey_id = js.journey_id
+        UNION ALL
+        SELECT 'SOURCE', sv.journey_id, sv.line_kind || ':' || sv.component_key, sv.amount::text,
+               sv.source_document_type, sv.source_document_id::text
+        FROM js JOIN auditcore.commercial_line_source_values sv ON sv.tenant_id = :t AND sv.journey_id = js.journey_id
+        UNION ALL
+        SELECT 'DISCOUNT', da.journey_id, da.discount_key, da.standard_eligible_amount::text,
+               da.actual_discount_amount::text, da.eligibility_result
+        FROM js JOIN auditcore.discount_applications da ON da.tenant_id = :t AND da.journey_id = js.journey_id
+        UNION ALL
+        SELECT 'READ', f.journey_id, f.source_document_type_key || '.' || f.field_key,
+               left(f.effective_value #>> '{}', 900), f.stage_code, NULL
+        FROM js JOIN auditcore.journey_document_extracted_fields f ON f.tenant_id = :t AND f.journey_id = js.journey_id
+        WHERE f.effective_value IS NOT NULL
+          AND (f.field_key ~ '(amount|price|total|discount|tax|gst|cess|line_items|bonus|tcs|premium|charges)'
+               OR f.field_key IN ('model_name_raw', 'variant_raw', 'vehicle_description_raw', 'vehicle_model'))
+        ORDER BY 2, 1, 3
+    """,
 }
 
 
@@ -372,7 +417,10 @@ def run_diagnostics(engine: Engine, names: list[str]) -> None:
                 with engine.begin() as connection:
                     connection.execute(text("SET TRANSACTION READ ONLY"))
                     set_tenant_context(connection, tenant_id)
-                    rows = connection.execute(text(REPORTS[name]), {"t": tenant_id}).mappings().all()
+                    rows = connection.execute(
+                        text(REPORTS[name]),
+                        {"t": tenant_id, "c": os.environ.get("AUDIT_CORE_DIAG_CUSTOMER", "") or "%"},
+                    ).mappings().all()
                 for row in rows[:_MAX_ROWS]:
                     logger.info("diag_row", report=name, tenant_id=tenant_id,
                                 project=project["project_name"], **{k: _plain(v) for k, v in row.items()})
