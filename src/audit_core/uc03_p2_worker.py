@@ -3210,9 +3210,94 @@ def _sku_run_once(engine: Engine, tag: str) -> None:
             logger.warning("sku_run_failed", tenant_id=tenant_id, tag=tag, exc_info=True)
 
 
+def refresh_journey_dates(engine: Engine) -> None:
+    """On every worker start: recompute each Journey's booking date from the
+    receipts on file, and take back a gate-pass delivery date before the
+    programme's floor. Idempotent. Each change is logged with the before and
+    after and the receipts it was decided on (2026-10-20: Subrat Kumar
+    Mallick showed "Booking 07 Oct 2026" while 21,000 was received on 05 Oct;
+    the booking date was only recomputed when a Booking-stage receipt synced,
+    so a receipt that came in another way never moved it)."""
+    from audit_core.uc03_booking_confirmation_rules import (
+        _minimum_booking_amount,
+        evaluate_minimum_booking_payment,
+    )
+    from audit_core.uc03_p2_dates import programme_date_floor
+
+    floor = programme_date_floor()
+    for tenant_id in _active_tenants(engine):
+        changed = 0
+        try:
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                journeys = connection.execute(
+                    text("SELECT DISTINCT journey_id FROM auditcore.payments WHERE tenant_id=:t"),
+                    {"t": tenant_id},
+                ).scalars().all()
+                minimum = _minimum_booking_amount(connection, tenant_id=tenant_id)
+            for journey_id in journeys:
+                with engine.begin() as connection:
+                    set_tenant_context(connection, tenant_id)
+                    before = connection.execute(
+                        text("SELECT booking_confirm_date FROM auditcore.journey_stage_states "
+                             "WHERE tenant_id=:t AND journey_id=:j AND stage_code='BOOKING'"),
+                        {"t": tenant_id, "j": journey_id},
+                    ).scalar_one_or_none()
+                    evaluate_minimum_booking_payment(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                                     correlation_id="refresh-journey-dates")
+                    after = connection.execute(
+                        text("SELECT booking_confirm_date FROM auditcore.journey_stage_states "
+                             "WHERE tenant_id=:t AND journey_id=:j AND stage_code='BOOKING'"),
+                        {"t": tenant_id, "j": journey_id},
+                    ).scalar_one_or_none()
+                    if before != after:
+                        changed += 1
+                        receipts = connection.execute(
+                            text(
+                                """
+                                SELECT p.receipt_date::text AS d, p.amount::text AS a, p.receipt_number AS n,
+                                       COALESCE(e.association_status, 'NO_DOCUMENT') AS s
+                                FROM auditcore.payments p
+                                LEFT JOIN auditcore.evidence e
+                                  ON e.tenant_id=p.tenant_id AND e.journey_id=p.journey_id
+                                 AND e.di_document_id=p.source_di_document_id
+                                WHERE p.tenant_id=:t AND p.journey_id=:j ORDER BY p.receipt_date
+                                """
+                            ),
+                            {"t": tenant_id, "j": journey_id},
+                        ).mappings().all()
+                        logger.info(
+                            "booking_date_refreshed", tenant_id=tenant_id, journey_id=str(journey_id),
+                            before=str(before), after=str(after), minimum=str(minimum),
+                            receipts=" | ".join(f"{r['d']} {r['a']} {r['n']} {r['s']}" for r in receipts),
+                        )
+            if floor is not None:
+                with engine.begin() as connection:
+                    set_tenant_context(connection, tenant_id)
+                    cleared = connection.execute(
+                        text(
+                            """
+                            UPDATE auditcore.deliveries
+                            SET actual_delivered_at=NULL, updated_at_utc=now(), version_no=version_no+1
+                            WHERE tenant_id=:t AND status_source='EVIDENCE'
+                              AND actual_delivered_at < CAST(:floor AS date)
+                            RETURNING journey_id, actual_delivered_at
+                            """
+                        ),
+                        {"t": tenant_id, "floor": floor},
+                    ).all()
+                for journey_id, _ in cleared:
+                    logger.info("delivery_date_before_floor_cleared", tenant_id=tenant_id, journey_id=str(journey_id))
+            logger.info("journey_dates_refreshed", tenant_id=tenant_id, journeys=len(journeys),
+                        booking_dates_changed=changed)
+        except Exception:
+            logger.warning("journey_dates_refresh_failed", tenant_id=tenant_id, exc_info=True)
+
+
 def main() -> None:
     _configure_worker_observability()
     engine = get_engine()
+    threading.Thread(target=refresh_journey_dates, args=(engine,), name="journey-dates", daemon=True).start()
     diag_reports = [r.strip() for r in os.environ.get("AUDIT_CORE_DIAG_REPORTS", "").split(",") if r.strip()]
     if diag_reports:
         from audit_core.uc03_p2_diagnostics import run_diagnostics
