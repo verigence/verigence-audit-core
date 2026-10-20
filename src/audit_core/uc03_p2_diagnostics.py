@@ -378,12 +378,21 @@ REPORTS: dict[str, str] = {
                da.actual_discount_amount::text, da.eligibility_result
         FROM js JOIN auditcore.discount_applications da ON da.tenant_id = :t AND da.journey_id = js.journey_id
         UNION ALL
-        SELECT 'READ', f.journey_id, f.source_document_type_key || '.' || f.field_key,
+        SELECT 'z_READ', f.journey_id, f.source_document_type_key || '.' || f.field_key,
                left(f.effective_value #>> '{}', 900), f.stage_code, NULL
         FROM js JOIN auditcore.journey_document_extracted_fields f ON f.tenant_id = :t AND f.journey_id = js.journey_id
         WHERE f.effective_value IS NOT NULL
-          AND (f.field_key ~ '(amount|price|total|discount|tax|gst|cess|line_items|bonus|tcs|premium|charges)'
+          AND f.source_document_type_key IN ('customer_invoice_dms', 'tax_invoice_tally', 'booking_form',
+                                             'booking_docket', 'cost_sheet', 'credit_note')
+          AND (f.field_key ~ '(amount|price|total|discount|tax|gst|cess|line_items|bonus|tcs|charges)'
                OR f.field_key IN ('model_name_raw', 'variant_raw', 'vehicle_description_raw', 'vehicle_model'))
+        UNION ALL
+        SELECT 'EVENT', e.journey_id, e.event_type, left(e.details::text, 600),
+               to_char(e.created_at_utc, 'YYYY-MM-DD HH24:MI'), NULL
+        FROM js JOIN auditcore.p2_activity_events e ON e.tenant_id = :t AND e.journey_id = js.journey_id
+        WHERE e.event_type ~ '(SKU|MODEL|PRICE)'
+        -- The document reads sort last ("z_READ"), so the row cap never cuts
+        -- the SKU, price list and lines.
         ORDER BY 2, 1, 3
     """,
 }
