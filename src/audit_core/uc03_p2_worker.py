@@ -2610,7 +2610,9 @@ def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
     transition seen on the way."""
     # The booking date follows the receipts still on file: a receipt deleted,
     # re-read or replaced since the last pass no longer sets it (2026-10-20).
-    from audit_core.uc03_booking_confirmation_rules import evaluate_minimum_booking_payment
+    from audit_core.uc03_booking_confirmation_rules import (
+        evaluate_minimum_booking_payment,
+    )
 
     try:
         with connection.begin_nested():
