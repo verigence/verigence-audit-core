@@ -18,7 +18,7 @@ from sqlalchemy import Engine, text
 from audit_core.db import set_platform_super_admin_context, set_tenant_context
 
 logger = structlog.get_logger(__name__)
-_MAX_ROWS = 600
+_MAX_ROWS = int(os.environ.get("AUDIT_CORE_DIAG_MAX_ROWS", "600"))
 
 REPORTS: dict[str, str] = {
     # Every Journey's vehicle: what was read, the SKU pinned, how and when.
@@ -351,7 +351,7 @@ REPORTS: dict[str, str] = {
             FROM auditcore.journeys j
             JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
             LEFT JOIN auditcore.journey_products jp ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
-            WHERE j.tenant_id = :t AND c.display_name ILIKE :c
+            WHERE j.tenant_id = :t AND (c.display_name ILIKE :c OR j.journey_id::text ILIKE :c)
         )
         SELECT 'SKU' AS kind, js.journey_id, s.sku_code AS a, jp.selection_method AS b,
                plv.version_no::text || ' from ' || plv.effective_from::text AS c, jp.vehicle_category AS d
