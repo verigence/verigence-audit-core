@@ -207,3 +207,26 @@ def test_resync_leaves_phase2_pages_to_the_worker(journey):
                                  document_ids=[page["di_document_id"], phase1_document])
         assert _phase2_page_ids(connection, tenant_id=journey.tenant_id, document_ids=[]) == set()
     assert found == {str(page["di_document_id"])}
+
+
+def test_each_retry_of_a_page_di_never_received_gets_a_new_upload_id(journey):
+    """DEV 2026-10-21 (RJ Hot max p11): from the second retry on, the id was
+    worked out from a count of rows that stayed at 1, so "~r2" was sent again
+    and DI refused it as a conflict on every later retry."""
+    _, [page] = add_batch_pages(journey, [("pan_card", "DEAD_LETTER")], grouping_status="NOT_NEEDED")
+    seen = []
+    for _ in range(3):
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            connection.execute(
+                text("UPDATE auditcore.p2_document_queue SET di_document_id=NULL, queue_status='FAILED' "
+                     "WHERE queue_id=:q"),
+                {"q": page["queue_id"]},
+            )
+        with journey.engine.begin() as connection:
+            retry_page(tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=page["queue_id"],
+                       request=_request(), human_principal=principal(journey),
+                       authorization_client=AllowAllAuthorization(), connection=connection)
+        seen.append(_unit(journey, page["queue_id"])["client_upload_id"])
+    assert [value.rsplit("~", 1)[1] for value in seen] == ["r1", "r2", "r3"]
+    assert len({value.split("~", 1)[0] for value in seen}) == 1
