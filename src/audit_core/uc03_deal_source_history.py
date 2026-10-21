@@ -147,7 +147,8 @@ def active_source_rows(connection: Connection, *, tenant_id: str, journey_id: UU
                 WHERE s.tenant_id = :tenant_id AND s.journey_id = :journey_id
                   AND {ACTIVE_SOURCE_CONDITION}
                 ORDER BY s.line_kind, s.component_key, {NORMALISED_TYPE_SQL}, s.source_document_id,
-                         s.updated_at_utc DESC
+                         s.updated_at_utc DESC,
+                         (s.source_document_type = {NORMALISED_TYPE_SQL}) DESC
             ) newest
             ORDER BY line_kind, component_key, source_document_type, source_document_id NULLS FIRST
             """
@@ -180,7 +181,8 @@ def load_source_breakdown(
                 WHERE s.tenant_id = :tenant_id AND s.journey_id = :journey_id
                   AND {ACTIVE_SOURCE_CONDITION}
                 ORDER BY s.line_kind, s.component_key, {NORMALISED_TYPE_SQL}, s.source_document_id,
-                         s.updated_at_utc DESC
+                         s.updated_at_utc DESC,
+                         (s.source_document_type = {NORMALISED_TYPE_SQL}) DESC
             ) newest
             ORDER BY "lineKind", "componentKey", "sourceDocumentType", "sourceDocumentId" NULLS FIRST
             """
