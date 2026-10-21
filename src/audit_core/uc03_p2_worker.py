@@ -3392,6 +3392,14 @@ def main() -> None:
 
         threading.Thread(target=run_master_reload, args=(engine, reload_tag), name="master-reload",
                          daemon=True).start()
+    # One-off re-send of pages that failed on our side (2026-10-21): dry run
+    # unless the tag ends with "-commit"; only FAILED pages are picked.
+    resend_tag = os.environ.get("AUDIT_CORE_PAGE_RESEND_TAG", "").strip()
+    if resend_tag:
+        from audit_core.uc03_p2_page_resend import run_page_resend
+
+        threading.Thread(target=run_page_resend, args=(engine, resend_tag, _active_tenants(engine)),
+                         name="page-resend", daemon=True).start()
     sku_run_tag = os.environ.get("AUDIT_CORE_SKU_RUN_TAG", "").strip()
     if sku_run_tag:
         threading.Thread(target=_sku_run_once, args=(engine, sku_run_tag), name="sku-run", daemon=True).start()
