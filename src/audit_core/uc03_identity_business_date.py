@@ -436,6 +436,11 @@ def _identity_aware_write_typed_capture(
             journey_id=journey_id,
             business_date=business_date,
         )
+        # The pricing date may have moved: raise, refresh or close "No price
+        # master in force on <date>" now, SKU or not (2026-10-20).
+        from audit_core.uc03_sku_candidates import sync_price_master_in_force_task
+
+        sync_price_master_in_force_task(connection, tenant_id=tenant_id, journey_id=journey_id)
     return result
 
 

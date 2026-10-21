@@ -352,9 +352,15 @@ def test_dealer_ev_workbook_reads_every_model_sheet_and_the_file_name_date() -> 
 
 def test_dealer_sheet_and_file_name_dates_disagree_is_a_warning() -> None:
     content = _dealer_pv_workbook([_pv_row("1.6XXL HD V2", 859_501, 3_632, 3_632)])
+    # Review of PR 468 (S1): a dealer sheet re-issued with additions keeps
+    # the month's header date; the later date in its name is the file's own.
     result = parse_price_list(content, filename="02_Nos_Added_PRICE_-07th__Sept26.xlsx")
-    assert result.effective_from_hint == date(2026, 9, 3)
-    assert any("file name says 2026-09-07" in w for w in result.warnings)
+    assert result.effective_from_hint == date(2026, 9, 7) and result.meta["effectiveFromSource"] == "FILENAME"
+    assert any("file name says 2026-09-07; the later date" in w for w in result.warnings)
+    # An earlier date in the name does not move the sheet's own date.
+    result = parse_price_list(content, filename="PRICE_-01st_Sept26.xlsx")
+    assert result.effective_from_hint == date(2026, 9, 3) and result.meta["effectiveFromSource"] == "SHEET"
+    assert any("file name says 2026-09-01" in w for w in result.warnings)
 
 
 def test_dealer_sheet_preview_shows_absent_components_as_blank() -> None:

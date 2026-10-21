@@ -382,15 +382,20 @@ def _set_model_segments(connection: Connection, *, rows: list[PriceRow], model_i
 
 
 def _bulk_ensure_model_identities(
-    connection: Connection, *, oem_id: UUID, rows: list[PriceRow]
+    connection: Connection, *, oem_id: UUID, rows: list[PriceRow], conflicts: list[str] | None = None,
 ) -> dict[str, tuple[UUID, str]]:
     """identity key -> (model_id, model_code) for every row's model.
 
     A model the OEM already carries under any spelling of the same identity
-    is reused, with its first name and code (2026-10-20 product owner rules:
-    one vehicle, one SKU code across months). Where several existing models
-    share an identity (two spellings loaded before this rule), the oldest
-    wins. One SELECT and at most one batched INSERT."""
+    is reused, with its name and code (2026-10-20 product owner rules: one
+    vehicle, one SKU code across months). Where several existing models
+    share an identity, the one that owns this OEM's native price-list SKUs
+    wins (the most of them), then the one named as the identity's canonical
+    model, then the oldest: a model some other import created under a
+    similar name (a project master's "Scorpio") never captures the vehicle
+    and orphans the SKUs Journeys are pinned to. Two candidates that both
+    own price-list SKUs are reported in ``conflicts``. One SELECT and at
+    most one batched INSERT."""
     wanted: dict[str, str] = {}
     for row in rows:
         key = price_list_model_key(row.model_name, row.variant_name)
@@ -398,16 +403,41 @@ def _bulk_ensure_model_identities(
 
     existing = connection.execute(
         text(
-            "SELECT model_id, model_code, model_name FROM auditcore.product_models "
-            "WHERE oem_id = :oem_id ORDER BY created_at_utc, model_code"
+            """
+            SELECT pm.model_id, pm.model_code, pm.model_name,
+                   (SELECT count(*) FROM auditcore.product_skus s
+                     WHERE s.model_id = pm.model_id
+                       AND s.attributes ->> 'source' = 'OEM_NATIVE_PRICE_LIST') AS native_skus
+            FROM auditcore.product_models pm
+            WHERE pm.oem_id = :oem_id
+            ORDER BY pm.created_at_utc, pm.model_code
+            """
         ),
         {"oem_id": oem_id},
     ).all()
-    by_key: dict[str, tuple[UUID, str]] = {}
+    candidates: dict[str, list[tuple[int, int, int, UUID, str]]] = {}
     codes: set[str] = set()
-    for model_id, model_code, model_name in existing:
+    for order, (model_id, model_code, model_name, native_skus) in enumerate(existing):
         codes.add(model_code)
-        by_key.setdefault(price_list_model_key(model_name), (model_id, model_code))
+        key = price_list_model_key(model_name)
+        # Named as the vehicle itself, not only through an alias ("Scorpio"
+        # is SCORPIO CLASSIC only by alias).
+        canonical = _squash(model_name) in (key, _squash(_MODEL_DISPLAY_BY_IDENTITY.get(key, "")))
+        if not native_skus and not canonical:
+            # Owns no price-list SKU and is not named as the vehicle: some
+            # other import's model, never the vehicle's identity.
+            continue
+        candidates.setdefault(key, []).append((-int(native_skus), 0 if canonical else 1, order, model_id, model_code))
+    by_key: dict[str, tuple[UUID, str]] = {}
+    for key, found in candidates.items():
+        found.sort()
+        by_key[key] = (found[0][3], found[0][4])
+        owners = [f for f in found if f[0] < 0]
+        if key in wanted and len(owners) > 1 and conflicts is not None:
+            conflicts.append(
+                f"{len(owners)} models own price-list SKUs for one vehicle ({', '.join(f[4] for f in owners)}); "
+                f"{found[0][4]} was used"
+            )
 
     to_insert: list[dict[str, Any]] = []
     for key, name in wanted.items():
@@ -442,23 +472,29 @@ def _sku_name_part(sku_code: str) -> tuple[str, str]:
 
 def _identity_variant_names(
     connection: Connection, *, oem_id: UUID, rows: list[PriceRow], model_ids: list[UUID],
-) -> list[str]:
-    """For each row, the variant name its SKU is keyed on: the name of the
-    SKU the model already has for the same vehicle, else the row's own.
+) -> list[tuple[str, str | None]]:
+    """For each row, the variant name its SKU is keyed on and the code of the
+    SKU the model already has for that vehicle (None for a new vehicle).
 
     Same vehicle: the same name (spacing and case aside), or the same name
     once a release marker ("- New", "- Refresh", "- N") is taken off, when
     exactly one existing SKU of the model and registration basis matches,
     that SKU's own name is not in this file, and no other row of the file
-    shares the stripped name. Price never decides."""
+    shares the stripped name. Price never decides. The existing code is
+    reused as it stands, so a SKU moved onto another model (the Bolero
+    split, migration 0151) keeps the code Journeys are pinned to; where a
+    model holds two SKUs for one name, the older one wins."""
     existing = connection.execute(
-        text("SELECT sku_code, model_id FROM auditcore.product_skus WHERE oem_id = :o AND model_id = ANY(:m)"),
+        text(
+            "SELECT sku_code, model_id FROM auditcore.product_skus WHERE oem_id = :o AND model_id = ANY(:m) "
+            "ORDER BY created_at_utc, sku_code"
+        ),
         {"o": oem_id, "m": list(set(model_ids))},
     ).all()
-    names_by_group: dict[tuple[UUID, str], list[str]] = {}
+    names_by_group: dict[tuple[UUID, str], list[tuple[str, str]]] = {}
     for sku_code, model_id in existing:
         name, suffix = _sku_name_part(sku_code)
-        names_by_group.setdefault((model_id, suffix), []).append(name)
+        names_by_group.setdefault((model_id, suffix), []).append((name, sku_code))
 
     def norm(value: str) -> str:
         return re.sub(r"\s+", " ", value.strip().upper())
@@ -475,23 +511,20 @@ def _identity_variant_names(
         core = variant_core(row.variant_name)
         cores[core] = cores.get(core, 0) + 1
 
-    out: list[str] = []
+    out: list[tuple[str, str | None]] = []
     for row, model_id in zip(rows, model_ids):
         group = (model_id, suffix_of(row))
         known = names_by_group.get(group, [])
-        exact = [n for n in known if n == row.variant_name] or [n for n in known if norm(n) == norm(row.variant_name)]
+        exact = [k for k in known if k[0] == row.variant_name] or [k for k in known if norm(k[0]) == norm(row.variant_name)]
         if exact:
             out.append(exact[0])
             continue
         core = variant_core(row.variant_name)
-        same = [
-            n for n in known
-            if variant_core(n) == core and norm(n) not in in_file[group]
-        ]
-        if len(same) == 1 and cores_in_file[group][core] == 1:
+        same = [k for k in known if variant_core(k[0]) == core and norm(k[0]) not in in_file[group]]
+        if len({k[0] for k in same}) == 1 and cores_in_file[group][core] == 1:
             out.append(same[0])
         else:
-            out.append(row.variant_name)
+            out.append((row.variant_name, None))
     return out
 
 
@@ -510,6 +543,13 @@ def _merge_attributes(current: dict[str, Any], incoming: dict[str, Any]) -> dict
             continue
         merged[key] = value
     return merged
+
+
+def _name_fits_code(display_name: str, variant_code: str) -> bool:
+    """Whether a variant's display name is the one its code was made from."""
+    base = re.sub(r"\s*\((?:Private|Commercial)\)\s*$", "", display_name or "")
+    code = re.sub(r"__(?:PRI|COM)$", "", variant_code or "")
+    return _variant_slug(base)[:110] == code or _slug_model(base)[:110] == code and "+" not in base
 
 
 def _bulk_ensure_variants(
@@ -533,13 +573,14 @@ def _bulk_ensure_variants(
 
     existing = connection.execute(
         text(
-            "SELECT model_id, variant_code, variant_id, attributes FROM auditcore.product_variants "
+            "SELECT model_id, variant_code, variant_id, attributes, variant_name FROM auditcore.product_variants "
             "WHERE model_id = ANY(:model_ids)"
         ),
         {"model_ids": model_ids},
     ).all()
     id_by_key: dict[tuple[UUID, str], UUID] = {(row[0], row[1]): row[2] for row in existing}
     attrs_by_key: dict[tuple[UUID, str], dict[str, Any]] = {(row[0], row[1]): dict(row[3] or {}) for row in existing}
+    name_by_key: dict[tuple[UUID, str], str] = {(row[0], row[1]): row[4] for row in existing}
 
     to_insert: dict[tuple[UUID, str], dict[str, Any]] = {}
     to_update: dict[tuple[UUID, str], dict[str, Any]] = {}
@@ -576,18 +617,24 @@ def _bulk_ensure_variants(
 
     for key, row in to_update.items():
         merged = _merge_attributes(attrs_by_key.get(key, {}), row["attributes"])
+        # A name that no longer fits its code is the old "+"-stripping at
+        # work (2026-10-20): the THREE variant row was named "THREE+ ..."
+        # because a THREE+ row reached it first. It takes this row's name.
+        current = name_by_key.get(key) or ""
+        name = current if _name_fits_code(current, key[1]) else row["variant_name"]
         connection.execute(
             text(
                 """
                 UPDATE auditcore.product_variants
-                SET fuel_powertrain = COALESCE(:fuel_powertrain, fuel_powertrain),
+                SET variant_name = :name,
+                    fuel_powertrain = COALESCE(:fuel_powertrain, fuel_powertrain),
                     transmission = COALESCE(:transmission, transmission),
                     body_type = COALESCE(:body_type, body_type),
                     attributes = CAST(:attributes AS jsonb)
                 WHERE variant_id = :variant_id
                 """
             ),
-            {**row, "attributes": json.dumps(merged), "variant_id": id_by_key[key]},
+            {**row, "attributes": json.dumps(merged), "variant_id": id_by_key[key], "name": name},
         )
 
     return id_by_key
@@ -771,13 +818,15 @@ def ingest_price_list(
     rows = parsed.price_rows
 
     # 1) models — one identity per vehicle, whatever this month's spelling.
-    model_by_key = _bulk_ensure_model_identities(connection, oem_id=oem_id, rows=rows)
+    conflicts: list[str] = []
+    model_by_key = _bulk_ensure_model_identities(connection, oem_id=oem_id, rows=rows, conflicts=conflicts)
     row_models = [model_by_key[price_list_model_key(row.model_name, row.variant_name)] for row in rows]
     model_ids = [model_id for model_id, _ in row_models]
     _set_model_segments(connection, rows=rows, model_ids=model_ids)
 
     # 2) variants — keyed on the name the model already has for the vehicle.
-    names = _identity_variant_names(connection, oem_id=oem_id, rows=rows, model_ids=model_ids)
+    identities = _identity_variant_names(connection, oem_id=oem_id, rows=rows, model_ids=model_ids)
+    names = [name for name, _ in identities]
 
     def _basis_suffix(row: PriceRow, sep: str) -> str:
         return "" if row.registration_basis == "STANDARD" else f"{sep}{row.registration_basis[:3]}"
@@ -816,8 +865,8 @@ def ingest_price_list(
 
     # 3) SKUs — the stable model code plus the vehicle's variant name.
     sku_codes = [
-        f"{model_code}::{name}{_basis_suffix(row, '::')}"[:160]
-        for row, (_, model_code), name in zip(rows, row_models, names)
+        existing_code or f"{model_code}::{name}{_basis_suffix(row, '::')}"[:160]
+        for row, (_, model_code), (name, existing_code) in zip(rows, row_models, identities)
     ]
     sku_entries = [
         (
@@ -909,6 +958,8 @@ def ingest_price_list(
             "completeBook": complete,
             "standingVersionId": str(standing_version) if standing_version else None,
         })
+        if conflicts:
+            stats["modelIdentityConflicts"] = conflicts
 
     publish_price_list_version(
         connection, tenant_id=tenant_id, price_list_version_id=version_id, actor_id=actor_id
@@ -918,6 +969,13 @@ def ingest_price_list(
     )
     if stats is not None:
         stats["laterVersionsRederived"] = len(rederived)
+    # Journeys waiting on a book for their date, or on their SKU being in
+    # one, are re-checked now rather than on their next event (2026-10-20).
+    from audit_core.uc03_sku_candidates import sweep_price_master_tasks
+
+    swept = sweep_price_master_tasks(connection, tenant_id=tenant_id)
+    if stats is not None:
+        stats["journeysRechecked"] = swept
     return version_id, sku_id_by_code
 
 
@@ -1019,6 +1077,20 @@ def _carry_into_later_versions(
 _SUCCESSOR_IDENTITY: dict[str, str] = {"SCORPION": "NEWSCORPION"}
 
 
+def model_identity_keys(model_text: str | None, variant_text: str | None = None) -> list[str]:
+    """THE model-identity rule for a document's wording (for the SKU
+    resolver): the identities a model text can name, in the order to try
+    them against the book in force on the pricing date. A book row matches
+    when ``price_list_model_key(row.model_name)`` is in this list. The first
+    key is the model the words name under any month's spelling (squashed,
+    aliased, the Bolero family split by the variant's series letter); a
+    second one is the successor that the same words mean once the old
+    model has left the book (SCORPIO N -> the new Scorpio N). Filter the
+    book in force by the first key that has rows; never by price."""
+    key = price_list_model_key(model_text, variant_text)
+    return [key] + ([_SUCCESSOR_IDENTITY[key]] if key in _SUCCESSOR_IDENTITY else [])
+
+
 def find_book_sku(
     connection: Connection,
     *,
@@ -1067,8 +1139,7 @@ def find_book_sku(
     def norm(value: str | None) -> str:
         return re.sub(r"\s+", " ", (value or "").strip().upper())
 
-    key = price_list_model_key(model_text, variant_text)
-    keys = [key] + ([_SUCCESSOR_IDENTITY[key]] if key in _SUCCESSOR_IDENTITY else [])
+    keys = model_identity_keys(model_text, variant_text)
     pool = [dict(r) for r in rows if price_list_model_key(r["model_name"]) in keys]
     if suffix:
         pool = [r for r in pool if _sku_name_part(r["sku_code"])[1] in ("", suffix)]
@@ -1881,7 +1952,9 @@ async def upload_oem_master(
             "row_counts": json.dumps(preview["rowCounts"]),
             "preview": json.dumps({"sample": preview["sample"], "warnings": preview["warnings"], "dryRun": dry_run}),
             "actor": actor_id,
-            "error": f"{len(parsed.errors)} unreconciled row(s): " + "; ".join(parsed.errors[:50]),
+            # A preview is marked as such: it is not a refused publish.
+            "error": ("PREVIEW: " if dry_run else "")
+            + f"{len(parsed.errors)} unreconciled row(s): " + "; ".join(parsed.errors[:50]),
         }
         if dry_run:
             # A preview commits with the request; its response is unchanged.
@@ -2126,6 +2199,7 @@ __all__ = [
     "ingest_corporate_policy",
     "ingest_discount_document",
     "ingest_price_list",
+    "model_identity_keys",
     "price_list_model_key",
     "router",
     "variant_core",

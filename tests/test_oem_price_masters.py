@@ -450,7 +450,8 @@ def test_a_complete_book_withdraws_what_it_does_not_list_and_dates_each_price(co
         actor_id="admin", stats=stats,
     )
     assert stats == {"uploaded": 1, "changed": 1, "unchanged": 0, "carriedForward": 0, "withdrawn": 1,
-                     "completeBook": True, "standingVersionId": str(v1), "laterVersionsRederived": 0}
+                     "completeBook": True, "standingVersionId": str(v1), "laterVersionsRederived": 0,
+                     "journeysRechecked": 0}
     thar, xuv = _code_of(first_skus, "MX1 PMT 2WD"), _code_of(first_skus, "MX1")
     first, second = _items(connection, tenant_id, v1), _items(connection, tenant_id, v2)
     assert len(first) == 20 and len(second) == 10  # the XUV is not in the second book
@@ -881,3 +882,257 @@ def test_the_book_in_force_ends_the_day_before_the_next_and_ignores_other_lists(
     assert on(date(2026, 10, 3))["price_list_version_id"] == octo
     assert on(date(2026, 10, 15))["price_list_version_id"] == octo  # not the later segment list
     assert on(date(2026, 10, 15))["in_force_to"] is None
+
+
+# ── review of PR 468: live data loaded by the old code ─────────────────────────
+def _migration_0151():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "migrations" / "versions" / "0151_bolero_split_model_aliases.py"
+    spec = importlib.util.spec_from_file_location("migration_0151", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
+
+def _legacy_bolero(c) -> dict[str, object]:
+    """The catalogue and September book as the dev code left them: one model
+    "THE BOSS- BOLERO+NEO" holding the Bolero, Neo and Neo Plus, a model-wide
+    consumer scheme for the Neo, a variant-level one for the N10, a corporate
+    one on the combined model, and a grid row for the Bolero."""
+    from audit_core.discount_schemes import (
+        create_discount_scheme,
+        create_discount_scheme_version,
+        publish_discount_scheme_version,
+    )
+    from audit_core.oem_price_masters import _insert_eligibility
+    from audit_core.price_lists import (
+        add_price_list_item,
+        create_price_list,
+        create_price_list_version,
+        publish_price_list_version,
+    )
+
+    model = c.execute(text("INSERT INTO auditcore.product_models (oem_id, model_code, model_name) "
+                           "VALUES (:o, 'THE_BOSS_BOLERO_NEO', 'THE BOSS- BOLERO+NEO') RETURNING model_id"),
+                      {"o": c.oem_id}).scalar_one()
+    price_list = create_price_list(c, tenant_id=c.tenant_id, code="OEM_NATIVE_PRICE_LIST", name="OEM")
+    version = create_price_list_version(c, tenant_id=c.tenant_id, price_list_id=price_list, version_no=1,
+                                        effective_from=date(2026, 9, 3))
+    skus, variants = {}, {}
+    for name, ex in (("B4 BS6.2 - Refresh", "848999.65"), ("N10 BS6.2 - R - Refresh", "1008999.65"),
+                     ("P4 BS6.2", "1138999.58")):
+        code = "_".join("".join(ch if ch.isalnum() else " " for ch in name.upper()).split()) + "__PRI"
+        variants[name] = c.execute(text(
+            "INSERT INTO auditcore.product_variants (model_id, variant_code, variant_name, attributes) "
+            "VALUES (:m, :c, :n, CAST('{\"category\": \"PV\"}' AS jsonb)) RETURNING variant_id"),
+            {"m": model, "c": code, "n": f"{name} (Private)"}).scalar_one()
+        skus[name] = c.execute(text(
+            "INSERT INTO auditcore.product_skus (oem_id, model_id, variant_id, sku_code, attributes) "
+            "VALUES (:o, :m, :v, :c, CAST('{\"source\": \"OEM_NATIVE_PRICE_LIST\"}' AS jsonb)) RETURNING product_sku_id"),
+            {"o": c.oem_id, "m": model, "v": variants[name], "c": f"THE_BOSS_BOLERO_NEO::{name}::PRI"}).scalar_one()
+        add_price_list_item(c, tenant_id=c.tenant_id, price_list_version_id=version, product_sku_id=skus[name],
+                            component_key="EX_SHOWROOM", standard_amount=Decimal(ex))
+    publish_price_list_version(c, tenant_id=c.tenant_id, price_list_version_id=version, actor_id="dev")
+    for scheme_name, variant in (("Mahindra Consumer — Bolero Neo", None),
+                                 ("Mahindra Consumer — THE BOSS- BOLERO+NEO", "N10 BS6.2 - R - Refresh"),
+                                 ("Mahindra Corporate Privilege Z — THE BOSS- BOLERO+NEO", None)):
+        scheme = create_discount_scheme(c, tenant_id=c.tenant_id, code=f"S{uuid4().hex[:8]}", name=scheme_name)
+        sv = create_discount_scheme_version(c, tenant_id=c.tenant_id, discount_scheme_id=scheme, version_no=1,
+                                            effective_from=date(2026, 9, 3))
+        _insert_eligibility(c, tenant_id=c.tenant_id, version_id=sv, model_id=model,
+                            variant_id=variants[variant] if variant else None, customer_type=None,
+                            criteria={"scope": "MODEL"} if variant is None else {"variantText": variant})
+        publish_discount_scheme_version(c, tenant_id=c.tenant_id, discount_scheme_version_id=sv, actor_id="dev")
+    grid = c.execute(text("INSERT INTO auditcore.dealer_discount_grid_versions (tenant_id, version_no, effective_from, "
+                          "parameters) VALUES (:t, 1, :e, CAST('[]' AS jsonb)) RETURNING grid_version_id"),
+                     {"t": c.tenant_id, "e": date(2026, 9, 1)}).scalar_one()
+    c.execute(text("INSERT INTO auditcore.dealer_discount_grid_rows (tenant_id, grid_version_id, model_alias, model_id, "
+                   "in_scope, booking_protection_days) VALUES (:t, :g, 'BOLERO', :m, true, 30)"),
+              {"t": c.tenant_id, "g": grid, "m": model})
+    return {"model": model, "skus": skus}
+
+
+def _model_of(c, sku_id) -> tuple:
+    return tuple(c.execute(text("SELECT s.sku_code, pm.model_name FROM auditcore.product_skus s JOIN auditcore.product_models pm "
+                                "ON pm.model_id = s.model_id WHERE s.product_sku_id = :s"), {"s": sku_id}).one())
+
+
+def test_the_bolero_split_keeps_every_live_sku_pinned_and_priced(fresh_oem) -> None:
+    """Review of PR 468, B1: re-loading the books after the split must not
+    orphan the September Bolero SKUs Journeys are pinned to. Migration 0151
+    moves them in place (same id, same code) with their scheme and grid rows;
+    the re-load then prices the same SKU ids in both months."""
+    c = fresh_oem
+    legacy = _legacy_bolero(c)
+    counts = _migration_0151().split_bolero_family(c)
+    assert counts["skus"] == 3 and counts["models"] == 3
+    assert {_model_of(c, s) for s in legacy["skus"].values()} == {
+        ("THE_BOSS_BOLERO_NEO::B4 BS6.2 - Refresh::PRI", "BOLERO"),
+        ("THE_BOSS_BOLERO_NEO::N10 BS6.2 - R - Refresh::PRI", "BOLERO NEO"),
+        ("THE_BOSS_BOLERO_NEO::P4 BS6.2::PRI", "BOLERO NEO PLUS"),
+    }
+    eligibility = sorted((r[0], r[1] is not None) for r in c.execute(text(
+        "SELECT pm.model_name, e.variant_id FROM auditcore.discount_scheme_eligibility e "
+        "JOIN auditcore.product_models pm ON pm.model_id = e.model_id WHERE pm.oem_id = :o"), {"o": c.oem_id}))
+    assert eligibility == [
+        ("BOLERO", False),           # the corporate row named the combined model: all three
+        ("BOLERO NEO", False),       # "Bolero Neo" model-wide
+        ("BOLERO NEO", False),       # corporate
+        ("BOLERO NEO", True),        # the N10 row follows its variant
+        ("BOLERO NEO PLUS", False),  # corporate
+    ]
+    grid = c.execute(text("SELECT pm.model_name FROM auditcore.dealer_discount_grid_rows g JOIN auditcore.product_models pm "
+                          "ON pm.model_id = g.model_id WHERE pm.oem_id = :o"), {"o": c.oem_id}).scalars().all()
+    assert grid == ["BOLERO"]
+    assert _migration_0151().split_bolero_family(c) == {
+        "models": 0, "variants": 0, "merged": 0, "skus": 0, "eligibility": 0, "grid": 0}  # idempotent
+
+    _load(c, date(2026, 9, 3), _book(
+        ("PV", "THE BOSS- BOLERO+NEO", "B4 BS6.2 - Refresh", 848_999.65, "NEW BOLERO NEO (PVT)"),
+        ("PV", "THE BOSS- BOLERO+NEO", "N10 BS6.2 - R - Refresh", 1_008_999.65, "NEW BOLERO NEO (PVT)"),
+        ("PV", "THE BOSS- BOLERO+NEO", "P4 BS6.2", 1_138_999.58, "NEW BOLERO NEO (PVT)"),
+    ))
+    _load(c, date(2026, 10, 3), _book(
+        ("PV", "Bolero", "B4 BS6.2 - Refresh", 856_998.57, "NEW BOLERO NEO (PVT)"),
+        ("PV", "Bolero neo", "N10 BS6.2 - R - Refresh", 999_898.93, "NEW BOLERO NEO (PVT)"),
+        ("PV", "Bolero Neo Plus", "P4 BS6.2", 1_145_998.99, "NEW BOLERO NEO (PVT)"),
+    ))
+    for on in (date(2026, 9, 15), date(2026, 10, 15)):
+        plan = find_effective_price_plan(c, tenant_id=c.tenant_id, effective_on=on)
+        priced = set(c.execute(text("SELECT DISTINCT product_sku_id FROM auditcore.price_list_items "
+                                    "WHERE price_list_version_id = :v"), {"v": plan["price_list_version_id"]}).scalars())
+        assert priced == set(legacy["skus"].values()), on
+
+
+def test_the_old_three_variant_named_three_plus_is_renamed_on_reload(fresh_oem) -> None:
+    """Review of PR 468, S2: the dev code filed the THREE B79 SKU (added on
+    07 Sep) under the variant row created for THREE+, still named "THREE+".
+    The re-load moves THREE+ to its own variant and gives the old row the
+    THREE name, so each name has its own variant."""
+    c = fresh_oem
+    model = c.execute(text("INSERT INTO auditcore.product_models (oem_id, model_code, model_name) "
+                           "VALUES (:o, 'BE6_SPORTEQ', 'BE6 SPORTEQ') RETURNING model_id"), {"o": c.oem_id}).scalar_one()
+    legacy = c.execute(text("INSERT INTO auditcore.product_variants (model_id, variant_code, variant_name) "
+                            "VALUES (:m, 'BE_6_SPORTEQ_THREE_B79_R19_NCH', 'BE 6 SPORTEQ THREE+ B79 R19 NCH') "
+                            "RETURNING variant_id"), {"m": model}).scalar_one()
+    ids = {}
+    for name in ("BE 6 SPORTEQ THREE+ B79 R19 NCH", "BE 6 SPORTEQ THREE B79 R19 NCH"):
+        ids[name] = c.execute(text("INSERT INTO auditcore.product_skus (oem_id, model_id, variant_id, sku_code, attributes) "
+                                   "VALUES (:o, :m, :v, :c, CAST('{\"source\": \"OEM_NATIVE_PRICE_LIST\"}' AS jsonb)) "
+                                   "RETURNING product_sku_id"),
+                              {"o": c.oem_id, "m": model, "v": legacy, "c": f"BE6_SPORTEQ::{name}"}).scalar_one()
+    _, skus, _ = _load(c, date(2026, 10, 3), _book(("BEV", "BE6 SPORTEQ", "BE 6 SPORTEQ THREE B79 R19 NCH", 2_394_999.50),
+                                                  ("BEV", "BE6 SPORTEQ", "BE 6 SPORTEQ THREE+ B79 R19 NCH", 2_494_999.50)))
+    assert set(skus.values()) == set(ids.values())
+    named = dict(c.execute(text("SELECT s.product_sku_id, v.variant_name FROM auditcore.product_skus s "
+                                "JOIN auditcore.product_variants v ON v.variant_id = s.variant_id WHERE s.model_id = :m"),
+                           {"m": model}).all())
+    assert named == {ids[n]: n for n in ids}
+
+
+def test_an_unrelated_older_model_never_captures_a_vehicle(fresh_oem) -> None:
+    """Review of PR 468, S3: a "Scorpio" created earlier by some other import
+    (owning no price-list SKU) shares SCORPIO CLASSIC's identity only through
+    an alias; an older "XUV 3XO" with no SKUs sits beside the "XUV3XO" that
+    owns them. Neither captures the vehicle."""
+    c = fresh_oem
+    for code, name in (("SCORPIO", "Scorpio"), ("XUV_3XO_DECOY", "XUV 3XO")):
+        c.execute(text("INSERT INTO auditcore.product_models (oem_id, model_code, model_name, created_at_utc) "
+                       "VALUES (:o, :c, :n, now() - interval '1 year')"), {"o": c.oem_id, "c": code, "n": name})
+    owner = c.execute(text("INSERT INTO auditcore.product_models (oem_id, model_code, model_name) "
+                           "VALUES (:o, 'XUV3XO', 'XUV3XO') RETURNING model_id"), {"o": c.oem_id}).scalar_one()
+    variant = c.execute(text("INSERT INTO auditcore.product_variants (model_id, variant_code, variant_name) "
+                             "VALUES (:m, 'AX5_PM_MT', 'AX5 PM MT') RETURNING variant_id"), {"m": owner}).scalar_one()
+    pinned = c.execute(text("INSERT INTO auditcore.product_skus (oem_id, model_id, variant_id, sku_code, attributes) "
+                            "VALUES (:o, :m, :v, 'XUV3XO::AX5 PM MT', CAST('{\"source\": \"OEM_NATIVE_PRICE_LIST\"}' AS jsonb)) "
+                            "RETURNING product_sku_id"), {"o": c.oem_id, "m": owner, "v": variant}).scalar_one()
+    _, sept, _ = _load(c, date(2026, 9, 3), _book(("PV", "SCORPIO CLASSIC", "Classic S BS6.2 - E", 1_336_700.64),
+                                                  ("PV", "XUV 3XO", "AX5 PM MT", 999_901.32)))
+    _, octo, stats = _load(c, date(2026, 10, 3), _book(("PV", "SCORPIO", "Classic S BS6.2 - E", 1_343_200.67)))
+    assert sept["XUV3XO::AX5 PM MT"] == pinned
+    assert octo == {"SCORPIO_CLASSIC::Classic S BS6.2 - E": sept["SCORPIO_CLASSIC::Classic S BS6.2 - E"]}
+    assert _model_of(c, octo["SCORPIO_CLASSIC::Classic S BS6.2 - E"])[1] == "SCORPIO CLASSIC"
+    assert "modelIdentityConflicts" not in stats
+
+
+def test_the_07_sep_added_ev_sheet_prices_its_additions_from_07_sep(fresh_oem) -> None:
+    """Review of PR 468, S1: the "02 Nos Added ... 07th Sept'26" sheet keeps
+    the month's "w.e.f. 01.09.2026" header. Dated by the header, its two
+    added variants were priced 01-02 Sep only (the complete 03 Sep book does
+    not list them). Dated by its name, they are priced from 07 Sep until
+    the October book."""
+    from openpyxl import load_workbook
+
+    c = fresh_oem
+    _load(c, date(2026, 9, 3), _book(("BEV", "BE6 SPORTEQ", "BE 6 SPORTEQ THREE+ B79 R19 NCH", 2_494_999.50)))
+    wb = load_workbook(BytesIO(_dealer_ev_bytes({"BE6 SPORTEQ": [("BE 6 SPORTEQ THREE+ B79 R19 NCH", 2_494_999),
+                                                              ("BE 6 SPORTEQ THREE B79 R19 NCH", 2_394_999)]})))
+    wb["BE6 SPORTEQ"]["B1"] = "EV PRICE LIST w.e.f. 01.09.2026"
+    buf = BytesIO()
+    wb.save(buf)
+    name = "02 Nos Added EV PRICE -07th  Sept'26.xlsx"
+    parsed = parse_price_list(buf.getvalue(), filename=name)
+    assert parsed.effective_from_hint == date(2026, 9, 7) and parsed.meta["effectiveFromSource"] == "FILENAME"
+    assert "the later date, 2026-09-07, is applied" in parsed.warnings[0]
+    _, added, _ = _load(c, parsed.effective_from_hint, buf.getvalue(), filename=name)
+    three = added["BE6_SPORTEQ::BE 6 SPORTEQ THREE B79 R19 NCH"]
+    _load(c, date(2026, 10, 3), _book(("BEV", "BE6 SPORTEQ", "BE 6 SPORTEQ THREE+ B79 R19 NCH", 2_494_999.50)))
+
+    def priced(on):
+        plan = find_effective_price_plan(c, tenant_id=c.tenant_id, effective_on=on)
+        return three in set(c.execute(text("SELECT product_sku_id FROM auditcore.price_list_items WHERE "
+                                           "price_list_version_id = :v"), {"v": plan["price_list_version_id"]}).scalars())
+
+    assert [priced(d) for d in (date(2026, 9, 6), date(2026, 9, 7), date(2026, 10, 2), date(2026, 10, 3))] == \
+        [False, True, True, False]
+
+
+def test_a_refused_upload_is_recorded_and_a_preview_is_labelled(connection) -> None:
+    """Review of PR 468, S8: a preview with errors is kept as FAILED with
+    "PREVIEW:" in front of its detail; a refused publish is kept as FAILED
+    (written in its own transaction, so it survives the request's rollback)."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from starlette.datastructures import UploadFile
+
+    from audit_core.errors import ValidationError as AuditValidationError
+    from audit_core.oem_price_masters import upload_oem_master
+
+    tenant_id = connection.tenant_id
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Price List"
+    ws.append(_HEADER)
+    ws.append([1, "PV", "THAR ROXX", "AX7 DMT 2WD", "AX7", "DIESEL", "MT", "2WD", "5", 1_000_000, 100, 200,
+               "see note", 0, 0, 0, 0, 5000, 1_005_300, 5000, 1_005_300, "S"])
+    buf = BytesIO()
+    wb.save(buf)
+    name = f"bad-{uuid4().hex[:6]}.xlsx"
+
+    def call(dry_run: bool):
+        return asyncio.run(upload_oem_master(
+            admin_request=SimpleNamespace(user_id="admin"), connection=connection, tenant_id=tenant_id,
+            master_kind="PRICE_LIST", file=UploadFile(file=BytesIO(buf.getvalue()), filename=name),
+            effective_from=date(2026, 10, 3), dry_run=dry_run,
+        ))
+
+    preview = call(True)
+    assert preview.status == "PREVIEW" and preview.errors
+    status, detail = connection.execute(text("SELECT status, error_detail FROM auditcore.oem_master_uploads "
+                                             "WHERE tenant_id = :t AND source_filename = :n"),
+                                        {"t": tenant_id, "n": name}).one()
+    assert status == "FAILED" and detail.startswith("PREVIEW: 1 unreconciled row(s): row 2: non-numeric")
+
+    with pytest.raises(AuditValidationError):
+        call(False)
+    engine = create_engine(os.environ["DATABASE_URL"])
+    with engine.begin() as other:  # another transaction sees the refused publish
+        other.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        rows = other.execute(text("SELECT error_detail FROM auditcore.oem_master_uploads WHERE tenant_id = :t "
+                                  "AND source_filename = :n AND error_detail NOT LIKE 'PREVIEW:%'"),
+                             {"t": tenant_id, "n": name}).scalars().all()
+    engine.dispose()
+    assert len(rows) == 1 and rows[0].startswith("1 unreconciled row(s)")
