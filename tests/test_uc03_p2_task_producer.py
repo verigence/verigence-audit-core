@@ -285,3 +285,23 @@ def test_a_booking_form_filed_under_its_old_key_still_gets_its_dates_checked(jou
     assert task["severity"] == "HIGH" and task["assigned_role_code"] == "PC"
     (field,) = task["reference"]["fields"]
     assert field["fieldKey"] == "booking_date" and "DATE_BEFORE_FLOOR" in field["reasons"]
+
+
+def test_a_booking_date_after_today_is_a_high_verification(journey):
+    """DEV 2026-10-21 (UTK-SU-261020-008): a booking form read with a booking
+    date after today is a misread, so it goes to the PC as a High date check."""
+    from datetime import timedelta
+
+    from audit_core.uc03_p2_dates import programme_today
+
+    ahead = (programme_today() + timedelta(days=30)).isoformat()
+    form = add_ready_document(journey, "booking_form", confidence=99.0, booking_date=ahead)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {"RAISED": 1}
+    task = _task(journey, f"field-review:{form}")
+    assert task["severity"] == "HIGH" and task["assigned_role_code"] == "PC"
+    assert "which is after today" in task["description"]
+    (field,) = task["reference"]["fields"]
+    assert field["fieldKey"] == "booking_date" and field["reasons"] == ["DATE_IN_FUTURE"]

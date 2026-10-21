@@ -268,6 +268,32 @@ def _as_date(value: Any, field_key: str) -> date:
         ) from exc
 
 
+def _refuse_future_booking_date(connection: Connection, *, tenant_id: str, journey_id: UUID, day: date) -> None:
+    """The bookings table refuses a booking date after the project's local
+    today (trigger validate_actual_booking_date). Checking first turns that
+    into a validation error the caller can handle -- a misread date on a
+    booking form is skipped and sent to the PC -- instead of a database
+    error that aborts the whole transaction."""
+    today = connection.execute(
+        text(
+            """
+            SELECT (now() AT TIME ZONE p.timezone_name)::date
+            FROM auditcore.journeys j
+            JOIN auditcore.projects p ON p.tenant_id = j.tenant_id
+            WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalar()
+    if today is not None and day > today:
+        raise AuditCoreError(
+            error_code="VAC-VAL-002",
+            status_code=422,
+            title="Business validation failed",
+            detail=f"BOOKING_DATE {day.isoformat()} is after today ({today.isoformat()}).",
+        )
+
+
 def _as_decimal(value: Any, field_key: str) -> Decimal:
     try:
         return Decimal(str(value))
@@ -363,6 +389,8 @@ def _write_typed_capture(
             "LEAD_SOURCE": "lead_source_code",
         }[key]
         normalized: Any = _as_date(value, key) if key == "BOOKING_DATE" else _as_text(value, key)
+        if key == "BOOKING_DATE":
+            _refuse_future_booking_date(connection, tenant_id=tenant_id, journey_id=journey_id, day=normalized)
         connection.execute(
             text(
                 f"""
