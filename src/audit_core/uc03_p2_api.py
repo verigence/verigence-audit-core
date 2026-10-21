@@ -2087,6 +2087,118 @@ def retry_page(
     return {"queueId": str(queue_id), "status": "QUEUED"}
 
 
+_REMOVABLE_PAGE_STATES = ("FAILED", "DEAD_LETTER")
+
+
+class RemovePageCommand(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
+
+
+@router.post("/journeys/{journey_id}/pages/{queue_id}:remove")
+def remove_page(
+    tenant_id: str,
+    journey_id: UUID,
+    queue_id: UUID,
+    command: RemovePageCommand,
+    request: Request,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """Take a refused or failed page off the Journey (2026-10-21).
+
+    A page refused for image quality is never replaced by its re-scan (a new
+    scan is different bytes), cannot be retried and cannot be read again, so
+    without this its tasks -- and the delivery gate -- stay open for good.
+    Once the re-scan is uploaded, the PC (or TL) removes the refused page
+    with a reason: the page unit is cancelled, any document Document
+    Intelligence holds for it is voided the same way as deleting a document
+    (nothing is read twice), the removal is recorded with who and why, and
+    the file's tasks close or refresh at once, naming the removal. Only a
+    FAILED page can be removed this way; same permission as deleting a
+    document."""
+    from audit_core.uc03_p2_documents import void_p2_document
+    from audit_core.uc03_p2_task_producer import sync_processing_failure_tasks
+    from audit_core.uc03_p2_worker import _refresh_batch_status
+
+    access = _authorize(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
+    )
+    reason = command.reason.strip()
+    if len(reason) < 3:
+        raise HTTPException(status_code=400, detail="Say why the page is removed.")
+    unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id)
+    if unit["queue_status"] not in _REMOVABLE_PAGE_STATES:
+        raise HTTPException(
+            status_code=409,
+            detail="Only a page that was refused or could not be processed can be removed here.",
+        )
+    actor = human_principal.subject
+    role = access.operating_role
+    pages = [int(p) for p in (unit.get("page_numbers") or [unit["page_number"]])]
+    filename = connection.execute(
+        text("SELECT original_filename FROM auditcore.p2_upload_batches WHERE tenant_id=:t AND batch_id=:b"),
+        {"t": tenant_id, "b": unit["batch_id"]},
+    ).scalar_one_or_none()
+    details = {"queueId": str(queue_id), "batchId": str(unit["batch_id"]), "pages": pages, "filename": filename,
+               "lastError": unit.get("last_error"), "removedBy": actor, "removedRole": role, "reason": reason}
+    voided = False
+    if unit.get("di_document_id") is not None:
+        held = connection.execute(
+            text(
+                """
+                SELECT 1 FROM auditcore.document_capture_v2_documents
+                WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:d AND capture_status <> 'SUPERSEDED'
+                UNION ALL
+                SELECT 1 FROM auditcore.evidence
+                WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:d AND association_status='ACTIVE'
+                LIMIT 1
+                """
+            ),
+            {"t": tenant_id, "j": journey_id, "d": unit["di_document_id"]},
+        ).scalar_one_or_none()
+        if held:
+            void_p2_document(connection, tenant_id=tenant_id, journey_id=journey_id,
+                             document_id=UUID(str(unit["di_document_id"])), actor_id=actor,
+                             activity_details={"via": "PAGE_REMOVED", "queueId": str(queue_id)})
+            voided = True
+    # The page unit itself, whether or not a document was held for it. The
+    # refusal code stays in last_error (reports count refusals by it).
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue
+            SET queue_status='CANCELLED', status_reason=:reason, updated_at_utc=now()
+            WHERE tenant_id=:t AND queue_id=:q
+            """
+        ),
+        {"t": tenant_id, "q": queue_id,
+         "reason": f"Removed from the journey by {actor}{f' ({role})' if role else ''}: {reason}"},
+    )
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_work_queue SET work_status='CANCELLED', updated_at_utc=now()
+            WHERE tenant_id=:t AND journey_id=:j AND work_key=:k
+              AND work_type IN ('DOCUMENT_INGEST','DOCUMENT_RECONCILE')
+              AND work_status NOT IN ('COMPLETED','DEAD_LETTER','CANCELLED')
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "k": str(queue_id)},
+    )
+    _refresh_batch_status(connection, tenant_id, UUID(str(unit["batch_id"])))
+    _activity(
+        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="PAGE_REMOVED",
+        subject_type="DOCUMENT_PAGE", subject_id=str(queue_id), details={**details, "documentVoided": voided},
+        correlation_id=get_correlation_id(request),
+    )
+    sync_processing_failure_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, removal=details)
+    return {"queueId": str(queue_id), "status": "CANCELLED", "documentVoided": voided}
+
+
 class SetPageTypeCommand(BaseModel):
     templateKey: str = Field(min_length=1, max_length=120)
     # The name a page kept as Others is shown under (required for Others).

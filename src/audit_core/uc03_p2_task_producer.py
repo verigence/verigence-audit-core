@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -557,7 +558,7 @@ def _stage_rows(connection: Connection, *, tenant_id: str, journey_id: UUID) -> 
 
 
 def _resolve_prefix_except(connection: Connection, *, tenant_id: str, journey_id: UUID, prefix: str,
-                           keep: set[str], evidence: dict[str, Any]) -> int:
+                           keep: set[str], evidence: dict[str, Any] | Callable[[str], dict[str, Any]]) -> int:
     open_keys = connection.execute(
         text(
             """
@@ -570,7 +571,8 @@ def _resolve_prefix_except(connection: Connection, *, tenant_id: str, journey_id
     closed = 0
     for key in open_keys:
         if key not in keep:
-            resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key, evidence=evidence)
+            resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                            evidence=evidence(key) if callable(evidence) else evidence)
             closed += 1
     return closed
 
@@ -653,6 +655,18 @@ _QUALITY_CLOSED_EVIDENCE = {
 }
 
 
+def _removal_evidence(removal: dict[str, Any]) -> dict[str, Any]:
+    """Closing evidence naming a page a person removed from the Journey."""
+    pages = [int(p) for p in removal.get("pages") or []]
+    where = (_pages_text(pages).capitalize() if pages else "A page") + f" of {removal.get('filename') or 'the file'}"
+    who = str(removal.get("removedBy") or "someone") + (f" ({removal['removedRole']})" if removal.get("removedRole") else "")
+    return {
+        "reason": f"{where} was removed from the journey by {who}: {removal.get('reason') or 'no reason given'}",
+        "removedPage": {k: removal.get(k) for k in ("queueId", "batchId", "pages", "removedBy", "removedRole", "reason")},
+        "verifiedAt": datetime.now(UTC).isoformat(),
+    }
+
+
 def _sync_quality_task(
     connection: Connection, *, tenant_id: str, journey_id: UUID, batch_id: Any, filename: str,
     quality: list[dict[str, Any]], registry: Registry, evaluation_started_at: datetime | None,
@@ -673,7 +687,11 @@ def _sync_quality_task(
 
     by_reason: dict[str, list[int]] = {}
     codes: dict[str, list[str]] = {}
+    # Each refused page's unit, so the task can offer "Remove this page".
+    page_queues: dict[int, str] = {}
     for page in quality:
+        if page.get("queueId"):
+            page_queues.setdefault(int(page["page"]), str(page["queueId"]))
         reason = rejection_reason(page.get("code")) or "other"
         number = int(page["page"])
         if number not in by_reason.setdefault(reason, []):
@@ -697,7 +715,8 @@ def _sync_quality_task(
         reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": "DOCUMENT_QUALITY_REJECTED",
                    "batchId": str(batch_id), "filename": filename, "pageNumbers": pages,
                    "rejections": [{"reason": reason, "pages": sorted(group), "codes": codes[reason]}
-                                  for reason, group in by_reason.items()]},
+                                  for reason, group in by_reason.items()],
+                   "pageQueues": [{"page": page, "queueId": queue} for page, queue in sorted(page_queues.items())]},
         severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
     )
     return outcome
@@ -711,8 +730,13 @@ def sync_processing_failure_tasks(
     registry: Registry | None = None,
     evaluation_started_at: datetime | None = None,
     now: datetime | None = None,
+    removal: dict[str, Any] | None = None,
 ) -> dict[str, int]:
     """One task (PC) per uploaded file that is not done, never one per page.
+
+    ``removal`` (a page a person just removed from the Journey: batchId,
+    pages, filename, removedBy, removedRole, reason) is named in the closing
+    evidence of that file's tasks.
 
     Info, an hour after upload, while pages are still being identified or
     waiting for an automatic retry: how far the file is and "check back
@@ -744,7 +768,8 @@ def sync_processing_failure_tasks(
                    COALESCE(array_agg(p.page::text || '|' || COALESCE(q.last_error, '') ORDER BY p.page)
                             FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')), ARRAY[]::text[])
                      AS failed_errors,
-                   COALESCE(jsonb_agg(jsonb_build_object('page', p.page, 'code', q.last_error) ORDER BY p.page)
+                   COALESCE(jsonb_agg(jsonb_build_object('page', p.page, 'code', q.last_error,
+                                                         'queueId', q.queue_id) ORDER BY p.page)
                             FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')
                                       AND q.last_error LIKE 'DI_QUALITY_%'), '[]'::jsonb) AS quality_pages
             FROM auditcore.p2_upload_batches b
@@ -851,9 +876,28 @@ def sync_processing_failure_tasks(
             severity=severity, registry=registry, evaluation_started_at=evaluation_started_at,
         )
         counts[outcome] = counts.get(outcome, 0) + 1
+    quality_batches = {key.rsplit(":", 1)[-1] for key in quality_wanted}
+    removal_evidence = _removal_evidence(removal) if removal else None
+
+    def status_evidence(key: str) -> dict[str, Any]:
+        batch = key.rsplit(":", 1)[-1]
+        if removal_evidence and batch == str(removal["batchId"]):
+            return removal_evidence
+        if batch in quality_batches:
+            # Nothing on the file failed otherwise: what is left was refused
+            # for image quality and is on the file's own quality task.
+            return {"reason": "The pages still not read were refused for image quality; they are on the file's "
+                              "image-quality task."}
+        return {"reason": "The file was processed or removed."}
+
+    def quality_evidence(key: str) -> dict[str, Any]:
+        if removal_evidence and key.rsplit(":", 1)[-1] == str(removal["batchId"]):
+            return removal_evidence
+        return _QUALITY_CLOSED_EVIDENCE
+
     closed = _resolve_prefix_except(
         connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"upload-status:{journey_id}:",
-        keep=wanted, evidence={"reason": "The file was processed or removed."},
+        keep=wanted, evidence=status_evidence,
     )
     closed += _resolve_prefix_except(
         connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"upload-stuck-tl:{journey_id}:",
@@ -861,7 +905,7 @@ def sync_processing_failure_tasks(
     )
     closed += _resolve_prefix_except(
         connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"upload-quality:{journey_id}:",
-        keep=quality_wanted, evidence=_QUALITY_CLOSED_EVIDENCE,
+        keep=quality_wanted, evidence=quality_evidence,
     )
     # The per-page tasks this replaced (one per failed page) close too.
     closed += _resolve_prefix_except(
