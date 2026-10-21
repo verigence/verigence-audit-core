@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 from uuid import UUID
 
@@ -366,11 +367,17 @@ def requeue_page_for_ingest(
     for the nightly sweep (which re-drives a page once). Returns the new
     client upload id."""
     base = client_upload_id.split("~", 1)[0]
-    attempt = connection.execute(
-        text("SELECT COUNT(*) FROM auditcore.p2_document_queue WHERE tenant_id=:t AND client_upload_id LIKE :p"),
+    # The next number is one past the highest already used for this page and
+    # marker -- never a count of rows: the queue row carries its own id, so a
+    # count stays at 1 from the second attempt on and re-used "~r2", which DI
+    # refuses as a conflict (RJ Hot max p11, 2026-10-21).
+    used = connection.execute(
+        text("SELECT client_upload_id FROM auditcore.p2_document_queue WHERE tenant_id=:t AND client_upload_id LIKE :p"),
         {"t": tenant_id, "p": f"{base}~{marker}%"},
-    ).scalar_one()
-    new_id = f"{base}~{marker}{int(attempt) + 1}"
+    ).scalars().all()
+    numbers = [int(match[1]) for value in [*used, client_upload_id]
+               if (match := re.fullmatch(rf"{re.escape(base)}~{re.escape(marker)}(\d+)", str(value)))]
+    new_id = f"{base}~{marker}{max(numbers, default=0) + 1}"
     connection.execute(
         text(
             """

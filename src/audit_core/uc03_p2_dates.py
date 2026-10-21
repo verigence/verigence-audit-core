@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from datetime import date, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 _MONTHS = {
     "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3, "apr": 4, "april": 4,
@@ -89,6 +90,33 @@ def date_floor_verdict(value: Any, floor: date | None) -> str | None:
     if parsed < floor:
         return "DATE_BEFORE_FLOOR"
     return None
+
+
+# Every project of the programme runs on Indian time (project timezone
+# default); the database refuses a booking date after the project's local
+# today, so the review check uses the same day.
+_PROGRAMME_TIMEZONE = ZoneInfo("Asia/Kolkata")
+
+# Fields whose date can never lie after today: a booking is made on or
+# before the day its form is read.
+NO_FUTURE_DATE_FIELDS = frozenset({"booking_date"})
+
+
+def programme_today() -> date:
+    """Today's date on the programme's (Indian) clock."""
+    return datetime.now(_PROGRAMME_TIMEZONE).date()
+
+
+def future_date_verdict(field_key: str, value: Any, today: date | None = None) -> str | None:
+    """``DATE_IN_FUTURE`` when a field that cannot lie in the future (the
+    booking date) was read as a day after today: a digit or the year was
+    misread. None otherwise, including when the value is not a date."""
+    if field_key not in NO_FUTURE_DATE_FIELDS or value is None or str(value).strip() == "":
+        return None
+    parsed = parse_extracted_date(value)
+    if parsed is None:
+        return None
+    return "DATE_IN_FUTURE" if parsed > (today or programme_today()) else None
 
 
 def programme_date_floor() -> date | None:

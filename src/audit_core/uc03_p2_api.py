@@ -634,11 +634,15 @@ def list_p2_journeys(
                 AND finding_status IN ('OPEN','ACKNOWLEDGED')
             ) fd ON true
             LEFT JOIN LATERAL (
-              -- Journey 360's "current vs standard": for every priced line the
-              -- figure a document now carries (the invoice, else the booking
-              -- form, else the line's own actual) against the price list, less
-              -- the same difference on the discounts, over the lines both sides
-              -- know. Nothing priced or nothing different is 0, never blank.
+              -- Fallback while the Journey's stored Deal variance (price_variance,
+              -- the Deal tab's own number) is not computed yet: for every
+              -- priced line the figure a document still on file carries (a
+              -- billing document, else the booking form, else the line's own
+              -- actual before any invoice) against the price list, less the
+              -- same difference on the discounts. 2026-10-20 (review S8):
+              -- voided documents and the wholesale invoice never count, and a
+              -- line awaiting its own document with no booking figure is left
+              -- out instead of counting at nil.
               SELECT COALESCE((
                 SELECT SUM(cur.current - cl.standard_amount)
                 FROM auditcore.commercial_lines cl
@@ -646,9 +650,13 @@ def list_p2_journeys(
                   SELECT EXISTS (
                     SELECT 1 FROM auditcore.commercial_line_source_values s
                     WHERE s.tenant_id=p.tenant_id AND s.journey_id=p.journey_id
-                      AND s.source_document_type IN ('customer_invoice_dms','tax_invoice_tally',
-                        'accessory_invoice_dms','accessory_invoice_tally','ew_invoice','rsa_invoice',
-                        'invoice_generic','credit_note','debit_note')
+                      AND s.source_document_type IN ('customer_invoice_dms','tax_invoice_tally','tax_invoice_dms',
+                        'tax_invoice','customer_invoice_dms_v2','accessory_invoice_dms','accessory_invoice_tally',
+                        'ew_invoice','rsa_invoice','invoice_generic','credit_note','debit_note')
+                      AND NOT EXISTS (SELECT 1 FROM auditcore.evidence e
+                                     WHERE e.tenant_id=s.tenant_id AND e.journey_id=s.journey_id
+                                       AND (e.di_document_id=s.source_document_id OR e.evidence_id=s.source_evidence_id)
+                                       AND e.association_status <> 'ACTIVE')
                   ) AS invoiced
                 ) vi
                 LEFT JOIN LATERAL (
@@ -657,21 +665,22 @@ def list_p2_journeys(
                       WHERE s.tenant_id=cl.tenant_id AND s.journey_id=cl.journey_id
                         AND s.line_kind='COMMERCIAL' AND s.component_key=cl.component_key
                         AND s.source_document_type NOT IN ('booking_form','booking_docket','order_taking_form',
-                                                           'customer_ledger','cost_sheet')
-                      ORDER BY s.updated_at_utc DESC LIMIT 1),
-                    -- Once any customer invoice is on file invoices alone
-                    -- price the deal: no booking-form fallback, and a
-                    -- mandatory master line no invoice bills counts at nil.
-                    CASE WHEN NOT vi.invoiced THEN COALESCE(
-                      (SELECT s.amount FROM auditcore.commercial_line_source_values s
-                        WHERE s.tenant_id=cl.tenant_id AND s.journey_id=cl.journey_id
-                          AND s.line_kind='COMMERCIAL' AND s.component_key=cl.component_key
-                          AND s.source_document_type IN ('booking_form','booking_docket','order_taking_form')
-                        ORDER BY s.updated_at_utc DESC LIMIT 1),
-                      cl.actual_amount)
-                    WHEN cl.component_key NOT IN ('accessories_cost','essential_kit_amount',
-                        'genuine_accessories_amount','non_genuine_accessories_amount',
-                        'additional_warranty_amount','extended_warranty_amount') THEN 0 END) AS current
+                                                           'customer_ledger','cost_sheet','wholesale_invoice')
+                        AND NOT EXISTS (SELECT 1 FROM auditcore.evidence e
+                                     WHERE e.tenant_id=s.tenant_id AND e.journey_id=s.journey_id
+                                       AND (e.di_document_id=s.source_document_id OR e.evidence_id=s.source_evidence_id)
+                                       AND e.association_status <> 'ACTIVE')
+                      ORDER BY s.source_document_type, s.source_document_id LIMIT 1),
+                    (SELECT s.amount FROM auditcore.commercial_line_source_values s
+                      WHERE s.tenant_id=cl.tenant_id AND s.journey_id=cl.journey_id
+                        AND s.line_kind='COMMERCIAL' AND s.component_key=cl.component_key
+                        AND s.source_document_type IN ('booking_form','booking_docket','order_taking_form')
+                        AND NOT EXISTS (SELECT 1 FROM auditcore.evidence e
+                                     WHERE e.tenant_id=s.tenant_id AND e.journey_id=s.journey_id
+                                       AND (e.di_document_id=s.source_document_id OR e.evidence_id=s.source_evidence_id)
+                                       AND e.association_status <> 'ACTIVE')
+                      ORDER BY s.source_document_type, s.source_document_id LIMIT 1),
+                    CASE WHEN NOT vi.invoiced THEN cl.actual_amount END) AS current
                 ) cur ON true
                 WHERE cl.tenant_id=p.tenant_id AND cl.journey_id=p.journey_id
                   AND cl.standard_amount IS NOT NULL AND cur.current IS NOT NULL
