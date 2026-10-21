@@ -63,6 +63,10 @@ from audit_core.uc03_p2_tasks import create_p2_task, task_queue_tab
         ("SKU_CLOSEST_MATCH_CONFIRM", "CORRECTION_APPROVAL", None, None),
         ("PC_CONFIRMATION", "PROCESS_CONFIRMATION", "CASH_INTIMATION_UNCONFIRMED", None),
         ("PC_CONFIRMATION", "PROCESS_CONFIRMATION", "INSURANCE_INVOICE_MISSING", "MISSING_DOCUMENT"),
+        # External rule engine checks for a document not on file.
+        *[("RULE_DISCREPANCY_REVIEW", "CROSS_DOCUMENT_REVIEW", code, "MISSING_DOCUMENT") for code in (
+            "INVOICE_MISSING", "GATE_PASS_MISSING", "RTO_CHALLAN_MISSING", "INSURANCE_COVER_NOTE_MISSING",
+            "DELIVERY_ORDER_MISSING", "CORPORATE_PO_MISSING", "CUSTOMER_LEDGER_MISSING")],
         ("RULE_DISCREPANCY_REVIEW", "CROSS_DOCUMENT_REVIEW", "BK_PRICE_MATCH", None),
         ("FINDING_REVIEW", "FINDING_REMEDIATION", "ANY_RULE", None),
         ("MODEL_SELECTION_CORRECTION_REVIEW", "CORRECTION_APPROVAL", None, None),
@@ -192,31 +196,48 @@ def _task(journey, key: str) -> dict | None:
     return dict(row) if row else None
 
 
-def _new_upload(journey, *, minutes_ago: float = 0.0):
-    batch, _ = add_batch_pages(journey, [("booking_form", "READY")])
+def _unrelated_upload(journey):
+    """Another file on the booking (an insurance cover note), fully read."""
+    batch, _ = add_batch_pages(journey, [("insurance_cover_note", "READY")])
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
-        connection.execute(
-            text("UPDATE auditcore.p2_upload_batches SET created_at_utc=now() - (:ago * interval '1 minute') "
-                 "WHERE batch_id=:b"),
-            {"b": batch, "ago": minutes_ago},
-        )
+        connection.execute(text("UPDATE auditcore.p2_upload_batches SET batch_status='COMPLETED' WHERE batch_id=:b"),
+                           {"b": batch})
     return batch
 
 
-def test_refused_pages_get_their_own_task_per_file_and_close_when_uploaded_again(journey):
-    batch, pages = add_batch_pages(journey, [("booking_form", "READY")] + [(None, "QUEUED")] * 4)
-    _fail(journey, pages[1]["queue_id"], "DI_QUALITY_IMAGE_CONTRAST", minutes_ago=30)   # page 2
-    _fail(journey, pages[2]["queue_id"], "DI_QUALITY_IMAGE_BLUR_SCORE", minutes_ago=30)  # page 3
-    _fail(journey, pages[3]["queue_id"], "DI_QUALITY_IMAGE_MIN_DIMENSIONS", minutes_ago=30)  # page 4
-    _fail(journey, pages[4]["queue_id"], "DOCUMENT_AI_RESPONSE_INVALID", minutes_ago=30)  # page 5
+def _gate_tasks(journey) -> list[str]:
+    """What the delivery gate PC_TASKS_CLOSED sees as open PC work."""
+    from audit_core.uc03_p2_stage import _open_tasks_for
+
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
-        connection.execute(
-            text("UPDATE auditcore.p2_upload_batches SET batch_status='PARTIAL_FAILURE', "
-                 "created_at_utc=now() - interval '40 minutes' WHERE batch_id=:b"),
-            {"b": batch},
-        )
+        return [t["taskType"] for t in _open_tasks_for(connection, tenant_id=journey.tenant_id,
+                                                        journey_id=journey.journey_id, role="PC",
+                                                        tabs=("DOCUMENTS", "MANUAL_VERIFICATION"))]
+
+
+def _page_status(journey, queue_id, status: str) -> None:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_document_queue SET queue_status=:s WHERE queue_id=:q"),
+                           {"s": status, "q": queue_id})
+
+
+def _batch_status(journey, batch, status: str) -> None:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_upload_batches SET batch_status=:s WHERE batch_id=:b"),
+                           {"s": status, "b": batch})
+
+
+def test_refused_pages_get_their_own_task_per_file(journey):
+    batch, pages = add_batch_pages(journey, [("booking_form", "READY")] + [(None, "QUEUED")] * 4)
+    _fail(journey, pages[1]["queue_id"], "DI_QUALITY_IMAGE_CONTRAST")   # page 2
+    _fail(journey, pages[2]["queue_id"], "DI_QUALITY_IMAGE_BLUR_SCORE")  # page 3
+    _fail(journey, pages[3]["queue_id"], "DI_QUALITY_IMAGE_MIN_DIMENSIONS")  # page 4
+    _fail(journey, pages[4]["queue_id"], "DOCUMENT_AI_RESPONSE_INVALID")  # page 5
+    _batch_status(journey, batch, "PARTIAL_FAILURE")
     _sync(journey)
 
     quality = _task(journey, f"upload-quality:{journey.journey_id}:{batch}")
@@ -234,51 +255,88 @@ def test_refused_pages_get_their_own_task_per_file_and_close_when_uploaded_again
     assert status["title"] == "packet.pdf: 1 page could not be processed"
     assert status["reference"]["pageNumbers"] == [5]
     assert "faded" not in status["description"] and "blurred" not in status["description"]
+    assert sorted(_gate_tasks(journey)) == ["PC_PAGE_QUALITY_REJECTED", "PC_UPLOAD_STATUS"]
 
-    # The PC re-scans and uploads: the image-quality task closes, the other stays.
-    _new_upload(journey)
+    # One refused page is read after all: the task names only the others.
+    _page_status(journey, pages[1]["queue_id"], "READY")
     _sync(journey)
-    assert _task(journey, f"upload-quality:{journey.journey_id}:{batch}")["task_status"] == "VERIFIED_COMPLETE"
-    assert _task(journey, f"upload-status:{journey.journey_id}:{batch}")["task_status"] == "READY"
+    assert _task(journey, f"upload-quality:{journey.journey_id}:{batch}")["reference"]["pageNumbers"] == [3, 4]
 
-    # A page of the same file refused after that upload reopens it, naming only that page.
-    _fail(journey, pages[0]["queue_id"], "DI_QUALITY_IMAGE_BLUR_SCORE")
+
+def test_an_unrelated_upload_never_closes_it_and_the_gate_stays_blocked(journey):
+    """Review of #479: bundle page 1 read as the booking form, page 2
+    refused for blur; the PC then uploads an insurance cover note. The
+    quality task stays open and the delivery gate stays blocked, as the
+    status task kept it on origin/dev."""
+    batch, pages = add_batch_pages(journey, [("booking_form", "READY"), (None, "QUEUED")])
+    _fail(journey, pages[1]["queue_id"], "DI_QUALITY_IMAGE_BLUR_SCORE", minutes_ago=30)
+    _batch_status(journey, batch, "PARTIAL_FAILURE")
     _sync(journey)
-    reopened = _task(journey, f"upload-quality:{journey.journey_id}:{batch}")
-    assert reopened["task_status"] == "READY" and reopened["reference"]["pageNumbers"] == [1]
-    assert reopened["title"] == "packet.pdf: 1 page refused for image quality"
+    _unrelated_upload(journey)
+    _sync(journey)
+    assert _task(journey, f"upload-quality:{journey.journey_id}:{batch}")["task_status"] == "READY"
+    assert _gate_tasks(journey) == ["PC_PAGE_QUALITY_REJECTED"]
+
+
+def test_moving_from_the_old_status_task_keeps_the_refused_page_covered(journey):
+    """Review of #479: a status task raised by the old code for a file whose
+    only failed page was refused for quality closes, and in the same pass
+    the quality task opens -- the gate is never left uncovered."""
+    from audit_core.uc03_p2_task_producer import _failed_pages_text, raise_or_refresh
+
+    batch, pages = add_batch_pages(journey, [("booking_form", "READY"), (None, "QUEUED")])
+    _fail(journey, pages[1]["queue_id"], "DI_QUALITY_IMAGE_BLUR_SCORE")
+    _batch_status(journey, batch, "PARTIAL_FAILURE")
+    _unrelated_upload(journey)
+    old_title, old_text = _failed_pages_text("packet.pdf", ["2|DI_QUALITY_IMAGE_BLUR_SCORE"], [2], None)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        raise_or_refresh(  # what the code before this change left on file
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+            dedupe_key=f"upload-status:{journey.journey_id}:{batch}", task_type="PC_UPLOAD_STATUS",
+            source_type="DOCUMENT", source_code="DOCUMENT_PROCESSING_FAILED", title=old_title, description=old_text,
+            reference={"batchId": str(batch), "filename": "packet.pdf", "pageNumbers": [2]}, severity="HIGH",
+            registry=get_registry(),
+        )
+    assert _gate_tasks(journey) == ["PC_UPLOAD_STATUS"]
+
+    _sync(journey)
+    assert _task(journey, f"upload-status:{journey.journey_id}:{batch}")["task_status"] == "VERIFIED_COMPLETE"
+    quality = _task(journey, f"upload-quality:{journey.journey_id}:{batch}")
+    assert quality["task_status"] == "READY" and quality["reference"]["pageNumbers"] == [2]
+    assert _gate_tasks(journey) == ["PC_PAGE_QUALITY_REJECTED"]
 
 
 def test_a_file_with_only_refused_pages_has_no_status_task(journey):
     batch, pages = add_batch_pages(journey, [(None, "QUEUED")])
     _fail(journey, pages[0]["queue_id"], "DI_QUALITY_IMAGE_BLUR_SCORE")
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        connection.execute(text("UPDATE auditcore.p2_upload_batches SET batch_status='FAILED' WHERE batch_id=:b"),
-                           {"b": batch})
+    _batch_status(journey, batch, "FAILED")
     _sync(journey)
     assert _task(journey, f"upload-status:{journey.journey_id}:{batch}") is None
     assert _task(journey, f"upload-quality:{journey.journey_id}:{batch}")["task_status"] == "READY"
 
 
-def test_an_upload_made_before_the_refusal_does_not_close_it(journey):
-    _new_upload(journey, minutes_ago=60)
+@pytest.mark.parametrize("how", ["same scan uploaded again", "page removed", "file deleted", "page read"])
+def test_it_closes_only_when_the_refused_pages_themselves_go(journey, how):
     batch, pages = add_batch_pages(journey, [(None, "QUEUED")])
     _fail(journey, pages[0]["queue_id"], "DI_QUALITY_IMAGE_CONTRAST")
     _sync(journey)
     assert _task(journey, f"upload-quality:{journey.journey_id}:{batch}")["task_status"] == "READY"
-
-
-def test_the_refused_page_replaced_by_the_same_scan_closes_it(journey):
-    batch, pages = add_batch_pages(journey, [(None, "QUEUED")])
-    _fail(journey, pages[0]["queue_id"], "DI_QUALITY_IMAGE_CONTRAST")
+    if how == "same scan uploaded again":
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            connection.execute(text("UPDATE auditcore.p2_document_queue SET queue_status='CANCELLED', "
+                                    "last_error='SUPERSEDED_PAGE' WHERE queue_id=:q"), {"q": pages[0]["queue_id"]})
+    elif how == "page removed":
+        _page_status(journey, pages[0]["queue_id"], "CANCELLED")
+    elif how == "file deleted":
+        _batch_status(journey, batch, "CANCELLED")
+    else:
+        _page_status(journey, pages[0]["queue_id"], "READY")
     _sync(journey)
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        connection.execute(text("UPDATE auditcore.p2_document_queue SET queue_status='CANCELLED', "
-                                "last_error='SUPERSEDED_PAGE' WHERE queue_id=:q"), {"q": pages[0]["queue_id"]})
-    _sync(journey)
-    assert _task(journey, f"upload-quality:{journey.journey_id}:{batch}")["task_status"] == "VERIFIED_COMPLETE"
+    closed = _task(journey, f"upload-quality:{journey.journey_id}:{batch}")
+    assert closed["task_status"] == "VERIFIED_COMPLETE"
+    assert _gate_tasks(journey) == []
 
 
 # ----------------------------------------------------------------- the API

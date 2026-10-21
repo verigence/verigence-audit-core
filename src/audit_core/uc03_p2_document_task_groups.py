@@ -98,6 +98,15 @@ DOCUMENT_CATEGORY_BY_RULE: dict[str, str] = {
     # The vehicle is invoiced and no insurance cover note is on file: upload
     # it (or answer that the customer arranged their own insurance).
     "INSURANCE_INVOICE_MISSING": "MISSING_DOCUMENT",
+    # External rule engine checks for a document not on file (raised as
+    # RULE_DISCREPANCY_REVIEW).
+    "INVOICE_MISSING": "MISSING_DOCUMENT",
+    "GATE_PASS_MISSING": "MISSING_DOCUMENT",
+    "RTO_CHALLAN_MISSING": "MISSING_DOCUMENT",
+    "INSURANCE_COVER_NOTE_MISSING": "MISSING_DOCUMENT",
+    "DELIVERY_ORDER_MISSING": "MISSING_DOCUMENT",
+    "CORPORATE_PO_MISSING": "MISSING_DOCUMENT",
+    "CUSTOMER_LEDGER_MISSING": "MISSING_DOCUMENT",
 }
 
 # DOCUMENT_MISSING is also raised for a document carrying the wrong name

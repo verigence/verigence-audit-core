@@ -128,9 +128,9 @@ task_types:
   # (blurred, faded / low contrast, too small: any DI_QUALITY_* refusal),
   # naming the pages and why (product owner 2026-10-21: image quality is
   # its own group of document tasks). A retry cannot fix such a page, so
-  # the PC re-scans it; the task closes itself when a file is uploaded on
-  # the journey after the refusal, or the refused pages are replaced or
-  # removed.
+  # the PC re-scans it. The task closes itself only when the refused pages
+  # are replaced by the same scan, read or removed, or the file is deleted;
+  # another upload on the journey never closes it.
   PC_PAGE_QUALITY_REJECTED:
     category: DOCUMENT_REUPLOAD
     owner: PC

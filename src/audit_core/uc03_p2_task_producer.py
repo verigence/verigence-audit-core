@@ -645,51 +645,35 @@ def _failed_pages_text(filename: str, failed_errors: list[str], failed_pages: li
 _QUALITY_PREFIX = "DI_QUALITY_"
 
 
-def _when(value: Any) -> datetime | None:
-    if isinstance(value, datetime):
-        return value
-    try:
-        return datetime.fromisoformat(str(value)) if value else None
-    except ValueError:
-        return None
-
-
-def _quality_closed_evidence(uploads: list) -> dict[str, Any]:
-    latest = uploads[-1] if uploads else None
-    return {
-        "reason": "A file was uploaded on this booking after the pages were refused, or the refused pages were "
-                  "replaced or removed.",
-        "latestUpload": ({"batchId": str(latest["batch_id"]), "filename": latest["original_filename"],
-                          "uploadedAt": latest["created_at_utc"].isoformat()} if latest else None),
-        "verifiedAt": datetime.now(UTC).isoformat(),
-    }
+# Why the quality task closed. There is no time rule: an upload of some
+# other file never answers a refused page (review of #479, 2026-10-21).
+_QUALITY_CLOSED_EVIDENCE = {
+    "reason": "No page of this file is refused any more: the refused pages were replaced by the same scan, "
+              "read, or removed, or the file was deleted.",
+}
 
 
 def _sync_quality_task(
     connection: Connection, *, tenant_id: str, journey_id: UUID, batch_id: Any, filename: str,
-    quality: list[dict[str, Any]], uploads: list, registry: Registry, evaluation_started_at: datetime | None,
-) -> str | None:
+    quality: list[dict[str, Any]], registry: Registry, evaluation_started_at: datetime | None,
+) -> str:
     """One PC task per uploaded file with pages refused by the scan-quality
     check (product owner 2026-10-21: blur, low contrast, too small and every
     other DI_QUALITY_* refusal are document tasks of their own, "Image
-    quality"). It names the pages and why. A retry cannot help, so it asks
-    for a re-scan, and it closes itself once a file is uploaded on this
-    booking after the refusal (the re-scan), or once the refused pages are
-    replaced by the same scan, removed or the file deleted. A page refused
-    after the latest upload keeps (or reopens) the task. Returns what
-    happened to the task, or None when nothing is outstanding."""
+    quality"). It names the pages and why, and asks for a re-scan (a retry
+    cannot help). It stays open, and blocks the delivery gate, for as long
+    as any refused page of the file is still refused -- exactly as the
+    file's status task did for those pages before -- and closes itself once
+    they are replaced by the same scan, read or removed, or the file is
+    deleted. Another file uploaded on the booking never closes it: nothing
+    says which document a refused page was (it was refused before it was
+    classified). Returns what happened to the task."""
     from audit_core.uc03_p2_daily_report import rejection_reason
     from audit_core.uc03_p2_document_task_groups import rejection_words
 
-    later_uploads = [_when(u["created_at_utc"]) for u in uploads if str(u["batch_id"]) != str(batch_id)]
-    latest_upload = max((t for t in later_uploads if t is not None), default=None)
     by_reason: dict[str, list[int]] = {}
     codes: dict[str, list[str]] = {}
-    refused_at: datetime | None = None
     for page in quality:
-        at = _when(page.get("at"))
-        if latest_upload is not None and at is not None and at < latest_upload:
-            continue  # uploaded again since this page was refused
         reason = rejection_reason(page.get("code")) or "other"
         number = int(page["page"])
         if number not in by_reason.setdefault(reason, []):
@@ -697,18 +681,15 @@ def _sync_quality_task(
         code = str(page.get("code") or "")
         if code not in codes.setdefault(reason, []):
             codes[reason].append(code)
-        refused_at = max(refused_at, at) if refused_at and at else (at or refused_at)
     pages = sorted({p for group in by_reason.values() for p in group})
-    if not pages:
-        return None
     why = "; ".join(f"{_pages_text(sorted(group)).capitalize()} {'is' if len(group) == 1 else 'are'} "
                     f"{rejection_words(reason)}" for reason, group in by_reason.items())
     count = len(pages)
     title = f"{filename}: {count} page{'' if count == 1 else 's'} refused for image quality"
     description = (f"Refused by the scan-quality check and not read: {why}. A retry will not help. Scan "
                    f"{'it' if count == 1 else 'them'} again in good light, flat and in focus, and upload from "
-                   "Upload / Edit Documents. This task closes itself once a file is uploaded on this booking "
-                   "after the refusal.")
+                   "Upload / Edit Documents. This task closes itself once the refused pages are processed or "
+                   "removed; delete this booking if nothing on it can be used.")
     _, outcome = raise_or_refresh(
         connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=f"upload-quality:{journey_id}:{batch_id}",
         task_type="PC_PAGE_QUALITY_REJECTED", source_type="DOCUMENT", source_code="DOCUMENT_QUALITY_REJECTED",
@@ -716,8 +697,7 @@ def _sync_quality_task(
         reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": "DOCUMENT_QUALITY_REJECTED",
                    "batchId": str(batch_id), "filename": filename, "pageNumbers": pages,
                    "rejections": [{"reason": reason, "pages": sorted(group), "codes": codes[reason]}
-                                  for reason, group in by_reason.items()],
-                   "refusedAt": refused_at.isoformat() if refused_at else None},
+                                  for reason, group in by_reason.items()]},
         severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
     )
     return outcome
@@ -746,19 +726,6 @@ def sync_processing_failure_tasks(
     tl_wanted: set[str] = set()
     quality_wanted: set[str] = set()
     counts: dict[str, int] = {}
-    # Every file the PC finished uploading on this journey (a file refused
-    # whole as a copy of an earlier one is not a new upload): a page refused
-    # for image quality before the latest of them counts as uploaded again.
-    uploads = connection.execute(
-        text(
-            """
-            SELECT batch_id, original_filename, created_at_utc FROM auditcore.p2_upload_batches
-            WHERE tenant_id=:t AND journey_id=:j AND batch_status NOT IN ('AWAITING_UPLOAD','CANCELLED')
-            ORDER BY created_at_utc
-            """
-        ),
-        {"t": tenant_id, "j": journey_id},
-    ).mappings().all()
     batches = connection.execute(
         text(
             """
@@ -777,8 +744,7 @@ def sync_processing_failure_tasks(
                    COALESCE(array_agg(p.page::text || '|' || COALESCE(q.last_error, '') ORDER BY p.page)
                             FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')), ARRAY[]::text[])
                      AS failed_errors,
-                   COALESCE(jsonb_agg(jsonb_build_object('page', p.page, 'code', q.last_error,
-                                                         'at', q.updated_at_utc) ORDER BY p.page)
+                   COALESCE(jsonb_agg(jsonb_build_object('page', p.page, 'code', q.last_error) ORDER BY p.page)
                             FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')
                                       AND q.last_error LIKE 'DI_QUALITY_%'), '[]'::jsonb) AS quality_pages
             FROM auditcore.p2_upload_batches b
@@ -803,15 +769,16 @@ def sync_processing_failure_tasks(
         failed_pages = [int(p) for p in (row["failed_pages"] or [])]
         quality = [dict(q) for q in (row["quality_pages"] or [])]
         if quality:
+            # Every refused page lands in the file's quality task in this
+            # same pass, so nothing leaves the status task uncovered.
             failed_pages = sorted({int(str(e).partition("|")[0]) for e in failed_errors})
             outcome = _sync_quality_task(
                 connection, tenant_id=tenant_id, journey_id=journey_id, batch_id=row["batch_id"],
-                filename=filename, quality=quality, uploads=uploads, registry=registry,
+                filename=filename, quality=quality, registry=registry,
                 evaluation_started_at=evaluation_started_at,
             )
-            if outcome is not None:
-                quality_wanted.add(f"upload-quality:{journey_id}:{row['batch_id']}")
-                counts[outcome] = counts.get(outcome, 0) + 1
+            quality_wanted.add(f"upload-quality:{journey_id}:{row['batch_id']}")
+            counts[outcome] = counts.get(outcome, 0) + 1
         split_failed = row["batch_status"] == "FAILED" and int(row["page_count"] or 0) == 0
         in_progress = retrying + working > 0 or row["batch_status"] in ("AWAITING_UPLOAD", "UPLOADED", "SPLITTING")
         age = (now - row["created_at_utc"]).total_seconds() if row["created_at_utc"] else 0.0
@@ -894,7 +861,7 @@ def sync_processing_failure_tasks(
     )
     closed += _resolve_prefix_except(
         connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"upload-quality:{journey_id}:",
-        keep=quality_wanted, evidence=_quality_closed_evidence(uploads),
+        keep=quality_wanted, evidence=_QUALITY_CLOSED_EVIDENCE,
     )
     # The per-page tasks this replaced (one per failed page) close too.
     closed += _resolve_prefix_except(
