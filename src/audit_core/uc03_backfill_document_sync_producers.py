@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import structlog
@@ -258,8 +258,52 @@ RECHECK_DRY_RUN = "RERESOLVE_DRY_RUN"
 RECHECK_COMMIT = "RERESOLVE_COMMIT"
 
 
+def _action_taken(action: str | None, before: dict[str, Any], after: dict[str, Any]) -> str:
+    """What the Apply run actually did to the Journey, read from the SKU it
+    carried before and after (not from what the check expected)."""
+    if action == "KEEP_HUMAN":
+        return "LEFT_ALONE"
+    had, has = bool(before.get("has_sku")), bool(after.get("has_sku"))
+    if not has:
+        return "NO_SKU"
+    if not had:
+        return "SET"
+    if before.get("sku_code") != after.get("sku_code"):
+        return "REPLACED"
+    return "KEPT_AND_FLAGGED" if action == "UNCONFIRMED" else "KEPT"
+
+
+def _checked_proposal(connection, *, tenant_id: str, check_run_id: UUID | None, journey_id: UUID) -> dict[str, Any] | None:
+    if check_run_id is None:
+        return None
+    return connection.execute(
+        text("SELECT proposal FROM auditcore.sku_resolution_run_items "
+             "WHERE tenant_id=:t AND run_id=:r AND journey_id=:j"),
+        {"t": tenant_id, "r": check_run_id, "j": journey_id},
+    ).scalar_one_or_none()
+
+
+def _left_alone_item(connection, *, tenant_id: str, run_id: UUID, journey_id: UUID, before: dict[str, Any],
+                     reason: str, why: str, commit: bool) -> None:
+    """A Journey a re-check does not touch (review complete, booking cancelled
+    or closed): recorded with a proposal so the review page can list it."""
+    proposal = {
+        "action": "LEFT_ALONE", "oldSku": before.get("sku_code"), "oldBasis": before.get("match_basis"),
+        "proposedSku": before.get("sku_code"), "proposedBasis": before.get("match_basis"), "changes": False,
+        "skipped": reason, "why": why, "tasks": [], "group": "LEFT_ALONE", "dryRun": not commit,
+        **({"actionTaken": "LEFT_ALONE"} if commit else {}),
+    }
+    _record_item(
+        connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id,
+        label=before.get("journey_label"), model_label=before.get("model_label"),
+        outcome="ALREADY_HAD_SKU" if before.get("has_sku") else "STILL_UNMATCHED",
+        sku_code=before.get("sku_code"), detail=why, proposal=proposal,
+    )
+
+
 def _recheck_item(
     connection, *, tenant_id: str, run_id: UUID, journey_id: UUID, before: dict[str, Any], commit: bool,
+    check_run_id: UUID | None = None,
 ) -> None:
     """One Journey of a reresolve run (review 471 B2): nothing is cleared;
     the dry run writes only the run item, the commit writes the decision
@@ -279,6 +323,18 @@ def _recheck_item(
         return
     after = before if not commit else _journey_sku_state(connection, tenant_id=tenant_id, journey_id=journey_id)
     proposal = dict(result.get("proposal") or {})
+    if commit:
+        # The action actually taken, and whether it is what the check run
+        # showed for this Journey (it differs when the data moved in between).
+        proposal.update(actionTaken=_action_taken(proposal.get("action"), before, after),
+                        skuAfter=after.get("sku_code"), basisAfter=after.get("match_basis"))
+        checked = _checked_proposal(connection, tenant_id=tenant_id, check_run_id=check_run_id,
+                                    journey_id=journey_id)
+        if check_run_id is not None:
+            proposal["differsFromCheck"] = (
+                checked is None or checked.get("proposedSku") != proposal.get("proposedSku")
+                or checked.get("action") != proposal.get("action")
+            )
     old, new = proposal.get("oldSku"), proposal.get("proposedSku")
     if proposal.get("action") == "UNCONFIRMED":
         outcome = "STILL_UNMATCHED"
@@ -310,10 +366,142 @@ def _recheck_item(
     )
 
 
+CHECK_VALID_HOURS = 24
+_DATA_CHANGING_RUN = "COALESCE(run_mode, 'RESOLVE') <> 'RERESOLVE_DRY_RUN'"
+
+
+class CommitNotAllowed(Exception):
+    """Apply (RERESOLVE_COMMIT) was asked for without a usable check run. The
+    route answers 409 with ``detail`` (a code, a message in plain words and the
+    numbers of the check run when there is one)."""
+
+    def __init__(self, detail: dict[str, Any]):
+        super().__init__(detail["message"])
+        self.detail = detail
+
+
+def _group_counts(connection, *, tenant_id: str, run_ids: list[UUID]) -> dict[UUID, dict[str, int]]:
+    """Per run: how many Journeys sit in each review group (CHANGE, CONFIRM,
+    KEEP, LEFT_ALONE) and how many failed."""
+    if not run_ids:
+        return {}
+    rows = connection.execute(
+        text(
+            """
+            SELECT run_id, CASE WHEN outcome = 'FAILED' THEN 'FAILED' ELSE proposal->>'group' END AS grp,
+                   count(*) AS n
+            FROM auditcore.sku_resolution_run_items
+            WHERE tenant_id = :t AND run_id = ANY(:ids)
+            GROUP BY 1, 2
+            """
+        ),
+        {"t": tenant_id, "ids": run_ids},
+    ).all()
+    out: dict[UUID, dict[str, int]] = {rid: {} for rid in run_ids}
+    for run_id, group, n in rows:
+        out[run_id][group or "OTHER"] = int(n)
+    return out
+
+
+def _check_summary(connection, *, tenant_id: str, run: Any) -> dict[str, Any]:
+    """The numbers of a check run, for the Apply gate and the Apply response."""
+    counts = _group_counts(connection, tenant_id=tenant_id, run_ids=[run["run_id"]])[run["run_id"]]
+    not_checked = int(connection.execute(
+        text(
+            """
+            SELECT count(*) FROM auditcore.journeys j
+            WHERE j.tenant_id = :t AND NOT EXISTS (
+              SELECT 1 FROM auditcore.sku_resolution_run_items i
+              WHERE i.tenant_id = j.tenant_id AND i.run_id = :r AND i.journey_id = j.journey_id)
+            """
+        ),
+        {"t": tenant_id, "r": run["run_id"]},
+    ).scalar_one())
+    return {
+        "runId": run["run_id"], "startedAtUtc": run["started_at_utc"].isoformat(),
+        "finishedAtUtc": run["finished_at_utc"].isoformat() if run["finished_at_utc"] else None,
+        "journeysTotal": run["journeys_total"], "journeysChecked": run["journeys_processed"],
+        "failed": run["failed"], "notChecked": not_checked,
+        "willChange": counts.get("CHANGE", 0), "needConfirmation": counts.get("CONFIRM", 0),
+        "keep": counts.get("KEEP", 0), "leftAlone": counts.get("LEFT_ALONE", 0),
+    }
+
+
+def check_numbers_text(check: dict[str, Any] | None) -> str:
+    """The check run's numbers in words (for the 409 and the Apply response)."""
+    if not check:
+        return ""
+    return (
+        f"Check run {str(check['runId'])[:8]} ({check['startedAtUtc'][:16].replace('T', ' ')} UTC): "
+        f"{check['journeysChecked']} of {check['journeysTotal']} journeys checked, {check['failed']} failed, "
+        f"{check['notChecked']} not checked; {check['willChange']} will change SKU, "
+        f"{check['needConfirmation']} need a PC decision, {check['keep']} stay as they are, "
+        f"{check['leftAlone']} are left alone."
+    )
+
+
+def commit_gate(connection, *, tenant_id: str) -> dict[str, Any]:
+    """May an Apply run start? Only on top of a COMPLETE check run of the
+    Project started within the last 24 hours, with no run that changes
+    Journey data (an Apply, or the old Run SKU Resolution) started since.
+    A check that had errors or Journeys it did not process does not block;
+    the numbers are returned for the response to state. Returns the check
+    summary; raises ``CommitNotAllowed`` otherwise."""
+    check = connection.execute(
+        text(
+            f"""
+            SELECT * FROM auditcore.sku_resolution_runs
+            WHERE tenant_id = :t AND run_mode = '{RECHECK_DRY_RUN}' AND status = 'COMPLETE'
+              AND started_at_utc > now() - make_interval(hours => {CHECK_VALID_HOURS})
+            ORDER BY started_at_utc DESC LIMIT 1
+            """
+        ),
+        {"t": tenant_id},
+    ).mappings().one_or_none()
+    if check is None:
+        last = connection.execute(
+            text(f"SELECT *, started_at_utc > now() - make_interval(hours => {CHECK_VALID_HOURS}) AS recent "
+                 f"FROM auditcore.sku_resolution_runs WHERE tenant_id = :t AND run_mode = '{RECHECK_DRY_RUN}' "
+                 "ORDER BY started_at_utc DESC LIMIT 1"),
+            {"t": tenant_id},
+        ).mappings().one_or_none()
+        if last is None:
+            message = "There is no completed check of this Project's SKUs. Run \"Check SKUs\" first, review it, then Apply."
+            code = "NO_CHECK_RUN"
+        elif last["status"] != "COMPLETE" and last["recent"]:
+            message = "The latest check of this Project's SKUs has not finished. Let it finish (or run it again), then Apply."
+            code = "CHECK_RUN_NOT_COMPLETE"
+        else:
+            message = (f"The last completed check was run on {last['started_at_utc']:%d %b %Y %H:%M} UTC, more than "
+                       f"{CHECK_VALID_HOURS} hours ago. Run \"Check SKUs\" again, then Apply.")
+            code = "CHECK_RUN_TOO_OLD"
+        raise CommitNotAllowed({"code": code, "message": message,
+                                "check": _check_summary(connection, tenant_id=tenant_id, run=last) if last else None})
+    summary = _check_summary(connection, tenant_id=tenant_id, run=check)
+    later = connection.execute(
+        text(
+            f"""
+            SELECT run_id, run_mode, started_at_utc FROM auditcore.sku_resolution_runs
+            WHERE tenant_id = :t AND run_id <> :r AND started_at_utc >= :since AND {_DATA_CHANGING_RUN}
+            ORDER BY started_at_utc DESC LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "r": check["run_id"], "since": check["started_at_utc"]},
+    ).mappings().one_or_none()
+    if later is not None:
+        raise CommitNotAllowed({
+            "code": "DATA_CHANGED_SINCE_CHECK",
+            "message": (f"Another SKU run ({later['run_mode'] or 'RESOLVE'}, started {later['started_at_utc']:%d %b %Y %H:%M} UTC) "
+                        "has changed journey data since the check. Run \"Check SKUs\" again, review it, then Apply."),
+            "check": summary,
+        })
+    return summary
+
+
 def backfill_sku_resolution_for_tenant(
     engine: Engine, *, tenant_id: str, offset: int = 0, limit: int | None = None,
     run_id: UUID | None = None, actor_id: str | None = None, only_without_sku: bool = False,
-    recheck: str | None = None,
+    recheck: str | None = None, require_check: bool = False,
 ) -> dict[str, Any]:
     """Run SKU resolution (booking model/price match, then the Delivery-invoice fallback) for
     the Project's Journeys, in a stable order, ``limit`` at a time starting at ``offset`` (all of
@@ -351,20 +539,39 @@ def backfill_sku_resolution_for_tenant(
                 {"tenant_id": tenant_id, "offset": offset, "limit": limit},
             ).scalars().all()
         )
+        check: dict[str, Any] | None = None
+        check_run_id: UUID | None = None
         if run_id is None:
+            # One run is started at a time per Project, so the Apply gate and
+            # the run row are decided together.
+            connection.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": f"sku-run:{tenant_id}"})
+            if recheck == RECHECK_COMMIT and require_check:
+                check = commit_gate(connection, tenant_id=tenant_id)
+                check_run_id = check["runId"]
             run_id = connection.execute(
                 text(
                     """
                     INSERT INTO auditcore.sku_resolution_runs
-                      (tenant_id, started_by_actor_id, journeys_total, run_mode)
-                    VALUES (:t, :actor, :total, :mode) RETURNING run_id
+                      (tenant_id, started_by_actor_id, journeys_total, run_mode, checked_by_run_id)
+                    VALUES (:t, :actor, :total, :mode, :check) RETURNING run_id
                     """
                 ),
-                {"t": tenant_id, "actor": actor_id, "total": journeys_total, "mode": recheck or "RESOLVE"},
+                {"t": tenant_id, "actor": actor_id, "total": journeys_total, "mode": recheck or "RESOLVE",
+                 "check": check_run_id},
             ).scalar_one()
             first_batch = True
         else:
             first_batch = False
+            check_run_id = connection.execute(
+                text("SELECT checked_by_run_id FROM auditcore.sku_resolution_runs WHERE tenant_id=:t AND run_id=:r"),
+                {"t": tenant_id, "r": run_id},
+            ).scalar_one_or_none()
+            if check_run_id is not None:
+                linked = connection.execute(
+                    text("SELECT * FROM auditcore.sku_resolution_runs WHERE tenant_id=:t AND run_id=:r"),
+                    {"t": tenant_id, "r": check_run_id},
+                ).mappings().one_or_none()
+                check = _check_summary(connection, tenant_id=tenant_id, run=linked) if linked else None
     if first_batch:
         with_before, _ = _sku_counts(engine, tenant_id=tenant_id)
         with engine.begin() as connection:
@@ -391,27 +598,24 @@ def backfill_sku_resolution_for_tenant(
                     continue
                 if recheck is not None and booking_cancelled(connection, tenant_id=tenant_id,
                                                              journey_id=journey_id):
-                    _record_item(
-                        connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id,
-                        label=before.get("journey_label"), model_label=before.get("model_label"),
-                        outcome="ALREADY_HAD_SKU" if before.get("has_sku") else "STILL_UNMATCHED",
-                        sku_code=before.get("sku_code"),
-                        detail="Booking cancelled, duplicate or closed with no delivery: not re-checked",
+                    _left_alone_item(
+                        connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id, before=before,
+                        reason="booking_cancelled", commit=recheck == RECHECK_COMMIT,
+                        why="Booking cancelled, duplicate or closed with no delivery: not re-checked",
                     )
                     continue
                 if recheck is not None and before.get("review_completed"):
                     # A Journey whose review is complete is not re-checked:
                     # its SKU (and the standards priced on it) stay as reviewed.
-                    _record_item(
-                        connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id,
-                        label=before.get("journey_label"), model_label=before.get("model_label"),
-                        outcome="ALREADY_HAD_SKU" if before.get("has_sku") else "STILL_UNMATCHED",
-                        sku_code=before.get("sku_code"), detail="Review completed: not re-checked",
+                    _left_alone_item(
+                        connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id, before=before,
+                        reason="review_completed", commit=recheck == RECHECK_COMMIT,
+                        why="Review completed: not re-checked",
                     )
                     continue
                 if recheck is not None:
                     _recheck_item(connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id,
-                                  before=before, commit=recheck == RECHECK_COMMIT)
+                                  before=before, commit=recheck == RECHECK_COMMIT, check_run_id=check_run_id)
                     continue
                 step_error = None
                 reasons: list[str] = []
@@ -502,6 +706,9 @@ def backfill_sku_resolution_for_tenant(
         "withSkuBefore": int(run["with_sku_before"]),
         "withSkuAfter": with_after,
         "withoutSkuAfter": without_after,
+        "runMode": recheck or "RESOLVE",
+        "checkedByRunId": check_run_id,
+        "check": check,
     }
 
 
@@ -545,6 +752,12 @@ class SkuResolutionBackfillResult(BaseModel):
     withSkuBefore: int
     withSkuAfter: int
     withoutSkuAfter: int
+    runMode: str = "RESOLVE"
+    checkedByRunId: UUID | None = None
+    # An Apply run: the numbers of the check it applies (errors, Journeys not
+    # checked), so the response states them.
+    check: dict[str, Any] | None = None
+    checkNote: str | None = None
 
 
 class SkuResolutionRunSummary(BaseModel):
@@ -560,6 +773,11 @@ class SkuResolutionRunSummary(BaseModel):
     failed: int
     withSkuBefore: int
     withSkuAfter: int
+    runMode: str = "RESOLVE"
+    checkedByRunId: UUID | None = None
+    # Check and Apply runs: Journeys per review group (CHANGE, CONFIRM, KEEP,
+    # LEFT_ALONE, FAILED).
+    actionCounts: dict[str, int] = {}
 
 
 class SkuResolutionRunItem(BaseModel):
@@ -569,6 +787,10 @@ class SkuResolutionRunItem(BaseModel):
     outcome: str
     skuCode: str | None
     detail: str | None
+    # Check and Apply runs: the full decision for the Journey (old and proposed
+    # SKU and basis, action, the documents' words and prices, why, tasks, and for
+    # an Apply the action actually taken).
+    proposal: dict[str, Any] | None = None
 
 
 class SkuResolutionRunDetail(SkuResolutionRunSummary):
@@ -584,7 +806,11 @@ def _run_summary(row) -> dict[str, Any]:
         "newlyMatched": row["newly_matched"], "alreadyHadSku": row["already_had_sku"],
         "stillUnmatched": row["still_unmatched"], "failed": row["failed"],
         "withSkuBefore": row["with_sku_before"], "withSkuAfter": row["with_sku_after"],
+        "runMode": row["run_mode"] or "RESOLVE", "checkedByRunId": row["checked_by_run_id"],
     }
+
+
+SKU_RUN_MODES = ("RESOLVE", RECHECK_DRY_RUN, RECHECK_COMMIT)
 
 
 @router.post("/sku-resolution", response_model=SkuResolutionBackfillResult)
@@ -595,14 +821,68 @@ def backfill_sku_resolution(
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=25)] = 3,
     runId: UUID | None = None,
+    mode: Annotated[Literal["RESOLVE", "RERESOLVE_DRY_RUN", "RERESOLVE_COMMIT"] | None, Query(
+        description="RESOLVE (the default): resolve Journeys without a SKU, as before. RERESOLVE_DRY_RUN "
+                    "(\"Check SKUs\"): re-check every Journey and record what would change; writes no Journey data. "
+                    "RERESOLVE_COMMIT (\"Apply\"): write those decisions; refused with 409 unless a complete check "
+                    "run of the Project started in the last 24 hours and no run has changed Journey data since. "
+                    "With runId the run's own mode applies.")] = None,
 ) -> SkuResolutionBackfillResult:
     """One batch of Journeys; repeat with ``nextOffset`` (and the returned ``runId``) until it is null."""
-    return SkuResolutionBackfillResult.model_validate(
-        backfill_sku_resolution_for_tenant(
+    run_mode = mode or "RESOLVE"
+    if runId is not None:
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            stored = connection.execute(
+                text("SELECT run_mode FROM auditcore.sku_resolution_runs WHERE tenant_id=:t AND run_id=:r"),
+                {"t": tenant_id, "r": runId},
+            ).mappings().one_or_none()
+        if stored is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        stored_mode = stored["run_mode"] or "RESOLVE"
+        if mode is not None and mode != stored_mode:
+            raise HTTPException(
+                status_code=409, detail=f"Run {runId} is a {stored_mode} run; it cannot be continued as {mode}.")
+        run_mode = stored_mode
+    try:
+        result = backfill_sku_resolution_for_tenant(
             engine, tenant_id=tenant_id, offset=offset, limit=limit, run_id=runId,
-            actor_id=admin_request.user_id,
+            actor_id=admin_request.user_id, recheck=None if run_mode == "RESOLVE" else run_mode,
+            require_check=True,
         )
-    )
+    except CommitNotAllowed as refused:
+        # The error handler keeps only a string detail, so the numbers are in the words;
+        # GET /sku-resolution/apply-check returns them structured.
+        raise HTTPException(
+            status_code=409,
+            detail=" ".join(p for p in (refused.detail["message"], check_numbers_text(refused.detail.get("check"))) if p),
+        ) from refused
+    return SkuResolutionBackfillResult.model_validate({**result, "checkNote": check_numbers_text(result.get("check"))})
+
+
+class SkuApplyCheck(BaseModel):
+    allowed: bool
+    code: str
+    message: str
+    check: dict[str, Any] | None = None
+
+
+@router.get("/sku-resolution/apply-check", response_model=SkuApplyCheck)
+def sku_apply_check(
+    tenant_id: str,
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    engine: Annotated[Engine, Depends(get_engine)],
+) -> dict[str, Any]:
+    """Whether Apply (RERESOLVE_COMMIT) would be allowed now, and on which check run, with its numbers."""
+    del admin_request
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        try:
+            check = commit_gate(connection, tenant_id=tenant_id)
+        except CommitNotAllowed as refused:
+            return {"allowed": False, "code": refused.detail["code"], "message": refused.detail["message"],
+                    "check": refused.detail.get("check")}
+    return {"allowed": True, "code": "OK", "message": check_numbers_text(check), "check": check}
 
 
 @router.get("/sku-resolution/runs", response_model=list[SkuResolutionRunSummary])
@@ -622,7 +902,8 @@ def list_sku_resolution_runs(
             ),
             {"t": tenant_id},
         ).mappings().all()
-    return [_run_summary(r) for r in rows]
+        counts = _group_counts(connection, tenant_id=tenant_id, run_ids=[r["run_id"] for r in rows])
+    return [{**_run_summary(r), "actionCounts": counts.get(r["run_id"], {})} for r in rows]
 
 
 @router.get("/sku-resolution/runs/{run_id}", response_model=SkuResolutionRunDetail)
@@ -645,7 +926,7 @@ def get_sku_resolution_run(
         items = connection.execute(
             text(
                 """
-                SELECT journey_id, journey_label, model_label, outcome, sku_code, detail
+                SELECT journey_id, journey_label, model_label, outcome, sku_code, detail, proposal
                 FROM auditcore.sku_resolution_run_items WHERE tenant_id=:t AND run_id=:r
                 ORDER BY CASE outcome WHEN 'FAILED' THEN 0 WHEN 'STILL_UNMATCHED' THEN 1
                                       WHEN 'NEWLY_MATCHED' THEN 2 ELSE 3 END, journey_label
@@ -653,11 +934,13 @@ def get_sku_resolution_run(
             ),
             {"t": tenant_id, "r": run_id},
         ).mappings().all()
+        counts = _group_counts(connection, tenant_id=tenant_id, run_ids=[run_id])
     return {
         **_run_summary(run),
+        "actionCounts": counts.get(run_id, {}),
         "items": [
             {"journeyId": i["journey_id"], "journeyLabel": i["journey_label"], "modelLabel": i["model_label"],
-             "outcome": i["outcome"], "skuCode": i["sku_code"], "detail": i["detail"]}
+             "outcome": i["outcome"], "skuCode": i["sku_code"], "detail": i["detail"], "proposal": i["proposal"]}
             for i in items
         ],
     }

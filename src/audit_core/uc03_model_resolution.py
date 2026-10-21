@@ -1771,7 +1771,8 @@ def _proposal(ev: dict[str, Any], state: dict[str, Any], plan: dict[str, Any]) -
     offered = (reading or {}).get("exShowroom")
     new_sku = row["sku_code"] if row is not None else state.get("sku_code") if action in {
         "KEEP", "KEEP_HUMAN", "UNCONFIRMED"} else None
-    return {
+    invoices = ev.get("invoices") or []
+    proposal = {
         "action": action,
         "oldSku": state.get("sku_code"), "oldBasis": state.get("match_basis"),
         "proposedSku": new_sku, "proposedBasis": basis if new_sku else None,
@@ -1782,7 +1783,48 @@ def _proposal(ev: dict[str, Any], state: dict[str, Any], plan: dict[str, Any]) -
         "documentExShowroom": str(offered) if offered is not None else None,
         "priceCheck": check, "why": plan.get("why") or plan.get("keepReason"), "skipped": plan.get("skipped"),
         "tasks": tasks,
+        # What each kind of document says on its own, so the product owner can
+        # read the booking form against the price list and the invoice.
+        "booking": _document_summary(ev.get("booking"), ev.get("bookingResult")),
+        "invoice": _document_summary(*invoices[0]) if invoices else None,
+        "invoiceCount": len(invoices),
+        "selectionStatus": state.get("selection_status"),
     }
+    proposal["group"] = proposal_group(proposal)
+    return proposal
+
+
+def _document_summary(reading: dict[str, Any] | None, result: Any) -> dict[str, Any] | None:
+    """One document's words, ex-showroom and the SKU its words name (if one)."""
+    if reading is None:
+        return None
+    row = getattr(result, "row", None) if result is not None and result.identified else None
+    master = _to_decimal((row or {}).get("master_ex_showroom"))
+    offered = reading.get("exShowroom")
+    return {
+        "documentType": reading.get("documentType"), "documentId": reading.get("documentId"),
+        "words": " / ".join(v for v in (reading.get("model"), reading.get("variant")) if v) or None,
+        "exShowroom": str(offered) if offered is not None else None,
+        "sku": row["sku_code"] if row is not None else None,
+        "masterExShowroom": str(master) if master is not None else None,
+    }
+
+
+def proposal_group(proposal: dict[str, Any]) -> str:
+    """Where a Journey sits in the product owner's review (exclusive, in this order):
+
+    LEFT_ALONE -- a SKU a PC or Team Lead set, a review that is complete, a
+                  cancelled booking, or nothing to read yet and nothing to ask;
+    CHANGE     -- the SKU will be set or replaced;
+    CONFIRM    -- the SKU stays (or there is none) and a PC task asks for a decision;
+    KEEP       -- the SKU stays and nothing is asked."""
+    action = proposal.get("action")
+    tasks = proposal.get("tasks") or []
+    if action in {"LEFT_ALONE", "KEEP_HUMAN"} or (action == "SKIP" and not tasks):
+        return "LEFT_ALONE"
+    if proposal.get("changes"):
+        return "CHANGE"
+    return "CONFIRM" if tasks else "KEEP"
 
 
 def _other_pc_question(ev: dict[str, Any], plan: dict[str, Any]) -> bool:
@@ -2821,6 +2863,7 @@ def recheck_model_resolution(
         proposal["noSkuGate"] = gate
         if gate != "DUE":
             proposal["tasks"] = []
+        proposal["group"] = proposal_group(proposal)
     if not commit:
         return {"dryRun": True, "proposal": proposal}
     result = _guarded(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
@@ -2949,6 +2992,7 @@ __all__ = [
     "invoice_ex_showroom",
     "is_human_decision",
     "journey_pricing_date",
+    "proposal_group",
     "reassign_confirmed_sku",
     "recheck_model_resolution",
     "sync_model_resolution",
