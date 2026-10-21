@@ -106,6 +106,7 @@ jobs:
           [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN secret is not configured.'; exit 1; }
           if ! railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json 2>/tmp/link.err; then
             cat /tmp/link.err >&2 || true
+            echo "::warning title=railway link::$(head -c 400 /tmp/link.err | tr '\n' ' ') | out: $(head -c 200 /tmp/link.json | tr '\n' ' ')"
             echo '::error::Could not link the approved Railway project/service to environment dev.'
             exit 1
           fi
