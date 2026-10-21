@@ -267,7 +267,15 @@ def _scheme_rows(connection: Connection, *, tenant_id: str, model_id: UUID, vari
         ),
         {"t": tenant_id, "model_id": model_id, "variant_id": variant_id, "on": on},
     ).mappings().all()
-    return [dict(r) for r in rows]
+    # 2026-10-20 (review of PR 472, S9): the same skip as the deal's
+    # reconciliation -- a model-level row stored for named variants the price
+    # list did not carry is not an offer on this variant.
+    return [
+        dict(r) for r in rows
+        if not (r["variant_id"] is None and (
+            (r["criteria"] or {}).get("scope") == "UNRESOLVED" or (r["criteria"] or {}).get("unresolvedVariantTexts")
+        ))
+    ]
 
 
 def _benefit(row: dict[str, Any]) -> dict[str, Any]:

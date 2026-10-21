@@ -240,6 +240,18 @@ CONDITIONAL_DISCOUNT_LABEL: dict[str, str] = {
     "SCRAPPAGE_BONUS_COD": "scrappage_discount",
 }
 
+# 2026-10-20 product owner rules (review of PR 472, B1/B3): the entitlement
+# states that mean "not known", never "not entitled". A discount given under
+# one has no standard: the Deal sheet takes it as given (so it is no
+# variance) and the over-grant check leaves it out, while a task says why.
+ENTITLEMENT_UNKNOWN_RESULTS: frozenset[str] = frozenset({
+    "MASTER_UNMATCHED",          # the master row's wording is not mapped to the price list
+    "OUT_OF_GRID_SCOPE",         # the dealer grid line is outside the discount control program
+    "NOT_EVALUATED",             # no SKU / pricing date / price list in force: not reconciled
+    "SCHEME_NOT_IN_FORCE",       # no bulletin in force on the pricing date
+    "NEEDS_CORPORATE_EVIDENCE",  # the corporate category is still to be confirmed
+})
+
 # OEM scheme_category -> the canonical discount keys it can grant.  Used to pick
 # which applicable scheme's benefit backs a given canonical discount key.
 SCHEME_CATEGORY_DISCOUNT_KEYS: dict[str, frozenset[str]] = {
@@ -266,6 +278,7 @@ __all__ = [
     "CONDITIONAL_DISCOUNT_LABEL",
     "DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY",
     "DISCOUNT_ACTUAL_FIELD_TO_CANONICAL_KEY",
+    "ENTITLEMENT_UNKNOWN_RESULTS",
     "LEGACY_DISCOUNT_KEY_TO_CANONICAL",
     "PRICE_COMPONENT_TO_COMMERCIAL_KEY",
     "SCHEME_CATEGORY_DISCOUNT_KEYS",

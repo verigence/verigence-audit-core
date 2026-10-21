@@ -59,6 +59,7 @@ from audit_core.oem_master_parsers import (
     split_model_cell,
     variant_excluded,
     variant_key,
+    variant_loose_key,
 )
 from audit_core.price_lists import (
     create_price_list,
@@ -1229,26 +1230,55 @@ _VARIANT_GROUP_TESTS: dict[str, Any] = {
 }
 
 
+def _variant_group_key(value: str | None) -> str:
+    """A model wording squashed for the variant-group tests, with a trailing
+    "+" read as PLUS ("BOLERO NEO+" is the Neo Plus, never the Neo). Not the
+    model identity: that is ``price_list_model_key`` (#468), whose squash
+    drops the "+"; a wording goes through ``_plus_spelled`` before it."""
+    return _squash(_plus_spelled(value))
+
+
+def _plus_spelled(value: str | None) -> str:
+    """"BOLERO NEO+" -> "BOLERO NEO PLUS"; an inner "+" ("BOLERO+NEO", the
+    combined September model) is left as printed."""
+    return re.sub(r"(\w)\s*\+(?=\s|$|[)|/,])", r"\1 PLUS", value or "")
+
+
 def _variant_group(part: _ModelPart, model_name: str) -> str | None:
-    model = _squash(model_name)
-    words = part.raw.upper()
-    if model == "THEBOSSBOLEROPLUSNEO":
-        if "PLUS" in words or "+" in part.raw:
+    """The group of a combined model's variants the wording names, or None
+    for the whole model (2026-10-20 product owner rules)."""
+    identity = price_list_model_key(model_name)
+    words = _variant_group_key(part.raw)
+    if identity == "THEBOSSBOLERONEO":
+        # Only a database the Bolero split (0151) has not reached still
+        # carries variants on the combined model.
+        if "BOSS" in words:
+            return None
+        if "NEOPLUS" in words:
             return "BOLERO_NEO_PLUS"
         if "NEO" in words:
             return "BOLERO_NEO"
         if "BOLERO" in words:
             return "BOLERO"
-    if model == "PICKUP":
-        if "CAMPER" in words:
+    if identity == "PICKUP":
+        upper = part.raw.upper()
+        if "CAMPER" in upper:
             return "CAMPER"
-        if re.search(r"PICK\s*-?\s*UP|PIK\s*-?\s*UP", words):
+        if re.search(r"PICK\s*-?\s*UP|PIK\s*-?\s*UP", upper):
             return "PICKUP"
-    if model.startswith("XUV3XO") and not is_ev_model_text(model_name) and "REVX" in part.base.upper():
+    if identity.startswith("XUV3XO") and not is_ev_model_text(model_name) and "REVX" in part.base.upper():
         return "REVX"
-    if model == "MAXXHD" and re.search(r"\b2\.0", part.base):
+    if identity == "MAXXHD" and re.search(r"\b2\.0", part.base):
         return "MAXX_HD_2_0"
     return None
+
+
+def grid_variant_group(model_alias: str | None, model_name: str) -> str | None:
+    """The variant group a grid line's own wording names ("Camper", "MAXX HD
+    2.0"), for a line stored before the group was recorded on it."""
+    base, qualifiers = parse_model_qualifiers(model_alias or "")
+    return _variant_group(_ModelPart(raw=model_alias or "", base=base, canonical=None, qualifiers=qualifiers),
+                          model_name)
 
 
 def variant_in_group(group: str | None, variant_name: str) -> bool:
@@ -1270,32 +1300,78 @@ class _Target:
         return _slug_model(self.model_name) + (f"_{self.group}" if self.group else "")
 
 
+def _scheme_identity_keys(wording: str | None) -> list[str]:
+    """The model identities a scheme's wording can name, most literal first.
+
+    #468 owns model identity (``price_list_model_key`` /
+    ``model_identity_keys``); a bulletin is read through it with one
+    difference of order: the squashed wording comes before the spelling
+    alias, because "SCORPIO-N" in the September bulletin is September's
+    Scorpio N while the alias reads it as October's new one. The book in
+    force on the scheme's date then says which of them the words mean."""
+    spelled = _plus_spelled(wording)
+    squashed = _squash(spelled)
+    keys = [_MODEL_IDENTITY_BY_KEY.get(squashed, squashed), *model_identity_keys(spelled)]
+    for key in list(keys):
+        if key in _SUCCESSOR_IDENTITY:
+            keys.append(_SUCCESSOR_IDENTITY[key])
+    if keys and keys[0] == "THEBOSSBOLERONEO":
+        # The combined September model is the three models since 0151.
+        keys.extend(["BOLERO", "BOLERONEO", "BOLERONEOPLUS"])
+    return [k for i, k in enumerate(keys) if k and k not in keys[:i]]
+
+
+_REFRESH_RE = re.compile(r"\bREFRESH\b", re.IGNORECASE)
+
+
 def _model_targets(
     models: list[tuple[str, UUID, list[tuple[str, UUID]]]],
     alias_map: dict[str, str],
     model_alias: str,
     extra_aliases: dict[str, str] | None = None,
+    *,
+    in_book: set[UUID] | None = None,
+    named_variants: bool = False,
 ) -> tuple[list[_Target], list[str], list[str], list[str]]:
     """The loaded models a scheme's model cell names: (targets, matched model
     names, parts nothing knows, parts known by name but not loaded).
 
-    The alias map canonicalises to the naming of the month it was seeded
-    in, and Mahindra renames models between bulletins: September's XUV3XO
-    is October's 'XUV 3XO', SCORPIO CLASSIC is 'SCORPIO', XEV9S is
-    'XEV 9S'. One rule: a model matches when its name, with spacing and
-    punctuation taken out, equals the canonical name OR the part's own
-    wording. The scheme version is dated, so an older row picking the new
-    month's offer up only ever answers for dates that offer stands on.
+    2026-10-20 product owner rules and the review of PR 472 (B4): a part
+    names the models whose identity (#468's ``price_list_model_key``) is one
+    its wording can mean (``_scheme_identity_keys``), tried on the part's own
+    words first and on its alias's canonical name only when they reach
+    nothing. ``in_book`` (the models the book in force on the scheme's date
+    prices) picks which identity a model-wide row means: the first one on
+    sale then. A row naming variants keeps every identity, and its variant
+    words decide. "including Refresh" adds the successor (the new Scorpio N
+    beside the Scorpio N). The scheme version is dated, so a row reaching a
+    model no longer sold only ever answers for dates that model is priced on.
     """
     aliases = {**alias_map, **{_norm(k): v for k, v in (extra_aliases or {}).items()}}
+    by_identity: dict[str, list[tuple[str, UUID, list[tuple[str, UUID]]]]] = {}
+    for entry in models:
+        by_identity.setdefault(price_list_model_key(entry[0]), []).append(entry)
     targets: list[_Target] = []
     matched: list[str] = []
     unknown: list[str] = []
     not_loaded: list[str] = []
     seen: set[tuple[UUID, str | None]] = set()
     for part in _model_parts(aliases, model_alias):
-        wanted = {_squash(name) for name in (part.canonical, part.base) if name and _squash(name)}
-        hits = [(name, model_id, variants) for name, model_id, variants in models if _squash(name) in wanted]
+        refresh = any(_REFRESH_RE.search(str(note)) for note in part.qualifiers.get("includes") or [])
+        hits: list[tuple[str, UUID, list[tuple[str, UUID]]]] = []
+        for wording in (part.base, part.canonical):
+            if not wording:
+                continue
+            keys = [k for k in _scheme_identity_keys(wording) if k in by_identity]
+            if not keys:
+                continue
+            if not (named_variants or refresh):
+                on_sale = [k for k in keys if in_book and any(m[1] in in_book for m in by_identity[k])]
+                first = on_sale[0] if on_sale else keys[0]
+                keys = [first] + [k for k in keys[1:] if first == "THEBOSSBOLERONEO"
+                                  and k in ("BOLERO", "BOLERONEO", "BOLERONEOPLUS")]
+            hits = [entry for k in keys for entry in by_identity[k]]
+            break
         if not hits:
             # Unreadable wording -- a leftover bracket, or a loaded model's
             # name followed by words nothing understood ("XUV 3XO EDGE & REVX
@@ -1310,6 +1386,8 @@ def _model_targets(
             (unknown if unreadable and not part.canonical else not_loaded).append(part.raw)
             continue
         for name, model_id, variants in hits:
+            if price_list_model_key(name) == "THEBOSSBOLERONEO" and not variants:
+                continue  # the combined model, emptied by the Bolero split
             group = _variant_group(part, name)
             if (model_id, group) in seen:
                 continue
@@ -1321,18 +1399,48 @@ def _model_targets(
     return targets, matched, unknown, not_loaded
 
 
+def _models_in_book(connection: Connection, *, tenant_id: str, effective_on: date) -> set[UUID] | None:
+    """The models the price master in force on a date prices (None: no book)."""
+    from audit_core.price_lists import find_effective_price_plan
+
+    plan = find_effective_price_plan(connection, tenant_id=tenant_id, effective_on=effective_on)
+    if plan is None:
+        return None
+    return {
+        row[0] for row in connection.execute(
+            text(
+                """
+                SELECT DISTINCT s.model_id FROM auditcore.price_list_items i
+                JOIN auditcore.product_skus s ON s.product_sku_id = i.product_sku_id
+                WHERE i.tenant_id = :t AND i.price_list_version_id = :v
+                """
+            ),
+            {"t": tenant_id, "v": plan["price_list_version_id"]},
+        ).all()
+    }
+
+
 def _match_variants(
     variant_texts: list[str], variants: list[tuple[str, UUID]]
 ) -> list[tuple[str, list[UUID]]]:
-    """Each named variant and the price-list variants it is, word for word.
+    """Each named variant and the price-list variants it is, word for word,
+    else by its distinguishing words (``variant_loose_key``).
 
     Matched on the name as two spellings share it (``variant_key``): without
     the "(Private)" / "(Commercial)" registration suffix, so "P10 BS6.2"
     reaches both registrations of that variant. Never a nearest guess."""
     by_key: dict[str, list[UUID]] = {}
+    by_loose: dict[str, list[UUID]] = {}
     for name, variant_id in variants:
         by_key.setdefault(variant_key(name), []).append(variant_id)
-    return [(raw, list(by_key.get(variant_key(raw), []))) for raw in variant_texts]
+        by_loose.setdefault(variant_loose_key(name), []).append(variant_id)
+    # 2026-10-20 (review of PR 472, B1): a name that differs from the price
+    # list's only by the emission norm, the "- E" / release markers, "(O)"
+    # for OPT or "& Mocha Interiors" is the same variant.
+    return [
+        (raw, list(by_key.get(variant_key(raw)) or by_loose.get(variant_loose_key(raw)) or []))
+        for raw in variant_texts
+    ]
 
 
 def _condition_code(qualifiers: dict[str, Any], config: dict[str, Any]) -> str:
@@ -1352,19 +1460,24 @@ def ingest_discount_document(
     effective_from: date,
     parsed: ParseResult,
     actor_id: str,
+    effective_to: date | None = None,
 ) -> dict[str, Any]:
     alias_map = _alias_map(connection, oem_code)
     models = _model_catalogue(connection, oem_id)
+    in_book = _models_in_book(connection, tenant_id=tenant_id, effective_on=effective_from)
     categories = _SCHEME_CATEGORY_BY_KIND[master_kind]
     summary: dict[str, Any] = {
         "published": 0, "tombstoned": 0, "unresolved": [], "unresolvedVariants": [], "warnings": [],
     }
+    effective_to = _valid_to(parsed, effective_from, effective_to, summary)
     live_codes: set[str] = set()
     blocking: list[str] = []
 
     for drow in parsed.discount_rows:
         offers = any(amount > 0 for _, amount in drow.benefits)
-        targets, matched_names, unknown, not_loaded = _model_targets(models, alias_map, drow.model_alias)
+        targets, matched_names, unknown, not_loaded = _model_targets(
+            models, alias_map, drow.model_alias, in_book=in_book, named_variants=bool(drow.variant_texts),
+        )
         # 2026-10-20 product owner rules (R4): an EV row reaches EV models
         # only, an ICE row ICE models only.
         category = drow.config.get("vehicleCategory")
@@ -1441,6 +1554,7 @@ def ingest_discount_document(
                 connection, "discount_scheme_versions", "discount_scheme_id", tenant_id, scheme_id
             ),
             effective_from=effective_from,
+            effective_to=effective_to,
             actor_id=actor_id,
         )
         for benefit_key, amount in drow.benefits:
@@ -1454,7 +1568,12 @@ def ingest_discount_document(
                 benefit_type="AMOUNT",
                 amount_value=amount,
             )
-        unmatched = [
+        # A named variant is unresolved only when no target model carries
+        # it: "Scorpio-N" rows reach the old and the new Scorpio N, and a
+        # variant on one of them is not an unmatched text of the other.
+        unmatched = [_unmatched_texts(target, drow) for target in targets]
+        nowhere = [t for t in (unmatched[0] if unmatched else []) if all(t in other for other in unmatched[1:])]
+        for target in targets:
             _add_eligibility(
                 connection,
                 tenant_id=tenant_id,
@@ -1462,9 +1581,8 @@ def ingest_discount_document(
                 target=target,
                 drow=drow,
                 summary=summary,
+                unresolved_texts=nowhere,
             )
-            for target in targets
-        ]
         _report_unresolved(summary, drow, unmatched, [t.model_name for t in targets])
         publish_discount_scheme_version(
             connection, tenant_id=tenant_id, discount_scheme_version_id=version_id, actor_id=actor_id
@@ -1487,7 +1605,15 @@ def ingest_discount_document(
         effective_from=effective_from,
         actor_id=actor_id,
     )
+    summary["mappingTasksClosed"] = _close_superseded_master_tasks(connection, tenant_id=tenant_id)
     return summary
+
+
+def _close_superseded_master_tasks(connection: Connection, *, tenant_id: str) -> int:
+    # imported here: the reconciliation module imports this one lazily too
+    from audit_core.uc03_deal_reconciliation import close_superseded_master_tasks
+
+    return close_superseded_master_tasks(connection, tenant_id=tenant_id)
 
 
 def _ensure_scheme(
@@ -1517,6 +1643,7 @@ def _add_eligibility(
     summary: dict[str, Any],
     customer_type: str | None = None,
     extra_criteria: dict[str, Any] | None = None,
+    unresolved_texts: list[str] | None = None,
 ) -> list[str]:
     """Who a scheme version applies to on one model; returns the named
     variants this model does not carry (the caller reports those no target
@@ -1576,6 +1703,8 @@ def _add_eligibility(
 
     matches = _match_variants(texts, pool)
     unmatched = [raw for raw, ids in matches if not ids]
+    if unresolved_texts is not None:
+        unmatched = [raw for raw in unmatched if raw in unresolved_texts]
     for raw, ids in matches:
         for variant_id in ids:
             insert(variant_id, {"scope": "VARIANT", "variantText": raw})
@@ -1583,6 +1712,39 @@ def _add_eligibility(
         insert(None, {"scope": "UNRESOLVED", "unresolvedVariantTexts": unmatched,
                       "variantTexts": texts})
     return unmatched
+
+
+def _target_pool(target: _Target, drow: Any) -> tuple[list[tuple[str, UUID]], list[str]]:
+    excluded = list(target.qualifiers.get("excludedVariantTexts") or [])
+    pool = [(name, vid) for name, vid in target.variants
+            if variant_in_group(target.group, name) and not variant_excluded(name, excluded)]
+    texts = [] if target.qualifiers.get("allVariants") else list(drow.variant_texts)
+    return pool, texts
+
+
+def _unmatched_texts(target: _Target, drow: Any) -> list[str]:
+    """The named variants this target model does not carry (pure)."""
+    pool, texts = _target_pool(target, drow)
+    if not texts:
+        return [f"{target.group} variants of {target.model_name}"] if target.group and not pool else []
+    return [raw for raw, ids in _match_variants(texts, pool) if not ids]
+
+
+def _valid_to(parsed: ParseResult, effective_from: date, effective_to: date | None,
+              summary: dict[str, Any]) -> date | None:
+    """The last day a scheme upload stands on (2026-10-20 product owner
+    rules, R5; the review of PR 472, S1): as entered, else the validity the
+    bulletin prints ("valid from 3rd Sept'26 to 30th Sept'26"; a monthly
+    bulletin its month), so September's schemes never answer for October."""
+    if effective_to is None:
+        effective_to = parsed.effective_to_hint
+    if effective_to is not None and effective_to < effective_from:
+        summary["warnings"].append(
+            f"The document says it is valid to {effective_to.isoformat()}, before the effective date "
+            f"{effective_from.isoformat()} applied; no end date set."
+        )
+        return None
+    return effective_to
 
 
 def _report_unresolved(summary: dict[str, Any], drow: Any, per_target: list[list[str]], models: list[str]) -> None:
@@ -1708,6 +1870,7 @@ def ingest_corporate_policy(
     parsed: ParseResult,
     upload_id: UUID,
     actor_id: str,
+    effective_to: date | None = None,
 ) -> dict[str, Any]:
     """One scheme per (privilege category, model and variant group).
 
@@ -1718,14 +1881,16 @@ def ingest_corporate_policy(
     competing versions of one."""
     alias_map = _alias_map(connection, oem_code)
     models = _model_catalogue(connection, oem_id)
+    in_book = _models_in_book(connection, tenant_id=tenant_id, effective_on=effective_from)
     summary: dict[str, Any] = {
         "published": 0, "tombstoned": 0, "unresolved": [], "unresolvedVariants": [], "warnings": [], "companies": 0,
     }
+    effective_to = _valid_to(parsed, effective_from, effective_to, summary)
     live_codes: set[str] = set()
     blocking: list[str] = []
 
     for brow in parsed.corporate_benefits:
-        targets, _, unknown, not_loaded = _model_targets(models, alias_map, brow.brand_alias)
+        targets, _, unknown, not_loaded = _model_targets(models, alias_map, brow.brand_alias, in_book=in_book)
         if unknown:
             blocking.append(f"corporate {brow.privilege_category}: no model for {unknown} in '{brow.brand_alias}'")
         for part in not_loaded:
@@ -1769,6 +1934,7 @@ def ingest_corporate_policy(
                     connection, "discount_scheme_versions", "discount_scheme_id", tenant_id, scheme_id
                 ),
                 effective_from=effective_from,
+                effective_to=effective_to,
                 actor_id=actor_id,
             )
             add_discount_benefit(
@@ -1832,8 +1998,51 @@ def ingest_corporate_policy(
             for company in parsed.corporate_companies
         ],
     )
+    _insert_registry_entries(
+        connection, tenant_id=tenant_id, oem_code=oem_code, upload_id=upload_id,
+        effective_from=effective_from, companies=parsed.corporate_companies,
+    )
     summary["companies"] = len(parsed.corporate_companies)
+    summary["mappingTasksClosed"] = _close_superseded_master_tasks(connection, tenant_id=tenant_id)
     return summary
+
+
+def _insert_registry_entries(
+    connection: Connection, *, tenant_id: str, oem_code: str, upload_id: UUID, effective_from: date,
+    companies: list[Any], chunk_size: int = 500,
+) -> None:
+    """2026-10-20 product owner rules (R5; review of PR 472, S5): the
+    corporate list a deal is categorised by is the tenant's own upload in
+    force on the deal's pricing date -- every upload is kept under its date,
+    so a later list never re-categorises an earlier deal."""
+    deduped = {company.corporate_code[:60]: company for company in companies}
+    rows = [
+        {
+            "tenant_id": tenant_id, "oem_code": oem_code, "source_upload_id": upload_id,
+            "effective_from": effective_from, "corporate_code": code,
+            "corporate_name": company.corporate_name[:400],
+            "corporate_type": (company.corporate_type or None) and company.corporate_type[:200],
+            "privilege_category": company.privilege_category,
+        }
+        for code, company in deduped.items()
+    ]
+    columns = ["tenant_id", "oem_code", "source_upload_id", "effective_from", "corporate_code",
+               "corporate_name", "corporate_type", "privilege_category"]
+    for start in range(0, len(rows), chunk_size):
+        chunk = rows[start: start + chunk_size]
+        params: dict[str, Any] = {}
+        values_sql: list[str] = []
+        for i, row in enumerate(chunk):
+            for col in columns:
+                params[f"{col}_{i}"] = row[col]
+            values_sql.append("(" + ", ".join(f":{col}_{i}" for col in columns) + ")")
+        connection.execute(
+            text(
+                f"INSERT INTO auditcore.corporate_registry_entries ({', '.join(columns)}) "
+                f"VALUES {', '.join(values_sql)} ON CONFLICT DO NOTHING"
+            ),
+            params,
+        )
 
 
 
@@ -1931,6 +2140,7 @@ def ingest_discount_grid(
     so the grid line for a deal is the one for its variant."""
     alias_map = _alias_map(connection, oem_code)
     models = _model_catalogue(connection, oem_id)
+    in_book = _models_in_book(connection, tenant_id=tenant_id, effective_on=effective_from)
     summary: dict[str, Any] = {"published": 0, "resolved": 0, "unresolved": [], "warnings": [], "parameters": len(parsed.grid_parameters)}
     version_no = int(connection.execute(
         text("SELECT COALESCE(MAX(version_no), 0) + 1 FROM auditcore.dealer_discount_grid_versions WHERE tenant_id = :t"),
@@ -1955,7 +2165,7 @@ def ingest_discount_grid(
     for grow in parsed.grid_rows:
         for alias in grow.model_aliases:
             targets, _, _unknown, _not_loaded = _model_targets(
-                models, alias_map, alias, extra_aliases=_GRID_MODEL_ALIASES
+                models, alias_map, alias, extra_aliases=_GRID_MODEL_ALIASES, in_book=in_book,
             )
             if not targets:
                 summary["unresolved"].append(f"grid row {grow.row_no}: model '{alias}' is not in the catalogue yet")
@@ -1987,21 +2197,13 @@ def ingest_discount_grid(
     )
     summary["published"] = len(rows)
     summary["gridVersionId"] = str(version_id)
+    summary["mappingTasksClosed"] = _close_superseded_master_tasks(connection, tenant_id=tenant_id)
     return summary
 
 
-def grid_row_for_model(
-    connection: Connection, *, tenant_id: str, model_id: UUID, effective_on: date,
-    variant_name: str | None = None,
-) -> dict[str, Any] | None:
-    """The grid line for a model from the grid version standing on a date.
-
-    2026-10-20 product owner rules (R5): only the grid in force on the date
-    answers -- a model the October grid leaves out has no October line, it
-    does not fall back to September's. Where a model has several lines
-    (Camper and Pick-Up, MAXX HD and MAXX HD 2.0) the line whose variant
-    group holds the deal's variant wins over the model's general line."""
-    version = connection.execute(
+def grid_version_for_date(connection: Connection, *, tenant_id: str, effective_on: date) -> dict[str, Any] | None:
+    """The dealer discount grid version standing on a date, or None."""
+    row = connection.execute(
         text(
             """
             SELECT grid_version_id, version_no, effective_from, effective_to, parameters
@@ -2014,15 +2216,45 @@ def grid_row_for_model(
         ),
         {"t": tenant_id, "on": effective_on},
     ).mappings().first()
+    return dict(row) if row is not None else None
+
+
+def _grid_alias_identity(alias: str | None) -> str:
+    base, _ = parse_model_qualifiers(alias or "")
+    mapped = _GRID_MODEL_ALIASES.get(re.sub(r"\s+", " ", base.strip().upper()), base)
+    return price_list_model_key(mapped)
+
+
+def grid_row_for_model(
+    connection: Connection, *, tenant_id: str, model_id: UUID, effective_on: date,
+    variant_name: str | None = None,
+) -> dict[str, Any] | None:
+    """The grid line for a model from the grid version standing on a date.
+
+    2026-10-20 product owner rules (R5): only the grid in force on the date
+    answers -- a model the October grid leaves out has no October line, it
+    does not fall back to September's. Where a model has several lines
+    (Camper and Pick-Up, MAXX HD and MAXX HD 2.0) the line whose variant
+    group holds the deal's variant wins over the model's general line, and
+    a line for another group never answers (a Pick-Up never takes the
+    Camper line). A line stored before its model resolved (no model) is
+    read by its wording -- the grid's own spellings ("3XO", "MAXX") -- and
+    a line stored without its group gets the group its wording names
+    (review of PR 472, B1)."""
+    version = grid_version_for_date(connection, tenant_id=tenant_id, effective_on=effective_on)
     if version is None:
         return None
+    model_name = connection.execute(
+        text("SELECT model_name FROM auditcore.product_models WHERE model_id = :m"), {"m": model_id},
+    ).scalar_one_or_none()
+    identity = price_list_model_key(model_name) if model_name else None
     rows = connection.execute(
         text(
             """
-            SELECT r.grid_row_id, r.model_alias, r.in_scope, r.booking_protection_days, r.agreed_buffer_amount,
-                   r.insurance_od_percent, r.out_of_territory_amount, r.raw
+            SELECT r.grid_row_id, r.model_alias, r.model_id, r.in_scope, r.booking_protection_days,
+                   r.agreed_buffer_amount, r.insurance_od_percent, r.out_of_territory_amount, r.raw
             FROM auditcore.dealer_discount_grid_rows r
-            WHERE r.tenant_id = :t AND r.grid_version_id = :v AND r.model_id = :model_id
+            WHERE r.tenant_id = :t AND r.grid_version_id = :v AND (r.model_id = :model_id OR r.model_id IS NULL)
             ORDER BY r.model_alias, r.grid_row_id
             """
         ),
@@ -2031,8 +2263,12 @@ def grid_row_for_model(
     specific: list[dict[str, Any]] = []
     general: list[dict[str, Any]] = []
     for row in rows:
+        if row["model_id"] is None and (identity is None or _grid_alias_identity(row["model_alias"]) != identity):
+            continue
         raw = row["raw"] if isinstance(row["raw"], dict) else json.loads(row["raw"] or "{}")
         group = raw.get("variantGroup")
+        if group is None and model_name:
+            group = grid_variant_group(row["model_alias"], model_name)
         if group is None:
             general.append(dict(row))
         elif variant_name is not None and variant_in_group(group, variant_name):
@@ -2040,7 +2276,8 @@ def grid_row_for_model(
     chosen = (specific or general or [None])[0]
     if chosen is None:
         return None
-    return {**dict(version), **chosen}
+    chosen.pop("model_id", None)
+    return {**version, **chosen}
 
 
 

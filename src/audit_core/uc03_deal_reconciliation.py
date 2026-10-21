@@ -56,6 +56,7 @@ from audit_core.uc03_masters_alignment import (
     CONDITIONAL_DISCOUNT_EVIDENCE_DOCUMENT,
     CONDITIONAL_DISCOUNT_LABEL,
     DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY,
+    SCHEME_CATEGORY_DISCOUNT_KEYS,
     canonical_discount_key,
     commercial_key_for_price_component,
     registration_basis,
@@ -67,7 +68,7 @@ from audit_core.uc03_sku_candidates import (
     sync_price_master_in_force_task,
     sync_sku_in_price_master_task,
 )
-from audit_core.workflow import create_workflow_task
+from audit_core.workflow import cancel_workflow_task, create_workflow_task
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +113,8 @@ def _context(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
                    cu.customer_type_code,
                    cu.display_name AS customer_name,
                    rr.registration_type_code,
-                   o.oem_code
+                   o.oem_code,
+                   to_jsonb(jp) ->> 'match_basis' AS match_basis
             FROM auditcore.journey_products jp
             JOIN auditcore.product_skus s ON s.product_sku_id = jp.product_sku_id
             LEFT JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id
@@ -301,6 +303,7 @@ def _materialize_price_standards(
 
 def _clear_stale_price_standards(
     connection: Connection, *, tenant_id: str, journey_id: UUID, produced: set[str], correlation_id: str = "",
+    reason: str | None = None,
 ) -> list[str]:
     """2026-10-20 product owner rules: a price-master standard this run did
     not produce (the SKU or the price version changed, the component is not
@@ -324,7 +327,7 @@ def _clear_stale_price_standards(
     if cleared:
         logger.info("deal_reconciliation_stale_prices_cleared journey_id=%s keys=%s", journey_id, cleared)
         _note_cleared(connection, tenant_id=tenant_id, journey_id=journey_id, kind="PRICE", keys=cleared,
-                      correlation_id=correlation_id)
+                      correlation_id=correlation_id, reason=reason)
     return cleared
 
 
@@ -396,41 +399,91 @@ def _old_vehicle_facts(connection: Connection, *, tenant_id: str, journey_id: UU
     return list(documents.values())
 
 
+# Makers as RCs and valuation reports print them (2026-10-20, review of PR
+# 472, B2): the RC's "Maker's name and model" reads "MARUTI SUZUKI INDIA LTD /
+# SWIFT DZIRE VXI", a valuation report "MSIL".
+_BRAND_SPELLINGS: dict[str, tuple[str, ...]] = {
+    "MARUTI": ("MARUTI", "MSIL", "MARUTISUZUKI"),
+    "TATA": ("TATA", "TML", "TATAMOTORS"),
+}
+
+
 def _old_vehicle_meets(requirement: dict[str, Any] | None, facts: list[dict[str, str]]) -> bool:
     """Whether an old vehicle on file meets a scheme's old-vehicle condition
-    ("against old Maruti", "Tata Ace Family"). No document, no match: the
-    condition is never assumed."""
+    ("against old Maruti", "Tata Ace Family"). The brand is looked for in the
+    make and the model text together, case-insensitively: the RC has no make
+    field, its ``vehicle_model`` is the maker's name and model. No document,
+    no match: the condition is never assumed."""
     if not requirement:
         return True
     brand = str(requirement.get("brand") or "").upper()
-    model_words = set(str(requirement.get("model") or "").upper().split())
+    spellings = _BRAND_SPELLINGS.get(brand, (brand,)) if brand else ()
+    model_words = set(re.sub(r"[^A-Z0-9 ]+", " ", str(requirement.get("model") or "").upper()).split())
     for fact in facts:
-        make = re.sub(r"[^A-Z0-9 ]+", " ", fact.get("make", "").upper()).split()
-        model = re.sub(r"[^A-Z0-9 ]+", " ", f"{fact.get('make', '')} {fact.get('model', '')}".upper()).split()
-        if brand and brand not in make:
+        words = re.sub(r"[^A-Z0-9 ]+", " ", f"{fact.get('make', '')} {fact.get('model', '')}".upper()).split()
+        squashed = "".join(words)
+        if spellings and not any(s in words or (len(s) > 4 and s in squashed) for s in spellings):
             continue
-        if model_words and not model_words <= set(model):
+        if model_words and not model_words <= set(words):
             continue
         return True
     return False
 
 
-def _corporate_category(
-    connection: Connection, *, tenant_id: str, journey_id: UUID, oem_code: str | None,
-    basis: str, customer_name: str | None,
-) -> dict[str, Any] | None:
-    """The corporate privilege category this deal is entitled to, from the
-    OEM's corporate registry, or None when nothing on file names a listed
-    corporate.
+_CORPORATE_NAME_NOISE = frozenset({"LIMITED", "LTD", "PRIVATE", "PVT", "THE", "CO", "COMPANY", "INC", "LLP", "OF", "AND"})
 
-    2026-10-20 product owner rules: corporate privilege follows the corporate
-    company's category (Z / Y / F / A / B), for a company buying in its own
-    name or an employee of it -- not the buyer's registration type. Looked up
-    by the corporate code the Corporate ID quotes, else by the employer's
-    exact name, else (a company buyer) by the customer's own exact name.
-    Never a partial-name guess."""
-    if not oem_code:
+
+def _corporate_core(name: str | None) -> str:
+    words = re.sub(r"[^A-Z0-9 ]+", " ", (name or "").upper()).split()
+    return " ".join(w for w in words if w not in _CORPORATE_NAME_NOISE)
+
+
+def _registry_upload(
+    connection: Connection, *, tenant_id: str, oem_code: str, effective_on: date | None,
+) -> Any:
+    """The corporate list in force for the tenant on the date: its newest
+    upload dated on or before it (2026-10-20 product owner rules, R5; review
+    of PR 472, S5). None: the tenant has no dated list (an older database),
+    and the OEM-wide list stands in."""
+    if effective_on is None:
         return None
+    return connection.execute(
+        text(
+            """
+            SELECT source_upload_id FROM auditcore.corporate_registry_entries
+            WHERE tenant_id = :t AND oem_code = :oem AND effective_from <= :on
+            ORDER BY effective_from DESC, created_at_utc DESC LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "oem": oem_code, "on": effective_on},
+    ).scalar_one_or_none()
+
+
+def _registry_rows(
+    connection: Connection, *, tenant_id: str, oem_code: str, effective_on: date | None, where: str,
+    params: dict[str, Any],
+) -> list[dict[str, Any]]:
+    upload = _registry_upload(connection, tenant_id=tenant_id, oem_code=oem_code, effective_on=effective_on)
+    has_dated = upload is not None or connection.execute(
+        text("SELECT EXISTS (SELECT 1 FROM auditcore.corporate_registry_entries WHERE tenant_id = :t AND oem_code = :oem)"),
+        {"t": tenant_id, "oem": oem_code},
+    ).scalar_one()
+    if has_dated:
+        if upload is None:
+            return []  # the tenant's first list is dated after the deal
+        sql = ("SELECT corporate_code, corporate_name, privilege_category FROM auditcore.corporate_registry_entries "
+               f"WHERE tenant_id = :t AND oem_code = :oem AND source_upload_id = :upload AND ({where}) "
+               "ORDER BY corporate_code")
+        params = {**params, "t": tenant_id, "upload": upload}
+    else:
+        sql = ("SELECT corporate_code, corporate_name, privilege_category FROM auditcore.corporate_privilege_registry "
+               f"WHERE oem_code = :oem AND ({where}) ORDER BY corporate_code")
+    return [dict(r) for r in connection.execute(text(sql), {**params, "oem": oem_code}).mappings().all()]
+
+
+def _corporate_names_on_file(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, basis: str, customer_name: str | None,
+) -> tuple[list[str], list[str]]:
     fields = connection.execute(
         text(
             """
@@ -452,35 +505,84 @@ def _corporate_category(
              if r["field_key"] == "employer_name" and r["effective_value"]]
     if basis == "CORPORATE" and customer_name:
         names.append(customer_name)
+    codes = [c for c in codes if c and c.lower() != "null"]
+    names = [n for n in names if n and n.lower() != "null"]
+    return codes, names
+
+
+def _corporate_category(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, oem_code: str | None,
+    basis: str, customer_name: str | None, effective_on: date | None = None,
+) -> dict[str, Any] | None:
+    """The corporate privilege category this deal is entitled to, from the
+    OEM's corporate list in force for the tenant on the pricing date, or
+    None when nothing on file names a listed corporate.
+
+    2026-10-20 product owner rules: corporate privilege follows the corporate
+    company's category (Z / Y / F / A / B), for a company buying in its own
+    name or an employee of it -- not the buyer's registration type. Looked up
+    by the corporate code the Corporate ID quotes, else by the employer's
+    exact name, else (a company buyer) by the customer's own exact name.
+    Never a partial-name guess: an inexact name is a PC task
+    (``_corporate_shortlist``)."""
+    if not oem_code:
+        return None
+    codes, names = _corporate_names_on_file(
+        connection, tenant_id=tenant_id, journey_id=journey_id, basis=basis, customer_name=customer_name,
+    )
     for code in codes:
-        row = connection.execute(
-            text(
-                "SELECT corporate_code, corporate_name, privilege_category FROM auditcore.corporate_privilege_registry "
-                "WHERE oem_code = :oem AND upper(corporate_code) = upper(:code)"
-            ),
-            {"oem": oem_code, "code": code},
-        ).mappings().first()
-        if row is not None:
+        rows = _registry_rows(connection, tenant_id=tenant_id, oem_code=oem_code, effective_on=effective_on,
+                              where="upper(corporate_code) = upper(:code)", params={"code": code})
+        if rows:
+            row = rows[0]
             return {"category": row["privilege_category"], "code": row["corporate_code"],
                     "name": row["corporate_name"], "matchedOn": "CODE"}
     for name in names:
-        matches = connection.execute(
-            text(
-                """
-                SELECT corporate_code, corporate_name, privilege_category FROM auditcore.corporate_privilege_registry
-                WHERE oem_code = :oem
-                  AND lower(regexp_replace(corporate_name, '\\s+', ' ', 'g')) = lower(regexp_replace(:name, '\\s+', ' ', 'g'))
-                ORDER BY corporate_code
-                """
-            ),
-            {"oem": oem_code, "name": name.strip()},
-        ).mappings().all()
+        matches = _registry_rows(
+            connection, tenant_id=tenant_id, oem_code=oem_code, effective_on=effective_on,
+            where="lower(regexp_replace(corporate_name, '\\s+', ' ', 'g')) = lower(regexp_replace(:name, '\\s+', ' ', 'g'))",
+            params={"name": name.strip()},
+        )
         # One listed name in two categories is not decided by guesswork.
         if matches and len({m["privilege_category"] for m in matches}) == 1:
             first = matches[0]
             return {"category": first["privilege_category"], "code": first["corporate_code"],
                     "name": first["corporate_name"], "matchedOn": "NAME"}
     return None
+
+
+def _corporate_shortlist(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, oem_code: str | None, basis: str,
+    customer_name: str | None, effective_on: date | None,
+) -> dict[str, Any] | None:
+    """The listed corporates a name on file may be ("Ltd." against "Limited"),
+    for the PC to confirm -- ordered, never chosen here. None when nothing
+    on file names a corporate."""
+    if not oem_code:
+        return None
+    codes, names = _corporate_names_on_file(
+        connection, tenant_id=tenant_id, journey_id=journey_id, basis=basis, customer_name=customer_name,
+    )
+    if not codes and not names:
+        return None
+    candidates: dict[str, dict[str, Any]] = {}
+    for name in names:
+        core = _corporate_core(name)
+        first = core.split(" ")[0] if core else ""
+        if len(first) < 3:
+            continue
+        for row in _registry_rows(connection, tenant_id=tenant_id, oem_code=oem_code, effective_on=effective_on,
+                                  where="upper(corporate_name) LIKE '%' || :first || '%'", params={"first": first}):
+            listed = _corporate_core(row["corporate_name"])
+            score = 0 if listed == core else (1 if listed.startswith(core) or core.startswith(listed) else 2)
+            if score < 2 or len(candidates) < 20:
+                candidates.setdefault(row["corporate_code"], {**row, "score": score})
+    shortlist = sorted(candidates.values(), key=lambda r: (r["score"], r["corporate_name"]))[:5]
+    return {
+        "codesOnFile": codes, "namesOnFile": names,
+        "shortlist": [{"code": r["corporate_code"], "name": r["corporate_name"], "category": r["privilege_category"]}
+                      for r in shortlist],
+    }
 
 
 def _candidate_rows(
@@ -561,9 +663,16 @@ def _select_benefits(
     basis: str,
     corporate_category: str | None,
     old_vehicles: list[dict[str, str]],
+    unmatched: dict[str, list[dict[str, Any]]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Decimal]]:
     """One benefit per canonical discount key, chosen deterministically, and
     the corporate amounts by category when the category is not known.
+
+    ``unmatched`` (when given) collects, per key, the master rows stored
+    UNRESOLVED -- named variants the price list did not carry -- that could
+    be meant for this deal's variant: their scheme matched none of the
+    deal's rows, the variant is in their group and not excluded. Their
+    benefit is not known, never "not entitled" (review of PR 472, B1).
 
     2026-10-20 product owner rules:
       * a model-level row stored for a scheme whose named variants did not
@@ -576,15 +685,26 @@ def _select_benefits(
         then a met condition), then the newest date, then the lower amount,
         then the newer version and the scheme code: the same data always
         gives the same entitlement."""
+    # imported here: oem_price_masters pulls in the admin routes
+    from audit_core.oem_price_masters import variant_in_group
+
     eligible: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
     corporate_candidates: dict[str, Decimal] = {}
     colour_key = (colour or "").strip().upper()
+    unresolved: list[dict[str, Any]] = []
+    matched_versions: set[Any] = set()
     for row in rows:
         criteria = _json(row.get("criteria"))
         if row.get("variant_id") is None and (
             criteria.get("scope") == "UNRESOLVED" or criteria.get("unresolvedVariantTexts")
         ):
+            if variant_in_group(criteria.get("variantGroup"), variant_name or "") and not variant_excluded(
+                variant_name, criteria.get("excludedVariantTexts")
+            ):
+                unresolved.append(row)
             continue
+        if row.get("variant_id") is not None and row["variant_id"] == variant_id:
+            matched_versions.add(row.get("discount_scheme_version_id"))
         if row.get("variant_id") is not None and row["variant_id"] != variant_id:
             continue
         if row.get("product_sku_id") is not None and row["product_sku_id"] != product_sku_id:
@@ -647,6 +767,16 @@ def _select_benefits(
             "alternatives": len(candidates) - 1,
             "ambiguous_amounts": sorted({str(_to_decimal(r.get("amount_value"))) for r in tied}),
         })
+    if unmatched is not None:
+        for row in unresolved:
+            if row.get("discount_scheme_version_id") in matched_versions:
+                continue
+            customer_type = str(row.get("customer_type_code") or "").strip().upper()
+            if customer_type.startswith("CORPORATE") and corporate_category is not None:
+                category = customer_type.split(":", 1)[1] if ":" in customer_type else ""
+                if category and category != corporate_category:
+                    continue
+            unmatched.setdefault(canonical_discount_key(str(row["benefit_key"])), []).append(row)
     return chosen, corporate_candidates
 
 
@@ -765,12 +895,17 @@ def _write_discount_row(
         return
     payload = json.dumps({"origin": "DEAL_RECONCILIATION", **details}, default=str)
     if existing is not None:
+        # A booking-fed actual this run no longer feeds (the component was
+        # cleared, or it came from a declared total) is reset, so a row never
+        # reads "unclaimed" while carrying an old actual (review of PR 472, S3).
+        reset = existing["details"].get("origin") in ("DEAL_RECONCILIATION", "BOOKING_FORM_MATERIALIZATION")
         connection.execute(
             text(
                 """
                 UPDATE auditcore.discount_applications
                 SET standard_eligible_amount = :standard,
-                    actual_discount_amount = COALESCE(:actual, actual_discount_amount),
+                    actual_discount_amount = CASE WHEN :reset THEN :actual
+                                                  ELSE COALESCE(:actual, actual_discount_amount) END,
                     discount_scheme_version_id = :dsv,
                     eligibility_result = :result,
                     actual_source_kind = COALESCE(actual_source_kind, :calc),
@@ -780,7 +915,8 @@ def _write_discount_row(
                 """
             ),
             {"tenant_id": tenant_id, "id": existing["discount_application_id"], "standard": standard,
-             "actual": booking_actual, "dsv": dsv, "result": result, "calc": _CALCULATED, "details": payload},
+             "actual": booking_actual, "dsv": dsv, "result": result, "calc": _CALCULATED, "details": payload,
+             "reset": reset},
         )
         return
     connection.execute(
@@ -872,6 +1008,56 @@ def _management_referral(connection: Connection, *, tenant_id: str, journey_id: 
     return _to_decimal(row["amount"])
 
 
+# Benefits one old vehicle (one RC, one COD) can earn only one of: "One Can
+# not combine Exchange/Loyalty/Welcome/Scrappage Bonus" (the September and
+# October exchange bulletins). 2026-10-20 (review of PR 472, S2); whether
+# the dealer and the COD scrappage bonus combine is with the product owner --
+# until answered, the bulletin's note is followed and they do not.
+_ONE_OLD_VEHICLE_BENEFIT = ("EXCHANGE_BONUS", "WELCOME_BONUS", "SCRAPPAGE_BONUS_DEALER", "SCRAPPAGE_BONUS_COD")
+# The bulletins a scheme key comes from, for "no scheme in force" (S1).
+_BULLETIN_CATEGORIES: dict[str, tuple[str, ...]] = {}
+for _category, _keys in SCHEME_CATEGORY_DISCOUNT_KEYS.items():
+    _group = ("CONSUMER",) if _category == "CONSUMER" else (
+        ("CORPORATE",) if _category == "CORPORATE" else ("EXCHANGE", "SCRAPPAGE", "WELCOME"))
+    for _key in _keys:
+        _BULLETIN_CATEGORIES[_key] = _group
+
+
+def _bulletins_in_force(connection: Connection, *, tenant_id: str, effective_on: date) -> set[str]:
+    """The scheme categories with any published version in force on the date
+    (a withdrawal counts: the bulletin answered)."""
+    return {
+        str(r[0]) for r in connection.execute(
+            text(
+                """
+                SELECT DISTINCT ds.scheme_category
+                FROM auditcore.discount_scheme_versions v
+                JOIN auditcore.discount_schemes ds
+                  ON ds.tenant_id = v.tenant_id AND ds.discount_scheme_id = v.discount_scheme_id
+                WHERE v.tenant_id = :t AND v.lifecycle_status = 'PUBLISHED'
+                  AND v.effective_from <= :on AND (v.effective_to IS NULL OR v.effective_to >= :on)
+                """
+            ),
+            {"t": tenant_id, "on": effective_on},
+        ).all()
+    }
+
+
+def _unmatched_detail(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        criteria = _json(row.get("criteria"))
+        out.setdefault(str(row["eligibility_id"]), {
+            "eligibilityId": str(row["eligibility_id"]),
+            "schemeCode": row.get("scheme_code"),
+            "schemeVersionId": str(row.get("discount_scheme_version_id")),
+            "modelCell": criteria.get("modelCell"),
+            "variantTexts": criteria.get("unresolvedVariantTexts") or criteria.get("variantTexts") or [],
+            "amount": str(_to_decimal(row.get("amount_value"))) if row.get("amount_value") is not None else None,
+        })
+    return list(out.values())
+
+
 def _materialize_discount_standards(
     connection: Connection,
     *,
@@ -884,29 +1070,45 @@ def _materialize_discount_standards(
     grid: dict[str, Any] | None = None,
     management_referral: Decimal | None = None,
     correlation_id: str = "",
+    unmatched: dict[str, list[dict[str, Any]]] | None = None,
+    bulletins_in_force: set[str] | None = None,
+    grid_gap: str | None = None,
+    effective_on: date | None = None,
 ) -> dict[str, Any]:
     """Write the entitlement side of every discount key, then clear the keys
-    this run no longer produces (their actuals stay)."""
+    this run no longer produces (their actuals stay).
+
+    2026-10-20 product owner rules and the review of PR 472:
+      * a conditional benefit (exchange, scrappage, welcome, corporate) is in
+        the standard only when the deal claims it; proven but unclaimed it is
+        shown for information (S2), and one old vehicle earns one of the
+        exchange / welcome / scrappage benefits (the larger claimed one);
+      * "not matched" is not "not entitled" (B1): a given discount whose
+        master row is not mapped (MASTER_UNMATCHED), whose bulletin is not in
+        force on the date (SCHEME_NOT_IN_FORCE), whose grid line is out of
+        the discount program's scope (OUT_OF_GRID_SCOPE) or whose corporate
+        category is to be confirmed (NEEDS_CORPORATE_EVIDENCE) has no
+        standard and is never an over-grant;
+      * a discount given with an entitlement known to be none is NOT_ELIGIBLE.
+    ``bulletins_in_force`` None: not checked (every bulletin taken in force)."""
     existing = _discount_rows(connection, tenant_id=tenant_id, journey_id=journey_id)
     produced: set[str] = set()
-    counts = {"eligible": 0, "unclaimed": 0, "informational": 0, "overGranted": 0, "needsCorporateEvidence": 0}
+    counts = {"eligible": 0, "unclaimed": 0, "informational": 0, "overGranted": 0, "needsCorporateEvidence": 0,
+              "unknown": 0}
+    unmatched = unmatched or {}
 
     def invoice_actual(key: str) -> Decimal | None:
         row = existing.get(key)
         if row is not None and row["details"].get("origin") == "INVOICE_MATERIALIZATION":
-            return _to_decimal(row["actual_discount_amount"])
+            amount = _to_decimal(row["actual_discount_amount"])
+            return amount if amount else None
         return None
 
-    def claimed(key: str) -> bool:
-        return actuals.get(key) is not None or invoice_actual(key) is not None
+    def claimed_amount(key: str) -> Decimal | None:
+        return actuals.get(key) if actuals.get(key) is not None else invoice_actual(key)
 
-    def evidenced(key: str) -> bool:
-        if key == "CORPORATE_PRIVILEGE":
-            return corporate is not None
-        document = CONDITIONAL_DISCOUNT_EVIDENCE_DOCUMENT.get(key)
-        return bool(document) and _has_active_document(
-            connection, tenant_id=tenant_id, journey_id=journey_id, document_type_key=document
-        )
+    def claimed(key: str) -> bool:
+        return claimed_amount(key) is not None
 
     def write(key: str, *, standard: Decimal | None, result: str | None, dsv: UUID | None,
               details: dict[str, Any]) -> None:
@@ -915,6 +1117,20 @@ def _materialize_discount_standards(
             connection, tenant_id=tenant_id, journey_id=journey_id, key=key, existing=existing.get(key),
             standard=standard, result=result, dsv=dsv, details=details, booking_actual=actuals.get(key),
         )
+
+    def unknown(key: str, result: str, reason: str, **extra: Any) -> None:
+        write(key, standard=None, result=result, dsv=None,
+              details={"benefitKey": key, "entitlementUnknown": reason, **extra})
+        counts["unknown"] += 1
+
+    # One old vehicle, one benefit: of the claimed exchange-group benefits
+    # the deal has an entitlement to, the larger one stands.
+    by_key = {b.get("canonical_key") or canonical_discount_key(str(b["benefit_key"])): b for b in benefits}
+    exclusive_claimed = sorted(
+        (k for k in _ONE_OLD_VEHICLE_BENEFIT if k in by_key and claimed(k)),
+        key=lambda k: (-(_to_decimal(by_key[k]["amount_value"]) or Decimal(0)), _ONE_OLD_VEHICLE_BENEFIT.index(k)),
+    )
+    exclusive_winner = exclusive_claimed[0] if exclusive_claimed else None
 
     for benefit in benefits:
         key = benefit.get("canonical_key") or canonical_discount_key(str(benefit["benefit_key"]))
@@ -931,15 +1147,27 @@ def _materialize_discount_standards(
         }
         if benefit.get("ambiguous_amounts"):
             details["ambiguousAmounts"] = benefit["ambiguous_amounts"]
+        if unmatched.get(key):
+            details["unmatchedMasters"] = _unmatched_detail(unmatched[key])
         if key == "CORPORATE_PRIVILEGE" and corporate:
             details["corporate"] = corporate
         is_claimed = claimed(key)
-        if key in _CONDITIONAL_KEYS and not is_claimed and not evidenced(key):
-            # Shown, never owed: no claim and no proof on file.
+        if key in _CONDITIONAL_KEYS and not is_claimed:
+            # Shown, never owed: not claimed on the deal (proof on file or not).
             details.update({"potentialAmount": str(amount) if amount is not None else None, "informational": True})
             write(key, standard=None, result="ELIGIBLE_UNCLAIMED", dsv=benefit["discount_scheme_version_id"],
                   details=details)
             counts["informational"] += 1
+            continue
+        if key in _ONE_OLD_VEHICLE_BENEFIT and exclusive_winner is not None and key != exclusive_winner:
+            details.update({
+                "potentialAmount": str(amount) if amount is not None else None,
+                "reason": f"Cannot be combined with the {exclusive_winner.replace('_', ' ').lower()} "
+                          "on the same old vehicle (exchange bulletin).",
+                "notCombinableWith": exclusive_winner,
+            })
+            write(key, standard=None, result="NOT_ELIGIBLE", dsv=benefit["discount_scheme_version_id"], details=details)
+            counts["overGranted"] += 1
             continue
         result = "ELIGIBLE" if is_claimed else "ELIGIBLE_UNCLAIMED"
         write(key, standard=amount, result=result, dsv=benefit["discount_scheme_version_id"], details=details)
@@ -953,24 +1181,36 @@ def _materialize_discount_standards(
         write("CORPORATE_PRIVILEGE", standard=None, result="NEEDS_CORPORATE_EVIDENCE", dsv=None, details={
             "benefitKey": "CORPORATE_PRIVILEGE",
             "candidatesByCategory": {k: str(v) for k, v in sorted(corporate_candidates.items())},
-            "reason": "No corporate on the OEM's corporate list is named on file (Corporate ID code or employer).",
+            "reason": "No corporate on the OEM's corporate list in force is named exactly on file "
+                      "(Corporate ID code or employer); the PC confirms the category.",
+            "entitlementUnknown": "corporate category to be confirmed",
         })
         counts["needsCorporateEvidence"] += 1
 
     # The dealer's own discount: its allowance is the dealer discount grid.
     if _DEALER_DISCOUNT_KEY not in produced and (grid is not None or claimed(_DEALER_DISCOUNT_KEY)):
-        allowance = grid["buffer"] if grid and grid["inScope"] else None
         details = {"benefitKey": _DEALER_DISCOUNT_KEY, "source": "DEALER_DISCOUNT_GRID", "grid": grid}
-        if allowance is None:
+        if grid is None:
+            # No grid line for the model on the date: not known, never "none
+            # allowed" -- a task asks for the line (B1).
+            unknown(_DEALER_DISCOUNT_KEY, "MASTER_UNMATCHED", grid_gap or "no dealer discount grid line",
+                    source="DEALER_DISCOUNT_GRID")
+        elif not grid["inScope"]:
+            # "Out of scope": outside the Discount Control Program, which is
+            # not "no discount allowed" (S6).
             if claimed(_DEALER_DISCOUNT_KEY):
-                details["reason"] = "No dealer discount grid line allows a discount on this model on the date."
-                write(_DEALER_DISCOUNT_KEY, standard=None, result="NOT_ELIGIBLE", dsv=None, details=details)
-                counts["overGranted"] += 1
+                unknown(_DEALER_DISCOUNT_KEY, "OUT_OF_GRID_SCOPE",
+                        "the dealer discount grid puts this model outside the discount control program",
+                        source="DEALER_DISCOUNT_GRID", grid=grid)
+        elif grid["buffer"] is None:
+            if claimed(_DEALER_DISCOUNT_KEY):
+                unknown(_DEALER_DISCOUNT_KEY, "MASTER_UNMATCHED", "the grid line carries no amount for the tier",
+                        source="DEALER_DISCOUNT_GRID", grid=grid)
         elif claimed(_DEALER_DISCOUNT_KEY):
-            write(_DEALER_DISCOUNT_KEY, standard=allowance, result="ELIGIBLE", dsv=None, details=details)
+            write(_DEALER_DISCOUNT_KEY, standard=grid["buffer"], result="ELIGIBLE", dsv=None, details=details)
             counts["eligible"] += 1
         else:
-            details.update({"potentialAmount": str(allowance), "informational": True})
+            details.update({"potentialAmount": str(grid["buffer"]), "informational": True})
             write(_DEALER_DISCOUNT_KEY, standard=None, result="ELIGIBLE_UNCLAIMED", dsv=None, details=details)
             counts["informational"] += 1
 
@@ -986,9 +1226,22 @@ def _materialize_discount_standards(
                   details={"benefitKey": _MR_KEY, "reason": "No Team Lead approval for a Management Referral."})
             counts["overGranted"] += 1
 
-    # A discount given with no entitlement at all: an over-grant.
-    for key in sorted(actuals):
-        if key in produced:
+    # A discount given with no entitlement: not known when its master is not
+    # mapped or its bulletin is not in force; else an over-grant.
+    given = set(actuals) | {k for k in existing if k in _RECONCILED_KEYS and invoice_actual(k) is not None}
+    for key in sorted(given):
+        if key in produced or key in (_UNCLASSIFIED_KEY, _DEALER_DISCOUNT_KEY, _MR_KEY):
+            continue
+        if unmatched.get(key):
+            unknown(key, "MASTER_UNMATCHED",
+                    "the scheme names variants the price list does not carry; to be mapped",
+                    unmatchedMasters=_unmatched_detail(unmatched[key]))
+            continue
+        categories = _BULLETIN_CATEGORIES.get(key)
+        if bulletins_in_force is not None and categories and not set(categories) & bulletins_in_force:
+            unknown(key, "SCHEME_NOT_IN_FORCE",
+                    f"no {categories[0].lower()} scheme bulletin is in force on "
+                    f"{effective_on.isoformat() if effective_on else 'the pricing date'}")
             continue
         write(key, standard=None, result="NOT_ELIGIBLE", dsv=None, details={"benefitKey": key})
         counts["overGranted"] += 1
@@ -1051,47 +1304,57 @@ def _assess_unclassified_discount(connection: Connection, *, tenant_id: str, jou
 
 def _clear_stale_discount_rows(
     connection: Connection, *, tenant_id: str, journey_id: UUID, produced: set[str], correlation_id: str = "",
+    reason: str | None = None,
 ) -> list[str]:
     """2026-10-20 product owner rules: an entitlement this run did not produce
     (the SKU, the pricing date or a master changed) is not left standing. Its
     entitlement, scheme version and eligibility are reset; a discount still
-    given on it is now an over-grant. Actuals are never touched. Logged."""
+    given on it is now an over-grant. Actuals are never touched. Logged.
+
+    With ``reason`` (the deal could not be reconciled: no SKU, no pricing
+    date, no price list in force -- review of PR 472, B3) a discount still
+    given is NOT_EVALUATED with that reason, never NOT_ELIGIBLE."""
     stale = [key for key in sorted(_RECONCILED_KEYS) if key not in produced]
+    given_result = "NOT_EVALUATED" if reason else "NOT_ELIGIBLE"
     rows = connection.execute(
         text(
             """
             UPDATE auditcore.discount_applications
             SET standard_eligible_amount = NULL,
                 discount_scheme_version_id = NULL,
-                eligibility_result = CASE WHEN actual_discount_amount IS NOT NULL THEN 'NOT_ELIGIBLE' END,
+                eligibility_result = CASE WHEN actual_discount_amount IS NOT NULL THEN CAST(:given AS varchar) END,
+                details = CASE WHEN CAST(:reason AS text) IS NULL THEN details
+                               ELSE COALESCE(details, '{}'::jsonb)
+                                    || jsonb_build_object('entitlementUnknown', CAST(:reason AS text)) END,
                 updated_at_utc = now()
             WHERE tenant_id = :tenant_id AND journey_id = :journey_id
               AND discount_key = ANY(:keys)
               AND (standard_eligible_amount IS NOT NULL
                    OR discount_scheme_version_id IS NOT NULL
                    OR eligibility_result IS DISTINCT FROM
-                      (CASE WHEN actual_discount_amount IS NOT NULL THEN 'NOT_ELIGIBLE' END))
+                      (CASE WHEN actual_discount_amount IS NOT NULL THEN CAST(:given AS varchar) END))
             RETURNING discount_key, actual_discount_amount
             """
         ),
-        {"tenant_id": tenant_id, "journey_id": journey_id, "keys": stale},
+        {"tenant_id": tenant_id, "journey_id": journey_id, "keys": stale, "given": given_result, "reason": reason},
     ).mappings().all()
     cleared = sorted({str(r["discount_key"]) for r in rows})
     if cleared:
         logger.info("deal_reconciliation_stale_discounts_cleared journey_id=%s keys=%s", journey_id, cleared)
         _note_cleared(connection, tenant_id=tenant_id, journey_id=journey_id, kind="DISCOUNT", keys=cleared,
-                      correlation_id=correlation_id)
+                      correlation_id=correlation_id, reason=reason)
     return cleared
 
 
 def _note_cleared(
     connection: Connection, *, tenant_id: str, journey_id: UUID, kind: str, keys: list[str], correlation_id: str,
+    reason: str | None = None,
 ) -> None:
     try:
         with connection.begin_nested():
             record_activity(
                 connection, tenant_id=tenant_id, journey_id=journey_id, event_type="DEAL_STANDARDS_CLEARED",
-                subject_type=kind, details={"keys": keys, "reason": "no longer produced by the masters"},
+                subject_type=kind, details={"keys": keys, "reason": reason or "no longer produced by the masters"},
                 correlation_id=correlation_id or None,
             )
     except Exception:  # the activity feed must never block reconciliation
@@ -1234,7 +1497,18 @@ def _sync_total_variance(
     summary = deal_sheet(connection, tenant_id=tenant_id, journey_id=journey_id).get("summary") or {}
     variance = _to_decimal((summary.get("variance") or {}).get("currentVsStandard"))
     if variance is None:
+        _close_total_variance(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                              note="The deal has no standard to compare with yet.")
         return {"skipped": True, "reason": "no_comparable_lines_yet"}
+    # A SKU the automatic pin matched only on price (#471, AUTO_PRICE_MISMATCH)
+    # is still to be confirmed: a shortfall measured against it is MEDIUM,
+    # not HIGH (review of PR 472, S7).
+    tentative = connection.execute(
+        text("SELECT to_jsonb(jp) ->> 'match_basis' FROM auditcore.journey_products jp "
+             "WHERE jp.tenant_id = :t AND jp.journey_id = :j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one_or_none() == "AUTO_PRICE_MISMATCH"
+    severity = "MEDIUM" if tentative else "HIGH"
     net = summary.get("net") or {}
     standard_net = _to_decimal(net.get("standard")) or Decimal(0)
     actual_net = _to_decimal(net.get("current"))
@@ -1260,18 +1534,25 @@ def _sync_total_variance(
             stage_code="BOOKING",
             rule_key=_TOTAL_VARIANCE_RULE_KEY,
             finding_type=_TOTAL_VARIANCE_FINDING_TYPE,
-            severity="HIGH",
+            severity=severity,
             title="Deal total is below the standard price",
             description=(
                 f"This deal's actual net total (₹{actual_net:,.2f}) is below the standard net "
                 f"total per the price masters (₹{standard_net:,.2f}) by ₹{-variance:,.2f}. "
                 f"A Team Lead must validate this shortfall."
+                + (" SKU still to be confirmed." if tentative else "")
             ),
             correlation_id=correlation_id,
             safe_payload={
                 "standardNet": str(standard_net), "actualNet": str(actual_net), "variance": str(variance),
+                **({"reason": "SKU still to be confirmed"} if tentative else {}),
             },
             blocking_completion=False,
+        )
+        connection.execute(
+            text("UPDATE auditcore.audit_findings SET severity = :severity WHERE tenant_id = :t "
+                 "AND audit_finding_id = :f AND severity IS DISTINCT FROM :severity"),
+            {"t": tenant_id, "f": finding_id, "severity": severity},
         )
         open_task_count = connection.execute(
             text(
@@ -1301,29 +1582,62 @@ def _sync_total_variance(
                 task_type=_TOTAL_VARIANCE_TASK_TYPE,
                 assigned_role_code="TL",
                 related_finding_id=finding_id,
-                severity="HIGH",
+                severity=severity,
                 task_payload={
                     "ruleKey": _TOTAL_VARIANCE_RULE_KEY,
                     "findingId": str(finding_id),
                     "standardNet": str(standard_net),
                     "actualNet": str(actual_net),
+                    **({"reason": "SKU still to be confirmed"} if tentative else {}),
                 },
                 effect_key=f"task:{finding_id}:total-variance",
                 correlation_id=correlation_id,
             )
     elif existing_finding_id is not None:
-        _resolve_finding(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            stage_code="BOOKING",
-            finding_id=existing_finding_id,
-            actor_id=None,
-            correlation_id=correlation_id,
-            note="The deal total no longer falls below the standard price.",
-        )
+        _close_total_variance(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                              note="The deal total no longer falls below the standard price.")
 
-    return {"standardNet": str(standard_net), "actualNet": str(actual_net), "variance": str(variance)}
+    return {"standardNet": str(standard_net), "actualNet": str(actual_net), "variance": str(variance),
+            "severity": severity}
+
+
+def _close_total_variance(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, note: str,
+) -> bool:
+    """Resolve an open DEAL_TOTAL_VARIANCE_NEGATIVE finding and cancel its
+    open Team Lead task, with the reason (review of PR 472, B3: a deal that
+    can no longer be reconciled does not keep a shortfall measured on
+    standards it no longer has). True when something was closed."""
+    finding_id = connection.execute(
+        text(
+            """
+            SELECT audit_finding_id FROM auditcore.audit_findings
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+              AND rule_key = :rule_key AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "rule_key": _TOTAL_VARIANCE_RULE_KEY},
+    ).scalar_one_or_none()
+    if finding_id is None:
+        return False
+    _resolve_finding(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING", finding_id=finding_id,
+        actor_id=None, correlation_id=correlation_id, note=note,
+    )
+    tasks = connection.execute(
+        text(
+            """
+            SELECT workflow_task_id FROM auditcore.workflow_tasks
+            WHERE tenant_id = :t AND related_finding_id = :f
+              AND task_status IN ('PENDING', 'READY', 'CLAIMED', 'IN_PROGRESS', 'RETRY_WAIT')
+            """
+        ),
+        {"t": tenant_id, "f": finding_id},
+    ).scalars().all()
+    for task_id in tasks:
+        cancel_workflow_task(connection, tenant_id=tenant_id, workflow_task_id=task_id, actor_id="SYSTEM",
+                             reason=note)
+    return True
 
 
 def sync_deal_reconciliation(
@@ -1361,15 +1675,223 @@ def sync_deal_reconciliation(
         return {"error": True}
 
 
+def _grid_gap(
+    connection: Connection, *, tenant_id: str, effective_on: date, model_name: str | None,
+) -> dict[str, Any]:
+    """Why the deal has no dealer-grid line: no grid in force, or none for the model."""
+    from audit_core.oem_price_masters import grid_version_for_date
+
+    version = grid_version_for_date(connection, tenant_id=tenant_id, effective_on=effective_on)
+    if version is None:
+        return {"gridVersionId": None,
+                "reason": f"no dealer discount grid is in force on {effective_on.isoformat()}"}
+    return {"gridVersionId": str(version["grid_version_id"]),
+            "reason": f"the dealer discount grid in force (v{version['version_no']}) has no line for "
+                      f"{model_name or 'the model'}"}
+
+
+def _declared_totals_check(reviewed: dict[str, Any], actuals: dict[str, Decimal]) -> dict[str, Any] | None:
+    """The booking form's declared totals, kept as a check only, never a
+    discount row (2026-10-20; review of PR 472, S3 -- bonus_amount is with
+    the product owner): "Bonus" against the exchange / welcome / scrappage
+    components, "Discount" against all of them."""
+    out: dict[str, Any] = {}
+    bonus = _to_decimal(reviewed.get("bonus_amount"))
+    if bonus:
+        components = sum((actuals.get(k, Decimal(0)) for k in _ONE_OLD_VEHICLE_BENEFIT), Decimal(0))
+        out["bonus"] = {"declared": str(bonus), "components": str(components), "matches": bonus == components}
+    total = _to_decimal(reviewed.get("discount_amount"))
+    if total:
+        components = sum(actuals.values(), Decimal(0))
+        out["discount"] = {"declared": str(total), "components": str(components), "matches": total == components}
+    return out or None
+
+
+_MAPPING_TASK = "SCHEME_MASTER_UNMATCHED"
+_CORPORATE_TASK = "CORPORATE_CATEGORY_CONFIRM"
+_NOT_IN_FORCE_TASK = "DISCOUNT_SCHEME_NOT_IN_FORCE"
+
+
+def _mapping_task_key(eligibility_id: Any) -> str:
+    return f"scheme-master-unmatched:{eligibility_id}"
+
+
+def _grid_task_key(grid_version_id: Any, model_id: Any) -> str:
+    return f"grid-line-missing:{grid_version_id or 'none'}:{model_id}"
+
+
+def _sync_master_tasks(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, ctx: dict[str, Any], effective_on: date,
+    unmatched: dict[str, list[dict[str, Any]]], grid: dict[str, Any] | None, grid_gap: dict[str, Any] | None,
+    corporate: dict[str, Any] | None,
+) -> dict[str, int]:
+    """The tasks that say why an entitlement is not known (2026-10-20 product
+    owner rules, R3/R5; review of PR 472): one mapping task per unmatched
+    master row (not per deal) and per missing grid line, for the Team Lead;
+    "no scheme in force" for the deal; "confirm the corporate category" for
+    the PC. Each closes itself when its question is gone."""
+    from audit_core.uc03_p2_registry import get_registry
+    from audit_core.uc03_p2_task_producer import raise_or_refresh, resolve_if_open
+
+    registry = get_registry()
+    counts = {"mapping": 0, "grid": 0, "notInForce": 0, "corporate": 0}
+    rows = _discount_rows(connection, tenant_id=tenant_id, journey_id=journey_id)
+    vehicle = f"{ctx.get('model_name') or ''} {ctx.get('variant_name') or ''}".strip()
+
+    for master in {m["eligibilityId"]: m for ms in unmatched.values() for m in _unmatched_detail(ms)}.values():
+        texts = ", ".join(master["variantTexts"])[:200]
+        raise_or_refresh(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            dedupe_key=_mapping_task_key(master["eligibilityId"]), task_type=_MAPPING_TASK,
+            source_type="RESOLVER", source_code=_MAPPING_TASK,
+            title=f"Map scheme variants to the price list: {texts}"[:300],
+            description=(
+                f"The scheme {master['schemeCode']} ({master['modelCell']}) names variant(s) {texts} that the "
+                "price list does not carry, so deals on this model (first seen on "
+                f"{vehicle or 'this deal'}) have no standard for it and are not called over-grants. Map the "
+                "wording to price-list variants (a model / variant alias) and re-upload the bulletin."
+            ),
+            reference={"sourceCode": _MAPPING_TASK, **master}, severity="MEDIUM", registry=registry,
+        )
+        counts["mapping"] += 1
+
+    if grid is not None and grid.get("gridVersionId"):
+        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id,
+                        dedupe_key=_grid_task_key(grid["gridVersionId"], ctx["model_id"]),
+                        evidence={"gridVersionId": grid["gridVersionId"]})
+    elif grid_gap is not None and (rows.get(_DEALER_DISCOUNT_KEY) or {}).get("eligibility_result") == "MASTER_UNMATCHED":
+        raise_or_refresh(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            dedupe_key=_grid_task_key(grid_gap["gridVersionId"], ctx["model_id"]), task_type=_MAPPING_TASK,
+            source_type="RESOLVER", source_code=_MAPPING_TASK,
+            title=f"Dealer discount grid: {grid_gap['reason']}"[:300],
+            description=(
+                f"A dealer discount is given on {vehicle or 'this deal'} and {grid_gap['reason']}, so it has no "
+                "allowance and is not called an over-grant. Load the grid line (or a grid alias for the model)."
+            ),
+            reference={"sourceCode": _MAPPING_TASK, "gridVersionId": grid_gap["gridVersionId"],
+                       "modelId": str(ctx["model_id"]), "model": ctx.get("model_name")},
+            severity="MEDIUM", registry=registry,
+        )
+        counts["grid"] += 1
+
+    not_in_force = sorted(k for k, r in rows.items() if r.get("eligibility_result") == "SCHEME_NOT_IN_FORCE")
+    key = f"discount-scheme-not-in-force:{journey_id}"
+    if not_in_force:
+        raise_or_refresh(
+            connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key, task_type=_NOT_IN_FORCE_TASK,
+            source_type="RESOLVER", source_code=_NOT_IN_FORCE_TASK,
+            title=f"No discount scheme in force on {effective_on.isoformat()}",
+            description=(
+                f"{', '.join(k.replace('_', ' ').lower() for k in not_in_force)} given on this deal, priced on "
+                f"{effective_on.isoformat()}, and no bulletin for it is in force on that date (the last one has "
+                "ended): no standard, and no other month's scheme is applied. Load the bulletin for the date."
+            ),
+            reference={"sourceCode": _NOT_IN_FORCE_TASK, "onDate": effective_on.isoformat(), "keys": not_in_force},
+            severity="LOW", registry=registry,
+        )
+        counts["notInForce"] += 1
+    else:
+        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                        evidence={"onDate": effective_on.isoformat()})
+
+    key = f"corporate-category-confirm:{journey_id}"
+    needs = (rows.get("CORPORATE_PRIVILEGE") or {}).get("eligibility_result") == "NEEDS_CORPORATE_EVIDENCE"
+    shortlist = _corporate_shortlist(
+        connection, tenant_id=tenant_id, journey_id=journey_id, oem_code=ctx.get("oem_code"), basis=ctx["basis"],
+        customer_name=ctx.get("customer_name"), effective_on=effective_on,
+    ) if needs and corporate is None else None
+    if shortlist is not None:
+        named = ", ".join(shortlist["codesOnFile"] + shortlist["namesOnFile"])[:160]
+        raise_or_refresh(
+            connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key, task_type=_CORPORATE_TASK,
+            source_type="RESOLVER", source_code=_CORPORATE_TASK,
+            title=f"Confirm the corporate category: {named}"[:300],
+            description=(
+                f"A corporate privilege is claimed and the corporate on file ({named}) is not named exactly on "
+                "the OEM's corporate list in force on the pricing date. Confirm which listed corporate it is "
+                "(and so its category) from the shortlist, or correct the Corporate ID."
+            ),
+            reference={"sourceCode": _CORPORATE_TASK, "onDate": effective_on.isoformat(), **shortlist},
+            severity="MEDIUM", registry=registry,
+        )
+        counts["corporate"] += 1
+    else:
+        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                        evidence={"corporate": corporate})
+    return counts
+
+
+def close_superseded_master_tasks(connection: Connection, *, tenant_id: str) -> int:
+    """After a master upload: close the mapping tasks whose master row a newer
+    version of its scheme has replaced (the re-upload answered the question),
+    and the grid-line tasks of a grid version no longer standing. A deal
+    still unmatched raises a fresh task on its next reconciliation."""
+    from audit_core.uc03_p2_task_producer import resolve_if_open
+
+    open_tasks = connection.execute(
+        text(
+            """
+            SELECT t.journey_id, t.dedupe_key
+            FROM auditcore.p2_tasks t
+            LEFT JOIN auditcore.discount_scheme_eligibility e
+              ON e.tenant_id = t.tenant_id
+             AND e.eligibility_id::text = t.reference ->> 'eligibilityId'
+            LEFT JOIN auditcore.discount_scheme_versions v
+              ON v.tenant_id = e.tenant_id AND v.discount_scheme_version_id = e.discount_scheme_version_id
+            WHERE t.tenant_id = :t AND t.task_type = :type
+              AND t.task_status IN ('READY', 'IN_PROGRESS', 'RETURNED', 'ACTION_COMPLETED', 'VERIFYING')
+              AND (
+                (t.reference ->> 'eligibilityId' IS NOT NULL AND EXISTS (
+                    SELECT 1 FROM auditcore.discount_scheme_versions v2
+                    WHERE v2.tenant_id = v.tenant_id AND v2.discount_scheme_id = v.discount_scheme_id
+                      AND v2.lifecycle_status = 'PUBLISHED' AND v2.version_no > v.version_no))
+                OR (t.reference ->> 'gridVersionId' IS NOT NULL AND NOT EXISTS (
+                    SELECT 1 FROM auditcore.dealer_discount_grid_versions g
+                    WHERE g.tenant_id = t.tenant_id
+                      AND g.grid_version_id::text = t.reference ->> 'gridVersionId'
+                      AND NOT EXISTS (SELECT 1 FROM auditcore.dealer_discount_grid_versions g2
+                                      WHERE g2.tenant_id = g.tenant_id AND g2.version_no > g.version_no)))
+              )
+            """
+        ),
+        {"t": tenant_id, "type": _MAPPING_TASK},
+    ).mappings().all()
+    for task in open_tasks:
+        resolve_if_open(connection, tenant_id=tenant_id, journey_id=task["journey_id"], dedupe_key=task["dedupe_key"],
+                        evidence={"supersededByUpload": True})
+    return len(open_tasks)
+
+
+_SKIP_REASONS = {
+    "no_resolved_sku": "no SKU resolved for the deal yet",
+    "no_booking_date": "no pricing date on the deal",
+    "no_effective_price_list": "no price list in force on the pricing date",
+    "sku_not_in_price_list": "the SKU is not in the price list in force on the pricing date",
+}
+
+
 def _skip(connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, reason: str) -> dict[str, Any]:
-    """Nothing can be priced: no standard from an earlier run is left standing."""
+    """Nothing can be priced: no standard from an earlier run is left standing.
+
+    2026-10-20 (review of PR 472, B3): a discount given stays "entitlement
+    not known -- <reason>" (NOT_EVALUATED), never NOT_ELIGIBLE, so it is no
+    over-grant; a shortfall finding from an earlier run is closed with the
+    reason, and its Team Lead task cancelled."""
+    why = _SKIP_REASONS.get(reason, reason)
     _clear_stale_price_standards(
         connection, tenant_id=tenant_id, journey_id=journey_id, produced=set(), correlation_id=correlation_id,
+        reason=why,
     )
     _clear_stale_discount_rows(
         connection, tenant_id=tenant_id, journey_id=journey_id, produced=set(), correlation_id=correlation_id,
+        reason=why,
     )
-    return {"skipped": True, "reason": reason}
+    closed = _close_total_variance(
+        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+        note=f"Not reconciled: {why}. The shortfall was measured on standards the deal no longer has.",
+    )
+    return {"skipped": True, "reason": reason, "varianceClosed": closed}
 
 
 def _reconcile(
@@ -1419,12 +1941,13 @@ def _reconcile(
 
     corporate = _corporate_category(
         connection, tenant_id=tenant_id, journey_id=journey_id, oem_code=ctx.get("oem_code"),
-        basis=ctx["basis"], customer_name=ctx.get("customer_name"),
+        basis=ctx["basis"], customer_name=ctx.get("customer_name"), effective_on=effective_on,
     )
     rows = _candidate_rows(
         connection, tenant_id=tenant_id, model_id=ctx["model_id"], variant_id=ctx["variant_id"],
         product_sku_id=ctx["product_sku_id"], effective_on=effective_on,
     )
+    unmatched: dict[str, list[dict[str, Any]]] = {}
     benefits, corporate_candidates = _select_benefits(
         rows,
         variant_id=ctx["variant_id"],
@@ -1436,10 +1959,16 @@ def _reconcile(
         basis=ctx["basis"],
         corporate_category=corporate["category"] if corporate else None,
         old_vehicles=_old_vehicle_facts(connection, tenant_id=tenant_id, journey_id=journey_id),
+        unmatched=unmatched,
     )
-    actuals = _actual_discounts_by_benefit(
-        _reviewed_booking(connection, tenant_id=tenant_id, journey_id=journey_id)
+    reviewed = _reviewed_booking(connection, tenant_id=tenant_id, journey_id=journey_id)
+    actuals = _actual_discounts_by_benefit(reviewed)
+    grid = _grid_entitlement(
+        connection, tenant_id=tenant_id, journey_id=journey_id, model_id=ctx["model_id"],
+        variant_name=ctx.get("variant_name"), effective_on=effective_on,
     )
+    grid_gap = None if grid is not None else _grid_gap(connection, tenant_id=tenant_id, effective_on=effective_on,
+                                                      model_name=ctx.get("model_name"))
     discount = _materialize_discount_standards(
         connection,
         tenant_id=tenant_id,
@@ -1448,16 +1977,23 @@ def _reconcile(
         actuals=actuals,
         corporate_candidates=corporate_candidates,
         corporate=corporate,
-        grid=_grid_entitlement(
-            connection, tenant_id=tenant_id, journey_id=journey_id, model_id=ctx["model_id"],
-            variant_name=ctx.get("variant_name"), effective_on=effective_on,
-        ),
+        grid=grid,
         management_referral=_management_referral(connection, tenant_id=tenant_id, journey_id=journey_id),
         correlation_id=correlation_id,
+        unmatched=unmatched,
+        bulletins_in_force=_bulletins_in_force(connection, tenant_id=tenant_id, effective_on=effective_on),
+        grid_gap=grid_gap["reason"] if grid_gap else None,
+        effective_on=effective_on,
     )
     discount["pricingDate"] = effective_on.isoformat()
+    discount["declaredTotals"] = _declared_totals_check(reviewed, actuals)
     if not raise_findings:
         return {"priceLines": price_lines, **discount}
+
+    discount["tasks"] = _sync_master_tasks(
+        connection, tenant_id=tenant_id, journey_id=journey_id, ctx=ctx, effective_on=effective_on,
+        unmatched=unmatched, grid=grid, grid_gap=grid_gap, corporate=corporate,
+    )
 
     evidence_rows = _sync_conditional_discount_evidence(
         connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id

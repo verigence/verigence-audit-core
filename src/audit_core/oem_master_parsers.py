@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from io import BytesIO
 from typing import Any
@@ -144,6 +144,9 @@ class GridRow:
 class ParseResult:
     kind: str
     effective_from_hint: date | None = None
+    # The last day the document says it is valid for (2026-10-20: "valid
+    # from 3rd Sept'26 to 30th Sept'26"; a monthly bulletin: its month).
+    effective_to_hint: date | None = None
     price_rows: list[PriceRow] = field(default_factory=list)
     discount_rows: list[DiscountRow] = field(default_factory=list)
     corporate_benefits: list[CorporateBenefitRow] = field(default_factory=list)
@@ -881,6 +884,16 @@ def _expand_slash(variant: str) -> list[str] | None:
     return [f"{head}{match.group(1)}{tail}", f"{head}{match.group(2)}{tail}"]
 
 
+def _expand_repeat(variant: str) -> list[str] | None:
+    """"LX & LX CBC", "Vxi & Vxi AC": the word, and the word with its
+    addition, are two variants (2026-10-20, review of PR 472)."""
+    match = re.search(r"\b(\S+)\s*&\s*\1\s+(\S+)", variant, re.IGNORECASE)
+    if match is None:
+        return None
+    head, tail = variant[: match.start()], variant[match.end():]
+    return [f"{head}{match.group(1)}{tail}", f"{head}{match.group(1)} {match.group(2)}{tail}"]
+
+
 def _expand_ampersand(variant: str) -> list[str] | None:
     """"AT & MT" (two gearboxes) and "6 & 7STR" (two seaters) as two names.
     Any other "&" ("& Mocha Interiors", "LX & CBC") is part of the name."""
@@ -932,7 +945,7 @@ def split_variant_cell(cell: Any) -> list[str]:
         name = re.sub(r"\s+", " ", pending.pop(0)).strip(" -")
         if not name:
             continue
-        alternatives = _expand_ampersand(name) or _expand_slash(name)
+        alternatives = _expand_repeat(name) or _expand_ampersand(name) or _expand_slash(name)
         if alternatives:
             pending[:0] = alternatives
             continue
@@ -1069,6 +1082,29 @@ def variant_key(name: str | None) -> str:
     return re.sub(r"[^A-Z0-9]+", " ", text).strip()
 
 
+def variant_loose_key(name: str | None) -> str:
+    """A variant name with only its distinguishing words (2026-10-20, the
+    review of PR 472): the emission norm ("BS6.2"), the trailing release
+    markers ("- New", "- Refresh", "- N") and the "- E" suffix the price
+    list adds, and a trailing "& Mocha Interiors" (an interior option the
+    price list does not sell as its own variant) are taken off; "(O)" is
+    spelt OPT. Used only when the name does not match word for word, and
+    every price-list variant sharing the result gets the row: they differ by
+    nothing that names a different vehicle."""
+    text = re.sub(r"\((?:PRIVATE|COMMERCIAL)\)", " ", (name or "").upper())
+    text = re.sub(r"\(O\)", " OPT ", text)
+    text = re.sub(r"\s*&\s*MOCHA\s+INTERIORS?\s*$", " ", text)
+    text = re.sub(r"\bBS\s*-?\s*\d+(?:\.\d+)?\b", " ", text)
+    text = re.sub(r"-\s*E\b", " ", text)
+    while True:
+        stripped = re.sub(r"[\s-]*-\s*(?:NEW|REFRESH|N)\s*$", "", text.strip())
+        if stripped == text.strip():
+            break
+        text = stripped
+    text = re.sub(r"(\d)\s*STR\b", r"\1 STR", text)
+    return re.sub(r"[^A-Z0-9]+", " ", text).strip()
+
+
 def variant_excluded(variant_name: str | None, excluded_texts: list[str] | None) -> bool:
     """True when a scheme's exclusion ("EDGE", "REVX M(O) PM AT", "Star
     Edition") names this variant: every word of the exclusion is a word of
@@ -1123,9 +1159,40 @@ def _carry_forward_declaration(full_text: str) -> str | None:
     )
 
 
+_DATE_WORDS = r"\d{1,2}\s*(?:st|nd|rd|th)?[\s.\-/]*[A-Za-z]{3,9}\.?[\s.\-/'’`;]*\d{2,4}"
+_VALID_TO_RE = re.compile(
+    rf"(?:valid\s*from|from|w\.?e\.?f\.?)\s*{_DATE_WORDS}\s*(?:to|till|until|upto|up\s*to|-|–)\s*({_DATE_WORDS})",
+    re.IGNORECASE,
+)
+_MONTHLY_RE = re.compile(r"monthly\s+[\w\s]*?bulletin\s+([A-Za-z]{3,9})\s*['’`]?\s*(\d{2,4})", re.IGNORECASE)
+
+
+def validity_end_hint(blob: str | None) -> date | None:
+    """The last day a scheme document says it is valid (2026-10-20 product
+    owner rules, R5: a scheme answers only for the dates it stands on).
+    "Schemes are valid from 3rd Sept'26 to 30th Sept'26", "From 3rd Sept' 26
+    - 30th Sept' 26"; a "Monthly Consumer Scheme Bulletin Sep'26" with no end
+    printed stands to the end of its month."""
+    match = _VALID_TO_RE.search(blob or "")
+    if match:
+        end = _date_hint(f"w.e.f. {match.group(1)}")
+        if end is not None:
+            return end
+    monthly = _MONTHLY_RE.search(blob or "")
+    if monthly:
+        month = _MONTHS.get(monthly.group(1)[:3].lower())
+        year = int(monthly.group(2))
+        year = year + 2000 if year < 100 else year
+        if month:
+            following = date(year + (month == 12), month % 12 + 1, 1)
+            return following - timedelta(days=1)
+    return None
+
+
 def _parse_consumer_tables(page_tables: list[list[list[list[Any]]]], full_text: str) -> ParseResult:
     result = ParseResult(kind="CONSUMER_SCHEME")
     result.effective_from_hint = _date_hint(full_text)
+    result.effective_to_hint = validity_end_hint(full_text)
 
     row_no = 0
     found_header = False
@@ -1327,6 +1394,7 @@ def parse_exchange_scheme(content: bytes) -> ParseResult:
     result.effective_from_hint = _date_hint(
         full_text.replace("valid from", "w.e.f.")
     )
+    result.effective_to_hint = validity_end_hint(full_text)
 
     row_no = 0
     recognised = 0
@@ -1472,6 +1540,7 @@ def parse_corporate_policy(content: bytes) -> ParseResult:
         if isinstance(c, str)
     )
     result.effective_from_hint = _date_hint(hint.replace("From", "w.e.f."))
+    result.effective_to_hint = validity_end_hint(hint)
     result.meta["benefitRows"] = len(result.corporate_benefits)
     result.meta["companies"] = len(result.corporate_companies)
     return result
