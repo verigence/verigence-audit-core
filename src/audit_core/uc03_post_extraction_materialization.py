@@ -23,7 +23,7 @@ from audit_core import uc03_v2_review_materialization as materialization
 from audit_core.errors import AuditCoreError
 from audit_core.uc03_attribute_mapping import spec_for_field
 from audit_core.uc03_attribute_resolution import apply_supported_operational_attribute
-from audit_core.uc03_deal_source_history import record_source_value
+from audit_core.uc03_deal_source_history import upsert_commercial_actual
 
 logger = logging.getLogger(__name__)
 
@@ -139,46 +139,18 @@ def _materialize_commercial(
     evidence_id = winner.get("evidenceId")
     document_id = winner.get("documentId")
     document_type = str(winner.get("documentTypeKey") or "di").strip().lower()
-    connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.commercial_lines (
-                tenant_id, journey_id, component_key, actual_amount,
-                actual_source_kind, source_evidence_id, source_reference
-            ) VALUES (
-                :tenant_id, :journey_id, :component_key, :actual_amount,
-                'EVIDENCE', :evidence_id, :source_reference
-            )
-            ON CONFLICT (tenant_id, journey_id, component_key)
-            DO UPDATE SET
-                actual_amount=EXCLUDED.actual_amount,
-                actual_source_kind='EVIDENCE',
-                source_evidence_id=EXCLUDED.source_evidence_id,
-                source_reference=EXCLUDED.source_reference,
-                updated_at_utc=now()
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "component_key": field_key,
-            "actual_amount": amount,
-            "evidence_id": evidence_id,
-            "source_reference": f"{document_type}:{document_id}",
-        },
-    )
-    # Recorded regardless of whether this source currently wins the canonical
-    # row above -- see uc03_deal_source_history's own docstring.
-    record_source_value(
+    # 2026-10-20 (R6, invoice is the source of truth): through the one ranked
+    # writer, so this booking-stage pass never overwrites an invoice's actual.
+    # The source's own value is recorded either way (uc03_deal_source_history).
+    upsert_commercial_actual(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
-        line_kind="COMMERCIAL",
         component_key=field_key,
-        source_document_type=document_type,
         amount=amount,
-        evidence_id=evidence_id,
+        document_type=document_type,
         document_id=document_id,
+        evidence_id=evidence_id,
     )
     return True
 

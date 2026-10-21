@@ -635,26 +635,32 @@ def test_invoice_discount_survives_booking_form_reheal(journey) -> None:
     # A tax invoice arrives reporting a different discount — invoice wins.
     im.materialize_reviewed_invoices(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        # 2026-10-20 (R1/R2): the invoice discount is read by its printed
+        # description (a consumer offer) and shown GST-inclusive.
         documents=[_invoice_doc("tax_invoice_tally", {
             "invoice_purpose": "VEHICLE_SALE",
             "taxable_amount": "2000000",
+            "cgst_amount": "180000",
+            "sgst_amount": "180000",
             "invoice_discount_amount": "25000",
+            "line_items": [{"line_category": "DISCOUNT_LINE", "description_raw": "Consumer Offer",
+                            "taxable_amount": "25000"}],
         })],
     )
     row = _discount(c, "CASH_DISCOUNT")
-    assert row["actual_discount_amount"] == Decimal(25000)
+    assert row["actual_discount_amount"] == Decimal(29500)
 
     # Re-running deal reconciliation (the routine self-heal on every overview
     # read) must not regress the actual back to the booking form's 15000.
     dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     row = _discount(c, "CASH_DISCOUNT")
-    assert row["actual_discount_amount"] == Decimal(25000)
+    assert row["actual_discount_amount"] == Decimal(29500)
     assert row["eligibility_result"] == "ELIGIBLE"
 
     # A second, redundant self-heal is still a no-op on the invoice's value.
     dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     row = _discount(c, "CASH_DISCOUNT")
-    assert row["actual_discount_amount"] == Decimal(25000)
+    assert row["actual_discount_amount"] == Decimal(29500)
 
 
 def test_positive_variance_is_not_flagged(journey) -> None:

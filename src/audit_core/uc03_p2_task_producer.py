@@ -456,6 +456,8 @@ def _date_problem(field: dict[str, Any], floor: date | None) -> str:
     shown = format_value(field["fieldKey"], field.get("value"))
     if "DATE_UNREADABLE" in field.get("reasons", ()):
         return f"{_label(field['fieldKey'])} read as {shown!r}, which is not a date"
+    if "DATE_IN_FUTURE" in field.get("reasons", ()):
+        return f"{_label(field['fieldKey'])} read as {shown}, which is after today"
     when = f", before {floor.strftime('%B %Y')}" if floor else ""
     return f"{_label(field['fieldKey'])} read as {shown}{when}"
 

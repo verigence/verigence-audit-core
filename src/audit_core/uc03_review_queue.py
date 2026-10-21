@@ -716,6 +716,7 @@ _TASK_TITLE = {
     "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE": "Re-upload a document that failed processing",
     "FIELD_CORRECTION_REVIEW": "Review proposed field correction",
     "MANUAL_VERIFICATION_REVIEW": "Verify low-confidence fields",
+    "INVOICE_FIELD_REVIEW": "Check the figures read from an invoice",
     "DUPLICATE_RECEIPT_NOTICE": "Duplicate receipt -- won't be counted",
     "WRONG_DOCUMENT_REVIEW": "Verify customer name mismatch",
     "WRONG_DOCUMENT_DEALER_NOTICE": "Receipt dealer name mismatch",
@@ -778,6 +779,9 @@ _TASK_TYPE_FINDING_CLASS: dict[str, str] = {
     "SKU_RESOLUTION_INVOICE": "DATA_GAP",
     "DEAL_TOTAL_VARIANCE_REVIEW": "DATA_GAP",
     "INVOICE_DISCREPANCY_REVIEW": "DATA_GAP",
+    # 2026-10-20: an invoice whose own figures do not add up, or whose taxes
+    # were not read (uc03_invoice_materialization) -- the PC re-checks it.
+    "INVOICE_FIELD_REVIEW": "DATA_GAP",
     "MODEL_SELECTION_CORRECTION_REVIEW": "DATA_GAP",
     "INVOICE_SKU_MISMATCH_REASON": "DATA_GAP",
     "DELIVERY_VEHICLE_PHOTOS_MISSING": "DOCUMENT_GAP",
