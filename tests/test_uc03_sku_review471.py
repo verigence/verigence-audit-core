@@ -713,3 +713,33 @@ def test_a_journey_with_no_price_list_in_force_gets_the_price_master_task(journe
     result = _sync(c)
     assert result["reason"] == "no_effective_price_list" and result["taskOpen"] == "PRICE_MASTER_NOT_IN_FORCE"
     assert "PRICE_MASTER_NOT_IN_FORCE" in _open_pc_or_master_tasks(c)
+
+
+def test_marking_an_invoice_cancelled_voids_that_document_and_resolves_again(journey, monkeypatch):
+    from audit_core import uc03_p2_documents as documents
+
+    c = journey
+    lx, _ax = _seed_price_list(c, _THAR)
+    docs = _two_invoices(c)
+    _sync(c)
+    task = dict(_sku_task(c, "SKU_INVOICES_DISAGREE"))
+    voided: list[dict] = []
+
+    def void(connection, **kwargs):
+        voided.append(kwargs)
+        connection.execute(text("DELETE FROM auditcore.journey_document_extracted_fields WHERE tenant_id=:t "
+                                "AND journey_id=:j AND di_document_id=:d"),
+                           {"t": kwargs["tenant_id"], "j": kwargs["journey_id"], "d": kwargs["document_id"]})
+        return {}
+
+    monkeypatch.setattr(documents, "void_p2_document", void)
+    with pytest.raises(ValueError):
+        handle_sku_task_action(c, tenant_id=c.tenant_id, task=task, action="REJECT", actor_id="pc",
+                               actor_role_code="PC", comment="cancelled", details={"documentId": str(uuid4())})
+    handle_sku_task_action(c, tenant_id=c.tenant_id, task=task, action="REJECT", actor_id="pc",
+                           actor_role_code="PC", comment="cancelled", details={"documentId": str(docs["AX"])})
+    assert voided[0]["document_id"] == docs["AX"]
+    assert voided[0]["activity_details"]["reason"] == "INVOICE_CANCELLED_PER_SKU_TASK"
+    # The remaining invoice names LX at its price: it sets the SKU.
+    assert _vehicle(c)["product_sku_id"] == lx
+    assert _sku_task(c, "SKU_INVOICES_DISAGREE")["task_status"] == "VERIFIED_COMPLETE"
