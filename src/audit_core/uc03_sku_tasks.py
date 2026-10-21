@@ -806,7 +806,8 @@ def handle_sku_task_action(
             raise ValueError("Say which of the task's documents was cancelled")
         kind = "INVOICE" if task_type == INVOICES_DISAGREE_TASK else "BOOKING_FORM"
         void_p2_document(connection, tenant_id=tenant_id, journey_id=journey_id, document_id=UUID(document_id),
-                         actor_id=actor_id, void_reason=f"{kind}_CANCELLED_PER_SKU_TASK")
+                         actor_id=actor_id, activity_details={"reason": f"{kind}_CANCELLED_PER_SKU_TASK",
+                                                              "taskId": str(task["task_id"])})
         closed = _close(connection, tenant_id=tenant_id, task=task, outcome="DOCUMENT_CANCELLED", actor_id=actor_id,
                         role=role, comment=comment, extra={"documentId": document_id})
         sync_model_resolution(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id="")

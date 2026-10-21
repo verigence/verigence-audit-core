@@ -531,10 +531,13 @@ def void_p2_document(
     journey_id: UUID,
     document_id: UUID,
     actor_id: str,
-    void_reason: str = "P2_DOCUMENT_VOIDED",
-) -> None:
-    """Void one document of the Journey and recompute what it fed (the
-    DELETE route; also a PC's "this invoice was cancelled" on a SKU task)."""
+    activity_details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Take one document off the Journey: its evidence is voided, its capture
+    row superseded and its page unit cancelled with any work still queued
+    for it, so nothing is read twice; the projections are recomputed from
+    what remains. Used by DELETE /documents/{id} and by removing a refused
+    page (2026-10-21). Raises 404 when the Journey holds no such document."""
     context = _document_context(
         connection,
         tenant_id=tenant_id,
@@ -547,7 +550,7 @@ def void_p2_document(
             """
             UPDATE auditcore.evidence
             SET association_status='VOIDED',
-                void_reason=:void_reason,
+                void_reason='P2_DOCUMENT_VOIDED',
                 voided_by_actor_id=:actor_id,
                 voided_at_utc=now()
             WHERE tenant_id=:tenant_id
@@ -561,7 +564,6 @@ def void_p2_document(
             "journey_id": journey_id,
             "document_id": document_id,
             "actor_id": actor_id,
-            "void_reason": void_reason,
         },
     )
     connection.execute(
@@ -650,8 +652,9 @@ def void_p2_document(
         event_type="DOCUMENT_VOIDED",
         subject_type="DOCUMENT",
         subject_id=str(document_id),
-        details={"stage": stage_code, **({"reason": void_reason} if void_reason != "P2_DOCUMENT_VOIDED" else {})},
+        details={"stage": stage_code, **(activity_details or {})},
     )
+    return context
 
 
 @router.delete("/documents/{document_id}", status_code=204)
@@ -673,13 +676,8 @@ def delete_p2_document(
         authorization_client=authorization_client,
         permission_key=_UPDATE_PERMISSION,
     )
-    void_p2_document(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        document_id=document_id,
-        actor_id=human_principal.subject,
-    )
+    void_p2_document(connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+                     actor_id=human_principal.subject)
     return Response(status_code=204)
 
 
