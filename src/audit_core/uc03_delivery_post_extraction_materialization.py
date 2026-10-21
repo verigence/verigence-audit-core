@@ -199,8 +199,17 @@ def materialize_booking_documents_from_durable_store(
         documents = _documents_from_durable_store(
             connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING"
         )
+        # 2026-10-20 (R2): the canonical actuals an invoice owns are
+        # re-derived from the invoices still on file, so a Booking-stage
+        # invoice voided or replaced stops counting on this pass too -- even
+        # when it was the stage's last document.
+        from audit_core.uc03_invoice_materialization import sync_invoice_actuals
+
+        invoices = sync_invoice_actuals(
+            connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING"
+        )
         if not documents:
-            return {"skipped": True, "reason": "no_documents"}
+            return {"skipped": True, "reason": "no_documents", "invoiceActuals": invoices}
         insurance_written = materialize_delivery_insurance(
             connection,
             tenant_id=tenant_id,
@@ -216,6 +225,7 @@ def materialize_booking_documents_from_durable_store(
         result = {
             "insuranceFieldsWritten": insurance_written,
             "registrationFieldsWritten": registration_written,
+            "invoiceActuals": invoices,
         }
         logger.info(
             "uc03_booking_documents_materialized",

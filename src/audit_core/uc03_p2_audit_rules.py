@@ -625,6 +625,7 @@ def _invoice_bills(facts: _Facts) -> tuple[list[dict[str, Any]], list[str]]:
     from audit_core.uc03_invoice_materialization import (
         FAMILY_CREDIT_NOTE,
         FAMILY_VEHICLE,
+        plausible_from,
         select_invoices,
     )
     from audit_core.uc03_p2_journey360 import (
@@ -637,7 +638,8 @@ def _invoice_bills(facts: _Facts) -> tuple[list[dict[str, Any]], list[str]]:
         read_invoice(d["documentType"], _invoice_fields(d["fields"]), document_id=d["documentId"])
         for d in facts.documents(*_INVOICE_TYPES)
     ]
-    selection = select_invoices(readings, plausible_from=facts.booking_date)
+    selection = select_invoices(readings, plausible_from=plausible_from(
+        facts.connection, tenant_id=facts.tenant_id, journey_id=facts.journey_id))
     bills: list[dict[str, Any]] = []
     unreadable: list[str] = []
     for group in selection["groups"]:
