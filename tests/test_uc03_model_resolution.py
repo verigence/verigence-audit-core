@@ -1169,16 +1169,14 @@ def test_rejecting_the_closest_match_leaves_the_pc_to_pick_and_never_resuggests_
     assert _sku_task(c, "SKU_CLOSEST_MATCH_CONFIRM")["task_status"] == "VERIFIED_COMPLETE"
 
 
-def test_integration_falls_back_to_latest_master_when_booking_predates_it(journey) -> None:
-    """Regression: a real Booking Form's own extracted booking_date is often
-    well in the past (this one -- a real production case -- was 2024-08-12),
-    while a freshly-onboarded tenant's OEM master is necessarily effective
-    from the day it was ingested. Requiring a master version genuinely
-    effective as of that historical date meant sync_model_resolution always
-    hit "no_effective_price_list" and silently skipped -- forever, since
-    nothing about that mismatch ever changes on a later retry."""
+def test_a_booking_before_every_master_is_not_priced_on_the_newest_one(journey) -> None:
+    """2026-10-20 product owner rules (R5) reverse the earlier fallback that
+    took the newest published master "regardless of its effective window"
+    when the booking predated every master: that priced an August booking on
+    the October book without a word. Now nothing is resolved against a book
+    that was not in force, and the reason is given."""
     c = journey
-    (sku_id,) = _seed_price_list(
+    _seed_price_list(
         c,
         [{"model": "SCORPIO N", "variant": "Z8L",
           "components": {"EX_SHOWROOM": "1600000", "INSURANCE": "60000",
@@ -1193,16 +1191,9 @@ def test_integration_falls_back_to_latest_master_when_booking_predates_it(journe
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
 
-    assert result.get("resolved") is True
-    pinned = c.execute(
-        text("SELECT product_sku_id FROM auditcore.journey_products "
-             "WHERE tenant_id=:t AND journey_id=:j"),
-        {"t": c.tenant_id, "j": c.journey_id},
-    ).scalar_one()
-    assert pinned == sku_id
+    assert result == {"skipped": True, "reason": "no_effective_price_list"}
+    assert _vehicle(c)["product_sku_id"] is None
 
-
-# ── Delivery-invoice fallback ────────────────────────────────────────────────
 def _set_invoice_field(c, field_key, value, *, document_type_key="customer_invoice_dms", stage_code="DELIVERY"):
     c.execute(
         text(
@@ -2336,4 +2327,6 @@ def test_dealer_spellings_of_the_pickups_and_the_neo_name_the_list_model(mahindr
     aliases = mr._oem_model_aliases(c, oem_code="MAHINDRA")
     assert resolve_model_via_aliases(model_name="BOL MAXX PUP HD 1.7 LX", oem_aliases=aliases)[0] == "MAXX HD"
     assert resolve_model_via_aliases(model_name="BOLERO MAXX PUP HD 2.0L VXI", oem_aliases=aliases)[0] == "MAXX HD"
-    assert resolve_model_via_aliases(model_name="Bol Neo N10 R", oem_aliases=aliases)[0] == "THE BOSS- BOLERO+NEO"
+    # 2026-10-20 product owner rules (migration 0151): the Bolero family is
+    # split as October prints it; the Neo is its own model.
+    assert resolve_model_via_aliases(model_name="Bol Neo N10 R", oem_aliases=aliases)[0] == "BOLERO NEO"

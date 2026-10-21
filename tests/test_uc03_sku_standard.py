@@ -249,15 +249,16 @@ def test_the_price_master_reads_a_months_book_and_names_a_rename(connection) -> 
     assert book["previous"]["effectiveFrom"] == date(2026, 9, 1)
     by_model = {m["model"]: m for m in book["models"]}
 
-    # A respelt model appears TWICE in the month's book: the new spelling
-    # the OEM sent, and the old spelling carried forward because a partial
-    # book keeps every SKU it does not mention. Both are priced, so the
-    # reader has to be able to see they are one model -- which is what
-    # previousName is for.
-    assert set(by_model) == {"THAR ROXX", "XUV 3XO", "XUV3XO"}
-    assert by_model["XUV3XO"]["previousName"] == "XUV 3XO"
-    # Carried forward under the name it already had: nothing to report.
+    # 2026-10-20 product owner rules: a respelt model is ONE model. October's
+    # "XUV3XO" reuses the "XUV 3XO" loaded in September (its SKU keeps its
+    # code), and a complete book carries nothing forward, so the month's book
+    # holds it once, at the October price. (It used to appear twice: the new
+    # spelling and the old one carried forward at the September price.)
+    assert set(by_model) == {"THAR ROXX", "XUV 3XO"}
     assert by_model["XUV 3XO"]["previousName"] is None
+    (xuv,) = by_model["XUV 3XO"]["variants"]
+    ex = next(c for c in xuv["components"] if c["key"] == "EX_SHOWROOM")
+    assert Decimal(str(ex["amount"])) == Decimal(820_000)
     # Unchanged between books: nothing to report.
     assert by_model["THAR ROXX"]["previousName"] is None
     # Every variant carries its priced components and the on-road figure.
