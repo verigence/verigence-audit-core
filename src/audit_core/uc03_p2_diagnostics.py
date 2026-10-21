@@ -97,6 +97,23 @@ REPORTS: dict[str, str] = {
         WHERE tenant_id = :t
         ORDER BY uploaded_at_utc
     """,
+    # Pages not read, last 3 days: which booking, which file and page, the
+    # document service's id and the stored reason (2026-10-21: "files take
+    # 12 hours -- document issue or queueing?").
+    "failed_pages": """
+        SELECT j.journey_reference, b.original_filename, q.page_number, q.queue_status,
+               q.di_document_id::text AS di_document_id, q.classified_document_type,
+               q.attempt_count, left(q.last_error, 300) AS last_error,
+               to_char(q.created_at_utc AT TIME ZONE 'Asia/Kolkata', 'MM-DD HH24:MI') AS uploaded_ist,
+               to_char(q.updated_at_utc AT TIME ZONE 'Asia/Kolkata', 'MM-DD HH24:MI') AS updated_ist
+        FROM auditcore.p2_document_queue q
+        JOIN auditcore.journeys j ON j.tenant_id = q.tenant_id AND j.journey_id = q.journey_id
+        JOIN auditcore.p2_upload_batches b ON b.tenant_id = q.tenant_id AND b.batch_id = q.batch_id
+        WHERE q.tenant_id = :t
+          AND q.queue_status NOT IN ('READY', 'NEEDS_REVIEW', 'CANCELLED', 'MERGED', 'SUPPORTING')
+          AND q.created_at_utc > now() - interval '3 days'
+        ORDER BY q.created_at_utc
+    """,
     # Live checks before the 2026-10-21 fix merges (price masters, invoices).
     "pre_merge_checks": """
         SELECT 'DMS_TALLY_PAIR' AS kind, j.journey_reference AS a, v.document_type_key AS b,
