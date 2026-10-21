@@ -40,7 +40,10 @@ from audit_core.uc03_p2_access import (
 )
 from audit_core.uc03_p2_controls import control_statistics
 from audit_core.uc03_p2_dates import parse_extracted_date, programme_date_floor
-from audit_core.uc03_p2_document_health import journey_document_health
+from audit_core.uc03_p2_document_health import (
+    journey_document_health,
+    waits_for_night_attempt,
+)
 from audit_core.uc03_p2_journey_views import (
     ALL_VIEWS,
     BREAKDOWN_SQL,
@@ -2065,6 +2068,14 @@ def retry_page(
             status_code=409,
             detail="This page was rejected for scan quality; retrying will not help. Re-scan it and upload it again.",
         )
+    if waits_for_night_attempt(unit.get("last_error")):
+        # 2026-10-20 review (S4): a Retry now would start a second set of AI
+        # attempts on top of the overnight one already scheduled.
+        raise HTTPException(
+            status_code=409,
+            detail=("This page is waiting for its overnight AI retry; nothing to do now. If it is still not read "
+                    "by 08:00 the next morning you will get a task, and Retry works again."),
+        )
     request_page_recovery(
         connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id,
         marker="r", requested_by=human_principal.subject, correlation_id=get_correlation_id(request),
@@ -2385,8 +2396,11 @@ def _p2_page_statistics(
         text(
             """
             SELECT COUNT(*) AS pages,
+                   -- a page waiting for DI's night attempt is not processed yet
+                   -- (2026-10-20 review)
                    COUNT(*) FILTER (
                      WHERE queue_status IN ('READY','NEEDS_REVIEW','FAILED','DEAD_LETTER')
+                       AND COALESCE(last_error, '') NOT LIKE 'AI_RETRY_TONIGHT%'
                    ) AS processed
             FROM auditcore.p2_document_queue
             WHERE tenant_id=:tenant_id

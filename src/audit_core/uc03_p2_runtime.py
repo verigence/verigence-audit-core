@@ -254,15 +254,21 @@ def request_page_recovery(
             client_upload_id=str(row["client_upload_id"]), marker=marker, requested_by=requested_by,
             correlation_id=correlation_id,
         )
+    # The nightly look-up keeps the page's reason and last_error (2026-10-20
+    # review): a page waiting for DI's night attempt keeps its marker until
+    # the look-up has an answer, so a DI hiccup during it never loses it.
     connection.execute(
         text(
             """
             UPDATE auditcore.p2_document_queue
-            SET queue_status='QUEUED', status_reason=NULL, last_error=NULL, updated_at_utc=now()
+            SET queue_status='QUEUED',
+                status_reason=CASE WHEN :keep THEN status_reason END,
+                last_error=CASE WHEN :keep THEN last_error END,
+                updated_at_utc=now()
             WHERE tenant_id=:tenant_id AND queue_id=:queue_id
             """
         ),
-        {"tenant_id": tenant_id, "queue_id": queue_id},
+        {"tenant_id": tenant_id, "queue_id": queue_id, "keep": marker == "n"},
     )
     enqueue_work(
         connection, tenant_id=tenant_id, journey_id=journey_id, work_type="DOCUMENT_INGEST",
@@ -270,6 +276,26 @@ def request_page_recovery(
         correlation_id=correlation_id,
     )
     return str(row["client_upload_id"])
+
+
+def claim_scheduled_run(
+    connection: Connection, *, tenant_id: str, run_name: str, run_key: str, claimed_by: str | None = None,
+) -> bool:
+    """Claim a once-only run (the nightly review of one night, a one-time
+    deploy step) for a tenant, durably (2026-10-20 review: a worker restart
+    must not run the night again). True when this caller claimed it; the
+    claim commits or rolls back with the caller's transaction."""
+    return connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.p2_scheduled_runs (tenant_id, run_name, run_key, claimed_by)
+            VALUES (:tenant_id, :run_name, :run_key, :claimed_by)
+            ON CONFLICT (tenant_id, run_name, run_key) DO NOTHING
+            RETURNING run_key
+            """
+        ),
+        {"tenant_id": tenant_id, "run_name": run_name, "run_key": run_key, "claimed_by": claimed_by},
+    ).scalar_one_or_none() is not None
 
 
 def request_page_reread(

@@ -113,6 +113,11 @@ def test_page_outcome_follows_di_never_a_timer(di_item, fields, submitted_ago, f
 
 
 _AI = {"failureKind": "AI", "scanPassed": True}
+_AI_RETRYING = ("AI reading failed — it is tried again 10 minutes later, again 20 minutes after that, then "
+                "overnight. Nothing to do now.")
+_AI_TONIGHT = ("AI reading failed on the first try and on both automatic retries (10 minutes later, then 20 "
+               "minutes after that) — it will be tried again overnight. Nothing to do now.")
+_NIGHT_DUE = "2026-10-20T17:00:00+00:00"
 
 
 @pytest.mark.parametrize(
@@ -120,19 +125,22 @@ _AI = {"failureKind": "AI", "scanPassed": True}
     [
         # Retries DI has scheduled: the page stays in hand and says which case it is.
         ({"state": "CLASSIFIED", "processingStatus": "RETRY_PENDING", "processingFailureCode": "DOCUMENT_AI_UNAVAILABLE",
-          **_AI}, "EXTRACTING", "AI reading failed — will retry at 10 and 20 minutes, then overnight. Nothing to do now.",
-         None),
-        ({"state": "STORED", **_AI}, "CLASSIFYING",
-         "AI reading failed — will retry at 10 and 20 minutes, then overnight. Nothing to do now.", None),
+          **_AI}, "EXTRACTING", _AI_RETRYING, None),
+        ({"state": "STORED", **_AI}, "CLASSIFYING", _AI_RETRYING, None),
         ({"state": "STORED", "failureKind": "TECHNICAL", "scanPassed": None}, "CLASSIFYING",
          "Document service had a problem with this page — trying once more in 2 minutes. Nothing to do yet.", None),
+        # 2026-10-20 review (B1): DI has queued the night attempt but not run it
+        # yet; the document still says FAILED. In hand, never "failed overnight".
+        ({"state": "CLASSIFIED", "processingStatus": "FAILED", "processingFailureCode": "DOCUMENT_AI_UNAVAILABLE",
+          "nextAttemptAtUtc": _NIGHT_DUE, "inNightAttempt": True, "retryTonight": True, **_AI}, "EXTRACTING",
+         "AI reading failed earlier — the overnight attempt is under way. Nothing to do now.", None),
+        ({"state": "STORED", "nextAttemptAtUtc": _NIGHT_DUE, "inNightAttempt": True, **_AI}, "CLASSIFYING",
+         "AI reading failed earlier — the overnight attempt is under way. Nothing to do now.", None),
         # Three AI failures on a scanned page: left for the night, PC not troubled.
         ({"state": "CLASSIFIED", "processingStatus": "FAILED", "processingFailureCode": "DOCUMENT_AI_RESPONSE_INVALID",
-          "retryTonight": True, **_AI}, "FAILED",
-         ("AI reading failed — tried 3 times today (at once, after 10 and after 20 minutes); it will be tried "
-          "again overnight. Nothing to do now."), "AI_RETRY_TONIGHT:DOCUMENT_AI_RESPONSE_INVALID"),
+          "retryTonight": True, **_AI}, "FAILED", _AI_TONIGHT, "AI_RETRY_TONIGHT:DOCUMENT_AI_RESPONSE_INVALID"),
         ({"state": "FAILED", "failureCode": "DOCUMENT_AI_RATE_LIMITED", "retryTonight": True, **_AI}, "FAILED",
-         None, "AI_RETRY_TONIGHT:DOCUMENT_AI_RATE_LIMITED"),
+         _AI_TONIGHT, "AI_RETRY_TONIGHT:DOCUMENT_AI_RATE_LIMITED"),
         # ... and when the night attempt failed too, or the AI refused outright: the PC uploads it again.
         ({"state": "CLASSIFIED", "processingStatus": "FAILED", "processingFailureCode": "DOCUMENT_AI_UNAVAILABLE",
           "retryTonight": False, **_AI}, "FAILED",
@@ -144,15 +152,25 @@ _AI = {"failureKind": "AI", "scanPassed": True}
         # An AI failure on a page that never passed the scan: reload it.
         ({"state": "FAILED", "failureCode": "DOCUMENT_AI_UNAVAILABLE", "failureKind": "AI", "scanPassed": None,
           "retryTonight": False}, "FAILED", "File couldn't be scanned — please reload it.", "DOCUMENT_AI_UNAVAILABLE"),
-        # A technical failure inside DI after its two attempts.
+        # A technical failure inside DI after its two attempts (no attempt count claimed).
         ({"state": "FAILED", "failureCode": "CLASSIFICATION_FAILED", "failureKind": "TECHNICAL", "scanPassed": True},
-         "FAILED", ("Document service couldn't process this page — tried twice. Retry the page from the card, "
-                    "or upload it again."), "CLASSIFICATION_FAILED"),
+         "FAILED", ("Document service couldn't process this page, and its automatic retry failed too. Retry the "
+                    "page from the card, or upload it again."), "CLASSIFICATION_FAILED"),
         # A refusal of the content: at once, in words.
         ({"state": "CLASSIFIED", "processingStatus": "FAILED", "processingFailureCode": "DOCUMENT_AI_CONTENT_BLOCKED",
           "failureKind": "DOCUMENT", "scanPassed": True}, "FAILED",
          "AI declined to read this page's content — check the page and upload it again.",
          "DOCUMENT_AI_CONTENT_BLOCKED"),
+        # 2026-10-20 review (S8): Gemini refused our key or model -- ours to fix,
+        # never "upload it again"; it waits for the night attempt.
+        ({"state": "CLASSIFIED", "processingStatus": "FAILED", "processingFailureCode": "DOCUMENT_AI_NOT_CONFIGURED",
+          "failureKind": "CONFIGURATION", "scanPassed": True, "retryTonight": True}, "FAILED",
+         ("The AI service is not set up correctly on our side (support has been told). The page is tried again "
+          "overnight once it is fixed. Nothing to do now."), "AI_RETRY_TONIGHT:DOCUMENT_AI_NOT_CONFIGURED"),
+        ({"state": "FAILED", "failureCode": "DOCUMENT_TYPE_NOT_FOUND", "failureKind": "CONFIGURATION",
+          "scanPassed": True, "retryTonight": False}, "FAILED",
+         ("Document Intelligence is not set up to read this page on our side (support has been told). Retry the "
+          "page from the card once support confirms it is fixed."), "DOCUMENT_TYPE_NOT_FOUND"),
     ],
 )
 def test_page_outcome_says_which_retry_case_the_page_is_in(di_item, status, reason, last_error):
@@ -237,7 +255,8 @@ def test_failures_back_off_then_dead_letter_and_fail_the_page(journey, monkeypat
             {"q": queue_id},
         ).mappings().one()
     assert waiting["queue_status"] == "RETRY_WAIT"
-    assert waiting["status_reason"] == ("Document service didn't respond — trying once more in 2 minutes "
+    # DI answered with an error (503): it did respond (2026-10-20 review wording)
+    assert waiting["status_reason"] == ("Document service returned an error — trying once more in 2 minutes "
                                         "(attempt 1 of 2). Nothing to do yet.")
     # A first transient failure is not worth a task: the file is minutes old.
     with journey.engine.begin() as connection:
@@ -282,7 +301,7 @@ def test_failures_back_off_then_dead_letter_and_fail_the_page(journey, monkeypat
             {"q": queue_id},
         ).mappings().one()
     assert page["queue_status"] == "FAILED"
-    assert page["status_reason"] == ("Document service didn't respond — tried twice. "
+    assert page["status_reason"] == ("Document service returned an error — tried twice. "
                                      "Retry the page from the card, or upload it again.")
     # ...and the file's one task turns High and names the page to upload on its own.
     with journey.engine.begin() as connection:
@@ -299,7 +318,7 @@ def test_failures_back_off_then_dead_letter_and_fail_the_page(journey, monkeypat
     assert task["task_type"] == "PC_UPLOAD_STATUS" and task["assigned_role_code"] == "PC"
     assert task["severity"] == "HIGH" and task["task_status"] == "READY"
     assert task["title"] == "scan.pdf: 1 page could not be processed"
-    assert task["description"].startswith("Document service didn't respond — tried twice.")
+    assert task["description"].startswith("Document service returned an error — tried twice.")
     assert "Page 1 could not be processed: upload it on its own" in task["description"]
     assert task["reference"]["pageNumbers"] == [1] and task["reference"]["retrying"] is False
 
@@ -310,10 +329,28 @@ def test_retries_are_never_within_five_minutes():
     delays = [worker._retry_delay("STAGE_RECOMPUTE", n) for n in (1, 2, 3, 4)]
     assert delays == [900, 1800, 3600, 7200]  # decision 2026-10-01: spread out, never within five minutes
     assert min(delays) >= 300
-    assert worker._max_attempts("JOURNEY_RECONCILE") == 5
+    assert worker._max_attempts("STAGE_RECOMPUTE") == 5
 
 
-@pytest.mark.parametrize("work_type", ["DOCUMENT_INGEST", "SPLIT_BATCH"])
+@pytest.mark.parametrize(
+    ("work_type", "payload"),
+    [("JOURNEY_RECONCILE", None), ("DOCUMENT_RECONCILE", None), ("DOCUMENT_INGEST", {"recover": "n"})],
+)
+def test_polling_di_never_stretches_to_hours(work_type, payload):
+    """2026-10-20 review (S1, S2): checking DI for results, and the nightly
+    look-up of a page waiting for the night attempt, retry after 1, 2, then
+    every 5 minutes, and stop (telling the Team Lead) after about an hour."""
+    delays = [worker._retry_delay(work_type, n, payload) for n in range(1, 13)]
+    assert delays[:3] == [60, 120, 300] and max(delays) == 300
+    assert worker._max_attempts(work_type, payload) == 13
+    assert sum(delays) < 3600
+
+
+def test_the_pcs_retry_lookup_keeps_the_two_attempt_rule():
+    assert worker._max_attempts("DOCUMENT_INGEST", {"recover": "r"}) == 2
+
+
+@pytest.mark.parametrize("work_type", ["DOCUMENT_INGEST", "SPLIT_BATCH", "PAGE_REREAD", "BATCH_GROUP"])
 def test_a_documents_own_steps_get_two_attempts_two_minutes_apart(work_type):
     """Product owner's rule (2026-10-20): a technical failure on a
     document's own step is not tried beyond two attempts."""
@@ -836,7 +873,7 @@ def test_three_ai_failures_leave_the_page_for_the_night_without_a_pc_task(journe
     [task] = _file_tasks(journey)
     assert task["severity"] == "INFO"
     assert "1 being identified or read" in task["description"]
-    assert "1 waiting for tonight's AI retry" in task["description"]
+    assert "1 waiting for the overnight AI retry" in task["description"]
     assert "could not be processed" not in task["description"]
 
     # The other page is read: the file now waits only for the night, and the task closes.

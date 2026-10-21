@@ -356,7 +356,7 @@ def test_file_status_task_tells_the_truth_after_eight_hours_and_the_tl_after_a_d
     [pc_task] = _tasks(journey, "upload-status:")
     assert pc_task["task_type"] == "PC_UPLOAD_STATUS" and pc_task["severity"] == "INFO"
     assert "Waiting for the document service since" in pc_task["description"]
-    assert "retried automatically tonight" in pc_task["description"]
+    assert "retried automatically overnight" in pc_task["description"]
     assert "Re-sync on Upload / Edit Documents" in pc_task["description"]
     assert "check back after 1 hour" not in pc_task["description"]
     assert _tasks(journey, "upload-stuck-tl:") == []

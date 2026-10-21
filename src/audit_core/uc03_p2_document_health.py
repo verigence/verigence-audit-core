@@ -27,7 +27,7 @@ States and the one action each offers:
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -47,8 +47,30 @@ AI_RETRY_TONIGHT = "AI_RETRY_TONIGHT"
 
 
 def waits_for_night_attempt(last_error: str | None) -> bool:
-    """True for a FAILED page left for DI's night attempt (AI_RETRY_TONIGHT)."""
+    """True for a page left for DI's night attempt (AI_RETRY_TONIGHT): FAILED,
+    or QUEUED while the nightly sweep looks it up again."""
     return str(last_error or "").startswith(AI_RETRY_TONIGHT)
+
+
+# DI's night attempt runs at 17:00 UTC (22:30 IST, verigence-di
+# scheduler/beat.py). DI's daytime AI retries end about 30 minutes after a
+# page was submitted, so a page submitted later than 16:20 UTC waits for the
+# next night. 2026-10-20 review (S3): a page still waiting at 08:00 IST
+# (02:30 UTC) the morning after its night attempt is the PC's to know about.
+_DI_NIGHT_RUN_UTC = time(17, 0)
+_DAYTIME_LADDER = timedelta(minutes=40)
+_MORNING_AFTER = timedelta(hours=9, minutes=30)  # 17:00 UTC + 9h30 = 08:00 IST
+
+
+def night_attempt_deadline(submitted_at: datetime) -> datetime:
+    """When a page submitted at ``submitted_at`` that is waiting for DI's night
+    attempt stops waiting quietly: 08:00 IST the morning after the first
+    night run that follows the end of its daytime retries."""
+    ladder_done = submitted_at.astimezone(UTC) + _DAYTIME_LADDER
+    night = datetime.combine(ladder_done.date(), _DI_NIGHT_RUN_UTC, tzinfo=UTC)
+    if night < ladder_done:
+        night += timedelta(days=1)
+    return night + _MORNING_AFTER
 
 _IN_HAND = frozenset({
     "QUEUED", "PREPARING_PAGE", "DI_UPLOAD_PREPARING", "DI_UPLOADING", "DI_FINALIZING",
@@ -85,10 +107,11 @@ def page_health(
         return result("SUPERSEDED", "RESTORE")
     if status == "READY":
         return result("READ", None)
+    if status in ("FAILED", "DEAD_LETTER", "QUEUED") and waits_for_night_attempt(unit.get("last_error")):
+        # Left for DI's night attempt (2026-10-20), or being looked up again
+        # by the nightly sweep: nothing for the PC to do.
+        return result("WAITING", None)
     if status in ("FAILED", "DEAD_LETTER"):
-        if waits_for_night_attempt(unit.get("last_error")):
-            # Left for DI's night attempt (2026-10-20): nothing for the PC to do.
-            return result("WAITING", None)
         code = str(unit.get("last_error") or "").upper()
         if code.startswith(_QUALITY_PREFIX) or code in _UNREADABLE_CODES:
             return result("REJECTED", "UPLOAD_AGAIN")

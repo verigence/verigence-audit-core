@@ -667,6 +667,7 @@ def sync_processing_failure_tasks(
     now = now or datetime.now(UTC)
     wanted: set[str] = set()
     tl_wanted: set[str] = set()
+    cfg_wanted: set[str] = set()
     counts: dict[str, int] = {}
     batches = connection.execute(
         text(
@@ -676,14 +677,19 @@ def sync_processing_failure_tasks(
                    COUNT(q.queue_id) FILTER (WHERE q.queue_status IN ('READY','SUPPORTING','NEEDS_REVIEW')) AS done,
                    COUNT(q.queue_id) FILTER (WHERE q.queue_status='RETRY_WAIT') AS retrying,
                    COUNT(q.queue_id) FILTER (WHERE q.queue_status NOT IN
-                     ('READY','SUPPORTING','NEEDS_REVIEW','CANCELLED','MERGED','RETRY_WAIT','FAILED','DEAD_LETTER'))
+                     ('READY','SUPPORTING','NEEDS_REVIEW','CANCELLED','MERGED','RETRY_WAIT','FAILED','DEAD_LETTER')
+                     AND COALESCE(q.last_error, '') NOT LIKE :tonight)
                      AS working,
-                   -- left for DI's night attempt after an AI failure (2026-10-20):
+                   -- left for DI's night attempt after an AI failure (2026-10-20),
+                   -- or being looked up again by the nightly sweep (QUEUED):
                    -- neither failed nor a reason to raise the task
                    COALESCE(array_agg(DISTINCT p.page ORDER BY p.page)
-                            FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')
+                            FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER','QUEUED')
                                       AND COALESCE(q.last_error, '') LIKE :tonight), ARRAY[]::int[])
                      AS overnight_pages,
+                   bool_or(q.queue_status IN ('FAILED','DEAD_LETTER','QUEUED')
+                           AND COALESCE(q.last_error, '') LIKE '%DOCUMENT_AI_NOT_CONFIGURED%')
+                     AS ai_not_configured,
                    COALESCE(array_agg(DISTINCT p.page ORDER BY p.page)
                             FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')
                                       AND COALESCE(q.last_error, '') NOT LIKE :tonight), ARRAY[]::int[])
@@ -713,10 +719,30 @@ def sync_processing_failure_tasks(
         overnight_pages = [int(p) for p in (row["overnight_pages"] or [])]
         overnight_text = (
             f"{_pages_text(overnight_pages).capitalize()} {'is' if len(overnight_pages) == 1 else 'are'} "
-            "waiting for tonight's AI retry; nothing to do for "
+            "waiting for the overnight AI retry; nothing to do for "
             f"{'it' if len(overnight_pages) == 1 else 'them'}."
             if overnight_pages else ""
         )
+        if row["ai_not_configured"]:
+            # Gemini refused our key or model (2026-10-20 review, S8): ours to
+            # fix, not the PC's. The Team Lead (and through them support) is
+            # told; the page waits for the night attempt.
+            cfg_key = f"ai-config-tl:{journey_id}:{row['batch_id']}"
+            cfg_wanted.add(cfg_key)
+            _, cfg_outcome = raise_or_refresh(
+                connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=cfg_key,
+                task_type="TL_DOCUMENT_STUCK", source_type="DOCUMENT", source_code="DOCUMENT_AI_NOT_CONFIGURED",
+                title=f"{filename}: the AI service refused our credentials",
+                description=(f"The AI service (Gemini) refused Document Intelligence's key or model while reading "
+                             f"{filename}. This is a configuration problem on our side, not the PC's: raise it "
+                             "with support now. The pages are tried again overnight once it is fixed; the PC "
+                             "has nothing to do. This task closes itself when the pages are read."),
+                reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT",
+                           "sourceCode": "DOCUMENT_AI_NOT_CONFIGURED", "batchId": str(row["batch_id"]),
+                           "filename": filename},
+                severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
+            )
+            counts[cfg_outcome] = counts.get(cfg_outcome, 0) + 1
         split_failed = row["batch_status"] == "FAILED" and int(row["page_count"] or 0) == 0
         in_progress = retrying + working > 0 or row["batch_status"] in ("AWAITING_UPLOAD", "UPLOADED", "SPLITTING")
         age = (now - row["created_at_utc"]).total_seconds() if row["created_at_utc"] else 0.0
@@ -743,13 +769,13 @@ def sync_processing_failure_tasks(
             if failed_pages:
                 parts.append(f"{_pages_text(failed_pages)} could not be processed so far")
             if overnight_pages:
-                parts.append(f"{len(overnight_pages)} waiting for tonight's AI retry")
+                parts.append(f"{len(overnight_pages)} waiting for the overnight AI retry")
             if age >= STUCK_AFTER_SECONDS:
                 # Decision 2026-10-01: after eight hours the PC is told the
                 # truth, and what will happen next, instead of "check back".
                 since = row["created_at_utc"].astimezone(_IST).strftime("%H:%M on %d %b")
                 description = (", ".join(parts) + f". Waiting for the document service since {since}. It is "
-                               "retried automatically tonight; Re-sync on Upload / Edit Documents asks for it "
+                               "retried automatically overnight; Re-sync on Upload / Edit Documents asks for it "
                                "again now. This task updates itself and closes when the file is done.")
             else:
                 description = (", ".join(parts) + ". Nothing to do yet: check back after 1 hour. This task "
@@ -800,6 +826,10 @@ def sync_processing_failure_tasks(
     closed += _resolve_prefix_except(
         connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"upload-stuck-tl:{journey_id}:",
         keep=tl_wanted, evidence={"reason": "The file was processed or removed."},
+    )
+    closed += _resolve_prefix_except(
+        connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"ai-config-tl:{journey_id}:",
+        keep=cfg_wanted, evidence={"reason": "The pages were read, or are no longer waiting."},
     )
     # The per-page tasks this replaced (one per failed page) close too.
     closed += _resolve_prefix_except(
