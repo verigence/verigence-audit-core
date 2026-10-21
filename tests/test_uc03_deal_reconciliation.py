@@ -1300,7 +1300,7 @@ def test_an_unclassified_invoice_discount_is_compared_with_the_whole_entitlement
 # ── review of PR 472 (2026-10-20 product owner rules) ────────────────────────
 def _p2_tasks(c, task_type: str) -> list[dict]:
     return [dict(r) for r in c.execute(
-        text("SELECT dedupe_key, task_status, assigned_role_code, reference FROM auditcore.p2_tasks "
+        text("SELECT dedupe_key, task_status, assigned_role_code, reference, severity, title FROM auditcore.p2_tasks "
              "WHERE tenant_id=:t AND task_type=:k ORDER BY dedupe_key"),
         {"t": c.tenant_id, "k": task_type},
     ).mappings().all()]
@@ -1569,6 +1569,8 @@ def test_n1_a_model_no_bulletin_in_force_covers_is_not_known_ev_included(journey
     assert _open_finding(c, "DEAL_TOTAL_VARIANCE_NEGATIVE") is None
     (task,) = _p2_tasks(c, "DISCOUNT_SCHEME_NOT_IN_FORCE")
     assert task["reference"]["ev"] is True and task["assigned_role_code"] == "TL"
+    assert task["severity"] == "MEDIUM"
+    assert task["title"] == "Discount given on BE 6 but no EV scheme in force on 2026-09-10 lists it — confirm"
 
 
 def _welcome_masters(c):
@@ -1640,3 +1642,45 @@ def test_a_loyalty_figure_that_may_be_the_cod_scrappage_bonus_is_not_an_over_gra
     dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     row = _discount(c, "WELCOME_BONUS")
     assert row["eligibility_result"] == "LOYALTY_MAY_BE_COD" and row["standard_eligible_amount"] is None
+    (task,) = [t for t in _p2_tasks(c, "OLD_VEHICLE_EVIDENCE_CONFIRM") if t["dedupe_key"].startswith("cod-certificate:")]
+    assert task["assigned_role_code"] == "PC" and task["task_status"] == "READY"
+
+    # The certificate on file and read: the question is answered.
+    _old_vehicle_document(c, document_type="scrappage_certificate_of_deposit", fields={"vehicle_model": "MARUTI / ALTO"})
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert [t["task_status"] for t in _p2_tasks(c, "OLD_VEHICLE_EVIDENCE_CONFIRM")
+            if t["dedupe_key"].startswith("cod-certificate:")] == ["VERIFIED_COMPLETE"]
+
+
+def test_a_loyalty_figure_beside_an_exchange_is_flagged_either_way(journey) -> None:
+    """Exchange 50,000 + loyalty 20,000 with COD 20,000 in force: read as a
+    welcome bonus (none for the model) or as the COD bonus (not combinable
+    with the exchange), one old vehicle has earned two benefits."""
+    c = journey
+    seeded = _seed_pinned_sku(c, model="XUV 3XO", variant="AX5 PM MT", effective_from=date(2026, 9, 1),
+                              components={"EX_SHOWROOM": "1029900.54"})
+    for category, key, amount in (("EXCHANGE", "EXCHANGE_BONUS", "50000"), ("SCRAPPAGE", "SCRAPPAGE_BONUS_COD", "20000")):
+        _scheme(c, category=category, effective_from=_SEPT_SCHEMES, benefits={key: amount},
+                eligibility=[{"model_id": seeded["model_id"], "criteria": {"scope": "MODEL"}}])
+    _price_on(c, _UTKAL_PRICING_DATE)
+    _seed_reviewed_booking(c, exchange_discount_amount="50000", loyalty_discount_amount="20000")
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert _discount(c, "EXCHANGE_BONUS")["standard_eligible_amount"] == Decimal(50000)
+    row = _discount(c, "WELCOME_BONUS")
+    assert row["eligibility_result"] == "NOT_ELIGIBLE" and row["actual_discount_amount"] == Decimal(20000)
+    assert Decimal(_sheet_discount(c, "WELCOME_BONUS")["entitled"]) == 0
+
+
+def test_n2_an_unverified_old_vehicle_never_hides_the_excess_above_the_best_offer(journey) -> None:
+    """Exchange 1,50,000 with no RC read, the best conditional offer 70,000:
+    the 80,000 above it is a shortfall whatever the RC says."""
+    c = journey
+    _exchange_masters(c)
+    _seed_reviewed_booking(c, exchange_discount_amount="150000")
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    row = _discount(c, "EXCHANGE_BONUS")
+    assert row["eligibility_result"] == "OLD_VEHICLE_UNVERIFIED"
+    assert row["standard_eligible_amount"] == Decimal(70000)
+    assert _details(c, "EXCHANGE_BONUS")["excessAboveBestConditional"] == "80000.00"
+    sheet = _sheet_discount(c, "EXCHANGE_BONUS")
+    assert sheet["entitled"] == "70000.00" and sheet["takenAsGiven"] is False

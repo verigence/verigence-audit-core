@@ -408,6 +408,23 @@ _BRAND_SPELLINGS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _document_read(connection: Connection, *, tenant_id: str, journey_id: UUID, document_type_key: str) -> bool:
+    """Whether a document of the type is on file and something was read from it."""
+    return bool(connection.execute(
+        text(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM auditcore.evidence e
+                JOIN auditcore.journey_document_extracted_fields f
+                  ON f.tenant_id = e.tenant_id AND f.journey_id = e.journey_id AND f.di_document_id = e.di_document_id
+                WHERE e.tenant_id = :t AND e.journey_id = :j AND e.association_status = 'ACTIVE'
+                  AND e.document_type_key = :dt)
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "dt": document_type_key},
+    ).scalar_one())
+
+
 def _old_vehicle_readable(facts: list[dict[str, str]]) -> bool:
     """Whether a document on file has been read for the old vehicle's maker or model."""
     return any(fact.get("make") or fact.get("model") for fact in facts)
@@ -1149,6 +1166,25 @@ def _materialize_discount_standards(
         return (given_amount is not None and best is not None and given_amount > (entitled or Decimal(0))
                 and best > (entitled or Decimal(0)))
 
+    def old_vehicle_unverified(key: str, certain: Decimal | None) -> None:
+        """Taken as given up to the best conditional amount; anything given
+        above it is a shortfall whatever the RC says (round 2 of the review:
+        the excess is never hidden). The best amount then stands as the
+        standard, so the excess is the variance."""
+        best = max((_to_decimal(r.get("amount_value")) or Decimal(0) for r in unverified.get(key, [])),
+                   default=Decimal(0))
+        given_amount = claimed_amount(key) or Decimal(0)
+        extra = {"conditionalSchemes": unverified_detail(key), "bestConditionalAmount": str(best),
+                 **({"certainAmount": str(certain)} if certain is not None else {})}
+        reason = "the old vehicle's RC / valuation report is not on file or not read yet"
+        if given_amount > best:
+            write(key, standard=best, result="OLD_VEHICLE_UNVERIFIED", dsv=None, details={
+                "benefitKey": key, "entitlementUnknown": reason, "excessAboveBestConditional":
+                    str(given_amount - best), **extra})
+            counts["overGranted"] += 1
+            return
+        unknown(key, "OLD_VEHICLE_UNVERIFIED", reason, **extra)
+
     def invoice_actual(key: str) -> Decimal | None:
         row = existing.get(key)
         if row is not None and row["details"].get("origin") == "INVOICE_MATERIALIZATION":
@@ -1222,10 +1258,7 @@ def _materialize_discount_standards(
             counts["overGranted"] += 1
             continue
         if is_claimed and needs_old_vehicle(key, amount):
-            unknown(key, "OLD_VEHICLE_UNVERIFIED",
-                    "the old vehicle's RC / valuation report is not on file or not read yet",
-                    certainAmount=str(amount) if amount is not None else None,
-                    conditionalSchemes=unverified_detail(key))
+            old_vehicle_unverified(key, amount)
             continue
         result = "ELIGIBLE" if is_claimed else "ELIGIBLE_UNCLAIMED"
         write(key, standard=amount, result=result, dsv=benefit["discount_scheme_version_id"], details=details)
@@ -1296,17 +1329,19 @@ def _materialize_discount_standards(
                     unmatchedMasters=_unmatched_detail(unmatched[key]))
             continue
         if needs_old_vehicle(key, None):
-            unknown(key, "OLD_VEHICLE_UNVERIFIED",
-                    "the old vehicle's RC / valuation report is not on file or not read yet",
-                    conditionalSchemes=unverified_detail(key))
+            old_vehicle_unverified(key, None)
             continue
         cod = by_key.get("SCRAPPAGE_BONUS_COD")
+        other_old_vehicle_claim = any(
+            claimed(k) for k in _ONE_OLD_VEHICLE_BENEFIT if k not in ("WELCOME_BONUS", "SCRAPPAGE_BONUS_COD"))
         if key == "WELCOME_BONUS" and cod is not None and not claimed("SCRAPPAGE_BONUS_COD") and (
-            claimed_amount(key) or Decimal(0)
-        ) <= (_to_decimal(cod.get("amount_value")) or Decimal(0)):
+            not other_old_vehicle_claim
+        ) and (claimed_amount(key) or Decimal(0)) <= (_to_decimal(cod.get("amount_value")) or Decimal(0)):
             # The bulletin enters the COD scrappage bonus under the DMS
             # "Loyalty" tab: a loyalty figure may be that bonus (open question
-            # with the product owner).
+            # with the product owner). Only when no other old-vehicle benefit
+            # is claimed -- else, read either way, one old vehicle has earned
+            # two benefits and the rule below flags it (round 2 of the review).
             unknown(key, "LOYALTY_MAY_BE_COD",
                     "may be the COD scrappage bonus, which the DMS records under Loyalty",
                     codAmount=str(_to_decimal(cod.get("amount_value"))))
@@ -1856,20 +1891,22 @@ def _sync_master_tasks(
     key = f"discount-scheme-not-in-force:{journey_id}"
     if not_in_force:
         ev = is_ev_model_text(ctx.get("model_name"))
-        kind = "EV scheme" if ev else "discount scheme"
+        kind = "EV scheme" if ev else "scheme"
+        model = ctx.get("model_name") or "this model"
         raise_or_refresh(
             connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key, task_type=_NOT_IN_FORCE_TASK,
             source_type="RESOLVER", source_code=_NOT_IN_FORCE_TASK,
-            title=f"No {kind} loaded for {ctx.get('model_name') or 'this model'} on {effective_on.isoformat()}",
+            title=f"Discount given on {model} but no {kind} in force on {effective_on.isoformat()} lists it — confirm",
             description=(
                 f"{', '.join(k.replace('_', ' ').lower() for k in not_in_force)} given on this deal "
                 f"({vehicle or 'this vehicle'}, priced on {effective_on.isoformat()}), and no {kind} in force on "
-                "that date covers the model: the discount is taken as given, with no standard, and no other "
-                "month's scheme is applied. Load the bulletin that covers it for the date."
+                "that date lists the model: the bulletin may omit it on purpose, or the bulletin that covers it "
+                "is not loaded. The discount is kept out of the variance until then, and no other month's "
+                "scheme is applied. Confirm the discount, or load the bulletin that covers the model."
             ),
             reference={"sourceCode": _NOT_IN_FORCE_TASK, "onDate": effective_on.isoformat(), "keys": not_in_force,
                        "model": ctx.get("model_name"), "ev": ev},
-            severity="LOW", registry=registry,
+            severity="MEDIUM", registry=registry,
         )
         counts["notInForce"] += 1
     else:
@@ -1896,6 +1933,28 @@ def _sync_master_tasks(
     else:
         resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
                         evidence={"oldVehicleRead": True})
+
+    # A loyalty figure that may be the COD scrappage bonus: the certificate of
+    # deposit decides it once it is on file and read.
+    key = f"cod-certificate:{journey_id}"
+    maybe_cod = (rows.get("WELCOME_BONUS") or {}).get("eligibility_result") == "LOYALTY_MAY_BE_COD"
+    if maybe_cod and not _document_read(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                        document_type_key="scrappage_certificate_of_deposit"):
+        raise_or_refresh(
+            connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key, task_type=_OLD_VEHICLE_TASK,
+            source_type="RESOLVER", source_code=_OLD_VEHICLE_TASK,
+            title="Upload or confirm the scrappage certificate of deposit",
+            description=(
+                "A loyalty bonus is given on this deal, the deal is entitled to the COD scrappage bonus, and the "
+                "bulletin enters that bonus under the DMS \"Loyalty\" tab. No certificate of deposit on file "
+                "has been read. Upload or confirm it, so the figure can be checked as the COD scrappage bonus."
+            ),
+            reference={"sourceCode": _OLD_VEHICLE_TASK, "keys": ["WELCOME_BONUS"], "document": "scrappage_certificate_of_deposit"},
+            severity="MEDIUM", registry=registry,
+        )
+    else:
+        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                        evidence={"codCertificateRead": maybe_cod})
 
     key = f"corporate-category-confirm:{journey_id}"
     needs = (rows.get("CORPORATE_PRIVILEGE") or {}).get("eligibility_result") == "NEEDS_CORPORATE_EVIDENCE"
