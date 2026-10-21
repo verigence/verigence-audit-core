@@ -110,7 +110,7 @@ REPORTS: dict[str, str] = {
         JOIN auditcore.journeys j ON j.tenant_id = q.tenant_id AND j.journey_id = q.journey_id
         JOIN auditcore.p2_upload_batches b ON b.tenant_id = q.tenant_id AND b.batch_id = q.batch_id
         WHERE q.tenant_id = :t
-          AND q.queue_status NOT IN ('READY', 'NEEDS_REVIEW', 'CANCELLED')
+          AND q.queue_status NOT IN ('READY', 'NEEDS_REVIEW', 'CANCELLED', 'MERGED', 'SUPPORTING')
           AND q.created_at_utc > now() - interval '3 days'
         ORDER BY q.created_at_utc
     """,
