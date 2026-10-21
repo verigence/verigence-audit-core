@@ -173,7 +173,7 @@ def test_the_wholesale_invoice_and_a_voided_invoice_never_name_the_vehicle(journ
     _set_invoice_field(c, "model_name_raw", "THAR", document_type_key="wholesale_invoice", doc=wholesale)
     _set_invoice_field(c, "variant_raw", "AX", document_type_key="wholesale_invoice", doc=wholesale)
     result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
-    assert result == {"skipped": True, "reason": "no_vehicle_model_read"}
+    assert (result["skipped"], result["reason"]) == (True, "no_vehicle_model_read")  # and a task is left open (2026-10-21)
 
     voided, active = uuid4(), uuid4()
     customer_id = c.execute(text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
@@ -224,7 +224,7 @@ def test_no_pricing_date_means_no_resolution_never_today(journey) -> None:
               {"t": c.tenant_id, "j": c.journey_id})
     _set_journey_product(c, "THAR", "LX")
     result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
-    assert result == {"skipped": True, "reason": "no_pricing_date"}
+    assert (result["skipped"], result["reason"]) == (True, "no_pricing_date")  # and a task is left open (2026-10-21)
     assert mr.journey_pricing_date(c, tenant_id=c.tenant_id, journey_id=c.journey_id) is None
 
 

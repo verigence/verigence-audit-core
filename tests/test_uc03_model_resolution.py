@@ -932,7 +932,7 @@ def test_a_booking_before_every_master_is_not_priced_on_the_newest_one(journey) 
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
 
-    assert result == {"skipped": True, "reason": "no_effective_price_list"}
+    assert (result["skipped"], result["reason"]) == (True, "no_effective_price_list")  # and a task is left open (2026-10-21)
     assert _vehicle(c)["product_sku_id"] is None
 
 
@@ -1279,7 +1279,7 @@ def test_invoice_fallback_skips_without_any_model_read(journey) -> None:
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
 
-    assert result == {"skipped": True, "reason": "no_vehicle_model_read"}
+    assert (result["skipped"], result["reason"]) == (True, "no_vehicle_model_read")  # and a task is left open (2026-10-21)
 
 
 def _vehicle(c):
@@ -1344,7 +1344,7 @@ def test_an_accessory_invoice_never_names_the_vehicle(journey) -> None:
 
     result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
 
-    assert result == {"skipped": True, "reason": "no_vehicle_model_read"}
+    assert (result["skipped"], result["reason"]) == (True, "no_vehicle_model_read")  # and a task is left open (2026-10-21)
     assert _vehicle(c) is None
 
 

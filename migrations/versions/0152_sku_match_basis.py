@@ -39,7 +39,8 @@ an automatic method, so the history is the only signal:
     actor_role_snapshot HUMAN -- only the PC's confirm writes that), or the
     PC accepted a SKU_CLOSEST_MATCH_CONFIRM task naming the pinned SKU --
     unless an invoice replaced the SKU afterwards (a later
-    MODEL_CHANGED_BY_INVOICE task). The evidence names the trace.
+    MODEL_CHANGED_BY_INVOICE task whose SKU differs; a colour-only one
+    keeps the SKU). The evidence names the trace.
   * TL_APPROVED, CONFIRMED -- MODEL_SELECTION_CORRECTION_V1.
   * AUTO_LEGACY, TENTATIVE -- the remaining resolver pins. They stay on the
     Journey (normal syncs leave them alone) until the "reresolve-...-commit"
@@ -107,7 +108,12 @@ def classify_existing_pins(execute) -> None:
           AND NOT EXISTS (
               SELECT 1 FROM auditcore.p2_tasks c
               WHERE c.tenant_id = jp.tenant_id AND c.journey_id = jp.journey_id
-                AND c.task_type = 'MODEL_CHANGED_BY_INVOICE' AND c.created_at_utc > l.at)
+                AND c.task_type = 'MODEL_CHANGED_BY_INVOICE' AND c.created_at_utc > l.at
+                -- Only a task where the SKU itself changed: the colour-only
+                -- note (#470's _apply_invoice_colour) keeps the SKU, and its
+                -- after.skuId is "<skuId>:<colour>" (review of #471).
+                AND split_part(c.reference->'after'->>'skuId', ':', 1)
+                    IS DISTINCT FROM c.reference->'before'->>'skuId')
         """
     )
     execute(

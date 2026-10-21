@@ -23,6 +23,13 @@
   once decided for those documents and a new disagreement raises a new one.
 * SKU_BOOKING_FORMS_DISAGREE (PC) -- two booking forms name different SKUs
   (review 471 S6: never "the newest wins"); the same two actions.
+* SKU_NOT_SET (PC) -- 2026-10-21 product owner rule "a Journey left with
+  no clearly defined SKU gets a PC task": the Journey has no SKU and the
+  ladder could not even run (no document names the vehicle, no booking
+  date). Closes itself once a SKU is on the Journey.
+* SKU_BOOKING_FORM_DIFFERS (PC) -- a booking form names a different SKU
+  from the one a PC / Team Lead set. The decision is never overwritten; the
+  PC keeps it (Accept) or proposes a correction to the Team Lead.
 * SKU_NOT_CONFIRMED (PC) -- an automatic SKU on the Journey that its
   documents no longer name (a re-check could not confirm it, or the booking
   form was corrected): the SKU is kept so the deal still shows, marked
@@ -53,9 +60,11 @@ INVOICES_DISAGREE_TASK = "SKU_INVOICES_DISAGREE"
 INVOICE_REVIEW_TASK = "SKU_INVOICE_REVIEW"
 BOOKING_FORMS_DISAGREE_TASK = "SKU_BOOKING_FORMS_DISAGREE"
 NOT_CONFIRMED_TASK = "SKU_NOT_CONFIRMED"
+NOT_SET_TASK = "SKU_NOT_SET"
+BOOKING_FORM_DIFFERS_TASK = "SKU_BOOKING_FORM_DIFFERS"
 SKU_TASK_TYPES = frozenset({
     CLOSEST_TASK, OTHER_MONTH_TASK, MODEL_CHANGED_TASK, PRICE_MISMATCH_TASK, INVOICES_DISAGREE_TASK,
-    INVOICE_REVIEW_TASK, BOOKING_FORMS_DISAGREE_TASK, NOT_CONFIRMED_TASK,
+    INVOICE_REVIEW_TASK, BOOKING_FORMS_DISAGREE_TASK, NOT_CONFIRMED_TASK, NOT_SET_TASK, BOOKING_FORM_DIFFERS_TASK,
 })
 # The tasks an automatic match leaves for the PC; a PC / TL decision settles
 # all of them for good (review 471 B4).
@@ -600,12 +609,82 @@ def resolve_automatic_match_tasks(
     return closed
 
 
+def _not_set_key(journey_id: UUID) -> str:
+    return f"sku-not-set:{journey_id}"
+
+
+def raise_not_set_task(connection: Connection, *, tenant_id: str, journey_id: UUID, why: str, reason: str) -> None:
+    """No SKU on the Journey and nothing to identify it from yet: the PC is
+    asked to supply what is missing or set the SKU (2026-10-21)."""
+    from audit_core.uc03_p2_registry import get_registry
+    from audit_core.uc03_p2_task_producer import raise_or_refresh
+
+    raise_or_refresh(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        dedupe_key=_not_set_key(journey_id),
+        task_type=NOT_SET_TASK,
+        source_type="RESOLVER",
+        source_code="SKU_NOT_SET",
+        title="No SKU on this Journey \u2014 set the vehicle",
+        description=(
+            f"The Journey has no SKU: {why}. The deal cannot be checked against the price and discount masters "
+            "until it has one. Upload or correct the booking form or vehicle invoice, or set the SKU in the "
+            "model picker. This task closes itself once a SKU is on the Journey."
+        ),
+        reference={"sourceCode": "SKU_NOT_SET", "leftValue": reason, "rightValue": why},
+        severity="MEDIUM",
+        registry=get_registry(),
+    )
+
+
+def raise_booking_form_differs_task(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, current_sku_code: str | None,
+    current_basis: str | None, forms: list[dict[str, Any]],
+) -> str:
+    """A booking form names a different SKU from the one a PC or Team Lead
+    set: the decision stays (never overwritten); the PC is told."""
+    from audit_core.uc03_p2_registry import get_registry
+    from audit_core.uc03_p2_task_producer import raise_or_refresh
+
+    key, material = _disagree_key("sku-booking-form-differs", journey_id, forms)
+    who = "the Team Lead" if current_basis == "TL_APPROVED" else "the PC"
+    lines = "; ".join(f"{f.get('vehicle')} ({f.get('skuCode')})" for f in forms)
+    raise_or_refresh(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        dedupe_key=key,
+        task_type=BOOKING_FORM_DIFFERS_TASK,
+        source_type="RESOLVER",
+        source_code="SKU_BOOKING_FORM_DIFFERS",
+        title="A booking form names a different vehicle from the confirmed SKU",
+        description=(
+            f"The SKU on this Journey ({current_sku_code or '-'}) was set by {who} and stays as it is. A booking "
+            f"form on file names {lines}. Keep the confirmed vehicle if it is the one sold, or propose a "
+            "correction for the Team Lead from the Deal tab."
+        ),
+        reference={"sourceCode": "SKU_BOOKING_FORM_DIFFERS", "leftValue": current_sku_code, "rightValue": material,
+                   "documents": forms, "documentIds": [f.get("documentId") for f in forms]},
+        severity="MEDIUM",
+        registry=get_registry(),
+    )
+    return key
+
+
+def resolve_booking_form_differs_task(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                                      keep: set[str] | None = None) -> None:
+    _resolve_open(connection, tenant_id=tenant_id, journey_id=journey_id, task_type=BOOKING_FORM_DIFFERS_TASK,
+                  keep=keep or set(), reason="The booking forms name the confirmed SKU")
+
+
 def resolve_sku_tasks(connection: Connection, *, tenant_id: str, journey_id: UUID, sku_code: str | None) -> None:
-    """A SKU is on the Journey: the suggestion and the price-list approval
-    have nothing left to decide."""
+    """A SKU is on the Journey: the suggestion, the price-list approval and
+    the "no SKU" question have nothing left to decide."""
     from audit_core.uc03_p2_task_producer import resolve_if_open
 
-    for key in (_closest_key(journey_id), _other_month_key(journey_id)):
+    for key in (_closest_key(journey_id), _other_month_key(journey_id), _not_set_key(journey_id)):
         resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
                         evidence={"skuCode": sku_code, "reason": "SKU resolved"})
 
@@ -732,6 +811,11 @@ def handle_sku_task_action(
                         role=role, comment=comment, extra={"documentId": document_id})
         sync_model_resolution(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id="")
         return closed
+
+    if task_type == BOOKING_FORM_DIFFERS_TASK and action == "ACCEPT":
+        # The PC keeps the confirmed vehicle: the same forms never ask again.
+        return _close(connection, tenant_id=tenant_id, task=task, outcome="CONFIRMED_SKU_KEPT", actor_id=actor_id,
+                      role=role, comment=comment)
 
     if task_type == INVOICE_REVIEW_TASK and action in {"ACCEPT", "REJECT"}:
         if role not in {"TL", "PM"}:

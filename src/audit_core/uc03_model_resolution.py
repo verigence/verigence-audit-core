@@ -1749,8 +1749,15 @@ def _proposal(ev: dict[str, Any], state: dict[str, Any], plan: dict[str, Any]) -
     inv = plan.get("invoice") or {}
     if inv.get("disagree"):
         tasks.append("SKU_INVOICES_DISAGREE")
-    if ev.get("bookingDisagree"):
+    if action == "KEEP_HUMAN":
+        if _booking_forms_differing(ev, state):
+            tasks.append("SKU_BOOKING_FORM_DIFFERS")
+    elif ev.get("bookingDisagree"):
         tasks.append("SKU_BOOKING_FORMS_DISAGREE")
+    if action == "SKIP":
+        tasks.append({"no_effective_price_list": "PRICE_MASTER_NOT_IN_FORCE",
+                      "no_pricing_date": "PC_BOOKING_DATE_MISSING or SKU_NOT_SET"}.get(
+                          str(plan.get("skipped")), "SKU_NOT_SET"))
     tasks += ["SKU_PRICE_MISMATCH (invoice)"] * len(inv.get("priceTasks") or [])
     if inv.get("review"):
         tasks.append("SKU_INVOICE_REVIEW")
@@ -1793,10 +1800,12 @@ def _document_tasks(
     """Raise the PC / TL tasks the documents call for and close the ones
     they no longer call for."""
     from audit_core.uc03_sku_tasks import (
+        raise_booking_form_differs_task,
         raise_booking_forms_disagree_task,
         raise_invoice_review_task,
         raise_invoices_disagree_task,
         raise_price_mismatch_task,
+        resolve_booking_form_differs_task,
         resolve_booking_forms_disagree_task,
         resolve_invoice_review_task,
         resolve_invoices_disagree_task,
@@ -1843,7 +1852,22 @@ def _document_tasks(
         info["reviewRaised"] = True
     elif not ev.get("skipped"):
         resolve_invoice_review_task(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if ev.get("bookingDisagree"):
+    if is_human_decision(state):
+        # A PC / TL decision is never overwritten and never re-asked as a
+        # disagreement between forms (review of #471): a booking form naming
+        # another SKU is one PC task that says so and keeps the decision.
+        resolve_booking_forms_disagree_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+        differs = _booking_forms_differing(ev, state)
+        if differs:
+            key = raise_booking_form_differs_task(
+                connection, tenant_id=tenant_id, journey_id=journey_id, current_sku_code=state.get("sku_code"),
+                current_basis=state.get("match_basis"), forms=[_document_item(b, r) for b, r in differs],
+            )
+            resolve_booking_form_differs_task(connection, tenant_id=tenant_id, journey_id=journey_id, keep={key})
+            info["bookingFormDiffers"] = True
+        elif not ev.get("skipped"):
+            resolve_booking_form_differs_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+    elif ev.get("bookingDisagree"):
         key = raise_booking_forms_disagree_task(
             connection, tenant_id=tenant_id, journey_id=journey_id,
             forms=[_document_item(b, r) for b, r in ev["bookingDisagree"]],
@@ -1853,6 +1877,50 @@ def _document_tasks(
     elif not ev.get("skipped"):
         resolve_booking_forms_disagree_task(connection, tenant_id=tenant_id, journey_id=journey_id)
     return info
+
+
+def _booking_forms_differing(ev: dict[str, Any], state: dict[str, Any]) -> list[tuple[dict[str, Any], WordResult]]:
+    """Booking forms whose words name one SKU other than the PC / TL one."""
+    return [(b, r) for b, r in ev.get("bookings") or []
+            if r.identified and b.get("documentId") and str(r.row["product_sku_id"]) != str(state["product_sku_id"])]
+
+
+_NOT_SET_WHY = {
+    "no_vehicle_model_read": "no booking form or vehicle invoice on file names the vehicle",
+    "no_pricing_date": "the Journey has no booking date to price it on -- enter the booking date",
+}
+
+
+def _no_sku_task(connection: Connection, *, tenant_id: str, journey_id: UUID, ev: dict[str, Any]) -> str | None:
+    """A Journey with no SKU that the ladder could not run on always leaves a
+    task (2026-10-21 product owner rule). No price list in force on the
+    pricing date: the "no price master in force" task says so. No booking
+    date: the booking form's "enter the booking date" task when there is a
+    form, else SKU_NOT_SET. Nothing names the vehicle: SKU_NOT_SET. Returns
+    the task type left open."""
+    from audit_core.uc03_sku_tasks import raise_not_set_task
+
+    reason = str(ev.get("reason") or "")
+    if reason == "no_effective_price_list":
+        from audit_core.uc03_sku_candidates import sync_price_master_in_force_task
+
+        sync_price_master_in_force_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+        return "PRICE_MASTER_NOT_IN_FORCE"
+    if reason == "no_pricing_date":
+        from audit_core.uc03_p2_task_producer import sync_booking_date_task
+
+        sync_booking_date_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+        open_task = connection.execute(
+            text("SELECT 1 FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
+                 "AND task_type='PC_BOOKING_DATE_MISSING' AND task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED')"),
+            {"t": tenant_id, "j": journey_id},
+        ).first()
+        if open_task is not None:
+            return "PC_BOOKING_DATE_MISSING"
+    raise_not_set_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                       why=_NOT_SET_WHY.get(reason, reason.replace("_", " ") or "it could not be identified"),
+                       reason=reason or "unknown")
+    return "SKU_NOT_SET"
 
 
 def _note_change(
@@ -2106,6 +2174,9 @@ def _raise_not_identified(
         return {"skipped": True, "reason": "no_vehicle_model_read"}
     resolve_price_mismatch_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, source="BOOKING",
                                  keep=set(), reason="No SKU is named by the booking form's words")
+    # MODEL_NOT_IDENTIFIED (with its shortlist) is the PC's question now.
+    resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=f"sku-not-set:{journey_id}",
+                    evidence={"reason": "The documents name the vehicle; MODEL_NOT_IDENTIFIED asks which SKU"})
     reading, result, matched, stage = picked["reading"], picked["result"], picked["matched"], picked["stage"]
     source = picked["source"]
     use_invoice = source == "INVOICE"
@@ -2765,6 +2836,9 @@ def _sync_model_resolution_unguarded(
                   "raise_findings": raise_findings}
         action = plan["action"]
         if action == "SKIP":
+            if raise_findings:
+                return {**ev, "taskOpen": _no_sku_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                                       ev=ev)}
             return ev
         if action == "UNCONFIRMED" and ev.get("skipped"):
             return _apply_unconfirmed(connection, ev=ev, state=state, plan=plan, info={}, **common)

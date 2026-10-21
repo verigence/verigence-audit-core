@@ -464,3 +464,170 @@ def test_0152_keeps_an_accepted_closest_match_and_labels_the_rest_legacy(journey
     v = _vehicle(c)
     assert (v["selection_status"], v["match_basis"]) == ("TENTATIVE", "AUTO_LEGACY")
     assert v["match_evidence"]["statusBefore"] == "CONFIRMED"
+
+
+# ── review of #471 (2026-10-21, second round) ─────────────────────────────────
+def _colour_only_change_after_the_pick(c):
+    """#470's _apply_invoice_colour: a retail invoice printed another colour
+    for the same SKU, raising a colour-only MODEL_CHANGED_BY_INVOICE after
+    the PC's pick (after.skuId is "<skuId>:<colour>")."""
+    from audit_core.uc03_sku_tasks import raise_model_changed_observation
+
+    before = mr._vehicle_snapshot(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    raise_model_changed_observation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, before=before,
+                                    after={**before, "colour": "RED", "skuId": f"{before['skuId']}:RED"})
+    c.execute(text("UPDATE auditcore.p2_tasks SET created_at_utc = now() + interval '1 day' WHERE tenant_id=:t "
+                   "AND journey_id=:j AND task_type='MODEL_CHANGED_BY_INVOICE'"), {"t": c.tenant_id, "j": c.journey_id})
+
+
+def _pc_pick_before_441(c, sku):
+    mr.confirm_model_resolution_sku(c, tenant_id=c.tenant_id, journey_id=c.journey_id, product_sku_id=sku,
+                                    actor_id="pc-1", correlation_id="")
+    if c.execute(text("SELECT audit_finding_id FROM auditcore.audit_findings WHERE tenant_id=:t AND journey_id=:j "
+                      "AND finding_type_code='MODEL_NOT_IDENTIFIED'"),
+                 {"t": c.tenant_id, "j": c.journey_id}).scalar_one_or_none() is None:
+        mr._machine_flag(c, tenant_id=c.tenant_id, journey_id=c.journey_id, stage_code="BOOKING",
+                         rule_key="MODEL_NOT_IDENTIFIED:BOOKING", finding_type="MODEL_NOT_IDENTIFIED",
+                         severity="MEDIUM", title="t", description="d", correlation_id="", safe_payload={},
+                         task_payload_extra={})
+        mr._resolve_open_flag(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="", actor_id="pc-1")
+    c.execute(text("UPDATE auditcore.journey_products SET selection_method='MODEL_RESOLUTION_SYNC_V1', "
+                   "selection_status='CONFIRMED', match_basis=NULL, match_evidence=NULL "
+                   "WHERE tenant_id=:t AND journey_id=:j"), {"t": c.tenant_id, "j": c.journey_id})
+
+
+def test_0152_a_colour_only_invoice_note_keeps_the_pc_pick(journey):
+    c = journey
+    lx, _ax = _seed_price_list(c, _THAR)
+    _set_journey_product(c, "THAR", "LX")
+    _pc_pick_before_441(c, lx)
+    _colour_only_change_after_the_pick(c)
+    _migration().classify_existing_pins(lambda sql: c.execute(text(sql)))
+    v = _vehicle(c)
+    assert (v["product_sku_id"], v["selection_status"], v["match_basis"]) == (lx, "CONFIRMED", "PC_CONFIRMED")
+
+
+def test_0152_an_invoice_that_changed_the_sku_after_the_pick_is_not_the_pcs(journey):
+    from audit_core.uc03_sku_tasks import raise_model_changed_observation
+
+    c = journey
+    lx, ax = _seed_price_list(c, _THAR)
+    _set_journey_product(c, "THAR", "LX")
+    _pc_pick_before_441(c, lx)
+    before = mr._vehicle_snapshot(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    raise_model_changed_observation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, before=before,
+                                    after={**before, "skuId": str(ax), "skuCode": "AX"})
+    c.execute(text("UPDATE auditcore.p2_tasks SET created_at_utc = now() + interval '1 day' WHERE tenant_id=:t "
+                   "AND journey_id=:j AND task_type='MODEL_CHANGED_BY_INVOICE'"), {"t": c.tenant_id, "j": c.journey_id})
+    c.execute(text("UPDATE auditcore.journey_products SET product_sku_id=:s WHERE tenant_id=:t AND journey_id=:j"),
+              {"s": ax, "t": c.tenant_id, "j": c.journey_id})
+    _migration().classify_existing_pins(lambda sql: c.execute(text(sql)))
+    assert _vehicle(c)["match_basis"] == "AUTO_LEGACY"
+
+
+def test_reresolve_never_replaces_a_pc_pick_kept_by_0152(journey):
+    """The reviewer's p1b: the booking form (which the PC overrode) names AX;
+    the PC's LX survives 0152 and the reresolve commit."""
+    c = journey
+    lx, _ax = _seed_price_list(c, _THAR)
+    _set_journey_product(c, "THAR", "LX")
+    _pc_pick_before_441(c, lx)
+    _colour_only_change_after_the_pick(c)
+    _booking_form(c, {"vehicle_model": "THAR", "vehicle_variant": "AX", "ex_showroom_price": "1300000"})
+    _migration().classify_existing_pins(lambda sql: c.execute(text(sql)))
+    _recheck(c)
+    v = _vehicle(c)
+    assert (v["product_sku_id"], v["match_basis"]) == (lx, "PC_CONFIRMED")
+    assert "SKU_BOOKING_FORM_DIFFERS" in _open_tasks(c)
+
+
+def test_a_new_booking_form_after_a_pc_decision_is_one_task_and_never_overwrites(journey):
+    c = journey
+    lx, _ax = _seed_price_list(c, _THAR)
+    _booking_form(c, {"vehicle_model": "THAR", "vehicle_variant": "LX", "ex_showroom_price": "1400000"})
+    _sync(c)
+    mr.confirm_model_resolution_sku(c, tenant_id=c.tenant_id, journey_id=c.journey_id, product_sku_id=lx,
+                                    actor_id="pc-1", correlation_id="")
+    _booking_form(c, {"vehicle_model": "THAR", "vehicle_variant": "AX", "ex_showroom_price": "1300000"})
+    _sync(c)
+    assert _vehicle(c)["product_sku_id"] == lx and _vehicle(c)["match_basis"] == "PC_CONFIRMED"
+    assert _tasks(c, "SKU_BOOKING_FORMS_DISAGREE") == []
+    task = dict(_sku_task(c, "SKU_BOOKING_FORM_DIFFERS"))
+    assert task["assigned_role_code"] == "PC" and "THAR AX" in task["description"]
+    handle_sku_task_action(c, tenant_id=c.tenant_id, task=task, action="ACCEPT", actor_id="pc-1",
+                           actor_role_code="PC", comment=None)
+    for _ in range(2):
+        _sync(c)
+    (only,) = _tasks(c, "SKU_BOOKING_FORM_DIFFERS")
+    assert (only["task_status"], only["round_number"]) == ("VERIFIED_COMPLETE", 1)
+    assert _vehicle(c)["product_sku_id"] == lx
+
+
+def _invoice_document(kind, number):
+    return SimpleNamespace(documentTypeKey=kind, extractionState="READY", documentId=uuid4(), evidenceId=None,
+                           fields=[SimpleNamespace(fieldKey="invoice_number", value=number,
+                                                   effectiveValue=number, extractedValue=number)])
+
+
+@pytest.mark.parametrize("failure", ["exception", "sql"])
+def test_an_error_in_the_sku_rerun_never_fails_the_invoice_materialisation(journey, monkeypatch, failure):
+    from audit_core import uc03_invoice_materialization as im
+
+    c = journey
+
+    def boom(connection, **_kwargs):
+        if failure == "sql":
+            connection.execute(text("SELECT * FROM auditcore.no_such_table_sku_rerun"))
+        raise RuntimeError("failure inside the ladder")
+
+    monkeypatch.setattr(mr, "_evaluate", boom)
+    result = im.materialize_reviewed_invoices(c, tenant_id=c.tenant_id, journey_id=c.journey_id,
+                                              documents=[_invoice_document("customer_invoice_dms", "INV-1")],
+                                              actor_id="pc")
+    assert result["invoices"] == 1 and result["skuResolution"] == "ERROR"
+    # The invoice stays materialised and the connection usable.
+    assert c.execute(text("SELECT count(*) FROM auditcore.invoice_review_values WHERE tenant_id=:t AND journey_id=:j"),
+                     {"t": c.tenant_id, "j": c.journey_id}).scalar_one() == 1
+
+
+def _open_pc_or_master_tasks(c):
+    return {r[0] for r in c.execute(
+        text("SELECT task_type FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
+             "AND task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED')"),
+        {"t": c.tenant_id, "j": c.journey_id}).all()}
+
+
+def test_a_journey_with_nothing_naming_the_vehicle_gets_a_pc_task(journey):
+    c = journey
+    _seed_price_list(c, _THAR)
+    result = _sync(c)
+    assert result["reason"] == "no_vehicle_model_read" and result["taskOpen"] == "SKU_NOT_SET"
+    task = _sku_task(c, "SKU_NOT_SET")
+    assert task["assigned_role_code"] == "PC" and task["task_status"] == "READY"
+    # Once the documents name it, MODEL_NOT_IDENTIFIED / the pin takes over.
+    _booking_form(c, {"vehicle_model": "THAR", "vehicle_variant": "LX", "ex_showroom_price": "1400000"})
+    _sync(c)
+    assert _sku_task(c, "SKU_NOT_SET")["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_a_journey_with_no_booking_date_gets_a_pc_task(journey):
+    c = journey
+    _seed_price_list(c, _THAR)
+    _booking_form(c, {"vehicle_model": "THAR", "vehicle_variant": "LX", "ex_showroom_price": "1400000"})
+    c.execute(text("UPDATE auditcore.bookings SET booking_date=NULL WHERE tenant_id=:t AND journey_id=:j"),
+              {"t": c.tenant_id, "j": c.journey_id})
+    result = _sync(c)
+    assert result["reason"] == "no_pricing_date"
+    assert result["taskOpen"] in {"PC_BOOKING_DATE_MISSING", "SKU_NOT_SET"}
+    assert result["taskOpen"] in _open_pc_or_master_tasks(c)
+
+
+def test_a_journey_with_no_price_list_in_force_gets_the_price_master_task(journey):
+    c = journey
+    _seed_price_list(c, _THAR, effective_from="CURRENT_DATE - 5")
+    c.execute(text("UPDATE auditcore.bookings SET booking_date=CURRENT_DATE - 30 WHERE tenant_id=:t AND journey_id=:j"),
+              {"t": c.tenant_id, "j": c.journey_id})
+    _booking_form(c, {"vehicle_model": "THAR", "vehicle_variant": "LX", "ex_showroom_price": "1400000"})
+    result = _sync(c)
+    assert result["reason"] == "no_effective_price_list" and result["taskOpen"] == "PRICE_MASTER_NOT_IN_FORCE"
+    assert "PRICE_MASTER_NOT_IN_FORCE" in _open_pc_or_master_tasks(c)

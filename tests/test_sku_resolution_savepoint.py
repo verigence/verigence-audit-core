@@ -69,4 +69,4 @@ def test_no_vehicle_model_read_is_a_named_skip(journey):
         result = resolution.sync_model_resolution(
             connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id, correlation_id="t",
         )
-    assert result == {"skipped": True, "reason": "no_vehicle_model_read"}
+    assert (result["skipped"], result["reason"]) == (True, "no_vehicle_model_read")  # and a task is left open (2026-10-21)
