@@ -14,7 +14,7 @@ from __future__ import annotations
 from alembic import op
 
 revision = "0155_p2_scheduled_runs"
-down_revision = "0151_bolero_split_model_aliases"
+down_revision = "0153_source_values_per_document"
 branch_labels = None
 depends_on = None
 
