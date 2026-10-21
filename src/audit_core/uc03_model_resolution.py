@@ -40,12 +40,11 @@ Idempotent, never raises (the sync entry points run inside a savepoint).
 """
 from __future__ import annotations
 
-import ast
 import json
 import logging
 import re
 from datetime import UTC, date, datetime
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from typing import Annotated, Any
 from uuid import UUID
@@ -72,9 +71,14 @@ from audit_core.uc03_model_attribute_matching import (
     _master_attributes,
     normalized_model_key,
 )
-from audit_core.uc03_sku_candidates import _label_similarity, _price_plan_for_journey
+from audit_core.uc03_sku_candidates import (
+    _label_similarity,
+    _price_plan_for_journey,
+    journey_pricing_date,
+)
 from audit_core.uc03_sku_words import (
     WordResult,
+    clear_suggestion,
     identify,
     order_shortlist,
     price_check,
@@ -105,9 +109,11 @@ BASIS_AUTO_MATCHED = "AUTO_MATCHED"
 BASIS_AUTO_PRICE_MISMATCH = "AUTO_PRICE_MISMATCH"
 BASIS_AUTO_INVOICE = "AUTO_INVOICE_MATCHED"
 BASIS_AUTO_LEGACY = "AUTO_LEGACY"
+BASIS_AUTO_UNCONFIRMED = "AUTO_UNCONFIRMED"
 BASIS_PC = "PC_CONFIRMED"
 BASIS_TL = "TL_APPROVED"
-AUTOMATIC_BASES = frozenset({BASIS_AUTO_MATCHED, BASIS_AUTO_PRICE_MISMATCH, BASIS_AUTO_INVOICE, BASIS_AUTO_LEGACY})
+AUTOMATIC_BASES = frozenset({BASIS_AUTO_MATCHED, BASIS_AUTO_PRICE_MISMATCH, BASIS_AUTO_INVOICE, BASIS_AUTO_LEGACY,
+                             BASIS_AUTO_UNCONFIRMED})
 HUMAN_BASES = frozenset({BASIS_PC, BASIS_TL})
 # Plain words for the Deal screen (2026-10-20: automatic matches are not
 # "Confirmed"; only a PC / TL decision is).
@@ -116,6 +122,7 @@ BASIS_LABELS = {
     BASIS_AUTO_PRICE_MISMATCH: "Matched automatically by its words; price differs from the booking -- PC to set",
     BASIS_AUTO_INVOICE: "Set by the vehicle invoice (words and price agree)",
     BASIS_AUTO_LEGACY: "Matched automatically before 20 Oct 2026 -- to be re-checked",
+    BASIS_AUTO_UNCONFIRMED: "Matched automatically, but the documents do not name it -- PC to confirm or set",
     BASIS_PC: "Confirmed by the PC",
     BASIS_TL: "Approved by the Team Lead",
 }
@@ -141,10 +148,10 @@ _NON_VEHICLE_PURPOSES = frozenset({"ACCESSORY", "EXTENDED_WARRANTY", "RSA", "INS
                                    "SERVICE", "FASTAG"})
 _INVOICE_FIELD_KEYS = (
     "sku_code", "model_name_raw", "vehicle_description_raw", "variant_raw", "vehicle_color",
-    "invoice_purpose", "invoice_nature", "invoice_number",
+    "invoice_purpose", "invoice_nature", "invoice_number", "invoice_date", "vin_number", "chassis_number",
     "gross_amount_before_discount", "invoice_discount_amount", "taxable_amount",
     "cgst_rate", "sgst_rate", "igst_rate", "cgst_amount", "sgst_amount", "igst_amount", "cess_amount",
-    "line_items",
+    "tcs_amount", "round_off_amount", "grand_total_amount", "line_items",
 )
 
 # A SKU a person set that the vehicle invoice disagrees with (kept for the
@@ -231,42 +238,6 @@ def _rows_for_registration(rows: list[dict[str, Any]], category: str | None) -> 
     if category is None:
         return rows
     return [r for r in rows if _row_registration(r) in (None, category)]
-
-
-# ── the pricing date ──────────────────────────────────────────────────────────
-def _local_journey_pricing_date(connection: Connection, *, tenant_id: str, journey_id: UUID) -> date | None:
-    """The one date the Journey is priced on (rule R5): the date applied to
-    it (``bookings.pricing_effective_on``: the PC's booking/invoice-date
-    choice or a Team Lead's other-month approval), else the booking date the
-    booking form carries, else the booking date entered by hand. Never
-    today: no date means no price list and no SKU until there is one.
-
-    2026-10-20: identical to ``uc03_sku_candidates.journey_pricing_date``
-    from the price-master work (PR #468); used only until that is merged
-    (the import below prefers it), then this copy can go."""
-    row = connection.execute(
-        text(
-            "SELECT pricing_effective_on, booking_date FROM auditcore.bookings "
-            "WHERE tenant_id = :t AND journey_id = :j"
-        ),
-        {"t": tenant_id, "j": journey_id},
-    ).mappings().one_or_none() or {}
-    if row.get("pricing_effective_on"):
-        return row["pricing_effective_on"]
-    from audit_core.uc03_p2_dates import booking_form_date
-
-    form = booking_form_date(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if form and form.get("date"):
-        return form["date"]
-    return row.get("booking_date")
-
-
-try:  # the single pricing-date function, once the price-master work is merged
-    from audit_core.uc03_sku_candidates import (
-        journey_pricing_date,  # type: ignore[attr-defined]
-    )
-except ImportError:  # pragma: no cover - until PR #468 lands
-    journey_pricing_date = _local_journey_pricing_date
 
 
 # ── the price list's rows ─────────────────────────────────────────────────────
@@ -383,7 +354,11 @@ def is_human_decision(state: dict[str, Any]) -> bool:
 
 
 def _journey_registration(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
-    reg = connection.execute(
+    """The Journey's registration: Private or Commercial decides between the
+    two SKUs of a pickup (rule R4). Several registration records that say
+    different things leave it unknown -- never "the newest wins" (review
+    471 S6)."""
+    rows = connection.execute(
         text(
             """
             SELECT cu.customer_type_code, rr.registration_type_code, rr.registration_category_code
@@ -394,18 +369,22 @@ def _journey_registration(connection: Connection, *, tenant_id: str, journey_id:
               ON rr.tenant_id = j.tenant_id AND rr.journey_id = j.journey_id
             WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
             ORDER BY rr.updated_at_utc DESC NULLS LAST
-            LIMIT 1
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one_or_none() or {}
+    ).mappings().all()
+    reg = dict(rows[0]) if rows else {}
+    categories = {
+        registration_category(r.get("registration_type_code")) or registration_category(r.get("registration_category_code"))
+        for r in rows
+    } - {None}
     return {
         "basis": registration_basis(
             customer_type_code=reg.get("customer_type_code"),
             registration_type_code=reg.get("registration_type_code"),
         ),
-        "category": registration_category(reg.get("registration_type_code"))
-        or registration_category(reg.get("registration_category_code")),
+        "category": next(iter(categories)) if len(categories) == 1 else None,
+        "conflict": len(categories) > 1,
     }
 
 
@@ -480,13 +459,27 @@ def _reviewed_overlay(
     return {k: v for k, v in (dict(row) if row else {}).items() if _plain(v) is not None}
 
 
-def _booking_reading(connection: Connection, *, tenant_id: str, journey_id: UUID,
-                     state: dict[str, Any] | None = None) -> dict[str, Any] | None:
-    """What the booking form says the vehicle is, and its quoted ex-showroom
-    price -- all from the same form. The newest booking form wins (a docket
-    only when there is no form). Journeys captured by hand, with no booking
-    form on file, fall back to the reviewed booking values and then to the
-    model typed on the Journey."""
+def _booking_doc_reading(fields: dict[str, Any], *, document_id: str | None, document_type: str,
+                         updated_at: Any = None) -> dict[str, Any]:
+    return {
+        "source": "BOOKING", "documentId": document_id, "documentType": document_type,
+        "model": clean_model_text(fields.get("vehicle_model")), "variant": _plain(fields.get("vehicle_variant")),
+        "colour": _plain(fields.get("vehicle_color")), "skuCode": _plain(fields.get("sku_code")),
+        "exShowroom": _money(fields.get("ex_showroom_price")),
+        "registration": registration_category(fields.get("registration_type")),
+        "updatedAt": updated_at,
+    }
+
+
+def _booking_readings(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                      state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Every booking form that names the vehicle, each read on its own (its
+    words and its quoted ex-showroom), newest first; a docket only when there
+    is no form. Journeys captured by hand, with no booking form on file, fall
+    back to the reviewed booking values and then to the model typed on the
+    Journey -- or, once a SKU was pinned from that typed model, to the words
+    the pin recorded (the snapshot then holds the price master's own names,
+    and reading those back would confirm the pin by itself)."""
     documents = _document_fields(
         connection, tenant_id=tenant_id, journey_id=journey_id,
         types=_BOOKING_DOCUMENT_TYPES, keys=_BOOKING_FIELD_KEYS,
@@ -494,18 +487,16 @@ def _booking_reading(connection: Connection, *, tenant_id: str, journey_id: UUID
     documents = [d for d in documents if d["fields"].get("vehicle_model") or d["fields"].get("vehicle_variant")
                  or d["fields"].get("sku_code")]
     if documents:
-        doc = next((d for d in documents if d["documentType"] == "booking_form"), documents[0])
-        fields = {**doc["fields"], **_reviewed_overlay(
-            connection, tenant_id=tenant_id, journey_id=journey_id, table="booking_form_review_values",
-            document_id=doc["documentId"], keys=_BOOKING_FIELD_KEYS,
-        )}
-        return {
-            "source": "BOOKING", "documentId": doc["documentId"], "documentType": doc["documentType"],
-            "model": clean_model_text(fields.get("vehicle_model")), "variant": _plain(fields.get("vehicle_variant")),
-            "colour": _plain(fields.get("vehicle_color")), "skuCode": _plain(fields.get("sku_code")),
-            "exShowroom": _money(fields.get("ex_showroom_price")),
-            "registration": registration_category(fields.get("registration_type")),
-        }
+        forms = [d for d in documents if d["documentType"] == "booking_form"] or documents
+        readings = []
+        for doc in forms:
+            fields = {**doc["fields"], **_reviewed_overlay(
+                connection, tenant_id=tenant_id, journey_id=journey_id, table="booking_form_review_values",
+                document_id=doc["documentId"], keys=_BOOKING_FIELD_KEYS,
+            )}
+            readings.append(_booking_doc_reading(fields, document_id=doc["documentId"],
+                                                 document_type=doc["documentType"], updated_at=doc["updatedAt"]))
+        return readings
     reviewed = connection.execute(
         text(
             """
@@ -520,22 +511,21 @@ def _booking_reading(connection: Connection, *, tenant_id: str, journey_id: UUID
     ).mappings().all()
     named = next((r for r in reviewed if _plain(r["vehicle_model"]) or _plain(r["sku_code"])), None)
     if named is not None:
-        return {
-            "source": "BOOKING", "documentId": str(named["source_di_document_id"]), "documentType": "booking_form",
-            "model": clean_model_text(named["vehicle_model"]), "variant": _plain(named["vehicle_variant"]),
-            "colour": _plain(named["vehicle_color"]), "skuCode": _plain(named["sku_code"]),
-            "exShowroom": _money(named["ex_showroom_price"]),
-            "registration": registration_category(named["registration_type"]),
-        }
+        return [_booking_doc_reading(dict(named), document_id=str(named["source_di_document_id"]),
+                                     document_type="booking_form")]
     state = state or _pin_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+    evidence = state.get("match_evidence") if isinstance(state.get("match_evidence"), dict) else {}
+    if state.get("product_sku_id") is not None:
+        if evidence.get("documentType") == "journey" and evidence.get("modelText"):
+            return [{
+                "source": "BOOKING", "documentId": None, "documentType": "journey",
+                "model": clean_model_text(evidence.get("modelText")), "variant": _plain(evidence.get("variantText")),
+                "colour": state.get("colour_name"), "skuCode": None,
+                "exShowroom": _money(evidence.get("documentExShowroom")), "registration": None,
+            }]
+        return []
     if not state.get("model_name"):
-        return None
-    evidence = state.get("match_evidence") or {}
-    if state.get("product_sku_id") is not None or (isinstance(evidence, dict) and "cleared" in evidence):
-        # Once a SKU was pinned the Journey's model / variant are the price
-        # master's own names, not what anyone wrote: reading them back would
-        # only confirm the pin by its own words.
-        return None
+        return []
     # The model typed on the Journey (manual capture). Its quoted price is the
     # reviewed booking form's, else the Journey's ex-showroom line when no
     # invoice wrote it.
@@ -554,24 +544,42 @@ def _booking_reading(connection: Connection, *, tenant_id: str, journey_id: UUID
         source = str((line or {}).get("source_reference") or "").split(":", 1)[0].strip().lower()
         if line is not None and "invoice" not in source:
             price = _money(line["actual_amount"])
-    return {
+    return [{
         "source": "BOOKING", "documentId": None, "documentType": "journey",
         "model": clean_model_text(state["model_name"]), "variant": state.get("variant_name"),
         "colour": state.get("colour_name"), "skuCode": None, "exShowroom": price, "registration": None,
-    }
+    }]
+
+
+def _cancelled_invoice_ids(connection: Connection, *, tenant_id: str, journey_id: UUID) -> set[str]:
+    """Vehicle invoices a credit note reverses in full (PR #470's
+    ``select_invoices``): cancelled, so they name no vehicle any more. One
+    still waiting for the PC's "does this credit note cancel it?" counts."""
+    from audit_core.uc03_invoice_materialization import (
+        load_invoice_readings,
+        select_invoices,
+    )
+
+    selection = select_invoices(load_invoice_readings(connection, tenant_id=tenant_id, journey_id=journey_id))
+    return {str(copy["documentId"]) for group in selection.get("cancelled") or []
+            for copy in group.get("copies") or [] if copy.get("documentId")}
 
 
 def _vehicle_invoice_readings(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
     """Each customer vehicle invoice on its own: what it names (model,
     variant, printed SKU code, colour) and its ex-showroom by rule R1, all
     from that one invoice. A credit note, an accessory / warranty / RSA
-    invoice or the OEM's wholesale invoice is not a vehicle invoice."""
+    invoice, the OEM's wholesale invoice, or a vehicle invoice a credit note
+    cancelled is not a vehicle invoice."""
     readings: list[dict[str, Any]] = []
     documents = _document_fields(
         connection, tenant_id=tenant_id, journey_id=journey_id, types=_VEHICLE_INVOICE_TYPES,
         keys=_INVOICE_FIELD_KEYS,
     )
+    cancelled = _cancelled_invoice_ids(connection, tenant_id=tenant_id, journey_id=journey_id) if documents else set()
     for doc in documents:
+        if doc["documentId"] in cancelled:
+            continue
         fields = {**doc["fields"], **_reviewed_overlay(
             connection, tenant_id=tenant_id, journey_id=journey_id, table="invoice_review_values",
             document_id=doc["documentId"], keys=_INVOICE_FIELD_KEYS,
@@ -586,7 +594,7 @@ def _vehicle_invoice_readings(connection: Connection, *, tenant_id: str, journey
         sku_code = _plain(fields.get("sku_code"))
         if model is None and sku_code is None:
             continue
-        ex_showroom, basis = invoice_ex_showroom(fields)
+        ex_showroom, basis = invoice_ex_showroom(fields, doc["documentType"])
         readings.append({
             "source": "INVOICE", "documentId": doc["documentId"], "documentType": doc["documentType"],
             "invoiceNumber": _plain(fields.get("invoice_number")),
@@ -600,9 +608,6 @@ def _vehicle_invoice_readings(connection: Connection, *, tenant_id: str, journey
 
 
 # ── rule R1: the invoice's ex-showroom ────────────────────────────────────────
-_PAISE = Decimal("0.01")
-
-
 def _money(value: Any) -> Decimal | None:
     if value is None or isinstance(value, bool):
         return None
@@ -615,85 +620,34 @@ def _money(value: Any) -> Decimal | None:
         return None
 
 
-def _line_items(value: Any) -> list[dict[str, Any]]:
-    raw = value
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except (ValueError, TypeError):
-            try:
-                raw = ast.literal_eval(raw)
-            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
-                return []
-    return [row for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
+def invoice_ex_showroom(fields: dict[str, Any], document_type: str = "customer_invoice_dms",
+                        ) -> tuple[Decimal | None, dict[str, Any]]:
+    """Rule R1 (2026-10-20) for one vehicle invoice: its printed selling
+    price (before any discount) times (1 + its printed GST rate). One
+    implementation for the Deal sheet and the SKU check: PR #470's
+    ``uc03_invoice_materialization.vehicle_invoice_ex_showroom`` (review 471
+    S5 -- discounts printed negative or only as lines, the vehicle line's own
+    discount, add-on lines sharing the invoice). Returns (ex-showroom or None,
+    how it was read: the GST rate in percent for the category gate, and the
+    issues that left it unread)."""
+    from audit_core.uc03_invoice_materialization import vehicle_invoice_ex_showroom
 
-
-def invoice_ex_showroom(fields: dict[str, Any]) -> tuple[Decimal | None, dict[str, Any]]:
-    """Rule R1 (2026-10-20): the billed ex-showroom is the invoice's printed
-    selling price (gross, before any discount) plus GST at that invoice's
-    printed rate(s) -- CGST + SGST, or IGST, plus cess -- on that selling
-    price. Example: 7,22,033.90 x 1.18 = 8,52,000.00. When the invoice prints
-    no discount, its selling price is the taxable value and the printed GST
-    amounts are added as printed. The rate is the printed one; only when no
-    rate is printed is it read off the printed amounts (tax / taxable).
-
-    Returns (ex-showroom or None, how it was worked out)."""
-    taxable = _money(fields.get("taxable_amount"))
-    gross = _money(fields.get("gross_amount_before_discount"))
-    header_discount = _money(fields.get("invoice_discount_amount"))
-    lines = _line_items(fields.get("line_items"))
-    vehicle_lines = [li for li in lines if str(li.get("line_category") or "").strip().upper() == "VEHICLE"]
-    discount_lines = [li for li in lines if str(li.get("line_category") or "").strip().upper() == "DISCOUNT_LINE"]
-    has_discount = bool(header_discount) or bool(discount_lines)
-    basis: dict[str, Any] = {}
-
-    selling = gross
-    if selling is None and vehicle_lines:
-        line_gross = [_money(li.get("gross_amount")) for li in vehicle_lines]
-        if line_gross and all(v is not None for v in line_gross):
-            selling = sum(line_gross, Decimal(0))
-            basis["selling"] = "VEHICLE_LINE_GROSS"
-    if selling is None and taxable is not None and not has_discount:
-        selling = taxable
-        basis["selling"] = "TAXABLE_NO_DISCOUNT"
-    if selling is None and taxable is not None and header_discount is not None and not discount_lines:
-        selling = taxable + header_discount
-        basis["selling"] = "TAXABLE_PLUS_DISCOUNT"
-    if selling is None:
-        return None, {"reason": "no selling price printed"}
-    basis.setdefault("selling", "GROSS_BEFORE_DISCOUNT")
-    basis["sellingPrice"] = str(selling)
-
-    cgst_r, sgst_r, igst_r = (_money(fields.get(k)) for k in ("cgst_rate", "sgst_rate", "igst_rate"))
-    cgst, sgst, igst, cess = (_money(fields.get(k)) for k in ("cgst_amount", "sgst_amount", "igst_amount",
-                                                               "cess_amount"))
-    rate: Decimal | None = None
-    if cgst_r or sgst_r:
-        rate = (cgst_r or Decimal(0)) + (sgst_r or Decimal(0))
-    elif igst_r:
-        rate = igst_r
-    else:
-        line_rates = {_money(li.get("tax_rate")) for li in vehicle_lines} - {None}
-        if len(line_rates) == 1:
-            rate = line_rates.pop()
-    tax_amounts = [v for v in (cgst, sgst, igst) if v is not None]
-    if rate is None and taxable and tax_amounts:
-        rate = (sum(tax_amounts, Decimal(0)) / taxable * 100).quantize(_PAISE)
-        basis["rate"] = "FROM_PRINTED_AMOUNTS"
-    if rate is None:
-        return None, {**basis, "reason": "no GST rate or amount printed"}
-    basis.setdefault("rate", "PRINTED")
-    basis["gstRatePercent"] = rate
-    cess_rate = (cess / taxable * 100).quantize(_PAISE) if cess and taxable else Decimal(0)
-    basis["cessRatePercent"] = cess_rate
-
-    if not has_discount and taxable is not None and selling == taxable and tax_amounts:
-        ex_showroom = selling + sum(tax_amounts, Decimal(0)) + (cess or Decimal(0))
-        basis["method"] = "SELLING_PLUS_PRINTED_GST"
-    else:
-        ex_showroom = (selling * (1 + (rate + cess_rate) / 100)).quantize(_PAISE, rounding=ROUND_HALF_UP)
-        basis["method"] = "SELLING_TIMES_GST_RATE"
-    return ex_showroom, {**basis, "gstRatePercent": rate}
+    reading = vehicle_invoice_ex_showroom(dict(fields), document_type)
+    rate = reading.get("rate")
+    basis: dict[str, Any] = {
+        "method": "R1_VEHICLE_INVOICE_EX_SHOWROOM",
+        "sellingPrice": reading.get("sellingPrice"),
+        "sellingPriceSource": reading.get("sellingPriceSource"),
+        "gstRatePercent": (Decimal(str(rate)) * 100).quantize(Decimal("0.01")) if rate is not None else None,
+    }
+    issues = [i.get("code") for i in reading.get("issues") or [] if isinstance(i, dict)]
+    if issues:
+        basis["issues"] = issues
+    ex = reading.get("exShowroom")
+    if ex is None:
+        basis["reason"] = " ".join(str(i.get("message")) for i in reading.get("issues") or []
+                                    if isinstance(i, dict) and i.get("message")) or "ex-showroom not read"
+    return (Decimal(str(ex)) if ex is not None else None), basis
 
 
 def _resolution_inputs(
@@ -907,7 +861,7 @@ def _pin_sku(
 
 def _pin_human(
     connection: Connection, *, tenant_id: str, journey_id: UUID, product_sku_id: UUID, method: str, basis: str,
-    evidence: dict[str, Any] | None = None,
+    evidence: dict[str, Any] | None = None, task_id: Any = None, actor_id: str | None = None,
 ) -> None:
     """A PC's or Team Lead's decision (CONFIRMED): replaces whatever is on
     the Journey."""
@@ -923,7 +877,8 @@ def _pin_human(
     from audit_core.uc03_sku_tasks import resolve_automatic_match_tasks
 
     resolve_automatic_match_tasks(connection, tenant_id=tenant_id, journey_id=journey_id,
-                                  reason=f"SKU set by {'the Team Lead' if basis == BASIS_TL else 'the PC'}")
+                                  reason=f"SKU set by {'the Team Lead' if basis == BASIS_TL else 'the PC'}",
+                                  skip_task_id=task_id, actor_id=actor_id)
 
 
 def _update_match(
@@ -940,32 +895,6 @@ def _update_match(
         ),
         {"t": tenant_id, "j": journey_id, "basis": basis, "evidence": json.dumps(evidence, default=str)},
     )
-
-
-def clear_automatic_pin(connection: Connection, *, tenant_id: str, journey_id: UUID, reason: str) -> dict[str, Any]:
-    """Take an automatic SKU off the Journey (never a PC / TL one) so it is
-    resolved again from its documents. Returns what was there."""
-    before = _pin_state(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if before["product_sku_id"] is None or is_human_decision(before):
-        return before
-    connection.execute(
-        text(
-            """
-            UPDATE auditcore.journey_products
-            SET product_sku_id = NULL, selection_status = NULL, selection_method = NULL, match_basis = NULL,
-                match_evidence = jsonb_build_object('cleared', CAST(:cleared AS jsonb)), updated_at_utc = now()
-            WHERE tenant_id = :t AND journey_id = :j AND selection_status IS DISTINCT FROM 'CONFIRMED'
-            """
-        ),
-        {"t": tenant_id, "j": journey_id, "cleared": json.dumps({
-            "skuCode": before["sku_code"], "productSkuId": str(before["product_sku_id"]),
-            "basis": before["match_basis"], "method": before["selection_method"], "reason": reason,
-            "atUtc": datetime.now(UTC).isoformat(),
-        })},
-    )
-    return before
-
-
 
 
 def _close_sku_tasks(connection: Connection, *, tenant_id: str, journey_id: UUID) -> None:
@@ -1202,8 +1131,8 @@ def _catalogue_similarity(a: str, b: str) -> float:
 
 
 def _catalogue_search(
-    rows: list[dict[str, Any]], reading: dict[str, Any], *, oem_code: str | None
-) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]], reading: dict[str, Any], *, oem_code: str | None, with_scores: bool = False,
+) -> Any:
     """The document's model text names no model of the list (handwriting
     read as a neighbouring nameplate: "XUV3XO AX7L EV" read as "XUV300" /
     "W7L EV"). Score every SKU on what the paperwork does say -- the model
@@ -1219,7 +1148,7 @@ def _catalogue_search(
     model_key = _catalogue_key(model_text, oem_code=oem_code)
     full_key = _catalogue_key(combined, oem_code=oem_code)
     if not model_key:
-        return []
+        return ([], []) if with_scores else []
     offered = reading.get("exShowroom")
     scored: list[tuple[float, Decimal, dict[str, Any]]] = []
     for row in rows:
@@ -1256,6 +1185,8 @@ def _catalogue_search(
         gap = abs(master_ex - offered) if master_ex is not None and offered is not None else Decimal("1e12")
         scored.append((score, gap, row))
     scored.sort(key=lambda item: (-item[0], item[1]))
+    if with_scores:
+        return [row for *_, row in scored[:_CATALOGUE_SHORTLIST]], [score for score, *_ in scored[:2]]
     return [row for *_, row in scored[:_CATALOGUE_SHORTLIST]]
 
 
@@ -1588,9 +1519,9 @@ def _evaluate(
     """Read every document that names the vehicle and identify the SKU on
     each one by its own words. No side effects."""
     state = state or _pin_state(connection, tenant_id=tenant_id, journey_id=journey_id)
-    booking = _booking_reading(connection, tenant_id=tenant_id, journey_id=journey_id, state=state)
+    bookings = _booking_readings(connection, tenant_id=tenant_id, journey_id=journey_id, state=state)
     invoices = _vehicle_invoice_readings(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if booking is None and not invoices:
+    if not bookings and not invoices:
         # No vehicle model read off the Booking Form, no vehicle invoice
         # naming one.
         return {"skipped": True, "reason": "no_vehicle_model_read"}
@@ -1601,15 +1532,25 @@ def _evaluate(
     oem_code = _oem_code_for_tenant(connection, tenant_id=tenant_id)
     aliases = _oem_model_aliases(connection, oem_code=oem_code) if oem_code else []
     registration = _journey_registration(connection, tenant_id=tenant_id, journey_id=journey_id)
-    booking_result = (
-        _identify(rows, booking, aliases=aliases, registration=registration["category"]) if booking else None
-    )
+    booking_results = [
+        (b, _identify(rows, b, aliases=aliases, registration=registration["category"])) for b in bookings
+    ]
     invoice_results = [
         (inv, _identify(rows, inv, aliases=aliases, registration=registration["category"])) for inv in invoices
     ]
+    # Several booking forms are compared like the invoices (review 471 S6):
+    # the ones whose words name one SKU decide; naming different SKUs is a
+    # PC task, never "the newest wins".
+    named = [(b, r) for b, r in booking_results if r.identified]
+    booking_disagree = len({str(r.row["product_sku_id"]) for _, r in named}) > 1
+    booking, booking_result = (
+        named[0] if named and not booking_disagree
+        else booking_results[0] if booking_results else (None, None)
+    )
     return {
         "plan": current["plan"], "rows": rows, "on": current["on"], "oemCode": oem_code, "aliases": aliases,
         "registration": registration, "state": state, "booking": booking, "bookingResult": booking_result,
+        "bookings": booking_results, "bookingDisagree": named if booking_disagree else None,
         "invoices": invoice_results,
     }
 
@@ -1618,7 +1559,9 @@ def _shortlist(ev: dict[str, Any]) -> dict[str, Any] | None:
     """The document to report and the PC's shortlist when no document's
     words name one SKU: a vehicle invoice first (the source of truth), then
     the booking form. The shortlist is ordered by shared words, then by the
-    nearest master price -- ordering only, nothing is picked from it."""
+    nearest master price -- ordering only, nothing is picked from it; a
+    one-click suggestion is offered only when the first row shares more of
+    the document's words than the second (review 471 S8)."""
     options = [*ev["invoices"]]
     if ev["booking"] is not None:
         options.append((ev["booking"], ev["bookingResult"]))
@@ -1628,74 +1571,298 @@ def _shortlist(ev: dict[str, Any]) -> dict[str, Any] | None:
     reading, result = (informative or options)[0]
     stage = _STAGE_FOR_STATUS.get(result.status, result.status)
     if result.status == "NO_MODEL":
-        matched = _catalogue_search(ev["rows"], reading, oem_code=ev["oemCode"])
+        matched, scores = _catalogue_search(ev["rows"], reading, oem_code=ev["oemCode"], with_scores=True)
         stage = _CATALOGUE_STAGE if matched else "NONE"
-        guess = bool(matched)
+        # Only a clear best spelling is offered: a tie the price would break
+        # shows the shortlist instead (review 471 S8).
+        suggestion = matched[0] if matched and (len(scores) < 2 or scores[0] > scores[1]) else None
     else:
         pool = result.candidates if len(result.candidates) > 1 else result.model_rows
         matched = order_shortlist(pool, model_text=reading.get("model"), variant_text=reading.get("variant"),
                                   offered_ex_showroom=reading.get("exShowroom"))
-        guess = result.status in {"NO_MATCH", "UNRECOGNISED_WORD"} and bool(matched)
-    return {"reading": reading, "result": result, "matched": matched, "stage": stage, "guess": guess,
-            "source": reading["source"]}
+        suggestion = (
+            clear_suggestion(matched, model_text=reading.get("model"), variant_text=reading.get("variant"))
+            if result.status in {"NO_MATCH", "UNRECOGNISED_WORD"} else None
+        )
+    return {"reading": reading, "result": result, "matched": matched, "stage": stage,
+            "guess": suggestion is not None, "suggestion": suggestion, "source": reading["source"]}
 
 
-def _invoice_target(
-    connection: Connection, *, tenant_id: str, journey_id: UUID, ev: dict[str, Any],
-) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    """The SKU the vehicle invoices set (rule R3): one invoice's words name
-    exactly one SKU and its R1 ex-showroom equals that SKU's master price.
-    Invoices naming different SKUs, or naming one at a different price, are
-    PC tasks and set nothing."""
-    from audit_core.uc03_sku_tasks import (
-        raise_invoices_disagree_task,
-        raise_price_mismatch_task,
-        resolve_invoices_disagree_task,
-        resolve_price_mismatch_tasks,
-    )
+def _document_item(reading: dict[str, Any], res: WordResult) -> dict[str, Any]:
+    return {
+        "documentId": reading.get("documentId"), "documentType": reading.get("documentType"),
+        "invoiceNumber": reading.get("invoiceNumber"), "skuId": str(res.row["product_sku_id"]),
+        "skuCode": res.row["sku_code"],
+        "vehicle": f"{res.row['model_name']} {res.row.get('variant_name') or ''}".strip(),
+    }
 
+
+def _invoice_analysis(ev: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    """What the vehicle invoices say (rule R3), without writing anything:
+
+    * ``target`` -- one invoice's words name exactly one SKU and its R1
+      ex-showroom equals that SKU's master price: the invoice sets the SKU;
+    * ``disagree`` -- invoices naming different SKUs (none sets it);
+    * ``priceTasks`` -- the invoices naming the one SKU at a different, or
+      unread, price (each a PC task), and ``fallback`` the newest of them;
+    * ``review`` -- with a PC / TL SKU on the Journey: invoices naming a
+      different SKU at its master price (a Team Lead task). A human decision
+      raises no price or disagreement task for itself (review 471 B4)."""
     named = [(inv, res) for inv, res in ev["invoices"] if res.identified]
     by_sku: dict[str, list[tuple[dict[str, Any], WordResult]]] = {}
     for inv, res in named:
         by_sku.setdefault(str(res.row["product_sku_id"]), []).append((inv, res))
+    out: dict[str, Any] = {"named": named, "target": None, "disagree": None, "priceTasks": [], "fallback": None,
+                           "review": []}
+
+    def checks(items: list[tuple[dict[str, Any], WordResult]]) -> list[tuple[dict[str, Any], WordResult, str]]:
+        master = _to_decimal(items[0][1].row.get("master_ex_showroom"))
+        return [(inv, res, price_check(master, inv.get("exShowroom"))) for inv, res in items]
+
+    if is_human_decision(state):
+        for sku_id, items in by_sku.items():
+            if sku_id == str(state["product_sku_id"]):
+                continue
+            agreeing = [(inv, res) for inv, res, check in checks(items) if check == "MATCH"]
+            if agreeing:
+                out["review"].append(agreeing[0])
+        return out
     if len(by_sku) > 1:
-        raise_invoices_disagree_task(
-            connection, tenant_id=tenant_id, journey_id=journey_id,
-            invoices=[{
-                "documentId": inv["documentId"], "documentType": inv["documentType"],
-                "invoiceNumber": inv.get("invoiceNumber"), "skuCode": res.row["sku_code"],
-                "vehicle": f"{res.row['model_name']} {res.row.get('variant_name') or ''}".strip(),
-            } for inv, res in named],
-        )
-        return None, {"invoicesDisagree": True}
-    resolve_invoices_disagree_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+        out["disagree"] = [_document_item(inv, res) for inv, res in named]
+        return out
     if not by_sku:
-        resolve_price_mismatch_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, source="INVOICE",
-                                     keep=set(), reason="No vehicle invoice names one SKU")
-        return None, {}
-    items = next(iter(by_sku.values()))
-    row = items[0][1].row
-    master = _to_decimal(row.get("master_ex_showroom"))
-    checks = [(inv, res, price_check(master, inv.get("exShowroom"))) for inv, res in items]
-    agreeing = [(inv, res) for inv, res, check in checks if check == "MATCH"]
+        return out
+    checked = checks(next(iter(by_sku.values())))
+    agreeing = [(inv, res) for inv, res, check in checked if check == "MATCH"]
     if agreeing:
-        resolve_price_mismatch_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, source="INVOICE",
-                                     keep=set(), reason="A vehicle invoice's price agrees with the SKU")
-        inv, res = agreeing[0]
-        return {"reading": inv, "result": res}, {}
+        out["target"] = {"reading": agreeing[0][0], "result": agreeing[0][1]}
+        return out
+    out["priceTasks"] = checked
+    inv, res, check = checked[0]  # the newest invoice naming the SKU
+    out["fallback"] = {"reading": inv, "result": res, "check": check}
+    return out
+
+
+def _legacy(state: dict[str, Any]) -> bool:
+    """A pin made by the resolver before the 2026-10-20 rules (it may have
+    been chosen by price): only the ``reresolve`` run re-checks it."""
+    return (state.get("product_sku_id") is not None and not is_human_decision(state)
+            and state.get("match_basis") in (None, BASIS_AUTO_LEGACY))
+
+
+_SKIP_WHY = {
+    "no_vehicle_model_read": "no booking form or vehicle invoice on file names the vehicle",
+    "no_pricing_date": "the Journey has no pricing date (no booking date read or entered)",
+    "no_effective_price_list": "no price list is in force on the Journey's pricing date",
+}
+
+
+def _why_not_named(ev: dict[str, Any]) -> str:
+    """Why the documents do not name the pinned SKU, for the PC."""
+    parts = []
+    booking, res = ev.get("booking"), ev.get("bookingResult")
+    if ev.get("bookingDisagree"):
+        parts.append("the booking forms name different vehicles")
+    elif booking is not None and res is not None:
+        read = " / ".join(v for v in (booking.get("model"), booking.get("variant")) if v) or "-"
+        reason = _REASON_TEXT.get(res.status, "does not name one SKU").format(
+            n=len(res.candidates), model=res.detail.get("model") or booking.get("model"),
+            unrecognised=", ".join(f"'{w}'" for w in res.detail.get("unrecognised") or []) or "a word")
+        parts.append(f"the booking form reads '{read}': {reason}")
+    else:
+        parts.append("no booking form names the vehicle")
+    named = [(inv, r) for inv, r in ev.get("invoices") or [] if r.identified]
+    if named:
+        parts.append("the vehicle invoice names " + ", ".join(sorted({r.row["sku_code"] for _, r in named})))
+    return "; ".join(parts)
+
+
+def _decide(ev: dict[str, Any], state: dict[str, Any], *, recheck_legacy: bool) -> dict[str, Any]:
+    """The ladder's decision for one Journey, without writing anything (the
+    dry run shows exactly this). Actions:
+
+    INVOICE_SET -- a vehicle invoice's words and price name one SKU;
+    KEEP_HUMAN -- a PC / TL SKU stays (Team Lead review tasks may be due);
+    BOOKING_PIN -- the booking form's words name one SKU (price checked);
+    INVOICE_WORDS_PIN -- no SKU yet, an invoice's words name one at a
+      different price: pinned AUTO_PRICE_MISMATCH with its PC task;
+    KEEP -- the automatic SKU stays as it is (an invoice still names it, or
+      a pre-rule pin outside the reresolve run, or nothing to read);
+    UNCONFIRMED -- an automatic SKU the documents do not name: it is KEPT
+      (never cleared: review 471 B2), marked AUTO_UNCONFIRMED, and the PC
+      gets "SKU not clearly identified from the documents";
+    NOT_IDENTIFIED -- no SKU and none named: MODEL_NOT_IDENTIFIED;
+    SKIP -- nothing to resolve."""
+    has_sku = state.get("product_sku_id") is not None
+    human = is_human_decision(state)
+    legacy = _legacy(state)
+    if ev.get("skipped"):
+        if has_sku and not human and legacy and recheck_legacy:
+            return {"action": "UNCONFIRMED", "why": _SKIP_WHY.get(ev.get("reason"), str(ev.get("reason"))),
+                    "invoice": None, "skipped": ev.get("reason")}
+        return {"action": "KEEP" if has_sku else "SKIP", "invoice": None, "skipped": ev.get("reason"),
+                "keepReason": "nothing to read" if has_sku else None}
+    inv = _invoice_analysis(ev, state)
+    plan: dict[str, Any] = {"invoice": inv}
+    if human:
+        return {**plan, "action": "KEEP_HUMAN"}
+    if inv["target"] is not None:
+        return {**plan, "action": "INVOICE_SET", "target": inv["target"]}
+    res = ev["bookingResult"]
+    if res is not None and res.identified and not ev.get("bookingDisagree"):
+        master = _to_decimal(res.row.get("master_ex_showroom"))
+        check = price_check(master, ev["booking"].get("exShowroom"))
+        return {**plan, "action": "BOOKING_PIN", "check": check,
+                "basis": BASIS_AUTO_MATCHED if check == "MATCH" else BASIS_AUTO_PRICE_MISMATCH}
+    if has_sku:
+        fallback = inv.get("fallback")
+        if fallback is not None and str(fallback["result"].row["product_sku_id"]) == str(state["product_sku_id"]):
+            return {**plan, "action": "KEEP", "keepReason": "a vehicle invoice's words name it", "named": True}
+        if legacy and not recheck_legacy:
+            return {**plan, "action": "KEEP", "keepReason": "pinned before the 2026-10-20 rules (reresolve re-checks it)"}
+        return {**plan, "action": "UNCONFIRMED", "why": _why_not_named(ev)}
+    if inv.get("fallback"):
+        return {**plan, "action": "INVOICE_WORDS_PIN", "fallback": inv["fallback"]}
+    return {**plan, "action": "NOT_IDENTIFIED"}
+
+
+def _proposal(ev: dict[str, Any], state: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    """The decision in words, for the dry run and the run items: old SKU ->
+    proposed SKU, basis, the document's words and prices, the task due."""
+    action = plan["action"]
+    row: dict[str, Any] | None = None
+    reading: dict[str, Any] | None = None
+    basis = state.get("match_basis")
+    check = None
+    if action == "INVOICE_SET":
+        reading, row, basis, check = plan["target"]["reading"], plan["target"]["result"].row, BASIS_AUTO_INVOICE, "MATCH"
+    elif action == "BOOKING_PIN":
+        reading, row, basis, check = ev["booking"], ev["bookingResult"].row, plan["basis"], plan["check"]
+    elif action == "INVOICE_WORDS_PIN":
+        fb = plan["fallback"]
+        reading, row, basis, check = fb["reading"], fb["result"].row, BASIS_AUTO_PRICE_MISMATCH, fb["check"]
+    elif action == "UNCONFIRMED":
+        basis = BASIS_AUTO_UNCONFIRMED
+    tasks: list[str] = []
+    inv = plan.get("invoice") or {}
+    if inv.get("disagree"):
+        tasks.append("SKU_INVOICES_DISAGREE")
+    if ev.get("bookingDisagree"):
+        tasks.append("SKU_BOOKING_FORMS_DISAGREE")
+    tasks += ["SKU_PRICE_MISMATCH (invoice)"] * len(inv.get("priceTasks") or [])
+    if inv.get("review"):
+        tasks.append("SKU_INVOICE_REVIEW")
+    if action == "BOOKING_PIN" and basis == BASIS_AUTO_PRICE_MISMATCH:
+        tasks.append("SKU_PRICE_MISMATCH (booking)")
+    if action == "UNCONFIRMED" and not _other_pc_question(ev, plan):
+        tasks.append("SKU_NOT_CONFIRMED")
+    if action == "NOT_IDENTIFIED":
+        tasks.append("MODEL_NOT_IDENTIFIED")
+    master = _to_decimal((row or {}).get("master_ex_showroom"))
+    offered = (reading or {}).get("exShowroom")
+    new_sku = row["sku_code"] if row is not None else state.get("sku_code") if action in {
+        "KEEP", "KEEP_HUMAN", "UNCONFIRMED"} else None
+    return {
+        "action": action,
+        "oldSku": state.get("sku_code"), "oldBasis": state.get("match_basis"),
+        "proposedSku": new_sku, "proposedBasis": basis if new_sku else None,
+        "changes": bool(row is not None and str(row["product_sku_id"]) != str(state.get("product_sku_id"))),
+        "document": (reading or {}).get("documentType"), "documentId": (reading or {}).get("documentId"),
+        "words": " / ".join(v for v in ((reading or {}).get("model"), (reading or {}).get("variant")) if v) or None,
+        "masterExShowroom": str(master) if master is not None else None,
+        "documentExShowroom": str(offered) if offered is not None else None,
+        "priceCheck": check, "why": plan.get("why") or plan.get("keepReason"), "skipped": plan.get("skipped"),
+        "tasks": tasks,
+    }
+
+
+def _other_pc_question(ev: dict[str, Any], plan: dict[str, Any]) -> bool:
+    """Another PC task already asks which vehicle it is (the documents
+    disagree, or an invoice's price does not check): no second question."""
+    inv = plan.get("invoice") or {}
+    return bool(inv.get("disagree") or ev.get("bookingDisagree") or inv.get("priceTasks"))
+
+
+# ── writing the decision ──────────────────────────────────────────────────────
+def _document_tasks(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, ev: dict[str, Any], state: dict[str, Any],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Raise the PC / TL tasks the documents call for and close the ones
+    they no longer call for."""
+    from audit_core.uc03_sku_tasks import (
+        raise_booking_forms_disagree_task,
+        raise_invoice_review_task,
+        raise_invoices_disagree_task,
+        raise_price_mismatch_task,
+        resolve_booking_forms_disagree_task,
+        resolve_invoice_review_task,
+        resolve_invoices_disagree_task,
+        resolve_price_mismatch_tasks,
+    )
+
+    inv = plan.get("invoice") or {}
+    info: dict[str, Any] = {}
+    if inv.get("disagree"):
+        key = raise_invoices_disagree_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                           invoices=inv["disagree"])
+        resolve_invoices_disagree_task(connection, tenant_id=tenant_id, journey_id=journey_id, keep={key})
+        info["invoicesDisagree"] = True
+    else:
+        resolve_invoices_disagree_task(connection, tenant_id=tenant_id, journey_id=journey_id)
     keep: set[str] = set()
-    for inv, res, check in checks:
-        if check != "DIFFERS":
-            continue
+    for reading, res, check in inv.get("priceTasks") or []:
         keep.add(raise_price_mismatch_task(
-            connection, tenant_id=tenant_id, journey_id=journey_id, source="INVOICE", reading=inv, row=res.row,
-            master=master, offered=inv.get("exShowroom"),
+            connection, tenant_id=tenant_id, journey_id=journey_id, source="INVOICE", reading=reading, row=res.row,
+            master=_to_decimal(res.row.get("master_ex_showroom")), offered=reading.get("exShowroom"),
+            current_sku_id=state.get("product_sku_id"),
         ))
-    resolve_price_mismatch_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, source="INVOICE",
-                                 keep=keep, reason="Superseded")
-    inv, res, check = checks[0]  # the newest invoice naming the SKU
-    return None, {"invoicePriceDiffers": bool(keep),
-                  "fallback": {"reading": inv, "result": res, "check": check}}
+        info["invoicePriceDiffers"] = True
+    if not ev.get("skipped"):
+        resolve_price_mismatch_tasks(
+            connection, tenant_id=tenant_id, journey_id=journey_id, source="INVOICE", keep=keep,
+            reason=("A vehicle invoice's price agrees with the SKU" if inv.get("target")
+                    else "No vehicle invoice names this SKU at this price any more"),
+        )
+    if inv.get("review"):
+        for reading, res in inv["review"]:
+            raise_invoice_review_task(
+                connection, tenant_id=tenant_id, journey_id=journey_id, current_sku_code=state["sku_code"],
+                current_basis=state.get("match_basis"), invoice_row=res.row, invoice=reading,
+                evidence=_evidence(reading, res, check="MATCH", plan=ev["plan"], on=ev["on"]),
+            )
+        info["reviewRaised"] = True
+    elif not ev.get("skipped"):
+        resolve_invoice_review_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if ev.get("bookingDisagree"):
+        key = raise_booking_forms_disagree_task(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            forms=[_document_item(b, r) for b, r in ev["bookingDisagree"]],
+        )
+        resolve_booking_forms_disagree_task(connection, tenant_id=tenant_id, journey_id=journey_id, keep={key})
+        info["bookingFormsDisagree"] = True
+    elif not ev.get("skipped"):
+        resolve_booking_forms_disagree_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return info
+
+
+def _note_change(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, state: dict[str, Any], new_sku: str | None,
+    basis: str, why: str, correlation_id: str,
+) -> None:
+    """The Journey's activity log: the SKU changed (or lost its footing) and
+    why -- what the Team Lead reads (review 471 S7)."""
+    from audit_core.uc03_p2_runtime import record_activity
+
+    record_activity(
+        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="SKU_RESOLUTION_CHANGED",
+        subject_type="JOURNEY", subject_id=str(journey_id),
+        details={"from": state.get("sku_code"), "fromBasis": state.get("match_basis"), "to": new_sku,
+                 "toBasis": basis, "why": why},
+        correlation_id=correlation_id or None,
+    )
+    logger.info("model_resolution_automatic_pin_changed tenant=%s journey=%s from=%s to=%s basis=%s",
+                tenant_id, journey_id, state.get("sku_code"), new_sku, basis)
 
 
 def _invoice_colour_for_pin(connection: Connection, *, tenant_id: str, journey_id: UUID, ev: dict[str, Any]) -> None:
@@ -1715,10 +1882,15 @@ def _invoice_colour_for_pin(connection: Connection, *, tenant_id: str, journey_i
 def _keep_pin(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, raise_findings: bool,
     state: dict[str, Any], info: dict[str, Any] | None = None, checked: bool = False,
-    ev: dict[str, Any] | None = None,
+    ev: dict[str, Any] | None = None, named: bool = False,
 ) -> dict[str, Any]:
+    from audit_core.uc03_sku_tasks import resolve_not_confirmed_task
+
     if ev is not None and not ev.get("skipped"):
         _invoice_colour_for_pin(connection, tenant_id=tenant_id, journey_id=journey_id, ev=ev)
+    if named:
+        resolve_not_confirmed_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                   reason="A document names the SKU again")
     resolved = _resolve_open_flag(connection, tenant_id=tenant_id, journey_id=journey_id,
                                   correlation_id=correlation_id)
     _run_deal_reconciliation(connection, tenant_id=tenant_id, journey_id=journey_id,
@@ -1726,7 +1898,7 @@ def _keep_pin(
     return {"resolved": True, "flagsResolved": resolved, "skuCode": state.get("sku_code"),
             "basis": state.get("match_basis"), "crossChecked": checked,
             "mismatchFlagged": bool((info or {}).get("invoicesDisagree") or (info or {}).get("invoicePriceDiffers")
-                                    or (info or {}).get("reviewRaised"))}
+                                    or (info or {}).get("reviewRaised") or (info or {}).get("bookingFormsDisagree"))}
 
 
 def _apply_invoice(
@@ -1734,12 +1906,10 @@ def _apply_invoice(
     ev: dict[str, Any], target: dict[str, Any],
 ) -> dict[str, Any]:
     """The invoice sets the SKU: it replaces an automatic pin (the Team Lead
-    is told when the vehicle changed); a SKU a PC or Team Lead set is never
-    overwritten -- a Team Lead task asks instead."""
+    is told when the vehicle changed). A PC / TL SKU never gets here."""
     from audit_core.uc03_sku_tasks import (
-        raise_invoice_review_task,
         raise_model_changed_observation,
-        resolve_invoice_review_task,
+        resolve_not_confirmed_task,
         resolve_price_mismatch_tasks,
     )
 
@@ -1747,21 +1917,6 @@ def _apply_invoice(
     inv, res = target["reading"], target["result"]
     row = res.row
     evidence = _evidence(inv, res, check="MATCH", plan=ev["plan"], on=ev["on"])
-    if is_human_decision(state):
-        if str(state["product_sku_id"]) == str(row["product_sku_id"]):
-            resolve_invoice_review_task(connection, tenant_id=tenant_id, journey_id=journey_id)
-            _close_legacy_mismatch(connection, tenant_id=tenant_id, journey_id=journey_id,
-                                   sku_id=row["product_sku_id"], correlation_id=correlation_id)
-            info = {}
-        else:
-            raise_invoice_review_task(
-                connection, tenant_id=tenant_id, journey_id=journey_id, current_sku_code=state["sku_code"],
-                current_basis=state.get("match_basis"), invoice_row=row, invoice=inv, evidence=evidence,
-            )
-            info = {"reviewRaised": True}
-        return _keep_pin(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
-                         raise_findings=raise_findings, state=state, info=info, checked=True)
-
     before = _vehicle_snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
     previous = state["product_sku_id"]
     changed = previous is not None and str(previous) != str(row["product_sku_id"])
@@ -1773,9 +1928,10 @@ def _apply_invoice(
                       evidence=evidence)
     if inv.get("retail"):
         _apply_invoice_colour(connection, tenant_id=tenant_id, journey_id=journey_id, colour=inv.get("colour"))
-    resolve_invoice_review_task(connection, tenant_id=tenant_id, journey_id=journey_id)
     resolve_price_mismatch_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, source="BOOKING",
                                  keep=set(), reason="The vehicle invoice set the SKU (its words and price agree)")
+    resolve_not_confirmed_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                               reason="The vehicle invoice set the SKU (its words and price agree)")
     _close_legacy_mismatch(connection, tenant_id=tenant_id, journey_id=journey_id, sku_id=row["product_sku_id"],
                            correlation_id=correlation_id)
     _resolve_open_flag(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id)
@@ -1785,6 +1941,9 @@ def _apply_invoice(
         after = _vehicle_snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
         raise_model_changed_observation(connection, tenant_id=tenant_id, journey_id=journey_id,
                                         before=before, after=after)
+        _note_change(connection, tenant_id=tenant_id, journey_id=journey_id, state=state, new_sku=row["sku_code"],
+                     basis=BASIS_AUTO_INVOICE, why="A vehicle invoice's words and price name it",
+                     correlation_id=correlation_id)
     return {"resolved": True, "changed": changed, "source": "INVOICE", "skuCode": row["sku_code"],
             "matchStage": "INVOICE_WORDS_AND_PRICE", "basis": BASIS_AUTO_INVOICE, "crossChecked": True,
             "mismatchFlagged": False}
@@ -1792,7 +1951,7 @@ def _apply_invoice(
 
 def _apply_booking(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, raise_findings: bool,
-    ev: dict[str, Any], info: dict[str, Any],
+    ev: dict[str, Any], info: dict[str, Any], check: str, basis: str,
 ) -> dict[str, Any]:
     """The booking form's words name one SKU: pin it, and compare its master
     ex-showroom with the form's (rule R3). A different or missing booking
@@ -1800,14 +1959,13 @@ def _apply_booking(
     -- but as AUTO_PRICE_MISMATCH, with a PC task to set the SKU."""
     from audit_core.uc03_sku_tasks import (
         raise_price_mismatch_task,
+        resolve_not_confirmed_task,
         resolve_price_mismatch_tasks,
     )
 
     state, booking, res = ev["state"], ev["booking"], ev["bookingResult"]
     row = res.row
     master = _to_decimal(row.get("master_ex_showroom"))
-    check = price_check(master, booking.get("exShowroom"))
-    basis = BASIS_AUTO_MATCHED if check == "MATCH" else BASIS_AUTO_PRICE_MISMATCH
     evidence = _evidence(booking, res, check=check, plan=ev["plan"], on=ev["on"])
     previous = state["product_sku_id"]
     changed = previous is not None and str(previous) != str(row["product_sku_id"])
@@ -1824,9 +1982,11 @@ def _apply_booking(
     else:
         resolve_price_mismatch_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, source="BOOKING",
                                      keep=set(), reason="The booking price agrees with the SKU's master price")
+    resolve_not_confirmed_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                               reason="The booking form's words name the SKU")
     if changed:
-        logger.info("model_resolution_automatic_pin_replaced tenant=%s journey=%s from=%s to=%s basis=%s",
-                    tenant_id, journey_id, state.get("sku_code"), row["sku_code"], basis)
+        _note_change(connection, tenant_id=tenant_id, journey_id=journey_id, state=state, new_sku=row["sku_code"],
+                     basis=basis, why="The booking form's words name it", correlation_id=correlation_id)
     _invoice_colour_for_pin(connection, tenant_id=tenant_id, journey_id=journey_id, ev=ev)
     _resolve_open_flag(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id)
     _run_deal_reconciliation(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
@@ -1844,23 +2004,65 @@ def _apply_invoice_words_only(
     invoice's words name exactly one SKU whose price does not agree (or could
     not be read). Like the booking form's case, the SKU the words name is put
     on the Journey as AUTO_PRICE_MISMATCH -- so the deal shows against it --
-    and the PC task to set the SKU stays open. Price chose nothing."""
-    from audit_core.uc03_sku_tasks import raise_price_mismatch_task
-
+    and the PC task to set the SKU (raised with the invoice's tasks) stays
+    open. Price chose nothing."""
     inv, res, check = fallback["reading"], fallback["result"], fallback["check"]
     row = res.row
-    master = _to_decimal(row.get("master_ex_showroom"))
     evidence = _evidence(inv, res, check=check, plan=ev["plan"], on=ev["on"])
     _pin_sku(connection, tenant_id=tenant_id, journey_id=journey_id, product_sku_id=row["product_sku_id"],
              method=_INVOICE_SELECTION_METHOD, basis=BASIS_AUTO_PRICE_MISMATCH, evidence=evidence)
-    raise_price_mismatch_task(connection, tenant_id=tenant_id, journey_id=journey_id, source="INVOICE",
-                              reading=inv, row=row, master=master, offered=inv.get("exShowroom"))
     _resolve_open_flag(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id)
     _run_deal_reconciliation(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
                              raise_findings=raise_findings)
     return {"resolved": True, "changed": False, "source": "INVOICE", "skuCode": row["sku_code"],
             "matchStage": "INVOICE_WORDS", "basis": BASIS_AUTO_PRICE_MISMATCH, "priceCheck": check,
             "crossChecked": True, "mismatchFlagged": True}
+
+
+def _apply_unconfirmed(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, raise_findings: bool,
+    ev: dict[str, Any], state: dict[str, Any], plan: dict[str, Any], info: dict[str, Any],
+) -> dict[str, Any]:
+    """The automatic SKU stays on the Journey (the deal keeps its prices) but
+    its documents do not name it: marked AUTO_UNCONFIRMED with why, and the
+    PC asked to confirm or set it -- unless another PC task already asks
+    which vehicle it is."""
+    from audit_core.uc03_sku_tasks import (
+        raise_not_confirmed_task,
+        resolve_price_mismatch_tasks,
+    )
+
+    why = plan["why"]
+    previous_evidence = state.get("match_evidence") if isinstance(state.get("match_evidence"), dict) else {}
+    if state.get("match_basis") != BASIS_AUTO_UNCONFIRMED or previous_evidence.get("why") != why:
+        _update_match(connection, tenant_id=tenant_id, journey_id=journey_id, basis=BASIS_AUTO_UNCONFIRMED,
+                      evidence={
+                          "source": "RECHECK", "why": why, "skuCode": state.get("sku_code"),
+                          "previousBasis": (previous_evidence.get("previousBasis")
+                                            if state.get("match_basis") == BASIS_AUTO_UNCONFIRMED
+                                            else state.get("match_basis")),
+                          "previousEvidence": (previous_evidence.get("previousEvidence")
+                                               if state.get("match_basis") == BASIS_AUTO_UNCONFIRMED
+                                               else previous_evidence),
+                          "decidedAtUtc": datetime.now(UTC).isoformat(),
+                      })
+        if state.get("match_basis") != BASIS_AUTO_UNCONFIRMED:
+            _note_change(connection, tenant_id=tenant_id, journey_id=journey_id, state=state,
+                         new_sku=state.get("sku_code"), basis=BASIS_AUTO_UNCONFIRMED,
+                         why=f"Kept, but not confirmed by the documents: {why}", correlation_id=correlation_id)
+    if not ev.get("skipped"):
+        resolve_price_mismatch_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, source="BOOKING",
+                                     keep=set(), reason="The booking form no longer names this SKU")
+    if not _other_pc_question(ev, plan):
+        vehicle = " ".join(v for v in (state.get("model_name"), state.get("variant_name")) if v) or None
+        raise_not_confirmed_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                 sku_id=state["product_sku_id"], sku_code=state.get("sku_code"), vehicle=vehicle,
+                                 why=why)
+    _run_deal_reconciliation(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                             raise_findings=raise_findings)
+    return {"resolved": True, "changed": False, "unconfirmed": True, "skuCode": state.get("sku_code"),
+            "basis": BASIS_AUTO_UNCONFIRMED, "reason": plan.get("skipped"), "why": why,
+            "mismatchFlagged": bool(info)}
 
 
 _REASON_TEXT = {
@@ -1987,10 +2189,10 @@ def _raise_not_identified(
         resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id,
                         dedupe_key=f"sku-other-month:{journey_id}",
                         evidence={"reason": "The Journey's own price list has the model"})
-        if picked["guess"] and matched:
+        if picked["guess"]:
             raise_closest_match_task(
                 connection, tenant_id=tenant_id, journey_id=journey_id, source=source,
-                read_model=report["model_name"], read_variant=report["variant_name"], suggestion=matched[0],
+                read_model=report["model_name"], read_variant=report["variant_name"], suggestion=picked["suggestion"],
                 price_list=price_list,
                 reason=None if not_in_list else reason,
             )
@@ -2182,6 +2384,7 @@ def confirm_model_resolution_sku(
     product_sku_id: UUID,
     actor_id: str,
     correlation_id: str,
+    task_id: Any = None,
 ) -> dict[str, Any]:
     """A PC's pick of the SKU: on a Journey with no SKU, or one the resolver
     matched automatically (2026-10-20: an automatic match is not a decision,
@@ -2229,7 +2432,9 @@ def confirm_model_resolution_sku(
             "replaced": {"skuCode": state.get("sku_code"), "basis": state.get("match_basis")}
             if state.get("product_sku_id") else None,
             "pricingDate": on.isoformat() if on else None, "decidedAtUtc": datetime.now(UTC).isoformat(),
+            "taskId": str(task_id) if task_id else None,
         },
+        task_id=task_id, actor_id=actor_id,
     )
     resolved = _resolve_open_flag(
         connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id, actor_id=actor_id,
@@ -2424,13 +2629,8 @@ def sync_model_resolution(
     attempt vanished without a trace. The savepoint undoes only this attempt;
     the caller's transaction stays usable, the failure is escalated, and one
     structured line says what happened."""
-    savepoint = connection.begin_nested()
-    result = _sync_model_resolution_unguarded(
-        connection, tenant_id=tenant_id, journey_id=journey_id,
-        correlation_id=correlation_id, raise_findings=raise_findings,
-    )
-    _close_savepoint(savepoint, result, tenant_id=tenant_id, journey_id=journey_id, source="BOOKING")
-    return result
+    return _guarded(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                    raise_findings=raise_findings, source="BOOKING")
 
 
 def sync_model_resolution_from_invoice(
@@ -2438,11 +2638,52 @@ def sync_model_resolution_from_invoice(
 ) -> dict[str, Any]:
     """The Delivery-side entry (a vehicle invoice was read or corrected): the
     same ladder over every document, inside a savepoint."""
+    return _guarded(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                    raise_findings=True, source="INVOICE")
+
+
+def recheck_model_resolution(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, commit: bool,
+) -> dict[str, Any]:
+    """The ``reresolve`` run for one Journey (review 471 B2). Nothing is
+    cleared first: the ladder decides from the documents, and
+
+    * a SKU a PC or Team Lead set is never touched;
+    * an automatic SKU (the pre-rule AUTO_LEGACY ones included) is replaced
+      only when the documents now name a different SKU; the same SKU gets
+      its new basis and evidence;
+    * when the documents do not name it (or cannot be read: no pricing date,
+      no price list in force, no document), the SKU is KEPT, marked
+      AUTO_UNCONFIRMED and the PC asked to confirm or set it.
+
+    ``commit=False`` (the dry run) writes nothing: the result carries the
+    ``proposal`` (old SKU -> proposed SKU, basis, words, prices, the tasks
+    that would be raised). With ``commit`` the decision is written inside a
+    savepoint around the whole Journey: an error leaves it untouched."""
+    try:
+        state = _pin_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+        ev = _evaluate(connection, tenant_id=tenant_id, journey_id=journey_id, state=state)
+        proposal = _proposal(ev, state, _decide(ev, state, recheck_legacy=True))
+    except Exception as exc:
+        logger.warning("recheck_model_resolution failed", exc_info=True)
+        return {"error": True, "errorType": type(exc).__name__, "errorMessage": str(exc)[:300]}
+    if not commit:
+        return {"dryRun": True, "proposal": proposal}
+    result = _guarded(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                      raise_findings=True, source="RERESOLVE", recheck_legacy=True)
+    return {**result, "proposal": proposal}
+
+
+def _guarded(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, raise_findings: bool,
+    source: str, recheck_legacy: bool = False,
+) -> dict[str, Any]:
     savepoint = connection.begin_nested()
     result = _sync_model_resolution_unguarded(
         connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+        raise_findings=raise_findings, recheck_legacy=recheck_legacy,
     )
-    _close_savepoint(savepoint, result, tenant_id=tenant_id, journey_id=journey_id, source="INVOICE")
+    _close_savepoint(savepoint, result, tenant_id=tenant_id, journey_id=journey_id, source=source)
     return result
 
 
@@ -2458,6 +2699,7 @@ def _close_savepoint(savepoint: Any, result: dict[str, Any], *, tenant_id: str, 
         source=source,
         outcome=(
             "ERROR" if result.get("error")
+            else "UNCONFIRMED" if result.get("unconfirmed")
             else "RESOLVED" if result.get("resolved") or result.get("pinned")
             else "NOT_MATCHED" if result.get("raised")
             else "SKIPPED" if result.get("skipped")
@@ -2483,17 +2725,22 @@ def _sync_model_resolution_unguarded(
     journey_id: UUID,
     correlation_id: str,
     raise_findings: bool = True,
+    recheck_legacy: bool = False,
 ) -> dict[str, Any]:
-    """The ladder (see the module docstring). Idempotent; never raises.
+    """The ladder (see the module docstring and ``_decide``). Idempotent;
+    never raises.
 
-    1. A vehicle invoice whose words name one SKU at its master price sets
-       it (an automatic pin gives way; a PC / TL one is put to the Team Lead).
-    2. A SKU a PC or Team Lead set stays.
+    1. A SKU a PC or Team Lead set stays (an invoice naming another SKU at
+       its master price is put to the Team Lead).
+    2. A vehicle invoice whose words name one SKU at its master price sets
+       it, replacing an automatic pin.
     3. The booking form's words name one SKU: pinned, AUTO_MATCHED or
        AUTO_PRICE_MISMATCH (+ PC task) by the price check.
-    4. Otherwise an automatic pin already on the Journey stays (nothing new
-       replaces it; ``reresolve_all_skus`` re-runs those from scratch), and a
-       Journey with no SKU gets MODEL_NOT_IDENTIFIED with a shortlist.
+    4. An automatic pin the documents do not name is kept, marked
+       AUTO_UNCONFIRMED, with a PC task -- except a pre-rule AUTO_LEGACY pin,
+       which only the reresolve run (``recheck_legacy``) re-checks.
+    5. No SKU: an invoice's words naming one SKU at another price pin it as
+       AUTO_PRICE_MISMATCH (PC task); otherwise MODEL_NOT_IDENTIFIED.
 
     ``raise_findings=False`` (a read-only self-heal) leaves a Journey that
     has a SKU as it is and skips the deal's evidence / variance checks."""
@@ -2504,25 +2751,31 @@ def _sync_model_resolution_unguarded(
             return {"resolved": True, "flagsResolved": 0, "skuCode": state["sku_code"],
                     "basis": state["match_basis"]}
         ev = _evaluate(connection, tenant_id=tenant_id, journey_id=journey_id, state=state)
+        plan = _decide(ev, state, recheck_legacy=recheck_legacy)
         common = {"tenant_id": tenant_id, "journey_id": journey_id, "correlation_id": correlation_id,
                   "raise_findings": raise_findings}
-        if ev.get("skipped"):
-            if has_sku:
-                return _keep_pin(connection, state=state, **common)
+        action = plan["action"]
+        if action == "SKIP":
             return ev
-
-        target, info = _invoice_target(connection, tenant_id=tenant_id, journey_id=journey_id, ev=ev)
-        if target is not None:
-            return _apply_invoice(connection, ev=ev, target=target, **common)
-        if is_human_decision(state):
+        if action == "UNCONFIRMED" and ev.get("skipped"):
+            return _apply_unconfirmed(connection, ev=ev, state=state, plan=plan, info={}, **common)
+        if action == "KEEP" and ev.get("skipped"):
+            return _keep_pin(connection, state=state, **common)
+        info = _document_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, ev=ev, state=state,
+                               plan=plan)
+        if action == "INVOICE_SET":
+            return _apply_invoice(connection, ev=ev, target=plan["target"], **common)
+        if action == "KEEP_HUMAN":
             return _keep_pin(connection, state=state, info=info, checked=bool(ev["invoices"]), ev=ev, **common)
-        booking_result = ev["bookingResult"]
-        if booking_result is not None and booking_result.identified:
-            return _apply_booking(connection, ev=ev, info=info, **common)
-        if has_sku:
-            return _keep_pin(connection, state=state, info=info, checked=bool(ev["invoices"]), ev=ev, **common)
-        if info.get("fallback"):
-            return _apply_invoice_words_only(connection, ev=ev, fallback=info["fallback"], info=info, **common)
+        if action == "BOOKING_PIN":
+            return _apply_booking(connection, ev=ev, info=info, check=plan["check"], basis=plan["basis"], **common)
+        if action == "KEEP":
+            return _keep_pin(connection, state=state, info=info, checked=bool(ev["invoices"]), ev=ev,
+                             named=bool(plan.get("named")), **common)
+        if action == "UNCONFIRMED":
+            return _apply_unconfirmed(connection, ev=ev, state=state, plan=plan, info=info, **common)
+        if action == "INVOICE_WORDS_PIN":
+            return _apply_invoice_words_only(connection, ev=ev, fallback=plan["fallback"], info=info, **common)
         return _raise_not_identified(connection, tenant_id=tenant_id, journey_id=journey_id,
                                      correlation_id=correlation_id, ev=ev, info=info)
     except Exception as exc:
@@ -2535,11 +2788,11 @@ __all__ = [
     "BASIS_LABELS",
     "HUMAN_BASES",
     "check_invoice_sku_mismatch",
-    "clear_automatic_pin",
     "invoice_ex_showroom",
     "is_human_decision",
     "journey_pricing_date",
     "reassign_confirmed_sku",
+    "recheck_model_resolution",
     "sync_model_resolution",
     "sync_model_resolution_from_invoice",
 ]

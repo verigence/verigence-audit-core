@@ -265,7 +265,8 @@ def two_journeys():
 def test_reresolve_replaces_a_price_chosen_pin_and_leaves_the_pcs(two_journeys) -> None:
     """A Journey pinned before 2026-10-20 by price (AUTO_LEGACY: "MX3 PM AT"
     although the booking says "MX3 PRO PETROL AT") is resolved again by its
-    words; a PC's pick on another Journey is not touched."""
+    words -- first as a dry run that writes nothing, then committed; a PC's
+    pick on another Journey is not touched."""
     from audit_core.db import set_tenant_context
     from audit_core.uc03_backfill_document_sync_producers import reresolve_all_skus
 
@@ -298,30 +299,57 @@ def test_reresolve_replaces_a_price_chosen_pin_and_leaves_the_pcs(two_journeys) 
                 {"t": first.tenant_id, "j": journey_id, "s": sku, "st": status, "m": method, "b": basis},
             )
 
-    result = reresolve_all_skus(engine, first.tenant_id, actor_id="test")
-    assert result["journeysFailed"] == []
+    def state():
+        with engine.begin() as connection:
+            set_tenant_context(connection, first.tenant_id)
+            return {
+                r["journey_id"]: r for r in connection.execute(
+                    text("SELECT journey_id, product_sku_id, match_basis, selection_status "
+                         "FROM auditcore.journey_products WHERE tenant_id=:t"), {"t": first.tenant_id},
+                ).mappings()
+            }
 
-    with engine.begin() as connection:
-        set_tenant_context(connection, first.tenant_id)
-        rows = {
-            r["journey_id"]: r for r in connection.execute(
-                text("SELECT journey_id, product_sku_id, match_basis, selection_status "
-                     "FROM auditcore.journey_products WHERE tenant_id=:t"), {"t": first.tenant_id},
-            ).mappings()
-        }
-        items = {
-            r["journey_id"]: r for r in connection.execute(
-                text("SELECT journey_id, outcome, detail FROM auditcore.sku_resolution_run_items "
-                     "WHERE tenant_id=:t AND run_id=:r"), {"t": first.tenant_id, "r": result["runId"]},
-            ).mappings()
-        }
+    def items(run_id):
+        with engine.begin() as connection:
+            set_tenant_context(connection, first.tenant_id)
+            return {
+                r["journey_id"]: r for r in connection.execute(
+                    text("SELECT journey_id, outcome, detail, proposal FROM auditcore.sku_resolution_run_items "
+                         "WHERE tenant_id=:t AND run_id=:r"), {"t": first.tenant_id, "r": run_id},
+                ).mappings()
+            }
+
+    # The dry run (review 471 B2) changes nothing and says what would happen.
+    dry = reresolve_all_skus(engine, first.tenant_id, actor_id="test-dry")
+    assert dry["journeysFailed"] == []
+    rows = state()
+    assert rows[first.journey_id]["product_sku_id"] == non_pro
+    assert rows[first.journey_id]["match_basis"] == "AUTO_LEGACY"
+    proposal = items(dry["runId"])[first.journey_id]["proposal"]
+    assert proposal["dryRun"] is True and proposal["action"] == "BOOKING_PIN"
+    assert proposal["oldBasis"] == "AUTO_LEGACY" and proposal["proposedBasis"] == "AUTO_PRICE_MISMATCH"
+    assert proposal["words"] == "XUV 3XO / MX3 PRO PETROL AT"
+    assert proposal["masterExShowroom"] == "1149000.00" and proposal["documentExShowroom"] == "1099000"
+    assert "SKU_PRICE_MISMATCH (booking)" in proposal["tasks"]
+    assert "[dry run]" in items(dry["runId"])[first.journey_id]["detail"]
+
+    result = reresolve_all_skus(engine, first.tenant_id, actor_id="test", commit=True)
+    assert result["journeysFailed"] == []
+    rows, run_items = state(), items(result["runId"])
     # Words name the PRO; the booking price is the non-PRO's -> a price task.
     assert rows[first.journey_id]["product_sku_id"] == pro
     assert rows[first.journey_id]["match_basis"] == "AUTO_PRICE_MISMATCH"
-    assert "AUTO_LEGACY" in items[first.journey_id]["detail"]
+    assert "AUTO_LEGACY" in run_items[first.journey_id]["detail"]
     assert rows[second_id]["product_sku_id"] == non_pro
     assert rows[second_id]["match_basis"] == "PC_CONFIRMED"
-    assert items[second_id]["outcome"] == "ALREADY_HAD_SKU"
+    assert run_items[second_id]["outcome"] == "ALREADY_HAD_SKU"
+    with engine.begin() as connection:
+        set_tenant_context(connection, first.tenant_id)
+        changed = connection.execute(
+            text("SELECT details FROM auditcore.p2_activity_events WHERE tenant_id=:t AND journey_id=:j "
+                 "AND event_type='SKU_RESOLUTION_CHANGED'"), {"t": first.tenant_id, "j": first.journey_id},
+        ).scalars().all()
+    assert len(changed) == 1 and changed[0]["fromBasis"] == "AUTO_LEGACY"
 
 
 def test_the_worker_runs_reresolve_for_a_reresolve_tag(monkeypatch) -> None:
@@ -350,11 +378,14 @@ def test_the_worker_runs_reresolve_for_a_reresolve_tag(monkeypatch) -> None:
     monkeypatch.setattr(worker, "_active_tenants", lambda engine: ["t1"])
     monkeypatch.setattr(worker, "set_tenant_context", lambda connection, tenant_id: None)
     monkeypatch.setattr(backfill, "reresolve_all_skus",
-                        lambda engine, tenant_id, actor_id=None: called.append(tenant_id) or {"runId": uuid4()})
+                        lambda engine, tenant_id, actor_id=None, commit=False:
+                        called.append((tenant_id, commit)) or {"runId": uuid4()})
     monkeypatch.setattr(backfill, "backfill_sku_resolution_for_tenant",
                         lambda *a, **k: pytest.fail("the plain run must not be used for a reresolve tag"))
     worker._sku_run_once(_E(), "reresolve-2026-10-21")
-    assert called == ["t1"]
+    worker._sku_run_once(_E(), "reresolve-2026-10-22-commit")
+    # "reresolve-..." is a dry run; only "-commit" writes (review 471 B2).
+    assert called == [("t1", False), ("t1", True)]
 
 
 # ── renamed models: either spelling, either date (coordinator, 2026-10-20) ────

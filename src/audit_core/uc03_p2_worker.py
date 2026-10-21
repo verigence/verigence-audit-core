@@ -3189,11 +3189,14 @@ def _sku_run_once(engine: Engine, tag: str) -> None:
     the same tag does not run it again. Each Journey's outcome is logged
     (``sku_run_item``) and kept against the run.
 
-    A tag starting "unresolved" leaves every pinned SKU as it is; a tag
-    starting "reresolve" (2026-10-20) takes every automatic SKU off and
-    resolves it again under the words-first rules (``reresolve_all_skus``),
-    never touching a SKU a PC or Team Lead set, and logs old SKU, new SKU and
-    basis per Journey (``sku_reresolve_item``)."""
+    A tag starting "unresolved" leaves every pinned SKU as it is. A tag
+    starting "reresolve" re-checks every SKU under the words-first rules
+    (``reresolve_all_skus``, review 471 B2): a DRY RUN that writes only the
+    run items and one ``sku_reresolve_item`` line per Journey (old SKU ->
+    proposed SKU, basis, words, prices, the task that would be raised),
+    unless the tag contains "-commit" ("reresolve-2026-10-22-commit"), which
+    writes the decisions. Nothing is cleared first; a SKU a PC or Team Lead
+    set is never touched."""
     from audit_core.uc03_backfill_document_sync_producers import (
         backfill_sku_resolution_for_tenant,
         reresolve_all_skus,
@@ -3213,7 +3216,7 @@ def _sku_run_once(engine: Engine, tag: str) -> None:
                 continue
             result: dict[str, Any] = {}
             if tag.lower().startswith("reresolve"):
-                result = reresolve_all_skus(engine, tenant_id, actor_id=actor)
+                result = reresolve_all_skus(engine, tenant_id, actor_id=actor, commit="-commit" in tag.lower())
                 run_id = result.get("runId")
             else:
                 offset: int | None = 0

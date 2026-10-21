@@ -17,7 +17,16 @@
   the booking named stays on the Journey as an automatic match so the deal
   still shows; the PC keeps it (Accept) or picks the right SKU.
 * SKU_INVOICES_DISAGREE (PC) -- two vehicle invoices name different SKUs;
-  neither sets the SKU, the PC picks it.
+  neither sets the SKU. The PC picks one of the SKUs they name (Accept with
+  the SKU) or marks one invoice cancelled (Reject with the invoice: it is
+  voided). Keyed by the invoices and the SKUs they name, so it stays closed
+  once decided for those documents and a new disagreement raises a new one.
+* SKU_BOOKING_FORMS_DISAGREE (PC) -- two booking forms name different SKUs
+  (review 471 S6: never "the newest wins"); the same two actions.
+* SKU_NOT_CONFIRMED (PC) -- an automatic SKU on the Journey that its
+  documents no longer name (a re-check could not confirm it, or the booking
+  form was corrected): the SKU is kept so the deal still shows, marked
+  AUTO_UNCONFIRMED, and the PC keeps it (Accept) or sets another.
 * SKU_INVOICE_REVIEW (TL) -- the vehicle invoice names a different SKU (at
   its master price) from the one a PC or Team Lead set: a human decision is
   never overwritten automatically; the Team Lead applies the invoice's SKU
@@ -27,6 +36,7 @@ Accept / approve / reject run here, called from uc03_p2_tasks.submit_action.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -41,10 +51,16 @@ MODEL_CHANGED_TASK = "MODEL_CHANGED_BY_INVOICE"
 PRICE_MISMATCH_TASK = "SKU_PRICE_MISMATCH"
 INVOICES_DISAGREE_TASK = "SKU_INVOICES_DISAGREE"
 INVOICE_REVIEW_TASK = "SKU_INVOICE_REVIEW"
+BOOKING_FORMS_DISAGREE_TASK = "SKU_BOOKING_FORMS_DISAGREE"
+NOT_CONFIRMED_TASK = "SKU_NOT_CONFIRMED"
 SKU_TASK_TYPES = frozenset({
     CLOSEST_TASK, OTHER_MONTH_TASK, MODEL_CHANGED_TASK, PRICE_MISMATCH_TASK, INVOICES_DISAGREE_TASK,
-    INVOICE_REVIEW_TASK,
+    INVOICE_REVIEW_TASK, BOOKING_FORMS_DISAGREE_TASK, NOT_CONFIRMED_TASK,
 })
+# The tasks an automatic match leaves for the PC; a PC / TL decision settles
+# all of them for good (review 471 B4).
+_DECIDED_BY_HUMAN = (PRICE_MISMATCH_TASK, INVOICES_DISAGREE_TASK, BOOKING_FORMS_DISAGREE_TASK, NOT_CONFIRMED_TASK)
+_NOT_CONFIRMED_TITLE = "SKU not clearly identified from the documents \u2014 confirm or set it"
 _PRICING_BASIS = "TL_PRICE_LIST"
 
 
@@ -213,19 +229,30 @@ def _money_text(value: Any) -> str:
     return f"Rs {sign}{','.join([*groups, tail]) if groups else tail}.{paise}"
 
 
-def _price_key(journey_id: UUID, source: str, document_id: str | None) -> str:
-    if source == "INVOICE":
-        return f"sku-price:{journey_id}:INVOICE:{document_id}"
-    return f"sku-price:{journey_id}:BOOKING"
+def _amount_key(value: Any) -> str:
+    if value is None:
+        return "-"
+    return str(Decimal(str(value)).quantize(Decimal("0.01")))
+
+
+def _price_key(journey_id: UUID, source: str, document_id: str | None, sku_id: Any, master: Any,
+               offered: Any) -> str:
+    """One task per (Journey, document, SKU, prices) (review 471 B4): the
+    same mismatch stays decided once the PC decided it, a different SKU or
+    price on the same document is a new question."""
+    return (f"sku-price:{journey_id}:{source}:{document_id or '-'}:{sku_id}:"
+            f"{_amount_key(master)}:{_amount_key(offered)}")
 
 
 def raise_price_mismatch_task(
     connection: Connection, *, tenant_id: str, journey_id: UUID, source: str, reading: dict[str, Any],
-    row: dict[str, Any], master: Any, offered: Any,
+    row: dict[str, Any], master: Any, offered: Any, current_sku_id: Any = None,
 ) -> str:
     """Rule R3 (2026-10-20): the document's words name this SKU, but its
-    master ex-showroom is not the document's. The PC sets the SKU. Returns
-    the task's dedupe key."""
+    master ex-showroom is not the document's (or the document's could not be
+    read). The PC decides: Accept confirms the SKU this task names
+    (``reference.skuId``), never whatever is on the Journey (review 471 B3).
+    Returns the task's dedupe key."""
     from audit_core.uc03_p2_registry import get_registry
     from audit_core.uc03_p2_task_producer import raise_or_refresh
 
@@ -233,30 +260,41 @@ def raise_price_mismatch_task(
     document = (f"vehicle invoice {reading.get('invoiceNumber') or ''}".strip() if invoice else "booking form")
     vehicle = _vehicle_label(row.get("model_name"), row.get("variant_name"), None)
     read = " / ".join(str(v) for v in (reading.get("model"), reading.get("variant")) if v) or "-"
+    other_vehicle = (invoice and current_sku_id is not None
+                     and str(current_sku_id) != str(row.get("product_sku_id")))
+    label = "invoice" if invoice else "booking"
     if offered is None:
-        title = "SKU price could not be compared with the booking: set the SKU"
-        reason = (f"The {document}'s ex-showroom price was not read, so the master price of {vehicle} "
-                  f"({_money_text(master)}) could not be checked against it.")
+        title = f"SKU price could not be checked: the {document}'s ex-showroom was not read"
+        reason = (f"The {document} reads '{read}', which names {vehicle} ({row.get('sku_code')}), but its "
+                  f"ex-showroom price was not read, so the master price ({_money_text(master)}) could not be "
+                  "checked against it.")
     else:
-        label = "invoice" if invoice else "booking"
         title = (f"SKU price differs from {label}: master {_money_text(master)} vs {label} "
                  f"{_money_text(offered)} -- set the SKU")
         reason = (f"The {document} reads '{read}', which names {vehicle} ({row.get('sku_code')}); its master "
                   f"ex-showroom is {_money_text(master)} but the {document} says {_money_text(offered)}.")
+    if other_vehicle:
+        title = (f"Vehicle invoice names a different vehicle from the booking: {vehicle} "
+                 f"({row.get('sku_code')})" + ("" if offered is None else
+                                               f", invoice {_money_text(offered)} vs master {_money_text(master)}"))
+    key = _price_key(journey_id, source, reading.get("documentId"), row.get("product_sku_id"), master, offered)
     raise_or_refresh(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
-        dedupe_key=_price_key(journey_id, source, reading.get("documentId")),
+        dedupe_key=key,
         task_type=PRICE_MISMATCH_TASK,
         source_type="RESOLVER",
         source_code="SKU_PRICE_MISMATCH",
         title=title,
         description=(
-            reason + (" The vehicle stays as the booking named it until the PC decides. " if not invoice
-                      else " The invoice does not set the SKU. ")
-            + "A price never picks the variant: accept this SKU if it is the vehicle sold, or pick the right one "
-            "in the model picker."
+            reason
+            + (" The Journey's SKU is a different vehicle; the invoice does not change it on its own. "
+               if other_vehicle
+               else " The vehicle stays as the booking named it until the PC decides. " if not invoice
+               else " The invoice does not set the SKU. ")
+            + f"A price never picks the variant: accept to confirm {vehicle} ({row.get('sku_code')}) if it is "
+            "the vehicle sold, or pick the right one in the model picker."
         ),
         reference={
             "sourceCode": "SKU_PRICE_MISMATCH",
@@ -264,18 +302,19 @@ def raise_price_mismatch_task(
             "documentId": reading.get("documentId"),
             "documentType": reading.get("documentType"),
             "invoiceNumber": reading.get("invoiceNumber"),
-            "leftValue": f"master {_money_text(master)}",
-            "rightValue": f"{'invoice' if invoice else 'booking'} {_money_text(offered)}",
+            "leftValue": f"master {_money_text(master)} ({row.get('sku_code')})",
+            "rightValue": f"{label} {_money_text(offered)} ({reading.get('documentId') or '-'})",
             "skuId": str(row.get("product_sku_id")),
             "skuCode": row.get("sku_code"),
             "vehicle": vehicle,
+            "differentFromJourney": bool(other_vehicle),
             "masterExShowroom": str(master) if master is not None else None,
             "documentExShowroom": str(offered) if offered is not None else None,
         },
         severity="MEDIUM",
         registry=get_registry(),
     )
-    return _price_key(journey_id, source, reading.get("documentId"))
+    return key
 
 
 def _open_task_keys(connection: Connection, *, tenant_id: str, journey_id: UUID, task_type: str) -> list[str]:
@@ -304,47 +343,154 @@ def resolve_price_mismatch_tasks(
                             evidence={"reason": reason})
 
 
-def raise_invoices_disagree_task(
-    connection: Connection, *, tenant_id: str, journey_id: UUID, invoices: list[dict[str, Any]],
-) -> None:
-    """Vehicle invoices on one Journey name different vehicles (rule R3):
-    none of them sets the SKU; the PC picks it."""
+def _disagree_key(prefix: str, journey_id: UUID, items: list[dict[str, Any]]) -> tuple[str, str]:
+    pairs = sorted(f"{i.get('documentId')}={i.get('skuCode')}" for i in items)
+    material = "; ".join(pairs)
+    return f"{prefix}:{journey_id}:{hashlib.sha256(material.encode()).hexdigest()[:16]}", material
+
+
+def _sku_options(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    options: dict[str, dict[str, Any]] = {}
+    for i in items:
+        option = options.setdefault(str(i.get("skuId")), {
+            "skuId": str(i.get("skuId")), "skuCode": i.get("skuCode"), "vehicle": i.get("vehicle"),
+            "documentIds": [],
+        })
+        option["documentIds"].append(i.get("documentId"))
+    return list(options.values())
+
+
+def _raise_disagree(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, task_type: str, prefix: str,
+    items: list[dict[str, Any]], title: str, what: str,
+) -> str:
     from audit_core.uc03_p2_registry import get_registry
     from audit_core.uc03_p2_task_producer import raise_or_refresh
 
+    key, material = _disagree_key(prefix, journey_id, items)
     lines = "; ".join(
-        f"{i.get('invoiceNumber') or i.get('documentType')}: {i.get('vehicle')} ({i.get('skuCode')})" for i in invoices
+        f"{i.get('invoiceNumber') or i.get('documentType')}: {i.get('vehicle')} ({i.get('skuCode')})" for i in items
     )
     raise_or_refresh(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
-        dedupe_key=f"sku-invoices-disagree:{journey_id}",
-        task_type=INVOICES_DISAGREE_TASK,
+        dedupe_key=key,
+        task_type=task_type,
         source_type="RESOLVER",
-        source_code="SKU_INVOICES_DISAGREE",
-        title="Vehicle invoices name different vehicles: set the SKU",
+        source_code=task_type,
+        title=title,
         description=(
-            f"The vehicle invoices on this Journey name different vehicles -- {lines}. Neither sets the SKU. "
-            "Check which invoice is the sale (a cancelled one should be voided) and pick the SKU in the model picker."
+            f"The {what} on this Journey name different vehicles -- {lines}. None of them sets the SKU. "
+            f"Pick the vehicle sold (one of these SKUs), or mark the {what[:-1]} that was cancelled; "
+            "any other SKU can be set in the model picker."
         ),
         reference={
-            "sourceCode": "SKU_INVOICES_DISAGREE",
-            "leftValue": invoices[0].get("skuCode") if invoices else None,
-            "rightValue": invoices[1].get("skuCode") if len(invoices) > 1 else None,
-            "invoices": invoices,
+            "sourceCode": task_type,
+            "leftValue": material,
+            "rightValue": None,
+            "documents": items,
+            "skuOptions": _sku_options(items),
+            "documentIds": [i.get("documentId") for i in items],
         },
         severity="MEDIUM",
         registry=get_registry(),
     )
+    return key
 
 
-def resolve_invoices_disagree_task(connection: Connection, *, tenant_id: str, journey_id: UUID) -> None:
+def raise_invoices_disagree_task(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, invoices: list[dict[str, Any]],
+) -> str:
+    """Vehicle invoices on one Journey name different vehicles (rule R3):
+    none of them sets the SKU; the PC picks it or marks one cancelled."""
+    return _raise_disagree(
+        connection, tenant_id=tenant_id, journey_id=journey_id, task_type=INVOICES_DISAGREE_TASK,
+        prefix="sku-invoices-disagree", items=invoices,
+        title="Vehicle invoices name different vehicles: set the SKU", what="vehicle invoices",
+    )
+
+
+def raise_booking_forms_disagree_task(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, forms: list[dict[str, Any]],
+) -> str:
+    """Booking forms on one Journey name different vehicles (review 471 S6):
+    none of them sets the SKU; the PC picks it or marks one cancelled."""
+    return _raise_disagree(
+        connection, tenant_id=tenant_id, journey_id=journey_id, task_type=BOOKING_FORMS_DISAGREE_TASK,
+        prefix="sku-booking-forms-disagree", items=forms,
+        title="Booking forms name different vehicles: set the SKU", what="booking forms",
+    )
+
+
+def _resolve_open(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, task_type: str, keep: set[str], reason: str,
+) -> None:
     from audit_core.uc03_p2_task_producer import resolve_if_open
 
-    resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id,
-                    dedupe_key=f"sku-invoices-disagree:{journey_id}",
-                    evidence={"reason": "The vehicle invoices no longer name different vehicles"})
+    for key in _open_task_keys(connection, tenant_id=tenant_id, journey_id=journey_id, task_type=task_type):
+        if key not in keep:
+            resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                            evidence={"reason": reason})
+
+
+def resolve_invoices_disagree_task(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                                   keep: set[str] | None = None) -> None:
+    _resolve_open(connection, tenant_id=tenant_id, journey_id=journey_id, task_type=INVOICES_DISAGREE_TASK,
+                  keep=keep or set(), reason="The vehicle invoices no longer name different vehicles")
+
+
+def resolve_booking_forms_disagree_task(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                                        keep: set[str] | None = None) -> None:
+    _resolve_open(connection, tenant_id=tenant_id, journey_id=journey_id, task_type=BOOKING_FORMS_DISAGREE_TASK,
+                  keep=keep or set(), reason="The booking forms no longer name different vehicles")
+
+
+def _not_confirmed_key(journey_id: UUID, sku_id: Any) -> str:
+    return f"sku-not-confirmed:{journey_id}:{sku_id}"
+
+
+def raise_not_confirmed_task(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, sku_id: Any, sku_code: str | None,
+    vehicle: str | None, why: str,
+) -> str:
+    """The automatic SKU stays on the Journey (the deal still shows), but
+    its documents do not name it: the PC confirms it or sets another."""
+    from audit_core.uc03_p2_registry import get_registry
+    from audit_core.uc03_p2_task_producer import raise_or_refresh
+
+    key = _not_confirmed_key(journey_id, sku_id)
+    raise_or_refresh(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        dedupe_key=key,
+        task_type=NOT_CONFIRMED_TASK,
+        source_type="RESOLVER",
+        source_code="SKU_NOT_CONFIRMED",
+        title=_NOT_CONFIRMED_TITLE,
+        description=(
+            f"The Journey carries {vehicle or '-'} ({sku_code or '-'}), matched automatically, but {why}. "
+            "It stays on the Journey so the deal still shows. Accept to confirm it if it is the vehicle sold, "
+            "or set the right SKU in the model picker."
+        ),
+        reference={
+            "sourceCode": "SKU_NOT_CONFIRMED",
+            "leftValue": f"{vehicle or '-'} ({sku_code or '-'})",
+            "rightValue": why,
+            "skuId": str(sku_id),
+            "skuCode": sku_code,
+            "vehicle": vehicle,
+        },
+        severity="MEDIUM",
+        registry=get_registry(),
+    )
+    return key
+
+
+def resolve_not_confirmed_task(connection: Connection, *, tenant_id: str, journey_id: UUID, reason: str) -> None:
+    _resolve_open(connection, tenant_id=tenant_id, journey_id=journey_id, task_type=NOT_CONFIRMED_TASK,
+                  keep=set(), reason=reason)
 
 
 def raise_invoice_review_task(
@@ -398,12 +544,51 @@ def resolve_invoice_review_task(connection: Connection, *, tenant_id: str, journ
                         evidence={"reason": "The invoice and the Journey's SKU agree"})
 
 
-def resolve_automatic_match_tasks(connection: Connection, *, tenant_id: str, journey_id: UUID, reason: str) -> None:
-    """A PC or Team Lead set the SKU: the price checks and the invoices'
-    disagreement have nothing left to decide."""
-    resolve_price_mismatch_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, source=None, keep=set(),
-                                 reason=reason)
-    resolve_invoices_disagree_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+def resolve_automatic_match_tasks(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, reason: str, skip_task_id: Any = None,
+    actor_id: str | None = None,
+) -> int:
+    """A PC or Team Lead set the SKU: the price checks, the documents'
+    disagreements and the "not confirmed" question have nothing left to
+    decide. They are closed as decided -- with the issue they asked about
+    (``acceptedIssueHash``) -- so the same question is never raised again
+    for the same documents and prices (review 471 B4). ``skip_task_id`` is
+    the task whose own action made the decision (it is closed by it)."""
+    from audit_core.uc03_p2_task_producer import _OPEN
+    from audit_core.uc03_p2_tasks import record_task_event
+
+    rows = connection.execute(
+        text(
+            "SELECT task_id, reference FROM auditcore.p2_tasks WHERE tenant_id = :t AND journey_id = :j "
+            "AND task_type = ANY(:types) AND task_status = ANY(:open) FOR UPDATE"
+        ),
+        {"t": tenant_id, "j": journey_id, "types": list(_DECIDED_BY_HUMAN), "open": list(_OPEN)},
+    ).mappings().all()
+    closed = 0
+    for row in rows:
+        if skip_task_id is not None and str(row["task_id"]) == str(skip_task_id):
+            continue
+        reference = dict(row["reference"] or {})
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_tasks
+                SET task_status='VERIFIED_COMPLETE', verified_at_utc=now(),
+                    completion_result=COALESCE(completion_result, '{}'::jsonb) || CAST(:result AS jsonb),
+                    updated_at_utc=now()
+                WHERE tenant_id=:t AND task_id=:id
+                """
+            ),
+            {"t": tenant_id, "id": row["task_id"], "result": _json({
+                "outcome": "DECIDED", "reason": reason, "by": actor_id, "at": datetime.now(UTC).isoformat(),
+                "acceptedIssueHash": reference.get("issueHash"),
+            })},
+        )
+        record_task_event(connection, tenant_id=tenant_id, journey_id=journey_id, task_id=UUID(str(row["task_id"])),
+                          event_type="COMPLETED", actor_id=actor_id or "SYSTEM", actor_role_code="SYSTEM",
+                          comment=None, details={"outcome": "DECIDED", "reason": reason})
+        closed += 1
+    return closed
 
 
 def resolve_sku_tasks(connection: Connection, *, tenant_id: str, journey_id: UUID, sku_code: str | None) -> None:
@@ -449,9 +634,22 @@ def _close(
     return {"taskId": str(task["task_id"]), "status": "VERIFIED_COMPLETE", "outcome": outcome}
 
 
+def _confirm(connection: Connection, *, tenant_id: str, journey_id: UUID, sku_id: Any, actor_id: str,
+             task: dict[str, Any]) -> None:
+    """The PC's decision on a SKU task: the SKU the task names (validated
+    against the Journey's price list by ``confirm_model_resolution_sku``)."""
+    from audit_core.uc03_model_resolution import confirm_model_resolution_sku
+
+    if not sku_id:
+        raise ValueError("This task names no SKU to confirm; pick one in the model picker")
+    confirm_model_resolution_sku(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                 product_sku_id=UUID(str(sku_id)), actor_id=actor_id, correlation_id="",
+                                 task_id=task["task_id"])
+
+
 def handle_sku_task_action(
     connection: Connection, *, tenant_id: str, task: dict[str, Any], action: str, actor_id: str,
-    actor_role_code: str, comment: str | None,
+    actor_role_code: str, comment: str | None, details: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Accept / reject on a SKU task; None when the action is not one of them."""
     task_type = str(task["task_type"])
@@ -459,14 +657,11 @@ def handle_sku_task_action(
     reference = dict(task["reference"] or {})
     role = str(actor_role_code or "").upper()
     comment = (comment or "").strip() or None
+    details = dict(details or {})
 
     if task_type == CLOSEST_TASK and action == "ACCEPT":
-        from audit_core.uc03_model_resolution import confirm_model_resolution_sku
-
-        confirm_model_resolution_sku(
-            connection, tenant_id=tenant_id, journey_id=journey_id,
-            product_sku_id=UUID(str(reference["suggestedSkuId"])), actor_id=actor_id, correlation_id="",
-        )
+        _confirm(connection, tenant_id=tenant_id, journey_id=journey_id, sku_id=reference.get("suggestedSkuId"),
+                 actor_id=actor_id, task=task)
         return _close(connection, tenant_id=tenant_id, task=task, outcome="SKU_ACCEPTED", actor_id=actor_id,
                       role=role, comment=comment, extra={"skuCode": reference.get("suggestedSkuCode")})
     if task_type == CLOSEST_TASK and action == "REJECT":
@@ -493,21 +688,41 @@ def handle_sku_task_action(
         return _close(connection, tenant_id=tenant_id, task=task, outcome="PRICE_LIST_APPROVED", actor_id=actor_id,
                       role=role, comment=comment, extra=outcome)
 
-    if task_type == PRICE_MISMATCH_TASK and action == "ACCEPT":
-        # The PC says the SKU on the Journey is the vehicle sold: it becomes
-        # the PC's decision (CONFIRMED), which also closes this task.
-        from audit_core.uc03_model_resolution import confirm_model_resolution_sku
-
-        sku_id = connection.execute(
-            text("SELECT product_sku_id FROM auditcore.journey_products WHERE tenant_id=:t AND journey_id=:j"),
-            {"t": tenant_id, "j": journey_id},
-        ).scalar_one_or_none()
-        if sku_id is None:
-            raise ValueError("There is no SKU on the Journey to accept; pick one in the model picker")
-        confirm_model_resolution_sku(connection, tenant_id=tenant_id, journey_id=journey_id,
-                                     product_sku_id=UUID(str(sku_id)), actor_id=actor_id, correlation_id="")
+    if task_type in {PRICE_MISMATCH_TASK, NOT_CONFIRMED_TASK} and action == "ACCEPT":
+        # "Keep this vehicle": the SKU this task names becomes the PC's
+        # decision -- never whatever is on the Journey now (review 471 B3).
+        _confirm(connection, tenant_id=tenant_id, journey_id=journey_id, sku_id=reference.get("skuId"),
+                 actor_id=actor_id, task=task)
         return _close(connection, tenant_id=tenant_id, task=task, outcome="SKU_ACCEPTED", actor_id=actor_id,
-                      role=role, comment=comment, extra={"productSkuId": str(sku_id)})
+                      role=role, comment=comment,
+                      extra={"productSkuId": reference.get("skuId"), "skuCode": reference.get("skuCode")})
+
+    if task_type in {INVOICES_DISAGREE_TASK, BOOKING_FORMS_DISAGREE_TASK} and action == "ACCEPT":
+        # The PC picks the vehicle sold among the SKUs the documents name.
+        options = {str(o.get("skuId")): o for o in reference.get("skuOptions") or []}
+        chosen = str(details.get("skuId") or details.get("productSkuId") or "")
+        if chosen not in options:
+            raise ValueError("Pick one of the SKUs the documents name (or set another in the model picker)")
+        _confirm(connection, tenant_id=tenant_id, journey_id=journey_id, sku_id=chosen, actor_id=actor_id, task=task)
+        return _close(connection, tenant_id=tenant_id, task=task, outcome="SKU_PICKED", actor_id=actor_id,
+                      role=role, comment=comment,
+                      extra={"productSkuId": chosen, "skuCode": options[chosen].get("skuCode")})
+    if task_type in {INVOICES_DISAGREE_TASK, BOOKING_FORMS_DISAGREE_TASK} and action == "REJECT":
+        # "This one was cancelled": the document is voided (as from the
+        # Documents tab) and the SKU is resolved again from the rest.
+        from audit_core.uc03_model_resolution import sync_model_resolution
+        from audit_core.uc03_p2_documents import void_p2_document
+
+        document_id = str(details.get("documentId") or "")
+        if document_id not in {str(d) for d in reference.get("documentIds") or []}:
+            raise ValueError("Say which of the task's documents was cancelled")
+        kind = "INVOICE" if task_type == INVOICES_DISAGREE_TASK else "BOOKING_FORM"
+        void_p2_document(connection, tenant_id=tenant_id, journey_id=journey_id, document_id=UUID(document_id),
+                         actor_id=actor_id, void_reason=f"{kind}_CANCELLED_PER_SKU_TASK")
+        closed = _close(connection, tenant_id=tenant_id, task=task, outcome="DOCUMENT_CANCELLED", actor_id=actor_id,
+                        role=role, comment=comment, extra={"documentId": document_id})
+        sync_model_resolution(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id="")
+        return closed
 
     if task_type == INVOICE_REVIEW_TASK and action in {"ACCEPT", "REJECT"}:
         if role not in {"TL", "PM"}:

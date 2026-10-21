@@ -183,34 +183,35 @@ def test_price_only_orders_a_shortlist():
 
 
 # ── rule R1: the invoice's ex-showroom ────────────────────────────────────────
+_R1_BASE = {"taxable_amount": "701017.32", "cgst_rate": "9", "sgst_rate": "9",
+            "cgst_amount": "63091.56", "sgst_amount": "63091.56"}
+
+
 def test_r1_selling_price_times_the_printed_gst_rate():
     """The product owner's example: selling 7,22,033.90 x 1.18 = 8,52,000.00;
-    the discount (21,016.58 before GST) is not taken off the ex-showroom."""
-    ex, basis = invoice_ex_showroom({
-        "gross_amount_before_discount": "722033.90", "invoice_discount_amount": "21016.58",
-        "taxable_amount": "701017.32", "cgst_rate": "9", "sgst_rate": "9",
-        "cgst_amount": "63091.56", "sgst_amount": "63091.56",
-    })
+    the discount (21,016.58 before GST) is not taken off the ex-showroom.
+    Read by PR #470's vehicle_invoice_ex_showroom (one implementation)."""
+    ex, basis = invoice_ex_showroom({**_R1_BASE, "gross_amount_before_discount": "722033.90",
+                                     "invoice_discount_amount": "21016.58"})
     assert ex == Decimal("852000.00")
-    assert basis["method"] == "SELLING_TIMES_GST_RATE" and basis["gstRatePercent"] == Decimal(18)
+    assert basis["method"] == "R1_VEHICLE_INVOICE_EX_SHOWROOM" and basis["gstRatePercent"] == Decimal(18)
 
 
-def test_r1_no_discount_adds_the_printed_gst_as_printed():
-    ex, basis = invoice_ex_showroom({"taxable_amount": "722033.90", "cgst_amount": "64983.05",
-                                     "sgst_amount": "64983.05", "cgst_rate": "9", "sgst_rate": "9"})
-    assert ex == Decimal("852000.00") and basis["method"] == "SELLING_PLUS_PRINTED_GST"
+def test_r1_negative_header_discount_is_still_a_discount():
+    """Review 471 S5 shape D: the discount printed negative, no gross."""
+    ex, _ = invoice_ex_showroom({**_R1_BASE, "invoice_discount_amount": "-21016.58"})
+    assert ex == Decimal("852000.00")
 
 
-def test_r1_igst_and_a_rate_read_off_the_amounts():
-    ex, _ = invoice_ex_showroom({"gross_amount_before_discount": "1322857.14", "invoice_discount_amount": "10000",
-                                 "taxable_amount": "1312857.14", "igst_rate": "5"})
-    assert ex == Decimal("1389000.00")
-    ex, basis = invoice_ex_showroom({"gross_amount_before_discount": "722033.90",
-                                     "invoice_discount_amount": "21016.58", "taxable_amount": "701017.32",
-                                     "cgst_amount": "63091.56", "sgst_amount": "63091.56"})
-    assert ex == Decimal("852000.00") and basis["rate"] == "FROM_PRINTED_AMOUNTS"
+def test_r1_igst_rate_and_the_ev_category_rate():
+    ex, basis = invoice_ex_showroom({"gross_amount_before_discount": "1322857.14", "invoice_discount_amount": "10000",
+                                     "taxable_amount": "1312857.14", "igst_rate": "5"})
+    assert ex == Decimal("1389000.00") and basis["gstRatePercent"] == Decimal(5)
 
 
 def test_r1_nothing_to_go_on():
-    assert invoice_ex_showroom({"taxable_amount": "701017.32", "invoice_discount_amount": "21016.58"})[0] is None
+    ex, basis = invoice_ex_showroom({"taxable_amount": "701017.32", "invoice_discount_amount": "21016.58"})
+    assert ex is None and "TAXES_NOT_READ" in basis["issues"]
     assert invoice_ex_showroom({})[0] is None
+    # A generic invoice that prints no purpose is no vehicle invoice on its own.
+    assert invoice_ex_showroom({**_R1_BASE, "gross_amount_before_discount": "722033.90"}, "invoice_generic")[0] is None

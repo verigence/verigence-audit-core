@@ -229,7 +229,9 @@ task_types:
     - ACCEPT
     - ADD_COMMENT
   # Two vehicle invoices on one Journey name different vehicles: the PC
-  # picks the SKU (nothing is set from either).
+  # picks one of their SKUs (ACCEPT, details.skuId) or marks one invoice
+  # cancelled (REJECT, details.documentId: it is voided). Nothing is set from
+  # either on its own.
   SKU_INVOICES_DISAGREE:
     category: CORRECTION_APPROVAL
     owner: PC
@@ -237,6 +239,32 @@ task_types:
     source: RESOLVER
     completion: MACHINE_VERIFIED
     actions:
+    - ACCEPT
+    - REJECT
+    - ADD_COMMENT
+  # Two booking forms name different vehicles (never "the newest wins"):
+  # the same two actions as SKU_INVOICES_DISAGREE.
+  SKU_BOOKING_FORMS_DISAGREE:
+    category: CORRECTION_APPROVAL
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - ACCEPT
+    - REJECT
+    - ADD_COMMENT
+  # An automatic SKU its documents no longer name (a re-check could not
+  # confirm it): kept on the Journey, the PC confirms it (ACCEPT confirms the
+  # SKU the task names) or sets another in the model picker.
+  SKU_NOT_CONFIRMED:
+    category: CORRECTION_APPROVAL
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - ACCEPT
     - ADD_COMMENT
   # The vehicle invoice names a different SKU (at its master price) from
   # the one a PC or Team Lead set: never overwritten, the Team Lead decides.

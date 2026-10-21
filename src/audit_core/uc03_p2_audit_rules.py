@@ -1411,8 +1411,11 @@ def queue_nightly_sku_retry(connection: Connection, *, tenant_id: str, today: da
                                  AND f.effective_value IS NOT NULL))
               -- A SKU a PC or Team Lead confirmed stays; an automatic match
               -- (TENTATIVE since 2026-10-20) is re-checked against the
-              -- documents and the masters like a Journey with no SKU.
+              -- documents and the masters like a Journey with no SKU. A pin
+              -- from before the rules (AUTO_LEGACY) is re-checked only by the
+              -- reresolve run, after its dry run was reviewed (review 471 B2).
               AND jp.selection_status IS DISTINCT FROM 'CONFIRMED'
+              AND jp.match_basis IS DISTINCT FROM 'AUTO_LEGACY'
               AND NOT EXISTS (SELECT 1 FROM auditcore.journey_stage_states s
                                WHERE s.tenant_id=j.tenant_id AND s.journey_id=j.journey_id AND s.stage_code='BOOKING'
                                  AND (s.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING')

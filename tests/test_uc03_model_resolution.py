@@ -1746,7 +1746,7 @@ def test_integration_an_ev_reading_without_a_price_is_pinned_as_a_price_mismatch
     assert result["basis"] == "AUTO_PRICE_MISMATCH" and result["priceCheck"] == "MISSING"
     assert _pinned(c) == skus["ev_ax7l"]
     task = _sku_task(c, "SKU_PRICE_MISMATCH")
-    assert task["title"].startswith("SKU price could not be compared")
+    assert task["title"].startswith("SKU price could not be checked")
 
 
 def _seed_maxx_hd(c):

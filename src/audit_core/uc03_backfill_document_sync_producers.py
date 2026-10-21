@@ -30,6 +30,7 @@ roll back progress on the rest; failures are collected, not raised.
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Annotated, Any
 from uuid import UUID
@@ -201,7 +202,7 @@ def _journey_sku_state(connection, *, tenant_id: str, journey_id: UUID) -> dict[
         text(
             """
             SELECT jp.product_sku_id IS NOT NULL AS has_sku,
-                   sku.sku_code, jp.match_basis,
+                   sku.sku_code, jp.match_basis, j.review_completed_at_utc IS NOT NULL AS review_completed,
                    NULLIF(concat_ws(' · ', NULLIF(jp.model_name_snapshot, ''),
                                     NULLIF(jp.variant_name_snapshot, ''),
                                     NULLIF(jp.colour_name_snapshot, '')), '') AS model_label,
@@ -228,21 +229,23 @@ def _journey_sku_state(connection, *, tenant_id: str, journey_id: UUID) -> dict[
 def _record_item(
     connection, *, tenant_id: str, run_id: UUID, journey_id: UUID, label: str | None,
     model_label: str | None, outcome: str, sku_code: str | None, detail: str | None,
+    proposal: dict[str, Any] | None = None,
 ) -> None:
     connection.execute(
         text(
             """
             INSERT INTO auditcore.sku_resolution_run_items
-              (tenant_id, run_id, journey_id, journey_label, model_label, outcome, sku_code, detail)
-            VALUES (:t, :r, :j, :label, :model, :outcome, :sku, :detail)
+              (tenant_id, run_id, journey_id, journey_label, model_label, outcome, sku_code, detail, proposal)
+            VALUES (:t, :r, :j, :label, :model, :outcome, :sku, :detail, CAST(:proposal AS jsonb))
             ON CONFLICT (tenant_id, run_id, journey_id) DO UPDATE
               SET journey_label = EXCLUDED.journey_label, model_label = EXCLUDED.model_label,
                   outcome = EXCLUDED.outcome, sku_code = EXCLUDED.sku_code, detail = EXCLUDED.detail,
-                  recorded_at_utc = now()
+                  proposal = EXCLUDED.proposal, recorded_at_utc = now()
             """
         ),
         {"t": tenant_id, "r": run_id, "j": journey_id, "label": label, "model": model_label,
-         "outcome": outcome, "sku": sku_code, "detail": (detail or None) and detail[:500]},
+         "outcome": outcome, "sku": sku_code, "detail": (detail or None) and detail[:500],
+         "proposal": json.dumps(proposal, default=str) if proposal is not None else None},
     )
     # One line per Journey, readable from the logs without database access.
     _run_log.info(
@@ -251,10 +254,66 @@ def _record_item(
     )
 
 
+RECHECK_DRY_RUN = "RERESOLVE_DRY_RUN"
+RECHECK_COMMIT = "RERESOLVE_COMMIT"
+
+
+def _recheck_item(
+    connection, *, tenant_id: str, run_id: UUID, journey_id: UUID, before: dict[str, Any], commit: bool,
+) -> None:
+    """One Journey of a reresolve run (review 471 B2): nothing is cleared;
+    the dry run writes only the run item, the commit writes the decision
+    (inside a savepoint around the whole Journey)."""
+    from audit_core.uc03_model_resolution import recheck_model_resolution
+
+    result = recheck_model_resolution(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                      correlation_id=_SKU_CORRELATION_ID, commit=commit)
+    if result.get("error"):
+        detail = f"An internal step reported an error (nothing changed): {result.get('errorType')}: " \
+                 f"{result.get('errorMessage')}"
+        _record_item(connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id,
+                     label=before.get("journey_label"), model_label=before.get("model_label"), outcome="FAILED",
+                     sku_code=before.get("sku_code"), detail=detail)
+        _run_log.info("sku_reresolve_item", tenant_id=tenant_id, run_id=str(run_id), journey_id=str(journey_id),
+                      dry_run=not commit, old_sku=before.get("sku_code"), error=detail)
+        return
+    after = before if not commit else _journey_sku_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+    proposal = dict(result.get("proposal") or {})
+    old, new = proposal.get("oldSku"), proposal.get("proposedSku")
+    if proposal.get("action") == "UNCONFIRMED":
+        outcome = "STILL_UNMATCHED"
+    elif new and new != old:
+        outcome = "NEWLY_MATCHED"
+    elif new:
+        outcome = "ALREADY_HAD_SKU"
+    else:
+        outcome = "STILL_UNMATCHED"
+    detail = (
+        ("[dry run] " if not commit else "")
+        + f"{old or 'no SKU'} ({proposal.get('oldBasis') or '-'}) -> "
+        + f"{new or 'no SKU'} ({proposal.get('proposedBasis') or '-'}) [{proposal.get('action')}]"
+        + (f"; words '{proposal['words']}'" if proposal.get("words") else "")
+        + (f"; master {proposal.get('masterExShowroom')} vs document {proposal.get('documentExShowroom')}"
+           f" ({proposal.get('priceCheck')})" if proposal.get("priceCheck") else "")
+        + (f"; {proposal['why']}" if proposal.get("why") else "")
+        + (f"; tasks: {', '.join(proposal['tasks'])}" if proposal.get("tasks") else "")
+    )
+    _record_item(connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id,
+                 label=after.get("journey_label"), model_label=after.get("model_label"), outcome=outcome,
+                 sku_code=new, detail=detail, proposal={**proposal, "dryRun": not commit})
+    _run_log.info(
+        "sku_reresolve_item", tenant_id=tenant_id, run_id=str(run_id), journey_id=str(journey_id),
+        dry_run=not commit, action=proposal.get("action"), old_sku=old, old_basis=proposal.get("oldBasis"),
+        proposed_sku=new, proposed_basis=proposal.get("proposedBasis"), words=proposal.get("words"),
+        master_ex_showroom=proposal.get("masterExShowroom"), document_ex_showroom=proposal.get("documentExShowroom"),
+        price_check=proposal.get("priceCheck"), why=proposal.get("why"), tasks=proposal.get("tasks"),
+    )
+
+
 def backfill_sku_resolution_for_tenant(
     engine: Engine, *, tenant_id: str, offset: int = 0, limit: int | None = None,
     run_id: UUID | None = None, actor_id: str | None = None, only_without_sku: bool = False,
-    clear_automatic: bool = False,
+    recheck: str | None = None,
 ) -> dict[str, Any]:
     """Run SKU resolution (booking model/price match, then the Delivery-invoice fallback) for
     the Project's Journeys, in a stable order, ``limit`` at a time starting at ``offset`` (all of
@@ -264,12 +323,12 @@ def backfill_sku_resolution_for_tenant(
     request runs long enough for the edge proxy to time out. Every Journey's outcome is kept
     against a run (``runId``) so the summary can be read afterwards.
 
-    ``clear_automatic`` (the "reresolve" run, 2026-10-20): each Journey's
-    automatic SKU is taken off first and resolved again from its documents
-    by the words-first ladder; a SKU a PC or Team Lead set is left as it is.
-    Each Journey logs its old SKU, new SKU and how the new one was set."""
+    ``recheck`` (the "reresolve" run, review 471 B2): RERESOLVE_DRY_RUN
+    writes only the run items -- per Journey the old SKU, the proposed SKU,
+    basis, words, prices and the tasks that would be raised; RERESOLVE_COMMIT
+    writes the decision (``recheck_model_resolution``). Nothing is ever
+    cleared first, and a SKU a PC or Team Lead set is left as it is."""
     from audit_core.uc03_async_sync_tasks import sync_model_resolution_with_escalation
-    from audit_core.uc03_model_resolution import clear_automatic_pin
 
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
@@ -296,11 +355,11 @@ def backfill_sku_resolution_for_tenant(
                 text(
                     """
                     INSERT INTO auditcore.sku_resolution_runs
-                      (tenant_id, started_by_actor_id, journeys_total)
-                    VALUES (:t, :actor, :total) RETURNING run_id
+                      (tenant_id, started_by_actor_id, journeys_total, run_mode)
+                    VALUES (:t, :actor, :total, :mode) RETURNING run_id
                     """
                 ),
-                {"t": tenant_id, "actor": actor_id, "total": journeys_total},
+                {"t": tenant_id, "actor": actor_id, "total": journeys_total, "mode": recheck or "RESOLVE"},
             ).scalar_one()
             first_batch = True
         else:
@@ -329,11 +388,22 @@ def backfill_sku_resolution_for_tenant(
                         outcome="ALREADY_HAD_SKU", sku_code=before.get("sku_code"), detail=None,
                     )
                     continue
+                if recheck is not None and before.get("review_completed"):
+                    # A Journey whose review is complete is not re-checked:
+                    # its SKU (and the standards priced on it) stay as reviewed.
+                    _record_item(
+                        connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id,
+                        label=before.get("journey_label"), model_label=before.get("model_label"),
+                        outcome="ALREADY_HAD_SKU" if before.get("has_sku") else "STILL_UNMATCHED",
+                        sku_code=before.get("sku_code"), detail="Review completed: not re-checked",
+                    )
+                    continue
+                if recheck is not None:
+                    _recheck_item(connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id,
+                                  before=before, commit=recheck == RECHECK_COMMIT)
+                    continue
                 step_error = None
                 reasons: list[str] = []
-                if clear_automatic:
-                    clear_automatic_pin(connection, tenant_id=tenant_id, journey_id=journey_id,
-                                        reason=f"reresolve run {run_id}")
                 # One pass: the ladder reads the booking form and every vehicle
                 # invoice itself (the Booking and Delivery entries are the same
                 # resolution since 2026-10-20).
@@ -351,7 +421,7 @@ def backfill_sku_resolution_for_tenant(
                 had, has = bool(before.get("has_sku")), bool(after.get("has_sku"))
                 same = had and has and before.get("sku_code") == after.get("sku_code")
                 outcome = (
-                    "ALREADY_HAD_SKU" if same or (had and has and not clear_automatic)
+                    "ALREADY_HAD_SKU" if same or (had and has)
                     else "NEWLY_MATCHED" if has else "STILL_UNMATCHED"
                 )
                 detail = (
@@ -361,18 +431,6 @@ def backfill_sku_resolution_for_tenant(
                         else "No matching SKU was found in the price masters."
                     ))
                 )
-                if clear_automatic:
-                    change = (
-                        f"{before.get('sku_code') or 'no SKU'} ({before.get('match_basis') or '-'}) -> "
-                        f"{after.get('sku_code') or 'no SKU'} ({after.get('match_basis') or '-'})"
-                    )
-                    detail = change + (f". {detail}" if detail else "")
-                    _run_log.info(
-                        "sku_reresolve_item", tenant_id=tenant_id, run_id=str(run_id), journey_id=str(journey_id),
-                        old_sku=before.get("sku_code"), old_basis=before.get("match_basis"),
-                        new_sku=after.get("sku_code"), new_basis=after.get("match_basis"),
-                        price_check=result.get("priceCheck"), word_status=result.get("wordStatus"),
-                    )
                 _record_item(
                     connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id,
                     label=after.get("journey_label"), model_label=after.get("model_label"),
@@ -437,23 +495,28 @@ def backfill_sku_resolution_for_tenant(
 
 
 def reresolve_all_skus(engine: Engine, tenant_id: str, *, actor_id: str | None = None,
-                       batch: int = 10) -> dict[str, Any]:
-    """Re-run SKU resolution for every Journey of the Project under the
-    2026-10-20 product owner rules: each automatic SKU (including the ones
-    pinned before the rules, possibly chosen by price) is taken off and
-    resolved again from the Journey's documents, words first; a SKU a PC or
-    Team Lead set is never touched. Journeys left without exactly one
-    clearly named SKU get the PC's MODEL_NOT_IDENTIFIED task (with the
-    shortlist), and a word-named SKU whose master price differs from the
-    booking gets its price task. Each Journey logs old SKU, new SKU and how
-    it was set (``sku_reresolve_item``) and is kept against the run."""
+                       batch: int = 10, commit: bool = False) -> dict[str, Any]:
+    """Re-check every Journey's SKU under the 2026-10-20 product owner rules
+    (review 471 B2), a DRY RUN unless ``commit``:
+
+    * the dry run writes nothing but the run items: per Journey the old SKU
+      and basis, the proposed SKU and basis, the document's words, the
+      master and document prices and the tasks that would be raised -- for
+      the product owner to review before anything changes;
+    * the commit writes the same decisions, each Journey in its own
+      transaction and savepoint (an error leaves it untouched, recorded as
+      FAILED). An automatic SKU is replaced only when the documents now name
+      a different one; one they do not name is kept, marked AUTO_UNCONFIRMED,
+      with the PC task "SKU not clearly identified from the documents"; a SKU
+      a PC or Team Lead set is never touched. Changes go to the Journey's
+      activity log."""
     offset: int | None = 0
     run_id = None
     result: dict[str, Any] = {}
     while offset is not None:
         result = backfill_sku_resolution_for_tenant(
             engine, tenant_id=tenant_id, offset=offset, limit=batch, run_id=run_id, actor_id=actor_id,
-            clear_automatic=True,
+            recheck=RECHECK_COMMIT if commit else RECHECK_DRY_RUN,
         )
         run_id = result["runId"]
         offset = result["nextOffset"]

@@ -524,25 +524,17 @@ def get_p2_document_review(
 
 
 
-@router.delete("/documents/{document_id}", status_code=204)
-def delete_p2_document(
+def void_p2_document(
+    connection: Connection,
+    *,
     tenant_id: str,
     journey_id: UUID,
     document_id: UUID,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient, Depends(get_security_authorization_client)
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
-) -> Response:
-    authorize_p2(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        permission_key=_UPDATE_PERMISSION,
-    )
+    actor_id: str,
+    void_reason: str = "P2_DOCUMENT_VOIDED",
+) -> None:
+    """Void one document of the Journey and recompute what it fed (the
+    DELETE route; also a PC's "this invoice was cancelled" on a SKU task)."""
     context = _document_context(
         connection,
         tenant_id=tenant_id,
@@ -555,7 +547,7 @@ def delete_p2_document(
             """
             UPDATE auditcore.evidence
             SET association_status='VOIDED',
-                void_reason='P2_DOCUMENT_VOIDED',
+                void_reason=:void_reason,
                 voided_by_actor_id=:actor_id,
                 voided_at_utc=now()
             WHERE tenant_id=:tenant_id
@@ -568,7 +560,8 @@ def delete_p2_document(
             "tenant_id": tenant_id,
             "journey_id": journey_id,
             "document_id": document_id,
-            "actor_id": human_principal.subject,
+            "actor_id": actor_id,
+            "void_reason": void_reason,
         },
     )
     connection.execute(
@@ -657,7 +650,35 @@ def delete_p2_document(
         event_type="DOCUMENT_VOIDED",
         subject_type="DOCUMENT",
         subject_id=str(document_id),
-        details={"stage": stage_code},
+        details={"stage": stage_code, **({"reason": void_reason} if void_reason != "P2_DOCUMENT_VOIDED" else {})},
+    )
+
+
+@router.delete("/documents/{document_id}", status_code=204)
+def delete_p2_document(
+    tenant_id: str,
+    journey_id: UUID,
+    document_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> Response:
+    authorize_p2(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        permission_key=_UPDATE_PERMISSION,
+    )
+    void_p2_document(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        document_id=document_id,
+        actor_id=human_principal.subject,
     )
     return Response(status_code=204)
 

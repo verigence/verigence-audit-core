@@ -444,7 +444,7 @@ def submit_action(
     if task["task_type"] in SKU_TASK_TYPES:
         handled = handle_sku_task_action(
             connection, tenant_id=tenant_id, task=task, action=action, actor_id=actor_id,
-            actor_role_code=actor_role_code, comment=comment,
+            actor_role_code=actor_role_code, comment=comment, details=details,
         )
         if handled is not None:
             return handled

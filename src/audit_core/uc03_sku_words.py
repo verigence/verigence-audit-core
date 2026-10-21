@@ -681,25 +681,31 @@ def price_check(master: Decimal | None, offered: Decimal | None) -> str:
     return "MATCH" if abs(Decimal(master) - Decimal(offered)) <= PRICE_TOLERANCE else "DIFFERS"
 
 
+def _shortlist_measures(row: dict[str, Any], reading: Reading, doc: set[str]) -> tuple[int, float]:
+    """How many of the document's words a row shares, and how close the
+    spelling of its trim is (a misread "Z9S" is closer to "Z8S" than to
+    "Z8T"); the model's own words are not trim."""
+    words = row_words(row).words
+    model_words = _model_words(row.get("model_name"))
+    doc_trim = "".join(sorted(w for w in reading.trim if w.replace("+", "") not in model_words))
+    row_trim = "".join(sorted(w for w in words if ":" not in w))
+    similar = SequenceMatcher(None, doc_trim, row_trim).ratio() if doc_trim and row_trim else 0.0
+    return len(words & doc), similar
+
+
 def order_shortlist(
     rows: list[dict[str, Any]], *, model_text: str | None, variant_text: str | None,
     offered_ex_showroom: Decimal | None, limit: int = 10,
 ) -> list[dict[str, Any]]:
     """Order a shortlist for the PC: most shared words first, then the
     nearest master ex-showroom to the document's, then the closest spelling
-    of the trim. Ordering only -- nothing here is ever pinned."""
+    of the trim. Ordering only -- nothing here is ever pinned or suggested
+    (``clear_suggestion`` decides that, without the price)."""
     reading = read_words(raw_tokens(" ".join(str(v) for v in (model_text, variant_text) if v)), model_name=None)
     doc = reading.tokens()
 
     def key(row: dict[str, Any]) -> tuple[int, Decimal, float]:
-        words = row_words(row).words
-        shared = len(words & doc)
-        # A misread trim ("Z9S") is closer to "Z8S" than to "Z8T"; the
-        # model's own words are not trim.
-        model_words = _model_words(row.get("model_name"))
-        doc_trim = "".join(sorted(w for w in reading.trim if w.replace("+", "") not in model_words))
-        row_trim = "".join(sorted(w for w in words if ":" not in w))
-        similar = SequenceMatcher(None, doc_trim, row_trim).ratio() if doc_trim and row_trim else 0.0
+        shared, similar = _shortlist_measures(row, reading, doc)
         master = row.get("master_ex_showroom")
         gap = (abs(Decimal(str(master)) - offered_ex_showroom)
                if master is not None and offered_ex_showroom is not None else Decimal("1e12"))
@@ -709,12 +715,43 @@ def order_shortlist(
     return sorted(unique, key=key)[:limit]
 
 
+_SPELLING_MARGIN = 0.15
+
+
+def clear_suggestion(rows: list[dict[str, Any]], *, model_text: str | None,
+                     variant_text: str | None) -> dict[str, Any] | None:
+    """The one row a PC may be offered as a one-click suggestion, or None
+    (review 471 S8): the row sharing the most of the document's words, when
+    no other row shares as many -- or, on a tie, when its trim's spelling is
+    clearly the closest (an OCR misread). Never by price: a tie the spelling
+    does not settle shows the shortlist instead."""
+    if not rows:
+        return None
+    reading = read_words(raw_tokens(" ".join(str(v) for v in (model_text, variant_text) if v)), model_name=None)
+    doc = reading.tokens()
+    measured = sorted(((_shortlist_measures(r, reading, doc), i) for i, r in enumerate(rows)),
+                      key=lambda m: (-m[0][0], -m[0][1], m[1]))
+    if len(measured) == 1:
+        return rows[measured[0][1]]
+    (shared0, sim0), first = measured[0]
+    (shared1, sim1), _ = measured[1]
+    if shared0 > shared1 or sim0 - sim1 >= _SPELLING_MARGIN:
+        return rows[first]
+    return None
+
+
+def clear_top(rows: list[dict[str, Any]], *, model_text: str | None, variant_text: str | None) -> bool:
+    """Whether a shortlist offers a one-click suggestion (``clear_suggestion``)."""
+    return clear_suggestion(rows, model_text=model_text, variant_text=variant_text) is not None
+
+
 __all__ = [
     "PRICE_TOLERANCE",
     "ModelPick",
     "Reading",
     "RowWords",
     "WordResult",
+    "clear_suggestion",
     "clear_top",
     "drop_model_runs",
     "generation_key",
@@ -729,15 +766,3 @@ __all__ = [
     "row_registration",
     "row_words",
 ]
-
-
-def clear_top(rows: list[dict[str, Any]], *, model_text: str | None, variant_text: str | None) -> bool:
-    """Whether the first row of a shortlist shares more of the document's
-    words than the second -- the only case a one-click suggestion is
-    offered; a tie on words is never broken for the PC by price (review
-    #471 S8)."""
-    if len(rows) < 2:
-        return bool(rows)
-    doc = read_words(raw_tokens(" ".join(str(v) for v in (model_text, variant_text) if v)), model_name=None).tokens()
-    shared = [len(row_words(r).words & doc) for r in rows[:2]]
-    return shared[0] > shared[1]
