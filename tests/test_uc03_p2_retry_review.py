@@ -165,24 +165,75 @@ def test_the_night_attempt_deadline_is_8_am_ist_the_morning_after():
                                                                                          tzinfo=UTC)
 
 
-def test_a_page_still_waiting_the_morning_after_is_told_to_the_pc(journey):
-    _, queue_id, _ = _overnight_page(journey)
-    _sql(journey, "UPDATE auditcore.p2_document_queue SET di_submitted_at_utc=:s WHERE queue_id=:q",
-         q=queue_id, s=datetime(2026, 10, 20, 9, 0, tzinfo=UTC))
+def _expire(journey, now):
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
-        assert worker.expire_night_waits(connection, tenant_id=journey.tenant_id,
-                                         now=datetime(2026, 10, 21, 2, 0, tzinfo=UTC)) == 0
-    assert _page(journey, queue_id)["last_error"] == MARK
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        assert worker.expire_night_waits(connection, tenant_id=journey.tenant_id,
-                                         now=datetime(2026, 10, 21, 2, 31, tzinfo=UTC)) == 1
+        return worker.expire_night_waits(connection, tenant_id=journey.tenant_id, now=now)
+
+
+def _waiting_since(journey, queue_id, submitted, updated):
+    _sql(journey, "UPDATE auditcore.p2_document_queue SET di_submitted_at_utc=:s, updated_at_utc=:u WHERE queue_id=:q",
+         q=queue_id, s=submitted, u=updated)
+
+
+_SUBMITTED = datetime(2026, 10, 20, 9, 0, tzinfo=UTC)  # deadline 2026-10-21 02:30 UTC (08:00 IST)
+
+
+def test_the_morning_deadline_asks_di_and_tells_the_pc_only_when_nothing_more_is_coming(journey, monkeypatch):
+    """2026-10-20 re-review (R1): the expiry goes through the DI look-up,
+    never a settle on the clock."""
+    _, queue_id, document_id = _overnight_page(journey)
+    _waiting_since(journey, queue_id, _SUBMITTED, datetime(2026, 10, 20, 21, 0, tzinfo=UTC))
+    assert _expire(journey, datetime(2026, 10, 21, 2, 0, tzinfo=UTC)) == 0  # before 08:00 IST
+    assert _expire(journey, datetime(2026, 10, 21, 2, 31, tzinfo=UTC)) == 1
+    assert _page(journey, queue_id)["last_error"] == MARK  # nothing settled yet
+    # DI still has the night attempt to come: the page keeps waiting.
+    _run_ingest(journey, monkeypatch, FakeClient([{**_AI_FAILED, "documentId": str(document_id),
+                                                   "retryTonight": True}]))
+    assert _page(journey, queue_id)["last_error"] == MARK and _open_tasks(journey) == []
+    # An hour on, DI confirms the night attempt ran and failed: now the PC is told.
+    _sql(journey, "UPDATE auditcore.p2_document_queue SET updated_at_utc=:u WHERE queue_id=:q",
+         q=queue_id, u=datetime(2026, 10, 21, 2, 31, tzinfo=UTC))
+    assert _expire(journey, datetime(2026, 10, 21, 3, 0, tzinfo=UTC)) == 0  # at most once an hour
+    assert _expire(journey, datetime(2026, 10, 21, 3, 40, tzinfo=UTC)) == 1
+    _due_now(journey, "DOCUMENT_INGEST", str(queue_id))
+    _run_ingest(journey, monkeypatch, FakeClient([{**_AI_FAILED, "documentId": str(document_id),
+                                                   "retryTonight": False}]))
     page = _page(journey, queue_id)
     assert page["last_error"] == "DOCUMENT_AI_UNAVAILABLE"
-    assert page["status_reason"].startswith("AI reading still had not succeeded by 08:00 the morning after")
+    assert page["status_reason"].startswith("AI reading failed again overnight")
+    assert [t["task_type"] for t in _open_tasks(journey)] == ["PC_UPLOAD_STATUS"]
+
+
+def test_the_morning_deadline_copies_a_page_di_has_read(journey, monkeypatch):
+    _, queue_id, document_id = _overnight_page(journey)
+    _waiting_since(journey, queue_id, _SUBMITTED, datetime(2026, 10, 20, 21, 0, tzinfo=UTC))
+    assert _expire(journey, datetime(2026, 10, 21, 2, 31, tzinfo=UTC)) == 1
+    _run_ingest(journey, monkeypatch, FakeClient([{"documentId": str(document_id), "state": "CLASSIFIED",
+                                                   "processingStatus": "PROCESSED"}]))
+    assert _page(journey, queue_id)["queue_status"] == "SYNCING_TO_AUDIT_CORE"
+    assert _open_tasks(journey) == []
+
+
+def test_di_unreachable_in_the_morning_keeps_waiting_and_alerts_the_team_lead_at_noon(journey, monkeypatch):
+    _, queue_id, _ = _overnight_page(journey)
+    _waiting_since(journey, queue_id, _SUBMITTED, datetime(2026, 10, 20, 21, 0, tzinfo=UTC))
+    assert _expire(journey, datetime(2026, 10, 21, 2, 31, tzinfo=UTC)) == 1
+    _run_ingest(journey, monkeypatch, FakeClient(fail_listing=True))
+    assert queue_row(journey, "DOCUMENT_INGEST", str(queue_id))["work_status"] == "RETRY_WAIT"
+    assert _page(journey, queue_id)["last_error"] == MARK and _open_tasks(journey) == []
+    # Still waiting at noon IST (06:30 UTC): the Team Lead is told, never the PC.
+    _expire(journey, datetime(2026, 10, 21, 6, 31, tzinfo=UTC))
     [task] = _open_tasks(journey)
-    assert task["task_type"] == "PC_UPLOAD_STATUS" and task["severity"] == "HIGH"
+    assert task["task_type"] == "TL_DOCUMENT_STUCK" and task["dedupe_key"].startswith("night-wait-tl:")
+    assert "1 page still waiting for the overnight AI retry at noon" == task["title"]
+    # The page is read later: the alert closes itself.
+    _sql(journey, "UPDATE auditcore.p2_document_queue SET queue_status='READY', last_error=NULL WHERE queue_id=:q",
+         q=queue_id)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        worker.sync_processing_failure_tasks(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert _open_tasks(journey) == []
 
 
 # ------------------------------------------------------------------- S4
@@ -351,6 +402,41 @@ def test_a_dead_grouping_tells_the_pc(journey):
     assert "could not be put together" in task["title"]
 
 
+def test_the_background_step_task_closes_when_the_step_runs_again(journey):
+    """2026-10-20 re-review (R2): no task left open or stuck in VERIFYING."""
+    _dead(journey, "JOURNEY_RECONCILE", str(journey.journey_id))
+    [task] = _open_tasks(journey)
+    # The TL marks it done while the step is still stopped: it comes back.
+    _sql(journey, "UPDATE auditcore.p2_tasks SET task_status='VERIFYING', "
+                  "completion_result=jsonb_build_object('submittedAt', CAST(now() - interval '1 minute' AS text)) "
+                  "WHERE tenant_id=:t AND dedupe_key=:k", k=task["dedupe_key"])
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        worker.sync_dead_work_tasks(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    [status] = _sql(journey, "SELECT task_status FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k",
+                    k=task["dedupe_key"])
+    assert status["task_status"] == "RETURNED"
+    # Re-sync runs the reconcile again and it completes: the task closes itself.
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        enqueue_work(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                     work_type="JOURNEY_RECONCILE", work_key=str(journey.journey_id), payload={}, correlation_id=None)
+    [item] = worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)
+    worker._complete(journey.engine, item)
+    assert _open_tasks(journey) == []
+
+
+def test_the_grouping_task_closes_when_the_file_is_uploaded_again(journey):
+    batch_id, _, _ = add_page(journey, status="CLASSIFYING")
+    _dead(journey, "BATCH_GROUP", str(batch_id))
+    assert len(_open_tasks(journey)) == 1
+    add_page(journey, page_number=1, status="CLASSIFYING")  # the same file (scan.pdf) uploaded again
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        worker.sync_processing_failure_tasks(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert [t for t in _open_tasks(journey) if t["dedupe_key"].startswith("group-failed:")] == []
+
+
 def test_a_poll_that_waits_resets_its_failure_count(journey):
     key = str(journey.journey_id)
     with journey.engine.begin() as connection:
@@ -389,3 +475,49 @@ def test_a_page_waiting_for_the_night_does_not_make_the_booking_stuck(journey):
         assert cancel_stuck_journey(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
                                     actor_id=journey.actor_id, actor_role="PC") == "NOT_STUCK"
 
+
+
+# ------------------------------------------------------------------- R3 / R4
+
+def test_read_again_pending_says_one_attempt():
+    outcome = worker.classify_page_outcome(
+        di_item={**_AI_FAILED, "nextAttemptAtUtc": "2026-10-21T05:00:00+00:00", "inNightAttempt": False},
+        extracted_count=0, submitted_at=None, facts_copy=None, now=datetime.now(UTC),
+    )
+    assert (outcome.status, outcome.reason) == ("EXTRACTING", "Being read again (one attempt). Nothing to do now.")
+
+
+def test_a_configuration_gap_without_an_alert_does_not_claim_support_was_told():
+    outcome = worker.classify_page_outcome(
+        di_item={"state": "FAILED", "failureCode": "DOCUMENT_TYPE_NOT_FOUND", "failureKind": "CONFIGURATION",
+                 "scanPassed": True, "retryTonight": False},
+        extracted_count=0, submitted_at=None, facts_copy=None, now=datetime.now(UTC),
+    )
+    assert "support has been told" not in outcome.reason and "Team Lead" in outcome.reason
+
+
+def test_retry_after_the_ai_credentials_are_fixed_reads_the_page_once_more(journey, monkeypatch):
+    from p2_support import AllowAllAuthorization
+
+    from audit_core.dependencies import get_human_principal
+    from audit_core.main import app
+    from audit_core.security import HumanPrincipal
+    from audit_core.security_authorization import get_security_authorization_client
+
+    _, queue_id, document_id = add_page(journey, status="FAILED")
+    _sql(journey, "UPDATE auditcore.p2_document_queue SET last_error='AI_RETRY_TONIGHT:DOCUMENT_AI_NOT_CONFIGURED' "
+                  "WHERE queue_id=:q", q=queue_id)
+    app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=journey.actor_id)
+    app.dependency_overrides[get_security_authorization_client] = lambda: AllowAllAuthorization()
+    try:
+        response = TestClient(app, raise_server_exceptions=False).post(
+            f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}/pages/{queue_id}:retry")
+    finally:
+        app.dependency_overrides.clear()
+    assert response.status_code < 300, response.text
+    _run_ingest(journey, monkeypatch, FakeClient([{
+        "documentId": str(document_id), "state": "CLASSIFIED", "processingStatus": "FAILED",
+        "processingFailureCode": "DOCUMENT_AI_NOT_CONFIGURED", "failureKind": "CONFIGURATION", "scanPassed": True,
+        "retryTonight": True}]))
+    assert queue_row(journey, "PAGE_REREAD", str(queue_id))["work_status"] == "PENDING"
+    assert "~" not in _page(journey, queue_id)["client_upload_id"], "no second upload"

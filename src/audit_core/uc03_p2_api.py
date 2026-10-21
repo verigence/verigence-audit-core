@@ -2068,7 +2068,12 @@ def retry_page(
             status_code=409,
             detail="This page was rejected for scan quality; retrying will not help. Re-scan it and upload it again.",
         )
-    if waits_for_night_attempt(unit.get("last_error")):
+    # A page waiting only because the AI service refused our credentials may
+    # be retried once they are fixed (2026-10-20 re-review, R4): the worker
+    # asks DI to read the page it holds once more (no second upload).
+    if waits_for_night_attempt(unit.get("last_error")) and not str(unit.get("last_error")).endswith(
+        ":DOCUMENT_AI_NOT_CONFIGURED"
+    ):
         # 2026-10-20 review (S4): a Retry now would start a second set of AI
         # attempts on top of the overnight one already scheduled.
         raise HTTPException(

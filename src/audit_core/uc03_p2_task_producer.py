@@ -836,9 +836,102 @@ def sync_processing_failure_tasks(
         connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"processing-failed:{journey_id}:",
         keep=set(), evidence={"reason": "Replaced by the file's own status task."},
     )
+    closed += sync_dead_work_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, registry=registry)
     if closed:
         counts["VERIFIED"] = counts.get("VERIFIED", 0) + closed
     return counts
+
+
+def sync_dead_work_tasks(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, registry: Registry | None = None,
+) -> int:
+    """Close the tasks a stopped step raised once their condition is gone
+    (2026-10-20 re-review, R2), and hand back one a person marked done while
+    the condition still holds -- never left waiting in VERIFYING:
+    - work-dead:{journey}:{work type} (Team Lead): that step of the journey
+      is no longer dead-lettered (Re-sync ran it, or it was asked again);
+    - group-failed:{journey}:{batch} (PC): the upload was grouped, removed,
+      or uploaded again (a later upload of the same file);
+    - night-wait-tl:{journey}: (Team Lead): no page of the journey is still
+      waiting for Document Intelligence's night attempt.
+    Returns the number of tasks closed."""
+    registry = registry or get_registry()
+    tasks = connection.execute(
+        text(
+            """
+            SELECT dedupe_key, task_status, task_type, source_type, source_code, title, description,
+                   reference, severity
+            FROM auditcore.p2_tasks
+            WHERE tenant_id=:t AND journey_id=:j AND task_status = ANY(:open)
+              AND (dedupe_key LIKE :dead OR dedupe_key LIKE :group OR dedupe_key LIKE :night)
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "open": list(_OPEN), "dead": f"work-dead:{journey_id}:%",
+         "group": f"group-failed:{journey_id}:%", "night": f"night-wait-tl:{journey_id}:%"},
+    ).mappings().all()
+    closed = 0
+    for task in tasks:
+        key = str(task["dedupe_key"])
+        kind, _, rest = key.partition(f":{journey_id}:")
+        if kind == "work-dead":
+            holds = connection.execute(
+                text(
+                    """
+                    SELECT EXISTS (SELECT 1 FROM auditcore.p2_work_queue
+                                   WHERE tenant_id=:t AND journey_id=:j AND work_type=:w
+                                     AND work_status='DEAD_LETTER')
+                    """
+                ),
+                {"t": tenant_id, "j": journey_id, "w": rest},
+            ).scalar_one()
+            reason = "The step ran again."
+        elif kind == "group-failed":
+            holds = connection.execute(
+                text(
+                    """
+                    SELECT EXISTS (
+                      SELECT 1 FROM auditcore.p2_upload_batches b
+                      WHERE b.tenant_id=:t AND b.batch_id=CAST(:b AS uuid) AND b.grouping_status='FAILED'
+                        AND b.batch_status <> 'CANCELLED'
+                        AND NOT EXISTS (
+                          SELECT 1 FROM auditcore.p2_upload_batches later
+                          WHERE later.tenant_id=b.tenant_id AND later.journey_id=b.journey_id
+                            AND later.original_filename=b.original_filename
+                            AND later.created_at_utc > b.created_at_utc
+                            AND later.batch_status <> 'CANCELLED'))
+                    """
+                ),
+                {"t": tenant_id, "b": rest},
+            ).scalar_one()
+            reason = "The upload was grouped, removed or uploaded again."
+        else:
+            holds = connection.execute(
+                text(
+                    """
+                    SELECT EXISTS (SELECT 1 FROM auditcore.p2_document_queue
+                                   WHERE tenant_id=:t AND journey_id=:j
+                                     AND queue_status IN ('FAILED','DEAD_LETTER','QUEUED')
+                                     AND COALESCE(last_error, '') LIKE :tonight)
+                    """
+                ),
+                {"t": tenant_id, "j": journey_id, "tonight": f"{AI_RETRY_TONIGHT}%"},
+            ).scalar_one()
+            reason = "No page is waiting for the overnight AI retry any more."
+        if not holds:
+            resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                            evidence={"reason": reason})
+            closed += 1
+        elif task["task_status"] == "VERIFYING":
+            # Marked done while the step is still stopped: back to the assignee.
+            raise_or_refresh(
+                connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                task_type=str(task["task_type"]), source_type=str(task["source_type"]),
+                source_code=str(task["source_code"]), title=str(task["title"]),
+                description=str(task["description"]),
+                reference={k: v for k, v in dict(task["reference"] or {}).items() if k != "issueHash"},
+                severity=str(task["severity"]), registry=registry, evaluation_started_at=datetime.now(UTC),
+            )
+    return closed
 
 
 def sync_unclassified_page_tasks(

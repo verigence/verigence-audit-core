@@ -169,8 +169,8 @@ _NIGHT_DUE = "2026-10-20T17:00:00+00:00"
           "overnight once it is fixed. Nothing to do now."), "AI_RETRY_TONIGHT:DOCUMENT_AI_NOT_CONFIGURED"),
         ({"state": "FAILED", "failureCode": "DOCUMENT_TYPE_NOT_FOUND", "failureKind": "CONFIGURATION",
           "scanPassed": True, "retryTonight": False}, "FAILED",
-         ("Document Intelligence is not set up to read this page on our side (support has been told). Retry the "
-          "page from the card once support confirms it is fixed."), "DOCUMENT_TYPE_NOT_FOUND"),
+         ("Document Intelligence is not set up to read this page on our side. Ask your Team Lead to raise it "
+          "with support, then retry the page from the card once it is fixed."), "DOCUMENT_TYPE_NOT_FOUND"),
     ],
 )
 def test_page_outcome_says_which_retry_case_the_page_is_in(di_item, status, reason, last_error):
