@@ -72,12 +72,16 @@ def test_task_detail_includes_history(journey):
 
 
 def test_tabs_classify_and_count(journey):
+    # Product owner 2026-10-21: a field review on a read document is document
+    # work, on the Documents tab under Manual verification (it used to be on
+    # the Manual Verification tab).
     _task(journey)
     client = TestClient(app, raise_server_exceptions=False)
-    body = client.get(f"/p2/v1/tenants/{journey.tenant_id}/tasks", params={"tab": "manual_verification"}).json()
-    assert body["counts"]["MANUAL_VERIFICATION"] == 1 and body["counts"]["DOCUMENTS"] == 0
-    assert [i["queue_tab"] for i in body["items"]] == ["MANUAL_VERIFICATION"]
-    assert client.get(f"/p2/v1/tenants/{journey.tenant_id}/tasks", params={"tab": "documents"}).json()["items"] == []
+    body = client.get(f"/p2/v1/tenants/{journey.tenant_id}/tasks", params={"tab": "documents"}).json()
+    assert body["counts"]["MANUAL_VERIFICATION"] == 0 and body["counts"]["DOCUMENTS"] == 1
+    assert [(i["queue_tab"], i["document_category"]) for i in body["items"]] == [("DOCUMENTS", "MANUAL_VERIFICATION")]
+    assert client.get(f"/p2/v1/tenants/{journey.tenant_id}/tasks",
+                      params={"tab": "manual_verification"}).json()["items"] == []
 
 
 def test_task_queue_tab_mapping():
