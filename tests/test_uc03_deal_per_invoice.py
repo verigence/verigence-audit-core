@@ -745,3 +745,29 @@ def test_grouping_never_marks_the_callers_readings():
     first, second = im.select_invoices(readings), im.select_invoices(readings)
     assert len(first["cancelled"]) == len(second["cancelled"]) == 2
     assert readings[0]["cancelled"] is None
+
+
+def test_a_voided_booking_stage_invoice_leaves_the_canonical_tables_on_rematerialisation(journey):
+    """The Booking-stage durable pass re-derives the invoice actuals too, so
+    a voided Booking invoice stops counting even when it was the stage's
+    only document."""
+    from audit_core.uc03_delivery_post_extraction_materialization import (
+        materialize_booking_documents_from_durable_store,
+    )
+
+    invoice = add_ready_document(journey, "customer_invoice_dms", **EXAMPLE)
+    _materialize(journey)
+    assert _line(journey, "ex_showroom_price")["actual_amount"] == Decimal("852000.00")
+
+    _sql(journey, "UPDATE auditcore.evidence SET association_status='VOIDED' WHERE tenant_id=:t AND "
+                  "di_document_id=:d", d=invoice)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        result = materialize_booking_documents_from_durable_store(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert not result.get("error"), result
+    line = _line(journey, "ex_showroom_price")
+    assert line["actual_amount"] is None and line["source_reference"] is None
+    discounts = _sql(journey, "SELECT actual_discount_amount, details->>'origin' FROM auditcore.discount_applications "
+                              "WHERE tenant_id=:t AND journey_id=:j").all()
+    assert discounts and all(a is None and o == "INVOICE_WITHDRAWN" for a, o in discounts)

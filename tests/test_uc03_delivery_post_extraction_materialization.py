@@ -205,7 +205,7 @@ def test_no_durable_documents_is_a_clean_skip(journey) -> None:
     result = materialize_delivery_documents_from_durable_store(
         journey, tenant_id=tenant_id, journey_id=journey_id
     )
-    assert result == {"skipped": True, "reason": "no_documents"}
+    assert result["skipped"] is True and result["reason"] == "no_documents"
 
 
 def test_voided_evidence_document_is_excluded_from_materialization(journey) -> None:
@@ -241,7 +241,7 @@ def test_voided_evidence_document_is_excluded_from_materialization(journey) -> N
     result = materialize_delivery_documents_from_durable_store(
         journey, tenant_id=tenant_id, journey_id=journey_id
     )
-    assert result == {"skipped": True, "reason": "no_documents"}
+    assert result["skipped"] is True and result["reason"] == "no_documents"
 
     payment = journey.execute(
         text(
@@ -343,4 +343,4 @@ def test_booking_insurance_no_durable_documents_is_a_clean_skip(journey) -> None
     result = materialize_booking_documents_from_durable_store(
         journey, tenant_id=tenant_id, journey_id=journey_id
     )
-    assert result == {"skipped": True, "reason": "no_documents"}
+    assert result["skipped"] is True and result["reason"] == "no_documents"
