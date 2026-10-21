@@ -41,6 +41,12 @@ from audit_core.uc03_p2_access import (
 from audit_core.uc03_p2_controls import control_statistics
 from audit_core.uc03_p2_dates import parse_extracted_date, programme_date_floor
 from audit_core.uc03_p2_document_health import journey_document_health
+from audit_core.uc03_p2_document_task_groups import (
+    DOCUMENT_CATEGORIES,
+    count_by_category,
+    document_category,
+    document_detail,
+)
 from audit_core.uc03_p2_journey_views import (
     ALL_VIEWS,
     BREAKDOWN_SQL,
@@ -2081,6 +2087,118 @@ def retry_page(
     return {"queueId": str(queue_id), "status": "QUEUED"}
 
 
+_REMOVABLE_PAGE_STATES = ("FAILED", "DEAD_LETTER")
+
+
+class RemovePageCommand(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
+
+
+@router.post("/journeys/{journey_id}/pages/{queue_id}:remove")
+def remove_page(
+    tenant_id: str,
+    journey_id: UUID,
+    queue_id: UUID,
+    command: RemovePageCommand,
+    request: Request,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """Take a refused or failed page off the Journey (2026-10-21).
+
+    A page refused for image quality is never replaced by its re-scan (a new
+    scan is different bytes), cannot be retried and cannot be read again, so
+    without this its tasks -- and the delivery gate -- stay open for good.
+    Once the re-scan is uploaded, the PC (or TL) removes the refused page
+    with a reason: the page unit is cancelled, any document Document
+    Intelligence holds for it is voided the same way as deleting a document
+    (nothing is read twice), the removal is recorded with who and why, and
+    the file's tasks close or refresh at once, naming the removal. Only a
+    FAILED page can be removed this way; same permission as deleting a
+    document."""
+    from audit_core.uc03_p2_documents import void_p2_document
+    from audit_core.uc03_p2_task_producer import sync_processing_failure_tasks
+    from audit_core.uc03_p2_worker import _refresh_batch_status
+
+    access = _authorize(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
+    )
+    reason = command.reason.strip()
+    if len(reason) < 3:
+        raise HTTPException(status_code=400, detail="Say why the page is removed.")
+    unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id)
+    if unit["queue_status"] not in _REMOVABLE_PAGE_STATES:
+        raise HTTPException(
+            status_code=409,
+            detail="Only a page that was refused or could not be processed can be removed here.",
+        )
+    actor = human_principal.subject
+    role = access.operating_role
+    pages = [int(p) for p in (unit.get("page_numbers") or [unit["page_number"]])]
+    filename = connection.execute(
+        text("SELECT original_filename FROM auditcore.p2_upload_batches WHERE tenant_id=:t AND batch_id=:b"),
+        {"t": tenant_id, "b": unit["batch_id"]},
+    ).scalar_one_or_none()
+    details = {"queueId": str(queue_id), "batchId": str(unit["batch_id"]), "pages": pages, "filename": filename,
+               "lastError": unit.get("last_error"), "removedBy": actor, "removedRole": role, "reason": reason}
+    voided = False
+    if unit.get("di_document_id") is not None:
+        held = connection.execute(
+            text(
+                """
+                SELECT 1 FROM auditcore.document_capture_v2_documents
+                WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:d AND capture_status <> 'SUPERSEDED'
+                UNION ALL
+                SELECT 1 FROM auditcore.evidence
+                WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:d AND association_status='ACTIVE'
+                LIMIT 1
+                """
+            ),
+            {"t": tenant_id, "j": journey_id, "d": unit["di_document_id"]},
+        ).scalar_one_or_none()
+        if held:
+            void_p2_document(connection, tenant_id=tenant_id, journey_id=journey_id,
+                             document_id=UUID(str(unit["di_document_id"])), actor_id=actor,
+                             activity_details={"via": "PAGE_REMOVED", "queueId": str(queue_id)})
+            voided = True
+    # The page unit itself, whether or not a document was held for it. The
+    # refusal code stays in last_error (reports count refusals by it).
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue
+            SET queue_status='CANCELLED', status_reason=:reason, updated_at_utc=now()
+            WHERE tenant_id=:t AND queue_id=:q
+            """
+        ),
+        {"t": tenant_id, "q": queue_id,
+         "reason": f"Removed from the journey by {actor}{f' ({role})' if role else ''}: {reason}"},
+    )
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_work_queue SET work_status='CANCELLED', updated_at_utc=now()
+            WHERE tenant_id=:t AND journey_id=:j AND work_key=:k
+              AND work_type IN ('DOCUMENT_INGEST','DOCUMENT_RECONCILE')
+              AND work_status NOT IN ('COMPLETED','DEAD_LETTER','CANCELLED')
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "k": str(queue_id)},
+    )
+    _refresh_batch_status(connection, tenant_id, UUID(str(unit["batch_id"])))
+    _activity(
+        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="PAGE_REMOVED",
+        subject_type="DOCUMENT_PAGE", subject_id=str(queue_id), details={**details, "documentVoided": voided},
+        correlation_id=get_correlation_id(request),
+    )
+    sync_processing_failure_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, removal=details)
+    return {"queueId": str(queue_id), "status": "CANCELLED", "documentVoided": voided}
+
+
 class SetPageTypeCommand(BaseModel):
     templateKey: str = Field(min_length=1, max_length=120)
     # The name a page kept as Others is shown under (required for Others).
@@ -2929,6 +3047,7 @@ def list_tasks(
     view: str = "open",
     role: str | None = None,
     tab: str = "all",
+    documentCategory: str | None = None,
 ) -> dict[str, Any]:
     """P2 worklist across P2 and existing (Phase 1) tasks, grouped by the
     client per Journey.
@@ -2939,7 +3058,15 @@ def list_tasks(
     none. ``tab`` narrows to DOCUMENTS or MANUAL_VERIFICATION; counts for
     every tab are always returned. Under a ``role`` filter the tasks the
     caller raised by hand stay visible, so a raised task is on the queue of
-    both the requester and the assignee."""
+    both the requester and the assignee.
+
+    Documents group (product owner 2026-10-21): every task that is document
+    work carries ``document_category`` (MANUAL_VERIFICATION, FAILED_TO_READ,
+    IMAGE_QUALITY, MISSING_DOCUMENT) and ``document`` (file, pages, reason in
+    plain words, the document to open) and is on the DOCUMENTS tab;
+    ``documentCounts`` counts them per category across the queue and
+    ``documentCountsByJourney`` per journey. ``documentCategory`` narrows the
+    items to one category (the counts stay whole)."""
     _authorize(
         connection,
         tenant_id=tenant_id,
@@ -3223,16 +3350,31 @@ def list_tasks(
 
     items.sort(key=_safe_sort)
     counts = {"ALL": len(items), "DOCUMENTS": 0, "MANUAL_VERIFICATION": 0}
+    registry = get_registry()
     for item in items:
-        item["queue_tab"] = task_queue_tab(str(item.get("task_type") or ""), str(item.get("category") or ""))
+        task_type = str(item.get("task_type") or "")
+        category = str(item.get("category") or "")
+        doc_category = document_category(task_type, category, item.get("source_code"))
+        item["document_category"] = doc_category
+        item["document"] = document_detail(item, doc_category, registry) if doc_category else None
+        # Document work is on the Documents tab whatever its old tab was
+        # (a field review used to be under Manual Verification); everything
+        # else keeps its tab. The delivery gate still reads task_queue_tab.
+        item["queue_tab"] = "DOCUMENTS" if doc_category else task_queue_tab(task_type, category)
         if item["queue_tab"] in counts:
             counts[item["queue_tab"]] += 1
+    document_counts, document_counts_by_journey = count_by_category(items)
     wanted = tab.upper()
     if wanted in {"DOCUMENTS", "MANUAL_VERIFICATION"}:
         items = [item for item in items if item["queue_tab"] == wanted]
+    wanted_category = str(documentCategory or "").upper()
+    if wanted_category in DOCUMENT_CATEGORIES:
+        items = [item for item in items if item["document_category"] == wanted_category]
     return {
         "items": items[:500],
         "counts": counts,
+        "documentCounts": document_counts,
+        "documentCountsByJourney": document_counts_by_journey,
         "sources": {
             "p2": len(p2_rows),
             "legacy": len(legacy_rows),
