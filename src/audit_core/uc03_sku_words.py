@@ -70,8 +70,11 @@ _COMPOUND = re.compile(r"^(D|DS|P|PM|G)(AT|MT|AS|AMT)$")
 _SEATER = re.compile(r"^(\d{1,2})(?:STR|STRS|ST|SEATER|SEATERS|SEATS|SEAT|S)$")
 _SEATER_WORDS = frozenset({"STR", "STRS", "ST", "SEATER", "SEATERS", "SEATS", "SEAT"})
 _LX_FUEL = {"LXD": ("LX", "DIESEL"), "LXI": ("LX", "PETROL")}
+# Never a distinguishing word. Release markers ("Refresh", "New") are not
+# here (review #471 S2): like "AC", such a word is optional only when no
+# other row of the model is the same vehicle without it.
 _NOISE = frozenset({
-    "REFRESH", "NEW", "E", "PRIVATE", "COMMERCIAL", "PACK", "BATTERY", "CHARGER", "KWH", "KW",
+    "E", "PRIVATE", "COMMERCIAL", "PACK", "BATTERY", "CHARGER", "KWH", "KW",
     "MAHINDRA", "WITH", "AND", "THE",
 })
 # A trim code a lone L or S belongs to: AX5 L, Z8 L, Z8 S, AX7 L.
@@ -161,6 +164,9 @@ class Reading:
     attrs: dict[str, str | None]
     ev_word: bool = False
     fuels: frozenset[str] = frozenset()  # every fuel the text names (two = a contradiction)
+    # Attributes the text states twice with different values ("2WD" and
+    # "4WD", two seat counts): a contradiction, never first-wins.
+    conflicts: frozenset[str] = frozenset()
 
     def tokens(self) -> frozenset[str]:
         return frozenset(self.trim) | frozenset(
@@ -175,11 +181,13 @@ def read_words(tokens: list[str], *, model_name: str | None) -> Reading:
     trim: set[str] = set()
     ev_word = False
     fuels: set[str] = set()
+    seen: dict[str, set[str]] = {k: set() for k in _ATTRIBUTE_KEYS}
     model_words = _model_words(model_name)
 
     def set_attr(key: str, value: str) -> None:
         if key == "fuel":
             fuels.add(value)
+        seen[key].add(value)
         if attrs[key] is None:
             attrs[key] = value
 
@@ -223,7 +231,37 @@ def read_words(tokens: list[str], *, model_name: str | None) -> Reading:
         if token.replace("+", "") in model_words:
             continue
         trim.add(token)
-    return Reading(trim=frozenset(trim), attrs=attrs, ev_word=ev_word, fuels=frozenset(fuels))
+    conflicts = frozenset(k for k, values in seen.items() if len(values) > 1 and k != "fuel")
+    return Reading(trim=frozenset(trim), attrs=attrs, ev_word=ev_word, fuels=frozenset(fuels),
+                   conflicts=conflicts)
+
+
+def drop_model_runs(tokens: list[str], spellings: list[str | None]) -> list[str]:
+    """Take out every run of words that spells the model (any of its
+    spellings), wherever it stands: a variant box that repeats the model
+    ("NEW THAR 2WD & 4WD LXT D MT 4WD", "XEV 9S ONE ABOVE ... 7STR") must not
+    read the model's own "2WD" or "9S" as the vehicle's drive or seats
+    (review #471 S1)."""
+    keys = sorted({normalized_key(sp) for sp in spellings if normalized_key(sp)}, key=len, reverse=True)
+    if not keys:
+        return tokens
+    out: list[str] = []
+    index = 0
+    while index < len(tokens):
+        for key in keys:
+            glued, end = "", index
+            while end < len(tokens) and key.startswith(glued + tokens[end].replace("+", "")):
+                glued += tokens[end].replace("+", "")
+                end += 1
+                if glued == key:
+                    break
+            if glued == key and end > index:
+                index = end
+                break
+        else:
+            out.append(tokens[index])
+            index += 1
+    return out
 
 
 # ── the price-master side ─────────────────────────────────────────────────────
@@ -263,7 +301,7 @@ class RowWords:
 
 def row_words(row: dict[str, Any]) -> RowWords:
     model_name = str(row.get("model_name") or "")
-    tokens = _strip_model_prefix(raw_tokens(row.get("variant_name")), model_name)
+    tokens = drop_model_runs(raw_tokens(row.get("variant_name")), [model_name])
     reading = read_words(tokens, model_name=model_name)
     attrs = dict(reading.attrs)
     columns = {
@@ -370,6 +408,7 @@ class WordResult:
       REGISTRATION_UNKNOWN  the words fit the Private and the Commercial row
       CATEGORY_UNCERTAIN    EV or ICE is not certain from the document
       CATEGORY_CONFLICT     the document says both (e.g. "EV" and "DIESEL")
+      ATTRIBUTE_CONFLICT    the document states one attribute twice, differently
       UNRECOGNISED_WORD     a trim-like word the list does not know
       NO_MATCH              the model is named but no row fits the words
       NO_MODEL              no list model is named at all
@@ -410,6 +449,15 @@ def _match_one_model(doc: Reading, sigs: list[RowWords]) -> tuple[list[RowWords]
     vocabulary_trim = {w for w in vocabulary if ":" not in w}
     # A bare battery number reads as the list's battery word ("59" -> B59).
     trim = {f"B{w}" if w.isdigit() and f"B{w}" in vocabulary_trim else w for w in doc.trim}
+    # "N10 (O)" is the list's "N10 OPT"; "EDGE OPT" is the list's "EDGE(O)".
+    for word in list(trim):
+        if word not in vocabulary_trim and word.endswith("O") and word[:-1] in vocabulary_trim \
+                and "OPT" in vocabulary_trim:
+            trim = (trim - {word}) | {word[:-1], "OPT"}
+    if "OPT" in trim and "OPT" not in vocabulary_trim:
+        glued = [w for w in trim if f"{w}O" in vocabulary_trim]
+        if len(glued) == 1:
+            trim = (trim - {"OPT", glued[0]}) | {f"{glued[0]}O"}
     known = trim & vocabulary_trim
     unknown = sorted(w for w in trim - vocabulary_trim if _TRIM_LIKE.match(w))
     if unknown:
@@ -443,6 +491,21 @@ def _pick_by_identity(
     splits = [(" ".join(words[:i]), " ".join(words[i:]) or None) for i in range(len(words), 0, -1)]
     # The longest run of words first, so "SCORPIO N" never stops at
     # "SCORPIO" (the Classic) on a book that has no old Scorpio N.
+    def without_repeat(prefix: str, rest: str | None) -> str | None:
+        """The rest without the model repeated at its start (the series
+        letter of a Bolero is read from the vehicle's own words)."""
+        if not rest:
+            return rest
+        target, glued, rest_words = normalized_key(prefix), "", rest.split()
+        for index, word in enumerate(rest_words):
+            glued += normalized_key(word)
+            if glued == target:
+                return " ".join(rest_words[index + 1:]) or None
+            if not target.startswith(glued):
+                break
+        return rest
+
+    splits = [(prefix, without_repeat(prefix, rest)) for prefix, rest in splits]
     for prefix, rest in splits:
         key = identity(prefix, rest)
         if key in groups:
@@ -497,7 +560,8 @@ def identify(
         key, prefix, rest_text, via = found
         picked = [key]
         consumed = raw_tokens(prefix)
-        rest = raw_tokens(rest_text)
+        spellings = [prefix, *{str(s.row.get("model_name") or "") for s in sigs_by_model[key]}]
+        rest = drop_model_runs(raw_tokens(rest_text), spellings)
         model_label = strip_name[key]
     else:
         model_names = list(dict.fromkeys(str(r.get("model_name") or "") for r in rows if r.get("model_name")))
@@ -506,7 +570,7 @@ def identify(
             return WordResult(status="NO_MODEL", detail={"words": tokens})
         picked = list(pick.model_names)  # ordered: the named model first, then its siblings
         consumed = tokens[:pick.consumed]
-        rest = tokens[pick.consumed:]
+        rest = drop_model_runs(tokens[pick.consumed:], list(pick.model_names))
         via = pick.via
         model_label = pick.model_names[0]
     reading = read_words(rest, model_name=model_label)
@@ -531,6 +595,10 @@ def identify(
     if reading.fuels & _ICE_FUELS or (gst_rate is not None and gst_rate >= Decimal(12)):
         stated.add("ICE")
     detail["categoryStated"] = sorted(stated)
+    if reading.conflicts:
+        detail["conflicts"] = sorted(reading.conflicts)
+        return WordResult(status="ATTRIBUTE_CONFLICT", detail=detail,
+                          model_rows=[s.row for n in picked for s in sigs_by_model.get(n, [])])
     if len(stated) == 2:
         return WordResult(status="CATEGORY_CONFLICT", detail=detail,
                           model_rows=[s.row for n in picked for s in sigs_by_model.get(n, [])])
@@ -642,7 +710,34 @@ def order_shortlist(
 
 
 __all__ = [
-    "PRICE_TOLERANCE", "ModelPick", "Reading", "RowWords", "WordResult", "generation_key", "identify",
-    "normalized_key", "order_shortlist", "pick_model", "price_check", "raw_tokens", "read_words",
-    "row_is_ev", "row_registration", "row_words",
+    "PRICE_TOLERANCE",
+    "ModelPick",
+    "Reading",
+    "RowWords",
+    "WordResult",
+    "clear_top",
+    "drop_model_runs",
+    "generation_key",
+    "identify",
+    "normalized_key",
+    "order_shortlist",
+    "pick_model",
+    "price_check",
+    "raw_tokens",
+    "read_words",
+    "row_is_ev",
+    "row_registration",
+    "row_words",
 ]
+
+
+def clear_top(rows: list[dict[str, Any]], *, model_text: str | None, variant_text: str | None) -> bool:
+    """Whether the first row of a shortlist shares more of the document's
+    words than the second -- the only case a one-click suggestion is
+    offered; a tie on words is never broken for the PC by price (review
+    #471 S8)."""
+    if len(rows) < 2:
+        return bool(rows)
+    doc = read_words(raw_tokens(" ".join(str(v) for v in (model_text, variant_text) if v)), model_name=None).tokens()
+    shared = [len(row_words(r).words & doc) for r in rows[:2]]
+    return shared[0] > shared[1]
