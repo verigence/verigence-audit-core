@@ -48,8 +48,8 @@ an automatic method, so the history is the only signal:
 AUTO_UNCONFIRMED marks an automatic pin whose documents no longer name it
 (a re-check could not confirm it); the SKU is kept and a PC task raised.
 
-Chain: this is the merge point of 0151 (price masters) and 0153 (source
-values per document, which branched from 0150); the coordinator may
+Chain: 0150 -> 0151 (price masters, #468) -> 0153 (source values per
+document, #470, which now follows 0151) -> 0152; the coordinator may
 re-chain it at merge.
 
 Nothing is deleted; the downgrade restores CONFIRMED on the relabelled rows.
@@ -59,7 +59,7 @@ from __future__ import annotations
 from alembic import op
 
 revision = "0152_sku_match_basis"
-down_revision = ("0151_bolero_split_model_aliases", "0153_source_values_per_document")
+down_revision = "0153_source_values_per_document"
 branch_labels = None
 depends_on = None
 
