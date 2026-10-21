@@ -122,6 +122,9 @@ jobs:
                 return 0
               fi
               echo "railway $* did not answer JSON (attempt $attempt): $(head -c 200 /tmp/rail.err 2>/dev/null)"
+              # Also as an annotation: the job log itself cannot be downloaded
+              # from some environments, annotations can (2026-10-21).
+              echo "::warning title=railway $1 attempt $attempt::$(head -c 300 /tmp/rail.err 2>/dev/null | tr '\n' ' ') | out: $(head -c 200 "$out" 2>/dev/null | tr '\n' ' ')"
               sleep 20
             done
             echo "::error::railway $* never answered JSON after 6 attempts."
