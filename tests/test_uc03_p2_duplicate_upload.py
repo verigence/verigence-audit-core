@@ -280,11 +280,13 @@ def test_a_failed_page_uploaded_again_is_superseded_and_its_task_closes(journey,
         with journey.engine.begin() as connection:
             set_tenant_context(connection, journey.tenant_id)
             return connection.execute(
-                text("SELECT severity, task_status FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k"),
-                {"t": journey.tenant_id, "k": f"upload-status:{journey.journey_id}:{first}"},
+                text("SELECT task_type, severity, task_status FROM auditcore.p2_tasks "
+                     "WHERE tenant_id=:t AND dedupe_key=:k"),
+                {"t": journey.tenant_id, "k": f"resubmit:{journey.journey_id}:{first}"},
             ).mappings().one()
 
-    assert (task()["severity"], task()["task_status"]) == ("HIGH", "READY")
+    # 2026-10-21: the file's "Document to resubmit" task.
+    assert (task()["task_type"], task()["severity"], task()["task_status"]) == ("DOCUMENT_RESUBMIT", "HIGH", "READY")
 
     # Page 2 comes in again on its own: the old copy is replaced, page 1 still waits.
     second = _batch(journey, storage, "page2.pdf", _scanned_pdf(_SCAN_B))
