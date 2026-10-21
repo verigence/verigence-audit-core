@@ -597,14 +597,96 @@ def _open_pc_or_master_tasks(c):
         {"t": c.tenant_id, "j": c.journey_id}).all()}
 
 
-def test_a_journey_with_nothing_naming_the_vehicle_gets_a_pc_task(journey):
+def _extracted(c, document_type, fields, *, stage="BOOKING"):
+    doc = uuid4()
+    for key, value in fields.items():
+        c.execute(
+            text(
+                """
+                INSERT INTO auditcore.journey_document_extracted_fields (
+                    tenant_id, journey_id, di_document_id, source_fact_version, stage_code,
+                    source_document_type_key, field_key, extracted_value, effective_value, is_modified
+                ) VALUES (:t, :j, :doc, 1, :stage, :type, :k, to_jsonb(CAST(:v AS text)), to_jsonb(CAST(:v AS text)),
+                          false)
+                """
+            ),
+            {"t": c.tenant_id, "j": c.journey_id, "doc": doc, "stage": stage, "type": document_type, "k": key,
+             "v": value},
+        )
+    return doc
+
+
+def _queued_page(c, status="EXTRACTING", classified=None):
+    batch = c.execute(
+        text("INSERT INTO auditcore.p2_upload_batches (tenant_id, journey_id, original_filename, size_bytes, "
+             "original_object_key, uploaded_by_actor_id) VALUES (:t, :j, 'bf.pdf', 1, :k, 'pc-1') RETURNING batch_id"),
+        {"t": c.tenant_id, "j": c.journey_id, "k": f"o/{uuid4()}"},
+    ).scalar_one()
+    c.execute(
+        text("INSERT INTO auditcore.p2_document_queue (tenant_id, batch_id, journey_id, page_number, page_sha256, "
+             "page_object_key, client_upload_id, queue_status, classified_document_type) "
+             "VALUES (:t, :b, :j, 1, :sha, :k, :u, :st, :cls)"),
+        {"t": c.tenant_id, "b": batch, "j": c.journey_id, "sha": uuid4().hex, "k": f"p/{uuid4()}",
+         "u": str(uuid4()), "st": status, "cls": classified},
+    )
+
+
+def test_a_pan_card_read_first_raises_no_sku_task(journey):
+    """Review of #471 (probe p5): SKU resolution runs after every Booking
+    document; the PAN read before the booking form must not ask for a SKU."""
     c = journey
     _seed_price_list(c, _THAR)
+    _extracted(c, "pan_card", {"pan_number": "ABCDE1234F"})
+    result = _sync(c)
+    assert result["reason"] == "no_vehicle_model_read" and result["taskOpen"] is None
+    assert "SKU_NOT_SET" not in _open_pc_or_master_tasks(c)
+
+
+def test_a_booking_form_still_being_read_raises_no_sku_task(journey):
+    c = journey
+    _seed_price_list(c, _THAR)
+    _extracted(c, "booking_form", {"customer_name": "A B"})  # read so far: no model yet
+    _queued_page(c, "EXTRACTING", "booking_form")
+    assert _sync(c)["taskOpen"] is None
+    assert "SKU_NOT_SET" not in _open_pc_or_master_tasks(c)
+
+
+def test_a_booking_form_read_with_no_model_raises_the_sku_task_and_closes_on_cancel(journey):
+    c = journey
+    _seed_price_list(c, _THAR)
+    _extracted(c, "booking_form", {"customer_name": "A B"})
     result = _sync(c)
     assert result["reason"] == "no_vehicle_model_read" and result["taskOpen"] == "SKU_NOT_SET"
     task = _sku_task(c, "SKU_NOT_SET")
     assert task["assigned_role_code"] == "PC" and task["task_status"] == "READY"
-    # Once the documents name it, MODEL_NOT_IDENTIFIED / the pin takes over.
+    # The booking is cancelled: the task is no longer due and closes.
+    c.execute(text("INSERT INTO auditcore.journey_stage_states (tenant_id, journey_id, stage_code, closure_disposition) "
+                   "VALUES (:t, :j, 'BOOKING', 'NO_DELIVERY') ON CONFLICT (tenant_id, journey_id, stage_code) "
+                   "DO UPDATE SET closure_disposition = 'NO_DELIVERY'"), {"t": c.tenant_id, "j": c.journey_id})
+    assert _sync(c)["taskOpen"] is None
+    assert _sku_task(c, "SKU_NOT_SET")["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_a_cancelled_journey_gets_no_sku_task_and_is_not_rechecked(journey):
+    c = journey
+    (lx,) = _seed_price_list(c, _THAR[:1])
+    _extracted(c, "booking_form", {"customer_name": "A B"})
+    c.execute(text("INSERT INTO auditcore.journey_stage_states (tenant_id, journey_id, stage_code, closure_disposition) "
+                   "VALUES (:t, :j, 'BOOKING', 'NO_DELIVERY') ON CONFLICT (tenant_id, journey_id, stage_code) "
+                   "DO UPDATE SET closure_disposition = 'NO_DELIVERY'"), {"t": c.tenant_id, "j": c.journey_id})
+    assert _sync(c)["taskOpen"] is None
+    assert "SKU_NOT_SET" not in _open_pc_or_master_tasks(c)
+    assert mr.booking_cancelled(c, tenant_id=c.tenant_id, journey_id=c.journey_id) is True
+    assert lx
+
+
+def test_a_journey_past_booking_with_no_sku_gets_the_task(journey):
+    c = journey
+    _seed_price_list(c, _THAR)
+    c.execute(text("INSERT INTO auditcore.journey_stage_states (tenant_id, journey_id, stage_code, "
+                   "first_started_at_utc) VALUES (:t, :j, 'DELIVERY', now())"), {"t": c.tenant_id, "j": c.journey_id})
+    assert _sync(c)["taskOpen"] == "SKU_NOT_SET"
+    # Once the documents name the vehicle, the ladder's own question takes over.
     _booking_form(c, {"vehicle_model": "THAR", "vehicle_variant": "LX", "ex_showroom_price": "1400000"})
     _sync(c)
     assert _sku_task(c, "SKU_NOT_SET")["task_status"] == "VERIFIED_COMPLETE"

@@ -329,6 +329,7 @@ def backfill_sku_resolution_for_tenant(
     writes the decision (``recheck_model_resolution``). Nothing is ever
     cleared first, and a SKU a PC or Team Lead set is left as it is."""
     from audit_core.uc03_async_sync_tasks import sync_model_resolution_with_escalation
+    from audit_core.uc03_model_resolution import booking_cancelled
 
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
@@ -386,6 +387,16 @@ def backfill_sku_resolution_for_tenant(
                         connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id,
                         label=before.get("journey_label"), model_label=before.get("model_label"),
                         outcome="ALREADY_HAD_SKU", sku_code=before.get("sku_code"), detail=None,
+                    )
+                    continue
+                if recheck is not None and booking_cancelled(connection, tenant_id=tenant_id,
+                                                             journey_id=journey_id):
+                    _record_item(
+                        connection, tenant_id=tenant_id, run_id=run_id, journey_id=journey_id,
+                        label=before.get("journey_label"), model_label=before.get("model_label"),
+                        outcome="ALREADY_HAD_SKU" if before.get("has_sku") else "STILL_UNMATCHED",
+                        sku_code=before.get("sku_code"),
+                        detail="Booking cancelled, duplicate or closed with no delivery: not re-checked",
                     )
                     continue
                 if recheck is not None and before.get("review_completed"):

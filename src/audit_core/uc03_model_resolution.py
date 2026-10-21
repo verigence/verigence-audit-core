@@ -1891,16 +1891,85 @@ _NOT_SET_WHY = {
 }
 
 
+# Pages still on their way into the Journey: a booking form or invoice among
+# them may name the vehicle yet (unclassified pages count as possibly one).
+_IN_FLIGHT_QUEUE = ("QUEUED", "PREPARING_PAGE", "DI_UPLOAD_PREPARING", "DI_UPLOADING", "DI_FINALIZING",
+                    "CLASSIFYING", "EXTRACTING", "SYNCING_TO_AUDIT_CORE", "RETRY_WAIT")
+
+
+def _no_sku_gate(connection: Connection, *, tenant_id: str, journey_id: UUID) -> str:
+    """Whether a Journey with no SKU is due a "no SKU" task yet (review of
+    #471: never the moment a PAN or a receipt is read, never while the
+    booking form is still being read, never on a cancelled booking):
+
+    CANCELLED -- the booking was cancelled, is a duplicate, or closed with no
+      delivery: no SKU is due;
+    PENDING -- a booking form / vehicle invoice page (or a page not yet
+      classified) is still queued, being read or waiting to retry;
+    DUE -- a booking form or vehicle invoice has been read and still names no
+      vehicle, or the Journey is past the Booking stage without a SKU;
+    NOT_YET -- neither (only other documents so far)."""
+    row = connection.execute(
+        text(
+            """
+            SELECT
+              EXISTS (SELECT 1 FROM auditcore.journey_stage_states s
+                      WHERE s.tenant_id = :t AND s.journey_id = :j AND s.stage_code = 'BOOKING'
+                        AND (s.business_status IN ('BOOKING_CANCELLED', 'DUPLICATE_BOOKING')
+                             OR s.closure_disposition = 'NO_DELIVERY')) AS cancelled,
+              EXISTS (SELECT 1 FROM auditcore.p2_document_queue q
+                      WHERE q.tenant_id = :t AND q.journey_id = :j AND q.queue_status = ANY(:in_flight)
+                        AND (q.classified_document_type IS NULL
+                             OR q.classified_document_type = ANY(:types))) AS pending,
+              EXISTS (SELECT 1 FROM auditcore.journey_document_extracted_fields f
+                      LEFT JOIN auditcore.evidence e
+                        ON e.tenant_id = f.tenant_id AND e.di_document_id = f.di_document_id
+                      WHERE f.tenant_id = :t AND f.journey_id = :j AND f.source_document_type_key = ANY(:types)
+                        AND (e.evidence_id IS NULL OR e.association_status = 'ACTIVE')) AS read,
+              (EXISTS (SELECT 1 FROM auditcore.journey_stage_states s
+                       WHERE s.tenant_id = :t AND s.journey_id = :j
+                         AND ((s.stage_code = 'BOOKING' AND s.business_completed_at_utc IS NOT NULL)
+                              OR (s.stage_code <> 'BOOKING' AND s.first_started_at_utc IS NOT NULL)))
+               OR EXISTS (SELECT 1 FROM auditcore.journeys j
+                          WHERE j.tenant_id = :t AND j.journey_id = :j AND j.delivery_id IS NOT NULL)) AS past_booking
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "in_flight": list(_IN_FLIGHT_QUEUE),
+         "types": [*_BOOKING_DOCUMENT_TYPES, *_VEHICLE_INVOICE_TYPES]},
+    ).mappings().one()
+    if row["cancelled"]:
+        return "CANCELLED"
+    if row["pending"]:
+        return "PENDING"
+    return "DUE" if row["read"] or row["past_booking"] else "NOT_YET"
+
+
+def booking_cancelled(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    """A cancelled or duplicate booking, or one closed with no delivery: the
+    reresolve run leaves it alone (review of #471)."""
+    return _no_sku_gate(connection, tenant_id=tenant_id, journey_id=journey_id) == "CANCELLED"
+
+
 def _no_sku_task(connection: Connection, *, tenant_id: str, journey_id: UUID, ev: dict[str, Any]) -> str | None:
-    """A Journey with no SKU that the ladder could not run on always leaves a
-    task (2026-10-21 product owner rule). No price list in force on the
-    pricing date: the "no price master in force" task says so. No booking
-    date: the booking form's "enter the booking date" task when there is a
-    form, else SKU_NOT_SET. Nothing names the vehicle: SKU_NOT_SET. Returns
-    the task type left open."""
+    """A Journey with no SKU that the ladder could not run on leaves a task
+    once one is due (2026-10-21 product owner rule; ``_no_sku_gate``). No
+    price list in force on the pricing date: the "no price master in force"
+    task says so. No booking date: the booking form's "enter the booking
+    date" task when there is a form, else SKU_NOT_SET. Nothing names the
+    vehicle: SKU_NOT_SET. A SKU_NOT_SET that is no longer due is closed.
+    Returns the task type left open, or None."""
+    from audit_core.uc03_p2_task_producer import resolve_if_open
     from audit_core.uc03_sku_tasks import raise_not_set_task
 
+    gate = _no_sku_gate(connection, tenant_id=tenant_id, journey_id=journey_id)
     reason = str(ev.get("reason") or "")
+    if gate != "DUE":
+        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id,
+                        dedupe_key=f"sku-not-set:{journey_id}",
+                        evidence={"reason": {"CANCELLED": "The booking is cancelled or a duplicate",
+                                             "PENDING": "A booking form or invoice is still being read",
+                                             "NOT_YET": "No booking form or vehicle invoice read yet"}[gate]})
+        return None
     if reason == "no_effective_price_list":
         from audit_core.uc03_sku_candidates import sync_price_master_in_force_task
 
@@ -2747,6 +2816,11 @@ def recheck_model_resolution(
     except Exception as exc:
         logger.warning("recheck_model_resolution failed", exc_info=True)
         return {"error": True, "errorType": type(exc).__name__, "errorMessage": str(exc)[:300]}
+    if proposal["action"] == "SKIP":
+        gate = _no_sku_gate(connection, tenant_id=tenant_id, journey_id=journey_id)
+        proposal["noSkuGate"] = gate
+        if gate != "DUE":
+            proposal["tasks"] = []
     if not commit:
         return {"dryRun": True, "proposal": proposal}
     result = _guarded(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
@@ -2870,6 +2944,7 @@ __all__ = [
     "AUTOMATIC_BASES",
     "BASIS_LABELS",
     "HUMAN_BASES",
+    "booking_cancelled",
     "check_invoice_sku_mismatch",
     "invoice_ex_showroom",
     "is_human_decision",
