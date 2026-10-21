@@ -278,11 +278,12 @@ def test_before_any_invoice_the_booking_prices_the_deal(journey):
     assert Decimal(summary["variance"]["currentVsStandard"]) == 0
 
 
-def test_any_invoice_switches_the_deal_to_invoices_only(journey):
-    """Decision 2026-10-20: the moment any invoice is uploaded -- here only
-    the accessory invoice -- the booking no longer prices anything. The
-    vehicle price, a mandatory price-master line no invoice bills yet, is a
-    variance at nil against its standard; nothing optional is."""
+def test_a_line_awaits_its_own_document_and_is_never_zeroed_by_another_invoice(journey):
+    """2026-10-20 (R2): each invoice serves only its own lines. An accessory
+    invoice says nothing about the vehicle: until the vehicle invoice is on
+    file the vehicle line awaits it (booking figure shown, labelled, no
+    variance of its own) instead of counting at nil. Corrects the earlier
+    decision that any invoice switched every unbilled line to nil."""
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
@@ -301,21 +302,28 @@ def test_any_invoice_switches_the_deal_to_invoices_only(journey):
         _source(connection, journey, "COMMERCIAL", "accessories_cost", "accessory_invoice_dms", "22000")
         view = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     summary = view["summary"]
-    assert summary["invoiceIsSourceOfTruth"] is True
+    assert summary["invoiceIsSourceOfTruth"] is True and summary["vehicleInvoiceOnFile"] is False
     rows = {r["key"]: r for g in view["categories"] for r in g["components"]}
     assert Decimal(rows["accessories_cost"]["variance"]) == 2000
-    assert Decimal(rows["ex_showroom_price"]["variance"]) == -1000000
-    assert "NOT_INVOICED" in rows["ex_showroom_price"]["flags"]
-    assert rows["extended_warranty_amount"]["variance"] is None
-    assert "NOT_INVOICED" not in rows["extended_warranty_amount"]["flags"]
-    assert Decimal(summary["variance"]["currentVsStandard"]) == 2000 - 1000000
+    vehicle = rows["ex_showroom_price"]
+    assert vehicle["awaiting"] == "vehicle invoice" and Decimal(vehicle["current"]) == 1000000
+    assert vehicle["currentSource"] == "booking" and vehicle["variance"] is None
+    assert "AWAITING_DOCUMENT" in vehicle["flags"] and "NOT_INVOICED" not in vehicle["flags"]
+    warranty = rows["extended_warranty_amount"]
+    assert warranty["awaiting"] == "extended warranty invoice" and Decimal(warranty["current"]) == 15000
+    # Variance vs standard is Current net less Standard net.
+    assert Decimal(summary["net"]["current"]) == 1037000 and Decimal(summary["net"]["standard"]) == 1035000
+    assert Decimal(summary["variance"]["currentVsStandard"]) == 2000
+    assert Decimal(summary["variance"]["awaiting"]) == 0
 
 
 def test_once_the_vehicle_invoice_is_on_file_only_the_invoice_counts(journey):
     """Invoice is the source of truth: the booking form's figures no longer
-    price the deal or its variance. The booking quoted the vehicle 20,000
-    over standard; the invoice bills it at standard. Registration, a
-    mandatory master line no invoice bills, is a variance at nil."""
+    price a line the invoice bills. The booking quoted the vehicle 20,000
+    over standard; the invoice bills it at standard. Registration is billed
+    by the RTO challan, not by the vehicle invoice: until the challan is on
+    file it awaits it at the booking figure (2026-10-20, R2), and only once
+    the deal is closed without it is it not invoiced."""
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
@@ -345,18 +353,30 @@ def test_once_the_vehicle_invoice_is_on_file_only_the_invoice_counts(journey):
         view = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     summary = view["summary"]
     assert summary["invoiceIsSourceOfTruth"] is True
-    # Booking still shown for comparison, never used for the current figure.
+    # Booking still shown for comparison, never used for a billed line.
     assert Decimal(summary["net"]["booking"]) == 1110000
-    assert Decimal(summary["net"]["current"]) == 1000000
-    assert Decimal(summary["variance"]["currentVsStandard"]) == -90000
     rows = {r["key"]: r for g in view["categories"] for r in g["components"]}
-    # Registration is compared as "Road tax + registration" (2026-10-20).
-    assert Decimal(rows["road_tax_registration"]["variance"]) == -90000
-    assert "NOT_INVOICED" in rows["road_tax_registration"]["flags"]
-    assert rows["registration_charges"]["partOf"] == "road_tax_registration"
     assert Decimal(rows["ex_showroom_price"]["variance"]) == 0
+    rto = rows["road_tax_registration"]
+    assert rto["awaiting"] == "RTO challan" and Decimal(rto["current"]) == 95000 and rto["variance"] is None
+    assert "NOT_INVOICED" not in rto["flags"]
+    assert rows["registration_charges"]["partOf"] == "road_tax_registration"
+    assert Decimal(summary["net"]["current"]) == 1095000
+    assert Decimal(summary["variance"]["currentVsStandard"]) == 5000
+    assert Decimal(summary["variance"]["awaiting"]) == 5000
     corporate = next(d for d in view["discounts"] if d["key"] == "CORPORATE_PRIVILEGE")
     assert corporate["current"] is None and corporate["variance"] is None
+
+    # Delivered and past the settlement window without a challan: not invoiced.
+    from datetime import UTC, datetime, timedelta
+    add_ready_document(journey, "gate_pass", delivery_date=(datetime.now(UTC).date() - timedelta(days=30)).isoformat())
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        closed = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    rto = next(r for g in closed["categories"] for r in g["components"] if r["key"] == "road_tax_registration")
+    assert rto["awaiting"] is None and Decimal(rto["current"]) == 0 and Decimal(rto["variance"]) == -90000
+    assert "NOT_INVOICED" in rto["flags"]
+    assert Decimal(closed["summary"]["variance"]["currentVsStandard"]) == -90000
 
 
 def test_discount_without_entitlement_is_an_over_grant(journey):
@@ -546,7 +566,10 @@ def test_opted_lines_read_the_invoice_once_one_exists_else_the_booking_form(jour
         view = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     rows = {r["key"]: r for g in view["categories"] for r in g["components"]}
     assert rows["ex_showroom_price"].get("opted") is None  # the vehicle price is never opted out
-    assert rows["essential_kit_amount"]["opted"] == {"taken": False, "source": "invoice"}
+    # 2026-10-20 (R2): the accessories are billed by the accessory invoice;
+    # the vehicle invoice says nothing about them, so the booking form still
+    # says until the accessory invoice is on file.
+    assert rows["essential_kit_amount"]["opted"] == {"taken": True, "source": "booking"}
     assert rows["additional_warranty_amount"]["opted"] == {"taken": True, "source": "invoice"}
     assert view["discounts"][0]["opted"] == {"taken": False, "source": "invoice"}
 
@@ -613,78 +636,52 @@ def test_a_document_reported_under_two_spellings_of_its_type_is_one_source(journ
 
 
 # ------------------------------------------- vehicle invoice amount includes tax
+# 2026-10-20 (R1): the ex-showroom is this invoice's own selling price plus
+# GST at this invoice's own rate; nothing is borrowed from another invoice.
 
-def _vehicle_source(amount, doc_id="doc-1", doc_type="tax_invoice_tally", component="ex_showroom_price"):
-    return {"line_kind": "COMMERCIAL", "component_key": component, "source_document_type": doc_type,
-            "amount": Decimal(amount), "source_document_id": doc_id}
-
-
-def _cash_discount(amount, doc_type="tax_invoice_tally"):
-    return {"line_kind": "DISCOUNT", "component_key": "cash_discount", "source_document_type": doc_type,
-            "amount": Decimal(amount), "source_document_id": "doc-1"}
+_PRATEEK = {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "998571.57", "invoice_discount_amount": "17857",
+            "cgst_amount": "199714.31", "sgst_amount": "199714.31"}
 
 
-_PRATEEK_TAXES = {"cgst_amount": "199714.31", "sgst_amount": "199714.31", "igst_amount": None, "cess_amount": None}
+def test_vehicle_invoice_amount_is_the_selling_price_plus_gst_at_its_own_rate():
+    from audit_core.uc03_invoice_materialization import read_invoice
+
+    reading = read_invoice("tax_invoice_tally", dict(_PRATEEK))
+    # selling price 9,98,571.57 + 17,857 = 10,16,428.57 at 40% GST: the
+    # cost sheet's 14,23,001 to the rupee (the earlier taxable + discount +
+    # printed GST read 14,15,857.19).
+    assert reading["vehicle"]["gstRate"] == Decimal("0.4")
+    assert reading["lines"]["ex_showroom_price"] == Decimal("1423000.00")
+    discount = reading["discounts"]["UNCLASSIFIED_DISCOUNT"]
+    assert discount["printed"] == Decimal(17857) and discount["amount"] == Decimal("24999.80")
+    assert reading["issues"] == []
 
 
-def test_vehicle_invoice_amount_is_the_price_before_discount_plus_cgst_and_sgst():
-    from audit_core.uc03_p2_journey360 import _vehicle_invoice_with_tax
+def test_vehicle_invoice_taxes_are_never_borrowed_from_another_invoice():
+    from audit_core.uc03_invoice_materialization import read_invoice
 
-    out = _vehicle_invoice_with_tax(
-        [_vehicle_source("998571.57"), _cash_discount("17857")],
-        [{"documentType": "tax_invoice_tally", "documentId": "doc-1", "fields": dict(_PRATEEK_TAXES)}],
-    )
-    vehicle = next(s for s in out if s["component_key"] == "ex_showroom_price")
-    # gross 1,016,428.57 + CGST 199,714.31 + SGST 199,714.31
-    assert vehicle["amount"] == Decimal("1415857.19")
-    # The sheet nets the 17,857 discount off once: 13,98,000.19, what the customer pays before TCS.
-    assert vehicle["amount"] - Decimal(17857) == Decimal("1398000.19")
-    # Nothing else moves.
-    assert [s for s in out if s["component_key"] != "ex_showroom_price"] == [_cash_discount("17857")]
-
-
-def test_vehicle_invoice_taxes_are_read_from_another_copy_of_the_same_invoice():
-    from audit_core.uc03_p2_journey360 import _vehicle_invoice_with_tax
-
-    out = _vehicle_invoice_with_tax(
-        [_vehicle_source("998571.57", doc_id="copy-without-taxes"), _cash_discount("17857")],
-        [
-            {"documentType": "tax_invoice_tally", "documentId": "copy-without-taxes", "fields": {}},
-            {"documentType": "tax_invoice_tally", "documentId": "copy-with-taxes", "fields": dict(_PRATEEK_TAXES)},
-        ],
-    )
-    assert next(s for s in out if s["component_key"] == "ex_showroom_price")["amount"] == Decimal("1415857.19")
-
-
-def test_vehicle_invoice_without_printed_tax_keeps_its_value():
-    from audit_core.uc03_p2_journey360 import _vehicle_invoice_with_tax
-
-    rows = [_vehicle_source("998571.57"), _cash_discount("17857")]
-    out = _vehicle_invoice_with_tax(rows, [{"documentType": "tax_invoice_tally", "documentId": "doc-1", "fields": {}}])
-    assert out == rows
+    without = read_invoice("tax_invoice_tally", {"invoice_purpose": "VEHICLE_SALE", "taxable_amount": "998571.57",
+                                                 "invoice_discount_amount": "17857"})
+    assert "ex_showroom_price" not in without["lines"]
+    assert [i["code"] for i in without["issues"]] == ["TAXES_NOT_READ"]
+    assert without["discounts"]["UNCLASSIFIED_DISCOUNT"]["amount"] is None
 
 
 def test_vehicle_invoice_igst_and_cess_count_like_cgst_and_sgst():
-    from audit_core.uc03_p2_journey360 import _vehicle_invoice_with_tax
+    from audit_core.uc03_invoice_materialization import read_invoice
 
-    out = _vehicle_invoice_with_tax(
-        [_vehicle_source("100000", doc_type="customer_invoice_dms")],
-        [{"documentType": "customer_invoice_dms", "documentId": "doc-1",
-          "fields": {"igst_amount": "28000", "cess_amount": "22000"}}],
-    )
-    assert out[0]["amount"] == Decimal(150000)
+    reading = read_invoice("customer_invoice_dms", {"taxable_amount": "100000", "igst_amount": "28000",
+                                                    "cess_amount": "22000"})
+    assert reading["family"] == "VEHICLE" and reading["vehicle"]["gstRate"] == Decimal("0.5")
+    assert reading["lines"]["ex_showroom_price"] == Decimal("150000.00")
 
 
-def test_only_the_vehicle_line_of_a_vehicle_invoice_is_adjusted():
-    from audit_core.uc03_p2_journey360 import _vehicle_invoice_with_tax
+def test_only_the_vehicle_invoice_gets_gst_added():
+    from audit_core.uc03_invoice_materialization import read_invoice
 
-    rows = [
-        _vehicle_source("78688.04", doc_type="accessory_invoice_tally", component="accessories_cost"),
-        _vehicle_source("1423001", doc_type="cost_sheet"),
-        _vehicle_source("13980", component="tcs_amount"),
-    ]
-    docs = [{"documentType": "tax_invoice_tally", "documentId": "doc-1", "fields": dict(_PRATEEK_TAXES)}]
-    assert _vehicle_invoice_with_tax(rows, docs) == rows
+    accessory = read_invoice("accessory_invoice_tally", {"grand_total_amount": "78688.04", "cgst_amount": "6000"})
+    assert accessory["lines"] == {"accessories_cost": Decimal("78688.04")}
+    assert accessory["netPayable"] == Decimal("78688.04")
 
 
 def test_the_etag_changes_with_the_deployed_build(journey, monkeypatch):

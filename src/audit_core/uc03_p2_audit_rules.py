@@ -418,15 +418,23 @@ def deal_undercharged(facts: _Facts) -> RuleOutcome:
     short: list[dict[str, Any]] = []
     for group in facts.sheet["categories"]:
         for row in group["components"]:
+            # 2026-10-20: measured on the figure the deal stands at (the
+            # invoice once it is on file); a line still awaiting its own
+            # document, or left out of the deal (Self insurance, a breakdown
+            # part), is not a shortfall.
+            if row.get("awaiting") or row.get("excluded") or row.get("partOf"):
+                continue
             standard = _dec(row["standard"])
-            charged = _charged(row)
+            charged = _dec(row.get("current")) if "current" in row else _charged(row)
             if standard is None or charged is None:
                 continue
             gap = standard - charged
             if gap > _LINE_TOLERANCE:
                 short.append({"key": row["key"], "label": row["label"], "standard": str(standard),
                               "charged": str(charged), "short": str(gap),
-                              "source": "invoice" if row["billed"] is not None else "booking form"})
+                              "source": ("invoice" if row["billed"] is not None
+                                         else "nothing billed" if row.get("currentSource") == "not_invoiced"
+                                         else "booking form")})
     net = facts.sheet["summary"]["net"]
     net_standard, net_current = _dec(net["standard"]), _dec(net["current"])
     net_gap = net_standard - net_current if net_standard is not None and net_current is not None else None
@@ -590,62 +598,93 @@ def delivered_on_short_payment(facts: _Facts) -> RuleOutcome:
 # added); an exchange appears on the invoice as a discount or a line item, so
 # it is already in the invoice total.
 #
-# Invoices counted: the customer's vehicle, accessory, extended-warranty and
-# RSA invoices, generic invoices and debit notes, less credit notes. The
+# Invoices counted (2026-10-20, R2): every distinct customer invoice once --
+# vehicle (every vehicle-sale invoice type), accessory, extended-warranty and
+# RSA invoices, generic invoices and debit notes, less credit notes. The same
+# invoice in DMS and Tally, or uploaded twice, is one invoice (same family and
+# invoice number; without a number, same date and total); a DMS and a Tally
+# invoice with different numbers are two invoices and both count. The
 # dealer's wholesale (OEM) invoice is the dealer's purchase, not the
-# customer's bill, and is left out. The same sale billed in both DMS and
-# Tally is one bill: when a DMS invoice of a kind is on file, the Tally one of
-# that kind is not counted again. The same invoice uploaded twice counts once
-# (same kind and invoice number; same kind, date and total without a number).
+# customer's bill, and is left out. One car has one vehicle invoice: when
+# more than one is on file the Deal raises it for a Team Lead, and each is
+# counted here as billed until the cancelled one is voided.
 _INVOICE_TOLERANCE = Decimal(1)
-_INVOICE_FAMILIES: dict[str, tuple[str, ...]] = {
-    # family -> its document types, DMS first (the one that counts when both are on file)
-    "VEHICLE": ("customer_invoice_dms", "tax_invoice_tally"),
-    "ACCESSORIES": ("accessory_invoice_dms", "accessory_invoice_tally"),
-    "EXTENDED_WARRANTY": ("ew_invoice",),
-    "RSA": ("rsa_invoice",),
-    "OTHER": ("invoice_generic",),
-    "DEBIT_NOTE": ("debit_note",),
-    "CREDIT_NOTE": ("credit_note",),
-}
 _INVOICE_TOTAL_FIELDS = ("grand_total_amount", "total_amount")
 
 
 def _invoice_bills(facts: _Facts) -> tuple[list[dict[str, Any]], list[str]]:
     """The invoices that count toward the bill, each with its signed amount,
     and the names of any counted invoice whose total could not be read."""
+    from audit_core.uc03_invoice_materialization import (
+        FAMILY_CREDIT_NOTE,
+        FAMILY_VEHICLE,
+        plausible_from,
+        select_invoices,
+    )
+    from audit_core.uc03_p2_journey360 import (
+        _INVOICE_TYPES,
+        _invoice_fields,
+        read_invoice,
+    )
+
+    readings = [
+        read_invoice(d["documentType"], _invoice_fields(d["fields"]), document_id=d["documentId"])
+        for d in facts.documents(*_INVOICE_TYPES)
+    ]
+    selection = select_invoices(readings, plausible_from=plausible_from(
+        facts.connection, tenant_id=facts.tenant_id, journey_id=facts.journey_id))
     bills: list[dict[str, Any]] = []
     unreadable: list[str] = []
-    for family, types in _INVOICE_FAMILIES.items():
-        documents = facts.documents(*types)
-        if not documents:
+    for group in selection["groups"]:
+        # A vehicle invoice reversed in full by a credit note, and that
+        # credit note, are both left out (review S4).
+        if group["family"] not in _COUNTED_FAMILIES or group["cancelled"] or group.get("pendingCancellation"):
             continue
-        preferred = next(t for t in types if any(d["documentType"] == t for d in documents))
-        seen: set[tuple[Any, ...]] = set()
-        for doc in documents:
-            if doc["documentType"] != preferred:
-                continue
-            fields = doc["fields"]
-            amount = next((_dec(fields.get(k)) for k in _INVOICE_TOTAL_FIELDS if _dec(fields.get(k)) is not None), None)
-            label = doc["documentType"].replace("_", " ")
-            number = " ".join(str(fields.get("invoice_number") or fields.get("debit_note_number") or "").split()).upper()
-            if amount is None:
-                unreadable.append(f"{label}{f' {number}' if number else ''}")
-                continue
-            key = (family, number) if number else (family, str(fields.get("invoice_date") or ""), amount)
-            if key in seen:
-                continue
-            seen.add(key)
-            signed = -abs(amount) if family == "CREDIT_NOTE" else amount
-            bills.append({"documentId": doc["documentId"], "documentType": doc["documentType"],
-                          "number": number or None, "amount": signed})
+        rep = group["representative"]
+        label = rep["documentType"].replace("_", " ")
+        amount = rep["grandTotal"] if rep["grandTotal"] is not None else rep["netPayable"]
+        if amount is None:
+            number = rep["number"]
+            unreadable.append(f"{label} {number}" if number else label)
+            continue
+        signed = -abs(amount) if group["family"] == FAMILY_CREDIT_NOTE else amount
+        bills.append({"documentId": rep["documentId"], "documentType": rep["documentType"],
+                      "number": rep["numberKey"], "amount": signed,
+                      "vehicle": group["family"] == FAMILY_VEHICLE,
+                      "copies": [r["documentId"] for r in group["copies"] if r is not rep]})
     return bills, unreadable
+
+
+_COUNTED_FAMILIES = frozenset({"VEHICLE", "ACCESSORY", "EXTENDED_WARRANTY", "RSA", "OTHER", "DEBIT_NOTE",
+                               "CREDIT_NOTE"})
+
+
+def _not_counted(facts: _Facts) -> list[dict[str, Any]]:
+    """Amounts the dealer may also have collected on its receipts but which
+    no invoice carries: the insurance premium of a dealer-arranged policy and
+    the RTO challan. Shown beside the comparison, not added to it.
+
+    TODO(2026-10-20, product owner): whether the dealer collected the premium
+    and the road tax through its own receipts cannot be read from the
+    documents on file. Count them once a reliable signal exists (for example
+    the PC confirming "collected by dealer" per line); until then they are
+    listed so the Team Lead can see them, never guessed into the total."""
+    out: list[dict[str, Any]] = []
+    rows = {r["key"]: r for g in facts.sheet["categories"] for r in g["components"]}
+    insurance = rows.get("insurance_amount")
+    if insurance and not insurance.get("excluded") and insurance.get("billedFrom") == "document":
+        out.append({"line": "insurance_amount", "amount": insurance["billed"],
+                    "reason": "insurance cover premium (dealer-arranged unless the PC says Self)"})
+    rto = rows.get("road_tax_registration")
+    if rto and rto.get("billed") is not None:
+        out.append({"line": "road_tax_registration", "amount": rto["billed"], "reason": "RTO challan"})
+    return out
 
 
 def receipts_equal_invoices(facts: _Facts) -> RuleOutcome:
     code = "RECEIPTS_EQUAL_INVOICES"
     bills, unreadable = _invoice_bills(facts)
-    if not any(b["documentType"] in _INVOICE_FAMILIES["VEHICLE"] for b in bills):
+    if not any(b["vehicle"] for b in bills):
         return RuleOutcome(code, "SKIPPED", "No vehicle invoice has been read yet.")
     if unreadable:
         return RuleOutcome(code, "SKIPPED", "The total could not be read on: " + ", ".join(unreadable) + ".")
@@ -666,7 +705,8 @@ def receipts_equal_invoices(facts: _Facts) -> RuleOutcome:
     counted = f"{len(bills)} invoice{'s' if len(bills) != 1 else ''}"
     refund_text = f" less {_rupees(refunded)} refunded" if refunded else ""
     details = {"invoiced": str(invoiced), "received": str(received), "refunded": str(refunded),
-               "difference": str(gap), "invoices": [{**b, "amount": str(b["amount"])} for b in bills]}
+               "difference": str(gap), "invoices": [{**b, "amount": str(b["amount"])} for b in bills],
+               "notCounted": _not_counted(facts)}
     if abs(gap) <= _INVOICE_TOLERANCE:
         return RuleOutcome(code, "PASS", (
             f"Receipts {_rupees(received)}{refund_text} match the {counted} totalling {_rupees(invoiced)}."
