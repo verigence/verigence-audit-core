@@ -29,7 +29,8 @@ import random
 import socket
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -122,6 +123,18 @@ _WORKER_CONCURRENCY = max(1, int(os.environ.get("P2_WORKER_CONCURRENCY", "6")))
 _PER_JOURNEY_CONCURRENCY = max(1, int(os.environ.get("P2_PER_JOURNEY_CONCURRENCY", "3")))
 _LEASE_SECONDS = int(os.environ.get("P2_WORKER_LEASE_SECONDS", "600"))
 _LEASE_RENEW_SECONDS = max(5, _LEASE_SECONDS // 3)
+# Intake (splitting an upload, sending a page to Document Intelligence, grouping) is quick and
+# is what every later step waits for, so it is claimed ahead of the follow-up work, oldest first
+# within each group. A few slots stay reserved for the follow-up work (reconcile polls
+# Document Intelligence and settles pages) so a long intake backlog cannot starve it either.
+# 2026-10-19: follow-up items that were older than the intake they waited for, and polled for
+# minutes each, held every slot while 226 page submissions and 13 uploads sat unclaimed.
+_INTAKE_WORK_TYPES = ("SPLIT_BATCH", "DOCUMENT_INGEST", "BATCH_GROUP")
+_FOLLOW_UP_RESERVED_SLOTS = max(0, int(os.environ.get("P2_FOLLOW_UP_RESERVED_SLOTS", "2")))
+# A cycle keeps refilling a freed slot for this long, then lets the running items finish so the
+# heartbeat and the loop come round again.
+_CYCLE_SECONDS = float(os.environ.get("P2_WORKER_CYCLE_SECONDS", "120"))
+_REFILL_POLL_SECONDS = 2.0
 # A page is never failed for taking long (decision 2026-09-30: load is
 # never a failure). While Document Intelligence still has it in hand it is
 # polled, ever more slowly (_reconcile_delay); the file's status task tells
@@ -208,9 +221,13 @@ _CLAIM_SQL = text(
           AND lease_expires_at_utc > now()
         GROUP BY journey_id
     ),
-    ready AS (
+    lane AS (
         SELECT work_id, journey_id, created_at_utc,
-               row_number() OVER (PARTITION BY journey_id ORDER BY created_at_utc) AS journey_rank
+               (work_type = ANY(:intake_types)) AS is_intake,
+               row_number() OVER (
+                   PARTITION BY journey_id, (work_type = ANY(:intake_types))
+                   ORDER BY created_at_utc
+               ) AS lane_pos
         FROM auditcore.p2_work_queue
         WHERE tenant_id=:tenant_id
           AND (
@@ -219,19 +236,40 @@ _CLAIM_SQL = text(
           )
           AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc <= now())
     ),
+    ready AS (
+        -- Within a journey, intake and follow-up work take turns (intake first), so a journey's
+        -- few allowed slots are never all spent on one kind.
+        SELECT work_id, journey_id, created_at_utc, is_intake,
+               row_number() OVER (
+                   PARTITION BY journey_id
+                   ORDER BY lane_pos * 2 + (CASE WHEN is_intake THEN 0 ELSE 1 END), created_at_utc
+               ) AS journey_rank
+        FROM lane
+    ),
     eligible AS (
-        SELECT r.work_id
+        SELECT r.work_id, r.created_at_utc, r.is_intake,
+               row_number() OVER (PARTITION BY r.is_intake ORDER BY r.created_at_utc) AS lane_rank
         FROM ready r
         LEFT JOIN inflight i ON i.journey_id=r.journey_id
         WHERE r.journey_rank + COALESCE(i.running, 0) <= :per_journey
-        ORDER BY r.created_at_utc
+    ),
+    picked AS (
+        SELECT work_id
+        FROM eligible
+        ORDER BY CASE
+                   WHEN is_intake AND lane_rank <= :limit - :reserve THEN 0
+                   WHEN NOT is_intake AND lane_rank <= :reserve THEN 1
+                   WHEN is_intake THEN 2
+                   ELSE 3
+                 END,
+                 created_at_utc
         LIMIT :limit
     )
     SELECT w.tenant_id, w.work_id, w.journey_id, w.work_type, w.work_key,
            w.payload, w.attempt_count, w.requested_version, w.correlation_id,
            (w.work_status IN ('CLAIMED','PROCESSING')) AS reclaimed
     FROM auditcore.p2_work_queue w
-    JOIN eligible e ON e.work_id=w.work_id
+    JOIN picked e ON e.work_id=w.work_id
     WHERE w.tenant_id=:tenant_id
     ORDER BY w.created_at_utc
     FOR UPDATE OF w SKIP LOCKED
@@ -245,7 +283,14 @@ def _claim_for_tenant(engine: Engine, tenant_id: str, limit: int) -> list[WorkIt
         set_tenant_context(connection, tenant_id)
         rows = connection.execute(
             _CLAIM_SQL,
-            {"tenant_id": tenant_id, "limit": limit, "per_journey": _PER_JOURNEY_CONCURRENCY},
+            {
+                "tenant_id": tenant_id,
+                "limit": limit,
+                "per_journey": _PER_JOURNEY_CONCURRENCY,
+                "intake_types": list(_INTAKE_WORK_TYPES),
+                # At least one slot always goes to intake when more than one is free.
+                "reserve": min(_FOLLOW_UP_RESERVED_SLOTS, max(0, limit - 1)),
+            },
         ).mappings().all()
         for row in rows:
             token = uuid4()
@@ -3046,27 +3091,35 @@ def _settle(engine: Engine, work: WorkItem, action, *args) -> None:
         )
 
 
-def run_once(engine: Engine | None = None) -> int:
-    engine = engine or get_engine()
+def _claim_round(engine: Engine, limit: int) -> list[WorkItem]:
     claimed: list[WorkItem] = []
     for tenant_id in _active_tenants(engine):
         _maybe_sweep(engine, tenant_id)
-        remaining = _WORKER_CONCURRENCY - len(claimed)
+        remaining = limit - len(claimed)
         if remaining > 0:
             claimed.extend(_claim_for_tenant(engine, tenant_id, remaining))
+    return claimed
+
+
+def run_once(engine: Engine | None = None) -> int:
+    engine = engine or get_engine()
+    claimed = _claim_round(engine, _WORKER_CONCURRENCY)
     if not claimed:
         return 0
 
+    leased = list(claimed)  # grows as freed slots are refilled; the lease renewer reads it
     renewing = threading.Event()
-    renewer = threading.Thread(target=_keep_leases, args=(engine, claimed, renewing), daemon=True)
+    renewer = threading.Thread(target=_keep_leases, args=(engine, leased, renewing), daemon=True)
     renewer.start()
     try:
-        _run_claimed(engine, claimed)
+        total = _run_claimed(
+            engine, claimed, refill=lambda free: _claim_round(engine, free), leased=leased
+        )
     finally:
         renewing.set()
         renewer.join(timeout=5)
-    _stats["processed"] += len(claimed)
-    return len(claimed)
+    _stats["processed"] += total
+    return total
 
 
 def _keep_leases(engine: Engine, items: list[WorkItem], done: threading.Event) -> None:
@@ -3094,27 +3147,58 @@ def _keep_leases(engine: Engine, items: list[WorkItem], done: threading.Event) -
                 logger.warning("p2_work_lease_renewal_failed", tenant_id=tenant_id, **exception_summary(exc))
 
 
-def _run_claimed(engine: Engine, claimed: list[WorkItem]) -> None:
+def _run_claimed(
+    engine: Engine,
+    claimed: list[WorkItem],
+    *,
+    refill: Callable[[int], list[WorkItem]] | None = None,
+    leased: list[WorkItem] | None = None,
+) -> int:
+    """Run the claimed items on the pool. A slot freed by a finished item is refilled at once
+    (until the cycle time is up), so one slow item never holds back the others the way a
+    wait-for-the-whole-batch loop did. Returns how many items ran."""
+    deadline = time.monotonic() + _CYCLE_SECONDS
+    total = len(claimed)
     with ThreadPoolExecutor(max_workers=_WORKER_CONCURRENCY) as pool:
         futures = {pool.submit(_process_in_context, engine, item): item for item in claimed}
-        for future in as_completed(futures):
-            work = futures[future]
-            started = _started_at.pop(work.work_id, None)
-            duration_ms = round((time.perf_counter() - started) * 1000.0, 1) if started else None
+        while futures:
+            done, _pending = wait(futures, timeout=_REFILL_POLL_SECONDS, return_when=FIRST_COMPLETED)
+            for future in done:
+                work = futures.pop(future)
+                _settle_finished(engine, work, future)
+            free = _WORKER_CONCURRENCY - len(futures)
+            if refill is None or free <= 0 or time.monotonic() >= deadline:
+                continue
             try:
-                future.result()
-            except RescheduleWork as exc:
-                logger.info("p2_work_rescheduled", retry_in_seconds=exc.delay_seconds,
-                            reason=redact_text(str(exc), 200), duration_ms=duration_ms, **_work_fields(work))
-                _settle(engine, work, _reschedule, exc)
-            except LeaseLost:
-                logger.warning("p2_work_lease_lost", duration_ms=duration_ms, **_work_fields(work))
-            except Exception as exc:  # noqa: BLE001 - every failure is settled (retry/dead-letter)
-                # _fail logs p2_work_retry_scheduled / p2_work_dead_lettered with the summary.
-                _settle(engine, work, _fail, exc)
-            else:
-                logger.info("p2_work_completed", duration_ms=duration_ms, **_work_fields(work))
-                _settle(engine, work, _complete)
+                fresh = refill(free)
+            except Exception as exc:  # noqa: BLE001 - a database blip must not drop running items
+                logger.warning("p2_worker_refill_failed", **exception_summary(exc))
+                continue
+            for item in fresh:
+                futures[pool.submit(_process_in_context, engine, item)] = item
+            if leased is not None:
+                leased.extend(fresh)
+            total += len(fresh)
+    return total
+
+
+def _settle_finished(engine: Engine, work: WorkItem, future: Future) -> None:
+    started = _started_at.pop(work.work_id, None)
+    duration_ms = round((time.perf_counter() - started) * 1000.0, 1) if started else None
+    try:
+        future.result()
+    except RescheduleWork as exc:
+        logger.info("p2_work_rescheduled", retry_in_seconds=exc.delay_seconds,
+                    reason=redact_text(str(exc), 200), duration_ms=duration_ms, **_work_fields(work))
+        _settle(engine, work, _reschedule, exc)
+    except LeaseLost:
+        logger.warning("p2_work_lease_lost", duration_ms=duration_ms, **_work_fields(work))
+    except Exception as exc:  # noqa: BLE001 - every failure is settled (retry/dead-letter)
+        # _fail logs p2_work_retry_scheduled / p2_work_dead_lettered with the summary.
+        _settle(engine, work, _fail, exc)
+    else:
+        logger.info("p2_work_completed", duration_ms=duration_ms, **_work_fields(work))
+        _settle(engine, work, _complete)
 
 
 _started_at: dict[UUID, float] = {}

@@ -1071,3 +1071,103 @@ def test_a_normal_document_review_returns_fields_with_the_correction_waiting_for
     assert field["pendingCorrection"]["taskId"] == proposal["taskId"]
     assert field["pendingCorrection"]["proposedValue"] == "150"
     assert review["diReadError"] is None and review["contentAvailable"] is True
+
+
+# ------------------------------------------------------- fair claiming and refill
+
+def _enqueue_at(journey, work_type, age_minutes, *, journey_id=None):
+    """Queue an item as if it had been created `age_minutes` ago (older work sorts first)."""
+    key = f"test:{uuid4().hex}"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        worker._enqueue(
+            connection,
+            tenant_id=journey.tenant_id,
+            journey_id=journey_id or journey.journey_id,
+            work_type=work_type,
+            work_key=key,
+            payload={},
+            correlation_id=None,
+        )
+        connection.execute(
+            text("UPDATE auditcore.p2_work_queue SET created_at_utc=now() - (:m * interval '1 minute') "
+                 "WHERE tenant_id=:t AND work_type=:w AND work_key=:k"),
+            {"m": age_minutes, "t": journey.tenant_id, "w": work_type, "k": key},
+        )
+
+
+def test_intake_is_claimed_before_older_follow_up_work(journey, monkeypatch):
+    monkeypatch.setattr(worker, "_PER_JOURNEY_CONCURRENCY", 100)
+    # 2026-10-19: older follow-up work held every slot while page submissions waited for hours.
+    for _ in range(4):
+        _enqueue_at(journey, "JOURNEY_RECONCILE", 600)
+    for _ in range(3):
+        _enqueue_at(journey, "DOCUMENT_INGEST", 10)
+    claimed = worker._claim_for_tenant(journey.engine, journey.tenant_id, 6)
+    types = [i.work_type for i in claimed]
+    assert types.count("DOCUMENT_INGEST") == 3
+    assert len(claimed) == 6
+
+
+def test_follow_up_work_keeps_reserved_slots_under_an_intake_backlog(journey, monkeypatch):
+    monkeypatch.setattr(worker, "_PER_JOURNEY_CONCURRENCY", 100)
+    for _ in range(10):
+        _enqueue_at(journey, "DOCUMENT_INGEST", 10)
+    for _ in range(3):
+        _enqueue_at(journey, "STAGE_RECOMPUTE", 600)
+    claimed = worker._claim_for_tenant(journey.engine, journey.tenant_id, 6)
+    types = [i.work_type for i in claimed]
+    assert types.count("STAGE_RECOMPUTE") == worker._FOLLOW_UP_RESERVED_SLOTS
+    assert types.count("DOCUMENT_INGEST") == 6 - worker._FOLLOW_UP_RESERVED_SLOTS
+
+
+def test_a_single_free_slot_goes_to_intake(journey):
+    _enqueue_at(journey, "STAGE_RECOMPUTE", 600)
+    _enqueue_at(journey, "SPLIT_BATCH", 5)
+    [item] = worker._claim_for_tenant(journey.engine, journey.tenant_id, 1)
+    assert item.work_type == "SPLIT_BATCH"
+
+
+def test_one_journey_allowance_is_shared_between_intake_and_follow_up(journey):
+    # 3 per journey: intake, follow-up, intake -- not three of one kind.
+    for _ in range(4):
+        _enqueue_at(journey, "CONTROL_EVALUATE", 600)
+    for _ in range(4):
+        _enqueue_at(journey, "DOCUMENT_INGEST", 10)
+    claimed = worker._claim_for_tenant(journey.engine, journey.tenant_id, 6)
+    assert sorted(i.work_type for i in claimed) == ["CONTROL_EVALUATE", "DOCUMENT_INGEST", "DOCUMENT_INGEST"]
+
+
+def test_a_finished_item_frees_its_slot_while_a_slow_one_is_still_running(journey, monkeypatch):
+    """The pool refills a freed slot at once instead of waiting for the slowest item."""
+    monkeypatch.setattr(worker, "_WORKER_CONCURRENCY", 2)
+    monkeypatch.setattr(worker, "_PER_JOURNEY_CONCURRENCY", 100)
+    monkeypatch.setattr(worker, "_REFILL_POLL_SECONDS", 0.05)
+    slow_started = __import__("threading").Event()
+    release_slow = __import__("threading").Event()
+    ran: list[str] = []
+
+    def fake_process(engine, item):
+        ran.append(item.work_type)
+        if item.work_type == "JOURNEY_RECONCILE":
+            slow_started.set()
+            assert release_slow.wait(10)
+
+    monkeypatch.setattr(worker, "_process_in_context", fake_process)
+    monkeypatch.setattr(worker, "_settle", lambda *a, **k: None)
+    _enqueue_at(journey, "JOURNEY_RECONCILE", 30)
+    _enqueue_at(journey, "DOCUMENT_INGEST", 20)
+    _enqueue_at(journey, "DOCUMENT_INGEST", 19)
+    _enqueue_at(journey, "DOCUMENT_INGEST", 18)
+
+    first = worker._claim_for_tenant(journey.engine, journey.tenant_id, 2)
+    assert {i.work_type for i in first} == {"JOURNEY_RECONCILE", "DOCUMENT_INGEST"}
+
+    def refill(free):
+        return worker._claim_for_tenant(journey.engine, journey.tenant_id, free)
+
+    import threading
+    threading.Timer(1.0, release_slow.set).start()
+    total = worker._run_claimed(journey.engine, first, refill=refill)
+    assert total >= 4, ran  # the two intake items queued behind the slow reconcile also ran
+    assert ran.count("DOCUMENT_INGEST") == 3

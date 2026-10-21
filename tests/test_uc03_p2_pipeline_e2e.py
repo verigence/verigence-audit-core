@@ -281,7 +281,7 @@ def test_upload_to_journey_360_end_to_end(pipeline):
     assert client.get(f"{base}/360/compliance-report").status_code == 200
 
 
-def test_worker_that_dies_mid_batch_loses_nothing(pipeline):
+def test_worker_that_dies_mid_batch_loses_nothing(pipeline, monkeypatch):
     """A worker claims work and dies without finishing: once its leases
     expire, another worker picks everything up and the batch completes with
     no duplicate DI documents."""
@@ -296,8 +296,10 @@ def test_worker_that_dies_mid_batch_loses_nothing(pipeline):
     storage.objects[upload["uploadUrl"].split("https://storage.test/", 1)[1]] = pdf
     assert client.post(f"{base}/uploads/{upload['batchId']}:finalize").status_code == 202
 
-    # Split, then a worker claims the ingest items and "crashes".
-    worker.run_once(journey.engine)
+    # Split (one round only: no refill), then a worker claims the ingest items and "crashes".
+    with monkeypatch.context() as one_round:
+        one_round.setattr(worker, "_CYCLE_SECONDS", 0.0)
+        worker.run_once(journey.engine)
     crashed = worker._claim_for_tenant(journey.engine, journey.tenant_id, 20)
     assert crashed, "expected claimed work to abandon"
     with journey.engine.begin() as connection:
