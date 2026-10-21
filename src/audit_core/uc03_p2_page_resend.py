@@ -31,7 +31,13 @@ _DAYS = int(os.environ.get("AUDIT_CORE_PAGE_RESEND_DAYS", "4"))
 
 # last_error prefixes that mean the page itself is the problem, or a failure
 # a re-send cannot fix until its own bug is fixed.
-_NOT_RESENT = ("DI_QUALITY_", "FACTS_COPY_FAILED")
+# AUDIT_CORE_PAGE_RESEND_SKIP overrides the list (comma-separated), e.g. to
+# re-send facts-copy failures once the bug behind them is fixed.
+_NOT_RESENT = tuple(
+    prefix.strip()
+    for prefix in os.environ.get("AUDIT_CORE_PAGE_RESEND_SKIP", "DI_QUALITY_,FACTS_COPY_FAILED").split(",")
+    if prefix.strip()
+)
 
 
 def _candidates(connection, tenant_id: str) -> list[dict[str, Any]]:
