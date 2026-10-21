@@ -176,6 +176,19 @@ def test_deal_undercharged_and_excess_discount_name_each_line(journey):
     assert _finding(journey, "DEAL_UNDERCHARGED")[0] == "RESOLVED"
 
 
+def test_a_line_awaiting_its_own_document_is_not_undercharged(journey):
+    """2026-10-20 (R2): an accessory invoice on file says nothing about the
+    RTO charges; the road tax + registration line awaits the RTO challan (at
+    its standard while the booking form gives no figure) instead of counting
+    at nil and failing the deal."""
+    _line(journey, "ex_showroom_price", "1000000", None)
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "booking_form", "1000000")
+    _line(journey, "registration_charges", "90000", None)
+    _source(journey, "COMMERCIAL", "accessories_cost", "accessory_invoice_dms", "20000")
+    result = _run(journey, "BOOKING")
+    assert result["DEAL_UNDERCHARGED"].outcome == "PASS", result["DEAL_UNDERCHARGED"].reason
+
+
 def test_deal_checks_wait_for_the_standard_prices(journey):
     _source(journey, "COMMERCIAL", "ex_showroom_price", "booking_form", "900000")
     result = _run(journey, "BOOKING")

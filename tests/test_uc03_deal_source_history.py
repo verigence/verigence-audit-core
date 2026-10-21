@@ -130,3 +130,20 @@ def test_commercial_and_discount_lines_do_not_collide_on_the_same_component_key(
     assert len(rows) == 2
     by_kind = {r["lineKind"]: r["amount"] for r in rows}
     assert by_kind == {"COMMERCIAL": Decimal(30000), "DISCOUNT": Decimal(25000)}
+
+
+def test_two_documents_of_one_type_keep_a_row_each(journey) -> None:
+    """2026-10-20 (R2): the table is keyed per source document; a second
+    invoice of the same type no longer overwrites the first. Two spellings
+    of one type are one type."""
+    c = journey
+    first, second = uuid4(), uuid4()
+    for document_id, amount in ((first, Decimal("852000.00")), (second, Decimal("862600.44"))):
+        record_source_value(c, tenant_id=c.tenant_id, journey_id=c.journey_id, line_kind="COMMERCIAL",
+                            component_key="ex_showroom_price", source_document_type="Customer Invoice DMS",
+                            amount=amount, document_id=document_id)
+    rows = load_source_breakdown(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    assert {(r["sourceDocumentType"], r["sourceDocumentId"], r["amount"]) for r in rows} == {
+        ("customer_invoice_dms", first, Decimal("852000.00")),
+        ("customer_invoice_dms", second, Decimal("862600.44")),
+    }

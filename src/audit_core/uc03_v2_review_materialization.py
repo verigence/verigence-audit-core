@@ -11,7 +11,10 @@ from sqlalchemy import Connection, text
 from audit_core import uc03_booking_capture
 from audit_core.uc03_attribute_mapping import spec_for_field
 from audit_core.uc03_booking_receipt_capture import _RECEIPT_CAPTURE_MAP
-from audit_core.uc03_deal_source_history import record_source_value
+from audit_core.uc03_deal_source_history import (
+    record_source_value,
+    upsert_commercial_actual,
+)
 from audit_core.uc03_document_registry import is_receipt_document_type
 from audit_core.uc03_masters_alignment import DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY
 from audit_core.uc03_payment_mode import classify_payment_mode
@@ -448,44 +451,18 @@ def _materialize_commercial_lines(
         amount = values.get(raw_key)
         if amount is None:
             continue
-        record_source_value(
+        # 2026-10-20 (R6, invoice is the source of truth): through the one
+        # ranked writer, so a booking re-review never overwrites an invoice's
+        # actual; the booking form's own value is still recorded per source.
+        upsert_commercial_actual(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
-            line_kind="COMMERCIAL",
             component_key=component_key,
-            source_document_type=_BOOKING_FORM_DOCUMENT_TYPE,
             amount=amount,
-            evidence_id=evidence_id,
+            document_type=_BOOKING_FORM_DOCUMENT_TYPE,
             document_id=document_id,
-        )
-        connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.commercial_lines (
-                    tenant_id, journey_id, component_key, actual_amount,
-                    actual_source_kind, source_evidence_id, source_reference
-                ) VALUES (
-                    :tenant_id, :journey_id, :component_key, :actual_amount,
-                    'EVIDENCE', :evidence_id, :source_reference
-                )
-                ON CONFLICT (tenant_id, journey_id, component_key)
-                DO UPDATE SET
-                    actual_amount=EXCLUDED.actual_amount,
-                    actual_source_kind='EVIDENCE',
-                    source_evidence_id=EXCLUDED.source_evidence_id,
-                    source_reference=EXCLUDED.source_reference,
-                    updated_at_utc=now()
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "component_key": component_key,
-                "actual_amount": amount,
-                "evidence_id": evidence_id,
-                "source_reference": f"booking_form:{document_id}",
-            },
+            evidence_id=evidence_id,
         )
         written += 1
     return written
