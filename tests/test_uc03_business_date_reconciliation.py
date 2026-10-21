@@ -492,3 +492,44 @@ def test_actual_booking_date_rebinds_versions_without_deleting_evidence(
     assert "ACTUAL_BOOKING_DATE_REQUIRED" not in uc03_codes
     assert "BUSINESS_DATE_CONFIGURATION_MISSING" not in uc03_codes
     assert "BUSINESS_DATE_CONFIGURATION_RECONCILIATION_PENDING" not in uc03_codes
+
+
+def test_future_booking_date_is_a_validation_error_not_a_database_error(
+    historical_booking_setup,
+):
+    """A booking form misread as a day after today must not abort the copy
+    of the page: the writer refuses it with a validation error (which the
+    machine copy skips and sends to the PC) before the database trigger
+    would raise and poison the whole transaction (UTK-SU-261020-008)."""
+    from audit_core.errors import AuditCoreError
+
+    setup = historical_booking_setup
+    with setup["engine"].begin() as connection:
+        tomorrow = connection.execute(text("SELECT CURRENT_DATE + 2")).scalar_one()
+        with pytest.raises(AuditCoreError) as raised:
+            _identity_aware_write_typed_capture(
+                connection,
+                tenant_id=setup["tenant_id"],
+                journey_id=setup["journey_id"],
+                field_key="BOOKING_DATE",
+                value=tomorrow.isoformat(),
+                source_evidence_id=None,
+            )
+        assert "after today" in raised.value.detail
+        # The transaction is still usable: the next write goes through.
+        _identity_aware_write_typed_capture(
+            connection,
+            tenant_id=setup["tenant_id"],
+            journey_id=setup["journey_id"],
+            field_key="BOOKING_DATE",
+            value=setup["historical_date"].isoformat(),
+            source_evidence_id=None,
+        )
+        stored = connection.execute(
+            text(
+                "SELECT booking_date FROM auditcore.bookings "
+                "WHERE tenant_id = :tenant_id AND journey_id = :journey_id"
+            ),
+            {"tenant_id": setup["tenant_id"], "journey_id": setup["journey_id"]},
+        ).scalar_one()
+    assert stored == setup["historical_date"]
