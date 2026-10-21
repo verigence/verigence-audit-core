@@ -43,6 +43,7 @@ from audit_core.uc03_invoice_materialization import (
     FAMILY_VEHICLE,
     UNCLASSIFIED_DISCOUNT,
     VEHICLE_SALE_TYPES,
+    plausible_from,
     read_invoice,
     select_invoices,
 )
@@ -1007,11 +1008,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         di_types=tuple(dict.fromkeys(_INVOICE_TYPES + _ITEM_SOURCES + ("insurance_cover",) + tuple(_BOOKING_SOURCES))),
     )
     # Each invoice read on its own and counted once (2026-10-20, R1/R2).
-    booking_documents = [d for d in documents if d["documentType"] in ("booking_form", "booking_docket")]
-    booking_form = next((d for d in booking_documents if d["documentType"] == "booking_form"),
-                        booking_documents[0] if booking_documents else None)
-    selection = deal_invoices(documents, booking_date=parse_extracted_date(
-        booking_form["fields"].get("booking_date")) if booking_form else None)
+    selection = deal_invoices(documents, booking_date=plausible_from(
+        connection, tenant_id=tenant_id, journey_id=journey_id))
     read_ids = {str(r["documentId"]) for g in selection["groups"] for r in g["copies"]}
     # A document read here supersedes its own materialised rows; the
     # wholesale invoice is the dealer's purchase and never a customer line.

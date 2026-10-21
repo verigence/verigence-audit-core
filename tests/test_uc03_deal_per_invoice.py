@@ -771,3 +771,90 @@ def test_a_voided_booking_stage_invoice_leaves_the_canonical_tables_on_remateria
     discounts = _sql(journey, "SELECT actual_discount_amount, details->>'origin' FROM auditcore.discount_applications "
                               "WHERE tenant_id=:t AND journey_id=:j").all()
     assert discounts and all(a is None and o == "INVOICE_WITHDRAWN" for a, o in discounts)
+
+
+# ── final check of PR #470 (2026-10-21) ──────────────────────────────────────
+def _both_passes(journey):
+    from audit_core.uc03_delivery_post_extraction_materialization import (
+        materialize_booking_documents_from_durable_store,
+    )
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        im.sync_invoice_actuals(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                                stage_code="DELIVERY")
+        result = materialize_booking_documents_from_durable_store(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert not result.get("error"), result
+
+
+def test_one_invoice_problem_is_one_finding_and_one_task_across_both_passes(journey):
+    """FB1: the Booking and Delivery passes both re-check the invoices; the
+    problem is the journey's, raised once. A duplicate raised earlier under
+    the other stage key is closed (its task cancelled)."""
+    add_ready_document(journey, "customer_invoice_dms", **{**EXAMPLE, "vin_number": "MA1VEHICLE0000001"})
+    add_ready_document(journey, "customer_invoice_dms", **{**EXAMPLE, "invoice_number": "DMS/26/0901",
+                                                           "vin_number": "MA1VEHICLE0000002"})
+    _materialize(journey)  # a BOOKING-stage confirm
+    _both_passes(journey)
+    _both_passes(journey)
+    findings = _sql(journey, "SELECT stage_code, finding_status FROM auditcore.audit_findings WHERE tenant_id=:t "
+                             "AND journey_id=:j AND rule_key='MULTIPLE_VEHICLE_INVOICES' "
+                             "AND finding_status IN ('OPEN','ACKNOWLEDGED')").all()
+    assert findings == [("DELIVERY", "OPEN")]
+    tasks = _sql(journey, "SELECT count(*) FROM auditcore.workflow_tasks WHERE tenant_id=:t AND journey_id=:j "
+                          "AND task_type='INVOICE_DISCREPANCY_REVIEW' "
+                          "AND task_status IN ('PENDING','READY','CLAIMED','IN_PROGRESS','RETRY_WAIT')").scalar_one()
+    assert tasks == 1
+
+
+def test_a_value_written_for_an_invoice_on_file_is_stable_across_passes(journey):
+    """FS1: an invoice-held value with no review row yet (written for an
+    invoice not yet confirmed) stays put while that document is on file --
+    no flip-flop with the booking form on each pass."""
+    from audit_core.uc03_deal_source_history import upsert_commercial_actual
+
+    booking = add_ready_document(journey, "booking_form", tcs_amount="0")
+    invoice = add_ready_document(journey, "customer_invoice_dms", invoice_number="DMS/26/0815")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        upsert_commercial_actual(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                                 component_key="tcs_amount", amount=Decimal(0), document_type="booking_form",
+                                 document_id=booking, evidence_id=None)
+        upsert_commercial_actual(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                                 component_key="tcs_amount", amount=Decimal("8272.00"),
+                                 document_type="customer_invoice_dms", document_id=invoice, evidence_id=None)
+    for _ in range(2):
+        _both_passes(journey)
+        line = _line(journey, "tcs_amount")
+        assert line["actual_amount"] == Decimal("8272.00")
+        assert line["source_reference"] == f"customer_invoice_dms:{invoice}"
+
+
+def test_same_system_numbers_equal_only_after_ocr_with_different_totals_are_two_invoices():
+    """FN2: "CLR/26/0091" and "C1R/26/0091" from DMS with different totals
+    are two bills; the very same number printed twice is one bill."""
+    def bill(document_id, number, total):
+        return im.read_invoice("accessory_invoice_dms", {"invoice_number": number, "grand_total_amount": total},
+                               document_id=document_id)
+    two = im.select_invoices([bill("a", "CLR/26/0091", "7457.01"), bill("b", "C1R/26/0091", "2500")])
+    assert len(two["counted"]) == 2 and two["lines"]["accessories_cost"] == Decimal("9957.01")
+    assert len({g["key"] for g in two["groups"]}) == 2
+    same = im.select_invoices([bill("c", "C1R/26/0091", "7457.01"), bill("d", "C1R/26/0091", "2500")])
+    assert len(same["counted"]) == 1 and same["counted"][0]["disagreements"]
+    vehicles = im.select_invoices([_vehicle("v1", invoice_number="INV27O000668", vin_number=None),
+                                   _vehicle("v2", invoice_number="INV270000668", vin_number=None,
+                                            grand_total_amount="999000")])
+    assert vehicles["multipleVehicle"] is True
+
+
+def test_a_credit_note_names_an_invoice_only_by_its_whole_number():
+    """FN3: "101" inside other text does not name invoice 101; a short
+    number never names an invoice on its own."""
+    target = _vehicle("v", invoice_number="DMS/26/0815")
+    loose = _note("cn", narration="Refund ref 26/08150 against booking")  # a longer number, not 0815's
+    assert im.select_invoices([target, loose])["cancellationQuestions"]  # asked, not cancelled
+    labelled = _note("cn2", narration="Cancel No.DMS/26/0815")
+    assert len(im.select_invoices([target, labelled])["cancelled"]) == 2
+    short = _vehicle("s", invoice_number="101")
+    assert im.select_invoices([short, _note("cn3", narration="Cancel invoice 101")])["cancellationQuestions"]
