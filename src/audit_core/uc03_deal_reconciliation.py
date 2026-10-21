@@ -54,6 +54,7 @@ from audit_core.uc03_sku_candidates import (
     _price_plan_for_journey,
     journey_pricing_date,
     sync_price_master_in_force_task,
+    sync_sku_in_price_master_task,
 )
 from audit_core.workflow import create_workflow_task
 
@@ -833,6 +834,14 @@ def sync_deal_reconciliation(
             )
         except AuditCoreError:  # no effective price list yet
             return {"skipped": True, "reason": "no_effective_price_list"}
+
+        # The SKU withdrawn from the book in force (2026-10-20): a PC task,
+        # and the old book's standards cleared rather than left standing.
+        if sync_sku_in_price_master_task(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            found={"onDate": effective_on, "plan": plan, "reason": None},
+        ):
+            return {"skipped": True, "reason": "sku_not_in_price_list"}
 
         price_lines = _materialize_price_standards(
             connection,

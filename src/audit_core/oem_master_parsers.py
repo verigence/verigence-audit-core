@@ -361,6 +361,24 @@ def parse_price_list(content: bytes, *, filename: str | None = None) -> ParseRes
     if result.effective_from_hint is None and from_name is not None:
         result.effective_from_hint = from_name
         result.meta["effectiveFromSource"] = "FILENAME"
+    elif (
+        result.meta.get("layout") == "DEALER_PER_MODEL"
+        and from_name is not None
+        and from_name > result.effective_from_hint
+    ):
+        # A dealer sheet re-issued with additions keeps the month's
+        # "w.e.f. 01.09.2026" header while its name carries the day the
+        # additions came ("02 Nos Added EV PRICE -07th Sept'26"). Dating it
+        # by the header priced the two added BE 6 SPORTEQ variants from
+        # 01 Sep, before they existed, and dropped them from 03 Sep (2026-10-20
+        # review). The later date is the file's own: the admin can still
+        # enter another.
+        result.warnings.append(
+            f"The sheet says effective {result.effective_from_hint.isoformat()} but the file name says "
+            f"{from_name.isoformat()}; the later date, {from_name.isoformat()}, is applied. Enter a date to override."
+        )
+        result.effective_from_hint = from_name
+        result.meta["effectiveFromSource"] = "FILENAME"
     elif result.effective_from_hint is not None:
         result.meta["effectiveFromSource"] = "SHEET"
         if from_name is not None and from_name != result.effective_from_hint:

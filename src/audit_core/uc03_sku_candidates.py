@@ -109,12 +109,15 @@ def sync_price_master_in_force_task(
 
     found = journey_price_plan(connection, tenant_id=tenant_id, journey_id=journey_id)
     on = found["onDate"]
-    if on is None:
-        return found
-    if found["plan"] is not None:
+    if on is None or found["plan"] is not None:
+        # No pricing date any more (cleared): the question is gone, and
+        # PC_BOOKING_DATE_MISSING asks for the date.
         resolve_if_open(
             connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=_not_in_force_key(journey_id),
-            evidence={"priceListVersionId": str(found["plan"]["price_list_version_id"]), "onDate": on.isoformat()},
+            evidence={
+                "priceListVersionId": str(found["plan"]["price_list_version_id"]) if found["plan"] else None,
+                "onDate": on.isoformat() if on else None,
+            },
         )
         return found
     raise_or_refresh(
@@ -136,6 +139,109 @@ def sync_price_master_in_force_task(
         registry=get_registry(),
     )
     return found
+
+
+SKU_NOT_IN_PRICE_MASTER_TASK = "SKU_NOT_IN_PRICE_MASTER"
+# The open statuses of uc03_p2_task_producer (imported lazily there).
+_OPEN_TASK_STATUSES = ("READY", "IN_PROGRESS", "RETURNED", "ACTION_COMPLETED", "VERIFYING")
+
+
+def _sku_not_in_book_key(journey_id: UUID) -> str:
+    return f"sku-not-in-price-master:{journey_id}"
+
+
+def sync_sku_in_price_master_task(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, found: dict[str, Any] | None = None,
+) -> bool:
+    """The Journey's SKU is not in the price master in force on its pricing
+    date (a complete book withdrew it): raise "SKU <code> is not in the price
+    master for <date> — set the SKU" for the PC and clear the standards the
+    deal still carries from an older book, so no stale figure is compared
+    (2026-10-20 product owner rules, review of PR 468). Closes once the SKU
+    is in the book in force (another SKU set, the date corrected, a book
+    re-loaded). Returns True when the SKU is missing from the book."""
+    from audit_core.uc03_p2_registry import get_registry
+    from audit_core.uc03_p2_task_producer import raise_or_refresh, resolve_if_open
+
+    sku = connection.execute(
+        text(
+            """
+            SELECT jp.product_sku_id, s.sku_code
+            FROM auditcore.journey_products jp
+            JOIN auditcore.product_skus s ON s.product_sku_id = jp.product_sku_id
+            WHERE jp.tenant_id=:tenant_id AND jp.journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
+    found = found or journey_price_plan(connection, tenant_id=tenant_id, journey_id=journey_id)
+    plan, on = found["plan"], found["onDate"]
+    missing = bool(sku and plan) and connection.execute(
+        text(
+            "SELECT NOT EXISTS (SELECT 1 FROM auditcore.price_list_items WHERE tenant_id=:t "
+            "AND price_list_version_id=:v AND product_sku_id=:s)"
+        ),
+        {"t": tenant_id, "v": plan["price_list_version_id"], "s": sku["product_sku_id"]},
+    ).scalar_one()
+    if not missing:
+        resolve_if_open(
+            connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=_sku_not_in_book_key(journey_id),
+            evidence={"skuCode": sku["sku_code"] if sku else None, "reason": "SKU priced or no longer set"},
+        )
+        return False
+    connection.execute(
+        text(
+            "UPDATE auditcore.commercial_lines SET standard_amount = NULL, price_list_item_id = NULL "
+            "WHERE tenant_id=:t AND journey_id=:j AND price_list_item_id IS NOT NULL"
+        ),
+        {"t": tenant_id, "j": journey_id},
+    )
+    label = f"{plan.get('price_list_name') or plan.get('price_list_code')} v{plan.get('version_no')}"
+    raise_or_refresh(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        dedupe_key=_sku_not_in_book_key(journey_id),
+        task_type=SKU_NOT_IN_PRICE_MASTER_TASK,
+        source_type="RESOLVER",
+        source_code=SKU_NOT_IN_PRICE_MASTER_TASK,
+        title=f"SKU {sku['sku_code']} is not in the price master for {on.isoformat()} — set the SKU",
+        description=(
+            f"The vehicle on this Journey ({sku['sku_code']}) is not listed in the price master in force on "
+            f"{on.isoformat()} ({label}, from {plan.get('effective_from')}). The OEM withdrew or renamed it; "
+            "the deal has no standard price until the SKU is set to the vehicle sold."
+        ),
+        reference={
+            "sourceCode": SKU_NOT_IN_PRICE_MASTER_TASK,
+            "skuCode": sku["sku_code"],
+            "onDate": on.isoformat(),
+            "priceListVersionId": str(plan["price_list_version_id"]),
+        },
+        severity="MEDIUM",
+        registry=get_registry(),
+    )
+    return True
+
+
+def sweep_price_master_tasks(connection: Connection, *, tenant_id: str) -> int:
+    """After a price master is published: re-check every Journey with an open
+    "no price master in force" or "SKU not in the price master" task, so the
+    ones the new book covers close at once. Returns the Journeys checked."""
+    journeys = connection.execute(
+        text(
+            """
+            SELECT DISTINCT journey_id FROM auditcore.p2_tasks
+            WHERE tenant_id=:t AND task_type = ANY(:types)
+              AND task_status = ANY(:open)
+            """
+        ),
+        {"t": tenant_id, "types": [PRICE_MASTER_NOT_IN_FORCE_TASK, SKU_NOT_IN_PRICE_MASTER_TASK],
+         "open": list(_OPEN_TASK_STATUSES)},
+    ).scalars().all()
+    for journey_id in journeys:
+        found = sync_price_master_in_force_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+        sync_sku_in_price_master_task(connection, tenant_id=tenant_id, journey_id=journey_id, found=found)
+    return len(journeys)
 
 
 def _price_plan_for_journey(

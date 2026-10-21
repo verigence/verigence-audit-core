@@ -22,6 +22,7 @@ from audit_core.oem_master_parsers import parse_price_list
 from audit_core.oem_price_masters import ingest_price_list
 from audit_core.uc03_sku_candidates import (
     PRICE_MASTER_NOT_IN_FORCE_TASK,
+    SKU_NOT_IN_PRICE_MASTER_TASK,
     _price_plan_for_journey,
     journey_price_plan,
     journey_pricing_date,
@@ -108,10 +109,10 @@ def _set(c, **values) -> None:
               {**values, "t": c.tenant_id, "j": c.journey_id})
 
 
-def _task(c):
-    return c.execute(text("SELECT task_status, title FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
-                          "AND task_type=:k"), {"t": c.tenant_id, "j": c.journey_id,
-                                                "k": PRICE_MASTER_NOT_IN_FORCE_TASK}).mappings().one_or_none()
+def _task(c, kind=PRICE_MASTER_NOT_IN_FORCE_TASK):
+    return c.execute(text("SELECT task_status, title, assigned_role_code FROM auditcore.p2_tasks WHERE tenant_id=:t "
+                          "AND journey_id=:j AND task_type=:k"),
+                     {"t": c.tenant_id, "j": c.journey_id, "k": kind}).mappings().one_or_none()
 
 
 def test_the_pricing_date_is_the_applied_date_else_the_booking_date_never_today(journey) -> None:
@@ -179,3 +180,71 @@ def test_the_sku_pricing_panel_reads_the_book_of_the_pricing_date(journey) -> No
     assert next(m for m in panel["masterComponents"] if m["componentKey"] == "EX_SHOWROOM")["masterAmount"] == 852000.62
     _set(c, booking_date=date(2026, 8, 15))
     assert _sku_pricing_panel(c, tenant_id=c.tenant_id, journey_id=c.journey_id, reviewed_booking={}) is None
+
+
+def test_the_task_closes_when_the_pricing_date_is_cleared(journey) -> None:
+    """Review of PR 468, S5: no pricing date any more, nothing to say about a
+    book for it (PC_BOOKING_DATE_MISSING asks for the date)."""
+    c = journey
+    _set(c, booking_date=date(2026, 8, 15))
+    sync_price_master_in_force_task(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    _set(c, booking_date=None)
+    sync_price_master_in_force_task(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    assert _task(c)["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_publishing_the_missing_book_closes_the_task_without_a_journey_event(journey) -> None:
+    """Review of PR 468, S5: the task is raised for a Journey with no SKU,
+    and loading a book that covers its date closes it at once."""
+    c = journey
+    _set(c, booking_date=date(2026, 8, 20))
+    sync_price_master_in_force_task(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    assert _task(c)["task_status"] != "VERIFIED_COMPLETE"
+    oem_id = c.execute(text("SELECT oem_id FROM auditcore.projects WHERE tenant_id=:t"), {"t": c.tenant_id}).scalar_one()
+    stats: dict = {}
+    ingest_price_list(c, tenant_id=c.tenant_id, oem_id=oem_id, effective_from=date(2026, 8, 1),
+                      parsed=parse_price_list(_book(830_000.00)), actor_id="admin", stats=stats)
+    assert stats["journeysRechecked"] == 1
+    assert _task(c)["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_a_pinned_sku_withdrawn_from_the_book_raises_a_pc_task_and_clears_its_standard(journey) -> None:
+    """Review of PR 468, S4: a complete book that no longer lists the SKU
+    (the old Scorpio N in October) must say so: a PC task, and no standard
+    from an older book left standing."""
+    from audit_core.uc03_deal_reconciliation import sync_deal_reconciliation
+
+    c = journey
+    oem_id = c.execute(text("SELECT oem_id FROM auditcore.projects WHERE tenant_id=:t"), {"t": c.tenant_id}).scalar_one()
+    c.execute(text("INSERT INTO auditcore.journey_products (tenant_id, journey_id, product_sku_id, selection_status) "
+                   "VALUES (:t, :j, :s, 'CONFIRMED')"), {"t": c.tenant_id, "j": c.journey_id, "s": c.sku_id})
+    _set(c, booking_date=date(2026, 9, 20))
+    sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    standard = c.execute(text("SELECT standard_amount FROM auditcore.commercial_lines WHERE tenant_id=:t AND journey_id=:j "
+                              "AND component_key='ex_showroom_price'"), {"t": c.tenant_id, "j": c.journey_id}).scalar_one()
+    assert standard == Decimal("839501.15")
+
+    # A November book that no longer lists the vehicle.
+    wb_rows = _book(900_000.00)
+    from openpyxl import load_workbook
+
+    wb = load_workbook(BytesIO(wb_rows))
+    wb.active["C2"] = "MAXX HD"
+    buf = BytesIO()
+    wb.save(buf)
+    ingest_price_list(c, tenant_id=c.tenant_id, oem_id=oem_id, effective_from=date(2026, 11, 1),
+                      parsed=parse_price_list(buf.getvalue()), actor_id="admin")
+    _set(c, pricing_effective_on=date(2026, 11, 5))  # the deal priced on its (later) invoice date
+    result = sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert result == {"skipped": True, "reason": "sku_not_in_price_list"}
+    task = _task(c, SKU_NOT_IN_PRICE_MASTER_TASK)
+    assert task["assigned_role_code"] == "PC" and task["task_status"] != "VERIFIED_COMPLETE"
+    assert task["title"] == "SKU MAXX_CITY::MAXX CITY 1.5 LX BS6.2 is not in the price master for 2026-11-05 — set the SKU"
+    standard = c.execute(text("SELECT standard_amount, price_list_item_id FROM auditcore.commercial_lines WHERE tenant_id=:t "
+                              "AND journey_id=:j AND component_key='ex_showroom_price'"),
+                         {"t": c.tenant_id, "j": c.journey_id}).one()
+    assert tuple(standard) == (None, None)
+
+    _set(c, pricing_effective_on=date(2026, 10, 20))  # back on a date whose book lists it
+    sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert _task(c, SKU_NOT_IN_PRICE_MASTER_TASK)["task_status"] == "VERIFIED_COMPLETE"
