@@ -47,7 +47,7 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from audit_core.errors import AuditCoreError
-from audit_core.oem_master_parsers import variant_excluded
+from audit_core.oem_master_parsers import is_ev_model_text, variant_excluded
 from audit_core.uc03_booking_confirmation_rules import _has_active_document
 from audit_core.uc03_delivery_commands import _machine_flag
 from audit_core.uc03_manual_verification import _resolve_finding
@@ -408,6 +408,11 @@ _BRAND_SPELLINGS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _old_vehicle_readable(facts: list[dict[str, str]]) -> bool:
+    """Whether a document on file has been read for the old vehicle's maker or model."""
+    return any(fact.get("make") or fact.get("model") for fact in facts)
+
+
 def _old_vehicle_meets(requirement: dict[str, Any] | None, facts: list[dict[str, str]]) -> bool:
     """Whether an old vehicle on file meets a scheme's old-vehicle condition
     ("against old Maruti", "Tata Ace Family"). The brand is looked for in the
@@ -668,6 +673,7 @@ def _select_benefits(
     corporate_category: str | None,
     old_vehicles: list[dict[str, str]],
     unmatched: dict[str, list[dict[str, Any]]] | None = None,
+    unverified: dict[str, list[dict[str, Any]]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Decimal]]:
     """One benefit per canonical discount key, chosen deterministically, and
     the corporate amounts by category when the category is not known.
@@ -738,6 +744,10 @@ def _select_benefits(
             continue
         requirement = criteria.get("requiredOldVehicle")
         if requirement and not _old_vehicle_meets(requirement, old_vehicles):
+            # Nothing read about the old vehicle yet: the condition is not
+            # failed, it is unanswered (review of PR 472, N2).
+            if unverified is not None and not _old_vehicle_readable(old_vehicles):
+                unverified.setdefault(canonical_discount_key(str(row["benefit_key"])), []).append(row)
             continue
         outlet_rank = 0 if row.get("outlet_id") else (1 if row.get("dealer_id") else 2)
         rank = (
@@ -1027,25 +1037,37 @@ for _category, _keys in SCHEME_CATEGORY_DISCOUNT_KEYS.items():
         _BULLETIN_CATEGORIES[_key] = _group
 
 
-def _bulletins_in_force(connection: Connection, *, tenant_id: str, effective_on: date) -> set[str]:
-    """The scheme categories with a scheme whose standing version (the newest
-    started on or before the date) is still in force on it (a withdrawal
-    counts: the bulletin answered)."""
+def _bulletins_covering(
+    connection: Connection, *, tenant_id: str, model_id: UUID, effective_on: date,
+) -> set[str]:
+    """The scheme categories of the bulletins in force on the date that cover
+    this model: a scheme whose standing version (the newest started on or
+    before the date) is still in force and has a row on the model, matched or
+    not (review of PR 472, N1). A model no bulletin in force covers (BE 6,
+    XEV 9e in September: the BEV e-mail is not loaded) has no entitlement
+    known, never "none"."""
     return {
         str(r[0]) for r in connection.execute(
             text(
                 """
-                SELECT DISTINCT ON (v.discount_scheme_id) ds.scheme_category,
-                       (v.effective_to IS NULL OR v.effective_to >= :on) AS in_force
-                FROM auditcore.discount_scheme_versions v
-                JOIN auditcore.discount_schemes ds
-                  ON ds.tenant_id = v.tenant_id AND ds.discount_scheme_id = v.discount_scheme_id
-                WHERE v.tenant_id = :t AND v.lifecycle_status = 'PUBLISHED' AND v.effective_from <= :on
-                ORDER BY v.discount_scheme_id, v.effective_from DESC, v.created_at_utc DESC
+                WITH started AS (
+                    SELECT DISTINCT ON (v.discount_scheme_id) v.discount_scheme_version_id, ds.scheme_category,
+                           (v.effective_to IS NULL OR v.effective_to >= :on) AS in_force
+                    FROM auditcore.discount_scheme_versions v
+                    JOIN auditcore.discount_schemes ds
+                      ON ds.tenant_id = v.tenant_id AND ds.discount_scheme_id = v.discount_scheme_id
+                    WHERE v.tenant_id = :t AND v.lifecycle_status = 'PUBLISHED' AND v.effective_from <= :on
+                    ORDER BY v.discount_scheme_id, v.effective_from DESC, v.created_at_utc DESC
+                )
+                SELECT DISTINCT s.scheme_category FROM started s
+                WHERE s.in_force AND EXISTS (
+                    SELECT 1 FROM auditcore.discount_scheme_eligibility e
+                    WHERE e.tenant_id = :t AND e.discount_scheme_version_id = s.discount_scheme_version_id
+                      AND e.model_id = :m)
                 """
             ),
-            {"t": tenant_id, "on": effective_on},
-        ).all() if r[1]
+            {"t": tenant_id, "on": effective_on, "m": model_id},
+        ).all()
     }
 
 
@@ -1077,7 +1099,9 @@ def _materialize_discount_standards(
     management_referral: Decimal | None = None,
     correlation_id: str = "",
     unmatched: dict[str, list[dict[str, Any]]] | None = None,
-    bulletins_in_force: set[str] | None = None,
+    bulletins_covering: set[str] | None = None,
+    unverified: dict[str, list[dict[str, Any]]] | None = None,
+    model_name: str | None = None,
     grid_gap: str | None = None,
     effective_on: date | None = None,
 ) -> dict[str, Any]:
@@ -1096,12 +1120,34 @@ def _materialize_discount_standards(
         category is to be confirmed (NEEDS_CORPORATE_EVIDENCE) has no
         standard and is never an over-grant;
       * a discount given with an entitlement known to be none is NOT_ELIGIBLE.
-    ``bulletins_in_force`` None: not checked (every bulletin taken in force)."""
+      * an old-vehicle condition the evidence on file cannot answer yet (no
+        RC / valuation report / COD read) is OLD_VEHICLE_UNVERIFIED when the
+        discount given needs it (review of PR 472, N2); only a document that
+        is read and names another vehicle makes the condition fail;
+      * a loyalty bonus on a deal entitled to the COD scrappage bonus, which
+        the bulletin enters under the DMS "Loyalty" tab, is LOYALTY_MAY_BE_COD.
+    ``bulletins_covering`` (the categories of the bulletins in force that
+    cover the model) None: not checked."""
     existing = _discount_rows(connection, tenant_id=tenant_id, journey_id=journey_id)
     produced: set[str] = set()
     counts = {"eligible": 0, "unclaimed": 0, "informational": 0, "overGranted": 0, "needsCorporateEvidence": 0,
               "unknown": 0}
     unmatched = unmatched or {}
+    unverified = unverified or {}
+
+    def unverified_detail(key: str) -> list[dict[str, Any]]:
+        return [{"schemeCode": r.get("scheme_code"), "amount": str(_to_decimal(r.get("amount_value"))),
+                 "requiredOldVehicle": _json(r.get("criteria")).get("requiredOldVehicle")}
+                for r in unverified.get(key, [])]
+
+    def needs_old_vehicle(key: str, entitled: Decimal | None) -> bool:
+        """The discount given is above what is certain and a conditional row
+        whose condition cannot be checked yet would cover more."""
+        given_amount = claimed_amount(key)
+        best = max((_to_decimal(r.get("amount_value")) or Decimal(0) for r in unverified.get(key, [])),
+                   default=None)
+        return (given_amount is not None and best is not None and given_amount > (entitled or Decimal(0))
+                and best > (entitled or Decimal(0)))
 
     def invoice_actual(key: str) -> Decimal | None:
         row = existing.get(key)
@@ -1175,6 +1221,12 @@ def _materialize_discount_standards(
             write(key, standard=None, result="NOT_ELIGIBLE", dsv=benefit["discount_scheme_version_id"], details=details)
             counts["overGranted"] += 1
             continue
+        if is_claimed and needs_old_vehicle(key, amount):
+            unknown(key, "OLD_VEHICLE_UNVERIFIED",
+                    "the old vehicle's RC / valuation report is not on file or not read yet",
+                    certainAmount=str(amount) if amount is not None else None,
+                    conditionalSchemes=unverified_detail(key))
+            continue
         result = "ELIGIBLE" if is_claimed else "ELIGIBLE_UNCLAIMED"
         write(key, standard=amount, result=result, dsv=benefit["discount_scheme_version_id"], details=details)
         counts["eligible"] += 1
@@ -1243,11 +1295,29 @@ def _materialize_discount_standards(
                     "the scheme names variants the price list does not carry; to be mapped",
                     unmatchedMasters=_unmatched_detail(unmatched[key]))
             continue
+        if needs_old_vehicle(key, None):
+            unknown(key, "OLD_VEHICLE_UNVERIFIED",
+                    "the old vehicle's RC / valuation report is not on file or not read yet",
+                    conditionalSchemes=unverified_detail(key))
+            continue
+        cod = by_key.get("SCRAPPAGE_BONUS_COD")
+        if key == "WELCOME_BONUS" and cod is not None and not claimed("SCRAPPAGE_BONUS_COD") and (
+            claimed_amount(key) or Decimal(0)
+        ) <= (_to_decimal(cod.get("amount_value")) or Decimal(0)):
+            # The bulletin enters the COD scrappage bonus under the DMS
+            # "Loyalty" tab: a loyalty figure may be that bonus (open question
+            # with the product owner).
+            unknown(key, "LOYALTY_MAY_BE_COD",
+                    "may be the COD scrappage bonus, which the DMS records under Loyalty",
+                    codAmount=str(_to_decimal(cod.get("amount_value"))))
+            continue
         categories = _BULLETIN_CATEGORIES.get(key)
-        if bulletins_in_force is not None and categories and not set(categories) & bulletins_in_force:
+        if bulletins_covering is not None and categories and not set(categories) & bulletins_covering:
+            ev = is_ev_model_text(model_name)
             unknown(key, "SCHEME_NOT_IN_FORCE",
-                    f"no {categories[0].lower()} scheme bulletin is in force on "
-                    f"{effective_on.isoformat() if effective_on else 'the pricing date'}")
+                    f"no {'EV ' if ev else ''}{categories[0].lower()} scheme in force on "
+                    f"{effective_on.isoformat() if effective_on else 'the pricing date'} covers "
+                    f"{model_name or 'this model'}", ev=ev)
             continue
         write(key, standard=None, result="NOT_ELIGIBLE", dsv=None, details={"benefitKey": key})
         counts["overGranted"] += 1
@@ -1716,6 +1786,7 @@ def _declared_totals_check(reviewed: dict[str, Any], actuals: dict[str, Decimal]
 _MAPPING_TASK = "SCHEME_MASTER_UNMATCHED"
 _CORPORATE_TASK = "CORPORATE_CATEGORY_CONFIRM"
 _NOT_IN_FORCE_TASK = "DISCOUNT_SCHEME_NOT_IN_FORCE"
+_OLD_VEHICLE_TASK = "OLD_VEHICLE_EVIDENCE_CONFIRM"
 
 
 def _mapping_task_key(eligibility_id: Any) -> str:
@@ -1740,7 +1811,7 @@ def _sync_master_tasks(
     from audit_core.uc03_p2_task_producer import raise_or_refresh, resolve_if_open
 
     registry = get_registry()
-    counts = {"mapping": 0, "grid": 0, "notInForce": 0, "corporate": 0}
+    counts = {"mapping": 0, "grid": 0, "notInForce": 0, "corporate": 0, "oldVehicle": 0}
     rows = _discount_rows(connection, tenant_id=tenant_id, journey_id=journey_id)
     vehicle = f"{ctx.get('model_name') or ''} {ctx.get('variant_name') or ''}".strip()
 
@@ -1784,22 +1855,47 @@ def _sync_master_tasks(
     not_in_force = sorted(k for k, r in rows.items() if r.get("eligibility_result") == "SCHEME_NOT_IN_FORCE")
     key = f"discount-scheme-not-in-force:{journey_id}"
     if not_in_force:
+        ev = is_ev_model_text(ctx.get("model_name"))
+        kind = "EV scheme" if ev else "discount scheme"
         raise_or_refresh(
             connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key, task_type=_NOT_IN_FORCE_TASK,
             source_type="RESOLVER", source_code=_NOT_IN_FORCE_TASK,
-            title=f"No discount scheme in force on {effective_on.isoformat()}",
+            title=f"No {kind} loaded for {ctx.get('model_name') or 'this model'} on {effective_on.isoformat()}",
             description=(
-                f"{', '.join(k.replace('_', ' ').lower() for k in not_in_force)} given on this deal, priced on "
-                f"{effective_on.isoformat()}, and no bulletin for it is in force on that date (the last one has "
-                "ended): no standard, and no other month's scheme is applied. Load the bulletin for the date."
+                f"{', '.join(k.replace('_', ' ').lower() for k in not_in_force)} given on this deal "
+                f"({vehicle or 'this vehicle'}, priced on {effective_on.isoformat()}), and no {kind} in force on "
+                "that date covers the model: the discount is taken as given, with no standard, and no other "
+                "month's scheme is applied. Load the bulletin that covers it for the date."
             ),
-            reference={"sourceCode": _NOT_IN_FORCE_TASK, "onDate": effective_on.isoformat(), "keys": not_in_force},
+            reference={"sourceCode": _NOT_IN_FORCE_TASK, "onDate": effective_on.isoformat(), "keys": not_in_force,
+                       "model": ctx.get("model_name"), "ev": ev},
             severity="LOW", registry=registry,
         )
         counts["notInForce"] += 1
     else:
         resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
                         evidence={"onDate": effective_on.isoformat()})
+
+    unverified = sorted(k for k, r in rows.items() if r.get("eligibility_result") == "OLD_VEHICLE_UNVERIFIED")
+    key = f"old-vehicle-evidence:{journey_id}"
+    if unverified:
+        raise_or_refresh(
+            connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key, task_type=_OLD_VEHICLE_TASK,
+            source_type="RESOLVER", source_code=_OLD_VEHICLE_TASK,
+            title="Upload or confirm the old vehicle's RC / valuation report",
+            description=(
+                f"{', '.join(k.replace('_', ' ').lower() for k in unverified)} given on this deal depends on the "
+                "old vehicle (an \"against old Maruti\" or \"Tata Ace Family\" scheme), and no RC, valuation "
+                "report or COD on file has been read for its maker and model. Until it is, the discount is taken "
+                "as given; once read, it is checked against the scheme's condition."
+            ),
+            reference={"sourceCode": _OLD_VEHICLE_TASK, "keys": unverified},
+            severity="MEDIUM", registry=registry,
+        )
+        counts["oldVehicle"] = 1
+    else:
+        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                        evidence={"oldVehicleRead": True})
 
     key = f"corporate-category-confirm:{journey_id}"
     needs = (rows.get("CORPORATE_PRIVILEGE") or {}).get("eligibility_result") == "NEEDS_CORPORATE_EVIDENCE"
@@ -1954,6 +2050,7 @@ def _reconcile(
         product_sku_id=ctx["product_sku_id"], effective_on=effective_on,
     )
     unmatched: dict[str, list[dict[str, Any]]] = {}
+    unverified: dict[str, list[dict[str, Any]]] = {}
     benefits, corporate_candidates = _select_benefits(
         rows,
         variant_id=ctx["variant_id"],
@@ -1966,6 +2063,7 @@ def _reconcile(
         corporate_category=corporate["category"] if corporate else None,
         old_vehicles=_old_vehicle_facts(connection, tenant_id=tenant_id, journey_id=journey_id),
         unmatched=unmatched,
+        unverified=unverified,
     )
     reviewed = _reviewed_booking(connection, tenant_id=tenant_id, journey_id=journey_id)
     actuals = _actual_discounts_by_benefit(reviewed)
@@ -1987,7 +2085,11 @@ def _reconcile(
         management_referral=_management_referral(connection, tenant_id=tenant_id, journey_id=journey_id),
         correlation_id=correlation_id,
         unmatched=unmatched,
-        bulletins_in_force=_bulletins_in_force(connection, tenant_id=tenant_id, effective_on=effective_on),
+        bulletins_covering=_bulletins_covering(
+            connection, tenant_id=tenant_id, model_id=ctx["model_id"], effective_on=effective_on,
+        ),
+        unverified=unverified,
+        model_name=ctx.get("model_name"),
         grid_gap=grid_gap["reason"] if grid_gap else None,
         effective_on=effective_on,
     )

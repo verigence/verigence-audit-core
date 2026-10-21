@@ -231,6 +231,18 @@ task_types:
     actions:
     - COMPLETE_ACTION
     - ADD_COMMENT
+  # A discount that depends on the old vehicle ("against old Maruti", "Tata
+  # Ace Family") with no RC / valuation report read yet: the PC uploads or
+  # confirms it. Closes itself once the document is read (review of PR 472).
+  OLD_VEHICLE_EVIDENCE_CONFIRM:
+    category: CORRECTION_APPROVAL
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - COMPLETE_ACTION
+    - ADD_COMMENT
   # No discount scheme of the bulletins is in force on the deal's pricing
   # date (the month's bulletin is not loaded yet): the given discounts have
   # no standard, said so here rather than applying another month's scheme.

@@ -10,11 +10,13 @@ the newest upload in force on its pricing date. The old table stays as it is
 (the Masters page still reads it); nothing is dropped.
 
 Backfilled from the old table for the uploads it came from (tenant and date
-from ``oem_master_uploads``). Additive; idempotent.
+from ``oem_master_uploads``, read one tenant at a time under its row
+security). Additive; idempotent.
 """
 from __future__ import annotations
 
 from alembic import op
+from sqlalchemy import text
 
 revision = "0154_corporate_registry_entries"
 down_revision = "0153_source_values_per_document"
@@ -51,22 +53,31 @@ def upgrade() -> None:
         f"CREATE INDEX IF NOT EXISTS ix_{_TABLE}_name "
         f"ON auditcore.{_TABLE} (tenant_id, source_upload_id, lower(corporate_name))"
     )
-    # Backfill before row security is forced, so the migration role writes
-    # every tenant's rows.
-    op.execute(
-        f"""
-        INSERT INTO auditcore.{_TABLE} (
-            tenant_id, oem_code, source_upload_id, effective_from,
-            corporate_code, corporate_name, corporate_type, privilege_category, created_at_utc
+    # Backfill, one tenant at a time: oem_master_uploads is under forced row
+    # security, so its rows are read with that tenant set (as 0151 does).
+    bind = op.get_bind()
+    bind.execute(text("SELECT set_config('app.platform_super_admin', 'true', true)"))
+    tenants = [r[0] for r in bind.execute(text("SELECT tenant_id FROM auditcore.projects ORDER BY tenant_id")).all()]
+    for tenant in tenants:
+        bind.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant})
+        bind.execute(
+            text(
+                f"""
+                INSERT INTO auditcore.{_TABLE} (
+                    tenant_id, oem_code, source_upload_id, effective_from,
+                    corporate_code, corporate_name, corporate_type, privilege_category, created_at_utc
+                )
+                SELECT u.tenant_id, r.oem_code, r.source_upload_id, COALESCE(u.effective_from, r.effective_from),
+                       r.corporate_code, r.corporate_name, r.corporate_type, r.privilege_category, r.created_at_utc
+                FROM auditcore.corporate_privilege_registry r
+                JOIN auditcore.oem_master_uploads u ON u.upload_id = r.source_upload_id AND u.tenant_id = :t
+                WHERE COALESCE(u.effective_from, r.effective_from) IS NOT NULL
+                ON CONFLICT DO NOTHING
+                """
+            ),
+            {"t": tenant},
         )
-        SELECT u.tenant_id, r.oem_code, r.source_upload_id, COALESCE(u.effective_from, r.effective_from),
-               r.corporate_code, r.corporate_name, r.corporate_type, r.privilege_category, r.created_at_utc
-        FROM auditcore.corporate_privilege_registry r
-        JOIN auditcore.oem_master_uploads u ON u.upload_id = r.source_upload_id
-        WHERE COALESCE(u.effective_from, r.effective_from) IS NOT NULL
-        ON CONFLICT DO NOTHING
-        """
-    )
+    bind.execute(text("SELECT set_config('app.tenant_id', '', true)"))
     op.execute(f"ALTER TABLE auditcore.{_TABLE} ENABLE ROW LEVEL SECURITY")
     op.execute(f"ALTER TABLE auditcore.{_TABLE} FORCE ROW LEVEL SECURITY")
     op.execute(f"DROP POLICY IF EXISTS tenant_isolation_{_TABLE} ON auditcore.{_TABLE}")

@@ -250,6 +250,8 @@ ENTITLEMENT_UNKNOWN_RESULTS: frozenset[str] = frozenset({
     "NOT_EVALUATED",             # no SKU / pricing date / price list in force: not reconciled
     "SCHEME_NOT_IN_FORCE",       # no bulletin in force on the pricing date
     "NEEDS_CORPORATE_EVIDENCE",  # the corporate category is still to be confirmed
+    "OLD_VEHICLE_UNVERIFIED",    # an old-vehicle condition with no RC / valuation report read yet
+    "LOYALTY_MAY_BE_COD",        # a loyalty figure that may be the COD scrappage bonus (DMS Loyalty tab)
 })
 
 # OEM scheme_category -> the canonical discount keys it can grant.  Used to pick

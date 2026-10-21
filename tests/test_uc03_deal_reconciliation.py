@@ -424,10 +424,11 @@ def test_over_grant_flagged_not_eligible(journey) -> None:
     row = _discount(c, "CORPORATE_PRIVILEGE")
     assert row["eligibility_result"] == "SCHEME_NOT_IN_FORCE" and row["standard_eligible_amount"] is None
 
-    # A corporate policy in force that offers this deal nothing (its one
-    # scheme withdrawn): an over-grant.
-    assert seeded
-    _scheme(c, category="CORPORATE", effective_from=date(2000, 1, 1), benefits={}, eligibility=[])
+    # A corporate policy in force that covers the model and offers this deal
+    # nothing (its variant excluded): an over-grant.
+    _scheme(c, category="CORPORATE", effective_from=date(2000, 1, 1), benefits={"CORPORATE_PRIVILEGE": "5000"},
+            eligibility=[{"model_id": seeded["model_id"],
+                          "criteria": {"scope": "MODEL", "excludedVariantTexts": ["EL"]}}])
     result = dr.sync_deal_reconciliation(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
@@ -1539,3 +1540,103 @@ def test_s5_the_corporate_list_is_dated_per_tenant_and_an_inexact_name_is_a_pc_t
     row = _discount(c, "CORPORATE_PRIVILEGE")
     assert row["eligibility_result"] == "ELIGIBLE" and row["standard_eligible_amount"] == Decimal(10000)
     assert _p2_tasks(c, "CORPORATE_CATEGORY_CONFIRM")[0]["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_n1_a_model_no_bulletin_in_force_covers_is_not_known_ev_included(journey) -> None:
+    """BE 6 priced 10 Sep with 50,000 cash: the September consumer bulletin
+    (in force, covering XUV 3XO) does not list BE 6 and the BEV e-mail is not
+    loaded. Not NOT_ELIGIBLE and no shortfall: SCHEME_NOT_IN_FORCE, taken as
+    given, and a TL information task saying no EV scheme is loaded."""
+    c = journey
+    other = c.execute(text("INSERT INTO auditcore.product_models (oem_id, model_code, model_name) "
+                           "VALUES (:o, :mc, 'XUV 3XO') RETURNING model_id"),
+                      {"o": c.oem_id, "mc": f"M{uuid4().hex[:8]}"}).scalar_one()
+    _scheme(c, category="CONSUMER", effective_from=_SEPT_SCHEMES, benefits={"CASH_DISCOUNT": "30000"},
+            effective_to=date(2026, 9, 30), eligibility=[{"model_id": other, "criteria": {"scope": "MODEL"}}])
+    _seed_pinned_sku(c, model="BE 6", variant="PACK ONE ABOVE 59 kWh", effective_from=date(2026, 9, 1),
+                     components={"EX_SHOWROOM": "1990000"})
+    _price_on(c, _UTKAL_PRICING_DATE)
+    _seed_reviewed_booking(c, sales_discount_amount="50000")
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    c.execute(text("UPDATE auditcore.commercial_lines SET actual_amount=standard_amount, "
+                   "source_reference='booking_form:test' WHERE tenant_id=:t AND journey_id=:j"),
+              {"t": c.tenant_id, "j": c.journey_id})
+    result = dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    row = _discount(c, "CASH_DISCOUNT")
+    assert row["eligibility_result"] == "SCHEME_NOT_IN_FORCE" and row["standard_eligible_amount"] is None
+    assert _details(c, "CASH_DISCOUNT")["ev"] is True
+    assert Decimal(result["totals"]["variance"]) == 0
+    assert _open_finding(c, "DEAL_TOTAL_VARIANCE_NEGATIVE") is None
+    (task,) = _p2_tasks(c, "DISCOUNT_SCHEME_NOT_IN_FORCE")
+    assert task["reference"]["ev"] is True and task["assigned_role_code"] == "TL"
+
+
+def _welcome_masters(c):
+    seeded = _seed_pinned_sku(c, model="SUPRO", variant="Supro Maxi Profit Truck LX BS6.2",
+                              effective_from=date(2026, 9, 1), components={"EX_SHOWROOM": "700000"})
+    _scheme(c, category="WELCOME", effective_from=_SEPT_SCHEMES, benefits={"WELCOME_BONUS": "20000"},
+            eligibility=[{"model_id": seeded["model_id"], "criteria": {
+                "scope": "MODEL", "requiredOldVehicle": {"brand": "TATA", "model": "ACE"}}}])
+    _scheme(c, category="EXCHANGE", effective_from=_SEPT_SCHEMES, benefits={"EXCHANGE_BONUS": "35000"},
+            eligibility=[{"model_id": seeded["model_id"], "criteria": {"scope": "MODEL"}}])
+    _price_on(c, _UTKAL_PRICING_DATE)
+    return seeded
+
+
+def test_n2_a_welcome_bonus_with_no_rc_read_is_unverified_not_an_over_grant(journey) -> None:
+    c = journey
+    _welcome_masters(c)
+    _seed_reviewed_booking(c, loyalty_discount_amount="20000")
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    row = _discount(c, "WELCOME_BONUS")
+    assert row["eligibility_result"] == "OLD_VEHICLE_UNVERIFIED" and row["standard_eligible_amount"] is None
+    assert _sheet_discount(c, "WELCOME_BONUS")["takenAsGiven"] is True
+    (task,) = _p2_tasks(c, "OLD_VEHICLE_EVIDENCE_CONFIRM")
+    assert task["assigned_role_code"] == "PC" and task["task_status"] == "READY"
+
+    # An RC linked but nothing read from it: still unverified.
+    _link_evidence(c, "vehicle_rc")
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert _discount(c, "WELCOME_BONUS")["eligibility_result"] == "OLD_VEHICLE_UNVERIFIED"
+
+    # Read and a Tata Ace: entitled, and the task closes.
+    _old_vehicle_document(c, document_type="vehicle_rc", fields={"vehicle_model": "TATA MOTORS LTD / ACE GOLD"})
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    row = _discount(c, "WELCOME_BONUS")
+    assert row["eligibility_result"] == "ELIGIBLE" and row["standard_eligible_amount"] == Decimal(20000)
+    assert _p2_tasks(c, "OLD_VEHICLE_EVIDENCE_CONFIRM")[0]["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_n2_a_read_rc_naming_another_vehicle_fails_the_condition(journey) -> None:
+    c = journey
+    _welcome_masters(c)
+    _seed_reviewed_booking(c, loyalty_discount_amount="20000")
+    _old_vehicle_document(c, document_type="vehicle_rc", fields={"vehicle_model": "HYUNDAI MOTOR INDIA / I20"})
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert _discount(c, "WELCOME_BONUS")["eligibility_result"] == "NOT_ELIGIBLE"
+
+
+def test_n2_the_maruti_70000_with_no_rc_read_is_unverified(journey) -> None:
+    c = journey
+    _exchange_masters(c)
+    _seed_reviewed_booking(c, exchange_discount_amount="70000")
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    row = _discount(c, "EXCHANGE_BONUS")
+    assert row["eligibility_result"] == "OLD_VEHICLE_UNVERIFIED" and row["standard_eligible_amount"] is None
+    assert _details(c, "EXCHANGE_BONUS")["certainAmount"] == "50000.00"
+    assert _open_finding(c, "DEAL_TOTAL_VARIANCE_NEGATIVE") is None
+
+
+def test_a_loyalty_figure_that_may_be_the_cod_scrappage_bonus_is_not_an_over_grant(journey) -> None:
+    """The bulletin enters the COD scrappage bonus under the DMS "Loyalty"
+    tab, so a loyalty figure on a deal entitled to it may be that bonus."""
+    c = journey
+    seeded = _seed_pinned_sku(c, model="XUV 3XO", variant="AX5 PM MT", effective_from=date(2026, 9, 1),
+                              components={"EX_SHOWROOM": "1029900.54"})
+    _scheme(c, category="SCRAPPAGE", effective_from=_SEPT_SCHEMES, benefits={"SCRAPPAGE_BONUS_COD": "20000"},
+            eligibility=[{"model_id": seeded["model_id"], "criteria": {"scope": "MODEL"}}])
+    _price_on(c, _UTKAL_PRICING_DATE)
+    _seed_reviewed_booking(c, loyalty_discount_amount="20000")
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    row = _discount(c, "WELCOME_BONUS")
+    assert row["eligibility_result"] == "LOYALTY_MAY_BE_COD" and row["standard_eligible_amount"] is None
