@@ -1214,16 +1214,17 @@ def test_the_bolero_split_keeps_every_live_sku_pinned_and_priced(fresh_oem) -> N
     eligibility = sorted((r[0], r[1] is not None) for r in c.execute(text(
         "SELECT pm.model_name, e.variant_id FROM auditcore.discount_scheme_eligibility e "
         "JOIN auditcore.product_models pm ON pm.model_id = e.model_id WHERE pm.oem_id = :o"), {"o": c.oem_id}))
+    # A model-wide row covered all three models before and still does,
+    # whatever its scheme is named (re-review B3); the N10 row follows its
+    # variant.
     assert eligibility == [
-        ("BOLERO", False),           # the corporate row named the combined model: all three
-        ("BOLERO NEO", False),       # "Bolero Neo" model-wide
-        ("BOLERO NEO", False),       # corporate
-        ("BOLERO NEO", True),        # the N10 row follows its variant
-        ("BOLERO NEO PLUS", False),  # corporate
+        ("BOLERO", False), ("BOLERO", False),
+        ("BOLERO NEO", False), ("BOLERO NEO", False), ("BOLERO NEO", True),
+        ("BOLERO NEO PLUS", False), ("BOLERO NEO PLUS", False),
     ]
-    grid = c.execute(text("SELECT pm.model_name FROM auditcore.dealer_discount_grid_rows g JOIN auditcore.product_models pm "
-                          "ON pm.model_id = g.model_id WHERE pm.oem_id = :o"), {"o": c.oem_id}).scalars().all()
-    assert grid == ["BOLERO"]
+    grid = sorted(c.execute(text("SELECT pm.model_name FROM auditcore.dealer_discount_grid_rows g JOIN auditcore.product_models pm "
+                                 "ON pm.model_id = g.model_id WHERE pm.oem_id = :o"), {"o": c.oem_id}).scalars().all())
+    assert grid == ["BOLERO", "BOLERO NEO", "BOLERO NEO PLUS"]  # the one grid row covered all three
     assert _migration_0151().split_bolero_family(c) == {
         "models": 0, "variants": 0, "merged": 0, "skus": 0, "eligibility": 0, "grid": 0}  # idempotent
 
@@ -1374,3 +1375,58 @@ def test_a_refused_upload_is_recorded_and_a_preview_is_labelled(connection) -> N
                              {"t": tenant_id, "n": name}).scalars().all()
     engine.dispose()
     assert len(rows) == 1 and rows[0].startswith("1 unreconciled row(s)")
+
+
+_SEPT_EXCHANGE = "/mnt/user-data/uploads/mahindra/PriceMastersMahindra/Exchange scheme Sept'26 - Bhubaneswar (2) (2).pdf"
+
+
+@pytest.mark.skipif(not os.path.exists(_SEPT_EXCHANGE), reason="the real September exchange bulletin is not on this machine")
+def test_the_bolero_split_keeps_the_september_exchange_and_scrappage_for_all_three(fresh_oem) -> None:
+    """Re-review of PR 468, B3: the September exchange bulletin prints the
+    Bolero, Bolero Neo and Bolero Neo Plus rows (exchange 10,000, scrappage
+    dealer 20,000, scrappage COD 10,000). Loaded the way the dev code did,
+    against the combined model, each set became one scheme named after its
+    first row ("— Bolero") with model-wide rows covering all three. After
+    0151 the Neo and the Neo Plus must keep every one of them."""
+    from audit_core.oem_master_parsers import parse_master
+    from audit_core.oem_price_masters import ingest_discount_document
+
+    c = fresh_oem
+    _legacy_bolero(c)
+    oem_code = c.execute(text("SELECT oem_code FROM auditcore.oems WHERE oem_id = :o"), {"o": c.oem_id}).scalar_one()
+    # The alias table as it stood before 0151: every Bolero spelling named
+    # the combined model.
+    c.execute(text("""
+        INSERT INTO auditcore.oem_model_aliases (oem_code, alias_text, canonical_model_name)
+        SELECT :code, alias_text,
+               CASE WHEN upper(alias_text) LIKE 'BOL%' AND upper(alias_text) NOT LIKE '%MAXX%'
+                         AND upper(alias_text) NOT LIKE '%PIK%' AND upper(alias_text) NOT LIKE '%CAMPER%'
+                         AND upper(alias_text) NOT LIKE '%PICK%'
+                    THEN 'THE BOSS- BOLERO+NEO' ELSE canonical_model_name END
+        FROM auditcore.oem_model_aliases WHERE oem_code = 'MAHINDRA'"""), {"code": oem_code})
+    from pathlib import Path
+
+    parsed = parse_master("EXCHANGE_SCHEME", Path(_SEPT_EXCHANGE).read_bytes(), filename=os.path.basename(_SEPT_EXCHANGE))
+    ingest_discount_document(c, tenant_id=c.tenant_id, oem_id=c.oem_id, oem_code=oem_code, master_kind="EXCHANGE_SCHEME",
+                             effective_from=date(2026, 9, 3), parsed=parsed, actor_id="dev")
+
+    def sections() -> dict[str, set[tuple[str, str]]]:
+        out: dict[str, set[tuple[str, str]]] = {}
+        for model, section, benefit, amount in c.execute(text("""
+            SELECT pm.model_name, e.criteria->>'section', b.benefit_key, b.amount_value::text
+            FROM auditcore.discount_scheme_eligibility e
+            JOIN auditcore.product_models pm ON pm.model_id = e.model_id
+            JOIN auditcore.discount_scheme_benefits b
+              ON b.tenant_id = e.tenant_id AND b.discount_scheme_version_id = e.discount_scheme_version_id
+            WHERE pm.oem_id = :o"""), {"o": c.oem_id}).all():
+            out.setdefault(model, set()).add((section, f"{benefit} {Decimal(amount):.0f}"))
+        return out
+
+    before = sections()["THE BOSS- BOLERO+NEO"]
+    assert {("EXCHANGE_PERSONAL", "EXCHANGE_BONUS 10000"), ("SCRAPPAGE_DEALER", "SCRAPPAGE_BONUS_DEALER 20000"),
+            ("SCRAPPAGE_COD", "SCRAPPAGE_BONUS_COD 10000")} <= before
+    _migration_0151().split_bolero_family(c)
+    after = sections()
+    assert "THE BOSS- BOLERO+NEO" not in after
+    for model in ("BOLERO", "BOLERO NEO", "BOLERO NEO PLUS"):
+        assert after[model] == before, model

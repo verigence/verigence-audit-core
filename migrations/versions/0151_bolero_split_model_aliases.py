@@ -15,11 +15,12 @@ N4..N11, P4/P10).
    its series with its SKUs (same product_sku_id, same sku_code, so every
    Journey stays pinned and every published price row still prices it),
    and the configurations follow their variant. Discount-scheme
-   eligibility rows move with their variant; a model-wide row, and a
-   dealer-grid row, goes to the model its own wording names ("Bolero Neo"
-   -> BOLERO NEO, "Bolero Neo+" -> BOLERO NEO PLUS, "Bolero" -> BOLERO),
-   and to all three when it names the combined model (it applied to all
-   three before). The combined model keeps no variants and is deactivated.
+   eligibility rows move with their variant; a model-wide row goes to the
+   model of the single series its own variant texts name, else to all
+   three (what it covered before). A dealer-grid row goes to the model its
+   alias names ("BOLERO NEO" -> BOLERO NEO), and a model of the three that
+   no row of that grid version names takes the nearest row's terms. The
+   combined model keeps no variants and is deactivated.
 
 Idempotent: a second run finds no variants left on a combined model. Safe on
 a database with none of these rows. Published scheme versions are immutable
@@ -88,22 +89,23 @@ def split_bolero_family(bind) -> dict[str, int]:
     if not combined:
         return counts
     bind.execute(text("SELECT set_config('app.platform_super_admin', 'true', true)"))
+    # Transactional: a failure rolls the disable back with everything else,
+    # so there is no finally (it would run in the aborted transaction and
+    # hide the original error).
     bind.execute(text("ALTER TABLE auditcore.discount_scheme_eligibility DISABLE TRIGGER trg_discount_eligibility_draft_only"))
-    try:
-        for model in combined:
-            # The projects of this OEM: scheme and grid rows are tenant rows.
-            tenants = [r[0] for r in bind.execute(
-                text("SELECT tenant_id FROM auditcore.projects WHERE oem_id = :o"), {"o": model["oem_id"]}
-            ).all()]
-            targets = _ensure_targets(bind, model, counts)
-            _move_variants(bind, model, targets, tenants, counts)
-            _route_model_rows(bind, model, targets, tenants, counts)
-            bind.execute(text("UPDATE auditcore.product_models SET is_active = false WHERE model_id = :m "
-                              "AND NOT EXISTS (SELECT 1 FROM auditcore.product_variants v WHERE v.model_id = :m)"),
-                         {"m": model["model_id"]})
-    finally:
-        bind.execute(text("ALTER TABLE auditcore.discount_scheme_eligibility ENABLE TRIGGER trg_discount_eligibility_draft_only"))
-        bind.execute(text("SELECT set_config('app.tenant_id', '', true)"))
+    for model in combined:
+        # The projects of this OEM: scheme and grid rows are tenant rows.
+        tenants = [r[0] for r in bind.execute(
+            text("SELECT tenant_id FROM auditcore.projects WHERE oem_id = :o"), {"o": model["oem_id"]}
+        ).all()]
+        targets = _ensure_targets(bind, model, counts)
+        _move_variants(bind, model, targets, tenants, counts)
+        _route_model_rows(bind, model, targets, tenants, counts)
+        bind.execute(text("UPDATE auditcore.product_models SET is_active = false WHERE model_id = :m "
+                          "AND NOT EXISTS (SELECT 1 FROM auditcore.product_variants v WHERE v.model_id = :m)"),
+                     {"m": model["model_id"]})
+    bind.execute(text("ALTER TABLE auditcore.discount_scheme_eligibility ENABLE TRIGGER trg_discount_eligibility_draft_only"))
+    bind.execute(text("SELECT set_config('app.tenant_id', '', true)"))
     return counts
 
 
@@ -220,10 +222,12 @@ def _route_model_rows(bind, model, targets, tenants, counts) -> None:
             criteria = row["criteria"] or {}
             texts = [*(criteria.get("variantTexts") or []), *(criteria.get("unresolvedVariantTexts") or [])]
             series = {m.group(1) for m in (_SERIES_RE.match(t.upper()) for t in texts) if m}
-            wording = (row["scheme_name"] or "").split("—")[-1]
-            chosen = sorted(series) if len(series) == 1 else (
-                [series_of_text(wording)] if series_of_text(wording) else sorted(targets)
-            )
+            # Only the row's own variant texts narrow it. A scheme NAME is not
+            # evidence: the dev ingest named one scheme after the first of
+            # three bulletin rows ("Mahindra Exchange — Bolero") while its
+            # model-wide rows covered the Bolero, the Neo and the Neo Plus
+            # (re-review of PR 468, B3). Otherwise: all three, as before.
+            chosen = sorted(series) if len(series) == 1 else sorted(targets)
             first, *rest = [targets[s] for s in chosen]
             bind.execute(text("UPDATE auditcore.discount_scheme_eligibility SET model_id = :t "
                               "WHERE tenant_id = :tn AND eligibility_id = :e"),
@@ -245,9 +249,12 @@ def _route_model_rows(bind, model, targets, tenants, counts) -> None:
         grid = bind.execute(text(
             "SELECT * FROM auditcore.dealer_discount_grid_rows WHERE tenant_id = :t AND model_id = :m"
         ), {"t": tenant, "m": model["model_id"]}).mappings().all()
+        placed: dict[object, dict[str, object]] = {}
         for row in grid:
             series = series_of_text(row["model_alias"])
             chosen = [series] if series else sorted(targets)
+            for s_ in chosen:
+                placed.setdefault(row["grid_version_id"], {}).setdefault(s_, row)
             first, *rest = [targets[s] for s in chosen]
             bind.execute(text("UPDATE auditcore.dealer_discount_grid_rows SET model_id = :t "
                               "WHERE tenant_id = :tn AND grid_row_id = :g"),
@@ -267,6 +274,33 @@ def _route_model_rows(bind, model, targets, tenants, counts) -> None:
                                            "insurance_od_percent", "out_of_territory_amount")},
                     "model_id": other, "raw": json.dumps(row["raw"] or {})})
             counts["grid"] += len(chosen)
+        # A grid version whose rows covered the combined model covered all
+        # three: a model none of its rows names (the Neo Plus, when the grid
+        # prints "BOLERO" and "BOLERO NEO") takes the nearest row's terms.
+        for rows_by_series in placed.values():
+            for series in sorted(set(targets) - set(rows_by_series)):
+                source = next(rows_by_series[s_] for s_ in _NEAREST[series] if s_ in rows_by_series)
+                _copy_grid_row(bind, source, targets[series])
+                counts["grid"] += 1
+
+
+_NEAREST = {"P": ("N", "B"), "N": ("P", "B"), "B": ("N", "P")}
+
+
+def _copy_grid_row(bind, row, model_id) -> None:
+    bind.execute(text(
+        """
+        INSERT INTO auditcore.dealer_discount_grid_rows (
+            tenant_id, grid_version_id, model_alias, model_id, in_scope, booking_protection_days,
+            agreed_buffer_amount, insurance_od_percent, out_of_territory_amount, raw
+        ) VALUES (:tenant_id, :grid_version_id, :model_alias, :model_id, :in_scope,
+                  :booking_protection_days, :agreed_buffer_amount, :insurance_od_percent,
+                  :out_of_territory_amount, CAST(:raw AS jsonb))
+        """
+    ), {**{k: row[k] for k in ("tenant_id", "grid_version_id", "model_alias", "in_scope",
+                               "booking_protection_days", "agreed_buffer_amount",
+                               "insurance_od_percent", "out_of_territory_amount")},
+        "model_id": model_id, "raw": json.dumps({**(row["raw"] or {}), "copiedForBoleroSplit": True})})
 
 
 def upgrade() -> None:
@@ -283,9 +317,28 @@ def upgrade() -> None:
         [{"alias_text": a, "canonical_model_name": c} for a, c in _ALIASES.items()],
     )
     split_bolero_family(bind)
+    # The durable claim of the one-off price-master re-load
+    # (audit_core.oem_master_reload): one row per tag and tenant.
+    bind.execute(text(
+        """
+        CREATE TABLE IF NOT EXISTS auditcore.oem_master_reload_runs (
+            reload_tag       varchar(120) NOT NULL,
+            tenant_id        varchar(128) NOT NULL,
+            mode             varchar(10)  NOT NULL CHECK (mode IN ('DRY_RUN', 'COMMIT')),
+            status           varchar(20)  NOT NULL DEFAULT 'CLAIMED'
+                             CHECK (status IN ('CLAIMED', 'DRY_RUN_PASSED', 'DRY_RUN_FAILED', 'COMMITTED', 'FAILED')),
+            summary          jsonb        NOT NULL DEFAULT '{}'::jsonb,
+            claimed_at_utc   timestamptz  NOT NULL DEFAULT now(),
+            finished_at_utc  timestamptz,
+            PRIMARY KEY (reload_tag, tenant_id)
+        )
+        """
+    ))
+    bind.execute(text("GRANT SELECT, INSERT, UPDATE ON auditcore.oem_master_reload_runs TO audit_core_runtime"))
 
 
 def downgrade() -> None:
+    op.get_bind().execute(text("DROP TABLE IF EXISTS auditcore.oem_master_reload_runs"))
     # The catalogue split is not reversed (it would orphan SKUs priced under
     # the three models since); only the aliases go back.
     op.get_bind().execute(
