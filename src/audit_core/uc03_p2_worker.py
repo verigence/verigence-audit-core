@@ -3916,6 +3916,14 @@ def main() -> None:
 
         threading.Thread(target=run_diagnostics, args=(engine, diag_reports), name="diagnostics",
                          daemon=True).start()
+    # The one-off price-master re-load (2026-10-21): dry run unless the tag
+    # ends with "-commit"; once per tag and tenant.
+    reload_tag = os.environ.get("AUDIT_CORE_MASTER_RELOAD_TAG", "").strip()
+    if reload_tag:
+        from audit_core.oem_master_reload import run_master_reload
+
+        threading.Thread(target=run_master_reload, args=(engine, reload_tag), name="master-reload",
+                         daemon=True).start()
     sku_run_tag = os.environ.get("AUDIT_CORE_SKU_RUN_TAG", "").strip()
     if sku_run_tag:
         threading.Thread(target=_sku_run_once, args=(engine, sku_run_tag), name="sku-run", daemon=True).start()
