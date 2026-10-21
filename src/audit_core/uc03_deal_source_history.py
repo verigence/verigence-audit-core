@@ -124,19 +124,32 @@ ACTIVE_SOURCE_CONDITION = """
 """
 
 
+# The SQL twin of normalise_document_type.
+NORMALISED_TYPE_SQL = "trim(both '_' from regexp_replace(lower(s.source_document_type), '[^a-z0-9]+', '_', 'g'))"
+
+
 def active_source_rows(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
-    """Every per-source value on documents still on file, in a fixed order
-    (kind, component, type, document) -- never by when a row was last
-    re-written, which only says which document was re-processed last."""
+    """Every per-source value on documents still on file, one per (kind,
+    component, normalised type, document), in a fixed order -- never by when
+    a row was last re-written, which only says which document was
+    re-processed last. Two spellings of one type on one document (rows
+    written before migration 0153) are one source: the newest row stands,
+    so a stale spelling never wins (review S6)."""
     rows = connection.execute(
         text(
             f"""
-            SELECT s.line_kind, s.component_key, s.source_document_type, s.amount,
-                   s.source_document_id, s.source_evidence_id
-            FROM auditcore.commercial_line_source_values s
-            WHERE s.tenant_id = :tenant_id AND s.journey_id = :journey_id
-              AND {ACTIVE_SOURCE_CONDITION}
-            ORDER BY s.line_kind, s.component_key, s.source_document_type, s.source_document_id NULLS FIRST
+            SELECT line_kind, component_key, source_document_type, amount, source_document_id, source_evidence_id
+            FROM (
+                SELECT DISTINCT ON (s.line_kind, s.component_key, {NORMALISED_TYPE_SQL}, s.source_document_id)
+                       s.line_kind, s.component_key, {NORMALISED_TYPE_SQL} AS source_document_type, s.amount,
+                       s.source_document_id, s.source_evidence_id
+                FROM auditcore.commercial_line_source_values s
+                WHERE s.tenant_id = :tenant_id AND s.journey_id = :journey_id
+                  AND {ACTIVE_SOURCE_CONDITION}
+                ORDER BY s.line_kind, s.component_key, {NORMALISED_TYPE_SQL}, s.source_document_id,
+                         s.updated_at_utc DESC
+            ) newest
+            ORDER BY line_kind, component_key, source_document_type, source_document_id NULLS FIRST
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
@@ -154,18 +167,22 @@ def load_source_breakdown(
     rows = connection.execute(
         text(
             f"""
-            SELECT
-                s.line_kind             AS "lineKind",
-                s.component_key         AS "componentKey",
-                s.source_document_type  AS "sourceDocumentType",
-                s.amount                AS "amount",
-                s.source_evidence_id    AS "sourceEvidenceId",
-                s.source_document_id    AS "sourceDocumentId",
-                s.updated_at_utc        AS "updatedAtUtc"
-            FROM auditcore.commercial_line_source_values s
-            WHERE s.tenant_id = :tenant_id AND s.journey_id = :journey_id
-              AND {ACTIVE_SOURCE_CONDITION}
-            ORDER BY s.line_kind, s.component_key, s.source_document_type, s.source_document_id NULLS FIRST
+            SELECT * FROM (
+                SELECT DISTINCT ON (s.line_kind, s.component_key, {NORMALISED_TYPE_SQL}, s.source_document_id)
+                    s.line_kind             AS "lineKind",
+                    s.component_key         AS "componentKey",
+                    {NORMALISED_TYPE_SQL}   AS "sourceDocumentType",
+                    s.amount                AS "amount",
+                    s.source_evidence_id    AS "sourceEvidenceId",
+                    s.source_document_id    AS "sourceDocumentId",
+                    s.updated_at_utc        AS "updatedAtUtc"
+                FROM auditcore.commercial_line_source_values s
+                WHERE s.tenant_id = :tenant_id AND s.journey_id = :journey_id
+                  AND {ACTIVE_SOURCE_CONDITION}
+                ORDER BY s.line_kind, s.component_key, {NORMALISED_TYPE_SQL}, s.source_document_id,
+                         s.updated_at_utc DESC
+            ) newest
+            ORDER BY "lineKind", "componentKey", "sourceDocumentType", "sourceDocumentId" NULLS FIRST
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
@@ -292,6 +309,7 @@ def upsert_commercial_actual(
 
 __all__ = [
     "ACTIVE_SOURCE_CONDITION",
+    "NORMALISED_TYPE_SQL",
     "active_source_rows",
     "load_source_breakdown",
     "normalise_document_type",

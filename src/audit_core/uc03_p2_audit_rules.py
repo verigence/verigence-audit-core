@@ -634,7 +634,9 @@ def _invoice_bills(facts: _Facts) -> tuple[list[dict[str, Any]], list[str]]:
     bills: list[dict[str, Any]] = []
     unreadable: list[str] = []
     for group in selection["groups"]:
-        if group["family"] not in _COUNTED_FAMILIES:
+        # A vehicle invoice reversed in full by a credit note, and that
+        # credit note, are both left out (review S4).
+        if group["family"] not in _COUNTED_FAMILIES or group["cancelled"]:
             continue
         rep = group["representative"]
         label = rep["documentType"].replace("_", " ")

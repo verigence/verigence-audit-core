@@ -168,7 +168,13 @@ def test_the_wholesale_invoice_is_the_dealers_purchase_never_a_customer_line():
     reading = im.read_invoice("wholesale_invoice", {**EXAMPLE, "invoice_number": "WS-1"})
     assert reading["family"] == "WHOLESALE" and reading["lines"] == {} and reading["discounts"] == {}
     assert reading["dealerPurchase"]["exShowroom"] == Decimal("852000.00")
-    assert im.read_invoice("customer_invoice_dms", {"invoice_purpose": "VEHICLE_WHOLESALE"})["family"] == "WHOLESALE"
+    # The document type decides (review S9); a purpose naming another kind of
+    # invoice is a PC check, never a silent re-classification.
+    misread = im.read_invoice("customer_invoice_dms", {**EXAMPLE, "invoice_purpose": "VEHICLE_WHOLESALE"})
+    assert misread["family"] == "VEHICLE" and "PURPOSE_CONFLICTS_WITH_TYPE" in [i["code"] for i in misread["issues"]]
+    accessory = im.read_invoice("accessory_invoice_dms", {**EXAMPLE, "grand_total_amount": "7457.01"})
+    assert accessory["family"] == "ACCESSORY" and accessory["lines"] == {"accessories_cost": Decimal("7457.01")}
+    assert "PURPOSE_CONFLICTS_WITH_TYPE" in [i["code"] for i in accessory["issues"]]
 
 
 def test_an_accessory_invoice_bills_its_grand_total_and_checks_its_lines():
@@ -233,8 +239,9 @@ def test_the_example_invoice_end_to_end(journey):
 def test_two_vehicle_invoices_are_two_invoices_one_prices_the_deal_and_a_team_lead_is_asked(journey):
     first = add_ready_document(journey, "customer_invoice_dms", **{**EXAMPLE, "invoice_number": "DMS/26/0815",
                                                                   "invoice_date": "2026-10-05"})
+    # A different vehicle (VIN): two sale invoices, not two copies of one.
     second = add_ready_document(journey, "customer_invoice_dms", **{
-        **EXAMPLE, "invoice_number": "DMS/26/0901", "invoice_date": "2026-10-09",
+        **EXAMPLE, "invoice_number": "DMS/26/0901", "invoice_date": "2026-10-09", "vin_number": "MA1NE2XO3T4000002",
         "line_items": [], "invoice_discount_amount": "30000", "gross_amount_before_discount": "731017.32",
     })
     _materialize(journey)
@@ -444,3 +451,151 @@ def test_the_header_names_the_plan_used_and_no_price_master_shows_why(journey, m
     assert view["standardUnavailable"] == "No price master in force on 2026-10-05"
     assert _rows(view)["ex_showroom_price"]["standard"] is None
     assert view["summary"]["net"]["standard"] is None and view["summary"]["variance"]["currentVsStandard"] is None
+
+
+# ── review of PR #470 (2026-10-21) ───────────────────────────────────────────
+def _tally_copy(**overrides):
+    tally = {k: v for k, v in EXAMPLE.items() if k != "line_items"}
+    tally.update({"invoice_number": "TL/2231", **overrides})
+    return tally
+
+
+def test_dms_and_tally_copies_of_one_sale_with_different_numbers_are_one_invoice():
+    """Review B1: one vehicle (VIN) is one sale invoice, whatever number each
+    copy prints; a disagreement between them is flagged, never added."""
+    dms = im.read_invoice("customer_invoice_dms", EXAMPLE, document_id="dms")
+    tally = im.read_invoice("tax_invoice_tally", _tally_copy(), document_id="tally")
+    selection = im.select_invoices([dms, tally])
+    assert len(selection["counted"]) == 1 and selection["multipleVehicle"] is False
+    assert selection["netPayable"] == Decimal("827200.44")
+    assert selection["lines"]["ex_showroom_price"] == Decimal("852000.00")
+    # Different discount reading on the Tally copy: one invoice, flagged.
+    assert selection["counted"][0]["disagreements"]
+    other_vehicle = im.read_invoice("tax_invoice_tally", _tally_copy(vin_number="MA1OTHERVIN000009"),
+                                    document_id="other")
+    assert im.select_invoices([dms, other_vehicle])["multipleVehicle"] is True
+
+
+def test_dms_and_tally_accessory_bills_pair_by_total_and_date_else_the_pc_is_asked():
+    dms = im.read_invoice("accessory_invoice_dms", {"invoice_number": "ACC/DMS/0091", "invoice_date": "2026-10-05",
+                                                    "grand_total_amount": "7457.01"}, document_id="a")
+    same = im.read_invoice("accessory_invoice_tally", {"invoice_number": "TL-2231", "invoice_date": "2026-10-06",
+                                                       "grand_total_amount": "7457.01"}, document_id="b")
+    one = im.select_invoices([dms, same])
+    assert len(one["counted"]) == 1 and one["lines"]["accessories_cost"] == Decimal("7457.01")
+    assert one["sameBillQuestions"] == []
+    other = im.read_invoice("accessory_invoice_tally", {"invoice_number": "TL-2231", "invoice_date": "2026-10-06",
+                                                        "grand_total_amount": "4746.01"}, document_id="c")
+    two = im.select_invoices([dms, other])
+    assert len(two["counted"]) == 2 and two["lines"]["accessories_cost"] == Decimal("12203.02")
+    assert len(two["sameBillQuestions"]) == 1
+
+
+def test_a_vehicle_line_rate_counts_only_when_it_agrees_with_the_header():
+    accessory = {"line_category": "ACCESSORY_GENUINE", "description_raw": "Mats", "net_amount": "5900"}
+    vehicle_line = {"line_category": "VEHICLE", "gross_amount": "722033.90", "taxable_amount": "701017.32"}
+    # 9% on the line = each of CGST and SGST: agrees with the header's 18%.
+    per_component = im.read_invoice("customer_invoice_dms", {**EXAMPLE, "line_items": [
+        {**vehicle_line, "tax_rate": 9}, accessory,
+        *[li for li in EXAMPLE["line_items"] if li["line_category"] == "DISCOUNT_LINE"]]})
+    assert per_component["lines"]["ex_showroom_price"] == Decimal("852000.00")
+    assert per_component["lines"]["accessories_cost"] == Decimal(5900)
+    # 28% on the line against 18% on the header: unclear, no figure.
+    disagree = im.read_invoice("customer_invoice_dms", {**EXAMPLE, "line_items": [{**vehicle_line, "tax_rate": 28}]})
+    assert "ex_showroom_price" not in disagree["lines"]
+    assert [i["code"] for i in disagree["issues"]] == ["RATE_UNCLEAR"]
+
+
+def test_a_vehicle_price_mixed_with_add_ons_is_not_read_from_the_header():
+    reading = im.read_invoice("customer_invoice_dms", {**EXAMPLE, "line_items": [
+        {"line_category": "VEHICLE", "description_raw": "XUV 3XO"},
+        {"line_category": "FASTAG", "net_amount": "500"}]})
+    assert "ex_showroom_price" not in reading["lines"] and reading["lines"]["fastag_amount"] == Decimal(500)
+    assert "VEHICLE_LINE_NOT_READ" in [i["code"] for i in reading["issues"]]
+
+
+def test_a_rate_printed_on_one_component_is_never_doubled_blindly():
+    base = {k: v for k, v in EXAMPLE.items() if k not in ("sgst_rate", "line_items")}
+    total_in_cgst = im.read_invoice("customer_invoice_dms", {**base, "cgst_rate": "18"})
+    assert total_in_cgst["vehicle"]["gstRate"] == Decimal("0.18")
+    assert total_in_cgst["lines"]["ex_showroom_price"] == Decimal("852000.00")
+    per_component = im.read_invoice("customer_invoice_dms", {**base, "cgst_rate": "9"})
+    assert per_component["vehicle"]["gstRate"] == Decimal("0.18")
+    unconfirmed = im.read_invoice("customer_invoice_dms", {
+        k: v for k, v in base.items() if k not in ("cgst_amount", "sgst_amount")})
+    assert "ex_showroom_price" not in unconfirmed["lines"]
+    assert "RATE_UNCLEAR" in [i["code"] for i in unconfirmed["issues"]]
+
+
+def test_a_credit_note_reversing_a_vehicle_invoice_cancels_it():
+    """Review S4: invoice 0815, a credit note for its whole total naming it,
+    then a reissue: the reissue alone is billed, no discount appears."""
+    original = im.read_invoice("customer_invoice_dms", {**EXAMPLE, "invoice_date": "2026-10-10"}, document_id="o")
+    note = im.read_invoice("credit_note", {"invoice_number": "CN-5", "grand_total_amount": "827200.44",
+                                          "narration": "Cancellation of invoice DMS/26/0815"}, document_id="cn")
+    reissue = im.read_invoice("customer_invoice_dms", {**EXAMPLE, "invoice_number": "DMS/26/0901",
+                                                       "invoice_date": "2026-10-15"}, document_id="r")
+    selection = im.select_invoices([original, note, reissue])
+    assert selection["multipleVehicle"] is False
+    assert selection["vehicle"]["representative"]["documentId"] == "r"
+    assert selection["netPayable"] == Decimal("827200.44")
+    # Only the reissue's own dealer discount; the credit note adds none.
+    assert selection["discounts"]["ADDITIONAL_DISCOUNT"]["amount"] == Decimal("10000.00")
+    assert {r["documentId"] for g in selection["cancelled"] for r in g["copies"]} == {"o", "cn"}
+    partial = im.read_invoice("credit_note", {"invoice_number": "CN-6", "grand_total_amount": "5000",
+                                             "narration": "Against invoice DMS/26/0901"}, document_id="p")
+    kept = im.select_invoices([reissue, partial])
+    assert kept["discounts"]["ADDITIONAL_DISCOUNT"]["amount"] == Decimal("15000.00")
+    assert kept["netPayable"] == Decimal("822200.44")
+
+
+def test_a_generic_copy_without_a_purpose_joins_the_vehicle_invoice():
+    dms = im.read_invoice("customer_invoice_dms", EXAMPLE, document_id="dms")
+    generic = im.read_invoice("invoice_generic", {k: v for k, v in EXAMPLE.items() if k != "invoice_purpose"},
+                              document_id="generic")
+    assert generic["family"] == "OTHER"
+    selection = im.select_invoices([dms, generic])
+    assert len(selection["counted"]) == 1 and selection["netPayable"] == Decimal("827200.44")
+
+
+def test_the_shared_r1_reading_for_every_caller():
+    reading = im.vehicle_invoice_ex_showroom(EXAMPLE)
+    assert reading["exShowroom"] == Decimal("852000.00") and reading["rate"] == Decimal("0.18")
+    assert reading["saleValue"] == Decimal("827200.44") and reading["issues"] == []
+    assert reading["discounts"]["CASH_DISCOUNT"] == {"amount": Decimal("13000.06"), "printed": Decimal("11017.00")}
+
+
+def test_a_stale_spelling_of_a_type_never_wins(journey):
+    """Review S6: two spellings of one type on one document (rows written
+    before 0153): the newest row stands."""
+    from audit_core.uc03_deal_source_history import active_source_rows
+
+    booking = add_ready_document(journey, "booking_docket", insurance_amount="47000")
+    for spelling, amount, age in (("booking docket", "45000", "2 days"), ("booking_docket", "47000", "1 hour")):
+        _sql(journey, "INSERT INTO auditcore.commercial_line_source_values (tenant_id, journey_id, line_kind, "
+                      "component_key, source_document_type, amount, source_document_id, updated_at_utc) "
+                      "VALUES (:t, :j, 'COMMERCIAL', 'insurance_amount', :d, :a, :doc, now() - CAST(:age AS interval))",
+             d=spelling, a=amount, doc=booking, age=age)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        rows = active_source_rows(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert [(r["source_document_type"], r["amount"]) for r in rows] == [("booking_docket", Decimal(47000))]
+    assert Decimal(_rows(_deal(journey))["insurance_amount"]["booking"]) == 47000
+
+
+def test_a_line_awaiting_its_document_with_no_booking_figure_is_listed_not_priced(journey):
+    """Review S7: no booking figure -> awaiting with no amount, out of both
+    nets and Balance due, listed under "awaiting"; never the standard."""
+    _sql(journey, "INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, standard_amount) "
+                  "VALUES (:t, :j, 'ex_showroom_price', 852000), (:t, :j, 'registration_charges', 90000), "
+                  "(:t, :j, 'rsa_amount', 2021)")
+    add_ready_document(journey, "customer_invoice_dms", **EXAMPLE)
+    view = _deal(journey)
+    rows, summary = _rows(view), view["summary"]
+    assert rows["road_tax_registration"]["awaiting"] == "RTO challan" and rows["road_tax_registration"]["current"] is None
+    assert rows["rsa_amount"]["awaiting"] == "RSA invoice" and rows["rsa_amount"]["current"] is None
+    assert {a["key"] for a in summary["awaiting"]} == {"road_tax_registration", "rsa_amount"}
+    assert summary["awaitingDocuments"] == 2
+    assert Decimal(summary["net"]["current"]) == Decimal("827200.44")
+    assert Decimal(summary["net"]["standard"]) == 852000
+    assert Decimal(summary["balanceDue"]) == Decimal("827200.44")

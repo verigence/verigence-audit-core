@@ -51,11 +51,13 @@ def _check(journey) -> rules.RuleOutcome:
 
 def _bill(journey) -> None:
     """Rs 5,15,000 billed: vehicle 5,00,000 (the DMS and Tally copies of one
-    invoice number), accessories 20,000 (uploaded twice), less a 5,000
-    credit note. The dealer's own wholesale invoice is on file too and is
-    not the customer's."""
-    add_ready_document(journey, "customer_invoice_dms", invoice_number="INV-1", grand_total_amount="500000")
-    add_ready_document(journey, "tax_invoice_tally", invoice_number="INV 1", grand_total_amount="500000")
+    sale: different numbers, one vehicle), accessories 20,000 (uploaded
+    twice), less a 5,000 credit note. The dealer's own wholesale invoice is
+    on file too and is not the customer's."""
+    add_ready_document(journey, "customer_invoice_dms", invoice_number="DMS-1", vin_number="MA1VIN0001",
+                       grand_total_amount="500000")
+    add_ready_document(journey, "tax_invoice_tally", invoice_number="TL-1", vin_number="MA1VIN0001",
+                       grand_total_amount="500000")
     add_ready_document(journey, "accessory_invoice_dms", invoice_number="ACC-1", grand_total_amount="20000")
     add_ready_document(journey, "accessory_invoice_dms", invoice_number="ACC-1", grand_total_amount="20000")
     add_ready_document(journey, "credit_note", invoice_number="CN-1", grand_total_amount="5000")
@@ -91,6 +93,25 @@ def test_receipts_short_of_the_invoices_fail_with_the_gap(journey):
     assert result.outcome == "FAIL"
     assert Decimal(result.details["difference"]) == Decimal(-104000)
     assert "short of the 3 invoices" in result.reason
+
+
+def test_dms_and_tally_copies_of_one_sale_with_different_numbers_count_once(journey):
+    """Review B1: the DMS and the Tally copy of one vehicle sale may print
+    different numbers; one vehicle (VIN) is one sale invoice."""
+    add_ready_document(journey, "customer_invoice_dms", invoice_number="DMS-1", vin_number="MA1VIN0001",
+                       grand_total_amount="500000")
+    add_ready_document(journey, "tax_invoice_tally", invoice_number="TL-1", vin_number="MA1VIN0001",
+                       grand_total_amount="500000")
+    add_ready_document(journey, "accessory_invoice_dms", invoice_number="ACC/DMS/0091", invoice_date="2026-10-05",
+                       grand_total_amount="7457.01")
+    add_ready_document(journey, "accessory_invoice_tally", invoice_number="TL-2231", invoice_date="2026-10-05",
+                       grand_total_amount="7457.01")
+    _delivered(journey, days_ago=30)
+    add_receipt_payment(journey, amount="507457.01", receipt_number="R-1", receipt_date="2026-09-01")
+    result = _check(journey)
+    assert result.outcome == "PASS", result.reason
+    assert Decimal(result.details["invoiced"]) == Decimal("507457.01")
+    assert len(result.details["invoices"]) == 2
 
 
 def test_a_tally_invoice_with_its_own_number_is_a_separate_invoice(journey):

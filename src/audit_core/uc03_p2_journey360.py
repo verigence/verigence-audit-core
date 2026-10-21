@@ -1343,11 +1343,12 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
                     if row["standard"] is not None:
                         row["flags"] = [*row["flags"], "NOT_INVOICED"]
             else:
-                placeholder = row["booking"] if row["booking"] is not None else (
-                    None if optional else row["standard"])
-                row["current"] = placeholder
-                row["currentSource"] = ("booking" if row["booking"] is not None else "standard") \
-                    if placeholder is not None else None
+                # The booking figure only (review S7): with none, the line is
+                # awaiting with no amount, out of Current net and Balance
+                # due, and listed under "awaiting" -- never the master's
+                # standard, which the customer may never be charged.
+                row["current"] = row["booking"]
+                row["currentSource"] = "booking" if row["booking"] is not None else None
                 # Its document on file without a readable figure for it is
                 # still awaited (the figure is to be read), never a nil.
                 row["awaiting"] = _LINE_DOCUMENT_LABELS[document] + (
@@ -1419,6 +1420,10 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     insurance["vehicleInvoiced"] = vehicle_on_file
 
     counted_rows = [r for r in all_rows if not r.get("excluded") and not r.get("partOf")]
+    # A line awaiting its document with no booking figure is in neither net
+    # (it is listed under "awaiting"), so it is never a variance of its own.
+    awaiting_unpriced = [r for r in counted_rows if r["awaiting"] and r["current"] is None]
+    counted_rows = [r for r in counted_rows if r not in awaiting_unpriced]
     standard_discounts = [r for r in discount_rows if r["inStandard"]]
     for group in groups:
         group["totals"] = {
@@ -1520,6 +1525,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
                 "family": reading["family"],
                 "netPayable": _money(reading["netPayable"]),
                 "counted": bool(group["counted"] and reading is group["representative"]),
+                "cancelledBy": reading.get("cancelled"),
+                "cancels": reading.get("cancels"),
                 "sameInvoiceAs": [r["documentId"] for r in group["copies"] if r is not reading],
                 "issues": reading["issues"],
                 "disagreements": group["disagreements"],
@@ -1576,6 +1583,11 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
                 "awaiting": str(awaiting_delta) if any(r["awaiting"] for r in counted_rows + discount_rows) else None,
             },
             "invoicedComponents": invoiced,
+            # Lines awaiting their own document with no figure yet: not in
+            # Current net, Standard net or Balance due.
+            "awaiting": [{"key": r["key"], "label": r["label"], "document": r["awaiting"],
+                          "standard": r["standard"]} for r in awaiting_unpriced],
+            "awaitingDocuments": len({r["awaiting"] for r in awaiting_unpriced}),
             # True once a customer invoice is on file: current and every
             # variance are then the invoices' figures (lines awaiting their
             # own document excepted).

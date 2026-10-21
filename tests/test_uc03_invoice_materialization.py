@@ -74,8 +74,9 @@ def test_derive_commercials_vehicle_line_fallback_when_no_header_figures() -> No
     out = im.derive_commercials(
         {
             "invoice_purpose": "VEHICLE_SALE",
+            # A line rate alone counts only when the line's own tax confirms it.
             "line_items": [{"line_category": "VEHICLE", "gross_amount": "1450000", "taxable_amount": "1450000",
-                            "tax_rate": "28"}],
+                            "tax_rate": "28", "tax_amount": "406000"}],
         }
     )
     assert out == {"ex_showroom_price": Decimal("1856000.00")}
@@ -269,7 +270,9 @@ def test_tax_invoice_persisted_and_projected(journey) -> None:
             "tcs_amount": "16000",
             "invoice_discount_amount": "20000",
             "grand_total_amount": "1904000",
-            "line_items": [{"line_category": "EXTENDED_WARRANTY", "net_amount": "12000"}],
+            # With an add-on line the vehicle is read from its own line.
+            "line_items": [{"line_category": "VEHICLE", "gross_amount": "1620000", "taxable_amount": "1600000"},
+                           {"line_category": "EXTENDED_WARRANTY", "net_amount": "12000"}],
         })],
     )
     assert result["invoices"] == 1
@@ -285,7 +288,7 @@ def test_tax_invoice_persisted_and_projected(journey) -> None:
     assert row["taxable_amount"] == Decimal(1600000)
     assert row["document_type_key"] == "tax_invoice_tally"
 
-    # 2026-10-20 (R1): (taxable 16,00,000 + its own discount 20,000) x 1.18.
+    # 2026-10-20 (R1): the vehicle line's selling price 16,20,000 x 1.18.
     ex = _commercial(c, "ex_showroom_price")
     assert ex["actual_amount"] == Decimal("1911600.00")
     assert ex["source_reference"].startswith("tax_invoice_tally:")

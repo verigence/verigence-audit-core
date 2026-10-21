@@ -444,8 +444,16 @@ def condition_reasons(connection: Connection, *, tenant_id: str, journey_id: UUI
              AND e.association_status='ACTIVE'
             WHERE f.tenant_id=:t AND f.journey_id=:j
             UNION ALL
-            SELECT component_key, to_jsonb(amount), source_document_type
-            FROM auditcore.commercial_line_source_values WHERE tenant_id=:t AND journey_id=:j
+            -- 2026-10-20 (review S8): a value from a voided or superseded
+            -- document no longer makes a condition true.
+            SELECT s.component_key, to_jsonb(s.amount), s.source_document_type
+            FROM auditcore.commercial_line_source_values s WHERE s.tenant_id=:t AND s.journey_id=:j
+              AND NOT EXISTS (
+                SELECT 1 FROM auditcore.evidence e
+                WHERE e.tenant_id = s.tenant_id AND e.journey_id = s.journey_id
+                  AND (e.di_document_id = s.source_document_id OR e.evidence_id = s.source_evidence_id)
+                  AND e.association_status <> 'ACTIVE'
+              )
             UNION ALL
             SELECT discount_key, to_jsonb(actual_discount_amount), 'deal'
             FROM auditcore.discount_applications WHERE tenant_id=:t AND journey_id=:j

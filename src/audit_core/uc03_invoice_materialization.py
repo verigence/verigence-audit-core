@@ -242,7 +242,7 @@ _RATE_PLACES = Decimal("0.0001")
 # Readings that leave a line without a figure (as opposed to a check that
 # does not add up): a copy with one of these never stands for its invoice
 # while a complete copy exists.
-_BLOCKING_ISSUES = frozenset({"TAXES_NOT_READ", "PRICE_NOT_READ"})
+_BLOCKING_ISSUES = frozenset({"TAXES_NOT_READ", "PRICE_NOT_READ", "RATE_UNCLEAR", "VEHICLE_LINE_NOT_READ"})
 
 
 def _to_decimal(value: Any) -> Decimal | None:
@@ -340,7 +340,7 @@ def _discount_line_amount(item: dict[str, Any]) -> Decimal | None:
     printed before tax), as a positive figure."""
     for key in ("taxable_amount", "gross_amount", "discount_amount", "net_amount"):
         amount = _to_decimal(item.get(key))
-        if amount is not None:
+        if amount:  # a printed zero is no figure; read the next one
             return abs(amount)
     rate = _to_decimal(item.get("unit_rate"))
     if rate is None:
@@ -385,24 +385,43 @@ def _header_values(raw: dict[str, Any]) -> dict[str, Any]:
 
 # ── reading one invoice on its own (R1, R2) ──────────────────────────────────
 def invoice_family(document_type: Any, raw: dict[str, Any]) -> str:
-    """What an invoice bills, from its printed nature and purpose, else its
-    document type. The OEM's wholesale invoice is never a customer bill."""
+    """What an invoice bills. The document type decides first (2026-10-20,
+    review S9: an accessory invoice whose reading says "vehicle sale" is
+    still an accessory invoice); the printed nature and purpose only decide
+    for a generic invoice or an unknown type. The OEM's wholesale invoice
+    is never a customer bill."""
     kind = normalise_document_type(document_type)
-    nature = _upper(raw.get("invoice_nature")).replace(" ", "_")
-    if kind == "credit_note" or nature == "CREDIT_NOTE":
+    if kind == "credit_note":
         return FAMILY_CREDIT_NOTE
-    if kind == "debit_note" or nature == "DEBIT_NOTE":
+    if kind == "debit_note":
         return FAMILY_DEBIT_NOTE
     if kind == "wholesale_invoice":
         return FAMILY_WHOLESALE
-    purpose = _upper(raw.get("invoice_purpose")).replace(" ", "_")
-    if purpose in _FAMILY_BY_PURPOSE:
-        return _FAMILY_BY_PURPOSE[purpose]
     if kind in _FAMILY_BY_TYPE:
         return _FAMILY_BY_TYPE[kind]
     if kind in VEHICLE_SALE_TYPES:
         return FAMILY_VEHICLE
-    return FAMILY_OTHER
+    nature = _upper(raw.get("invoice_nature")).replace(" ", "_")
+    if nature == "CREDIT_NOTE":
+        return FAMILY_CREDIT_NOTE
+    if nature == "DEBIT_NOTE":
+        return FAMILY_DEBIT_NOTE
+    purpose = _upper(raw.get("invoice_purpose")).replace(" ", "_")
+    return _FAMILY_BY_PURPOSE.get(purpose, FAMILY_OTHER)
+
+
+def _type_purpose_conflict(document_type: str, raw: dict[str, Any], family: str) -> dict[str, Any] | None:
+    """A printed purpose naming a different kind of invoice than the
+    document type: the type stands, the PC checks the reading."""
+    purpose = _upper(raw.get("invoice_purpose")).replace(" ", "_")
+    named = _FAMILY_BY_PURPOSE.get(purpose)
+    if named is None or named == family or normalise_document_type(document_type) == "invoice_generic":
+        return None
+    if family not in (FAMILY_VEHICLE, FAMILY_ACCESSORY, FAMILY_EXTENDED_WARRANTY, FAMILY_RSA):
+        return None
+    return _issue("PURPOSE_CONFLICTS_WITH_TYPE",
+                  f"The invoice was uploaded as {document_type} but its reading says {purpose}; "
+                  "it is read as its document type.", purpose=purpose)
 
 
 def _issue(code: str, message: str, **values: Any) -> dict[str, Any]:
@@ -410,29 +429,84 @@ def _issue(code: str, message: str, **values: Any) -> dict[str, Any]:
             **{k: (str(v) if isinstance(v, Decimal) else v) for k, v in values.items()}}
 
 
-def _gst_rate(raw: dict[str, Any], taxable: Decimal | None, line_rate: Decimal | None = None) -> Decimal | None:
-    """This invoice's own GST rate as a fraction (0.18), cess included:
-    the printed rate(s), else the printed tax amounts over the printed
-    taxable value. None when this invoice printed neither (never borrowed)."""
+_RATE_TOLERANCE = Decimal("0.005")
+
+
+def _near(a: Decimal | None, b: Decimal | None, tolerance: Decimal = _RATE_TOLERANCE) -> bool:
+    return a is not None and b is not None and abs(a - b) <= tolerance
+
+
+def _rate_reading(
+    raw: dict[str, Any],
+    header_taxable: Decimal | None,
+    vehicle_line: dict[str, Any] | None,
+) -> tuple[Decimal | None, list[dict[str, Any]]]:
+    """This invoice's own GST rate as a fraction (0.18), cess included, and
+    any problem with it (2026-10-20, review S1/S3):
+
+    - the printed header rates: CGST + SGST, or IGST;
+    - one of CGST / SGST printed alone counts twice only when the printed
+      tax amounts confirm it (never doubled blindly);
+    - no printed rate: the printed tax amounts over the taxable value;
+    - the vehicle line's own rate is used only when it agrees with the
+      header (as the total or as each of CGST/SGST); with no header tax at
+      all, only when the line's own tax amount confirms it.
+
+    None with RATE_UNCLEAR when the readings do not agree, None alone when
+    nothing was printed. Never borrowed from another invoice."""
+    issues: list[dict[str, Any]] = []
     cgst_rate, sgst_rate, igst_rate = (_to_decimal(raw.get(k)) for k in ("cgst_rate", "sgst_rate", "igst_rate"))
     amounts = [_to_decimal(raw.get(k)) for k in ("cgst_amount", "sgst_amount", "igst_amount")]
-    base: Decimal | None = None
-    if line_rate:
-        base = line_rate / 100
-    elif igst_rate:
-        base = igst_rate / 100
-    elif cgst_rate or sgst_rate:
-        # CGST and SGST are always levied at the same rate.
-        base = ((cgst_rate or sgst_rate or Decimal(0)) + (sgst_rate or cgst_rate or Decimal(0))) / 100
-    elif any(a is not None for a in amounts) and taxable:
-        base = (sum((a or Decimal(0) for a in amounts), Decimal(0)) / taxable).quantize(
+    amount_rate = None
+    if any(a is not None for a in amounts) and header_taxable:
+        amount_rate = (sum((a or Decimal(0) for a in amounts), Decimal(0)) / header_taxable).quantize(
             _RATE_PLACES, rounding=ROUND_HALF_UP)
+
+    def unclear(message: str) -> tuple[None, list[dict[str, Any]]]:
+        issues.append(_issue("RATE_UNCLEAR", message))
+        return None, issues
+
+    base: Decimal | None = None
+    if igst_rate:
+        base = igst_rate / 100
+    elif cgst_rate and sgst_rate:
+        base = (cgst_rate + sgst_rate) / 100
+    elif cgst_rate or sgst_rate:
+        single = (cgst_rate or sgst_rate) / 100
+        both_amounts = amounts[0] is not None and amounts[1] is not None
+        if _near(amount_rate, 2 * single) or (amount_rate is None and both_amounts and amounts[0] == amounts[1]):
+            base = 2 * single
+        elif _near(amount_rate, single):
+            base = single
+        else:
+            return unclear(f"Only one of CGST / SGST prints a rate ({single * 100}%) and the tax amounts do not "
+                           "say whether it is per component or the total.")
+    elif amount_rate is not None:
+        base = amount_rate
+
+    line_rate = _to_decimal((vehicle_line or {}).get("tax_rate"))
+    if line_rate:
+        line_fraction = line_rate / 100
+        if base is not None:
+            if not (_near(line_fraction, base) or _near(2 * line_fraction, base)):
+                return unclear(f"The vehicle line prints {line_rate}% but the invoice's GST is {base * 100}%.")
+        else:
+            line_taxable = _to_decimal(vehicle_line.get("taxable_amount"))
+            line_tax = _to_decimal(vehicle_line.get("tax_amount"))
+            implied = (line_tax / line_taxable) if line_tax is not None and line_taxable else None
+            if _near(implied, line_fraction):
+                base = line_fraction
+            elif _near(implied, 2 * line_fraction):
+                base = 2 * line_fraction
+            else:
+                return unclear(f"The vehicle line prints {line_rate}% and nothing else on the invoice confirms "
+                               "the GST rate.")
     if base is None:
-        return None
+        return None, issues
     cess = _to_decimal(raw.get("cess_amount"))
-    if cess and taxable:
-        base += (cess / taxable).quantize(_RATE_PLACES, rounding=ROUND_HALF_UP)
-    return base
+    if cess and header_taxable:
+        base += (cess / header_taxable).quantize(_RATE_PLACES, rounding=ROUND_HALF_UP)
+    return base, issues
 
 
 def _identity(document_type: str, raw: dict[str, Any]) -> dict[str, Any]:
@@ -447,6 +521,11 @@ def _identity(document_type: str, raw: dict[str, Any]) -> dict[str, Any]:
         "date": day.isoformat() if day else None,
         "vin": re.sub(r"\s+", "", vin).upper() if vin else None,
         "grandTotal": _to_decimal(raw.get("grand_total_amount") or raw.get("total_amount")),
+        # Which books the copy comes from: a DMS copy and a Tally copy of one
+        # bill can print different numbers (review B1).
+        "side": ("DMS" if "dms" in document_type else "TALLY" if "tally" in document_type
+                 else (_upper(raw.get("source_system")) or None)),
+        "purposePrinted": _upper(raw.get("invoice_purpose")) or None,
     }
 
 
@@ -462,21 +541,28 @@ def _read_vehicle(raw: dict[str, Any], lines: list[dict[str, Any]], out: dict[st
     # are their own lines; the header then covers them too, so the vehicle
     # is read from its own VEHICLE line when that line prints its figures.
     own_line = vehicle_lines[0] if len(vehicle_lines) == 1 else None
-    use_line = bool(addon_lines) and own_line is not None and (
+    line_figures = own_line is not None and (
         _to_decimal(own_line.get("gross_amount")) is not None or _to_decimal(own_line.get("taxable_amount")) is not None
     )
+    use_line = bool(addon_lines) and line_figures
+    vehicle_not_separable = bool(addon_lines) and not line_figures
+    rate_line: dict[str, Any] | None = own_line if line_figures else None
     if use_line:
         printed_gross = _to_decimal(own_line.get("gross_amount"))
         taxable = _to_decimal(own_line.get("taxable_amount"))
-        line_rate = _to_decimal(own_line.get("tax_rate"))
+    elif vehicle_not_separable:
+        # The header covers the add-on lines too and the vehicle line prints
+        # no figure of its own: the vehicle's price cannot be read (review
+        # S2); never the header gross, which would count the add-ons twice.
+        printed_gross, taxable = None, None
+        issues.append(_issue("VEHICLE_LINE_NOT_READ",
+                             "The invoice also bills add-ons, and its vehicle line prints no price of its own."))
     else:
         printed_gross = _to_decimal(raw.get("gross_amount_before_discount"))
         taxable = header_taxable
-        line_rate = None
         if printed_gross is None and taxable is None and own_line is not None:
             printed_gross = _to_decimal(own_line.get("gross_amount"))
             taxable = _to_decimal(own_line.get("taxable_amount"))
-            line_rate = _to_decimal(own_line.get("tax_rate"))
 
     # Discounts: the header discount OR the discount lines -- one discount
     # printed twice, never added together (R2).
@@ -516,11 +602,13 @@ def _read_vehicle(raw: dict[str, Any], lines: list[dict[str, Any]], out: dict[st
         selling, selling_source = taxable + discount_total, "TAXABLE_PLUS_DISCOUNT"
     else:
         selling, selling_source = None, None
-        issues.append(_issue("PRICE_NOT_READ", "Neither the selling price nor the taxable value was read."))
+        if not vehicle_not_separable:
+            issues.append(_issue("PRICE_NOT_READ", "Neither the selling price nor the taxable value was read."))
 
-    rate = _gst_rate(raw, header_taxable if header_taxable else taxable, line_rate)
+    rate, rate_issues = _rate_reading(raw, header_taxable if header_taxable else taxable, rate_line)
+    issues.extend(rate_issues)
     taxes_read = rate is not None
-    if not taxes_read:
+    if not taxes_read and not rate_issues:
         issues.append(_issue("TAXES_NOT_READ", "The GST on this invoice (CGST/SGST or IGST) was not read."))
 
     ex_showroom = _q(selling * (1 + rate)) if selling is not None and rate is not None else None
@@ -557,7 +645,7 @@ def _read_vehicle(raw: dict[str, Any], lines: list[dict[str, Any]], out: dict[st
         ))
     printed_rates = any(_to_decimal(raw.get(k)) for k in ("cgst_rate", "sgst_rate", "igst_rate"))
     gst_amounts = [t for t in taxes[:3] if t is not None]
-    if printed_rates and gst_amounts and header_taxable and not use_line:
+    if printed_rates and gst_amounts and header_taxable and rate is not None and not use_line:
         base = rate - ((_to_decimal(raw.get("cess_amount")) or Decimal(0)) / header_taxable).quantize(
             _RATE_PLACES, rounding=ROUND_HALF_UP)
         if abs(_q(header_taxable * base) - sum(gst_amounts, Decimal(0))) > _ONE_RUPEE:
@@ -586,6 +674,7 @@ def _read_vehicle(raw: dict[str, Any], lines: list[dict[str, Any]], out: dict[st
         "taxable": taxable,
         "gstRate": rate,
         "taxesRead": taxes_read,
+        "rateUnclear": bool(rate_issues),
         "exShowroom": ex_showroom,
         "discountPrinted": discount_total,
         # What the vehicle sold for: ex-showroom less every discount (the
@@ -610,6 +699,7 @@ def read_invoice(
     kind = normalise_document_type(document_type)
     family = invoice_family(kind, raw)
     lines = _line_item_rows(raw.get("line_items"))
+    conflict = _type_purpose_conflict(kind, raw, family)
     out: dict[str, Any] = {
         "documentId": str(document_id) if document_id is not None else None,
         "evidenceId": str(evidence_id) if evidence_id is not None else None,
@@ -620,7 +710,13 @@ def read_invoice(
         "discounts": {},
         "netPayable": None,
         "vehicle": None,
-        "issues": [],
+        "issues": [conflict] if conflict else [],
+        "cancelled": None,
+        "_raw": raw,
+        # What a credit note says it reverses (its narration, heading and lines).
+        "referenceText": _alnum(" ".join(filter(None, [
+            _clean_text(raw.get("narration")), _clean_text(raw.get("invoice_heading_as_printed")),
+            *(_clean_text(i.get("description_raw")) for i in lines)]))),
     }
     if family in (FAMILY_VEHICLE, FAMILY_WHOLESALE):
         _read_vehicle(raw, lines, out)
@@ -690,6 +786,32 @@ def read_invoice(
     return out
 
 
+def vehicle_invoice_ex_showroom(document_fields: dict[str, Any], document_type: str = "customer_invoice_dms",
+                                ) -> dict[str, Any]:
+    """The R1 reading of one vehicle invoice, for every caller that needs it
+    (the Deal sheet, SKU identification): one implementation.
+
+    Returns {exShowroom, rate, sellingPrice, sellingPriceSource, taxable,
+    saleValue, discounts: {key: {amount (GST-inclusive), printed}}, issues}.
+    ``exShowroom`` is None whenever the invoice's own figures do not give it
+    (taxes not read, rate unclear, vehicle price not separable); ``issues``
+    then says why. Never borrows from another document."""
+    reading = read_invoice(document_type, dict(document_fields))
+    vehicle = reading.get("vehicle") or reading.get("dealerPurchase") or {}
+    return {
+        "exShowroom": vehicle.get("exShowroom"),
+        "rate": vehicle.get("gstRate"),
+        "sellingPrice": vehicle.get("sellingPrice"),
+        "sellingPriceSource": vehicle.get("sellingPriceSource"),
+        "taxable": vehicle.get("taxable"),
+        "saleValue": vehicle.get("saleValue"),
+        "discounts": {k: {"amount": v["amount"], "printed": v["printed"]}
+                      for k, v in (reading["discounts"] or (vehicle.get("discounts") or {})).items()},
+        "family": reading["family"],
+        "issues": reading["issues"],
+    }
+
+
 # ── the invoices on file, each counted once (R2) ─────────────────────────────
 def _type_rank(document_type: str) -> int:
     try:
@@ -698,16 +820,36 @@ def _type_rank(document_type: str) -> int:
         return len(_TYPE_PRIORITY)
 
 
-def _group_key(reading: dict[str, Any]) -> tuple[str, ...]:
-    """The same invoice whatever copy it is (DMS or Tally, uploaded twice):
-    one invoice number in one family. Without a number, the same date and
-    grand total; with neither, the document itself."""
-    family = reading["family"]
+def _alnum(value: Any) -> str:
+    return re.sub(r"[^0-9A-Za-z]", "", str(value or "")).upper()
+
+
+def _single_key(reading: dict[str, Any]) -> str:
+    """One invoice's own key without its copies: its number, else its date
+    and total, else the document itself (review N2: a missing total never
+    merges two documents)."""
     if reading["numberKey"]:
-        return (family, "N", reading["numberKey"])
-    if reading["date"] or reading["grandTotal"] is not None:
-        return (family, "D", str(reading["date"]), str(reading["grandTotal"]))
-    return (family, "ID", str(reading["documentId"]))
+        return f"N|{reading['numberKey']}"
+    if reading["grandTotal"] is not None:
+        return f"D|{reading['date']}|{reading['grandTotal']}"
+    return f"ID|{reading['documentId']}"
+
+
+def _days_apart(a: str | None, b: str | None) -> int | None:
+    if not a or not b:
+        return None
+    return abs((date.fromisoformat(a) - date.fromisoformat(b)).days)
+
+
+def _same_bill(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """A DMS and a Tally copy of one single-purpose bill printing different
+    numbers: the same grand total to the rupee, dated within a day."""
+    if a["grandTotal"] is None or b["grandTotal"] is None:
+        return False
+    if abs(a["grandTotal"] - b["grandTotal"]) > _ONE_RUPEE:
+        return False
+    apart = _days_apart(a["date"], b["date"])
+    return apart is None or apart <= 1
 
 
 def _copy_order(reading: dict[str, Any]) -> tuple[Any, ...]:
@@ -746,44 +888,222 @@ def _copies_disagree(copies: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _pair_generic_copies(readings: list[dict[str, Any]]) -> None:
+    """A generic invoice that prints no purpose but carries the vehicle
+    invoice's VIN, number or grand total is a copy of that vehicle invoice
+    (review S5): re-read it as one."""
+    vehicles = [r for r in readings if r["family"] == FAMILY_VEHICLE]
+    for index, reading in enumerate(readings):
+        if (reading["documentType"] != "invoice_generic" or reading["family"] != FAMILY_OTHER
+                or reading["purposePrinted"] not in (None, "UNKNOWN", "OTHER")):
+            continue
+        match = any(
+            (reading["vin"] and reading["vin"] == v["vin"])
+            or (reading["numberKey"] and reading["numberKey"] == v["numberKey"])
+            or (reading["grandTotal"] is not None and v["grandTotal"] is not None
+                and abs(reading["grandTotal"] - v["grandTotal"]) <= _ONE_RUPEE)
+            for v in vehicles
+        )
+        if match:
+            raw = {**reading["_raw"], "invoice_purpose": "VEHICLE_SALE"}
+            copy = read_invoice("invoice_generic", raw, document_id=reading["documentId"],
+                                evidence_id=reading["evidenceId"])
+            copy["purposePrinted"] = reading["purposePrinted"]
+            copy["pairedAs"] = FAMILY_VEHICLE
+            readings[index] = copy
+
+
+def _mark_cancellations(readings: list[dict[str, Any]]) -> None:
+    """A credit note that reverses a whole vehicle invoice cancels it
+    (review S4): it names that invoice's number or carries its VIN, and
+    gives back its grand total to the rupee. The cancelled invoice and that
+    credit note both stop counting; a part credit note stays a discount.
+    With more than one candidate, the one it names, else the earliest."""
+    vehicles = [r for r in readings if r["family"] == FAMILY_VEHICLE]
+    for note in [r for r in readings if r["family"] == FAMILY_CREDIT_NOTE]:
+        amount = note["grandTotal"] if note["grandTotal"] is not None else _to_decimal(note["_raw"].get("taxable_amount"))
+        if amount is None:
+            continue
+        words = note["referenceText"]
+        candidates = []
+        for vehicle in vehicles:
+            if vehicle["cancelled"] or vehicle["grandTotal"] is None:
+                continue
+            if abs(abs(amount) - vehicle["grandTotal"]) > _ONE_RUPEE:
+                continue
+            named = bool(vehicle["numberKey"]) and vehicle["numberKey"] in words
+            same_vehicle = bool(note["vin"]) and note["vin"] == vehicle["vin"]
+            if named or same_vehicle:
+                candidates.append((not named, vehicle["date"] or "9999", str(vehicle["documentId"]), vehicle))
+        if not candidates:
+            continue
+        cancelled = min(candidates, key=lambda c: c[:3])[3]
+        # Its other copies (same number, or same date and total) go with it.
+        for vehicle in vehicles:
+            if vehicle is cancelled or (
+                (vehicle["numberKey"] and vehicle["numberKey"] == cancelled["numberKey"])
+                or (vehicle["date"] == cancelled["date"] and vehicle["grandTotal"] is not None
+                    and abs(vehicle["grandTotal"] - cancelled["grandTotal"]) <= _ONE_RUPEE
+                    and (not vehicle["vin"] or vehicle["vin"] == cancelled["vin"]))
+            ):
+                vehicle["cancelled"] = note["documentId"]
+        note["cancels"] = cancelled["documentId"]
+
+
+def _vehicle_sets(readings: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Vehicle invoices grouped into sales (review B1): one vehicle (VIN /
+    chassis) is one sale invoice whatever number each copy prints; copies
+    without a VIN join by number; different VINs are different vehicles."""
+    parent = list(range(len(readings)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    vins: dict[int, set[str]] = {i: ({r["vin"]} if r["vin"] else set()) for i, r in enumerate(readings)}
+
+    def join(i: int, j: int) -> None:
+        a, b = find(i), find(j)
+        if a == b or len(vins[a] | vins[b]) > 1:
+            return  # two vehicles are never one sale
+        parent[b] = a
+        vins[a] |= vins[b]
+
+    for i, a in enumerate(readings):
+        for j in range(i + 1, len(readings)):
+            b = readings[j]
+            if (a["vin"] and a["vin"] == b["vin"]) or (a["numberKey"] and a["numberKey"] == b["numberKey"]):
+                join(i, j)
+    for i, a in enumerate(readings):
+        for j in range(i + 1, len(readings)):
+            b = readings[j]
+            if not a["numberKey"] and not b["numberKey"] and _single_key(a) == _single_key(b):
+                join(i, j)
+    sets: dict[int, list[dict[str, Any]]] = {}
+    for i, reading in enumerate(readings):
+        sets.setdefault(find(i), []).append(reading)
+    return list(sets.values())
+
+
+def _other_sets(readings: list[dict[str, Any]]) -> tuple[list[list[dict[str, Any]]], list[tuple[Any, Any]]]:
+    """Non-vehicle invoices of one family grouped by number (else date and
+    total); then a DMS and a Tally accessory / EW / RSA bill printing
+    different numbers but the same total, dated within a day, are one bill
+    (review B1). A DMS and a Tally bill that differ stay two, and the PC is
+    asked whether they are one bill."""
+    by_key: dict[str, list[dict[str, Any]]] = {}
+    for reading in readings:
+        by_key.setdefault(_single_key(reading), []).append(reading)
+    sets = [sorted(v, key=_copy_order) for _, v in sorted(by_key.items())]
+    questions: list[tuple[Any, Any]] = []
+    if not readings or readings[0]["family"] not in _FAMILY_COMPONENT:
+        return sets, questions
+
+    def side(group: list[dict[str, Any]]) -> set[str]:
+        return {r["side"] for r in group if r["side"] in ("DMS", "TALLY")}
+
+    merged: list[list[dict[str, Any]]] = []
+    used: set[int] = set()
+    for i, a in enumerate(sets):
+        if i in used:
+            continue
+        for j in range(i + 1, len(sets)):
+            b = sets[j]
+            if j in used or side(a) == side(b) or not side(a) or not side(b) or len(side(a) | side(b)) != 2:
+                continue
+            if _same_bill(a[0], b[0]):
+                a = a + b
+                used.add(j)
+                break
+        merged.append(a)
+    for i, a in enumerate(merged):
+        for b in merged[i + 1:]:
+            if side(a) == {"DMS"} and side(b) == {"TALLY"} or side(a) == {"TALLY"} and side(b) == {"DMS"}:
+                questions.append((a, b))
+    return merged, questions
+
+
 def select_invoices(readings: list[dict[str, Any]]) -> dict[str, Any]:
     """Group the invoices on file into distinct invoices and count each once.
 
-    - Copies of one invoice (same family and number) are one invoice; the
-      copy that stands for it is the complete one, then the one whose own
-      arithmetic holds, then by the canonical document-type priority, then
-      by document id. Never by upload time.
-    - Different invoice numbers are different invoices. Accessory, EW, RSA,
-      other invoices, credit and debit notes all count. One car has one
-      vehicle invoice: when more than one is on file, the latest dated one
-      prices the deal and the rest are flagged for a Team Lead.
+    - Vehicle invoices: one vehicle (VIN / chassis) is one sale invoice, so
+      its DMS and Tally copies are one invoice even when they print
+      different numbers; without a VIN, copies join by number. Different
+      VINs are different vehicles. A generic copy that prints no purpose
+      joins the vehicle invoice it copies.
+    - Accessory / EW / RSA invoices: one number is one bill; a DMS and a
+      Tally bill with different numbers are one bill when their totals agree
+      to the rupee within a day, else two bills and the PC is asked.
+    - The copy that stands for an invoice is the complete one, then the one
+      whose own arithmetic holds, then the canonical document-type priority,
+      then the document id. Never by upload time.
+    - A credit note reversing a whole vehicle invoice cancels it: both stop
+      counting. One car has one vehicle invoice: when more than one is still
+      on file, the latest dated one prices the deal and a Team Lead is asked.
     - The wholesale invoice is kept apart as the dealer's purchase.
     """
-    groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    readings = list(readings)
+    _pair_generic_copies(readings)
+    _mark_cancellations(readings)
+    families: dict[str, list[dict[str, Any]]] = {}
     for reading in readings:
-        groups.setdefault(_group_key(reading), []).append(reading)
+        families.setdefault(reading["family"], []).append(reading)
+    raw_sets: list[list[dict[str, Any]]] = []
+    question_sets: list[tuple[Any, Any]] = []
+    for family, members in sorted(families.items()):
+        if family == FAMILY_VEHICLE:
+            live = [r for r in members if not r["cancelled"]]
+            raw_sets += _vehicle_sets(live)
+            raw_sets += [[r] for r in members if r["cancelled"]]
+        else:
+            sets, questions = _other_sets(members)
+            raw_sets += sets
+            question_sets += questions
+
+    def group_key(copies: list[dict[str, Any]]) -> str:
+        family = copies[0]["family"]
+        vin = next((r["vin"] for r in copies if r["vin"]), None)
+        if family == FAMILY_VEHICLE and vin:
+            return f"{family}|V|{vin}"
+        numbers = sorted({r["numberKey"] for r in copies if r["numberKey"]})
+        if numbers:
+            return f"{family}|N|{'+'.join(numbers)}"
+        return f"{family}|{_single_key(copies[0])}"
+
     built: list[dict[str, Any]] = []
-    for key, copies in sorted(groups.items(), key=lambda kv: kv[0]):
+    for copies in raw_sets:
         copies = sorted(copies, key=_copy_order)
+        rep = copies[0]
+        cancelled = bool(rep["cancelled"]) or bool(rep.get("cancels"))
         built.append({
-            "key": "|".join(key),
-            "family": copies[0]["family"],
-            "representative": copies[0],
+            "key": group_key(copies),
+            "family": rep["family"],
+            "representative": rep,
             "copies": copies,
             "disagreements": _copies_disagree(copies) if len(copies) > 1 else [],
-            "counted": copies[0]["family"] in CUSTOMER_FAMILIES,
+            "cancelled": cancelled,
+            "counted": rep["family"] in CUSTOMER_FAMILIES and not cancelled,
         })
-    vehicle_groups = [g for g in built if g["family"] == FAMILY_VEHICLE]
+    built.sort(key=lambda g: g["key"])
+    questions = []
+    for a, b in question_sets:
+        ga = next(g for g in built if a[0] in g["copies"])
+        gb = next(g for g in built if b[0] in g["copies"])
+        questions.append((ga, gb))
+    vehicle_groups = [g for g in built if g["family"] == FAMILY_VEHICLE and not g["cancelled"]]
     vehicle = None
     if vehicle_groups:
         def vehicle_rank(group: dict[str, Any]) -> tuple[Any, ...]:
             rep = group["representative"]
             complete = not any(i["code"] in _BLOCKING_ISSUES for i in rep["issues"])
-            return (complete, rep["date"] or "", rep["numberKey"] or "", str(rep["documentId"]))
+            return (complete, rep["date"] or "")
 
         # A complete reading first, then the latest invoice date (a reissue
-        # replaces the earlier invoice), then number and document id.
-        vehicle = max(vehicle_groups, key=vehicle_rank)
+        # replaces the earlier invoice); on a tie, the better copy (review N1).
+        ordered = sorted(vehicle_groups, key=lambda g: _copy_order(g["representative"]))
+        vehicle = max(ordered, key=vehicle_rank)
         for group in vehicle_groups:
             group["counted"] = group is vehicle
     counted = [g for g in built if g["counted"]]
@@ -814,6 +1134,8 @@ def select_invoices(readings: list[dict[str, Any]]) -> dict[str, Any]:
         "counted": counted,
         "vehicle": vehicle,
         "multipleVehicle": len(vehicle_groups) > 1,
+        "cancelled": [g for g in built if g["cancelled"]],
+        "sameBillQuestions": questions,
         "families": {g["family"] for g in counted},
         "lines": lines,
         "lineDocuments": line_documents,
@@ -1334,7 +1656,7 @@ def sync_invoice_checks(
     """
     wanted: dict[str, dict[str, Any]] = {}
     for group in selection["groups"]:
-        if not group["counted"] and group["family"] != FAMILY_VEHICLE:
+        if group["cancelled"] or (not group["counted"] and group["family"] != FAMILY_VEHICLE):
             continue
         for reading in group["copies"]:
             for issue in reading["issues"]:
@@ -1362,6 +1684,23 @@ def sync_invoice_checks(
                             "disagreements": group["disagreements"]},
                 "role": "TL", "task_type": _DISCREPANCY_TASK_TYPE, "severity": "HIGH",
             }
+    for first, second in selection.get("sameBillQuestions", []):
+        dms, tally = (first, second) if first["representative"]["side"] == "DMS" else (second, first)
+        label = {FAMILY_ACCESSORY: "accessory", FAMILY_EXTENDED_WARRANTY: "extended warranty",
+                 FAMILY_RSA: "RSA"}.get(first["family"], "")
+        rule_key = f"INVOICE_SAME_BILL_QUESTION:{dms['key']}~{tally['key']}"
+        d, t = dms["representative"], tally["representative"]
+        wanted[rule_key] = {
+            "title": f"Two {label} invoices (DMS {d['number'] or '-'}, Tally {t['number'] or '-'}): "
+                     "same bill or two bills?",
+            "description": (
+                f"DMS {d['number'] or '(no number)'} for {d['grandTotal']} dated {d['date']} and Tally "
+                f"{t['number'] or '(no number)'} for {t['grandTotal']} dated {t['date']} print different numbers "
+                "and totals, so both are counted. If they are one bill, void the wrong copy; if two, confirm."
+            ),
+            "payload": {"documentIds": [d["documentId"], t["documentId"]], "family": first["family"]},
+            "role": "PC", "task_type": _FIELD_REVIEW_TASK_TYPE, "severity": "MEDIUM",
+        }
     if selection["multipleVehicle"]:
         vehicles = [g["representative"] for g in selection["groups"] if g["family"] == FAMILY_VEHICLE]
         chosen = selection["vehicle"]["representative"]
@@ -1370,8 +1709,9 @@ def sync_invoice_checks(
             "description": (
                 "These vehicle invoices have different invoice numbers: "
                 + ", ".join(_invoice_name(r) for r in vehicles)
-                + f". The deal is priced on {_invoice_name(chosen)} (the latest). Void the cancelled invoice, "
-                "or confirm both were issued."
+                + f". The deal is priced on {_invoice_name(chosen)} (the latest); the receipts-vs-invoices check "
+                "counts every one of them until the cancelled one is voided or reversed by a credit note. "
+                "Void the cancelled invoice, or confirm both were issued."
             ),
             "payload": {"documentIds": [r["documentId"] for r in vehicles], "pricedOn": chosen["documentId"]},
             "role": "TL", "task_type": _DISCREPANCY_TASK_TYPE, "severity": "HIGH",
@@ -1389,12 +1729,13 @@ def sync_invoice_checks(
             SELECT audit_finding_id, rule_key, stage_code FROM auditcore.audit_findings
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
               AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
-              AND (rule_key LIKE :check OR rule_key LIKE :copies OR rule_key = :multiple OR rule_key LIKE :legacy)
+              AND (rule_key LIKE :check OR rule_key LIKE :copies OR rule_key = :multiple OR rule_key LIKE :legacy
+                   OR rule_key LIKE :question)
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id, "check": f"{_CHECK_RULE_PREFIX}%",
          "copies": f"{_COPIES_RULE_PREFIX}%", "multiple": _MULTIPLE_VEHICLE_RULE,
-         "legacy": f"{_LEGACY_DISAGREEMENT_PREFIX}%"},
+         "legacy": f"{_LEGACY_DISAGREEMENT_PREFIX}%", "question": "INVOICE_SAME_BILL_QUESTION:%"},
     ).mappings().all()
     resolved = 0
     for row in open_rows:
@@ -1552,4 +1893,5 @@ __all__ = [
     "select_invoices",
     "sync_invoice_actuals",
     "sync_invoice_checks",
+    "vehicle_invoice_ex_showroom",
 ]
