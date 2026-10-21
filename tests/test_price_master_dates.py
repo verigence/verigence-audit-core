@@ -236,7 +236,7 @@ def test_a_pinned_sku_withdrawn_from_the_book_raises_a_pc_task_and_clears_its_st
                       parsed=parse_price_list(buf.getvalue()), actor_id="admin")
     _set(c, pricing_effective_on=date(2026, 11, 5))  # the deal priced on its (later) invoice date
     result = sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
-    assert result == {"skipped": True, "reason": "sku_not_in_price_list"}
+    assert result["skuNotInPriceList"] is True and "error" not in result  # discounts still refreshed
     task = _task(c, SKU_NOT_IN_PRICE_MASTER_TASK)
     assert task["assigned_role_code"] == "PC" and task["task_status"] != "VERIFIED_COMPLETE"
     assert task["title"] == "SKU MAXX_CITY::MAXX CITY 1.5 LX BS6.2 is not in the price master for 2026-11-05 — set the SKU"
@@ -248,3 +248,58 @@ def test_a_pinned_sku_withdrawn_from_the_book_raises_a_pc_task_and_clears_its_st
     _set(c, pricing_effective_on=date(2026, 10, 20))  # back on a date whose book lists it
     sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     assert _task(c, SKU_NOT_IN_PRICE_MASTER_TASK)["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_a_page_view_never_raises_the_withdrawn_sku_task(journey) -> None:
+    """Re-review of PR 468, S10: the overview self-heal (raise_findings=False)
+    neither raises tasks nor rewrites lines."""
+    from audit_core.uc03_deal_reconciliation import sync_deal_reconciliation
+
+    c = journey
+    c.execute(text("INSERT INTO auditcore.journey_products (tenant_id, journey_id, product_sku_id, selection_status) "
+                   "VALUES (:t, :j, :s, 'CONFIRMED')"), {"t": c.tenant_id, "j": c.journey_id, "s": c.sku_id})
+    _set(c, pricing_effective_on=date(2026, 9, 20))
+    sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    oem_id = c.execute(text("SELECT oem_id FROM auditcore.projects WHERE tenant_id=:t"), {"t": c.tenant_id}).scalar_one()
+    from openpyxl import load_workbook
+
+    wb = load_workbook(BytesIO(_book(900_000.00)))
+    wb.active["C2"] = "MAXX HD"
+    buf = BytesIO()
+    wb.save(buf)
+    ingest_price_list(c, tenant_id=c.tenant_id, oem_id=oem_id, effective_from=date(2026, 11, 1),
+                      parsed=parse_price_list(buf.getvalue()), actor_id="admin")
+    _set(c, pricing_effective_on=date(2026, 11, 5))
+    sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="", raise_findings=False)
+    assert _task(c, SKU_NOT_IN_PRICE_MASTER_TASK) is None
+
+
+def test_the_publish_sweep_re_prices_the_deal(journey) -> None:
+    """Re-review of PR 468, S9: a withdrawn SKU's standards were cleared;
+    publishing a book that lists it again re-prices the deal, not only
+    closes the task."""
+    from audit_core.uc03_deal_reconciliation import sync_deal_reconciliation
+
+    c = journey
+    oem_id = c.execute(text("SELECT oem_id FROM auditcore.projects WHERE tenant_id=:t"), {"t": c.tenant_id}).scalar_one()
+    c.execute(text("INSERT INTO auditcore.journey_products (tenant_id, journey_id, product_sku_id, selection_status) "
+                   "VALUES (:t, :j, :s, 'CONFIRMED')"), {"t": c.tenant_id, "j": c.journey_id, "s": c.sku_id})
+    from openpyxl import load_workbook
+
+    wb = load_workbook(BytesIO(_book(900_000.00)))
+    wb.active["C2"] = "MAXX HD"
+    buf = BytesIO()
+    wb.save(buf)
+    ingest_price_list(c, tenant_id=c.tenant_id, oem_id=oem_id, effective_from=date(2026, 11, 1),
+                      parsed=parse_price_list(buf.getvalue()), actor_id="admin")
+    _set(c, pricing_effective_on=date(2026, 11, 5))
+    sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert _task(c, SKU_NOT_IN_PRICE_MASTER_TASK)["task_status"] != "VERIFIED_COMPLETE"
+
+    # A corrected November book that lists MAXX CITY again.
+    ingest_price_list(c, tenant_id=c.tenant_id, oem_id=oem_id, effective_from=date(2026, 11, 1),
+                      parsed=parse_price_list(_book(860_000.00)), actor_id="admin")
+    assert _task(c, SKU_NOT_IN_PRICE_MASTER_TASK)["task_status"] == "VERIFIED_COMPLETE"
+    standard = c.execute(text("SELECT standard_amount FROM auditcore.commercial_lines WHERE tenant_id=:t AND journey_id=:j "
+                              "AND component_key='ex_showroom_price'"), {"t": c.tenant_id, "j": c.journey_id}).scalar_one()
+    assert standard == Decimal("860000.00")

@@ -836,14 +836,14 @@ def sync_deal_reconciliation(
             return {"skipped": True, "reason": "no_effective_price_list"}
 
         # The SKU withdrawn from the book in force (2026-10-20): a PC task,
-        # and the old book's standards cleared rather than left standing.
-        if sync_sku_in_price_master_task(
+        # and the old book's price standards cleared rather than left
+        # standing. Event-driven runs only: a page view never raises tasks
+        # or rewrites lines. The discounts below are refreshed either way.
+        sku_missing = raise_findings and sync_sku_in_price_master_task(
             connection, tenant_id=tenant_id, journey_id=journey_id,
             found={"onDate": effective_on, "plan": plan, "reason": None},
-        ):
-            return {"skipped": True, "reason": "sku_not_in_price_list"}
-
-        price_lines = _materialize_price_standards(
+        )
+        price_lines = 0 if sku_missing else _materialize_price_standards(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
@@ -883,6 +883,7 @@ def sync_deal_reconciliation(
             "priceLines": price_lines,
             "evidenceRowsChecked": evidence_rows,
             "totals": totals,
+            **({"skuNotInPriceList": True} if sku_missing else {}),
             **discount,
         }
     except Exception:
