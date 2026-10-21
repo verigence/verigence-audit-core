@@ -366,8 +366,14 @@ def match_by_attributes(
 
 
 def _row_trim_words(row: dict[str, Any]) -> frozenset[str]:
+    """The master's trim words: its own Trim column when the masters sheet
+    carried one (``row["trim"]``), else read off the variant name. Since
+    2026-10-21 "NEW" / "Refresh" are words of a variant name (review 471
+    S2), so the stored Trim column matters here."""
     from audit_core.uc03_sku_words import row_words
 
+    if str(row.get("trim") or "").strip():
+        return _trim_words(str(row["trim"]), row)
     return frozenset(w for w in row_words(row).words if ":" not in w)
 
 
