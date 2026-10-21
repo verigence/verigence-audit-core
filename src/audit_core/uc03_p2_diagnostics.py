@@ -97,6 +97,71 @@ REPORTS: dict[str, str] = {
         WHERE tenant_id = :t
         ORDER BY uploaded_at_utc
     """,
+    # Live checks before the 2026-10-21 fix merges (price masters, invoices).
+    "pre_merge_checks": """
+        SELECT 'DMS_TALLY_PAIR' AS kind, j.journey_reference AS a, v.document_type_key AS b,
+               coalesce(v.invoice_number, '') || ' | ' || coalesce(v.invoice_date::text, '') AS c,
+               coalesce(v.vin_number, '') || ' | ' || coalesce(v.grand_total_amount::text, '') AS d
+        FROM auditcore.invoice_review_values v
+        JOIN auditcore.journeys j ON j.tenant_id = v.tenant_id AND j.journey_id = v.journey_id
+        WHERE v.tenant_id = :t AND v.journey_id IN (
+            SELECT journey_id FROM auditcore.invoice_review_values WHERE tenant_id = :t
+            GROUP BY journey_id
+            HAVING bool_or(document_type_key LIKE '%dms%') AND bool_or(document_type_key LIKE '%tally%'))
+        UNION ALL
+        SELECT 'CREDIT_NOTE_EQ_VEHICLE', cn.journey_id::text, cn.invoice_number,
+               cn.grand_total_amount::text, v.invoice_number
+        FROM auditcore.invoice_review_values cn
+        JOIN auditcore.invoice_review_values v
+          ON v.tenant_id = cn.tenant_id AND v.journey_id = cn.journey_id
+         AND v.document_type_key IN ('customer_invoice_dms','tax_invoice_tally','tax_invoice_dms','tax_invoice',
+                                     'customer_invoice_dms_v2')
+         AND abs(v.grand_total_amount - cn.grand_total_amount) <= 1
+        WHERE cn.tenant_id = :t AND cn.document_type_key = 'credit_note'
+        UNION ALL
+        SELECT 'GENERIC_NO_PURPOSE', journey_id::text, invoice_number, grand_total_amount::text, NULL
+        FROM auditcore.invoice_review_values
+        WHERE tenant_id = :t AND document_type_key = 'invoice_generic' AND invoice_purpose IS NULL
+        UNION ALL
+        SELECT 'SOURCE_TYPE_SPELLING', source_document_type, count(*)::text, NULL, NULL
+        FROM auditcore.commercial_line_source_values WHERE tenant_id = :t
+        GROUP BY source_document_type
+        UNION ALL
+        SELECT 'BOOKING_BEFORE_FIRST_BOOK', b.journey_id::text,
+               coalesce(b.pricing_effective_on, b.booking_date)::text, NULL, NULL
+        FROM auditcore.bookings b
+        WHERE b.tenant_id = :t AND coalesce(b.pricing_effective_on, b.booking_date) < (
+            SELECT min(v.effective_from) FROM auditcore.price_lists pl
+            JOIN auditcore.price_list_versions v ON v.tenant_id = pl.tenant_id AND v.price_list_id = pl.price_list_id
+            WHERE pl.tenant_id = :t AND pl.price_list_code = 'OEM_NATIVE_PRICE_LIST'
+              AND v.lifecycle_status IN ('PUBLISHED', 'RETIRED'))
+        UNION ALL
+        SELECT 'PINNED_SKU', s.sku_code, jp.selection_status || ' ' || coalesce(jp.selection_method, ''),
+               coalesce(b.pricing_effective_on, b.booking_date)::text, pm.model_name
+        FROM auditcore.journey_products jp
+        JOIN auditcore.product_skus s ON s.product_sku_id = jp.product_sku_id
+        JOIN auditcore.product_models pm ON pm.model_id = s.model_id
+        LEFT JOIN auditcore.bookings b ON b.tenant_id = jp.tenant_id AND b.journey_id = jp.journey_id
+        WHERE jp.tenant_id = :t
+        UNION ALL
+        SELECT 'PRICE_LISTS', pl.price_list_code, count(v.*)::text, max(v.effective_from)::text, NULL
+        FROM auditcore.price_lists pl
+        LEFT JOIN auditcore.price_list_versions v ON v.tenant_id = pl.tenant_id AND v.price_list_id = pl.price_list_id
+        WHERE pl.tenant_id = :t
+        GROUP BY pl.price_list_code
+        ORDER BY 1, 2
+    """,
+    # OEM catalogue identity collisions (not tenant data).
+    "model_identity": """
+        SELECT upper(regexp_replace(pm.model_name, '[^A-Za-z0-9]', '', 'g')) AS squashed,
+               string_agg(pm.model_code || ' / ' || pm.model_name, ' ; ' ORDER BY pm.created_at_utc) AS models,
+               string_agg((SELECT count(*) FROM auditcore.product_skus s WHERE s.model_id = pm.model_id)::text,
+                          ',' ORDER BY pm.created_at_utc) AS skus
+        FROM auditcore.product_models pm JOIN auditcore.oems o ON o.oem_id = pm.oem_id
+        WHERE o.oem_code = 'MAHINDRA'
+        GROUP BY 1
+        ORDER BY 1
+    """,
     # Every Journey: the date it should be priced on, the price-list version
     # it is actually priced from, and whether that version was in force on
     # that date (2026-10-20: "prices are not being picked as per dates").
