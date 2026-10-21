@@ -1,7 +1,7 @@
 """Per-document source values and printed GST rates on invoices.
 
 Revision ID: 0153_source_values_per_document
-Revises: 0150_more_mahindra_model_aliases
+Revises: 0151_bolero_split_model_aliases
 Create Date: 2026-10-20
 
 2026-10-20 product owner rules (R1, R2): each invoice serves only its own
@@ -36,7 +36,7 @@ from alembic import op
 from sqlalchemy import text
 
 revision = "0153_source_values_per_document"
-down_revision = "0150_more_mahindra_model_aliases"
+down_revision = "0151_bolero_split_model_aliases"
 branch_labels = None
 depends_on = None
 

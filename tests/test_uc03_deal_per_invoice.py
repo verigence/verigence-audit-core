@@ -452,6 +452,14 @@ def test_the_header_names_the_plan_used_and_no_price_master_shows_why(journey, m
     assert _rows(view)["ex_showroom_price"]["standard"] is None
     assert view["summary"]["net"]["standard"] is None and view["summary"]["variance"]["currentVsStandard"] is None
 
+    # No booking date yet: no pricing date to judge by; the header says why,
+    # the standards on record stay (review M2).
+    monkeypatch.setattr(model, "_journey_price_plan", lambda *a, **k: {
+        "onDate": None, "plan": None, "reason": "No booking date to price the deal on"})
+    view = _deal(journey)
+    assert view["standardUnavailable"] is None and view["sku"]["priceListReason"].startswith("No booking date")
+    assert Decimal(_rows(view)["ex_showroom_price"]["standard"]) == 852000
+
 
 # ── review of PR #470 (2026-10-21) ───────────────────────────────────────────
 def _tally_copy(**overrides):

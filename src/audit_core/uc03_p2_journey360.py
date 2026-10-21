@@ -987,7 +987,14 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     # header; when none is in force on the pricing date the Standard column
     # shows why instead of figures.
     price_plan = _journey_price_plan(connection, tenant_id=tenant_id, journey_id=journey_id)
-    standard_unavailable = (price_plan or {}).get("reason") if price_plan and price_plan.get("plan") is None else None
+    # Only "no price master in force on <date>" blanks the Standard column:
+    # with no booking date yet there is no pricing date to judge by, and the
+    # header carries the reason (merge of #468, review M2).
+    standard_unavailable = (
+        price_plan.get("reason")
+        if price_plan and price_plan.get("plan") is None and price_plan.get("onDate") is not None
+        else None
+    )
     if standard_unavailable:
         lines = [{**dict(r), "standard_amount": None} for r in lines]
     proof_on_file = {
