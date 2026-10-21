@@ -43,7 +43,7 @@ import ast
 import json
 import logging
 import re
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Literal
 from uuid import UUID
@@ -509,17 +509,45 @@ def _rate_reading(
     return base, issues
 
 
+# OCR reads one invoice number differently on its copies ("INV27O000668" /
+# "INV270000668", "C1R..." / "CIR..." / "CLR..."): compared without
+# separators, upper-cased, O as 0 and I / L as 1 (live data, 2026-10-21).
+_OCR_DIGITS = str.maketrans({"O": "0", "I": "1", "L": "1"})
+_VIN_RE = re.compile(r"[A-HJ-NPR-Z0-9]{17}")
+
+
+def ocr_number_key(value: Any) -> str | None:
+    """An invoice number as compared across copies (never shown)."""
+    key = re.sub(r"[^0-9A-Za-z]", "", str(value or "")).upper().translate(_OCR_DIGITS)
+    return key or None
+
+
+def _vin_parts(value: Any) -> tuple[str | None, str | None, str | None]:
+    """(as printed, full 17-character VIN, last 8 characters). DMS prints the
+    VIN partly or decorated ("T5H14641", "T2H36974 (MA1UN2YY2T2H36974)");
+    Tally often not at all (live data, 2026-10-21)."""
+    text_value = _clean_text(value)
+    if not text_value:
+        return None, None, None
+    tokens = [t for t in re.split(r"[^0-9A-Za-z]+", text_value.upper()) if t]
+    if not tokens:
+        return None, None, None
+    full = next((t for t in tokens if len(t) == 17 and _VIN_RE.fullmatch(t)), None)
+    longest = full or max(tokens, key=len)
+    return longest, full, longest[-8:] if len(longest) >= 6 else None
+
+
 def _identity(document_type: str, raw: dict[str, Any]) -> dict[str, Any]:
     number = _clean_text(raw.get("invoice_number") or raw.get("debit_note_number"))
     day = _to_date(raw.get("invoice_date") or raw.get("debit_note_date"))
-    vin = _clean_text(raw.get("vin_number") or raw.get("chassis_number"))
+    vin, vin_full, vin_tail = _vin_parts(raw.get("vin_number") or raw.get("chassis_number"))
     return {
         "number": number,
-        # One invoice number however the copy prints it: "DMS/26/0815",
-        # "dms 26 0815" and "DMS-26-0815" are one number.
-        "numberKey": re.sub(r"[^0-9A-Za-z]", "", number).upper() or None if number else None,
+        "numberKey": ocr_number_key(number) if number else None,
         "date": day.isoformat() if day else None,
-        "vin": re.sub(r"\s+", "", vin).upper() if vin else None,
+        "vin": vin,
+        "vinFull": vin_full,
+        "vinTail": vin_tail,
         "grandTotal": _to_decimal(raw.get("grand_total_amount") or raw.get("total_amount")),
         # Which books the copy comes from: a DMS copy and a Tally copy of one
         # bill can print different numbers (review B1).
@@ -527,6 +555,17 @@ def _identity(document_type: str, raw: dict[str, Any]) -> dict[str, Any]:
                  else (_upper(raw.get("source_system")) or None)),
         "purposePrinted": _upper(raw.get("invoice_purpose")) or None,
     }
+
+
+def _vin_relation(a: dict[str, Any], b: dict[str, Any]) -> str | None:
+    """"same" / "different" vehicle by VIN, None when either has none: the
+    full VIN when both print it, else the last 8 characters (a partial VIN
+    is the tail of the full one)."""
+    if not a.get("vinTail") or not b.get("vinTail"):
+        return None
+    if a.get("vinFull") and b.get("vinFull"):
+        return "same" if a["vinFull"] == b["vinFull"] else "different"
+    return "same" if a["vinTail"] == b["vinTail"] else "different"
 
 
 def _read_vehicle(raw: dict[str, Any], lines: list[dict[str, Any]], out: dict[str, Any]) -> None:
@@ -714,9 +753,9 @@ def read_invoice(
         "cancelled": None,
         "_raw": raw,
         # What a credit note says it reverses (its narration, heading and lines).
-        "referenceText": _alnum(" ".join(filter(None, [
+        "referenceText": ocr_number_key(" ".join(filter(None, [
             _clean_text(raw.get("narration")), _clean_text(raw.get("invoice_heading_as_printed")),
-            *(_clean_text(i.get("description_raw")) for i in lines)]))),
+            *(_clean_text(i.get("description_raw")) for i in lines)]))) or "",
     }
     if family in (FAMILY_VEHICLE, FAMILY_WHOLESALE):
         _read_vehicle(raw, lines, out)
@@ -786,8 +825,7 @@ def read_invoice(
     return out
 
 
-def vehicle_invoice_ex_showroom(document_fields: dict[str, Any], document_type: str = "customer_invoice_dms",
-                                ) -> dict[str, Any]:
+def vehicle_invoice_ex_showroom(document_fields: dict[str, Any], document_type: str) -> dict[str, Any]:
     """The R1 reading of one vehicle invoice, for every caller that needs it
     (the Deal sheet, SKU identification): one implementation.
 
@@ -795,7 +833,11 @@ def vehicle_invoice_ex_showroom(document_fields: dict[str, Any], document_type: 
     saleValue, discounts: {key: {amount (GST-inclusive), printed}}, issues}.
     ``exShowroom`` is None whenever the invoice's own figures do not give it
     (taxes not read, rate unclear, vehicle price not separable); ``issues``
-    then says why. Never borrows from another document."""
+    then says why. Never borrows from another document.
+
+    ``document_type`` is required: the type decides what kind of invoice it
+    is. A generic invoice that prints no purpose reads as no vehicle invoice
+    here; on the Deal it is paired with the vehicle invoice it copies."""
     reading = read_invoice(document_type, dict(document_fields))
     vehicle = reading.get("vehicle") or reading.get("dealerPurchase") or {}
     return {
@@ -818,10 +860,6 @@ def _type_rank(document_type: str) -> int:
         return _TYPE_PRIORITY.index(document_type)
     except ValueError:
         return len(_TYPE_PRIORITY)
-
-
-def _alnum(value: Any) -> str:
-    return re.sub(r"[^0-9A-Za-z]", "", str(value or "")).upper()
 
 
 def _single_key(reading: dict[str, Any]) -> str:
@@ -898,7 +936,7 @@ def _pair_generic_copies(readings: list[dict[str, Any]]) -> None:
                 or reading["purposePrinted"] not in (None, "UNKNOWN", "OTHER")):
             continue
         match = any(
-            (reading["vin"] and reading["vin"] == v["vin"])
+            _vin_relation(reading, v) == "same"
             or (reading["numberKey"] and reading["numberKey"] == v["numberKey"])
             or (reading["grandTotal"] is not None and v["grandTotal"] is not None
                 and abs(reading["grandTotal"] - v["grandTotal"]) <= _ONE_RUPEE)
@@ -913,47 +951,79 @@ def _pair_generic_copies(readings: list[dict[str, Any]]) -> None:
             readings[index] = copy
 
 
-def _mark_cancellations(readings: list[dict[str, Any]]) -> None:
-    """A credit note that reverses a whole vehicle invoice cancels it
-    (review S4): it names that invoice's number or carries its VIN, and
-    gives back its grand total to the rupee. The cancelled invoice and that
-    credit note both stop counting; a part credit note stays a discount.
-    With more than one candidate, the one it names, else the earliest."""
-    vehicles = [r for r in readings if r["family"] == FAMILY_VEHICLE]
-    for note in [r for r in readings if r["family"] == FAMILY_CREDIT_NOTE]:
+def _cancellation_amounts(reading: dict[str, Any]) -> list[Decimal]:
+    """What a credit note reversing this invoice would give back: its grand
+    total, or that less the TCS (and the round-off) (review RS3)."""
+    total = reading["grandTotal"]
+    if total is None:
+        return []
+    tcs = reading["lines"].get("tcs_amount") or Decimal(0)
+    round_off = _to_decimal(reading["_raw"].get("round_off_amount")) or Decimal(0)
+    return [total, total - tcs, total - tcs - round_off]
+
+
+def _mark_cancellations(groups: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """A credit note that reverses a whole vehicle invoice cancels that
+    invoice (review S4, RB1): it names the invoice's number or carries its
+    VIN, and gives back its total (grand total, or less TCS / round-off, to
+    the rupee). The invoice's group -- that bill and its copy from the other
+    system -- and the credit note stop counting; a separate reissue stays.
+    With more than one candidate, the one it names, else the earliest.
+
+    A credit note giving back a vehicle invoice's whole total but naming
+    neither its number nor its VIN is held back (not a dealer discount) and
+    the PC is asked whether it cancels that invoice (review RS2). Returns
+    those questions; a part credit note stays a discount."""
+    questions: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    vehicles = [g for g in groups if g["family"] == FAMILY_VEHICLE]
+    for note_group in [g for g in groups if g["family"] == FAMILY_CREDIT_NOTE and not g["cancelled"]]:
+        note = note_group["representative"]
         amount = note["grandTotal"] if note["grandTotal"] is not None else _to_decimal(note["_raw"].get("taxable_amount"))
         if amount is None:
             continue
-        words = note["referenceText"]
-        candidates = []
-        for vehicle in vehicles:
-            if vehicle["cancelled"] or vehicle["grandTotal"] is None:
+        named_candidates, unnamed = [], []
+        for group in vehicles:
+            if group["cancelled"]:
                 continue
-            if abs(abs(amount) - vehicle["grandTotal"]) > _ONE_RUPEE:
+            copies = group["copies"]
+            if not any(abs(abs(amount) - x) <= _ONE_RUPEE for c in copies for x in _cancellation_amounts(c)):
                 continue
-            named = bool(vehicle["numberKey"]) and vehicle["numberKey"] in words
-            same_vehicle = bool(note["vin"]) and note["vin"] == vehicle["vin"]
+            named = any(c["numberKey"] and c["numberKey"] in note["referenceText"] for c in copies)
+            same_vehicle = any(_vin_relation(note, c) == "same" for c in copies)
+            date_key = min((c["date"] for c in copies if c["date"]), default="9999")
             if named or same_vehicle:
-                candidates.append((not named, vehicle["date"] or "9999", str(vehicle["documentId"]), vehicle))
-        if not candidates:
-            continue
-        cancelled = min(candidates, key=lambda c: c[:3])[3]
-        # Its other copies (same number, or same date and total) go with it.
-        for vehicle in vehicles:
-            if vehicle is cancelled or (
-                (vehicle["numberKey"] and vehicle["numberKey"] == cancelled["numberKey"])
-                or (vehicle["date"] == cancelled["date"] and vehicle["grandTotal"] is not None
-                    and abs(vehicle["grandTotal"] - cancelled["grandTotal"]) <= _ONE_RUPEE
-                    and (not vehicle["vin"] or vehicle["vin"] == cancelled["vin"]))
-            ):
-                vehicle["cancelled"] = note["documentId"]
-        note["cancels"] = cancelled["documentId"]
+                named_candidates.append((not named, date_key, group["key"], group))
+            else:
+                unnamed.append((date_key, group["key"], group))
+        if named_candidates:
+            cancelled = min(named_candidates, key=lambda c: c[:3])[3]
+            cancelled["cancelled"] = True
+            cancelled["cancelledBy"] = note["documentId"]
+            for copy in cancelled["copies"]:
+                copy["cancelled"] = note["documentId"]
+            note_group["cancelled"] = True
+            note["cancels"] = cancelled["representative"]["documentId"]
+        elif unnamed:
+            target = min(unnamed, key=lambda c: c[:2])[2]
+            note_group["pendingCancellation"] = target["key"]
+            questions.append((note_group, target))
+    return questions
 
 
 def _vehicle_sets(readings: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    """Vehicle invoices grouped into sales (review B1): one vehicle (VIN /
-    chassis) is one sale invoice whatever number each copy prints; copies
-    without a VIN join by number; different VINs are different vehicles."""
+    """Vehicle invoices grouped into bills (review B1, RB2, RS1; live data
+    2026-10-21):
+
+    - the same invoice number (compared OCR-tolerantly) is one bill, on
+      either system, even when one copy's date or total was misread -- the
+      copies are then compared, never added;
+    - a DMS copy and a Tally copy of one vehicle (VIN, full or its last 8
+      characters) are one bill, whatever numbers they print;
+    - a DMS copy and a Tally copy where one prints no VIN are one bill when
+      their grand totals agree to the rupee (the closest date first);
+    - two invoices from the same system with different numbers are two
+      invoices (a cancel-and-reissue), and different VINs are different
+      vehicles."""
     parent = list(range(len(readings)))
 
     def find(i: int) -> int:
@@ -962,24 +1032,52 @@ def _vehicle_sets(readings: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
             i = parent[i]
         return i
 
-    vins: dict[int, set[str]] = {i: ({r["vin"]} if r["vin"] else set()) for i, r in enumerate(readings)}
+    def members(root: int) -> list[dict[str, Any]]:
+        return [readings[k] for k in range(len(readings)) if find(k) == root]
 
-    def join(i: int, j: int) -> None:
+    def join(i: int, j: int) -> bool:
         a, b = find(i), find(j)
-        if a == b or len(vins[a] | vins[b]) > 1:
-            return  # two vehicles are never one sale
+        if a == b:
+            return True
+        combined = members(a) + members(b)
+        for x in combined:
+            for y in combined:
+                if _vin_relation(x, y) == "different":
+                    return False  # two vehicles are never one bill
+                if x["side"] and x["side"] == y["side"] and x["numberKey"] != y["numberKey"]:
+                    return False  # one system, two numbers: two invoices
         parent[b] = a
-        vins[a] |= vins[b]
+        return True
 
-    for i, a in enumerate(readings):
-        for j in range(i + 1, len(readings)):
-            b = readings[j]
-            if (a["vin"] and a["vin"] == b["vin"]) or (a["numberKey"] and a["numberKey"] == b["numberKey"]):
+    order = sorted(range(len(readings)), key=lambda k: str(readings[k]["documentId"]))
+    for i in order:
+        for j in order:
+            if i < j and readings[i]["numberKey"] and readings[i]["numberKey"] == readings[j]["numberKey"]:
                 join(i, j)
-    for i, a in enumerate(readings):
-        for j in range(i + 1, len(readings)):
+    for i in order:
+        for j in order:
+            if i < j and readings[i]["side"] != readings[j]["side"] and _vin_relation(readings[i], readings[j]) == "same":
+                join(i, j)
+    for i in order:
+        a = readings[i]
+        candidates = []
+        for j in order:
             b = readings[j]
-            if not a["numberKey"] and not b["numberKey"] and _single_key(a) == _single_key(b):
+            if j == i or a["side"] == b["side"] or find(i) == find(j):
+                continue
+            if a["vinTail"] and b["vinTail"]:
+                continue  # both print a VIN: the VIN decides
+            if a["grandTotal"] is None or b["grandTotal"] is None or abs(a["grandTotal"] - b["grandTotal"]) > _ONE_RUPEE:
+                continue
+            apart = _days_apart(a["date"], b["date"])
+            candidates.append((apart if apart is not None else 99999, str(b["documentId"]), j))
+        for _, _, j in sorted(candidates):
+            if join(i, j):
+                break
+    for i in order:
+        for j in order:
+            a, b = readings[i], readings[j]
+            if i < j and not a["numberKey"] and not b["numberKey"] and _single_key(a) == _single_key(b):
                 join(i, j)
     sets: dict[int, list[dict[str, Any]]] = {}
     for i, reading in enumerate(readings):
@@ -1025,28 +1123,31 @@ def _other_sets(readings: list[dict[str, Any]]) -> tuple[list[list[dict[str, Any
     return merged, questions
 
 
-def select_invoices(readings: list[dict[str, Any]]) -> dict[str, Any]:
+def select_invoices(
+    readings: list[dict[str, Any]], *, plausible_from: date | None = None, today: date | None = None,
+) -> dict[str, Any]:
     """Group the invoices on file into distinct invoices and count each once.
 
-    - Vehicle invoices: one vehicle (VIN / chassis) is one sale invoice, so
-      its DMS and Tally copies are one invoice even when they print
-      different numbers; without a VIN, copies join by number. Different
-      VINs are different vehicles. A generic copy that prints no purpose
-      joins the vehicle invoice it copies.
+    - Vehicle invoices: see _vehicle_sets (same number, or a DMS and a Tally
+      copy of one vehicle, or of one total when one prints no VIN, are one
+      bill; one system with two numbers is two invoices). A generic copy
+      that prints no purpose joins the vehicle invoice it copies.
     - Accessory / EW / RSA invoices: one number is one bill; a DMS and a
       Tally bill with different numbers are one bill when their totals agree
       to the rupee within a day, else two bills and the PC is asked.
     - The copy that stands for an invoice is the complete one, then the one
       whose own arithmetic holds, then the canonical document-type priority,
       then the document id. Never by upload time.
-    - A credit note reversing a whole vehicle invoice cancels it: both stop
-      counting. One car has one vehicle invoice: when more than one is still
-      on file, the latest dated one prices the deal and a Team Lead is asked.
+    - A credit note reversing a whole vehicle invoice cancels it (see
+      _mark_cancellations). One car has one vehicle invoice: when more than
+      one is still on file, the latest dated one (within the deal's window,
+      booking date to today) prices the deal and a Team Lead is asked.
     - The wholesale invoice is kept apart as the dealer's purchase.
     """
-    readings = list(readings)
+    # Fresh copies: grouping marks readings, and a caller's own readings
+    # must not carry those marks into another call (review RN3).
+    readings = [dict(r) for r in readings]
     _pair_generic_copies(readings)
-    _mark_cancellations(readings)
     families: dict[str, list[dict[str, Any]]] = {}
     for reading in readings:
         families.setdefault(reading["family"], []).append(reading)
@@ -1054,9 +1155,7 @@ def select_invoices(readings: list[dict[str, Any]]) -> dict[str, Any]:
     question_sets: list[tuple[Any, Any]] = []
     for family, members in sorted(families.items()):
         if family == FAMILY_VEHICLE:
-            live = [r for r in members if not r["cancelled"]]
-            raw_sets += _vehicle_sets(live)
-            raw_sets += [[r] for r in members if r["cancelled"]]
+            raw_sets += _vehicle_sets(members)
         else:
             sets, questions = _other_sets(members)
             raw_sets += sets
@@ -1064,9 +1163,10 @@ def select_invoices(readings: list[dict[str, Any]]) -> dict[str, Any]:
 
     def group_key(copies: list[dict[str, Any]]) -> str:
         family = copies[0]["family"]
-        vin = next((r["vin"] for r in copies if r["vin"]), None)
+        numbers = sorted({r["numberKey"] for r in copies if r["numberKey"]})
+        vin = next((r["vinFull"] or r["vinTail"] for r in copies if r["vinTail"]), None)
         if family == FAMILY_VEHICLE and vin:
-            return f"{family}|V|{vin}"
+            return f"{family}|V|{vin}|{'+'.join(numbers)}" if numbers else f"{family}|V|{vin}"
         numbers = sorted({r["numberKey"] for r in copies if r["numberKey"]})
         if numbers:
             return f"{family}|N|{'+'.join(numbers)}"
@@ -1076,17 +1176,20 @@ def select_invoices(readings: list[dict[str, Any]]) -> dict[str, Any]:
     for copies in raw_sets:
         copies = sorted(copies, key=_copy_order)
         rep = copies[0]
-        cancelled = bool(rep["cancelled"]) or bool(rep.get("cancels"))
         built.append({
             "key": group_key(copies),
             "family": rep["family"],
             "representative": rep,
             "copies": copies,
             "disagreements": _copies_disagree(copies) if len(copies) > 1 else [],
-            "cancelled": cancelled,
-            "counted": rep["family"] in CUSTOMER_FAMILIES and not cancelled,
+            "cancelled": False,
+            "counted": rep["family"] in CUSTOMER_FAMILIES,
         })
     built.sort(key=lambda g: g["key"])
+    cancellation_questions = _mark_cancellations(built)
+    for group in built:
+        if group["cancelled"] or group.get("pendingCancellation"):
+            group["counted"] = False
     questions = []
     for a, b in question_sets:
         ga = next(g for g in built if a[0] in g["copies"])
@@ -1095,10 +1198,17 @@ def select_invoices(readings: list[dict[str, Any]]) -> dict[str, Any]:
     vehicle_groups = [g for g in built if g["family"] == FAMILY_VEHICLE and not g["cancelled"]]
     vehicle = None
     if vehicle_groups:
+        window_to = (today or datetime.now(UTC).date()).isoformat()
+        window_from = plausible_from.isoformat() if plausible_from else "0000"
+
         def vehicle_rank(group: dict[str, Any]) -> tuple[Any, ...]:
             rep = group["representative"]
             complete = not any(i["code"] in _BLOCKING_ISSUES for i in rep["issues"])
-            return (complete, rep["date"] or "")
+            # A date misread by years (2024 for 2026) never decides which
+            # invoice is the latest: only dates inside the deal's window
+            # (booking date to today) count (live data, 2026-10-21).
+            dated = [c["date"] for c in group["copies"] if c["date"] and window_from <= c["date"] <= window_to]
+            return (complete, max(dated, default=""))
 
         # A complete reading first, then the latest invoice date (a reissue
         # replaces the earlier invoice); on a tie, the better copy (review N1).
@@ -1136,6 +1246,7 @@ def select_invoices(readings: list[dict[str, Any]]) -> dict[str, Any]:
         "multipleVehicle": len(vehicle_groups) > 1,
         "cancelled": [g for g in built if g["cancelled"]],
         "sameBillQuestions": questions,
+        "cancellationQuestions": cancellation_questions,
         "families": {g["family"] for g in counted},
         "lines": lines,
         "lineDocuments": line_documents,
@@ -1332,6 +1443,19 @@ def _write_invoice_discount(
 
 
 # ── the invoices on file -> canonical actuals ────────────────────────────────
+def plausible_from(connection: Connection, *, tenant_id: str, journey_id: UUID) -> date | None:
+    """The earliest date a vehicle invoice of this deal can carry: the
+    booking date, when read (a year misread on an invoice falls outside)."""
+    try:
+        from audit_core.uc03_p2_dates import booking_form_date
+
+        form = booking_form_date(connection, tenant_id=tenant_id, journey_id=journey_id)
+    except Exception:  # never let a date lookup stop materialisation
+        logger.warning("uc03_invoice_booking_date_unavailable", exc_info=True)
+        return None
+    return (form or {}).get("date")
+
+
 def load_invoice_readings(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
     """Every invoice persisted for this journey whose document is still on
     file, read on its own."""
@@ -1461,7 +1585,8 @@ def sync_invoice_actuals(
     and a line or discount an invoice no longer carries recomputed from the
     remaining sources (2026-10-20, R2)."""
     readings = load_invoice_readings(connection, tenant_id=tenant_id, journey_id=journey_id)
-    selection = select_invoices(readings)
+    selection = select_invoices(readings, plausible_from=plausible_from(
+        connection, tenant_id=tenant_id, journey_id=journey_id))
     lines_written = 0
     for component_key, amount in sorted(selection["lines"].items()):
         reading = selection["lineDocuments"][component_key][0]
@@ -1701,6 +1826,20 @@ def sync_invoice_checks(
             "payload": {"documentIds": [d["documentId"], t["documentId"]], "family": first["family"]},
             "role": "PC", "task_type": _FIELD_REVIEW_TASK_TYPE, "severity": "MEDIUM",
         }
+    for note_group, vehicle_group in selection.get("cancellationQuestions", []):
+        note, vehicle = note_group["representative"], vehicle_group["representative"]
+        rule_key = f"INVOICE_CANCELLATION_QUESTION:{note_group['key']}~{vehicle_group['key']}"
+        wanted[rule_key] = {
+            "title": f"Does credit note {note['number'] or '-'} cancel invoice {vehicle['number'] or '-'}?",
+            "description": (
+                f"Credit note {note['number'] or '(no number)'} gives back {note['grandTotal']}, the whole of vehicle "
+                f"invoice {vehicle['number'] or '(no number)'}, but names neither that invoice nor its VIN. It is "
+                "held back (not counted as a discount) until confirmed: if it cancels the invoice, void the invoice; "
+                "if it is a discount, correct its narration."
+            ),
+            "payload": {"documentIds": [note["documentId"], vehicle["documentId"]]},
+            "role": "PC", "task_type": _FIELD_REVIEW_TASK_TYPE, "severity": "HIGH",
+        }
     if selection["multipleVehicle"]:
         vehicles = [g["representative"] for g in selection["groups"] if g["family"] == FAMILY_VEHICLE]
         chosen = selection["vehicle"]["representative"]
@@ -1730,12 +1869,13 @@ def sync_invoice_checks(
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
               AND finding_status IN ('OPEN', 'ACKNOWLEDGED')
               AND (rule_key LIKE :check OR rule_key LIKE :copies OR rule_key = :multiple OR rule_key LIKE :legacy
-                   OR rule_key LIKE :question)
+                   OR rule_key LIKE :question OR rule_key LIKE :cancellation)
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id, "check": f"{_CHECK_RULE_PREFIX}%",
          "copies": f"{_COPIES_RULE_PREFIX}%", "multiple": _MULTIPLE_VEHICLE_RULE,
-         "legacy": f"{_LEGACY_DISAGREEMENT_PREFIX}%", "question": "INVOICE_SAME_BILL_QUESTION:%"},
+         "legacy": f"{_LEGACY_DISAGREEMENT_PREFIX}%", "question": "INVOICE_SAME_BILL_QUESTION:%",
+         "cancellation": "INVOICE_CANCELLATION_QUESTION:%"},
     ).mappings().all()
     resolved = 0
     for row in open_rows:
@@ -1763,7 +1903,9 @@ def check_invoice_field_discrepancies(
     each other; different invoices are never compared as if they were one
     (2026-10-20, R2). Never raises -- best-effort, safe on every call."""
     try:
-        selection = select_invoices(load_invoice_readings(connection, tenant_id=tenant_id, journey_id=journey_id))
+        selection = select_invoices(
+            load_invoice_readings(connection, tenant_id=tenant_id, journey_id=journey_id),
+            plausible_from=plausible_from(connection, tenant_id=tenant_id, journey_id=journey_id))
         return sync_invoice_checks(connection, tenant_id=tenant_id, journey_id=journey_id, selection=selection,
                                    stage_code=stage_code, correlation_id=correlation_id)
     except Exception:
@@ -1889,6 +2031,8 @@ __all__ = [
     "invoice_family",
     "load_invoice_readings",
     "materialize_reviewed_invoices",
+    "ocr_number_key",
+    "plausible_from",
     "read_invoice",
     "select_invoices",
     "sync_invoice_actuals",

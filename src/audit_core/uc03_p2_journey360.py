@@ -870,14 +870,14 @@ def _invoice_fields(fields: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def deal_invoices(documents: list[dict[str, Any]]) -> dict[str, Any]:
+def deal_invoices(documents: list[dict[str, Any]], *, booking_date: Any = None) -> dict[str, Any]:
     """The invoices on file (ACTIVE documents), each read on its own and
     counted once (uc03_invoice_materialization.select_invoices)."""
     readings = [
         read_invoice(d["documentType"], _invoice_fields(d["fields"]), document_id=d["documentId"])
         for d in documents if d["documentType"] in _INVOICE_TYPES
     ]
-    return select_invoices(readings)
+    return select_invoices(readings, plausible_from=booking_date)
 
 
 def _deal_closed(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
@@ -1007,7 +1007,11 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         di_types=tuple(dict.fromkeys(_INVOICE_TYPES + _ITEM_SOURCES + ("insurance_cover",) + tuple(_BOOKING_SOURCES))),
     )
     # Each invoice read on its own and counted once (2026-10-20, R1/R2).
-    selection = deal_invoices(documents)
+    booking_documents = [d for d in documents if d["documentType"] in ("booking_form", "booking_docket")]
+    booking_form = next((d for d in booking_documents if d["documentType"] == "booking_form"),
+                        booking_documents[0] if booking_documents else None)
+    selection = deal_invoices(documents, booking_date=parse_extracted_date(
+        booking_form["fields"].get("booking_date")) if booking_form else None)
     read_ids = {str(r["documentId"]) for g in selection["groups"] for r in g["copies"]}
     # A document read here supersedes its own materialised rows; the
     # wholesale invoice is the dealer's purchase and never a customer line.
@@ -1334,7 +1338,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
                 # The vehicle invoice is on file but its own taxes were not
                 # read: never borrowed, never guessed (R1).
                 row["current"], row["currentSource"] = None, None
-                row["flags"] = [*row["flags"], "TAXES_NOT_READ"]
+                rate_unclear = (vehicle_reading.get("vehicle") or {}).get("rateUnclear")
+                row["flags"] = [*row["flags"], "RATE_UNCLEAR" if rate_unclear else "TAXES_NOT_READ"]
             elif (document == "VEHICLE" and vehicle_on_file) or closed:
                 if optional:
                     row["current"] = None
@@ -1526,6 +1531,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
                 "netPayable": _money(reading["netPayable"]),
                 "counted": bool(group["counted"] and reading is group["representative"]),
                 "cancelledBy": reading.get("cancelled"),
+                "awaitingCancellationAnswer": bool(group.get("pendingCancellation")),
                 "cancels": reading.get("cancels"),
                 "sameInvoiceAs": [r["documentId"] for r in group["copies"] if r is not reading],
                 "issues": reading["issues"],

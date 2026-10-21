@@ -15,7 +15,7 @@ SGST 9% 63,091.56 each; grand total 8,27,200.44.
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
@@ -559,7 +559,7 @@ def test_a_generic_copy_without_a_purpose_joins_the_vehicle_invoice():
 
 
 def test_the_shared_r1_reading_for_every_caller():
-    reading = im.vehicle_invoice_ex_showroom(EXAMPLE)
+    reading = im.vehicle_invoice_ex_showroom(EXAMPLE, "customer_invoice_dms")
     assert reading["exShowroom"] == Decimal("852000.00") and reading["rate"] == Decimal("0.18")
     assert reading["saleValue"] == Decimal("827200.44") and reading["issues"] == []
     assert reading["discounts"]["CASH_DISCOUNT"] == {"amount": Decimal("13000.06"), "printed": Decimal("11017.00")}
@@ -580,6 +580,16 @@ def test_a_stale_spelling_of_a_type_never_wins(journey):
         set_tenant_context(connection, journey.tenant_id)
         rows = active_source_rows(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     assert [(r["source_document_type"], r["amount"]) for r in rows] == [("booking_docket", Decimal(47000))]
+    # RN1: written in one pass (same timestamp), the normalised spelling wins.
+    for spelling, amount in (("Booking Docket", "90000"), ("booking_docket", "91000")):
+        _sql(journey, "INSERT INTO auditcore.commercial_line_source_values (tenant_id, journey_id, line_kind, "
+                      "component_key, source_document_type, amount, source_document_id, updated_at_utc) "
+                      "VALUES (:t, :j, 'COMMERCIAL', 'road_tax_amount', :d, :a, :doc, '2026-10-20T10:00:00Z')",
+             d=spelling, a=amount, doc=booking)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        rows = active_source_rows(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert [r["amount"] for r in rows if r["component_key"] == "road_tax_amount"] == [Decimal(91000)]
     assert Decimal(_rows(_deal(journey))["insurance_amount"]["booking"]) == 47000
 
 
@@ -599,3 +609,139 @@ def test_a_line_awaiting_its_document_with_no_booking_figure_is_listed_not_price
     assert Decimal(summary["net"]["current"]) == Decimal("827200.44")
     assert Decimal(summary["net"]["standard"]) == 852000
     assert Decimal(summary["balanceDue"]) == Decimal("827200.44")
+
+
+# ── re-review of PR #470 and the live Mahindra Orissa data (2026-10-21) ──────
+VIN = "MA1RM2TVXT5H14641"
+
+
+def _vehicle(document_id, document_type="customer_invoice_dms", **overrides):
+    raw = {**EXAMPLE, "vin_number": VIN, **overrides}
+    raw = {k: v for k, v in raw.items() if v is not None}
+    return im.read_invoice(document_type, raw, document_id=document_id)
+
+
+def _tally(document_id, **overrides):
+    raw = {k: v for k, v in EXAMPLE.items() if k != "line_items"}
+    raw.update({"vin_number": None, **overrides})
+    return im.read_invoice("tax_invoice_tally", {k: v for k, v in raw.items() if v is not None},
+                           document_id=document_id)
+
+
+def _note(document_id, amount="827200.44", **fields):
+    return im.read_invoice("credit_note", {"invoice_number": document_id.upper(), "grand_total_amount": amount,
+                                           **fields}, document_id=document_id)
+
+
+def test_a_same_day_reissue_survives_the_credit_note_that_cancels_the_original():
+    """RB1: only the cancelled bill (and its copy from the other system) goes."""
+    original = _vehicle("o", invoice_number="DMS/26/0815", invoice_date="2026-10-10")
+    note = _note("cn", narration="Cancellation of invoice DMS/26/0815 - name correction")
+    reissue = _vehicle("r", invoice_number="DMS/26/0816", invoice_date="2026-10-10")
+    selection = im.select_invoices([original, note, reissue])
+    assert selection["vehicle"]["representative"]["documentId"] == "r"
+    assert selection["netPayable"] == Decimal("827200.44") and selection["multipleVehicle"] is False
+    assert {r["documentId"] for g in selection["cancelled"] for r in g["copies"]} == {"o", "cn"}
+
+
+def test_one_system_with_two_numbers_is_two_invoices_and_the_latest_prices_the_deal():
+    """RB2: DMS -> DMS with a new number (same VIN) is a cancel-and-reissue,
+    never two copies of one bill."""
+    original = _vehicle("o", invoice_number="DMS/26/0815", invoice_date="2026-10-10")
+    reissue = _vehicle("r", invoice_number="DMS/26/0901", invoice_date="2026-10-15")
+    for readings in ([original, reissue], [reissue, original]):
+        selection = im.select_invoices(readings)
+        assert selection["multipleVehicle"] is True
+        assert selection["vehicle"]["representative"]["documentId"] == "r"
+
+
+def test_a_tally_copy_without_a_vin_pairs_by_total():
+    """RS1: DMS with a VIN, Tally without, different numbers, same total."""
+    selection = im.select_invoices([_vehicle("dms", invoice_number="DMS/26/0815"),
+                                    _tally("tally", invoice_number="TL/2231")])
+    assert len(selection["counted"]) == 1 and selection["multipleVehicle"] is False
+
+
+def test_a_full_credit_note_naming_nothing_is_asked_about_not_a_dealer_discount():
+    """RS2: held back with a PC question; never an 8-lakh discount."""
+    vehicle = _vehicle("v", invoice_number="DMS/26/0815")
+    selection = im.select_invoices([vehicle, _note("cn", narration="Cancellation")])
+    assert selection["netPayable"] == Decimal("827200.44")
+    assert selection["discounts"]["ADDITIONAL_DISCOUNT"]["amount"] == Decimal("10000.00")  # the invoice's own
+    [(note, target)] = selection["cancellationQuestions"]
+    assert note["representative"]["documentId"] == "cn" and target["representative"]["documentId"] == "v"
+
+
+def test_a_credit_note_without_the_tcs_still_cancels_the_invoice():
+    """RS3: the credit note gives back the invoice less its TCS."""
+    with_tcs = _vehicle("v", invoice_number="DMS/26/0815", tcs_amount="8272.00", grand_total_amount="835472.44")
+    selection = im.select_invoices([with_tcs, _note("cn", narration="Reversal of DMS/26/0815")])
+    assert selection["vehicle"] is None and selection["netPayable"] is None
+    assert len(selection["cancelled"]) == 2
+
+
+def test_ocr_variants_of_one_invoice_number_are_one_invoice():
+    """Live: "INV27O000668" (DMS) vs "INV270000668" (Tally); "INV/27C001498"
+    vs "INV27C001498"."""
+    for dms_number, tally_number in (("INV27O000668", "INV270000668"), ("INV/27C001498", "INV27C001498")):
+        selection = im.select_invoices([_vehicle("d", invoice_number=dms_number),
+                                        _tally("t", invoice_number=tally_number, grand_total_amount="827000")])
+        assert len(selection["counted"]) == 1, dms_number
+        assert selection["counted"][0]["disagreements"], dms_number  # totals differ: flagged, not added
+
+
+def test_partial_and_decorated_vins_match_the_full_vin():
+    """Live: DMS prints "T5H14641" or "T2H36974 (MA1UN2YY2T2H36974)"."""
+    partial = _vehicle("d", invoice_number="DMS/1", vin_number="T5H14641")
+    full = _tally("t", invoice_number="TL/1", vin_number=VIN, grand_total_amount="827000")
+    assert len(im.select_invoices([partial, full])["counted"]) == 1
+    decorated = im.read_invoice("customer_invoice_dms", {**EXAMPLE, "vin_number": "T2H36974 (MA1UN2YY2T2H36974)"})
+    assert decorated["vinFull"] == "MA1UN2YY2T2H36974" and decorated["vinTail"] == "T2H36974"
+    other = _tally("x", invoice_number="TL/2", vin_number="MA1RM2TVXT5H99999")
+    assert im.select_invoices([partial, other])["multipleVehicle"] is True
+
+
+def test_a_year_misread_neither_splits_copies_nor_decides_the_latest_invoice():
+    """Live: DMS 2026-09-30 vs Tally 2024-09-30 for one INV27A003006."""
+    copies = im.select_invoices([_vehicle("d", invoice_number="INV27A003006", invoice_date="2026-09-30"),
+                                 _tally("t", invoice_number="INV27A003006", invoice_date="2024-09-30")])
+    assert len(copies["counted"]) == 1
+    real = _vehicle("a", invoice_number="DMS/26/0901", invoice_date="2026-10-09")
+    misread = _vehicle("b", invoice_number="DMS/26/0815", invoice_date="2028-10-05")
+    selection = im.select_invoices([real, misread], plausible_from=date(2026, 9, 20), today=date(2026, 10, 21))
+    assert selection["vehicle"]["representative"]["documentId"] == "a"
+
+
+def test_one_number_with_different_totals_is_copies_that_disagree():
+    """Live ADI-BA-261019-001: INV27A003006 DMS 11,33,781 vs 9,99,000."""
+    selection = im.select_invoices([
+        _vehicle("d1", invoice_number="INV27A003006", grand_total_amount="1133781"),
+        _vehicle("d2", invoice_number="INV27A003006", grand_total_amount="999000"),
+        _tally("t", invoice_number="INV27A003006", grand_total_amount="999000"),
+    ])
+    assert len(selection["counted"]) == 1 and selection["multipleVehicle"] is False
+    assert any(d["field"] == "netPayable" for d in selection["counted"][0]["disagreements"])
+
+
+def test_accessory_bills_as_seen_live():
+    """UTK-SU-261019-001: DMS C1R27F00000002 (08 Sep, 7,457) and Tally
+    C1R27F000000053 (14 Oct, 4,746) are two bills and the PC is asked;
+    UTK-SU-261019-002: DMS and Tally both C1R27F000000053 (read once as
+    "CIR...") are one bill."""
+    def bill(document_id, document_type, number, day, total):
+        return im.read_invoice(document_type, {"invoice_number": number, "invoice_date": day,
+                                               "grand_total_amount": total}, document_id=document_id)
+    two = im.select_invoices([bill("a", "accessory_invoice_dms", "C1R27F00000002", "2026-09-08", "7457"),
+                              bill("b", "accessory_invoice_tally", "C1R27F000000053", "2026-10-14", "4746")])
+    assert len(two["counted"]) == 2 and len(two["sameBillQuestions"]) == 1
+    one = im.select_invoices([bill("c", "accessory_invoice_dms", "CIR27F000000053", "2026-10-14", "4746"),
+                              bill("d", "accessory_invoice_tally", "C1R27F000000053", "2026-10-14", "4746")])
+    assert len(one["counted"]) == 1 and one["lines"]["accessories_cost"] == Decimal(4746)
+
+
+def test_grouping_never_marks_the_callers_readings():
+    """RN3: the same readings give the same answer twice."""
+    readings = [_vehicle("o", invoice_number="DMS/26/0815"), _note("cn", narration="Cancel DMS/26/0815")]
+    first, second = im.select_invoices(readings), im.select_invoices(readings)
+    assert len(first["cancelled"]) == len(second["cancelled"]) == 2
+    assert readings[0]["cancelled"] is None

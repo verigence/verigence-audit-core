@@ -630,13 +630,13 @@ def _invoice_bills(facts: _Facts) -> tuple[list[dict[str, Any]], list[str]]:
         read_invoice(d["documentType"], _invoice_fields(d["fields"]), document_id=d["documentId"])
         for d in facts.documents(*_INVOICE_TYPES)
     ]
-    selection = select_invoices(readings)
+    selection = select_invoices(readings, plausible_from=facts.booking_date)
     bills: list[dict[str, Any]] = []
     unreadable: list[str] = []
     for group in selection["groups"]:
         # A vehicle invoice reversed in full by a credit note, and that
         # credit note, are both left out (review S4).
-        if group["family"] not in _COUNTED_FAMILIES or group["cancelled"]:
+        if group["family"] not in _COUNTED_FAMILIES or group["cancelled"] or group.get("pendingCancellation"):
             continue
         rep = group["representative"]
         label = rep["documentType"].replace("_", " ")
