@@ -785,9 +785,14 @@ def test_aliases_never_merge_models_and_conditions_make_separate_schemes(connect
     for r in rows:
         if r["criteria"].get("scope") != "UNRESOLVED":  # other test models of the same name
             by_code.setdefault(r["scheme_code"], []).append(r["variant_name"])
-    assert by_code["MAH_CORPORATE_Z_THE_BOSS_BOLERO_NEO_BOLERO_NEO_PLUS"] == ["P10 BS6.2"]
-    assert by_code["MAH_CORPORATE_Z_THE_BOSS_BOLERO_NEO_BOLERO_NEO"] == ["N8 BS6.2 - Refresh"]
-    assert by_code["MAH_CORPORATE_Z_THE_BOSS_BOLERO_NEO_BOLERO"] == ["B4 BS6.2 - Refresh"]
+    # #468 files the September "THE BOSS- BOLERO+NEO" rows under three
+    # models; "BOLERO NEO+" is the Neo Plus (the "+" read as PLUS before the
+    # identity), never the Neo next to its own row (review of PR 472, B4).
+    print(sorted(by_code))
+    models = {r["scheme_code"]: r["model_name"] for r in rows}
+    assert models["MAH_CORPORATE_Z_BOLERO_NEO_PLUS"] == "BOLERO NEO PLUS"
+    assert models["MAH_CORPORATE_Z_BOLERO_NEO"] == "BOLERO NEO"
+    assert models["MAH_CORPORATE_Z_BOLERO"] == "BOLERO"
     assert by_code["MAH_CORPORATE_F_XUV_3XO_REVX"] == ["REVX M PM MT"]  # REVX only, Edge excluded
     assert set(by_code["MAH_CORPORATE_F_XUV_3XO"]) == {None}  # the model-wide XUV 3XO line
     assert all(r["customer_type_code"].startswith("CORPORATE:") for r in rows)
@@ -1430,3 +1435,106 @@ def test_the_bolero_split_keeps_the_september_exchange_and_scrappage_for_all_thr
     assert "THE BOSS- BOLERO+NEO" not in after
     for model in ("BOLERO", "BOLERO NEO", "BOLERO NEO PLUS"):
         assert after[model] == before, model
+
+
+def _scheme_rows(c, code_like: str) -> list[tuple]:
+    return sorted(tuple(r) for r in c.execute(text("""
+        SELECT s.scheme_code, pm.model_name, COALESCE(pv.variant_name, '-'), e.criteria ->> 'scope',
+               v.effective_to
+        FROM auditcore.discount_schemes s
+        JOIN auditcore.discount_scheme_versions v ON v.discount_scheme_id = s.discount_scheme_id
+        JOIN auditcore.discount_scheme_eligibility e ON e.discount_scheme_version_id = v.discount_scheme_version_id
+        JOIN auditcore.product_models pm ON pm.model_id = e.model_id
+        LEFT JOIN auditcore.product_variants pv ON pv.variant_id = e.variant_id
+        WHERE s.tenant_id = :t AND s.scheme_code LIKE :c"""), {"t": c.tenant_id, "c": code_like}).all())
+
+
+def test_scheme_rows_reach_the_variants_they_name_through_model_identity(fresh_oem) -> None:
+    """Review of PR 472 (B1, B4, S1, S4), on #468's model identity: a variant
+    named without the emission norm, the "- E" suffix or with "& Mocha
+    Interiors" is the price list's variant; "Scorpio-N including Refresh"
+    reaches the old and the new Scorpio N, a plain "Scorpio-N" in September
+    the Scorpio N on sale (the old one); the bulletin's validity end is the
+    versions' effective_to."""
+    c = fresh_oem
+    oem_code = c.execute(text("SELECT oem_code FROM auditcore.oems WHERE oem_id = :o"), {"o": c.oem_id}).scalar_one()
+    _load(c, date(2026, 9, 3), _book(
+        ("PV", "SCORPIO N", "Z8 S D AT 2WD 7 STR BS6.2 - N", 1_917_499.58, "SCORPIO N D old"),
+        ("PV", "New SCORPIO N", "Z8 S D AT 2WD 7 STR BS6.2 - Refresh", 1_988_996.00, "SCORPIO N D New"),
+        ("PV", "SCORPIO CLASSIC", "Classic S BS6.2 - E", 1_336_700.64),
+        ("CV", "MAXX HD", "MAXX HD 1.3 LX BS6.2", 900_000),
+        ("PV", "THAR ROXX", "AX7L DAT 2WD", 2_000_000),
+    ))
+    consumer = ParseResult(kind="CONSUMER_SCHEME")
+    consumer.effective_to_hint = date(2026, 9, 30)
+    consumer.discount_rows = [
+        DiscountRow(1, "CONSUMER", "Scorpio Classic", ["Classic S BS6.2"], [("CASH_DISCOUNT", Decimal(7001))],
+                    Decimal(7001), {}),
+        DiscountRow(2, "CONSUMER", "MAXX HD", ["MAXX HD 1.3 LX"], [("CASH_DISCOUNT", Decimal(15000))],
+                    Decimal(15000), {}),
+        DiscountRow(3, "CONSUMER", "Thar Roxx", ["AX7L DAT 2WD & Mocha Interiors"],
+                    [("ACCESSORIES_KIT", Decimal(50001))], Decimal(50001), {}),
+    ]
+    summary = ingest_discount_document(c, tenant_id=c.tenant_id, oem_id=c.oem_id, oem_code=oem_code,
+                                       master_kind="CONSUMER_SCHEME", effective_from=date(2026, 9, 3),
+                                       parsed=consumer, actor_id="admin")
+    assert summary["unresolvedVariants"] == []
+    rows = _scheme_rows(c, "MAH_CONSUMER_%")
+    assert {(r[1], r[2], r[3]) for r in rows} == {
+        ("SCORPIO CLASSIC", "Classic S BS6.2 - E", "VARIANT"),
+        ("MAXX HD", "MAXX HD 1.3 LX BS6.2", "VARIANT"),
+        ("THAR ROXX", "AX7L DAT 2WD", "VARIANT"),
+    }
+    assert {r[4] for r in rows} == {date(2026, 9, 30)}
+
+    exchange = ParseResult(kind="EXCHANGE_SCHEME")
+    exchange.discount_rows = [
+        DiscountRow(1, "EXCHANGE", "Scorpio-N including Refresh", [], [("EXCHANGE_BONUS", Decimal(50000))],
+                    Decimal(50000), {"section": "EXCHANGE_PERSONAL"}),
+        DiscountRow(2, "SCRAPPAGE", "Scorpio-N", [], [("SCRAPPAGE_BONUS_DEALER", Decimal(25000))],
+                    Decimal(25000), {"section": "SCRAPPAGE"}),
+    ]
+    ingest_discount_document(c, tenant_id=c.tenant_id, oem_id=c.oem_id, oem_code=oem_code,
+                             master_kind="EXCHANGE_SCHEME", effective_from=date(2026, 9, 3), parsed=exchange,
+                             actor_id="admin")
+    exchange_models = {r[1] for r in _scheme_rows(c, "MAH_EXCHANGE_%")}
+    assert exchange_models == {"SCORPIO N", "NEW SCORPIO N"}
+    assert {r[1] for r in _scheme_rows(c, "MAH_SCRAPPAGE_%")} == {"SCORPIO N"}
+
+
+def test_the_grid_reads_its_own_spellings_and_a_pick_up_never_takes_the_camper_line(fresh_oem) -> None:
+    from audit_core.oem_master_parsers import GridRow
+    from audit_core.oem_price_masters import grid_row_for_model, ingest_discount_grid
+
+    c = fresh_oem
+    oem_code = c.execute(text("SELECT oem_code FROM auditcore.oems WHERE oem_id = :o"), {"o": c.oem_id}).scalar_one()
+    _load(c, date(2026, 9, 1), _book(
+        ("PV", "XUV3XO", "AX5 PM MT", 1_029_900.54), ("CV", "MAXX CITY", "MAXX CITY 1.5 LX BS6.2", 839_501.15),
+        ("CV", "PICK UP", "BOL CAMPER 2WD BS6.2 - Refresh", 950_000),
+        ("CV", "PICK UP", "BOL PIK UP FB 1.3T - BS6.2 - PS", 850_000),
+    ))
+    grid = ParseResult(kind="DISCOUNT_GRID")
+    grid.grid_rows = [
+        GridRow(row_no=1, model_alias="3XO", model_aliases=["3XO"], in_scope=True, booking_protection_days=None,
+                agreed_buffer_amount=Decimal(7000), insurance_od_percent=None, out_of_territory_amount=None, raw={}),
+        GridRow(row_no=2, model_alias="MAXX", model_aliases=["MAXX"], in_scope=True, booking_protection_days=None,
+                agreed_buffer_amount=Decimal(5000), insurance_od_percent=None, out_of_territory_amount=None, raw={}),
+        GridRow(row_no=3, model_alias="Camper", model_aliases=["Camper"], in_scope=True, booking_protection_days=None,
+                agreed_buffer_amount=Decimal(0), insurance_od_percent=None, out_of_territory_amount=None, raw={}),
+        GridRow(row_no=4, model_alias="Pick-Up", model_aliases=["Pick-Up"], in_scope=True,
+                booking_protection_days=None, agreed_buffer_amount=Decimal(7000), insurance_od_percent=None,
+                out_of_territory_amount=None, raw={}),
+    ]
+    summary = ingest_discount_grid(c, tenant_id=c.tenant_id, oem_id=c.oem_id, oem_code=oem_code,
+                                   effective_from=date(2026, 9, 1), parsed=grid, upload_id=uuid4(), actor_id="admin")
+    assert summary["unresolved"] == []
+    models = dict(c.execute(text("SELECT model_name, model_id FROM auditcore.product_models WHERE oem_id = :o"),
+                            {"o": c.oem_id}).all())
+    on = date(2026, 9, 15)
+    assert grid_row_for_model(c, tenant_id=c.tenant_id, model_id=models["XUV3XO"], effective_on=on,
+                              variant_name="AX5 PM MT")["agreed_buffer_amount"] == Decimal(7000)
+    assert grid_row_for_model(c, tenant_id=c.tenant_id, model_id=models["MAXX CITY"], effective_on=on,
+                              variant_name="MAXX CITY 1.5 LX BS6.2")["agreed_buffer_amount"] == Decimal(5000)
+    pick_up = grid_row_for_model(c, tenant_id=c.tenant_id, model_id=models["PICK UP"], effective_on=on,
+                                 variant_name="BOL PIK UP FB 1.3T - BS6.2 - PS")
+    assert pick_up["model_alias"] == "Pick-Up" and pick_up["agreed_buffer_amount"] == Decimal(7000)

@@ -603,12 +603,15 @@ def _candidate_rows(
         text(
             """
             WITH in_force AS (
+                -- Every version started on or before the date: the newest
+                -- one answers, and when it has ended (its bulletin's
+                -- validity is over) nothing does -- an ended version never
+                -- hands the date back to an older one (review of PR 472, S1).
                 SELECT v.discount_scheme_id, v.discount_scheme_version_id, v.version_no,
-                       v.effective_from, v.created_at_utc
+                       v.effective_from, v.effective_to, v.created_at_utc
                 FROM auditcore.discount_scheme_versions v
                 WHERE v.tenant_id = :tenant_id AND v.lifecycle_status = 'PUBLISHED'
                   AND v.effective_from <= :effective_on
-                  AND (v.effective_to IS NULL OR v.effective_to >= :effective_on)
             ), latest AS (
                 SELECT discount_scheme_id, max(effective_from) AS effective_from
                 FROM in_force GROUP BY discount_scheme_id
@@ -621,6 +624,7 @@ def _candidate_rows(
                 SELECT f.* FROM in_force f
                 JOIN latest l ON l.discount_scheme_id = f.discount_scheme_id AND l.effective_from = f.effective_from
                 JOIN batch b ON b.discount_scheme_id = f.discount_scheme_id AND b.created_at_utc = f.created_at_utc
+                WHERE f.effective_to IS NULL OR f.effective_to >= :effective_on
             )
             SELECT b.benefit_key, b.benefit_type, b.amount_value, b.percentage_value,
                    s.discount_scheme_version_id, s.version_no, s.effective_from,
@@ -1024,22 +1028,24 @@ for _category, _keys in SCHEME_CATEGORY_DISCOUNT_KEYS.items():
 
 
 def _bulletins_in_force(connection: Connection, *, tenant_id: str, effective_on: date) -> set[str]:
-    """The scheme categories with any published version in force on the date
-    (a withdrawal counts: the bulletin answered)."""
+    """The scheme categories with a scheme whose standing version (the newest
+    started on or before the date) is still in force on it (a withdrawal
+    counts: the bulletin answered)."""
     return {
         str(r[0]) for r in connection.execute(
             text(
                 """
-                SELECT DISTINCT ds.scheme_category
+                SELECT DISTINCT ON (v.discount_scheme_id) ds.scheme_category,
+                       (v.effective_to IS NULL OR v.effective_to >= :on) AS in_force
                 FROM auditcore.discount_scheme_versions v
                 JOIN auditcore.discount_schemes ds
                   ON ds.tenant_id = v.tenant_id AND ds.discount_scheme_id = v.discount_scheme_id
-                WHERE v.tenant_id = :t AND v.lifecycle_status = 'PUBLISHED'
-                  AND v.effective_from <= :on AND (v.effective_to IS NULL OR v.effective_to >= :on)
+                WHERE v.tenant_id = :t AND v.lifecycle_status = 'PUBLISHED' AND v.effective_from <= :on
+                ORDER BY v.discount_scheme_id, v.effective_from DESC, v.created_at_utc DESC
                 """
             ),
             {"t": tenant_id, "on": effective_on},
-        ).all()
+        ).all() if r[1]
     }
 
 

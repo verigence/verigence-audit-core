@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import structlog
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
@@ -2015,6 +2015,9 @@ def _insert_registry_entries(
     corporate list a deal is categorised by is the tenant's own upload in
     force on the deal's pricing date -- every upload is kept under its date,
     so a later list never re-categorises an earlier deal."""
+    # An ingest called without an upload (a test, a script) still gets one
+    # list of its own.
+    upload_id = upload_id or uuid4()
     deduped = {company.corporate_code[:60]: company for company in companies}
     rows = [
         {
@@ -2118,6 +2121,8 @@ _GRID_MODEL_ALIASES: dict[str, str] = {
     "XUV400 EV": "XUV400",
     "MAXX": "MAXX CITY",
     "MAXX HD 2.0": "MAXX HD",
+    # The Camper is a variant group of PICK UP (review of PR 472, B1).
+    "CAMPER": "PICK UP",
 }
 
 

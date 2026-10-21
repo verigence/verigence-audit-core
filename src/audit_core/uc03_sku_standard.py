@@ -237,15 +237,18 @@ def _scheme_rows(connection: Connection, *, tenant_id: str, model_id: UUID, vari
     rows = connection.execute(
         text(
             """
-            WITH standing AS (
+            WITH started AS (
+                -- The newest version started on the date answers; when its
+                -- bulletin has ended, nothing does (review of PR 472, S1).
                 SELECT DISTINCT ON (dsv.discount_scheme_id)
-                       dsv.discount_scheme_id, dsv.discount_scheme_version_id
+                       dsv.discount_scheme_id, dsv.discount_scheme_version_id, dsv.effective_to
                 FROM auditcore.discount_scheme_versions dsv
                 WHERE dsv.tenant_id = :t
                   AND dsv.lifecycle_status = 'PUBLISHED'
                   AND dsv.effective_from <= :on
-                  AND (dsv.effective_to IS NULL OR dsv.effective_to >= :on)
                 ORDER BY dsv.discount_scheme_id, dsv.effective_from DESC, dsv.version_no DESC
+            ), standing AS (
+                SELECT * FROM started WHERE effective_to IS NULL OR effective_to >= :on
             )
             SELECT b.benefit_key, b.benefit_type, b.amount_value, b.percentage_value,
                    ds.scheme_code, ds.scheme_name, ds.scheme_category,

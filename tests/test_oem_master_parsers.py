@@ -697,3 +697,32 @@ def test_the_real_october_2026_book_parses_with_no_errors() -> None:
     star = [r for r in result.price_rows if r.model_name == "THAR ROXX" and "Star Edition" in r.variant_name]
     assert len(star) == 3
     assert all(r.components["EXT_WARRANTY_4TH_YR"] == 0 for r in star)
+
+
+def test_validity_end_dates_from_the_bulletins() -> None:
+    """Review of PR 472 (S1): a scheme answers only for the dates it stands on."""
+    from audit_core.oem_master_parsers import validity_end_hint
+
+    assert validity_end_hint("Schemes are valid from 3rd Sept’26 to 30th Sept’26 (Blackout period 1st to 2nd "
+                             "Sept’26)") == date(2026, 9, 30)
+    assert validity_end_hint("Corporate Privilege Policy From 3rd Sept' 26 - 30th Sept' 26") == date(2026, 9, 30)
+    assert validity_end_hint("Monthly Consumer Scheme Bulletin Oct'26 w.e.f. 3rd Oct'26") == date(2026, 10, 31)
+    assert validity_end_hint("Monthly Consumer Scheme Bulletin Dec'26") == date(2026, 12, 31)
+    assert validity_end_hint("No dates here") is None
+
+
+def test_variant_names_match_on_their_distinguishing_words() -> None:
+    """Review of PR 472 (B1): the emission norm, "- E", the release markers,
+    "(O)" and "& Mocha Interiors" do not name another variant; "LX & LX CBC"
+    is two variants."""
+    from audit_core.oem_master_parsers import split_variant_cell, variant_loose_key
+
+    assert variant_loose_key("Classic S BS6.2") == variant_loose_key("Classic S BS6.2 - E")
+    assert variant_loose_key("MAXX HD 1.3 LX") == variant_loose_key("MAXX HD 1.3 LX BS6.2")
+    assert variant_loose_key("BOL PIK UP FB 1.3T - PS") == variant_loose_key("BOL PIK UP FB 1.3T - BS6.2 - PS")
+    assert variant_loose_key("AX7L DAT 2WD & Mocha Interiors") == variant_loose_key("AX7L DAT 2WD")
+    assert variant_loose_key("REVX M(O) PM MT") == variant_loose_key("REVX M OPT PM MT")
+    assert variant_loose_key("Z8 S D AT 2WD 7 STR BS6.2 - Refresh") == variant_loose_key("Z8 S D AT 2WD 7 STR BS6.2 - N")
+    assert variant_loose_key("AX5 PM MT") != variant_loose_key("AX5 PM AT")
+    assert split_variant_cell("Supro Maxi Profit Truck LX & LX\nCBC") == [
+        "Supro Maxi Profit Truck LX", "Supro Maxi Profit Truck LX CBC"]
