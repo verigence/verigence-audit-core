@@ -41,6 +41,12 @@ from audit_core.uc03_p2_access import (
 from audit_core.uc03_p2_controls import control_statistics
 from audit_core.uc03_p2_dates import parse_extracted_date, programme_date_floor
 from audit_core.uc03_p2_document_health import journey_document_health
+from audit_core.uc03_p2_document_task_groups import (
+    DOCUMENT_CATEGORIES,
+    count_by_category,
+    document_category,
+    document_detail,
+)
 from audit_core.uc03_p2_journey_views import (
     ALL_VIEWS,
     BREAKDOWN_SQL,
@@ -2920,6 +2926,7 @@ def list_tasks(
     view: str = "open",
     role: str | None = None,
     tab: str = "all",
+    documentCategory: str | None = None,
 ) -> dict[str, Any]:
     """P2 worklist across P2 and existing (Phase 1) tasks, grouped by the
     client per Journey.
@@ -2930,7 +2937,15 @@ def list_tasks(
     none. ``tab`` narrows to DOCUMENTS or MANUAL_VERIFICATION; counts for
     every tab are always returned. Under a ``role`` filter the tasks the
     caller raised by hand stay visible, so a raised task is on the queue of
-    both the requester and the assignee."""
+    both the requester and the assignee.
+
+    Documents group (product owner 2026-10-21): every task that is document
+    work carries ``document_category`` (MANUAL_VERIFICATION, FAILED_TO_READ,
+    IMAGE_QUALITY, MISSING_DOCUMENT) and ``document`` (file, pages, reason in
+    plain words, the document to open) and is on the DOCUMENTS tab;
+    ``documentCounts`` counts them per category across the queue and
+    ``documentCountsByJourney`` per journey. ``documentCategory`` narrows the
+    items to one category (the counts stay whole)."""
     _authorize(
         connection,
         tenant_id=tenant_id,
@@ -3214,16 +3229,31 @@ def list_tasks(
 
     items.sort(key=_safe_sort)
     counts = {"ALL": len(items), "DOCUMENTS": 0, "MANUAL_VERIFICATION": 0}
+    registry = get_registry()
     for item in items:
-        item["queue_tab"] = task_queue_tab(str(item.get("task_type") or ""), str(item.get("category") or ""))
+        task_type = str(item.get("task_type") or "")
+        category = str(item.get("category") or "")
+        doc_category = document_category(task_type, category, item.get("source_code"))
+        item["document_category"] = doc_category
+        item["document"] = document_detail(item, doc_category, registry) if doc_category else None
+        # Document work is on the Documents tab whatever its old tab was
+        # (a field review used to be under Manual Verification); everything
+        # else keeps its tab. The delivery gate still reads task_queue_tab.
+        item["queue_tab"] = "DOCUMENTS" if doc_category else task_queue_tab(task_type, category)
         if item["queue_tab"] in counts:
             counts[item["queue_tab"]] += 1
+    document_counts, document_counts_by_journey = count_by_category(items)
     wanted = tab.upper()
     if wanted in {"DOCUMENTS", "MANUAL_VERIFICATION"}:
         items = [item for item in items if item["queue_tab"] == wanted]
+    wanted_category = str(documentCategory or "").upper()
+    if wanted_category in DOCUMENT_CATEGORIES:
+        items = [item for item in items if item["document_category"] == wanted_category]
     return {
         "items": items[:500],
         "counts": counts,
+        "documentCounts": document_counts,
+        "documentCountsByJourney": document_counts_by_journey,
         "sources": {
             "p2": len(p2_rows),
             "legacy": len(legacy_rows),
