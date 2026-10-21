@@ -347,7 +347,10 @@ def test_dealer_ev_workbook_reads_every_model_sheet_and_the_file_name_date() -> 
     assert be6.components["REGISTRATION_INDIVIDUAL"] == Decimal("140.00")
     assert be6.components["REGISTRATION_CORPORATE"] == Decimal("1640.00")
     assert be6.onroad_corporate - be6.onroad_individual == Decimal("1500.00")
-    assert be6.category == "UNSPECIFIED"  # nothing on the sheet says electric
+    # 2026-10-20 product owner rules (R4): BE 6 / XEV / XUV400 / 3XO EV are
+    # electric models even where the sheet never says "EV" (it used to come
+    # out UNSPECIFIED and overwrite the consolidated book's BEV).
+    assert be6.category == "BEV" and be6.fuel == "ELECTRIC"
     assert "RSA_1YR" not in be6.components and "ACCESSORIES_KIT" in be6.components
     ev = by_variant["XUV3XO EV - AX5 FH"]
     assert ev.fuel == "ELECTRIC" and ev.category == "BEV"
@@ -355,9 +358,15 @@ def test_dealer_ev_workbook_reads_every_model_sheet_and_the_file_name_date() -> 
 
 def test_dealer_sheet_and_file_name_dates_disagree_is_a_warning() -> None:
     content = _dealer_pv_workbook([_pv_row("1.6XXL HD V2", 859_501, 3_632, 3_632)])
+    # Review of PR 468 (S1): a dealer sheet re-issued with additions keeps
+    # the month's header date; the later date in its name is the file's own.
     result = parse_price_list(content, filename="02_Nos_Added_PRICE_-07th__Sept26.xlsx")
-    assert result.effective_from_hint == date(2026, 9, 3)
-    assert any("file name says 2026-09-07" in w for w in result.warnings)
+    assert result.effective_from_hint == date(2026, 9, 7) and result.meta["effectiveFromSource"] == "FILENAME"
+    assert any("file name says 2026-09-07; the later date" in w for w in result.warnings)
+    # An earlier date in the name does not move the sheet's own date.
+    result = parse_price_list(content, filename="PRICE_-01st_Sept26.xlsx")
+    assert result.effective_from_hint == date(2026, 9, 3) and result.meta["effectiveFromSource"] == "SHEET"
+    assert any("file name says 2026-09-01" in w for w in result.warnings)
 
 
 def test_dealer_sheet_preview_shows_absent_components_as_blank() -> None:
@@ -605,3 +614,86 @@ def test_real_october_grid_and_bev_email() -> None:
     assert {r.model_alias: r.tiers.get("WITH_EW_INSURANCE") for r in grid.grid_rows}["XUV 3XO"] == Decimal("10000.00")
     with pytest.raises(MasterParseError, match="e-mail"):
         parse_master("CONSUMER_SCHEME", _fixture("Consumer Schemes - BEVs*.pdf").read_bytes())
+
+
+# ── 2026-10-20 product owner rules: blank components, EV sheets ─────────────────
+def _thar_star_edition_row(sl, *, warranty_4th, warranty_5th, onroad_ind, onroad_corp):
+    """Row 213 of the October 2026 consolidated book, THAR ROXX AX7 DMT 2WD
+    Star Edition, with both warranty cells as the file has them (empty)."""
+    return [
+        sl, "PV", "THAR ROXX", "AX7 DMT 2WD - Star Edition", "AX7", "DIESEL", "MT", "2WD", "5",
+        1797000.97, 17970.01, 80550.91, warranty_4th, warranty_5th, 35000, 2021, 500,
+        180440.10, onroad_ind, 180440.10, onroad_corp, "THAR ROXX D",
+    ]
+
+
+def test_a_blank_component_cell_reads_as_zero_and_still_reconciles() -> None:
+    """The October book left both warranty cells of the three THAR ROXX AX7
+    Star Edition rows empty, and the whole file was refused ("non-numeric
+    EXT_WARRANTY_4TH_YR 'None'"). Empty means not charged: read as 0, and the
+    row still has to add up to its own on-road price."""
+    content = _price_workbook([
+        _thar_star_edition_row(1, warranty_4th=None, warranty_5th=None,
+                               onroad_ind=2113482.98, onroad_corp=2113482.98),
+    ])
+    result = parse_price_list(content)
+    assert not result.errors, result.errors
+    (row,) = result.price_rows
+    assert row.components["EXT_WARRANTY_4TH_YR"] == Decimal("0.00")
+    assert row.components["EXT_WARRANTY_4TH_5TH_YR"] == Decimal("0.00")
+    assert row.components["EX_SHOWROOM"] == Decimal("1797000.97")
+
+
+def test_a_blank_that_hides_a_real_figure_still_fails_the_on_road_check() -> None:
+    # The on-road total includes a 20,000 warranty the blank cell does not show.
+    content = _price_workbook([
+        _thar_star_edition_row(1, warranty_4th=None, warranty_5th=None,
+                               onroad_ind=2133482.98, onroad_corp=2133482.98),
+    ])
+    result = parse_price_list(content)
+    assert not result.price_rows
+    assert len(result.errors) == 1 and "on-road (individual) is 2133482.98" in result.errors[0]
+
+
+def test_text_in_a_component_cell_is_still_an_error() -> None:
+    content = _price_workbook([
+        _thar_star_edition_row(1, warranty_4th="see note", warranty_5th=None,
+                               onroad_ind=2113482.98, onroad_corp=2113482.98),
+    ])
+    result = parse_price_list(content)
+    assert result.errors == ["row 2: non-numeric EXT_WARRANTY_4TH_YR 'see note'"]
+
+
+def test_dealer_ev_sheets_for_be_xev_and_xuv400_are_electric() -> None:
+    """"XEV" and "BE 6" never contain the word EV: the dealer's EV sheets for
+    them came out category UNSPECIFIED with no fuel."""
+    content = _dealer_ev_workbook({
+        "XEV9": [_ev_row("XEV 9e One B59 R19 NCH", 2_190_000)],
+        "XEV9 s": [_ev_row("XEV 9S ONE ABOVE B59 R18 7STR NCH", 2_065_000)],
+        "New SPAT": [_ev_row("BE 6 SPORTEQ THREE+ B70 R19 NCH", 2_395_000)],
+        "XUV400": [_ev_row("XUV400 EL PRO", 1_600_000)],
+    })
+    result = parse_price_list(content, filename="EV PRICE -01th Sept'26.xlsx")
+    assert not result.errors, result.errors
+    assert {(r.category, r.fuel) for r in result.price_rows} == {("BEV", "ELECTRIC")}
+
+
+def test_a_dealer_pv_sheet_is_not_electric() -> None:
+    content = _dealer_pv_workbook([_pv_row("1.5XXL SD V2", 839_500, 51_110, 51_110)])
+    (row,) = parse_price_list(content).price_rows
+    assert row.category == "ICE" and row.fuel == "DIESEL"
+
+
+_OCT_BOOK = Path("/mnt/user-data/uploads/mahindra/PriceMastersMahindra/Tool Updation/"
+                 "Mahindra_Consolidated_Price_List_Oct2026.xlsx")
+
+
+@pytest.mark.skipif(not _OCT_BOOK.exists(), reason="the real October 2026 book is not on this machine")
+def test_the_real_october_2026_book_parses_with_no_errors() -> None:
+    result = parse_price_list(_OCT_BOOK.read_bytes(), filename=_OCT_BOOK.name)
+    assert result.errors == []
+    assert len(result.price_rows) == 327
+    assert result.effective_from_hint == date(2026, 10, 3)
+    star = [r for r in result.price_rows if r.model_name == "THAR ROXX" and "Star Edition" in r.variant_name]
+    assert len(star) == 3
+    assert all(r.components["EXT_WARRANTY_4TH_YR"] == 0 for r in star)

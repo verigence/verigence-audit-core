@@ -849,46 +849,34 @@ def _sku_pricing_panel(
 
     product_sku_id = sku_row["product_sku_id"]
 
-    # Fetch all active price-list items for this SKU so we can show a per-component
-    # breakdown (ex-showroom, insurance, registration, accessories, etc.) as well as
-    # a master total.  We use the most recently published version that is still active.
-    master_items = connection.execute(
+    # The price master in force on the deal's pricing date -- the same
+    # version deal reconciliation prices the standard from (2026-10-20
+    # product owner rules, R5). This used to take whichever published book
+    # was newest, so a September deal showed October figures once October
+    # was loaded. No book in force, or the SKU absent from it: no panel.
+    from audit_core.uc03_sku_candidates import journey_price_plan
+
+    found = journey_price_plan(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if found["plan"] is None:
+        return None
+    plan = found["plan"]
+    active_items = connection.execute(
         text(
             """
-            SELECT
-                pli.component_key,
-                pli.standard_amount,
-                plv.price_list_version_id,
-                plv.version_no,
-                plv.currency_code AS plan_currency
+            SELECT pli.component_key, pli.standard_amount
             FROM auditcore.price_list_items pli
-            JOIN auditcore.price_list_versions plv
-              ON plv.tenant_id = pli.tenant_id
-             AND plv.price_list_version_id = pli.price_list_version_id
             WHERE pli.tenant_id=:tenant_id
               AND pli.product_sku_id=:product_sku_id
-              AND plv.lifecycle_status='PUBLISHED'
-              AND (
-                  CAST(:price_list_id AS uuid) IS NULL
-                  OR plv.price_list_id = CAST(:price_list_id AS uuid)
-              )
-            ORDER BY plv.effective_from DESC, plv.version_no DESC, pli.component_key
-            LIMIT 100
+              AND pli.price_list_version_id=:version_id
+            ORDER BY pli.component_key
             """
         ),
-        {
-            "tenant_id": tenant_id,
-            "product_sku_id": product_sku_id,
-            "price_list_id": str(sku_row["price_list_id"]) if sku_row["price_list_id"] else None,
-        },
+        {"tenant_id": tenant_id, "product_sku_id": product_sku_id, "version_id": plan["price_list_version_id"]},
     ).mappings().all()
 
-    if not master_items:
+    if not active_items:
         return None
-
-    # Group by version — take only rows belonging to the first (latest) version.
-    first_version_id = str(master_items[0]["price_list_version_id"])
-    active_items = [r for r in master_items if str(r["price_list_version_id"]) == first_version_id]
+    first_version_id = str(plan["price_list_version_id"])
 
     # An OEM price row carries both REGISTRATION_INDIVIDUAL and REGISTRATION_CORPORATE;
     # only the one that matches the buyer's basis counts toward the master total.
@@ -900,7 +888,7 @@ def _sku_pricing_panel(
 
     master_components: list[dict[str, Any]] = []
     master_total = Decimal(0)
-    currency = str(active_items[0]["plan_currency"]).upper()
+    currency = str(plan["currency_code"]).upper()
     for item in active_items:
         component_key = str(item["component_key"]).strip().upper()
         if component_key == _skip_reg:
@@ -1028,6 +1016,11 @@ def _sku_pricing_panel(
         "selectionStatus": str(sku_row["selection_status"]),
         "selectionMethod": str(sku_row["selection_method"]) if sku_row["selection_method"] else None,
         "priceListVersionId": first_version_id,
+        # The version actually used and the date it was picked for.
+        "priceList": plan.get("price_list_name") or plan.get("price_list_code"),
+        "priceListVersionNo": plan.get("version_no"),
+        "priceListEffectiveFrom": plan["effective_from"].isoformat() if plan.get("effective_from") else None,
+        "pricingDate": found["onDate"].isoformat() if found["onDate"] else None,
         "currencyCode": currency,
         # Master totals
         "masterTotalAmount": float(master_total),

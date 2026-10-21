@@ -184,6 +184,18 @@ def _money(value: Any) -> Decimal | None:
         return None
 
 
+def _component_money(value: Any) -> Decimal | None:
+    """A price-list component cell. An empty cell is 0: the OEM's legend
+    says a component not charged on that sheet reads 0, and the October 2026
+    book leaves both warranty cells of the THAR ROXX AX7 Star Edition rows
+    empty (2026-10-20 product owner rules). The row still has to add up to
+    its own on-road price, so a blank that hid a real figure is caught
+    there. Text that is not a number is still an error."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return Decimal(0)
+    return _money(value)
+
+
 def _q2(value: Decimal) -> Decimal:
     return value.quantize(_TWO_PLACES, rounding=ROUND_HALF_UP)
 
@@ -354,6 +366,24 @@ def parse_price_list(content: bytes, *, filename: str | None = None) -> ParseRes
     if result.effective_from_hint is None and from_name is not None:
         result.effective_from_hint = from_name
         result.meta["effectiveFromSource"] = "FILENAME"
+    elif (
+        result.meta.get("layout") == "DEALER_PER_MODEL"
+        and from_name is not None
+        and from_name > result.effective_from_hint
+    ):
+        # A dealer sheet re-issued with additions keeps the month's
+        # "w.e.f. 01.09.2026" header while its name carries the day the
+        # additions came ("02 Nos Added EV PRICE -07th Sept'26"). Dating it
+        # by the header priced the two added BE 6 SPORTEQ variants from
+        # 01 Sep, before they existed, and dropped them from 03 Sep (2026-10-20
+        # review). The later date is the file's own: the admin can still
+        # enter another.
+        result.warnings.append(
+            f"The sheet says effective {result.effective_from_hint.isoformat()} but the file name says "
+            f"{from_name.isoformat()}; the later date, {from_name.isoformat()}, is applied. Enter a date to override."
+        )
+        result.effective_from_hint = from_name
+        result.meta["effectiveFromSource"] = "FILENAME"
     elif result.effective_from_hint is not None:
         result.meta["effectiveFromSource"] = "SHEET"
         if from_name is not None and from_name != result.effective_from_hint:
@@ -392,7 +422,7 @@ def _parse_consolidated(rows: list[Any]) -> ParseResult:
         components: dict[str, Decimal] = {}
         bad = False
         for comp_key, col in _PRICE_COL.items():
-            value = _money(raw[col]) if len(raw) > col else None
+            value = _component_money(raw[col] if len(raw) > col else None)
             if value is None:
                 result.errors.append(
                     f"row {idx}: non-numeric {comp_key} '{raw[col] if len(raw) > col else None}'"
@@ -625,6 +655,23 @@ def _dealer_sheet_layout(rows: list[Any]) -> dict[str, Any] | None:
     }
 
 
+# Mahindra's electric models (2026-10-20 product owner rules, R4): BE 6 /
+# BE 6 SPORTEQ / BE6, XEV 9E, XEV 9S, XUV400 and XUV 3XO EV, or any EV /
+# ELECTRIC wording. "XEV" and "BE 6" never contain the word "EV", so the
+# dealer's EV sheets for them used to come out as category UNSPECIFIED.
+_ELECTRIC_RE = re.compile(
+    r"\bEV\b|ELECTRIC|\bBEV\b|\bBE\s*6|\bXEV\s*9|\bXUV\s*400|\b3XO\s*EV|WITH\s+CHARGER"
+)
+
+
+def _is_electric_sheet(model_name: str, title: str | None, fuel_hint: str | None, header_rows: list[Any]) -> bool:
+    """An EV price sheet: the model is one of the EV models, the fuel says
+    electric, or the ex-showroom column is priced "with Charger"."""
+    header_text = " ".join(str(c) for raw in header_rows for c in raw if isinstance(c, str))
+    blob = f"{model_name} {title or ''} {fuel_hint or ''} {header_text}".upper()
+    return bool(_ELECTRIC_RE.search(blob))
+
+
 def _parse_dealer_sheets(workbook: Any, *, header_seen: list[str]) -> ParseResult:
     result = ParseResult(kind="PRICE_LIST", meta={"layout": "DEALER_PER_MODEL"})
     seen: dict[tuple[str, ...], Any] = {}
@@ -641,7 +688,7 @@ def _parse_dealer_sheets(workbook: Any, *, header_seen: list[str]) -> ParseResul
             continue
         fuel_hint = _labelled_cell_after(rows[: layout["letter_row"]], "FUEL TYPE")
         fuel_hint = fuel_hint.upper() if fuel_hint else None
-        electric = bool(re.search(r"\bEV\b|ELECTRIC|\bBEV\b", f"{model_name} {sheet.title} {fuel_hint or ''}".upper()))
+        electric = _is_electric_sheet(model_name, sheet.title, fuel_hint, rows[: layout["letter_row"] + 1])
         if result.effective_from_hint is None:
             blob = " ".join(str(c) for raw in rows[: layout["letter_row"]] for c in raw if isinstance(c, str))
             result.effective_from_hint = _date_hint(blob)
@@ -661,7 +708,7 @@ def _parse_dealer_sheets(workbook: Any, *, header_seen: list[str]) -> ParseResul
             components: dict[str, Decimal] = {}
             bad = False
             for key, col in comp_cols.items():
-                value = _money(cell(col))
+                value = _component_money(cell(col))
                 if value is None:
                     result.errors.append(f"sheet '{sheet.title}' row {idx}: non-numeric {key} '{cell(col)}'")
                     bad = True
@@ -671,7 +718,7 @@ def _parse_dealer_sheets(workbook: Any, *, header_seen: list[str]) -> ParseResul
                 continue
             basis_values: list[tuple[Decimal, Decimal]] = []
             for reg_col, onroad_col in pairs:
-                registration = _money(cell(reg_col))
+                registration = _component_money(cell(reg_col))
                 onroad = _money(cell(onroad_col))
                 if registration is None or onroad is None:
                     result.errors.append(f"sheet '{sheet.title}' row {idx} ({variant_name}): missing registration or on-road price")
@@ -679,7 +726,7 @@ def _parse_dealer_sheets(workbook: Any, *, header_seen: list[str]) -> ParseResul
                     break
                 letters = layout["formula_by_letter"].get(layout["letter_by_col"].get(onroad_col, ""))
                 if letters:
-                    calc = sum((_money(cell(layout["col_by_letter"][x])) or Decimal(0) for x in letters
+                    calc = sum((_component_money(cell(layout["col_by_letter"][x])) or Decimal(0) for x in letters
                                 if x in layout["col_by_letter"]), Decimal(0))
                 else:
                     calc = sum(components.values(), Decimal(0)) + registration

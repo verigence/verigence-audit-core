@@ -60,9 +60,13 @@ from audit_core.uc03_masters_alignment import (
     commercial_key_for_price_component,
     registration_basis,
 )
-from audit_core.uc03_p2_dates import booking_form_date
 from audit_core.uc03_p2_runtime import record_activity
-from audit_core.uc03_sku_candidates import _price_plan_for_journey
+from audit_core.uc03_sku_candidates import (
+    _price_plan_for_journey,
+    journey_pricing_date,
+    sync_price_master_in_force_task,
+    sync_sku_in_price_master_task,
+)
 from audit_core.workflow import create_workflow_task
 
 logger = logging.getLogger(__name__)
@@ -90,23 +94,6 @@ def _to_decimal(value: Any) -> Decimal | None:
 
 
 # ── context ───────────────────────────────────────────────────────────────────
-def _journey_pricing_date(
-    connection: Connection, *, tenant_id: str, journey_id: UUID,
-    pricing_effective_on: date | None, manual_booking_date: date | None,
-) -> date | None:
-    """The deal's single pricing date: the date applied by hand, else the
-    booking date on the booking form, else the booking date entered by hand.
-    Never today (decision 2026-09-30): with none of them the deal is not
-    priced yet. Local until the shared ``journey_pricing_date`` lands; the
-    same order (2026-10-20 product owner rules)."""
-    if pricing_effective_on is not None:
-        return pricing_effective_on
-    form = booking_form_date(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if form and form.get("date"):
-        return form["date"]
-    return manual_booking_date
-
-
 def _context(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
     row = connection.execute(
         text(
@@ -149,11 +136,11 @@ def _context(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     if row is None:
         return None
     data = dict(row)
-    data["effective_on"] = _journey_pricing_date(
-        connection, tenant_id=tenant_id, journey_id=journey_id,
-        pricing_effective_on=data.pop("pricing_effective_on"),
-        manual_booking_date=data.pop("manual_booking_date"),
-    )
+    # One function for the pricing date everywhere (2026-10-20 product owner
+    # rules): applied date, else booking-form date, else manual booking date.
+    data["effective_on"] = journey_pricing_date(connection, tenant_id=tenant_id, journey_id=journey_id)
+    data.pop("pricing_effective_on", None)
+    data.pop("manual_booking_date", None)
     data["colour"] = data.get("colour_code_snapshot") or data.get("colour_name_snapshot")
     data["basis"] = registration_basis(
         customer_type_code=data["customer_type_code"],
@@ -1388,6 +1375,10 @@ def _skip(connection: Connection, *, tenant_id: str, journey_id: UUID, correlati
 def _reconcile(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, raise_findings: bool,
 ) -> dict[str, Any]:
+    if raise_findings:
+        # No book in force on the pricing date: a task says so (R5, #468),
+        # whether or not a SKU is resolved yet. Event-driven runs only.
+        sync_price_master_in_force_task(connection, tenant_id=tenant_id, journey_id=journey_id)
     ctx = _context(connection, tenant_id=tenant_id, journey_id=journey_id)
     if ctx is None:
         return _skip(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
@@ -1407,6 +1398,14 @@ def _reconcile(
     except AuditCoreError:  # no effective price list yet
         return _skip(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
                      reason="no_effective_price_list")
+    # The SKU withdrawn from the book in force (#468): a PC task, and the old
+    # book's standards cleared rather than left standing.
+    if sync_sku_in_price_master_task(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+        found={"onDate": effective_on, "plan": plan, "reason": None},
+    ):
+        return _skip(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                     reason="sku_not_in_price_list")
 
     price_lines = _materialize_price_standards(
         connection,
