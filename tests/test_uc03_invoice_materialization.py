@@ -495,7 +495,7 @@ def test_copies_of_one_invoice_disagreeing_raise_a_high_finding_and_tl_task(jour
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
         documents=[_vehicle("tax_invoice_tally", "1600000"), _vehicle("invoice_generic", "999999")],
     )
-    rule_key = "INVOICE_COPIES_DISAGREE:VEHICLE|N|INV9"
+    rule_key = "INVOICE_COPIES_DISAGREE:VEHICLE|N|1NV9"
     finding = _finding(c, rule_key)
     assert finding is not None
     assert finding["finding_class"] == "VIOLATION"
@@ -520,7 +520,7 @@ def test_two_different_vehicle_invoices_are_flagged_not_compared(journey) -> Non
         documents=[_vehicle("tax_invoice_tally", "1600000", "INV-1"), _vehicle("tax_invoice_tally", "1500000", "INV-2")],
     )
     assert _finding(c, "MULTIPLE_VEHICLE_INVOICES")["finding_status"] == "OPEN"
-    assert _finding(c, "INVOICE_COPIES_DISAGREE:VEHICLE|N|INV1") is None
+    assert _finding(c, "INVOICE_COPIES_DISAGREE:VEHICLE|N|1NV1") is None
 
 
 def test_an_invoice_that_does_not_add_up_is_a_pc_review_task(journey) -> None:
@@ -544,7 +544,7 @@ def test_agreeing_invoices_do_not_raise_a_discrepancy(journey) -> None:
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
         documents=[_vehicle("tax_invoice_tally", "1600000"), _vehicle("customer_invoice_dms", "1600000")],
     )
-    assert _finding(c, "INVOICE_COPIES_DISAGREE:VEHICLE|N|INV9") is None
+    assert _finding(c, "INVOICE_COPIES_DISAGREE:VEHICLE|N|1NV9") is None
 
 
 def test_wholesale_invoice_excluded_from_discrepancy_check(journey) -> None:
@@ -556,7 +556,7 @@ def test_wholesale_invoice_excluded_from_discrepancy_check(journey) -> None:
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
         documents=[_vehicle("tax_invoice_tally", "1600000"), _vehicle("wholesale_invoice", "1450000")],
     )
-    assert _finding(c, "INVOICE_COPIES_DISAGREE:VEHICLE|N|INV9") is None
+    assert _finding(c, "INVOICE_COPIES_DISAGREE:VEHICLE|N|1NV9") is None
     assert _finding(c, "MULTIPLE_VEHICLE_INVOICES") is None
     assert _commercial(c, "ex_showroom_price")["source_reference"].startswith("tax_invoice_tally:")
 
@@ -567,7 +567,7 @@ def test_discrepancy_resolves_once_invoices_agree(journey) -> None:
     im.materialize_reviewed_invoices(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester", documents=[tally, generic],
     )
-    rule_key = "INVOICE_COPIES_DISAGREE:VEHICLE|N|INV9"
+    rule_key = "INVOICE_COPIES_DISAGREE:VEHICLE|N|1NV9"
     assert _finding(c, rule_key)["finding_status"] == "OPEN"
 
     # The corrected generic copy now reports the same value.
