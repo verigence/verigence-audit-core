@@ -84,6 +84,11 @@ _FIELD_REVIEW_TASK_TYPE = "INVOICE_FIELD_REVIEW"
 _CHECK_RULE_PREFIX = "INVOICE_CHECK:"
 _COPIES_RULE_PREFIX = "INVOICE_COPIES_DISAGREE:"
 _MULTIPLE_VEHICLE_RULE = "MULTIPLE_VEHICLE_INVOICES"
+# Invoice problems belong to the journey, not to the pass that noticed them:
+# the Booking and Delivery passes both re-check the invoices on file, so the
+# findings are always raised under one stage key -- one finding and one task
+# per problem (final check FB1).
+_INVOICE_FINDING_STAGE: Literal["DELIVERY"] = "DELIVERY"
 # Findings raised by the earlier per-type comparison; superseded by the
 # per-invoice comparison and closed on the next run.
 _LEGACY_DISAGREEMENT_PREFIX = "INVOICE_FIELD_DISAGREEMENT:"
@@ -544,6 +549,7 @@ def _identity(document_type: str, raw: dict[str, Any]) -> dict[str, Any]:
     return {
         "number": number,
         "numberKey": ocr_number_key(number) if number else None,
+        "numberExact": re.sub(r"[^0-9A-Za-z]", "", number).upper() or None if number else None,
         "date": day.isoformat() if day else None,
         "vin": vin,
         "vinFull": vin_full,
@@ -753,9 +759,12 @@ def read_invoice(
         "cancelled": None,
         "_raw": raw,
         # What a credit note says it reverses (its narration, heading and lines).
-        "referenceText": ocr_number_key(" ".join(filter(None, [
+        # Every printed word, as compared with an invoice number (final
+        # check FN3: a whole number, never a fragment of the text).
+        "referenceTokens": sorted({(key, re.sub(r"[^0-9A-Za-z]", "", word).upper()) for word in " ".join(filter(None, [
             _clean_text(raw.get("narration")), _clean_text(raw.get("invoice_heading_as_printed")),
-            *(_clean_text(i.get("description_raw")) for i in lines)]))) or "",
+            *(_clean_text(i.get("description_raw")) for i in lines)])).split()
+            for key in [ocr_number_key(word)] if key}),
     }
     if family in (FAMILY_VEHICLE, FAMILY_WHOLESALE):
         _read_vehicle(raw, lines, out)
@@ -873,6 +882,19 @@ def _single_key(reading: dict[str, Any]) -> str:
     return f"ID|{reading['documentId']}"
 
 
+def _same_system_two_bills(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Two documents from one system are two bills when their numbers
+    differ -- including numbers equal only after reading O as 0 and I/L as
+    1, when their totals differ too (final check FN2). The very same number
+    printed twice is one bill, read twice (copies that may disagree)."""
+    if a["numberKey"] != b["numberKey"]:
+        return True
+    if a["numberExact"] == b["numberExact"]:
+        return False
+    return (a["grandTotal"] is not None and b["grandTotal"] is not None
+            and abs(a["grandTotal"] - b["grandTotal"]) > _ONE_RUPEE)
+
+
 def _days_apart(a: str | None, b: str | None) -> int | None:
     if not a or not b:
         return None
@@ -962,6 +984,19 @@ def _cancellation_amounts(reading: dict[str, Any]) -> list[Decimal]:
     return [total, total - tcs, total - tcs - round_off]
 
 
+def _names_invoice(note: dict[str, Any], invoice: dict[str, Any]) -> bool:
+    """The credit note prints this invoice's whole number as one word (or
+    as the end of one, after a label such as "No."), and the number is long
+    enough not to occur by chance (5+ characters)."""
+    key = invoice["numberKey"]
+    if not key or len(key) < 5:
+        return False
+    # The label before a number ("No.", "Inv") is read as printed, so "No"
+    # is never taken for the digits "N0".
+    return any(token == key or (token.endswith(key) and not exact[:-len(key)][-1:].isdigit())
+               for token, exact in note["referenceTokens"])
+
+
 def _mark_cancellations(groups: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     """A credit note that reverses a whole vehicle invoice cancels that
     invoice (review S4, RB1): it names the invoice's number or carries its
@@ -988,7 +1023,7 @@ def _mark_cancellations(groups: list[dict[str, Any]]) -> list[tuple[dict[str, An
             copies = group["copies"]
             if not any(abs(abs(amount) - x) <= _ONE_RUPEE for c in copies for x in _cancellation_amounts(c)):
                 continue
-            named = any(c["numberKey"] and c["numberKey"] in note["referenceText"] for c in copies)
+            named = any(_names_invoice(note, c) for c in copies)
             same_vehicle = any(_vin_relation(note, c) == "same" for c in copies)
             date_key = min((c["date"] for c in copies if c["date"]), default="9999")
             if named or same_vehicle:
@@ -1044,7 +1079,7 @@ def _vehicle_sets(readings: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
             for y in combined:
                 if _vin_relation(x, y) == "different":
                     return False  # two vehicles are never one bill
-                if x["side"] and x["side"] == y["side"] and x["numberKey"] != y["numberKey"]:
+                if x["side"] and x["side"] == y["side"] and _same_system_two_bills(x, y):
                     return False  # one system, two numbers: two invoices
         parent[b] = a
         return True
@@ -1094,7 +1129,18 @@ def _other_sets(readings: list[dict[str, Any]]) -> tuple[list[list[dict[str, Any
     by_key: dict[str, list[dict[str, Any]]] = {}
     for reading in readings:
         by_key.setdefault(_single_key(reading), []).append(reading)
-    sets = [sorted(v, key=_copy_order) for _, v in sorted(by_key.items())]
+    sets = []
+    for _, members in sorted(by_key.items()):
+        # One OCR key can hold two bills of one system (final check FN2).
+        parts: list[list[dict[str, Any]]] = []
+        for reading in sorted(members, key=lambda r: str(r["documentId"])):
+            home = next((part for part in parts if not any(
+                m["side"] and m["side"] == reading["side"] and _same_system_two_bills(m, reading) for m in part)), None)
+            if home is None:
+                parts.append([reading])
+            else:
+                home.append(reading)
+        sets += [sorted(part, key=_copy_order) for part in parts]
     questions: list[tuple[Any, Any]] = []
     if not readings or readings[0]["family"] not in _FAMILY_COMPONENT:
         return sets, questions
@@ -1169,7 +1215,11 @@ def select_invoices(
             return f"{family}|V|{vin}|{'+'.join(numbers)}" if numbers else f"{family}|V|{vin}"
         numbers = sorted({r["numberKey"] for r in copies if r["numberKey"]})
         if numbers:
-            return f"{family}|N|{'+'.join(numbers)}"
+            exact = sorted({r["numberExact"] for r in copies if r["numberExact"]})
+            mine = {str(r["documentId"]) for r in copies}
+            twin = any(not ({str(r["documentId"]) for r in g} & mine) and g[0]["family"] == family
+                       and {r["numberKey"] for r in g if r["numberKey"]} == set(numbers) for g in raw_sets)
+            return f"{family}|N|{'+'.join(numbers)}" + (f"|{'+'.join(exact)}" if twin else "")
         return f"{family}|{_single_key(copies[0])}"
 
     built: list[dict[str, Any]] = []
@@ -1445,7 +1495,9 @@ def _write_invoice_discount(
 # ── the invoices on file -> canonical actuals ────────────────────────────────
 def plausible_from(connection: Connection, *, tenant_id: str, journey_id: UUID) -> date | None:
     """The earliest date a vehicle invoice of this deal can carry: the
-    booking date, when read (a year misread on an invoice falls outside)."""
+    booking date on the booking form (the PC's correction first), when read
+    -- a year misread on an invoice falls outside. The one source the Deal,
+    the canonical tables and the receipts check all use (final check FN1)."""
     try:
         from audit_core.uc03_p2_dates import booking_form_date
 
@@ -1515,6 +1567,26 @@ def _fallback_source(connection: Connection, *, tenant_id: str, journey_id: UUID
     priority = spec.source_priority if spec is not None else ()
     return dict(min(rows, key=lambda r: (source_rank(priority, r["source_document_type"]),
                                          str(r["source_document_id"]))))
+
+
+def _document_on_file(connection: Connection, *, tenant_id: str, journey_id: UUID, document_id: str) -> bool:
+    """True unless the document's evidence on this journey is no longer
+    ACTIVE (voided, superseded, merged)."""
+    try:
+        document = UUID(document_id)
+    except ValueError:
+        return False
+    return not connection.execute(
+        text(
+            """
+            SELECT EXISTS (
+              SELECT 1 FROM auditcore.evidence e
+              WHERE e.tenant_id=:tenant_id AND e.journey_id=:journey_id AND e.di_document_id=:document_id
+                AND e.association_status <> 'ACTIVE')
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "document_id": document},
+    ).scalar_one()
 
 
 def _set_invoice_actual(
@@ -1610,10 +1682,20 @@ def sync_invoice_actuals(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
+    reviewed = {str(r["documentId"]) for r in readings}
     cleared = 0
     for row in held:
         holder = _reference_document_type(row["source_reference"])
         if holder not in _INVOICE_SOURCE_TYPES or row["component_key"] in selection["lines"]:
+            continue
+        holder_id = str(row["source_reference"]).split(":", 1)[1]
+        # Cleared only when that invoice is gone (voided / superseded), is
+        # the wholesale invoice, or was read here and no longer bills the
+        # line -- never merely because a value written for a document not
+        # yet confirmed has no review row (that flip-flopped with the booking
+        # form on every pass; final check FS1).
+        if holder != "wholesale_invoice" and holder_id not in reviewed and _document_on_file(
+                connection, tenant_id=tenant_id, journey_id=journey_id, document_id=holder_id):
             continue
         fallback = _fallback_source(connection, tenant_id=tenant_id, journey_id=journey_id,
                                     component_key=row["component_key"])
@@ -1857,7 +1939,7 @@ def sync_invoice_checks(
         }
 
     for rule_key, spec in sorted(wanted.items()):
-        _flag(connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage_code,
+        _flag(connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=_INVOICE_FINDING_STAGE,
               correlation_id=correlation_id, rule_key=rule_key, title=spec["title"],
               description=spec["description"], payload=spec["payload"], role=spec["role"],
               task_type=spec["task_type"], severity=spec["severity"])
@@ -1879,12 +1961,15 @@ def sync_invoice_checks(
     ).mappings().all()
     resolved = 0
     for row in open_rows:
-        if row["rule_key"] in wanted:
+        if row["rule_key"] in wanted and row["stage_code"] == _INVOICE_FINDING_STAGE:
             continue
+        # A finding no longer shown, or the same problem raised earlier under
+        # the other stage key: closed (its task is cancelled with it).
         _resolve_finding(
             connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=row["stage_code"] or stage_code,
             finding_id=row["audit_finding_id"], actor_id=None, correlation_id=correlation_id,
-            note="The invoices on file no longer show this problem.",
+            note=("The invoices on file no longer show this problem." if row["rule_key"] not in wanted
+                  else "Merged into the journey's one finding for this invoice problem."),
         )
         resolved += 1
     return {"raised": len(wanted), "resolved": resolved}
