@@ -867,19 +867,24 @@ def test_a_page_the_night_re_read_read_is_copied(journey, monkeypatch):
     ("di_item", "marker", "submitted_ago_hours", "expected"),
     [
         (None, "r", 1, "REUPLOAD"),
-        ({"state": "FAILED"}, "n", 1, "REUPLOAD"),
+        # Review of #469: the nightly look-up never sends a page again; a page
+        # DI no longer holds is the PC's to resubmit.
+        (None, "n", 1, "GONE"),
+        ({"state": "DELETED"}, "n", 1, "GONE"),
+        ({"state": "FAILED"}, "n", 1, "TELL_PC"),
         ({"state": "DELETED"}, "r", 1, "REUPLOAD"),
         ({"state": "CLASSIFIED", "processingStatus": "PROCESSED"}, "r", 1, "SYNCING_TO_AUDIT_CORE"),
         ({"state": "CLASSIFIED", "processingStatus": "PROCESSING"}, "n", 1, "EXTRACTING"),
         ({"state": "CLASSIFIED", "processingStatus": "RETRY_PENDING"}, "r", 1, "EXTRACTING"),
         ({"state": "STORED"}, "r", 1, "CLASSIFYING"),
         ({"state": "CLASSIFYING"}, "n", 1, "CLASSIFYING"),
-        # A technical extraction failure: DI's own nightly reprocessing retries it
-        # for a few nights, so the sweep leaves it; the PC's Retry acts at once.
-        ({"state": "CLASSIFIED", "processingStatus": "FAILED", "failureCode": "DOCUMENT_AI_UNAVAILABLE"}, "n", 30, "LEAVE"),
-        ({"state": "CLASSIFIED", "processingStatus": "FAILED", "failureCode": "DOCUMENT_AI_UNAVAILABLE"}, "n", 100, "REUPLOAD"),
-        ({"state": "CLASSIFIED", "processingStatus": "FAILED", "failureCode": "DOCUMENT_AI_UNAVAILABLE"}, "r", 30, "REUPLOAD"),
-        ({"state": "CLASSIFIED", "processingStatus": "FAILED", "failureCode": "CORRUPT"}, "n", 30, "REUPLOAD"),
+        # A failed reading (a DI without failureKind): the nightly look-up
+        # settles it for the PC; the PC's Retry sends it again.
+        ({"state": "CLASSIFIED", "processingStatus": "FAILED", "failureCode": "DOCUMENT_AI_UNAVAILABLE"}, "n", 30,
+         "TELL_PC"),
+        ({"state": "CLASSIFIED", "processingStatus": "FAILED", "failureCode": "DOCUMENT_AI_UNAVAILABLE"}, "r", 30,
+         "REUPLOAD"),
+        ({"state": "CLASSIFIED", "processingStatus": "FAILED", "failureCode": "CORRUPT"}, "n", 30, "TELL_PC"),
         # Product owner's rule (2026-10-21), with DI's failureKind: the night
         # look-up (pages our setup refused) never sends a page again; it
         # leaves one whose night re-read is still to come and settles any

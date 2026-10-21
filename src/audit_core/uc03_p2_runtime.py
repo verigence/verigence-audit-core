@@ -330,11 +330,18 @@ def request_page_reread(
             marker="r", requested_by=requested_by, correlation_id=correlation_id,
         )
         return
-    # A person asked for it: the page's 30 minutes start again (2026-10-21).
+    # A person asked for it: the page's 30 minutes start again (2026-10-21),
+    # and a failed page is back in line (QUEUED) so the reading may settle
+    # it; work still running for the page never writes over FAILED.
     connection.execute(
         text(
-            "UPDATE auditcore.p2_document_queue SET read_clock_started_at_utc=now() "
-            "WHERE tenant_id=:tenant_id AND queue_id=:queue_id"
+            """
+            UPDATE auditcore.p2_document_queue
+            SET read_clock_started_at_utc=now(),
+                queue_status=CASE WHEN queue_status IN ('FAILED','DEAD_LETTER') THEN 'QUEUED' ELSE queue_status END,
+                updated_at_utc=CASE WHEN queue_status IN ('FAILED','DEAD_LETTER') THEN now() ELSE updated_at_utc END
+            WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+            """
         ),
         {"tenant_id": tenant_id, "queue_id": queue_id},
     )

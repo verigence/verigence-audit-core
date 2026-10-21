@@ -303,3 +303,99 @@ def test_a_failed_page_uploaded_again_is_superseded_and_its_task_closes(journey,
     _split(journey, third)
     assert [p["queue_status"] for p in _pages(journey, first)] == ["CANCELLED", "CANCELLED"]
     assert task()["task_status"] == "VERIFIED_COMPLETE"
+
+
+def _withdrawals(journey):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return sorted(connection.execute(
+            text("SELECT work_key FROM auditcore.p2_work_queue WHERE tenant_id=:t AND journey_id=:j "
+                 "AND work_type='DI_DOCUMENT_WITHDRAW'"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        ).scalars().all())
+
+
+def test_a_file_whose_document_failed_is_replaced_when_uploaded_again_whole(journey, monkeypatch):
+    """Review of #469 (2026-10-21): a two-page document that failed as one
+    (a GROUP unit) is replaced when the whole file comes in again -- its
+    merged pages do not count as already on file, the failed document is
+    superseded, and its DI document is withdrawn."""
+    storage = MemoryStorage()
+    monkeypatch.setattr(worker, "get_p2_document_storage", lambda: storage)
+    monkeypatch.setattr(worker, "_owned", lambda *args, **kwargs: None)
+    payload = _scanned_pdf(_SCAN_A, _SCAN_B)
+    first = _batch(journey, storage, "booking.pdf", payload)
+    _split(journey, first)
+    group_document = uuid4()
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        group = connection.execute(
+            text("INSERT INTO auditcore.p2_document_queue (tenant_id, batch_id, journey_id, page_number, page_numbers, "
+                 "page_sha256, page_object_key, client_upload_id, di_document_id, queue_status, unit_kind, "
+                 "status_reason, last_error) VALUES (:t, :b, :j, 1, ARRAY[1,2], 'g', 'k', 'p2g-x', :d, 'FAILED', "
+                 "'GROUP', 'Not read within 30 minutes.', 'NOT_READ_IN_30_MIN') RETURNING queue_id"),
+            {"t": journey.tenant_id, "b": first, "j": journey.journey_id, "d": group_document},
+        ).scalar_one()
+        connection.execute(
+            text("UPDATE auditcore.p2_document_queue SET queue_status='MERGED', merged_into_queue_id=:g "
+                 "WHERE tenant_id=:t AND batch_id=:b AND unit_kind='PAGE'"),
+            {"t": journey.tenant_id, "b": first, "g": group},
+        )
+        connection.execute(
+            text("UPDATE auditcore.p2_upload_batches SET batch_status='FAILED' WHERE tenant_id=:t AND batch_id=:b"),
+            {"t": journey.tenant_id, "b": first},
+        )
+
+    again = _batch(journey, storage, "booking (1).pdf", payload)
+    _split(journey, again)
+    assert [p["queue_status"] for p in _pages(journey, again)] == ["QUEUED", "QUEUED"]  # read afresh
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        replaced = connection.execute(
+            text("SELECT queue_status, last_error FROM auditcore.p2_document_queue WHERE queue_id=:q"), {"q": group},
+        ).mappings().one()
+    assert (replaced["queue_status"], replaced["last_error"]) == ("CANCELLED", "SUPERSEDED_PAGE")
+    assert _withdrawals(journey) == [str(group_document)]
+
+    # A second copy of the same file, a moment later, never queues the pages twice.
+    third = _batch(journey, storage, "booking (2).pdf", payload)
+    _split(journey, third)
+    assert _batch_row(journey, third)["batch_status"] == "CANCELLED"  # the same file as the fresh upload
+
+
+def test_two_re_uploads_at_once_queue_a_failed_page_once(journey, monkeypatch):
+    """Review of #469: splits of one journey run one at a time, so two
+    uploads carrying the same failed page, arriving together, send it once."""
+    import threading
+
+    storage = MemoryStorage()
+    monkeypatch.setattr(worker, "get_p2_document_storage", lambda: storage)
+    monkeypatch.setattr(worker, "_owned", lambda *args, **kwargs: None)
+    first = _batch(journey, storage, "monday.pdf", _scanned_pdf(_SCAN_A))
+    _split(journey, first)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_document_queue SET queue_status='FAILED', last_error='NOT_READ_IN_30_MIN' "
+                 "WHERE tenant_id=:t AND batch_id=:b"),
+            {"t": journey.tenant_id, "b": first},
+        )
+        worker._refresh_batch_status(connection, journey.tenant_id, first)
+    one = _batch(journey, storage, "page-a.pdf", _scanned_pdf(_SCAN_A))
+    two = _batch(journey, storage, "page-a-and-c.pdf", _scanned_pdf(_SCAN_A, _SCAN_C))
+    errors: list[BaseException] = []
+
+    def split(batch):
+        try:
+            _split(journey, batch)
+        except BaseException as exc:  # noqa: BLE001 - surfaced below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=split, args=(batch,)) for batch in (one, two)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    statuses = [p["queue_status"] for p in _pages(journey, one)] + [_pages(journey, two)[0]["queue_status"]]
+    assert sorted(statuses) == ["CANCELLED", "QUEUED"]  # page A sent once, the other copy a duplicate

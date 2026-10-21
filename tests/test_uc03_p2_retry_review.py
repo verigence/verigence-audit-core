@@ -20,6 +20,7 @@ from conftest import delete_tenant_data
 from fastapi.testclient import TestClient
 from p2_support import (
     AllowAllAuthorization,
+    add_batch_pages,
     add_page,
     create_p2_journey,
     database_engine,
@@ -701,14 +702,129 @@ def test_a_dead_reconcile_tells_the_team_lead(journey):
     assert task["title"] == "Background step stopped: checking the document service for this booking's pages"
 
 
-def test_a_dead_grouping_tells_the_pc(journey):
-    batch_id, _, _ = add_page(journey, status="CLASSIFYING")
+def _grouping_batch(journey, *, created_minutes_ago=0, grouping_status="GROUPING"):
+    """A two-page booking form, both pages identified and waiting to be put
+    together (SUPPORTING: a booking form is only ever read whole)."""
+    batch_id, pages = add_batch_pages(journey, [("booking_form", "SUPPORTING"), ("booking_form", "SUPPORTING")],
+                                      grouping_status=grouping_status)
+    _sql(journey, "UPDATE auditcore.p2_upload_batches SET created_at_utc=now() - (:m * interval '1 minute') "
+                  "WHERE batch_id=:b", b=batch_id, m=created_minutes_ago)
+    return batch_id, pages
+
+
+def _withdrawals(journey):
+    return sorted(r["work_key"] for r in _sql(
+        journey, "SELECT work_key FROM auditcore.p2_work_queue WHERE tenant_id=:t AND journey_id=:j "
+                 "AND work_type='DI_DOCUMENT_WITHDRAW'"))
+
+
+def test_a_dead_grouping_raises_the_resubmit_task(journey):
+    """Review of #469: a stopped grouping fails the pages that waited for it
+    and the file's DOCUMENT_RESUBMIT task names them -- no task of its own."""
+    batch_id, pages = _grouping_batch(journey)
     _dead(journey, "BATCH_GROUP", str(batch_id))
     [status] = _sql(journey, "SELECT grouping_status FROM auditcore.p2_upload_batches WHERE batch_id=:b", b=batch_id)
     assert status["grouping_status"] == "FAILED"
+    for page in pages:
+        row = _page(journey, page["queue_id"])
+        assert (row["queue_status"], row["last_error"]) == ("FAILED", "GROUPING_FAILED")
     [task] = _open_tasks(journey)
-    assert task["task_type"] == "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE"
-    assert "could not be put together" in task["title"]
+    assert task["task_type"] == "DOCUMENT_RESUBMIT" and task["title"] == "packet.pdf: 2 pages to resubmit"
+    assert "could not be put together" in task["description"]
+    assert _withdrawals(journey) == sorted(str(p["di_document_id"]) for p in pages)
+
+
+def test_the_grouping_resubmit_task_closes_when_the_pages_are_uploaded_again(journey):
+    batch_id, pages = _grouping_batch(journey)
+    _dead(journey, "BATCH_GROUP", str(batch_id))
+    assert len(_open_tasks(journey)) == 1
+    for page in pages:  # the same scans arrive in a fresh upload (superseded)
+        _sql(journey, "UPDATE auditcore.p2_document_queue SET queue_status='CANCELLED', last_error='SUPERSEDED_PAGE' "
+                      "WHERE queue_id=:q", q=page["queue_id"])
+    _sync_tasks(journey)
+    assert _open_tasks(journey) == []
+
+
+def test_grouping_gets_a_bounded_grace_then_fails_with_a_resubmit_task(journey):
+    """Review of #469: grouping starts only once every page is identified,
+    so it (and the document it makes) may settle up to 40 minutes after the
+    upload; then it fails and the PC resubmits."""
+    batch_id, pages = _grouping_batch(journey, created_minutes_ago=35, grouping_status="PENDING")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        enqueue_work(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id, work_type="BATCH_GROUP",
+                     work_key=str(batch_id), payload={}, delay_seconds=600, correlation_id=None)
+    assert _watchdog(journey) == 0  # 35 minutes: inside the grace
+    _sql(journey, "UPDATE auditcore.p2_upload_batches SET created_at_utc=now() - interval '41 minutes' "
+                  "WHERE batch_id=:b", b=batch_id)
+    assert _watchdog(journey) == 2
+    assert queue_row(journey, "BATCH_GROUP", str(batch_id))["work_status"] == "CANCELLED"
+    assert {_page(journey, p["queue_id"])["last_error"] for p in pages} == {"GROUPING_FAILED"}
+    assert [t["task_type"] for t in _open_tasks(journey)] == ["DOCUMENT_RESUBMIT"]
+
+
+def test_a_document_made_by_grouping_settles_within_40_minutes_of_the_upload(journey):
+    batch_id, _ = _grouping_batch(journey, created_minutes_ago=35, grouping_status="GROUPED")
+    [group] = _sql(journey, "INSERT INTO auditcore.p2_document_queue (tenant_id, batch_id, journey_id, page_number, "
+                            "page_numbers, page_sha256, page_object_key, client_upload_id, queue_status, unit_kind) "
+                            "VALUES (:t, :b, :j, 1, ARRAY[1,2], 'g', 'k', 'p2g-y', 'QUEUED', 'GROUP') "
+                            "RETURNING queue_id", b=batch_id)
+    assert _watchdog(journey) == 0  # made at 35 minutes: not failed for the grouping starting late
+    _sql(journey, "UPDATE auditcore.p2_upload_batches SET created_at_utc=now() - interval '41 minutes' "
+                  "WHERE batch_id=:b", b=batch_id)
+    assert _watchdog(journey) == 1
+    assert _page(journey, group["queue_id"])["last_error"] == "NOT_READ_IN_30_MIN"
+
+
+# ------------------------------------------------------------------- the clock against running work
+
+def test_a_page_failed_while_its_send_was_running_stays_failed_and_its_di_copy_is_withdrawn(journey, monkeypatch):
+    """Review of #469: the ingest was sending the page when the 30-minute
+    clock failed it. Neither its retry nor its success writes over FAILED,
+    the resubmit task does not flap, and the DI document it made is
+    withdrawn (deleted at DI)."""
+    batch_id, queue_id, _ = add_page(journey, status="DI_UPLOAD_PREPARING")
+    _sql(journey, "UPDATE auditcore.p2_document_queue SET di_document_id=NULL WHERE queue_id=:q", q=queue_id)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        enqueue_work(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                     work_type="DOCUMENT_INGEST", work_key=str(queue_id), payload={}, correlation_id=None)
+    [running] = worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)
+    _uploaded_minutes_ago(journey, batch_id, 31)
+    assert _watchdog(journey) == 1
+    [before] = _open_tasks(journey)
+    # The send fails meanwhile: its retry wait never lands on the page.
+    worker._fail(journey.engine, running, DiCaptureV2Error(status_code=503, detail="down"))
+    assert _page(journey, queue_id)["queue_status"] == "FAILED"
+    # ... or it succeeds: the page stays FAILED and DI's new copy is withdrawn.
+    row = {"client_upload_id": _page(journey, queue_id)["client_upload_id"], "uploaded_by_actor_id": "pc"}
+    stored = uuid4()
+    worker._record_submitted_page(journey.engine, running, row, queue_id=queue_id, di_document_id=stored,
+                                  filename="scan-page-001.pdf", content_type="application/pdf")
+    page = _page(journey, queue_id)
+    assert (page["queue_status"], page["last_error"], page["di_document_id"]) == ("FAILED", "NOT_READ_IN_30_MIN", None)
+    [after] = _open_tasks(journey)
+    assert (after["task_type"], after["title"], after["description"]) == (
+        before["task_type"], before["title"], before["description"])
+    assert _withdrawals(journey) == [str(stored)]
+    # The withdrawal deletes it at DI.
+    client = FakeClient()
+    monkeypatch.setattr(worker, "_di_context_and_requirements", lambda engine, work: ("ctx", "tok", [], {}))
+    monkeypatch.setattr(worker, "get_di_capture_v2_client", lambda: client)
+    [item] = [i for i in worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)
+              if i.work_type == "DI_DOCUMENT_WITHDRAW"]
+    worker.process_work(journey.engine, item)
+    assert client.deleted == [str(stored)]
+
+
+def test_the_clock_withdraws_the_di_copy_of_a_page_it_fails_but_not_a_setup_page(journey):
+    batch_id, _, reading_doc = add_page(journey, page_number=1, status="EXTRACTING")
+    _, setup, _ = add_page(journey, page_number=2, status="QUEUED")
+    _sql(journey, "UPDATE auditcore.p2_document_queue SET batch_id=:b, last_error=:e WHERE queue_id=:q",
+         b=batch_id, q=setup, e=SETUP)
+    _uploaded_minutes_ago(journey, batch_id, 31)
+    assert _watchdog(journey) == 2
+    assert _withdrawals(journey) == [str(reading_doc)]  # DI re-reads the setup page at night
 
 
 def test_the_background_step_task_closes_when_the_step_runs_again(journey):
@@ -732,15 +848,6 @@ def test_the_background_step_task_closes_when_the_step_runs_again(journey):
     [item] = worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)
     worker._complete(journey.engine, item)
     assert _open_tasks(journey) == []
-
-
-def test_the_grouping_task_closes_when_the_file_is_uploaded_again(journey):
-    batch_id, _, _ = add_page(journey, status="CLASSIFYING")
-    _dead(journey, "BATCH_GROUP", str(batch_id))
-    assert len(_open_tasks(journey)) == 1
-    add_page(journey, page_number=1, status="CLASSIFYING")  # the same file (scan.pdf) uploaded again
-    _sync_tasks(journey)
-    assert [t for t in _open_tasks(journey) if t["dedupe_key"].startswith("group-failed:")] == []
 
 
 def test_a_poll_that_waits_resets_its_failure_count(journey):

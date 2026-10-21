@@ -11,8 +11,12 @@ then and the PC is asked to resubmit it.
 * p2_upload_batches.failure_reason: why a file failed as a whole (not
   uploaded, or not split into pages, within 30 minutes), for the PC's
   resubmit task and the failure report.
+* p2_work_queue work type DI_DOCUMENT_WITHDRAW: a page the worker failed on
+  the clock, or one uploaded again (superseded), has its Document
+  Intelligence document deleted, so DI stops reading it and nothing is read
+  twice (review of #469, 2026-10-21).
 
-Additive: two nullable columns, nothing else changes.
+Additive: two nullable columns and one more allowed work type.
 """
 from __future__ import annotations
 
@@ -24,18 +28,32 @@ branch_labels = None
 depends_on = None
 
 
+_WORK_TYPES = (
+    "'SPLIT_BATCH','DOCUMENT_INGEST','DOCUMENT_RECONCILE','JOURNEY_RECONCILE',"
+    "'STAGE_RECOMPUTE','CONTROL_EVALUATE','TASK_VERIFY','BATCH_GROUP','PAGE_REREAD'"
+)
+
+
 def upgrade() -> None:
     op.execute(
-        """
+        f"""
         ALTER TABLE auditcore.p2_document_queue ADD COLUMN IF NOT EXISTS read_clock_started_at_utc timestamptz;
         ALTER TABLE auditcore.p2_upload_batches ADD COLUMN IF NOT EXISTS failure_reason text;
+        ALTER TABLE auditcore.p2_work_queue
+          DROP CONSTRAINT IF EXISTS p2_work_queue_work_type_check,
+          ADD CONSTRAINT p2_work_queue_work_type_check
+            CHECK (work_type IN ({_WORK_TYPES},'DI_DOCUMENT_WITHDRAW'));
         """
     )
 
 
 def downgrade() -> None:
     op.execute(
-        """
+        f"""
+        DELETE FROM auditcore.p2_work_queue WHERE work_type='DI_DOCUMENT_WITHDRAW';
+        ALTER TABLE auditcore.p2_work_queue
+          DROP CONSTRAINT IF EXISTS p2_work_queue_work_type_check,
+          ADD CONSTRAINT p2_work_queue_work_type_check CHECK (work_type IN ({_WORK_TYPES}));
         ALTER TABLE auditcore.p2_upload_batches DROP COLUMN IF EXISTS failure_reason;
         ALTER TABLE auditcore.p2_document_queue DROP COLUMN IF EXISTS read_clock_started_at_utc;
         """
