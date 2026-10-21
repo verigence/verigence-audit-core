@@ -17,7 +17,7 @@ from __future__ import annotations
 from alembic import op
 
 revision = "0154_corporate_registry_entries"
-down_revision = "0150_more_mahindra_model_aliases"
+down_revision = "0153_source_values_per_document"
 branch_labels = None
 depends_on = None
 
