@@ -307,9 +307,7 @@ def cancel_stuck_journey(
             """
             SELECT
               (SELECT COUNT(*) FROM auditcore.p2_document_queue
-                WHERE tenant_id=:t AND journey_id=:j AND queue_status IN ('FAILED','DEAD_LETTER')
-                  -- a page waiting for DI's night attempt is not stuck (2026-10-20 review)
-                  AND COALESCE(last_error, '') NOT LIKE 'AI_RETRY_TONIGHT%') AS pages,
+                WHERE tenant_id=:t AND journey_id=:j AND queue_status IN ('FAILED','DEAD_LETTER')) AS pages,
               (SELECT COUNT(*) FROM auditcore.p2_upload_batches
                 WHERE tenant_id=:t AND journey_id=:j AND batch_status='FAILED') AS uploads
             """

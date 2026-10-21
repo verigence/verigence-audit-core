@@ -30,10 +30,8 @@ logger = structlog.get_logger(__name__)
 _DAYS = int(os.environ.get("AUDIT_CORE_PAGE_RESEND_DAYS", "4"))
 
 # last_error prefixes that mean the page itself is the problem, or a failure
-# a re-send cannot fix until its own bug is fixed. A page waiting for DI's
-# night attempt (AI_RETRY_TONIGHT, retry policy 2026-10-20) is not re-sent
-# either: a re-send would stack a second set of attempts on the night one.
-_NOT_RESENT = ("DI_QUALITY_", "FACTS_COPY_FAILED", "AI_RETRY_TONIGHT")
+# a re-send cannot fix until its own bug is fixed.
+_NOT_RESENT = ("DI_QUALITY_", "FACTS_COPY_FAILED")
 
 
 def _candidates(connection, tenant_id: str) -> list[dict[str, Any]]:

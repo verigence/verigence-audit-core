@@ -50,13 +50,9 @@ SCOPED_SQL = f"""
         GROUP BY t.journey_id
     ),
     pages AS (
-        -- a page left for DI's night attempt after an AI failure is still
-        -- processing, not stuck (product owner's rule 2026-10-20)
         SELECT q.journey_id,
-               bool_or(q.queue_status IN ({_IN_FLIGHT_SQL})
-                       OR COALESCE(q.last_error, '') LIKE 'AI_RETRY_TONIGHT%') AS processing,
-               bool_or(q.queue_status IN ('FAILED', 'DEAD_LETTER')
-                       AND COALESCE(q.last_error, '') NOT LIKE 'AI_RETRY_TONIGHT%') AS stuck
+               bool_or(q.queue_status IN ({_IN_FLIGHT_SQL})) AS processing,
+               bool_or(q.queue_status IN ('FAILED', 'DEAD_LETTER')) AS stuck
         FROM auditcore.p2_document_queue q
         WHERE q.tenant_id = :tenant_id
           AND q.queue_status IN ({_IN_FLIGHT_SQL}, 'FAILED', 'DEAD_LETTER')

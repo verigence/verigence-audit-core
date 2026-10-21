@@ -254,9 +254,10 @@ def request_page_recovery(
             client_upload_id=str(row["client_upload_id"]), marker=marker, requested_by=requested_by,
             correlation_id=correlation_id,
         )
-    # The nightly look-up keeps the page's reason and last_error (2026-10-20
-    # review): a page waiting for DI's night attempt keeps its marker until
-    # the look-up has an answer, so a DI hiccup during it never loses it.
+    # The nightly look-up (only pages our setup refused, 2026-10-21) keeps
+    # the page's reason and last_error until it has an answer, so a DI
+    # hiccup during it never loses why the page failed. Either way the
+    # page's 30 minutes start again (product owner 2026-10-21).
     connection.execute(
         text(
             """
@@ -264,6 +265,7 @@ def request_page_recovery(
             SET queue_status='QUEUED',
                 status_reason=CASE WHEN :keep THEN status_reason END,
                 last_error=CASE WHEN :keep THEN last_error END,
+                read_clock_started_at_utc=now(),
                 updated_at_utc=now()
             WHERE tenant_id=:tenant_id AND queue_id=:queue_id
             """
@@ -327,6 +329,14 @@ def request_page_reread(
             marker="r", requested_by=requested_by, correlation_id=correlation_id,
         )
         return
+    # A person asked for it: the page's 30 minutes start again (2026-10-21).
+    connection.execute(
+        text(
+            "UPDATE auditcore.p2_document_queue SET read_clock_started_at_utc=now() "
+            "WHERE tenant_id=:tenant_id AND queue_id=:queue_id"
+        ),
+        {"tenant_id": tenant_id, "queue_id": queue_id},
+    )
     enqueue_work(
         connection, tenant_id=tenant_id, journey_id=journey_id, work_type="PAGE_REREAD",
         work_key=str(queue_id), payload={"queueId": str(queue_id), "uploadedBy": requested_by},
@@ -368,7 +378,8 @@ def requeue_page_for_ingest(
             SET queue_status='QUEUED', client_upload_id=:client_upload_id, di_document_id=NULL,
                 di_state=NULL, di_processing_status=NULL, di_submitted_at_utc=NULL,
                 di_processed_seen_at_utc=NULL, status_reason=NULL, last_error=NULL,
-                attempt_count=0, extracted_field_count=0, updated_at_utc=now()
+                attempt_count=0, extracted_field_count=0, read_clock_started_at_utc=now(),
+                updated_at_utc=now()
             WHERE tenant_id=:tenant_id AND queue_id=:queue_id
             """
         ),

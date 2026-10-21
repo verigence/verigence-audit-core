@@ -23,7 +23,11 @@ Every figure is read from what Audit Core stores -- nothing is estimated:
   journey's "Re-sync with Document Intelligence");
 - night corrections: night-sweep requests on the day, and how many of those
   pages were read (DOCUMENT_READY) afterwards;
-- tasks: ``p2_tasks`` created on the day, plus REOPENED rounds.
+- tasks: ``p2_tasks`` created on the day, plus REOPENED rounds;
+- failed pages (2026-10-21, also its own endpoint /reports/failed-pages):
+  every page now FAILED, and every file that failed before it was split,
+  with the reason, the attempts, when it was uploaded and failed (the
+  page's last DOCUMENT_STATUS_CHANGED to FAILED) and a link that opens it.
 
 Day boundaries are the Project's own timezone. Known gaps, stated in the
 response rather than guessed: the actor of a journey Re-sync is not stored,
@@ -35,7 +39,7 @@ from collections import defaultdict
 from datetime import date, datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import Connection, text
 
 from audit_core.authorization import AuthorizationError
@@ -46,7 +50,6 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_p2_access import authorize_p2
-from audit_core.uc03_p2_document_health import waits_for_night_attempt
 
 router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-daily-report"])
 
@@ -349,9 +352,7 @@ def build_daily_processing_report(
                     docs["readNoValues"] += 1
                 elif status == "SUPPORTING":
                     docs["notRead"] += 1
-                elif status in _WAITING or waits_for_night_attempt(unit["last_error"]):
-                    # a page left for DI's night attempt after an AI failure
-                    # is waiting, not failed (product owner's rule 2026-10-20)
+                elif status in _WAITING:
                     docs["waiting"] += 1
                     in_flight = True
                 elif status in ("FAILED", "DEAD_LETTER"):
@@ -443,6 +444,9 @@ def build_daily_processing_report(
         if row["uploadStartedAt"] is not None:
             _add(day_total, {k: v for k, v in row.items() if k in _empty_counts()})
     docs = day_total["documents"]
+    # Every page and file that failed on the day, with its reason and a link
+    # that opens it (product owner 2026-10-21).
+    failed = build_failed_pages_report(connection, tenant_id=tenant_id, actor_id=actor_id, start=start, end=end)
     documents = docs["extracted"] + docs["readNoValues"] + docs["notRead"] + docs["waiting"] + docs["failed"]
     return {
         "day": day.isoformat(),
@@ -459,6 +463,8 @@ def build_daily_processing_report(
         # PCs who uploaded on the day first, the busiest first.
         "pcs": sorted(pcs.values(), key=lambda s: (-s["journeysUploaded"], s["pcName"] or s["pcActorId"] or "~")),
         "journeys": journeys,
+        "failedPages": failed["rows"],
+        "failedPagesTruncated": failed["truncated"],
         "notes": [
             "Documents are the units the uploads became after splitting and grouping, in their state now.",
             "Finished is the last document settling; it stays blank while any document of that day's uploads is in flight.",
@@ -468,7 +474,10 @@ def build_daily_processing_report(
             ("Rejected at upload: pages the scan-quality check refused (faded, blurred, too small or "
              "unreadable) -- never read, the PC is asked to re-scan. The trend counts the last 14 days."),
             "Re-sync counts the journey's 'Re-sync with Document Intelligence'; who pressed it is not stored.",
-            "Night jobs run at about 02:00 local time; night-fixed counts pages the sweep asked for that were read afterwards.",
+            ("Night jobs run at about 02:00 local time; night-fixed counts pages the sweep asked for that were "
+             "read afterwards (since 2026-10-21 only pages our own setup refused are looked at by night)."),
+            ("Failed pages lists every page and file that failed on the day and is still failed, with the reason "
+             "and a link that opens it (valid 30 minutes from when the report was loaded)."),
             "Document Intelligence's own nightly re-processing keeps its per-document results in DI and is not counted here.",
         ],
     }
@@ -517,6 +526,140 @@ def _rejection_trend(
     return list(by_day.values())
 
 
+# The failure report (product owner 2026-10-21): every page that failed, and
+# every file that failed as a whole, with the reason in plain words and a
+# link that opens it from storage. The link is a short-lived presigned link
+# issued with the report (the same mechanism the app serves documents by,
+# never a raw bucket address); filePath is the app endpoint that issues a
+# fresh one later (the PC's resubmit task carries that path).
+_FAILED_ROWS_LIMIT = 1000
+_LINK_SECONDS = 1800
+
+
+def _signed_link(object_key: str | None) -> str | None:
+    if not object_key:
+        return None
+    from audit_core.uc03_p2_storage import (
+        P2DocumentStorageError,
+        get_p2_document_storage,
+    )
+
+    try:
+        return get_p2_document_storage().presign_get(object_key, expires_seconds=_LINK_SECONDS)
+    except (RuntimeError, P2DocumentStorageError):
+        return None
+
+
+def build_failed_pages_report(
+    connection: Connection, *, tenant_id: str, actor_id: str, start: datetime, end: datetime,
+    limit: int = _FAILED_ROWS_LIMIT,
+) -> dict[str, Any]:
+    """Every page (document unit) now FAILED whose failure falls in [start,
+    end), and every file that failed before it was split into pages, within
+    the reader's own dealers and outlets. Newest failure first. A page the
+    PC uploaded again (superseded) or read again is no longer failed and is
+    not listed."""
+    from audit_core.uc03_p2_task_producer import (
+        FILE_NOT_UPLOADED_IN_TIME_REASON,
+        SETUP_FAILURE_CODE,
+        page_open_path,
+    )
+
+    params = {"t": tenant_id, "actor_id": actor_id, "s": start, "e": end, "limit": limit + 1}
+    pages = connection.execute(
+        text(
+            f"""
+            SELECT * FROM (
+              SELECT q.queue_id, q.journey_id, j.journey_reference,
+                     COALESCE(c.legal_name, c.display_name) AS customer_name,
+                     d.dealer_name, o.outlet_name, o.outlet_code,
+                     b.batch_id, b.original_filename, b.uploaded_by_actor_id,
+                     b.created_at_utc AS uploaded_at,
+                     COALESCE(q.page_numbers, ARRAY[q.page_number]) AS page_numbers,
+                     q.attempt_count, q.status_reason, q.last_error, q.page_object_key,
+                     COALESCE(
+                       (SELECT MAX(e.created_at_utc) FROM auditcore.p2_activity_events e
+                        WHERE e.tenant_id=q.tenant_id AND e.journey_id=q.journey_id
+                          AND e.subject_id=q.queue_id::text AND e.event_type='DOCUMENT_STATUS_CHANGED'
+                          AND e.details->>'status' IN ('FAILED','DEAD_LETTER')),
+                       q.updated_at_utc) AS failed_at
+              FROM auditcore.p2_document_queue q
+              JOIN auditcore.p2_upload_batches b ON b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
+              JOIN auditcore.journeys j ON j.tenant_id=q.tenant_id AND j.journey_id=q.journey_id
+              LEFT JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+              LEFT JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
+              LEFT JOIN auditcore.dealer_outlets o
+                ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id AND o.outlet_id=j.outlet_id
+              WHERE q.tenant_id=:t AND q.queue_status IN ('FAILED','DEAD_LETTER') AND {_SCOPE}
+            ) x
+            WHERE x.failed_at >= :s AND x.failed_at < :e
+            ORDER BY x.failed_at DESC
+            LIMIT :limit
+            """
+        ),
+        params,
+    ).mappings().all()
+    files = connection.execute(
+        text(
+            f"""
+            SELECT b.batch_id, b.journey_id, j.journey_reference,
+                   COALESCE(c.legal_name, c.display_name) AS customer_name,
+                   d.dealer_name, o.outlet_name, o.outlet_code,
+                   b.original_filename, b.uploaded_by_actor_id, b.created_at_utc AS uploaded_at,
+                   b.updated_at_utc AS failed_at, b.failure_reason, b.original_object_key
+            FROM auditcore.p2_upload_batches b
+            JOIN auditcore.journeys j ON j.tenant_id=b.tenant_id AND j.journey_id=b.journey_id
+            LEFT JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+            LEFT JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
+            LEFT JOIN auditcore.dealer_outlets o
+              ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id AND o.outlet_id=j.outlet_id
+            WHERE b.tenant_id=:t AND b.batch_status='FAILED' AND b.page_count=0
+              AND b.updated_at_utc >= :s AND b.updated_at_utc < :e AND {_SCOPE}
+            ORDER BY b.updated_at_utc DESC
+            LIMIT :limit
+            """
+        ),
+        params,
+    ).mappings().all()
+
+    def journey(row: Any) -> dict[str, Any]:
+        return {
+            "journeyId": str(row["journey_id"]), "journeyReference": row["journey_reference"],
+            "customerName": row["customer_name"], "dealerName": row["dealer_name"],
+            "outletName": row["outlet_name"], "outletCode": row["outlet_code"],
+            "batchId": str(row["batch_id"]), "filename": row["original_filename"],
+            "uploadedBy": row["uploaded_by_actor_id"],
+            "uploadedAtUtc": row["uploaded_at"].isoformat() if row["uploaded_at"] else None,
+            "failedAtUtc": row["failed_at"].isoformat() if row["failed_at"] else None,
+        }
+
+    rows: list[dict[str, Any]] = []
+    for row in pages:
+        setup = str(row["last_error"] or "") == SETUP_FAILURE_CODE
+        rows.append({
+            **journey(row), "kind": "PAGE", "queueId": str(row["queue_id"]),
+            "pageNumbers": [int(p) for p in (row["page_numbers"] or [])],
+            "attempts": int(row["attempt_count"] or 0) or None,
+            "reason": row["status_reason"] or "It could not be read.",
+            "code": row["last_error"], "setupProblem": setup,
+            "openUrl": _signed_link(row["page_object_key"]),
+            "filePath": page_open_path(tenant_id, row["journey_id"], row["queue_id"]),
+        })
+    for row in files:
+        not_uploaded = (row["failure_reason"] or "") == FILE_NOT_UPLOADED_IN_TIME_REASON
+        rows.append({
+            **journey(row), "kind": "FILE", "queueId": None, "pageNumbers": [], "attempts": None,
+            "reason": row["failure_reason"] or "The file could not be split into pages.",
+            "code": None, "setupProblem": False,
+            # A file that never finished uploading has nothing to open.
+            "openUrl": None if not_uploaded else _signed_link(row["original_object_key"]),
+            "filePath": None,
+        })
+    rows.sort(key=lambda r: r["failedAtUtc"] or "", reverse=True)
+    truncated = len(rows) > limit
+    return {"rows": rows[:limit], "truncated": truncated, "linkExpiresInSeconds": _LINK_SECONDS}
+
+
 @router.get("/reports/daily-processing")
 def get_daily_processing_report(
     tenant_id: str,
@@ -548,3 +691,50 @@ def get_daily_processing_report(
             text("SELECT (now() AT TIME ZONE :tz)::date"), {"tz": timezone_name},
         ).scalar_one()
     return build_daily_processing_report(connection, tenant_id=tenant_id, actor_id=human_principal.subject, day=day)
+
+
+@router.get("/reports/failed-pages")
+def get_failed_pages_report(
+    tenant_id: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+    from_day: Annotated[date | None, Query(alias="from")] = None,
+    to_day: Annotated[date | None, Query(alias="to")] = None,
+) -> dict[str, Any]:
+    """The failure report (product owner 2026-10-21): every failed page and
+    file of the Project (the tenant in the path is the Project) whose
+    failure falls between ``from`` and ``to`` (days, inclusive, in the
+    Project's timezone; today when left out): journey, file, page, uploaded
+    at, failed at, attempts, reason and a link that opens it. Same readers
+    as the daily processing report (TL, PM, Executive)."""
+    access = authorize_p2(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=None,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        permission_key=_READ_PERMISSION,
+    )
+    _require_report_role(
+        connection, tenant_id=tenant_id, actor_id=human_principal.subject,
+        functional_role=access.functional_role,
+    )
+    timezone_name = connection.execute(
+        text("SELECT COALESCE(timezone_name, :f) FROM auditcore.projects WHERE tenant_id=:t"),
+        {"t": tenant_id, "f": _FALLBACK_TIMEZONE},
+    ).scalar_one_or_none() or _FALLBACK_TIMEZONE
+    today = connection.execute(text("SELECT (now() AT TIME ZONE :tz)::date"), {"tz": timezone_name}).scalar_one()
+    first, last = from_day or to_day or today, to_day or from_day or today
+    if last < first:
+        raise HTTPException(status_code=422, detail="'to' is before 'from'.")
+    if (last - first).days > 92:
+        raise HTTPException(status_code=422, detail="Ask for at most 93 days at a time.")
+    _, start, _ = _bounds(connection, tenant_id=tenant_id, day=first)
+    _, _, end = _bounds(connection, tenant_id=tenant_id, day=last)
+    report = build_failed_pages_report(
+        connection, tenant_id=tenant_id, actor_id=human_principal.subject, start=start, end=end,
+    )
+    return {"from": first.isoformat(), "to": last.isoformat(), "timezone": timezone_name, **report}

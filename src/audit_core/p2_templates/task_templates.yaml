@@ -124,6 +124,21 @@ task_types:
     actions:
     - REUPLOAD_DOCUMENT
     - ADD_COMMENT
+  # "Document to resubmit" (product owner 2026-10-21): one task per uploaded
+  # file with pages that failed (after T0, T0+10 and T0+20 minutes, at once
+  # for a refusal, or when not read within 30 minutes), listing each failed
+  # page, the reason in plain words and a link that opens the page. Category
+  # key DOCUMENT_RESUBMIT. It updates and closes itself once the pages are
+  # read again or uploaded again.
+  DOCUMENT_RESUBMIT:
+    category: DOCUMENT_RESUBMIT
+    owner: PC
+    origin: SYSTEM
+    source: DOCUMENT
+    completion: MACHINE_VERIFIED
+    actions:
+    - REUPLOAD_DOCUMENT
+    - ADD_COMMENT
   # A file still not read a day after upload (decision 2026-10-01): the
   # Team Lead is told, with what the PC already has. Closes itself.
   TL_DOCUMENT_STUCK:
