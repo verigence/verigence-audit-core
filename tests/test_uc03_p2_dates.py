@@ -66,3 +66,23 @@ def test_registry_date_floor_applies_to_document_dates_not_birth_dates():
     assert not registry.date_check_applies("gst_certificate", "date_of_issue")
     assert not registry.date_check_applies("pan_card", "pan_number")
     assert not registry.date_check_applies("dealer_receipt", "amount_paid")
+
+
+@pytest.mark.parametrize(
+    ("field_key", "value", "expected"),
+    [
+        ("booking_date", "2026-10-22", "DATE_IN_FUTURE"),
+        ("booking_date", "22/10/2026", "DATE_IN_FUTURE"),
+        ("booking_date", "2026-10-21", None),  # today is fine
+        ("booking_date", "2026-10-20", None),
+        ("booking_date", "not a date", None),  # unreadable is the floor check's business
+        ("booking_date", "", None),
+        ("booking_date", None, None),
+        ("expected_delivery_date", "2026-11-30", None),  # may legitimately lie ahead
+        ("invoice_date", "2026-10-22", None),
+    ],
+)
+def test_future_date_verdict(field_key, value, expected):
+    from audit_core.uc03_p2_dates import future_date_verdict
+
+    assert future_date_verdict(field_key, value, today=date(2026, 10, 21)) == expected

@@ -35,7 +35,7 @@ from audit_core.uc03_duplicate_receipt_detection import (
     normalize_receipt_date,
     normalize_receipt_number,
 )
-from audit_core.uc03_p2_dates import date_floor_verdict
+from audit_core.uc03_p2_dates import date_floor_verdict, future_date_verdict
 from audit_core.uc03_p2_registry import (
     DocumentTemplate,
     Gate,
@@ -251,10 +251,11 @@ REVIEW_REASON_LABELS = {
     "LOW_CONFIDENCE": "read with low confidence",
     "DATE_BEFORE_FLOOR": "a date before the programme started",
     "DATE_UNREADABLE": "not a readable date",
+    "DATE_IN_FUTURE": "a date after today",
 }
 # Reasons that make the verification High severity: the value is wrong as
 # read, not merely uncertain.
-HIGH_SEVERITY_REASONS = frozenset({"DATE_BEFORE_FLOOR", "DATE_UNREADABLE"})
+HIGH_SEVERITY_REASONS = frozenset({"DATE_BEFORE_FLOOR", "DATE_UNREADABLE", "DATE_IN_FUTURE"})
 
 
 def field_review_reasons(
@@ -271,6 +272,9 @@ def field_review_reasons(
         verdict = date_floor_verdict(value, registry.extraction_rules.date_floor)
         if verdict:
             reasons.append(verdict)
+    future = future_date_verdict(field_key, value)
+    if future:
+        reasons.append(future)
     return reasons
 
 
