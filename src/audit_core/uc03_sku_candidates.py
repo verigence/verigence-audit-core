@@ -224,9 +224,10 @@ def sync_sku_in_price_master_task(
 
 
 def sweep_price_master_tasks(connection: Connection, *, tenant_id: str) -> int:
-    """After a price master is published: re-check every Journey with an open
+    """After a price master is published: re-price every Journey with an open
     "no price master in force" or "SKU not in the price master" task, so the
-    ones the new book covers close at once. Returns the Journeys checked."""
+    ones the new book covers close and get their standards at once. Returns
+    the Journeys checked."""
     journeys = connection.execute(
         text(
             """
@@ -238,9 +239,16 @@ def sweep_price_master_tasks(connection: Connection, *, tenant_id: str) -> int:
         {"t": tenant_id, "types": [PRICE_MASTER_NOT_IN_FORCE_TASK, SKU_NOT_IN_PRICE_MASTER_TASK],
          "open": list(_OPEN_TASK_STATUSES)},
     ).scalars().all()
+    from audit_core.uc03_deal_reconciliation import sync_deal_reconciliation
+
     for journey_id in journeys:
-        found = sync_price_master_in_force_task(connection, tenant_id=tenant_id, journey_id=journey_id)
-        sync_sku_in_price_master_task(connection, tenant_id=tenant_id, journey_id=journey_id, found=found)
+        # The deal is re-priced, not only the tasks closed (re-review S9):
+        # reconciliation syncs both tasks and re-materialises the standards
+        # a withdrawn SKU or a missing book had left empty.
+        sync_price_master_in_force_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+        sync_deal_reconciliation(
+            connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id="price-master-published",
+        )
     return len(journeys)
 
 
