@@ -1915,6 +1915,28 @@ def check_invoice_field_discrepancies(
 
 
 # ── producer ────────────────────────────────────────────────────────────────
+# The customer's DMS / Tally vehicle invoices: whenever one is uploaded or
+# read again, the SKU is resolved again to confirm the model against it
+# (2026-10-21 product owner rule; the invoice is the source of truth).
+SKU_CHECK_INVOICE_TYPES = frozenset({
+    "customer_invoice_dms", "customer_invoice_dms_v2", "tax_invoice_dms", "tax_invoice_tally", "tax_invoice",
+})
+
+
+def _confirm_sku_against_invoice(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str,
+) -> dict[str, Any]:
+    """Run the SKU ladder (in its own savepoint; an error is escalated, never
+    raised into the materialisation)."""
+    from audit_core.uc03_async_sync_tasks import (
+        sync_model_resolution_from_invoice_with_escalation,
+    )
+
+    return sync_model_resolution_from_invoice_with_escalation(
+        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+    )
+
+
 def materialize_reviewed_invoices(
     connection: Connection,
     *,
@@ -1924,11 +1946,12 @@ def materialize_reviewed_invoices(
     actor_id: str,
     stage_code: Literal["BOOKING", "DELIVERY"] = "DELIVERY",
     correlation_id: str = "",
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Persist every reviewed invoice, record each one's own figures per
     document, then set the canonical actuals from every invoice on file."""
 
     invoices_written = 0
+    vehicle_invoice_read = False
     for document in documents:
         document_type = normalise_document_type(getattr(document, "documentTypeKey", "") or "")
         if document_type not in INVOICE_DOCUMENT_TYPES:
@@ -1939,6 +1962,7 @@ def materialize_reviewed_invoices(
         raw = _fields_by_key(document)
         if not raw:
             continue
+        vehicle_invoice_read = vehicle_invoice_read or document_type in SKU_CHECK_INVOICE_TYPES
 
         header = _header_values(raw)
         evidence_id = getattr(document, "evidenceId", None)
@@ -1995,8 +2019,13 @@ def materialize_reviewed_invoices(
         connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage_code,
         correlation_id=correlation_id,
     ) if documents else {"commercialLines": 0, "discountApplications": 0}
+    sku = _confirm_sku_against_invoice(
+        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+    ) if vehicle_invoice_read else None
     result = {
         "invoices": invoices_written,
+        "skuResolution": (sku or {}).get("basis") or (sku or {}).get("reason") or ("ERROR" if (sku or {}).get("error")
+                                                                                  else None),
         "commercialLines": synced["commercialLines"],
         "discountApplications": synced["discountApplications"],
         "journeyAddons": 0,
@@ -2022,6 +2051,7 @@ __all__ = [
     "FAMILY_VEHICLE",
     "FAMILY_WHOLESALE",
     "INVOICE_DOCUMENT_TYPES",
+    "SKU_CHECK_INVOICE_TYPES",
     "UNCLASSIFIED_DISCOUNT",
     "VEHICLE_SALE_TYPES",
     "check_invoice_field_discrepancies",

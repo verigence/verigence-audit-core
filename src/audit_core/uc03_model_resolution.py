@@ -21,7 +21,7 @@ one document with a variant or price from another):
      against the booking form's ex-showroom, within two rupees. Equal ->
      pinned as AUTO_MATCHED. Different, or no booking price -> pinned as
      AUTO_PRICE_MISMATCH (so the deal still shows against it) and a PC task
-     "SKU price differs from booking: master X vs booking Y -- set the SKU".
+     "Confirm the model and price: master X vs booking Y" (2026-10-21).
   4. Invoice: when one customer vehicle invoice's words name exactly one SKU
      and its ex-showroom (rule R1: printed selling price before discount +
      GST at the invoice's printed rate) equals that SKU's master price, the
@@ -139,9 +139,11 @@ _BOOKING_FIELD_KEYS = (
 # DMS / generic spellings the rest of the code base already reads as
 # invoices.
 _VEHICLE_INVOICE_TYPES = (
-    "customer_invoice_dms", "tax_invoice_dms", "tax_invoice_tally", "tax_invoice", "invoice_generic",
+    "customer_invoice_dms", "customer_invoice_dms_v2", "tax_invoice_dms", "tax_invoice_tally", "tax_invoice",
+    "invoice_generic",
 )
-_RETAIL_INVOICE_TYPES = frozenset({"customer_invoice_dms", "tax_invoice_dms", "tax_invoice_tally", "tax_invoice"})
+_RETAIL_INVOICE_TYPES = frozenset({"customer_invoice_dms", "customer_invoice_dms_v2", "tax_invoice_dms",
+                                   "tax_invoice_tally", "tax_invoice"})
 # An invoice that bills something else (accessories, a warranty...) never
 # names the vehicle, whatever its model box says.
 _NON_VEHICLE_PURPOSES = frozenset({"ACCESSORY", "EXTENDED_WARRANTY", "RSA", "INSURANCE", "VEHICLE_WHOLESALE",
@@ -1803,6 +1805,13 @@ def _document_tasks(
 
     inv = plan.get("invoice") or {}
     info: dict[str, Any] = {}
+    # The SKU the Journey will carry after this run: a price task naming
+    # another vehicle says so in its title (review 471 B3).
+    resulting = (
+        plan["target"]["result"].row["product_sku_id"] if plan["action"] == "INVOICE_SET"
+        else ev["bookingResult"].row["product_sku_id"] if plan["action"] == "BOOKING_PIN"
+        else state.get("product_sku_id")
+    )
     if inv.get("disagree"):
         key = raise_invoices_disagree_task(connection, tenant_id=tenant_id, journey_id=journey_id,
                                            invoices=inv["disagree"])
@@ -1815,7 +1824,7 @@ def _document_tasks(
         keep.add(raise_price_mismatch_task(
             connection, tenant_id=tenant_id, journey_id=journey_id, source="INVOICE", reading=reading, row=res.row,
             master=_to_decimal(res.row.get("master_ex_showroom")), offered=reading.get("exShowroom"),
-            current_sku_id=state.get("product_sku_id"),
+            current_sku_id=resulting,
         ))
         info["invoicePriceDiffers"] = True
     if not ev.get("skipped"):

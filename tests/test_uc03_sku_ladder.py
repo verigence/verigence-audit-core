@@ -93,7 +93,7 @@ def test_the_maxx_city_booking_at_the_october_price_is_a_price_task_not_the_vxi(
     task = _sku_task(c, "SKU_PRICE_MISMATCH")
     assert task["assigned_role_code"] == "PC"
     assert task["title"] == (
-        "SKU price differs from booking: master Rs 8,39,501.15 vs booking Rs 8,52,000.00 -- set the SKU")
+        "Confirm the model and price: master Rs 8,39,501.15 vs booking Rs 8,52,000.00")
 
     # The PC corrects the form's price to the list's: the match is clean and
     # the task closes (paise rounding within two rupees is the same price).

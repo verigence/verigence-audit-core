@@ -263,14 +263,23 @@ def raise_price_mismatch_task(
     other_vehicle = (invoice and current_sku_id is not None
                      and str(current_sku_id) != str(row.get("product_sku_id")))
     label = "invoice" if invoice else "booking"
+    if not invoice:
+        # 2026-10-21 product owner rule: the booking form's price differing
+        # from (or missing against) the word-named SKU asks the PC to
+        # confirm the model and price.
+        title = ("Confirm the model and price: the booking form's ex-showroom was not read" if offered is None
+                 else f"Confirm the model and price: master {_money_text(master)} vs booking "
+                      f"{_money_text(offered)}")
     if offered is None:
-        title = f"SKU price could not be checked: the {document}'s ex-showroom was not read"
+        if invoice:
+            title = f"SKU price could not be checked: the {document}'s ex-showroom was not read"
         reason = (f"The {document} reads '{read}', which names {vehicle} ({row.get('sku_code')}), but its "
                   f"ex-showroom price was not read, so the master price ({_money_text(master)}) could not be "
                   "checked against it.")
     else:
-        title = (f"SKU price differs from {label}: master {_money_text(master)} vs {label} "
-                 f"{_money_text(offered)} -- set the SKU")
+        if invoice:
+            title = (f"SKU price differs from {label}: master {_money_text(master)} vs {label} "
+                     f"{_money_text(offered)} -- set the SKU")
         reason = (f"The {document} reads '{read}', which names {vehicle} ({row.get('sku_code')}); its master "
                   f"ex-showroom is {_money_text(master)} but the {document} says {_money_text(offered)}.")
     if other_vehicle:
