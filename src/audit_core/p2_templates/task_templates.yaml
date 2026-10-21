@@ -180,6 +180,30 @@ task_types:
     - ACCEPT
     - REJECT
     - ADD_COMMENT
+  # No price master version covers the deal's pricing date (2026-10-20
+  # product owner rules: no silent fallback to another month). Closes itself
+  # once a book for that date is loaded or the pricing date is corrected.
+  PRICE_MASTER_NOT_IN_FORCE:
+    category: OBSERVATION
+    owner: TL
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - COMPLETE_ACTION
+    - ADD_COMMENT
+  # The Journey's SKU is not in the price master in force on its pricing
+  # date (a complete book withdrew it): the PC sets the SKU. Closes itself
+  # once the SKU is in that book (2026-10-20 product owner rules).
+  SKU_NOT_IN_PRICE_MASTER:
+    category: CORRECTION_APPROVAL
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - COMPLETE_ACTION
+    - ADD_COMMENT
   # Information: the invoice named a different vehicle and the Journey now
   # carries it (the invoice is the source of truth).
   MODEL_CHANGED_BY_INVOICE:
