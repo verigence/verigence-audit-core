@@ -1747,7 +1747,8 @@ def _page_unit(connection: Connection, *, tenant_id: str, journey_id: UUID, queu
         text(
             """
             SELECT queue_id, batch_id, page_number, page_numbers, unit_kind, queue_status, last_error,
-                   client_upload_id, di_document_id, page_object_key, page_sha256, business_stage
+                   client_upload_id, di_document_id, page_object_key, page_sha256, business_stage,
+                   di_state
             FROM auditcore.p2_document_queue
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND queue_id=:queue_id
             FOR UPDATE
@@ -2069,11 +2070,19 @@ def retry_page(
             detail="This page was rejected for scan quality; retrying will not help. Re-scan it and upload it again.",
         )
     # A page waiting only because the AI service refused our credentials may
-    # be retried once they are fixed (2026-10-20 re-review, R4): the worker
-    # asks DI to read the page it holds once more (no second upload).
-    if waits_for_night_attempt(unit.get("last_error")) and not str(unit.get("last_error")).endswith(
-        ":DOCUMENT_AI_NOT_CONFIGURED"
-    ):
+    # be retried once they are fixed (2026-10-20 re-review, R4) -- but only
+    # when DI had identified it: the worker then asks DI to read the copy it
+    # holds once more. A page refused while being identified is identified
+    # again by DI's night attempt; a second upload now would leave two
+    # documents (final check F1, 2026-10-21).
+    refused_credentials = str(unit.get("last_error") or "").endswith(":DOCUMENT_AI_NOT_CONFIGURED")
+    if (waits_for_night_attempt(unit.get("last_error")) and refused_credentials
+            and unit.get("di_state") != "CLASSIFIED"):
+        raise HTTPException(
+            status_code=409,
+            detail="The document service will read this page overnight now that the setup is fixed — nothing to do.",
+        )
+    if waits_for_night_attempt(unit.get("last_error")) and not refused_credentials:
         # 2026-10-20 review (S4): a Retry now would start a second set of AI
         # attempts on top of the overnight one already scheduled.
         raise HTTPException(

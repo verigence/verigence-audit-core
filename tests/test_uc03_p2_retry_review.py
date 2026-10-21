@@ -41,6 +41,7 @@ class FakeClient:
         self.documents = documents or []
         self.fail_listing = fail_listing
         self.intents = intents
+        self.deleted: list[str] = []
 
     def list_documents(self, *, token, tenant_id, external_context_ref, phase):
         if self.fail_listing:
@@ -49,6 +50,9 @@ class FakeClient:
 
     def create_upload_intents(self, **_kwargs):
         return self.intents
+
+    def delete_document(self, *, token, tenant_id, external_context_ref, document_id):
+        self.deleted.append(document_id)
 
 
 def _sql(journey, statement, **params):
@@ -226,7 +230,7 @@ def test_di_unreachable_in_the_morning_keeps_waiting_and_alerts_the_team_lead_at
     _expire(journey, datetime(2026, 10, 21, 6, 31, tzinfo=UTC))
     [task] = _open_tasks(journey)
     assert task["task_type"] == "TL_DOCUMENT_STUCK" and task["dedupe_key"].startswith("night-wait-tl:")
-    assert "1 page still waiting for the overnight AI retry at noon" == task["title"]
+    assert task["title"] == "1 page still waiting for the overnight AI retry"
     # The page is read later: the alert closes itself.
     _sql(journey, "UPDATE auditcore.p2_document_queue SET queue_status='READY', last_error=NULL WHERE queue_id=:q",
          q=queue_id)
@@ -505,8 +509,8 @@ def test_retry_after_the_ai_credentials_are_fixed_reads_the_page_once_more(journ
     from audit_core.security_authorization import get_security_authorization_client
 
     _, queue_id, document_id = add_page(journey, status="FAILED")
-    _sql(journey, "UPDATE auditcore.p2_document_queue SET last_error='AI_RETRY_TONIGHT:DOCUMENT_AI_NOT_CONFIGURED' "
-                  "WHERE queue_id=:q", q=queue_id)
+    _sql(journey, "UPDATE auditcore.p2_document_queue SET last_error='AI_RETRY_TONIGHT:DOCUMENT_AI_NOT_CONFIGURED', "
+                  "di_state='CLASSIFIED' WHERE queue_id=:q", q=queue_id)
     app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=journey.actor_id)
     app.dependency_overrides[get_security_authorization_client] = lambda: AllowAllAuthorization()
     try:
@@ -521,3 +525,96 @@ def test_retry_after_the_ai_credentials_are_fixed_reads_the_page_once_more(journ
         "retryTonight": True}]))
     assert queue_row(journey, "PAGE_REREAD", str(queue_id))["work_status"] == "PENDING"
     assert "~" not in _page(journey, queue_id)["client_upload_id"], "no second upload"
+
+
+# ------------------------------------------------------------------- final check (F1 and nits)
+
+def _config_page(journey, *, di_state):
+    _, queue_id, document_id = add_page(journey, status="FAILED")
+    _sql(journey, "UPDATE auditcore.p2_document_queue SET last_error='AI_RETRY_TONIGHT:DOCUMENT_AI_NOT_CONFIGURED', "
+                  "di_state=:s WHERE queue_id=:q", q=queue_id, s=di_state)
+    return queue_id, document_id
+
+
+def _retry(journey, queue_id):
+    from p2_support import AllowAllAuthorization
+
+    from audit_core.dependencies import get_human_principal
+    from audit_core.main import app
+    from audit_core.security import HumanPrincipal
+    from audit_core.security_authorization import get_security_authorization_client
+
+    app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=journey.actor_id)
+    app.dependency_overrides[get_security_authorization_client] = lambda: AllowAllAuthorization()
+    try:
+        return TestClient(app, raise_server_exceptions=False).post(
+            f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}/pages/{queue_id}:retry")
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_retry_is_refused_for_a_page_refused_while_being_identified(journey):
+    """Final check F1: a second upload now would leave two documents once DI's
+    night attempt identifies the old one."""
+    queue_id, _ = _config_page(journey, di_state="FAILED")
+    response = _retry(journey, queue_id)
+    assert response.status_code == 409
+    assert response.json()["detail"] == ("The document service will read this page overnight now that the setup "
+                                         "is fixed — nothing to do.")
+    assert _page(journey, queue_id)["queue_status"] == "FAILED"
+
+
+def test_a_pcs_retry_meeting_a_classification_stage_refusal_keeps_waiting():
+    item = {"state": "FAILED", "failureCode": "DOCUMENT_AI_NOT_CONFIGURED", "failureKind": "CONFIGURATION",
+            "scanPassed": True, "retryTonight": True}
+    now = datetime.now(UTC)
+    assert worker.recovery_decision(di_item=item, marker="r", submitted_at=now, now=now) == "LEAVE"
+    outcome = worker.classify_page_outcome(di_item=item, extracted_count=0, submitted_at=None, facts_copy=None,
+                                           now=now)
+    assert outcome.last_error == "AI_RETRY_TONIGHT:DOCUMENT_AI_NOT_CONFIGURED"
+    assert "your Team Lead has been alerted" in outcome.reason and "support has been told" not in outcome.reason
+
+
+def test_the_worker_leaves_a_classification_stage_refusal_waiting(journey, monkeypatch):
+    queue_id, document_id = _config_page(journey, di_state="FAILED")
+    with journey.engine.begin() as connection:  # e.g. a Retry queued before this change
+        set_tenant_context(connection, journey.tenant_id)
+        worker.request_page_recovery(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                                     queue_id=queue_id, marker="r", requested_by="pc", correlation_id=None)
+    client = FakeClient([{"documentId": str(document_id), "state": "FAILED",
+                          "failureCode": "DOCUMENT_AI_NOT_CONFIGURED", "failureKind": "CONFIGURATION",
+                          "scanPassed": True, "retryTonight": True}])
+    _run_ingest(journey, monkeypatch, client)
+    page = _page(journey, queue_id)
+    assert page["queue_status"] == "FAILED" and page["last_error"] == "AI_RETRY_TONIGHT:DOCUMENT_AI_NOT_CONFIGURED"
+    assert "~" not in page["client_upload_id"] and client.deleted == []
+
+
+def test_an_upload_sent_again_deletes_the_old_di_document_first(journey, monkeypatch):
+    """Defence in depth (F1): DI gave the page up; before it is sent again the
+    old document is deleted so no night attempt can revive it."""
+    _, queue_id, document_id = add_page(journey, status="FAILED")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        worker.request_page_recovery(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                                     queue_id=queue_id, marker="r", requested_by="pc", correlation_id=None)
+    client = FakeClient([{"documentId": str(document_id), "state": "FAILED", "failureCode": "CLASSIFICATION_FAILED",
+                          "failureKind": "TECHNICAL"}])
+    _run_ingest(journey, monkeypatch, client)
+    assert client.deleted == [str(document_id)]
+    page = _page(journey, queue_id)
+    assert page["client_upload_id"].endswith("~r1") and page["di_document_id"] is None
+
+
+def test_no_noon_alert_for_a_page_waiting_for_its_next_night(journey, monkeypatch):
+    _, queue_id, document_id = _overnight_page(journey)
+    _waiting_since(journey, queue_id, _SUBMITTED, datetime(2026, 10, 20, 21, 0, tzinfo=UTC))
+    _expire(journey, datetime(2026, 10, 21, 2, 31, tzinfo=UTC))
+    # DI says the night attempt is still to come (the daytime work ran past the night run).
+    _run_ingest(journey, monkeypatch, FakeClient([{**_AI_FAILED, "documentId": str(document_id),
+                                                   "retryTonight": True}]))
+    _expire(journey, datetime(2026, 10, 21, 6, 31, tzinfo=UTC))
+    assert _open_tasks(journey) == []
+    # A whole day later it is still waiting: now the Team Lead is told.
+    _expire(journey, datetime(2026, 10, 22, 6, 31, tzinfo=UTC))
+    assert [t["dedupe_key"].split(":")[0] for t in _open_tasks(journey)] == ["night-wait-tl"]

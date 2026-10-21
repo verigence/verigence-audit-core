@@ -165,8 +165,8 @@ _NIGHT_DUE = "2026-10-20T17:00:00+00:00"
         # never "upload it again"; it waits for the night attempt.
         ({"state": "CLASSIFIED", "processingStatus": "FAILED", "processingFailureCode": "DOCUMENT_AI_NOT_CONFIGURED",
           "failureKind": "CONFIGURATION", "scanPassed": True, "retryTonight": True}, "FAILED",
-         ("The AI service is not set up correctly on our side (support has been told). The page is tried again "
-          "overnight once it is fixed. Nothing to do now."), "AI_RETRY_TONIGHT:DOCUMENT_AI_NOT_CONFIGURED"),
+         ("The AI service is not set up correctly on our side (your Team Lead has been alerted). The page is "
+          "tried again overnight once it is fixed. Nothing to do now."), "AI_RETRY_TONIGHT:DOCUMENT_AI_NOT_CONFIGURED"),
         ({"state": "FAILED", "failureCode": "DOCUMENT_TYPE_NOT_FOUND", "failureKind": "CONFIGURATION",
           "scanPassed": True, "retryTonight": False}, "FAILED",
          ("Document Intelligence is not set up to read this page on our side. Ask your Team Lead to raise it "

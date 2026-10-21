@@ -1609,8 +1609,8 @@ _TECHNICAL_GAVE_UP_REASON = ("Document service couldn't process this page, and i
                              "Retry the page from the card, or upload it again.")
 # Gemini refused our key or model, or another setting is missing on our side
 # (2026-10-20 review, S8): never the PC's to fix by uploading again.
-_CONFIG_NIGHT_REASON = ("The AI service is not set up correctly on our side (support has been told). The page "
-                        "is tried again overnight once it is fixed. Nothing to do now.")
+_CONFIG_NIGHT_REASON = ("The AI service is not set up correctly on our side (your Team Lead has been alerted). "
+                        "The page is tried again overnight once it is fixed. Nothing to do now.")
 _CONFIG_REASON = ("Document Intelligence is not set up to read this page on our side. Ask your Team Lead to "
                   "raise it with support, then retry the page from the card once it is fixed.")
 
@@ -1696,12 +1696,13 @@ def recovery_decision(
         # Read again): poll and copy its result, never tell the PC the page
         # failed (2026-10-20 review, B1).
         return _in_hand_state(di_item)
-    if (failed and marker == "r" and di_item.get("failureKind") == "CONFIGURATION"
-            and state == "CLASSIFIED"):
+    if failed and marker == "r" and di_item.get("failureKind") == "CONFIGURATION":
         # Retry after the AI credentials were fixed (2026-10-20 re-review, R4):
         # one more reading of the document DI holds, never a second upload
-        # stacked on DI's night attempt.
-        return "REREAD"
+        # stacked on DI's night attempt. A page refused while being
+        # identified keeps waiting: DI's night attempt identifies it again
+        # (final check F1, 2026-10-21; the API refuses this Retry already).
+        return "REREAD" if state == "CLASSIFIED" else "LEAVE"
     if failed and marker == "n" and di_item.get("failureKind"):
         # Product owner's rule (2026-10-20): the nightly sweep never sends a
         # page again. A page whose night attempt is still to come is left;
@@ -1756,6 +1757,17 @@ def _recover_page(engine: Engine, work: WorkItem, row: dict[str, Any]) -> None:
         di_processing_status=(di_item or {}).get("processingStatus"),
         decision=decision,
     )
+    if decision == "REUPLOAD" and di_item is not None and str(di_item.get("state") or "") != "DELETED":
+        # The page is sent again as a new DI document: the old one is deleted
+        # first (as a retired fragment is), so no night attempt can revive it
+        # and leave the journey with two documents for one page (final check
+        # F1, 2026-10-21). A failure here fails the look-up, which retries.
+        v2_client.delete_document(
+            token=token, tenant_id=work.tenant_id, external_context_ref=context_ref,
+            document_id=str(row["di_document_id"]),
+        )
+        logger.info("p2_page_recovery_old_document_deleted", di_document_id=str(row["di_document_id"]),
+                    **_work_fields(work))
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
         if decision == "REREAD":
@@ -3386,6 +3398,7 @@ _ROLLOUT_REASON = ("Retrying now (the automatic retries were shortened to at mos
 # told (2026-10-20 re-review, R1).
 _NIGHT_LOOKUP_EVERY = timedelta(hours=1)
 _NOON_AFTER_DEADLINE = timedelta(hours=4)
+_NEXT_NOON_AFTER_DEADLINE = timedelta(hours=28)
 
 
 def apply_retry_policy_rollout(connection, *, tenant_id: str) -> int | None:
@@ -3438,7 +3451,7 @@ def expire_night_waits(connection, *, tenant_id: str, now: datetime | None = Non
     rows = connection.execute(
         text(
             """
-            SELECT queue_id, journey_id, queue_status, updated_at_utc,
+            SELECT queue_id, journey_id, queue_status, updated_at_utc, status_reason,
                    COALESCE(di_submitted_at_utc, created_at_utc) AS since
             FROM auditcore.p2_document_queue
             WHERE tenant_id=:t AND queue_status IN ('FAILED','DEAD_LETTER','QUEUED') AND last_error LIKE :tonight
@@ -3455,7 +3468,13 @@ def expire_night_waits(connection, *, tenant_id: str, now: datetime | None = Non
         if now < deadline:
             continue
         journey_id = UUID(str(row["journey_id"]))
-        if now >= deadline + _NOON_AFTER_DEADLINE:
+        # The Team Lead is alerted at noon only when DI could not be reached;
+        # a page DI says is waiting for its next night attempt (a page that
+        # finished its daytime work after the night run) is not a false alarm
+        # until a whole day later (final check, 2026-10-21).
+        # (a look-up that gave up, or one still retrying: QUEUED)
+        unreachable = row["status_reason"] == _NIGHT_LOOKUP_FAILED_REASON or row["queue_status"] == "QUEUED"
+        if (unreachable and now >= deadline + _NOON_AFTER_DEADLINE) or now >= deadline + _NEXT_NOON_AFTER_DEADLINE:
             overdue[journey_id] = overdue.get(journey_id, 0) + 1
         if row["queue_status"] != "QUEUED" and row["updated_at_utc"] < now - _NIGHT_LOOKUP_EVERY:
             request_page_recovery(
@@ -3468,12 +3487,12 @@ def expire_night_waits(connection, *, tenant_id: str, now: datetime | None = Non
         raise_or_refresh(
             connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=f"night-wait-tl:{journey_id}:pages",
             task_type="TL_DOCUMENT_STUCK", source_type="DOCUMENT", source_code="DOCUMENT_NIGHT_ATTEMPT_OVERDUE",
-            title=f"{pages} page{'' if pages == 1 else 's'} still waiting for the overnight AI retry at noon",
+            title=f"{pages} page{'' if pages == 1 else 's'} still waiting for the overnight AI retry",
             description=(f"{pages} page{'' if pages == 1 else 's'} of this booking failed AI reading and {verb} "
-                         "still waiting for Document Intelligence's overnight attempt at noon the next day: the "
-                         "document service could not be reached, or has not run its night attempt. Raise it with "
-                         "support. The PC has not been asked to upload anything; this task closes itself when "
-                         "the pages are read or handed to the PC."),
+                         "still waiting for Document Intelligence's overnight attempt: the document service could "
+                         "not be reached this morning, or has not made the night attempt a day later than expected. "
+                         "Raise it with support. The PC has not been asked to upload anything; this task closes "
+                         "itself when the pages are read or handed to the PC."),
             reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT",
                        "sourceCode": "DOCUMENT_NIGHT_ATTEMPT_OVERDUE", "pages": pages},
             severity="HIGH", registry=get_registry(),
