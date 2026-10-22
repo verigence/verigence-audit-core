@@ -58,7 +58,6 @@ from audit_core.uc03_p2_journey_views import (
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_reviewer import page_stage_code, stage_is_reviewed
 from audit_core.uc03_p2_runtime import (
-    SWEPT_REMOVED_CODE,
     enqueue_work,
     request_page_recovery,
     request_page_reread,
@@ -598,7 +597,7 @@ def list_p2_journeys(
             ) ev ON true
             LEFT JOIN LATERAL (
               -- pages whose processing failed for good, and pages waiting for a retry
-              SELECT COUNT(*) FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER'))
+              SELECT COUNT(*) FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER') OR {swept_pending_sql("q")})
                      + (SELECT COUNT(*) FROM auditcore.p2_upload_batches b
                          WHERE b.tenant_id=p.tenant_id AND b.journey_id=p.journey_id AND b.batch_status='FAILED') AS failed_pages,
                      COUNT(*) FILTER (WHERE q.queue_status='RETRY_WAIT') AS retrying_pages
@@ -2209,16 +2208,17 @@ def remove_page(
     status_reason = f"Removed from the journey by {actor}{f' ({role})' if role else ''}: {reason}"
     if swept:
         # Already off the Journey, its document voided by the sweep: record the
-        # person's removal, so the page no longer waits to be resubmitted.
+        # person's removal (the PAGE_REMOVED event below is what ends the wait
+        # to be resubmitted). The failure code stays, as for any removed page.
         connection.execute(
             text(
                 """
                 UPDATE auditcore.p2_document_queue
-                SET last_error=:code, status_reason=:reason, updated_at_utc=now()
+                SET status_reason=:reason, updated_at_utc=now()
                 WHERE tenant_id=:t AND queue_id=:q
                 """
             ),
-            {"t": tenant_id, "q": queue_id, "code": SWEPT_REMOVED_CODE, "reason": status_reason},
+            {"t": tenant_id, "q": queue_id, "reason": status_reason},
         )
         _activity(
             connection, tenant_id=tenant_id, journey_id=journey_id, event_type="PAGE_REMOVED",
@@ -2544,10 +2544,11 @@ def _p2_page_statistics(
 ) -> tuple[int, int]:
     row = connection.execute(
         text(
-            """
+            f"""
             SELECT COUNT(*) AS pages,
                    COUNT(*) FILTER (
                      WHERE queue_status IN ('READY','NEEDS_REVIEW','FAILED','DEAD_LETTER')
+                        OR {swept_pending_sql("p2_document_queue")}
                    ) AS processed
             FROM auditcore.p2_document_queue
             WHERE tenant_id=:tenant_id
@@ -2790,7 +2791,7 @@ def overview_summary(
 
     operational = connection.execute(
         text(
-            """
+            f"""
             SELECT
               (SELECT COUNT(*)
                  FROM auditcore.invoice_review_values i
@@ -2810,7 +2811,7 @@ def overview_summary(
               (SELECT COUNT(*)
                  FROM auditcore.p2_document_queue q
                 WHERE q.tenant_id=:tenant_id AND q.journey_id=:journey_id
-                  AND q.queue_status IN ('FAILED','DEAD_LETTER')) AS extraction_failures,
+                  AND (q.queue_status IN ('FAILED','DEAD_LETTER') OR {swept_pending_sql("q")})) AS extraction_failures,
               (SELECT COALESCE(SUM(GREATEST(q.attempt_count - 1, 0)),0)
                  FROM auditcore.p2_document_queue q
                 WHERE q.tenant_id=:tenant_id AND q.journey_id=:journey_id) AS document_retries,

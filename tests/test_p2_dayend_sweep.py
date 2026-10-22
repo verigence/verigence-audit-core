@@ -334,7 +334,7 @@ def test_a_person_can_remove_a_swept_page_when_a_different_scan_was_uploaded(jou
     task = _task(journey, batch_id)
     assert task["task_status"] == "VERIFIED_COMPLETE"
     assert "removed from the journey by" in task["completion_result"]["reason"]
-    assert _page(journey, rows[1]["queue_id"])["last_error"] == "SWEPT_PAGE_REMOVED"
+    assert _page(journey, rows[1]["queue_id"])["last_error"] == "DOCUMENT_AI_UNAVAILABLE"  # the failure code is kept (V3)
     assert _batch_status(journey, batch_id) == "COMPLETED"
     # Once resolved it can neither be removed again nor swept again.
     assert client.post(url, json={"reason": "again"}).status_code == 409
@@ -358,14 +358,22 @@ class SpyStorage:
         raise AssertionError(f"storage.{name} must not be called by the sweep")
 
 
-def _tl(journey) -> str:
+def _tl(journey, scoped=False) -> str:
     tl = f"tl-{uuid4().hex[:8]}"
     with journey.engine.begin() as connection:
-        connection.execute(
-            text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code) "
-                 "VALUES (:t, :a, 'TL')"),
-            {"t": journey.tenant_id, "a": tl},
-        )
+        if scoped:  # a Team Lead of the journey's own outlet
+            connection.execute(
+                text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code, "
+                     "dealer_id, outlet_id) SELECT tenant_id, :a, 'TL', dealer_id, outlet_id "
+                     "FROM auditcore.business_assignments WHERE tenant_id=:t AND security_actor_id=:pc"),
+                {"t": journey.tenant_id, "a": tl, "pc": journey.actor_id},
+            )
+        else:
+            connection.execute(
+                text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code) "
+                     "VALUES (:t, :a, 'TL')"),
+                {"t": journey.tenant_id, "a": tl},
+            )
     return tl
 
 
@@ -748,7 +756,7 @@ def test_a_different_scan_does_not_close_the_quality_task_the_pc_or_the_remove_c
     task = _task(journey, first, "upload-quality")
     assert task["task_status"] == "VERIFIED_COMPLETE"
     assert "was removed from the journey by" in task["completion_result"]["reason"]
-    assert _page(journey, ids[1]["queue_id"])["last_error"] == "SWEPT_PAGE_REMOVED"
+    assert _page(journey, ids[1]["queue_id"])["last_error"] == BLUR  # the failure code is kept
     assert _gate(journey) == []
 
 
@@ -928,3 +936,63 @@ def test_an_open_quality_task_raised_before_the_action_existed_gets_it(journey):
     [row] = _sql(journey, "SELECT allowed_actions FROM auditcore.p2_tasks WHERE task_id=:i", i=task_id)
     assert row["allowed_actions"] == ["REUPLOAD_DOCUMENT", CLOSE, "ADD_COMMENT"]
     assert _act(journey, task_id, REASON).status_code == 200
+
+
+# ------------------------------------- a swept page still counts as failed (review of #484, V1 and V3)
+
+def _swept_file(journey):
+    batch_id, rows = _file(journey, [("booking_form", "READY"), (None, "FAILED")])
+    _fail(journey, rows[1]["queue_id"])
+    _sync(journey)
+    assert _sweep(journey)["pages"] == 1
+    assert _page(journey, rows[1]["queue_id"])["queue_status"] == "CANCELLED"
+    assert _task(journey, batch_id)["task_status"] == "READY"
+    return batch_id, rows
+
+
+def test_a_booking_with_a_swept_failed_page_can_still_be_deleted_and_is_still_stuck(journey):
+    """The sweep is only a clean-up: after it the PC can still delete the booking
+    (the resubmit task is still open), the list still counts the page as failed,
+    the Team Lead's stuck tab still has the booking, and the overview still counts
+    the extraction failure and the page as processed."""
+    from audit_core.uc03_p2_api import _p2_page_statistics, overview_summary
+
+    _swept_file(journey)
+    _sql(journey, "UPDATE auditcore.p2_document_queue SET business_stage='BOOKING' WHERE journey_id=:j")
+    client = _as(journey, journey.actor_id)
+    base = f"/p2/v1/tenants/{journey.tenant_id}"
+
+    listed = client.get(f"{base}/journeys", params={"state": "open"}).json()["items"]
+    assert next(i for i in listed if i["journey_id"] == str(journey.journey_id))["failed_pages"] == 1
+    with journey.engine.begin() as connection:  # the overview endpoint itself, on the owner connection
+        set_tenant_context(connection, journey.tenant_id)
+        overview = overview_summary(
+            journey.tenant_id, journey.journey_id, HumanPrincipal(subject=journey.actor_id),
+            AllowAllAuthorization(), connection)
+    assert overview["statistics"]["journey"]["extractionFailures"] == 1
+    assert overview["statistics"]["booking"]["pagesProcessed"] == 2
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        pages, processed = _p2_page_statistics(connection, tenant_id=journey.tenant_id,
+                                               journey_id=journey.journey_id, stage_code="BOOKING")
+    assert (pages, processed) == (2, 2)  # one read, one failed (swept); as before the sweep
+
+    tl = _tl(journey, scoped=True)
+    stuck = _as(journey, tl).get(f"{base}/journeys", params={"view": "stuck"}).json()["items"]
+    assert [i["journey_id"] for i in stuck] == [str(journey.journey_id)]
+
+    response = client.post(f"{base}/journeys/{journey.journey_id}:cancel", json={"reason": "Scanner output was corrupt"})
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "BOOKING_CANCELLED"
+
+
+def test_a_removed_swept_page_no_longer_counts_as_failed(journey):
+    """...and once a person removes the swept page it is resolved, as a removed page always was."""
+    _, rows = _swept_file(journey)
+    client = _as(journey, journey.actor_id)
+    base = f"/p2/v1/tenants/{journey.tenant_id}"
+    assert client.post(f"{base}/journeys/{journey.journey_id}/pages/{rows[1]['queue_id']}:remove",
+                       json={"reason": "Re-scan uploaded"}).status_code == 200
+    listed = client.get(f"{base}/journeys", params={"state": "open"}).json()["items"]
+    assert next(i for i in listed if i["journey_id"] == str(journey.journey_id))["failed_pages"] == 0
+    assert client.post(f"{base}/journeys/{journey.journey_id}:cancel", json={}).status_code == 409
