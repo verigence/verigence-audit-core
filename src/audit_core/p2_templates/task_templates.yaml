@@ -262,6 +262,10 @@ task_types:
   # No discount scheme of the bulletins is in force on the deal's pricing
   # date (the month's bulletin is not loaded yet): the given discounts have
   # no standard, said so here rather than applying another month's scheme.
+  # The Team Lead accepts it as an exception (comment required); the shared
+  # ACCEPT_EXCEPTION path closes it and the resolver does not reopen it while
+  # the condition is the same. COMPLETE_ACTION is not offered: a RESOLVER
+  # task has no worker verification adapter, so it would stay VERIFYING.
   DISCOUNT_SCHEME_NOT_IN_FORCE:
     category: OBSERVATION
     owner: TL
@@ -269,7 +273,7 @@ task_types:
     source: RESOLVER
     completion: MACHINE_VERIFIED
     actions:
-    - COMPLETE_ACTION
+    - ACCEPT_EXCEPTION
     - ADD_COMMENT
   # Information: the invoice named a different vehicle and the Journey now
   # carries it (the invoice is the source of truth).

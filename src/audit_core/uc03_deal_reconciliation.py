@@ -1904,8 +1904,12 @@ def _sync_master_tasks(
                 "is not loaded. The discount is kept out of the variance until then, and no other month's "
                 "scheme is applied. Confirm the discount, or load the bulletin that covers the model."
             ),
+            # leftValue / rightValue make up the issue hash, so a Team Lead's accept
+            # holds for this model, these discounts and this date only.
             reference={"sourceCode": _NOT_IN_FORCE_TASK, "onDate": effective_on.isoformat(), "keys": not_in_force,
-                       "model": ctx.get("model_name"), "ev": ev},
+                       "model": ctx.get("model_name"), "ev": ev,
+                       "leftValue": f"{model}: {', '.join(not_in_force)}",
+                       "rightValue": f"no {kind} in force on {effective_on.isoformat()}"},
             severity="MEDIUM", registry=registry,
         )
         counts["notInForce"] += 1

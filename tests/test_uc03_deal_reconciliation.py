@@ -1573,6 +1573,80 @@ def test_n1_a_model_no_bulletin_in_force_covers_is_not_known_ev_included(journey
     assert task["title"] == "Discount given on BE 6 but no EV scheme in force on 2026-09-10 lists it — confirm"
 
 
+def _be6_not_in_force(c) -> None:
+    """BE 6 priced 10 Sep with 50,000 cash given; no scheme in force lists it."""
+    other = c.execute(text("INSERT INTO auditcore.product_models (oem_id, model_code, model_name) "
+                           "VALUES (:o, :mc, 'XUV 3XO') RETURNING model_id"),
+                      {"o": c.oem_id, "mc": f"M{uuid4().hex[:8]}"}).scalar_one()
+    _scheme(c, category="CONSUMER", effective_from=_SEPT_SCHEMES, benefits={"CASH_DISCOUNT": "30000"},
+            effective_to=date(2026, 9, 30), eligibility=[{"model_id": other, "criteria": {"scope": "MODEL"}}])
+    _seed_pinned_sku(c, model="BE 6", variant="PACK ONE ABOVE 59 kWh", effective_from=date(2026, 9, 1),
+                     components={"EX_SHOWROOM": "1990000"})
+    _price_on(c, _UTKAL_PRICING_DATE)
+    _seed_reviewed_booking(c, sales_discount_amount="50000")
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+
+def _not_in_force_task(c) -> dict:
+    return dict(c.execute(
+        text("SELECT task_id, task_status, allowed_actions, completion_result, round_number FROM auditcore.p2_tasks "
+             "WHERE tenant_id=:t AND task_type='DISCOUNT_SCHEME_NOT_IN_FORCE'"),
+        {"t": c.tenant_id}).mappings().one())
+
+
+def _act(c, task_id, action: str, *, role: str, comment: str | None):
+    from audit_core.uc03_p2_tasks import submit_action
+
+    return submit_action(c, tenant_id=c.tenant_id, task_id=task_id, action=action, actor_id=f"{role.lower()}-1",
+                         actor_role_code=role, comment=comment)
+
+
+def test_n1b_the_team_lead_accepts_a_discount_no_scheme_covers_and_the_task_stays_closed(journey) -> None:
+    """The TL's accept closes the task with the comment, only a TL / PM may
+    accept, and the resolver does not reopen it while the condition is the
+    same; a different condition (another pricing date) asks again."""
+    from audit_core.uc03_p2_tasks import TaskPermissionError
+
+    c = journey
+    _be6_not_in_force(c)
+    task = _not_in_force_task(c)
+    assert task["task_status"] == "READY"
+    assert "ACCEPT_EXCEPTION" in task["allowed_actions"] and "COMPLETE_ACTION" not in task["allowed_actions"]
+
+    # A refused request rolls back in the API; a savepoint does the same here.
+    with pytest.raises(TaskPermissionError), c.begin_nested():
+        _act(c, task["task_id"], "ACCEPT_EXCEPTION", role="PC", comment="fine")
+    with pytest.raises(ValueError, match="requires a comment"), c.begin_nested():
+        _act(c, task["task_id"], "ACCEPT_EXCEPTION", role="TL", comment="  ")
+    assert _not_in_force_task(c)["task_status"] == "READY"
+
+    done = _act(c, task["task_id"], "ACCEPT_EXCEPTION", role="TL", comment="BEV mail not issued yet; as given")
+    assert done["status"] == "VERIFIED_COMPLETE" and done["outcome"] == "EXCEPTION_ACCEPTED"
+    closed = _not_in_force_task(c)
+    assert closed["task_status"] == "VERIFIED_COMPLETE"
+    assert closed["completion_result"]["comment"] == "BEV mail not issued yet; as given"
+    assert closed["completion_result"]["acceptedBy"] == "tl-1" and closed["completion_result"]["acceptedRole"] == "TL"
+    event = c.execute(text("SELECT comment FROM auditcore.p2_task_events WHERE tenant_id=:t AND task_id=:k "
+                           "AND event_type='ACCEPT_EXCEPTION'"), {"t": c.tenant_id, "k": task["task_id"]}).scalar_one()
+    assert event == "BEV mail not issued yet; as given"
+
+    # The deal is unchanged by the accept: still not in force, still taken as given, no shortfall.
+    c.execute(text("UPDATE auditcore.commercial_lines SET actual_amount=standard_amount, "
+                   "source_reference='booking_form:test' WHERE tenant_id=:t AND journey_id=:j"),
+              {"t": c.tenant_id, "j": c.journey_id})
+    result = dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert _discount(c, "CASH_DISCOUNT")["eligibility_result"] == "SCHEME_NOT_IN_FORCE"
+    assert _sheet_discount(c, "CASH_DISCOUNT")["takenAsGiven"] is True
+    assert Decimal(result["totals"]["variance"]) == 0
+    assert _not_in_force_task(c)["task_status"] == "VERIFIED_COMPLETE"
+
+    # Another pricing date is another question: the task is asked again.
+    _price_on(c, date(2026, 9, 20))
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    reopened = _not_in_force_task(c)
+    assert reopened["task_status"] == "READY" and reopened["round_number"] == 2
+
+
 def _welcome_masters(c):
     seeded = _seed_pinned_sku(c, model="SUPRO", variant="Supro Maxi Profit Truck LX BS6.2",
                               effective_from=date(2026, 9, 1), components={"EX_SHOWROOM": "700000"})
