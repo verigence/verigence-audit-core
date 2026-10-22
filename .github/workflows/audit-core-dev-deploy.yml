@@ -104,6 +104,13 @@ jobs:
         run: |
           set -euo pipefail
           [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN secret is not configured.'; exit 1; }
+          # What the token looks like to this job (2026-10-22): length, stray
+          # whitespace, and whether it equals the project id (no part of the token).
+          # Never the token itself. Added to find why railway link says Unauthorized.
+          tok="${RAILWAY_API_TOKEN}"
+          ws=no; [[ "$tok" =~ [[:space:]] ]] && ws=yes
+          same=no; [ "$tok" = "${PLATFORM_PROJECT_ID}" ] && same=yes
+          echo "::notice title=RAILWAY_API_TOKEN fingerprint::length=${#tok} whitespace=${ws} equals_project_id=${same}"
           if ! railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json 2>/tmp/link.err; then
             cat /tmp/link.err >&2 || true
             echo "::warning title=railway link::$(head -c 400 /tmp/link.err | tr '\n' ' ') | out: $(head -c 200 /tmp/link.json | tr '\n' ' ')"
