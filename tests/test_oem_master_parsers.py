@@ -18,9 +18,15 @@ from openpyxl import Workbook
 
 from audit_core.oem_master_parsers import (
     MasterParseError,
+    _parse_consumer_tables,
+    old_vehicle_requirement,
     parse_corporate_policy,
+    parse_discount_grid,
     parse_master,
+    parse_model_qualifiers,
     parse_price_list,
+    split_variant_cell,
+    variant_excluded,
 )
 from audit_core.oem_price_masters import _build_preview
 
@@ -426,6 +432,190 @@ def test_discount_grid_rejects_an_unreadable_cell_and_a_foreign_workbook() -> No
         parse_discount_grid(buf.getvalue())
 
 
+# ── scheme wording (2026-10-20 product owner rules) ─────────────────────────────
+@pytest.mark.parametrize(
+    ("cell", "names"),
+    [
+        ("MX2 PRO PM AT & MT", ["MX2 PRO PM AT", "MX2 PRO PM MT"]),
+        ("MX3 PRO PM AT/MT", ["MX3 PRO PM AT", "MX3 PRO PM MT"]),
+        ("MX3 PM MT/AT", ["MX3 PM MT", "MX3 PM AT"]),
+        ("MX3 DS AS/MT\nMX3 PRO DS MT", ["MX3 DS AS", "MX3 DS MT", "MX3 PRO DS MT"]),
+        ("AX7 DS AS DT/MT DT\nAX7L DS MT DT", ["AX7 DS AS DT", "AX7 DS MT DT", "AX7L DS MT DT"]),
+        ("LXT D AT/MT 4WD 4S HT BS6.2", ["LXT D AT 4WD 4S HT BS6.2", "LXT D MT 4WD 4S HT BS6.2"]),
+        ("EL PRO FC - Battery 34.5 Kwh -\nCharger 7.2 Kw - E\nEL PRO FC - DT - Battery 34.5\nKwh - Charger 7.2 Kw - E",
+         ["EL PRO FC - Battery 34.5 Kwh - Charger 7.2 Kw - E", "EL PRO FC - DT - Battery 34.5 Kwh - Charger 7.2 Kw - E"]),
+        ("Z8 L D AT 2WD 6 & 7STR BS6.2 -\nN - ADAS",
+         ["Z8 L D AT 2WD 6 STR BS6.2 - N - ADAS", "Z8 L D AT 2WD 7 STR BS6.2 - N - ADAS"]),
+        ("V4/V6", ["V4", "V6"]),
+        ("Z4 G / Z8 G / Z8L G 2WD", ["Z4 G", "Z8 G", "Z8L G 2WD"]),
+        ("Supro Maxi Profit Truck VX CBC\nBS6.2 - Tipper / Hopper",
+         ["Supro Maxi Profit Truck VX CBC BS6.2 - Tipper", "Supro Maxi Profit Truck VX CBC BS6.2 - Hopper"]),
+        ("MX5 DMT 4WD & Mocha Interiors", ["MX5 DMT 4WD & Mocha Interiors"]),
+        ("M2/M4+/M6+(Discontinued Model)", ["M2", "M4+", "M6+"]),
+    ],
+)
+def test_variant_cells_are_joined_and_expanded(cell, names) -> None:
+    assert split_variant_cell(cell) == names
+
+
+def test_model_cell_qualifiers_are_parsed_not_dropped() -> None:
+    base, q = parse_model_qualifiers("XUV 3XO (Excluding EDGE & REVX M(O) PM AT )")
+    assert base == "XUV 3XO" and q == {"excludedVariantTexts": ["EDGE", "REVX M(O) PM AT"]}
+    base, q = parse_model_qualifiers("XUV 3XO (Excluding EDGE & REVX M(O) PM AT) against Old Maruti Vehicle**")
+    assert base == "XUV 3XO" and q["requiredOldVehicle"] == {"brand": "MARUTI"}
+    assert q["excludedVariantTexts"] == ["EDGE", "REVX M(O) PM AT"]
+    assert parse_model_qualifiers("XUV3XO for All Variants") == ("XUV3XO", {"allVariants": True})
+    assert parse_model_qualifiers("Bolero Neo Plus (All Variants)") == ("Bolero Neo Plus", {"allVariants": True})
+    assert parse_model_qualifiers("THAR ROXX (Not on Star Edition)") == (
+        "THAR ROXX", {"excludedVariantTexts": ["Star Edition"]})
+    assert parse_model_qualifiers("3XO REVX (Not on REVX Edge)") == ("3XO REVX", {"excludedVariantTexts": ["REVX Edge"]})
+    assert parse_model_qualifiers("Scorpio-N including Refresh") == ("Scorpio-N", {"includes": ["Refresh"]})
+    assert old_vehicle_requirement("Tata Ace Family") == {"brand": "TATA", "model": "ACE"}
+    assert old_vehicle_requirement("Any Personal + Commercial Vehicle") is None
+    assert old_vehicle_requirement("Not Applicable") is None
+    assert variant_excluded("REVX EDGE(O) PM AT", ["EDGE"]) and variant_excluded("REVX M(O) PM AT", ["REVX M(O) PM AT"])
+    assert not variant_excluded("REVX M(O) PM MT", ["EDGE", "REVX M(O) PM AT"])
+    assert variant_excluded("AX7 DAT 2WD - Star Edition", ["Star Edition"])
+
+
+def _bulletin_row(product, variants, factor, total, cash, other="₹ 0", description=""):
+    contribution = f"{int(total.replace('₹', '').replace(',', '').strip()):,}"
+    return [product, variants, "1", factor, contribution, "-", total, cash, other, description]
+
+
+_HEADER_ROW = ["Product", "Variants", "M&M Contribution", "BNDP Factor", "M&M", "Dealer", "Total Consumer Offer",
+               "Cash Discount", "Other Schemes", "Description"]
+
+
+def test_a_product_cell_is_never_carried_over_a_page_break() -> None:
+    """The September bulletin's XUV400 EV block opens page 2 with an empty
+    product cell: carried, the Rs 2,50,000 EV offer read as XUV 3XO."""
+    pages = [
+        [[_HEADER_ROW,
+          _bulletin_row("XUV 3XO", "AX5 PM MT", "1.18", "₹ 30,000", "₹ 30,000"),
+          _bulletin_row("XUV 3XO", "AX7 DS AS DT/MT DT\nAX7L DS MT DT", "1.18", "₹ 20,000", "₹ 20,000")]],
+        [[_bulletin_row(None, "EL PRO FC - Battery 34.5 Kwh -\nCharger 7.2 Kw - E", "1.05", "₹ 2,50,000", "₹ 2,50,000"),
+          _bulletin_row("XUV400", "EC PRO - Battery 34.5 Kwh -\nCharger 3.2 Kw - E", "1.05", "₹ 50,000", "₹ 50,000")]],
+    ]
+    result = _parse_consumer_tables(pages, "w.e.f. 3rd Sep;26")
+    assert not result.errors, result.errors
+    bev = result.discount_rows[2]
+    assert bev.model_alias == "XUV400" and bev.benefits == [("CASH_DISCOUNT", Decimal("250000.00"))]
+    assert bev.variant_texts == ["EL PRO FC - Battery 34.5 Kwh - Charger 7.2 Kw - E"]
+    assert bev.config["vehicleCategory"] == "EV"
+    assert [r.model_alias for r in result.discount_rows] == ["XUV 3XO", "XUV 3XO", "XUV400", "XUV400"]
+
+
+def test_a_row_split_by_the_page_break_is_one_row_and_an_unplaceable_one_is_refused() -> None:
+    veero = [[_HEADER_ROW, _bulletin_row("VEERO", "V2\nV2 CNG", "1.18", "₹ 50,000", "₹ 45,000", "₹ 5,000")]]
+    continued = [[_bulletin_row(None, "V4 CNG", "1.18", "₹ 50,000", "₹ 45,000", "₹ 5,000"),
+                  _bulletin_row("MAXX CITY", "MAXX CITY 1.4 LX BS6.2", "1.18", "₹ 20,000", "₹ 15,000", "₹ 5,000")]]
+    result = _parse_consumer_tables([veero, continued], "")
+    assert not result.errors
+    assert [(r.model_alias, r.variant_texts) for r in result.discount_rows] == [
+        ("VEERO", ["V2", "V2 CNG", "V4 CNG"]), ("MAXX CITY", ["MAXX CITY 1.4 LX BS6.2"])]
+
+    orphan = [[_bulletin_row(None, "V4 CNG", "1.18", "₹ 40,000", "₹ 40,000"),
+               _bulletin_row("MAXX CITY", "MAXX CITY 1.4 LX BS6.2", "1.18", "₹ 20,000", "₹ 15,000", "₹ 5,000")]]
+    result = _parse_consumer_tables([veero, orphan], "")
+    assert any("cannot be placed" in e for e in result.errors)
+
+
+def test_the_ev_bndp_factor_requires_an_ev_model() -> None:
+    pages = [[[_HEADER_ROW, _bulletin_row("XUV 3XO", "EC PRO", "1.05", "₹ 2,50,000", "₹ 2,50,000"),
+               _bulletin_row("XUV400", "EC PRO", "1.18", "₹ 50,000", "₹ 50,000")]]]
+    result = _parse_consumer_tables(pages, "")
+    assert result.discount_rows == []
+    assert any("1.05 is the EV rate" in e for e in result.errors)
+    assert any("not the EV rate 1.05" in e for e in result.errors)
+
+
+def test_the_bev_carry_forward_email_is_refused_with_what_it_says() -> None:
+    text = (
+        "Consumer Schemes - BEVs - Sep'26\nDear All,\n"
+        "We are continuing the same Consumer Schemes of August’26 in the month of September’26.\n"
+        "There are no changes in schemes of –\nXEV 9e including Extended Warranty\nBE6 (old series)\n"
+        "FE (old series)\nPls note there are no consumer schemes in –\nXEV9S\nBE6 Sporteq\nRegards\n"
+    )
+    with pytest.raises(MasterParseError) as caught:
+        _parse_consumer_tables([[]], text)
+    message = str(caught.value)
+    assert "e-mail" in message and "Nothing was loaded" in message
+    assert "XEV 9e including Extended Warranty, BE6 (old series), FE (old series)" in message
+    assert "XEV9S, BE6 Sporteq" in message
+
+
+def test_the_october_grid_reads_three_tiers_and_the_od_caps_from_its_notes() -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.append([None, "Grid for ' October 2026"])
+    ws.append([None, "Model", "Booking Protection", "MY - 2026\nWithout Inhouse Insurance or Extended Warranty",
+               "MY - 2026\nWith Insurance  ", "With Extended Warranty + Insurance", "Out of Territory"])
+    ws.append([None, "XUV 3XO", "30 days", 5000, 7000, 10000, "Additional 5K"])
+    ws.append([None, "SCORPIO-N", "60 days", "Nil", "Nil", 5000, "Additional 5K"])
+    ws.append([None, "PICKUP, MAXX City, MAXX HD", "30 days", 5000, 7000, 7000, "Additional 5K"])
+    ws.append([])
+    ws.append([None, "Notes"])
+    ws.append([None, "Parameter", "Notes"])
+    ws.append([None, "OD Discount  Insurance", (
+        "Private Car: Maximum OD discount – 65%\nGoods Carrying Vehicle (GCV): Maximum OD discount – 60%\n"
+        "Passenger Carrying Vehicle (PCV): Maximum OD discount – 50%\n3+3 Insurance: Maximum discount – 85%")])
+    buf = BytesIO()
+    wb.save(buf)
+    result = parse_discount_grid(buf.getvalue(), filename="Odisha PV & CV Discount Grid-1Oct  2026 - Copy.xlsx")
+    assert not result.errors, result.errors
+    assert result.effective_from_hint == date(2026, 10, 1) and result.meta["effectiveFromSource"] == "FILENAME"
+    rows = {r.model_alias: r for r in result.grid_rows}
+    assert set(rows) == {"XUV 3XO", "SCORPIO-N", "PICKUP, MAXX City, MAXX HD"}  # "Notes" is not a model
+    xo = rows["XUV 3XO"]
+    assert xo.tiers == {"BASE": Decimal("5000.00"), "WITH_INSURANCE": Decimal("7000.00"),
+                        "WITH_EW_INSURANCE": Decimal("10000.00")}
+    assert xo.agreed_buffer_amount == Decimal("5000.00") and xo.out_of_territory_amount == Decimal("5000.00")
+    assert xo.insurance_od_percent == Decimal("65.00")
+    assert rows["PICKUP, MAXX City, MAXX HD"].insurance_od_percent == Decimal("60.00")  # goods carrier cap
+    assert rows["SCORPIO-N"].tiers["BASE"] == Decimal("0.00")
+    assert result.meta["odCapsPercent"] == {"PRIVATE_CAR": "65.00", "GCV": "60.00", "PCV": "50.00",
+                                            "THREE_PLUS_THREE": "85.00"}
+
+
+def _fixture(pattern: str) -> Path:
+    matches = sorted(Path(_FIXTURES).rglob(pattern))
+    if not matches:
+        pytest.skip(f"no fixture matching {pattern}")
+    return matches[0]
+
+
+@pytest.mark.skipif(not _FIXTURES, reason="MAHINDRA_FIXTURES_DIR not set")
+def test_real_september_bulletin_reads_the_bev_row_as_xuv400() -> None:
+    result = parse_master("CONSUMER_SCHEME", _fixture("Consumer Scheme*Sep*26*.pdf").read_bytes())
+    assert not result.errors
+    bev = [r for r in result.discount_rows if r.total_customer_offer == Decimal("250000.00")]
+    assert len(bev) == 1 and bev[0].model_alias == "XUV400" and bev[0].config["vehicleCategory"] == "EV"
+    assert all(r.model_alias != "XUV 3XO" or r.config["vehicleCategory"] == "ICE" for r in result.discount_rows)
+
+
+@pytest.mark.skipif(not _FIXTURES, reason="MAHINDRA_FIXTURES_DIR not set")
+def test_real_october_exchange_xuv3xo_rows_parse_with_their_conditions() -> None:
+    result = parse_master("EXCHANGE_SCHEME", _fixture("Exchange scheme Oct*26*.pdf").read_bytes())
+    assert not result.errors
+    xuv = [(r.model_alias, r.benefits) for r in result.discount_rows if parse_model_qualifiers(r.model_alias)[0] in
+           {"XUV 3XO", "XUV3XO"}]
+    amounts = sorted(str(b[0][1]) for _, b in xuv)
+    assert amounts == ["20000.00", "40000.00", "40000.00", "60000.00"]
+    maruti = next(a for a, b in xuv if b[0][1] == Decimal("60000.00"))
+    assert parse_model_qualifiers(maruti)[1]["requiredOldVehicle"] == {"brand": "MARUTI"}
+
+
+@pytest.mark.skipif(not _FIXTURES, reason="MAHINDRA_FIXTURES_DIR not set")
+def test_real_october_grid_and_bev_email() -> None:
+    grid_file = _fixture("*Discount Grid-1Oct*.xlsx")
+    grid = parse_master("DISCOUNT_GRID", grid_file.read_bytes(), filename=grid_file.name)
+    assert not grid.errors and grid.meta["layout"] == "DEALER_DISCOUNT_GRID_TIERED"
+    assert {r.model_alias: r.tiers.get("WITH_EW_INSURANCE") for r in grid.grid_rows}["XUV 3XO"] == Decimal("10000.00")
+    with pytest.raises(MasterParseError, match="e-mail"):
+        parse_master("CONSUMER_SCHEME", _fixture("Consumer Schemes - BEVs*.pdf").read_bytes())
+
+
 # ── 2026-10-20 product owner rules: blank components, EV sheets ─────────────────
 def _thar_star_edition_row(sl, *, warranty_4th, warranty_5th, onroad_ind, onroad_corp):
     """Row 213 of the October 2026 consolidated book, THAR ROXX AX7 DMT 2WD
@@ -507,3 +697,32 @@ def test_the_real_october_2026_book_parses_with_no_errors() -> None:
     star = [r for r in result.price_rows if r.model_name == "THAR ROXX" and "Star Edition" in r.variant_name]
     assert len(star) == 3
     assert all(r.components["EXT_WARRANTY_4TH_YR"] == 0 for r in star)
+
+
+def test_validity_end_dates_from_the_bulletins() -> None:
+    """Review of PR 472 (S1): a scheme answers only for the dates it stands on."""
+    from audit_core.oem_master_parsers import validity_end_hint
+
+    assert validity_end_hint("Schemes are valid from 3rd Sept’26 to 30th Sept’26 (Blackout period 1st to 2nd "
+                             "Sept’26)") == date(2026, 9, 30)
+    assert validity_end_hint("Corporate Privilege Policy From 3rd Sept' 26 - 30th Sept' 26") == date(2026, 9, 30)
+    assert validity_end_hint("Monthly Consumer Scheme Bulletin Oct'26 w.e.f. 3rd Oct'26") == date(2026, 10, 31)
+    assert validity_end_hint("Monthly Consumer Scheme Bulletin Dec'26") == date(2026, 12, 31)
+    assert validity_end_hint("No dates here") is None
+
+
+def test_variant_names_match_on_their_distinguishing_words() -> None:
+    """Review of PR 472 (B1): the emission norm, "- E", the release markers,
+    "(O)" and "& Mocha Interiors" do not name another variant; "LX & LX CBC"
+    is two variants."""
+    from audit_core.oem_master_parsers import split_variant_cell, variant_loose_key
+
+    assert variant_loose_key("Classic S BS6.2") == variant_loose_key("Classic S BS6.2 - E")
+    assert variant_loose_key("MAXX HD 1.3 LX") == variant_loose_key("MAXX HD 1.3 LX BS6.2")
+    assert variant_loose_key("BOL PIK UP FB 1.3T - PS") == variant_loose_key("BOL PIK UP FB 1.3T - BS6.2 - PS")
+    assert variant_loose_key("AX7L DAT 2WD & Mocha Interiors") == variant_loose_key("AX7L DAT 2WD")
+    assert variant_loose_key("REVX M(O) PM MT") == variant_loose_key("REVX M OPT PM MT")
+    assert variant_loose_key("Z8 S D AT 2WD 7 STR BS6.2 - Refresh") == variant_loose_key("Z8 S D AT 2WD 7 STR BS6.2 - N")
+    assert variant_loose_key("AX5 PM MT") != variant_loose_key("AX5 PM AT")
+    assert split_variant_cell("Supro Maxi Profit Truck LX & LX\nCBC") == [
+        "Supro Maxi Profit Truck LX", "Supro Maxi Profit Truck LX CBC"]

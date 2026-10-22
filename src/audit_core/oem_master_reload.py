@@ -17,7 +17,9 @@ right book on every day:
 The live 08 Sep and 19 Sep versions (the 03 Sep book plus the additions,
 then plus Veero LNT) are already right and are not touched.
 
-Run by the worker when AUDIT_CORE_MASTER_RELOAD_TAG is set. Once per tag and
+Run by the worker when AUDIT_CORE_MASTER_RELOAD_TAG is set. A tag containing
+"-schemes" re-loads the scheme masters instead (``SCHEME_RELOAD_PLAN``,
+review of PR 472). Once per tag and
 tenant (a durable claim in auditcore.oem_master_reload_runs). A DRY RUN
 unless the tag ends with "-commit": every check is run and logged and the
 transaction is rolled back. Per Mahindra tenant, ONE transaction: the five
@@ -236,9 +238,223 @@ def reload_tenant(connection: Connection, *, tenant_id: str, tag: str, store: bo
             "booksAfter": {str(d): len(_book(connection, tenant_id, d)[1]) for d in sorted(EXPECTED_SKUS)}}
 
 
+# ── the scheme masters (2026-10-21; the review of PR 472) ─────────────────────
+# A tag containing "-schemes" runs this plan instead of the price books (which
+# are already re-loaded): the bulletins, the corporate policy and the dealer
+# grid, in order, with the dates the documents print. The live September
+# schemes were loaded on 08 Sep and the August grid on 05 Sep by the old
+# ingestion (rows stored model-wide for variants nothing resolved, the grid
+# lines for 3XO / 7XO / MAXX / XUV400 with no model). A version answers from
+# its date, so each file is published on its own date AND again on every
+# date a live version of its kind was loaded inside its validity: the later
+# upload on a date wins, and its tombstones withdraw the old schemes the
+# re-upload no longer names.
+SCHEME_RELOAD_PLAN: tuple[tuple[str, str, date, date | None], ...] = (
+    ("DISCOUNT_GRID", "2026-09/Odisha PV & CV Discount Grid-1 Aug 2026.xlsx", date(2026, 9, 1), None),
+    ("CONSUMER_SCHEME", "2026-09/Consumer Scheme Bhubaneswar RO_Sep'26.pdf", date(2026, 9, 3), date(2026, 9, 30)),
+    ("EXCHANGE_SCHEME", "2026-09/Exchange scheme Sept'26 - Bhubaneswar.pdf", date(2026, 9, 3), date(2026, 9, 30)),
+    ("CORPORATE_POLICY", "2026-09/260903 Sept'26 Corporate Privilege Policy Mahindra PV and CV.xlsx",
+     date(2026, 9, 3), date(2026, 9, 30)),
+    ("CONSUMER_SCHEME", "2026-10/Consumer Scheme Bhubaneswar RO_Oct'26.pdf", date(2026, 10, 3), date(2026, 10, 31)),
+    ("EXCHANGE_SCHEME", "2026-10/Exchange scheme Oct'26 - B'newar_Raipur_Patna_Guwa.pdf",
+     date(2026, 10, 3), date(2026, 10, 31)),
+    ("CORPORATE_POLICY", "2026-10/261003 Oct'26 Corporate Privilege Policy Mahindra PV and CV.xlsx",
+     date(2026, 10, 3), date(2026, 10, 31)),
+    ("DISCOUNT_GRID", "2026-10/Odisha PV & CV Discount Grid-1 Oct 2026.xlsx", date(2026, 10, 1), None),
+)
+SCHEME_CHECK_DATES = (date(2026, 9, 15), date(2026, 10, 15))
+# Models with at least one scheme row applied (consumer, exchange, scrappage,
+# welcome, corporate) on each check date, from the dry run on the live-shaped
+# copy; a re-load that applies to fewer models fails.
+EXPECTED_MODELS_WITH_SCHEMES: dict[date, int] = {date(2026, 9, 15): 16, date(2026, 10, 15): 16}
+SCHEME_SPOT_CHECKS = (
+    # Utkal's deal: XUV 3XO AX5 PM MT, the September cash offer.
+    ("XUV 3XO", "AX5 PM MT", date(2026, 9, 15), "CASH_DISCOUNT", Decimal(30000)),
+)
+_KIND_CATEGORIES = {
+    "CONSUMER_SCHEME": ("CONSUMER",),
+    "EXCHANGE_SCHEME": ("EXCHANGE", "SCRAPPAGE", "WELCOME"),
+    "CORPORATE_POLICY": ("CORPORATE",),
+}
+
+
+def _shadow_dates(connection: Connection, tenant_id: str, kind: str, on: date, until: date | None) -> list[date]:
+    """The dates after ``on`` (up to ``until``) a live version of this kind was
+    loaded on, before this re-load: the file is published again on each."""
+    if kind == "DISCOUNT_GRID":
+        rows = connection.execute(text(
+            "SELECT DISTINCT effective_from FROM auditcore.dealer_discount_grid_versions WHERE tenant_id = :t "
+            "AND lifecycle_status IN ('PUBLISHED', 'RETIRED') AND effective_from > :on "
+            "AND (CAST(:until AS date) IS NULL OR effective_from < :until) ORDER BY 1"
+        ), {"t": tenant_id, "on": on, "until": until}).scalars().all()
+    else:
+        rows = connection.execute(text(
+            """
+            SELECT DISTINCT v.effective_from FROM auditcore.discount_scheme_versions v
+            JOIN auditcore.discount_schemes s ON s.tenant_id = v.tenant_id AND s.discount_scheme_id = v.discount_scheme_id
+            WHERE v.tenant_id = :t AND v.lifecycle_status = 'PUBLISHED' AND s.scheme_category = ANY(:cats)
+              AND v.effective_from > :on AND (CAST(:until AS date) IS NULL OR v.effective_from <= :until)
+            ORDER BY 1
+            """
+        ), {"t": tenant_id, "on": on, "until": until, "cats": list(_KIND_CATEGORIES[kind])}).scalars().all()
+    return list(rows)
+
+
+def _standing_rows(connection: Connection, tenant_id: str, on: date) -> list[dict[str, Any]]:
+    """Every eligibility row of the scheme versions standing on the date."""
+    return [dict(r) for r in connection.execute(text(
+        """
+        WITH started AS (
+            SELECT DISTINCT ON (v.discount_scheme_id) v.discount_scheme_version_id, v.effective_to
+            FROM auditcore.discount_scheme_versions v
+            WHERE v.tenant_id = :t AND v.lifecycle_status = 'PUBLISHED' AND v.effective_from <= :on
+            ORDER BY v.discount_scheme_id, v.effective_from DESC, v.created_at_utc DESC
+        )
+        SELECT pm.model_name, e.variant_id, e.criteria
+        FROM started s
+        JOIN auditcore.discount_scheme_eligibility e
+          ON e.tenant_id = :t AND e.discount_scheme_version_id = s.discount_scheme_version_id
+        JOIN auditcore.product_models pm ON pm.model_id = e.model_id
+        WHERE (s.effective_to IS NULL OR s.effective_to >= :on)
+          AND EXISTS (SELECT 1 FROM auditcore.discount_scheme_benefits b
+                      WHERE b.tenant_id = :t AND b.discount_scheme_version_id = s.discount_scheme_version_id)
+        """
+    ), {"t": tenant_id, "on": on}).mappings().all()]
+
+
+def reload_schemes_tenant(connection: Connection, *, tenant_id: str, tag: str, store: bool) -> dict[str, Any]:
+    """The scheme plan and every check, on one open transaction (the caller
+    commits or rolls back), like ``reload_tenant``."""
+    from audit_core.oem_master_parsers import parse_master
+    from audit_core.oem_price_masters import (
+        grid_lines_unbound_to_books,
+        ingest_corporate_policy,
+        ingest_discount_document,
+        ingest_discount_grid,
+    )
+    from audit_core.uc03_deal_reconciliation import _applicable_benefits
+
+    set_platform_super_admin_context(connection)
+    set_tenant_context(connection, tenant_id)
+    project = connection.execute(text(
+        "SELECT p.oem_id, o.oem_code FROM auditcore.projects p JOIN auditcore.oems o ON o.oem_id = p.oem_id "
+        "WHERE p.tenant_id = :t"), {"t": tenant_id}).mappings().one()
+    actor = f"worker:{tag}"[:160]
+    checks: list[dict[str, Any]] = []
+
+    def check(name: str, ok: bool, expected: Any, actual: Any) -> None:
+        checks.append({"check": name, "ok": bool(ok), "expected": expected, "actual": actual})
+
+    grid_dates = [on for kind, _, on, _ in SCHEME_RELOAD_PLAN if kind == "DISCOUNT_GRID"]
+    planned: list[tuple[str, Path, date, date | None]] = []
+    for kind, relative, on, until in SCHEME_RELOAD_PLAN:
+        shadow_until = until if kind != "DISCOUNT_GRID" else next((d for d in grid_dates if d > on), None)
+        for when in [on, *_shadow_dates(connection, tenant_id, kind, on, shadow_until)]:
+            planned.append((kind, DATA_DIR / relative, when, until))
+
+    uploads: list[dict[str, Any]] = []
+    grid_versions: list[tuple[date, Any]] = []
+    for kind, path, on, until in planned:
+        content = path.read_bytes()
+        parsed = parse_master(kind, content, filename=path.name)
+        plan_from = next(d for k, r, d, _ in SCHEME_RELOAD_PLAN if DATA_DIR / r == path)
+        if on == plan_from:
+            check(f"{path.name}: the dates the document prints", parsed.effective_from_hint == on
+                  and (kind == "DISCOUNT_GRID" or parsed.effective_to_hint == until),
+                  f"{on} to {until}", f"{parsed.effective_from_hint} to {parsed.effective_to_hint}")
+        upload_id = connection.execute(text(
+            """
+            INSERT INTO auditcore.oem_master_uploads (
+                tenant_id, oem_code, master_kind, source_filename, source_sha256, effective_from, status,
+                row_counts, preview, uploaded_by_actor_id
+            ) VALUES (:t, :oem, :kind, :name, :sha, :eff, 'STAGED', CAST(:rows AS jsonb), CAST(:preview AS jsonb), :actor)
+            RETURNING upload_id
+            """
+        ), {"t": tenant_id, "oem": project["oem_code"], "kind": kind, "name": path.name,
+            "sha": hashlib.sha256(content).hexdigest(), "eff": on,
+            "rows": json.dumps({"discountRows": len(parsed.discount_rows), "corporateRows": len(parsed.corporate_benefits),
+                                "gridRows": len(parsed.grid_rows)}),
+            "preview": json.dumps({"reloadTag": tag, "warnings": parsed.warnings[:50]}), "actor": actor}).scalar_one()
+        common = {"tenant_id": tenant_id, "oem_id": project["oem_id"], "oem_code": project["oem_code"],
+                  "effective_from": on, "parsed": parsed, "actor_id": actor}
+        if kind == "DISCOUNT_GRID":
+            summary = ingest_discount_grid(connection, upload_id=upload_id, **common)
+            grid_versions.append((on, summary["gridVersionId"]))
+        elif kind == "CORPORATE_POLICY":
+            summary = ingest_corporate_policy(connection, upload_id=upload_id, effective_to=until, **common)
+        else:
+            summary = ingest_discount_document(connection, master_kind=kind, effective_to=until, **common)
+        stored = None
+        if store:
+            key = _master_object_key(tenant_id=tenant_id, oem_code=project["oem_code"], master_kind=kind,
+                                     effective_from=on, upload_id=upload_id, filename=path.name)
+            try:
+                from audit_core.uc03_p2_storage import get_p2_document_storage
+
+                get_p2_document_storage().put_object(key, content, content_type=_master_content_type(path.name))
+                stored = key
+            except Exception as exc:  # noqa: BLE001 - the figures are published; the file is noted as not stored
+                logger.warning("oem_master_reload_file_not_stored", tenant_id=tenant_id, file=path.name,
+                               error=exc.__class__.__name__)
+        connection.execute(text(
+            "UPDATE auditcore.oem_master_uploads SET status = 'PUBLISHED', published_at_utc = now(), "
+            "source_object_key = :key, discount_scheme_summary = CAST(:summary AS jsonb) "
+            "WHERE tenant_id = :t AND upload_id = :u"
+        ), {"key": stored, "summary": json.dumps(summary, default=str), "t": tenant_id, "u": upload_id})
+        uploads.append({"file": path.name, "kind": kind, "effectiveFrom": on, "effectiveTo": until,
+                        "uploadId": upload_id, "stored": stored is not None,
+                        "published": summary.get("published"), "tombstoned": summary.get("tombstoned"),
+                        "unresolved": len(summary.get("unresolved") or []),
+                        "unresolvedVariants": len(summary.get("unresolvedVariants") or []),
+                        "gridResolved": summary.get("resolved")})
+
+    # A grid line must be bound to a model of every book the grid is used with
+    # (the October grid, dated 1 Oct, named the new Scorpio N, which only the
+    # book of 3 Oct prices; review of PR 472).
+    for on, grid_version_id in grid_versions:
+        gaps = grid_lines_unbound_to_books(connection, tenant_id=tenant_id, oem_id=project["oem_id"],
+                                           oem_code=project["oem_code"], grid_version_id=grid_version_id)
+        check(f"discount grid of {on}: every line bound to a model of the books it is used with", not gaps, [], gaps)
+
+    applied: dict[str, dict[str, int]] = {}
+    for on in SCHEME_CHECK_DATES:
+        rows = _standing_rows(connection, tenant_id, on)
+        per_model: dict[str, int] = {}
+        model_wide_unresolved = 0
+        for row in rows:
+            criteria = row["criteria"] or {}
+            if row["variant_id"] is None and criteria.get("scope") != "UNRESOLVED" and criteria.get(
+                    "unresolvedVariantTexts"):
+                model_wide_unresolved += 1
+            if criteria.get("scope") == "UNRESOLVED":
+                continue
+            per_model[row["model_name"]] = per_model.get(row["model_name"], 0) + 1
+        applied[str(on)] = dict(sorted(per_model.items()))
+        check(f"model-wide rows of unresolved variants applied on {on}", model_wide_unresolved == 0, 0,
+              model_wide_unresolved)
+        check(f"models with a scheme applied on {on}", len(per_model) >= EXPECTED_MODELS_WITH_SCHEMES[on],
+              f">= {EXPECTED_MODELS_WITH_SCHEMES[on]}", len(per_model))
+    for model, variant, on, key, amount in SCHEME_SPOT_CHECKS:
+        found = find_book_sku(connection, tenant_id=tenant_id, model_text=model, variant_text=variant, effective_on=on)
+        actual: Any = found["reason"]
+        if found["sku"]:
+            sku = connection.execute(text("SELECT model_id, variant_id FROM auditcore.product_skus "
+                                          "WHERE product_sku_id = :s"), {"s": found["sku"]["product_sku_id"]}).one()
+            benefits = _applicable_benefits(connection, tenant_id=tenant_id, model_id=sku[0], variant_id=sku[1],
+                                            effective_on=on, basis="INDIVIDUAL", variant_name=variant)
+            actual = next((Decimal(str(b["amount_value"])) for b in benefits if b["canonical_key"] == key), None)
+        check(f"{model} {variant} {key} on {on}", actual == amount, str(amount), str(actual))
+    for row in checks:
+        logger.info("oem_master_reload_check", tenant_id=tenant_id, tag=tag, **{k: str(v) for k, v in row.items()})
+    return {"checks": checks, "passed": all(c["ok"] for c in checks), "uploads": uploads, "appliedPerModel": applied}
+
+
 def run_master_reload(engine: Engine, tag: str, *, tenant_ids: list[str] | None = None) -> list[dict[str, Any]]:
-    """The one-off, for every Mahindra tenant (or ``tenant_ids``). Never raises."""
+    """The one-off, for every Mahindra tenant (or ``tenant_ids``). Never raises.
+    A tag containing "-schemes" re-loads the scheme masters
+    (``SCHEME_RELOAD_PLAN``), any other tag the price books."""
     commit = tag.endswith("-commit")
+    job = reload_schemes_tenant if "-schemes" in tag else reload_tenant
     mode = "COMMIT" if commit else "DRY_RUN"
     results: list[dict[str, Any]] = []
     for tenant_id in tenant_ids if tenant_ids is not None else mahindra_tenants(engine):
@@ -250,7 +466,7 @@ def run_master_reload(engine: Engine, tag: str, *, tenant_ids: list[str] | None 
             connection = engine.connect()
             transaction = connection.begin()
             try:
-                outcome = reload_tenant(connection, tenant_id=tenant_id, tag=tag, store=commit)
+                outcome = job(connection, tenant_id=tenant_id, tag=tag, store=commit)
                 if commit and outcome["passed"]:
                     transaction.commit()
                     status = "COMMITTED"
@@ -275,4 +491,4 @@ def run_master_reload(engine: Engine, tag: str, *, tenant_ids: list[str] | None 
     return results
 
 
-__all__ = ["RELOAD_PLAN", "reload_tenant", "run_master_reload"]
+__all__ = ["RELOAD_PLAN", "SCHEME_RELOAD_PLAN", "reload_schemes_tenant", "reload_tenant", "run_master_reload"]

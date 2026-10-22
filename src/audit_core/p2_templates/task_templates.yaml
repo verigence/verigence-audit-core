@@ -235,6 +235,61 @@ task_types:
     actions:
     - COMPLETE_ACTION
     - ADD_COMMENT
+  # A discount-scheme master row whose named variants the price list does
+  # not carry (2026-10-20 product owner rules; review of PR 472, B1): the
+  # deal's benefit has no standard until the wording is mapped, and is never
+  # called an over-grant meanwhile. One task per master row, not per deal;
+  # closes itself once a newer upload replaces the row.
+  SCHEME_MASTER_UNMATCHED:
+    category: OBSERVATION
+    owner: TL
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - COMPLETE_ACTION
+    - ADD_COMMENT
+  # A corporate privilege claimed where the corporate on file is not named
+  # exactly on the OEM's list in force: the PC confirms the category from
+  # the shortlist (only the PC decides). Closes itself once the corporate
+  # code or exact name is on file, or the claim is gone.
+  CORPORATE_CATEGORY_CONFIRM:
+    category: CORRECTION_APPROVAL
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - COMPLETE_ACTION
+    - ADD_COMMENT
+  # A discount that depends on the old vehicle ("against old Maruti", "Tata
+  # Ace Family") with no RC / valuation report read yet: the PC uploads or
+  # confirms it. Closes itself once the document is read (review of PR 472).
+  OLD_VEHICLE_EVIDENCE_CONFIRM:
+    category: CORRECTION_APPROVAL
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - COMPLETE_ACTION
+    - ADD_COMMENT
+  # No discount scheme of the bulletins is in force on the deal's pricing
+  # date (the month's bulletin is not loaded yet): the given discounts have
+  # no standard, said so here rather than applying another month's scheme.
+  # The Team Lead accepts it as an exception (comment required); the shared
+  # ACCEPT_EXCEPTION path closes it and the resolver does not reopen it while
+  # the condition is the same. COMPLETE_ACTION is not offered: a RESOLVER
+  # task has no worker verification adapter, so it would stay VERIFYING.
+  DISCOUNT_SCHEME_NOT_IN_FORCE:
+    category: OBSERVATION
+    owner: TL
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - ACCEPT_EXCEPTION
+    - ADD_COMMENT
   # Information: the invoice named a different vehicle and the Journey now
   # carries it (the invoice is the source of truth).
   MODEL_CHANGED_BY_INVOICE:

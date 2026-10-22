@@ -16,6 +16,7 @@ from audit_core.uc03_deal_source_history import (
     upsert_commercial_actual,
 )
 from audit_core.uc03_document_registry import is_receipt_document_type
+from audit_core.uc03_masters_alignment import DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY
 from audit_core.uc03_payment_mode import classify_payment_mode
 
 logger = logging.getLogger(__name__)
@@ -109,18 +110,27 @@ _COMMERCIAL_LINE_FIELDS = {
 # reviewed-value store); these tables are the per-discount / per-addon view the
 # audit rules reconcile against masters. Standard/master amounts are resolved
 # later (rule engine or human PUT /commercials), never guessed here.
+#
+# 2026-10-20 product owner rules: each discount field lands on the canonical
+# key the deal reconciliation writes (one row per key, never a legacy twin
+# such as EXCHANGE beside EXCHANGE_BONUS), the form's declared total
+# (discount_amount) is never a discount row of its own -- it already holds
+# the components -- and Management Referral keeps its own key.
+_BOOKING_DISCOUNT_FIELDS = (
+    "sales_discount_amount",
+    "buffer_discount_amount",
+    "exchange_discount_amount",
+    "corporate_discount_amount",
+    "loyalty_discount_amount",
+    "inhouse_insurance_discount_amount",
+    "mr_discount_amount",
+    "oem_referral_discount_amount",
+    "other_discount_amount",
+    "free_accessory_discount_amount",
+    "scrappage_discount_amount",
+)
 _DISCOUNT_KEY_BY_FIELD: dict[str, str] = {
-    "discount_amount": "TOTAL",
-    "sales_discount_amount": "SALES",
-    "buffer_discount_amount": "BUFFER",
-    "exchange_discount_amount": "EXCHANGE",
-    "corporate_discount_amount": "CORPORATE",
-    "loyalty_discount_amount": "LOYALTY",
-    "inhouse_insurance_discount_amount": "INHOUSE_INSURANCE",
-    "mr_discount_amount": "MR",
-    "oem_referral_discount_amount": "OEM_REFERRAL",
-    "other_discount_amount": "OTHER",
-    "free_accessory_discount_amount": "FREE_ACCESSORY",
+    field: DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY[field] for field in _BOOKING_DISCOUNT_FIELDS
 }
 _ADDON_TYPE_BY_FIELD: dict[str, str] = {
     "extended_warranty_amount": "EXTENDED_WARRANTY",
@@ -479,23 +489,25 @@ def _upsert_evidence_discount_application(
         amount=amount,
         evidence_id=evidence_id,
     )
-    existing_id = connection.execute(
+    # One row per canonical key (2026-10-20): the booking form's value goes
+    # onto the row the reconciliation and the invoice share, never a second
+    # row beside it. An invoice's value is never replaced by the form's.
+    existing = connection.execute(
         text(
             """
-            SELECT discount_application_id
+            SELECT discount_application_id, details->>'origin' AS origin
             FROM auditcore.discount_applications
             WHERE tenant_id = :tenant_id
               AND journey_id = :journey_id
               AND discount_key = :discount_key
-              AND actual_source_kind = 'EVIDENCE'
-            ORDER BY created_at_utc DESC
+            ORDER BY updated_at_utc DESC, created_at_utc DESC
             LIMIT 1
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id, "discount_key": discount_key},
-    ).scalar_one_or_none()
+    ).mappings().first()
     details = json.dumps({"origin": _MATERIALIZATION_ORIGIN})
-    if existing_id is None:
+    if existing is None:
         connection.execute(
             text(
                 """
@@ -519,6 +531,8 @@ def _upsert_evidence_discount_application(
             },
         )
         return
+    if existing["origin"] == "INVOICE_MATERIALIZATION":
+        return
     connection.execute(
         text(
             """
@@ -526,7 +540,7 @@ def _upsert_evidence_discount_application(
             SET actual_discount_amount = :amount,
                 actual_source_kind = 'EVIDENCE',
                 source_evidence_id = :evidence_id,
-                details = CAST(:details AS jsonb),
+                details = details || CAST(:details AS jsonb),
                 updated_at_utc = now()
             WHERE tenant_id = :tenant_id
               AND discount_application_id = :application_id
@@ -534,7 +548,7 @@ def _upsert_evidence_discount_application(
         ),
         {
             "tenant_id": tenant_id,
-            "application_id": existing_id,
+            "application_id": existing["discount_application_id"],
             "amount": amount,
             "evidence_id": evidence_id,
             "details": details,
@@ -627,10 +641,15 @@ def _materialize_reconciliation_projections(
 
     discounts_written = 0
     addons_written = 0
+    # Two fields can name one key (OEM referral and other discount are both
+    # "Other scheme"): their amounts are added, and the key written once.
+    by_key: dict[str, Any] = {}
     for field_key, discount_key in _DISCOUNT_KEY_BY_FIELD.items():
         amount = values.get(field_key)
         if amount is None:
             continue
+        by_key[discount_key] = amount if discount_key not in by_key else by_key[discount_key] + amount
+    for discount_key, amount in by_key.items():
         _upsert_evidence_discount_application(
             connection,
             tenant_id=tenant_id,

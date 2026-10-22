@@ -258,15 +258,18 @@ def _scheme_rows(connection: Connection, *, tenant_id: str, model_id: UUID, vari
     rows = connection.execute(
         text(
             """
-            WITH standing AS (
+            WITH started AS (
+                -- The newest version started on the date answers; when its
+                -- bulletin has ended, nothing does (review of PR 472, S1).
                 SELECT DISTINCT ON (dsv.discount_scheme_id)
-                       dsv.discount_scheme_id, dsv.discount_scheme_version_id
+                       dsv.discount_scheme_id, dsv.discount_scheme_version_id, dsv.effective_to
                 FROM auditcore.discount_scheme_versions dsv
                 WHERE dsv.tenant_id = :t
                   AND dsv.lifecycle_status = 'PUBLISHED'
                   AND dsv.effective_from <= :on
-                  AND (dsv.effective_to IS NULL OR dsv.effective_to >= :on)
                 ORDER BY dsv.discount_scheme_id, dsv.effective_from DESC, dsv.version_no DESC
+            ), standing AS (
+                SELECT * FROM started WHERE effective_to IS NULL OR effective_to >= :on
             )
             SELECT b.benefit_key, b.benefit_type, b.amount_value, b.percentage_value,
                    ds.scheme_code, ds.scheme_name, ds.scheme_category,
@@ -288,7 +291,15 @@ def _scheme_rows(connection: Connection, *, tenant_id: str, model_id: UUID, vari
         ),
         {"t": tenant_id, "model_id": model_id, "variant_id": variant_id, "on": on},
     ).mappings().all()
-    return [dict(r) for r in rows]
+    # 2026-10-20 (review of PR 472, S9): the same skip as the deal's
+    # reconciliation -- a model-level row stored for named variants the price
+    # list did not carry is not an offer on this variant.
+    return [
+        dict(r) for r in rows
+        if not (r["variant_id"] is None and (
+            (r["criteria"] or {}).get("scope") == "UNRESOLVED" or (r["criteria"] or {}).get("unresolvedVariantTexts")
+        ))
+    ]
 
 
 def _benefit(row: dict[str, Any]) -> dict[str, Any]:
@@ -368,7 +379,7 @@ def _exchange_block(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def _corporate_block(
-    connection: Connection, rows: list[dict[str, Any]], *, oem_code: str | None,
+    connection: Connection, rows: list[dict[str, Any]], *, tenant_id: str, on: date, oem_code: str | None,
     corporate_code: str | None, corporate_name: str | None,
 ) -> dict[str, Any] | None:
     by_category: dict[str, dict[str, Any]] = {}
@@ -381,21 +392,15 @@ def _corporate_block(
         return None
     registry = None
     if (corporate_code or corporate_name) and oem_code:
-        registry = connection.execute(
-            text(
-                """
-                SELECT corporate_code, corporate_name, corporate_type, privilege_category
-                FROM auditcore.corporate_privilege_registry
-                WHERE oem_code = :oem AND (
-                      (:code <> '' AND upper(corporate_code) = upper(:code))
-                   OR (:name <> '' AND lower(corporate_name) = lower(:name))
-                   OR (:name <> '' AND lower(corporate_name) LIKE '%' || lower(:name) || '%'))
-                ORDER BY (upper(corporate_code) = upper(:code)) DESC, (lower(corporate_name) = lower(:name)) DESC
-                LIMIT 1
-                """
-            ),
-            {"oem": oem_code, "code": corporate_code or "", "name": corporate_name or ""},
-        ).mappings().first()
+        # The deal's own lookup (the tenant's list in force on the date; a
+        # code, else an exact name; never a partial-name match).
+        from audit_core.uc03_deal_reconciliation import listed_corporate
+
+        registry = listed_corporate(
+            connection, tenant_id=tenant_id, oem_code=oem_code, effective_on=on,
+            codes=[corporate_code.strip()] if corporate_code and corporate_code.strip() else [],
+            names=[corporate_name.strip()] if corporate_name and corporate_name.strip() else [],
+        )
     amounts = [Decimal(b["amount"]) for b in by_category.values() if b["amount"]]
     block: dict[str, Any] = {
         "byCategory": {c: by_category[c] for c in sorted(by_category)},
@@ -407,10 +412,10 @@ def _corporate_block(
         if registry is None:
             block["corporate"] = {"lookedUp": corporate_code or corporate_name, "found": False}
         else:
-            category = registry["privilege_category"]
+            category = registry["category"]
             block["corporate"] = {
-                "lookedUp": corporate_code or corporate_name, "found": True, "code": registry["corporate_code"],
-                "name": registry["corporate_name"], "type": registry["corporate_type"], "privilegeCategory": category,
+                "lookedUp": corporate_code or corporate_name, "found": True, "code": registry["code"],
+                "name": registry["name"], "type": registry["type"], "privilegeCategory": category,
             }
             block["exact"] = by_category.get(category)
     return block
@@ -511,7 +516,8 @@ def standard_for_sku(
     price = _price_block(row, version, basis)
     consumer = _consumer_block(scheme_rows)
     exchange_block = _exchange_block(scheme_rows)
-    corporate = _corporate_block(connection, scheme_rows, oem_code=_oem_code(connection, tenant_id),
+    corporate = _corporate_block(connection, scheme_rows, tenant_id=tenant_id, on=on,
+                                 oem_code=_oem_code(connection, tenant_id),
                                  corporate_code=corporate_code, corporate_name=corporate_name)
     grid = _grid_block(connection, tenant_id=tenant_id, model_id=row["model_id"], on=on)
     return {

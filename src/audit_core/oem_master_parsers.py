@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from io import BytesIO
 from typing import Any
@@ -133,12 +133,20 @@ class GridRow:
     insurance_od_percent: Decimal | None
     out_of_territory_amount: Decimal | None
     raw: dict[str, Any] = field(default_factory=dict)
+    # The October 2026 grid gives the buffer by tier (2026-10-20): BASE
+    # (without in-house insurance or EW), WITH_INSURANCE, WITH_EW_INSURANCE.
+    # A single-buffer grid has no tiers; agreed_buffer_amount is then the
+    # buffer for every deal, and otherwise it is the BASE tier.
+    tiers: dict[str, Decimal] = field(default_factory=dict)
 
 
 @dataclass
 class ParseResult:
     kind: str
     effective_from_hint: date | None = None
+    # The last day the document says it is valid for (2026-10-20: "valid
+    # from 3rd Sept'26 to 30th Sept'26"; a monthly bulletin: its month).
+    effective_to_hint: date | None = None
     price_rows: list[PriceRow] = field(default_factory=list)
     discount_rows: list[DiscountRow] = field(default_factory=list)
     corporate_benefits: list[CorporateBenefitRow] = field(default_factory=list)
@@ -806,15 +814,413 @@ def _pdf_pages(content: bytes) -> tuple[list[list[list[list[Any]]]], str]:
 
 
 def parse_consumer_scheme(content: bytes) -> ParseResult:
-    result = ParseResult(kind="CONSUMER_SCHEME")
     page_tables, full_text = _pdf_pages(content)
-    result.effective_from_hint = _date_hint(full_text)
+    return _parse_consumer_tables(page_tables, full_text)
 
-    carry_product: str | None = None
+
+# ── scheme wording: EV models, variant cells, model-cell qualifiers ────────────
+# 2026-10-20 product owner rules (R4): EV and ICE are kept apart. The bulletin's
+# BNDP factor is the GST gross-up of the M&M contribution: 1.05 is 5% GST, which
+# only an electric vehicle carries (ICE rows read 1.18 or 1.40).
+_EV_BNDP_FACTOR = Decimal("1.05")
+_EV_MODEL_RE = re.compile(
+    r"\bBE\s*6\b|\bBE6|\bXEV\s*9\s*[ES]\b|\bXUV\s*400\b|\b3XO\s*EV\b|\bEV\b|\bELECTRIC\b",
+    re.IGNORECASE,
+)
+
+
+def is_ev_model_text(text: str | None) -> bool:
+    """True when a model name is an electric vehicle by its words (R4)."""
+    return bool(_EV_MODEL_RE.search(text or ""))
+
+
+# A bulletin variant cell wraps long names over several lines. A line is a
+# continuation of the one above when that one ends mid-phrase ("... Kwh -",
+# "... 6 &") or when it starts with a word no variant name starts with (an
+# emission norm, a body or edition word, a charger/battery unit).
+_CONTINUATION_WORDS = frozenset({
+    "N", "ADAS", "CHARGER", "KWH", "KW", "BLACK", "EDITION", "CBC", "STEERING", "TIPPER", "HOPPER",
+    "TPR", "HPR", "MS", "PS", "REFRESH", "REEFER", "AC", "NEW", "INTERIORS", "MOCHA",
+})
+_TRANSMISSIONS = frozenset({"AT", "MT", "AS", "AMT", "DCT", "IVT", "CVT"})
+
+
+def _is_continuation(previous: str, line: str) -> bool:
+    if previous.rstrip().endswith(("-", "&", ",", "/", "(")):
+        return True
+    if line.lstrip().startswith(("-", "&", ")", "/", ",")):
+        return True
+    first = line.split()[0].upper().strip(",")
+    return first in _CONTINUATION_WORDS or bool(re.match(r"^BS\d", first))
+
+
+def _expand_slash(variant: str) -> list[str] | None:
+    """One "A/B" written inside a name ("LXT D AT/MT 4WD", "AX7 DS AS DT/MT DT",
+    "V4/V6", "BS6.2 - TPR/HPR") as the two names it stands for, or None.
+
+    When the right side starts with a gearbox the slash offers a second
+    gearbox: the right side's words replace the left side's gearbox word and
+    as many words after it as the right side repeats ("AS DT/MT DT" is
+    "AS DT" or "MT DT"). Otherwise one word is swapped for another."""
+    match = re.search(r"(\S+)/(\S+)", variant)
+    if match is None:
+        return None
+    left = variant[: match.end(1)].split()
+    right = variant[match.start(2):].split()
+    if right and right[0].upper() in _TRANSMISSIONS:
+        positions = [i for i, token in enumerate(left) if token.upper() in _TRANSMISSIONS]
+        if positions:
+            at = positions[-1]
+            parallel = len(left) - at
+            first = " ".join(left + right[parallel:])
+            second = " ".join(left[:at] + right)
+            return [first, second]
+    # a seater pair "6/7STR" -> "6 STR", "7 STR"
+    seat = re.fullmatch(r"(\d+)", match.group(1)), re.fullmatch(r"(\d+)\s*(STR)", match.group(2), re.IGNORECASE)
+    if seat[0] and seat[1]:
+        head, tail = variant[: match.start(1)], variant[match.end(2):]
+        return [f"{head}{seat[0].group(1)} STR{tail}", f"{head}{seat[1].group(1)} STR{tail}"]
+    head, tail = variant[: match.start(1)], variant[match.end(2):]
+    return [f"{head}{match.group(1)}{tail}", f"{head}{match.group(2)}{tail}"]
+
+
+def _expand_repeat(variant: str) -> list[str] | None:
+    """"LX & LX CBC", "Vxi & Vxi AC": the word, and the word with its
+    addition, are two variants (2026-10-20, review of PR 472)."""
+    match = re.search(r"\b(\S+)\s*&\s*\1\s+(\S+)", variant, re.IGNORECASE)
+    if match is None:
+        return None
+    head, tail = variant[: match.start()], variant[match.end():]
+    return [f"{head}{match.group(1)}{tail}", f"{head}{match.group(1)} {match.group(2)}{tail}"]
+
+
+def _expand_ampersand(variant: str) -> list[str] | None:
+    """"AT & MT" (two gearboxes) and "6 & 7STR" (two seaters) as two names.
+    Any other "&" ("& Mocha Interiors", "LX & CBC") is part of the name."""
+    gear = re.search(r"\b(AT|MT|AS|AMT|DCT|IVT|CVT)\s*&\s*(AT|MT|AS|AMT|DCT|IVT|CVT)\b", variant, re.IGNORECASE)
+    if gear is not None:
+        head, tail = variant[: gear.start()], variant[gear.end():]
+        return [f"{head}{gear.group(1)}{tail}", f"{head}{gear.group(2)}{tail}"]
+    seat = re.search(r"\b(\d)\s*&\s*(\d)\s*STR\b", variant, re.IGNORECASE)
+    if seat is not None:
+        head, tail = variant[: seat.start()], variant[seat.end():]
+        return [f"{head}{seat.group(1)} STR{tail}", f"{head}{seat.group(2)} STR{tail}"]
+    return None
+
+
+def split_variant_cell(cell: Any) -> list[str]:
+    """A bulletin's variant cell as the list of variant names it names.
+
+    2026-10-20 product owner rules: wrapped lines are joined back together,
+    "A / B" lists and "AT & MT", "AT/MT", "MT/AT", "AS/MT" gearbox pairs are
+    expanded into one name each, so a name can be matched word for word with
+    the price list. A name still not found there is reported for an admin to
+    map; it is never applied to the whole model."""
+    # A note in brackets ("(Discontinued Model)") is not part of a name; a
+    # bracket that is ("M(O)", "EDGE(O)") has no space in it.
+    text = re.sub(r"\((?=[^()]*\s)[^()]*\)", " ", str(cell or ""))
+    lines = [re.sub(r"[ \t]+", " ", part).strip() for part in text.split("\n")]
+    lines = [line for line in lines if line]
+    joined: list[str] = []
+    for line in lines:
+        if joined and _is_continuation(joined[-1], line):
+            joined[-1] = re.sub(r"\s+", " ", f"{joined[-1]} {line}").strip()
+        else:
+            joined.append(line)
+
+    names: list[str] = []
+    for line in joined:
+        parts = [p.strip() for p in re.split(r"\s+/\s*|\s*/\s+", line) if p.strip()]
+        if len(parts) > 1 and all(len(p.split()) == 1 for p in parts[1:]) and len(parts[0].split()) > 1:
+            # "... - Tipper / Hopper": the last word has alternatives
+            stem = parts[0].rsplit(" ", 1)[0]
+            parts = [parts[0], *(f"{stem} {p}" for p in parts[1:])]
+        names.extend(parts)
+
+    expanded: list[str] = []
+    pending = list(names)
+    guard = 0
+    while pending and guard < 200:
+        guard += 1
+        name = re.sub(r"\s+", " ", pending.pop(0)).strip(" -")
+        if not name:
+            continue
+        alternatives = _expand_repeat(name) or _expand_ampersand(name) or _expand_slash(name)
+        if alternatives:
+            pending[:0] = alternatives
+            continue
+        if name not in expanded:
+            expanded.append(name)
+    return expanded
+
+
+def _split_outside_parentheses(text: str, separators: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    current = ""
+    for char in text:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        if depth == 0 and char in separators:
+            parts.append(current)
+            current = ""
+            continue
+        current += char
+    parts.append(current)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _balanced_groups(text: str) -> tuple[str, list[str]]:
+    """Text with every balanced (...) group removed, and the groups' contents.
+    "XUV 3XO (Excluding EDGE & REVX M(O) PM AT )" -> ("XUV 3XO", ["Excluding
+    EDGE & REVX M(O) PM AT"]): the inner "(O)" stays part of the variant."""
+    out = ""
+    groups: list[str] = []
+    depth = 0
+    current = ""
+    for char in text:
+        if char == "(":
+            if depth > 0:
+                current += char
+            depth += 1
+            continue
+        if char == ")" and depth > 0:
+            depth -= 1
+            if depth == 0:
+                groups.append(current.strip())
+                current = ""
+            else:
+                current += char
+            continue
+        if depth > 0:
+            current += char
+        else:
+            out += char
+    if depth > 0 and current.strip():  # unbalanced: keep the tail as a group
+        groups.append(current.strip())
+    return re.sub(r"\s+", " ", out).strip(), groups
+
+
+def _variant_list(text: str) -> list[str]:
+    return [p.strip() for p in re.split(r"\s*&\s*|\s*,\s*", text) if p.strip()]
+
+
+def old_vehicle_requirement(text: str | None) -> dict[str, str] | None:
+    """An exchange / welcome row's old-vehicle condition, or None when any old
+    vehicle qualifies ("Any Personal + Commercial Vehicle", "Not Applicable").
+    "Tata Ace Family" -> {"brand": "TATA", "model": "ACE"}; "Old Maruti
+    Vehicle" -> {"brand": "MARUTI"}."""
+    words = re.sub(r"[^A-Za-z0-9 ]+", " ", text or "").upper().split()
+    words = [w for w in words if w not in {"OLD", "VEHICLE", "VEHICLES", "FAMILY", "THE", "A", "AN"}]
+    if not words or words[0] in {"ANY", "NOT", "NA", "ALL"}:
+        return None
+    requirement = {"brand": words[0]}
+    if len(words) > 1:
+        requirement["model"] = " ".join(words[1:])
+    return requirement
+
+
+def parse_model_qualifiers(part: str) -> tuple[str, dict[str, Any]]:
+    """One model named in a scheme's model cell, and what its wording adds.
+
+    2026-10-20 product owner rules: the qualifiers are eligibility, not noise.
+      "(Not on 3XO EV)", "(Not on Star Edition)", "(Excluding EDGE & REVX
+      M(O) PM AT)"          -> excludedVariantTexts
+      "against Old Maruti Vehicle"   -> requiredOldVehicle {"brand": "MARUTI"}
+      "for All Variants", "(All Variants)" -> allVariants
+      "(Including REVX)", "including Refresh", "(Incl Thar OG Variants)" -> includes
+    The parentheses are stripped balanced, so "M(O)" inside one survives."""
+    text = re.sub(r"\*+", " ", part or "")
+    base, groups = _balanced_groups(text)
+    qualifiers: dict[str, Any] = {}
+
+    def note_group(content: str) -> None:
+        low = content.lower().strip()
+        excl = re.match(r"^(?:not\s+on|excluding|except|excl\.?)\s+(.+)$", low)
+        if excl:
+            original = content.strip()[len(content.strip()) - len(excl.group(1)):]
+            qualifiers.setdefault("excludedVariantTexts", []).extend(_variant_list(original))
+            return
+        if re.match(r"^(?:for\s+)?all\s+variants?$", low):
+            qualifiers["allVariants"] = True
+            return
+        inc = re.match(r"^(?:including|incl\.?)\s+(.+)$", low)
+        if inc:
+            qualifiers.setdefault("includes", []).append(content.strip()[len(content.strip()) - len(inc.group(1)):])
+            return
+        qualifiers.setdefault("notes", []).append(content.strip())
+
+    for group in groups:
+        note_group(group)
+
+    against = re.search(r"\bagainst\s+(.+)$", base, re.IGNORECASE)
+    if against:
+        requirement = old_vehicle_requirement(against.group(1))
+        if requirement:
+            qualifiers["requiredOldVehicle"] = requirement
+        base = base[: against.start()].strip()
+    all_variants = re.search(r"\bfor\s+all\s+variants?\b", base, re.IGNORECASE)
+    if all_variants:
+        qualifiers["allVariants"] = True
+        base = (base[: all_variants.start()] + base[all_variants.end():]).strip()
+    including = re.search(r"\b(?:including|incl\.?)\s+(.+)$", base, re.IGNORECASE)
+    if including:
+        qualifiers.setdefault("includes", []).append(including.group(1).strip())
+        base = base[: including.start()].strip()
+    return re.sub(r"\s+", " ", base).strip(" -"), qualifiers
+
+
+def variant_key(name: str | None) -> str:
+    """A variant name in the form two spellings of the same name share:
+    upper case, punctuation as spaces, "7STR" as "7 STR", and without the
+    price list's "(Private)" / "(Commercial)" registration suffix (the scheme
+    names the variant, not its registration basis)."""
+    text = re.sub(r"\((?:PRIVATE|COMMERCIAL)\)", " ", (name or "").upper())
+    text = re.sub(r"(\d)\s*STR\b", r"\1 STR", text)
+    return re.sub(r"[^A-Z0-9]+", " ", text).strip()
+
+
+def variant_loose_key(name: str | None) -> str:
+    """A variant name with only its distinguishing words (2026-10-20, the
+    review of PR 472): the emission norm ("BS6.2"), the trailing release
+    markers ("- New", "- Refresh", "- N") and the "- E" suffix the price
+    list adds, and a trailing "& Mocha Interiors" (an interior option the
+    price list does not sell as its own variant) are taken off; "(O)" is
+    spelt OPT. Used only when the name does not match word for word, and
+    every price-list variant sharing the result gets the row: they differ by
+    nothing that names a different vehicle."""
+    text = re.sub(r"\((?:PRIVATE|COMMERCIAL)\)", " ", (name or "").upper())
+    text = re.sub(r"\(O\)", " OPT ", text)
+    text = re.sub(r"\s*&\s*MOCHA\s+INTERIORS?\s*$", " ", text)
+    text = re.sub(r"\bBS\s*-?\s*\d+(?:\.\d+)?\b", " ", text)
+    text = re.sub(r"-\s*E\b", " ", text)
+    while True:
+        stripped = re.sub(r"[\s-]*-\s*(?:NEW|REFRESH|N)\s*$", "", text.strip())
+        if stripped == text.strip():
+            break
+        text = stripped
+    text = re.sub(r"(\d)\s*STR\b", r"\1 STR", text)
+    return re.sub(r"[^A-Z0-9]+", " ", text).strip()
+
+
+def variant_excluded(variant_name: str | None, excluded_texts: list[str] | None) -> bool:
+    """True when a scheme's exclusion ("EDGE", "REVX M(O) PM AT", "Star
+    Edition") names this variant: every word of the exclusion is a word of
+    the variant's name."""
+    words = set(variant_key(variant_name).split())
+    for excluded in excluded_texts or []:
+        wanted = set(variant_key(excluded).split())
+        if wanted and wanted <= words:
+            return True
+    return False
+
+
+def split_model_cell(cell: str | None) -> list[str]:
+    """A scheme's model cell ("Pick up/Camper/MAXX City", "XUV700 | Scorpio-N")
+    as the models it names; a separator inside parentheses does not split."""
+    return _split_outside_parentheses(cell or "", "|/")
+
+
+# The September BEV "bulletin" is an e-mail that carries the August schemes
+# forward for some EVs and declares none for others. It has no scheme table:
+# the August figures it refers to are not in it. 2026-10-20: it is refused
+# with what it says, never turned into schemes by guesswork.
+_CARRY_FORWARD_RE = re.compile(r"continu\w*\s+the\s+same\s+consumer\s+schemes?\s+of\s+([A-Za-z]+[’'`]?\s*\d{0,4})",
+                               re.IGNORECASE)
+
+
+def _carry_forward_declaration(full_text: str) -> str | None:
+    match = _CARRY_FORWARD_RE.search(full_text or "")
+    if match is None:
+        return None
+    lines = [line.strip() for line in full_text.splitlines()]
+
+    def block(start_re: str) -> list[str]:
+        out: list[str] = []
+        for i, line in enumerate(lines):
+            if re.search(start_re, line, re.IGNORECASE):
+                for following in lines[i + 1:]:
+                    if not following or re.match(r"^(pls|please|regards|there are|note)\b", following, re.IGNORECASE):
+                        break
+                    out.append(following)
+                break
+        return out
+
+    continued = block(r"no\s+changes\s+in\s+schemes?\s+of")
+    none = block(r"no\s+consumer\s+schemes?\s+in")
+    return (
+        "This file is an e-mail, not a consumer scheme bulletin: it has no scheme table to load. "
+        f"It says the consumer schemes of {match.group(1).strip()} continue unchanged for: "
+        f"{', '.join(continued) or 'the models it names'}; and that there are no consumer schemes for: "
+        f"{', '.join(none) or 'none named'}. Nothing was loaded. To apply it, upload that month's BEV "
+        "scheme bulletin with this month's effective date; models with no scheme need no upload."
+    )
+
+
+_DATE_WORDS = r"\d{1,2}\s*(?:st|nd|rd|th)?[\s.\-/]*[A-Za-z]{3,9}\.?[\s.\-/'’`;]*\d{2,4}"
+_VALID_TO_RE = re.compile(
+    rf"(?:valid\s*from|from|w\.?e\.?f\.?)\s*{_DATE_WORDS}\s*(?:to|till|until|upto|up\s*to|-|–)\s*({_DATE_WORDS})",
+    re.IGNORECASE,
+)
+_MONTHLY_RE = re.compile(r"monthly\s+[\w\s]*?bulletin\s+([A-Za-z]{3,9})\s*['’`]?\s*(\d{2,4})", re.IGNORECASE)
+
+
+def validity_end_hint(blob: str | None) -> date | None:
+    """The last day a scheme document says it is valid (2026-10-20 product
+    owner rules, R5: a scheme answers only for the dates it stands on).
+    "Schemes are valid from 3rd Sept'26 to 30th Sept'26", "From 3rd Sept' 26
+    - 30th Sept' 26"; a "Monthly Consumer Scheme Bulletin Sep'26" with no end
+    printed stands to the end of its month."""
+    match = _VALID_TO_RE.search(blob or "")
+    if match:
+        end = _date_hint(f"w.e.f. {match.group(1)}")
+        if end is not None:
+            return end
+    monthly = _MONTHLY_RE.search(blob or "")
+    if monthly:
+        month = _MONTHS.get(monthly.group(1)[:3].lower())
+        year = int(monthly.group(2))
+        year = year + 2000 if year < 100 else year
+        if month:
+            following = date(year + (month == 12), month % 12 + 1, 1)
+            return following - timedelta(days=1)
+    return None
+
+
+def _parse_consumer_tables(page_tables: list[list[list[list[Any]]]], full_text: str) -> ParseResult:
+    result = ParseResult(kind="CONSUMER_SCHEME")
+    result.effective_from_hint = _date_hint(full_text)
+    result.effective_to_hint = validity_end_hint(full_text)
+
     row_no = 0
     found_header = False
-    for tables in page_tables:
+    previous_page_product: str | None = None
+    previous_page_row: DiscountRow | None = None
+    previous_page_signature: tuple[Any, ...] | None = None
+    last_row_on_page: DiscountRow | None = None
+    last_signature_on_page: tuple[Any, ...] | None = None
+    for page_index, tables in enumerate(page_tables, start=1):
+        # 2026-10-20 product owner rules: a product cell is never carried over
+        # a page break. The September bulletin's XUV400 block starts page 2
+        # with its product cell empty; carried, it read as XUV 3XO and a
+        # Rs 2,50,000 EV offer reached petrol and diesel XUV 3XOs.
+        carry_product: str | None = None
+        last_on_page: str | None = None
         for table in tables:
+            data_rows = [
+                raw for raw in table
+                if raw and len(raw) >= 10 and _money(raw[6]) is not None and "₹" in str(raw[6] or "")
+            ]
+            next_product: dict[int, str | None] = {}
+            following: str | None = None
+            for index in range(len(data_rows) - 1, -1, -1):
+                next_product[index] = following
+                own = _text(data_rows[index][0])
+                if own:
+                    following = own
+            data_index = -1
             for raw in table:
                 if not raw or len(raw) < 10:
                     continue
@@ -825,9 +1231,42 @@ def parse_consumer_scheme(content: bytes) -> ParseResult:
                 total = _money(raw[6])
                 if total is None or "₹" not in str(raw[6] or ""):
                     continue  # not a data row (title / legend)
-                row_no += 1
+                data_index += 1
+                factor = _money(raw[3])
+                is_ev_row = factor is not None and abs(factor - _EV_BNDP_FACTOR) < Decimal("0.001")
+                signature = tuple(_money(c) for c in raw[2:9])
                 product = cells[0] or carry_product
+                if not product and previous_page_row is not None and signature == previous_page_signature:
+                    # The page break cut one bulletin row in two (October's
+                    # VEERO "V2 / V2 CNG / V4 CNG"): same figures, the rest of
+                    # its variants. It is that row, not a new one.
+                    for name in split_variant_cell(raw[1]):
+                        if name not in previous_page_row.variant_texts:
+                            previous_page_row.variant_texts.append(name)
+                    carry_product = previous_page_row.model_alias
+                    continue
+                row_no += 1
+                if not product:
+                    product, problem = _product_at_page_top(
+                        previous=previous_page_product, following=next_product.get(data_index), ev_row=is_ev_row,
+                    )
+                    if problem:
+                        result.errors.append(f"consumer row {row_no} (page {page_index}): {problem}")
+                        continue
                 carry_product = product
+                last_on_page = product
+                if is_ev_row and not is_ev_model_text(product):
+                    result.errors.append(
+                        f"consumer row {row_no} ({product}): the BNDP factor 1.05 is the EV rate (5% GST) "
+                        "but the model is not an electric vehicle"
+                    )
+                    continue
+                if factor is not None and factor > 0 and not is_ev_row and is_ev_model_text(product):
+                    result.errors.append(
+                        f"consumer row {row_no} ({product}): an electric vehicle with BNDP factor {factor}, "
+                        "not the EV rate 1.05"
+                    )
+                    continue
                 cash = _money(raw[7]) or Decimal(0)
                 other = _money(raw[8]) or Decimal(0)
                 if abs((cash + other) - total) > _MONEY_TOLERANCE:
@@ -837,11 +1276,7 @@ def parse_consumer_scheme(content: bytes) -> ParseResult:
                     )
                     continue
 
-                variant_texts = [
-                    v.strip()
-                    for v in re.split(r"\n|/(?=\s)", str(raw[1] or ""))
-                    if v.strip()
-                ]
+                variant_texts = split_variant_cell(raw[1])
                 description = re.sub(r"\s+", " ", str(raw[9] or "")).strip()
                 benefits, warnings = _consumer_benefits(cash, other, description)
                 result.discount_rows.append(
@@ -858,14 +1293,47 @@ def parse_consumer_scheme(content: bytes) -> ParseResult:
                             "otherSchemes": str(_q2(other)),
                             "mAndMContribution": str(_q2(_money(raw[4]) or Decimal(0))),
                             "dealerContribution": str(_q2(_money(raw[5]) or Decimal(0))),
+                            "bndpFactor": str(factor) if factor is not None else None,
+                            "vehicleCategory": "EV" if is_ev_row else "ICE",
+                            "variantCell": str(raw[1] or ""),
                         },
                         warnings=warnings,
                     )
                 )
+                last_row_on_page = result.discount_rows[-1]
+                last_signature_on_page = signature
+        if last_on_page:
+            previous_page_product = last_on_page
+        previous_page_row, previous_page_signature = last_row_on_page, last_signature_on_page
+        last_row_on_page, last_signature_on_page = None, None
     if not found_header:
+        declaration = _carry_forward_declaration(full_text)
+        if declaration:
+            raise MasterParseError(declaration)
         raise MasterParseError("Not a consumer scheme bulletin (header row not found).")
     result.meta["schemeRows"] = len(result.discount_rows)
     return result
+
+
+def _product_at_page_top(
+    *, previous: str | None, following: str | None, ev_row: bool,
+) -> tuple[str | None, str | None]:
+    """The product of a row that opens a page with its product cell empty.
+
+    The merged product cell either continues from the previous page or is
+    the block the next named row belongs to. The BNDP factor decides between
+    them; when it cannot, the row is refused rather than guessed."""
+    candidates = [c for c in dict.fromkeys((previous, following)) if c]
+    if ev_row:
+        fitting = [c for c in candidates if is_ev_model_text(c)]
+    else:
+        fitting = [c for c in candidates if not is_ev_model_text(c)]
+    if len(fitting) == 1:
+        return fitting[0], None
+    return None, (
+        "the product cell is empty at the top of the page and the row cannot be placed "
+        f"(previous page: {previous or '-'}, next row: {following or '-'}); fix the bulletin or enter it by hand"
+    )
 
 
 def _consumer_benefits(
@@ -926,6 +1394,7 @@ def parse_exchange_scheme(content: bytes) -> ParseResult:
     result.effective_from_hint = _date_hint(
         full_text.replace("valid from", "w.e.f.")
     )
+    result.effective_to_hint = validity_end_hint(full_text)
 
     row_no = 0
     recognised = 0
@@ -973,6 +1442,12 @@ def parse_exchange_scheme(content: bytes) -> ParseResult:
                 }
                 if old_i is not None and len(raw) > old_i and _text(raw[old_i]):
                     config["oldVehicleModel"] = _text(raw[old_i])
+                    # 2026-10-20 product owner rules: the old-vehicle column is
+                    # a condition ("Tata Ace Family"), kept structured so the
+                    # benefit applies only against that old vehicle.
+                    requirement = old_vehicle_requirement(config["oldVehicleModel"])
+                    if requirement:
+                        config["requiredOldVehicle"] = requirement
                 if scheme_i is not None and len(raw) > scheme_i and _text(raw[scheme_i]):
                     config["schemeType"] = _text(raw[scheme_i])
                 result.discount_rows.append(
@@ -1065,6 +1540,7 @@ def parse_corporate_policy(content: bytes) -> ParseResult:
         if isinstance(c, str)
     )
     result.effective_from_hint = _date_hint(hint.replace("From", "w.e.f."))
+    result.effective_to_hint = validity_end_hint(hint)
     result.meta["benefitRows"] = len(result.corporate_benefits)
     result.meta["companies"] = len(result.corporate_companies)
     return result
@@ -1235,12 +1711,25 @@ def parse_discount_grid(content: bytes, *, filename: str | None = None) -> Parse
             "Discount grid not recognised: no 'Model | Booking Protection | ...' header row."
         )
     columns: dict[str, int] = {}
+    tier_columns: dict[str, int] = {}
     for col, cell in enumerate(rows[header_row]):
         label = (_text(cell) or "").upper()
+        tier = _grid_tier(label)
+        if tier and tier not in tier_columns:
+            tier_columns[tier] = col
+            continue
         for key, needles in _GRID_HEADER.items():
             if key not in columns and label and any(n in label for n in needles):
                 columns[key] = col
-    for key in ("model", "booking_protection", "agreed_buffer", "insurance_od", "out_of_territory"):
+    # 2026-10-20: the October grid replaces the single agreed buffer with
+    # three tiers and moves the insurance OD caps into its notes.
+    if "agreed_buffer" not in columns and "BASE" in tier_columns:
+        columns["agreed_buffer"] = tier_columns["BASE"]
+        result.meta["layout"] = "DEALER_DISCOUNT_GRID_TIERED"
+    required = ["model", "booking_protection", "agreed_buffer", "out_of_territory"]
+    if not tier_columns:
+        required.append("insurance_od")
+    for key in required:
         if key not in columns:
             raise MasterParseError(f"Discount grid header lacks the {key.replace('_', ' ')} column.")
 
@@ -1253,6 +1742,7 @@ def parse_discount_grid(content: bytes, *, filename: str | None = None) -> Parse
         result.meta["effectiveFromSource"] = "FILENAME"
 
     in_parameters = False
+    od_caps: dict[str, Decimal] = {}
     for idx, raw in enumerate(rows[header_row + 1:], start=header_row + 2):
         cell = _cell_reader(raw)
         first = _text(cell(columns["model"]))
@@ -1262,20 +1752,47 @@ def parse_discount_grid(content: bytes, *, filename: str | None = None) -> Parse
             in_parameters = True
             continue
         if in_parameters:
-            note = next((_text(v) for v in raw[columns["model"] + 1:] if _text(v)), None)
+            raw_note = next((v for v in raw[columns["model"] + 1:] if _text(v)), None)
+            note = _text(raw_note)
             result.grid_parameters.append({"parameter": first, "note": note or ""})
+            if re.search(r"\bOD\b", first, re.IGNORECASE):
+                od_caps.update(_od_caps(str(raw_note or "")))
             continue
-        values = [cell(columns[k]) for k in ("booking_protection", "agreed_buffer", "insurance_od", "out_of_territory")]
-        in_scope = not all((_text(v) or "").upper() in _OUT_OF_SCOPE for v in values)
+        value_cols = [columns["booking_protection"], columns["agreed_buffer"], *tier_columns.values(),
+                      columns["out_of_territory"]]
+        if "insurance_od" in columns:
+            value_cols.append(columns["insurance_od"])
+        if all(not _text(cell(c)) for c in value_cols):
+            continue  # a heading inside the sheet ("Notes"), not a model row
+        values = [cell(columns["booking_protection"]), cell(columns["agreed_buffer"]),
+                  cell(columns["insurance_od"]) if "insurance_od" in columns else None,
+                  cell(columns["out_of_territory"])]
+        in_scope = not all((_text(v) or "").upper() in _OUT_OF_SCOPE for v in values if v is not None)
         days, e1 = _grid_days(values[0])
         buffer, e2 = _grid_amount(values[1])
         od, e3 = _grid_percent(values[2])
         territory, e4 = _grid_amount(values[3])
-        problems = [e for e in (e1, e2, e3, e4) if e]
+        tiers: dict[str, Decimal] = {}
+        tier_problems: list[str] = []
+        for tier, col in tier_columns.items():
+            amount, problem = _grid_amount(cell(col))
+            if problem:
+                tier_problems.append(problem)
+            elif amount is not None:
+                tiers[tier] = amount
+        problems = [e for e in (e1, e2, e3, e4, *tier_problems) if e]
         if problems:
             result.errors.append(f"grid row {idx} ({first}): " + "; ".join(problems))
             continue
         aliases = [a.strip() for a in re.split(r"[,&/|]|\band\b", first, flags=re.IGNORECASE) if a.strip()]
+        raw_values = {
+            "bookingProtection": _text(values[0]),
+            "agreedBuffer": _text(values[1]),
+            "insuranceOd": _text(values[2]),
+            "outOfTerritory": _text(values[3]),
+        }
+        if tiers:
+            raw_values["tiers"] = {tier: str(amount) for tier, amount in tiers.items()}
         result.grid_rows.append(
             GridRow(
                 row_no=idx,
@@ -1286,20 +1803,66 @@ def parse_discount_grid(content: bytes, *, filename: str | None = None) -> Parse
                 agreed_buffer_amount=buffer,
                 insurance_od_percent=od,
                 out_of_territory_amount=territory,
-                raw={
-                    "bookingProtection": _text(values[0]),
-                    "agreedBuffer": _text(values[1]),
-                    "insuranceOd": _text(values[2]),
-                    "outOfTerritory": _text(values[3]),
-                },
+                raw=raw_values,
+                tiers=tiers,
             )
         )
+    # The insurance OD cap the notes give per vehicle class (October 2026:
+    # private car 65%, goods carrier 65%, passenger carrier 50%, 3+3 85%):
+    # a row without its own OD column takes its class's cap.
+    if od_caps:
+        result.meta["odCapsPercent"] = {k: str(v) for k, v in od_caps.items()}
+        for grow in result.grid_rows:
+            if grow.insurance_od_percent is None and grow.in_scope:
+                vehicle_class = "GCV" if _CV_GRID_RE.search(grow.model_alias) else "PRIVATE_CAR"
+                grow.insurance_od_percent = od_caps.get(vehicle_class)
+                grow.raw["odCapsPercent"] = result.meta["odCapsPercent"]
+                grow.raw["odCapClass"] = vehicle_class
     if not result.grid_rows and not result.errors:
         raise MasterParseError("Discount grid contained no model rows.")
     result.meta["gridRows"] = len(result.grid_rows)
     result.meta["parameters"] = len(result.grid_parameters)
     result.meta["models"] = [r.model_alias for r in result.grid_rows]
+    if tier_columns:
+        result.meta["tiers"] = list(tier_columns)
     return result
+
+
+_CV_GRID_RE = re.compile(r"PICK\s*-?\s*UP|MAXX|SUPRO|CAMPER|VEERO", re.IGNORECASE)
+
+
+def _grid_tier(label: str) -> str | None:
+    """The October grid's buffer tier a header names, or None."""
+    if not label.startswith("MY") and "INSURANCE" not in label:
+        return None
+    if "WITHOUT" in label:
+        return "BASE"
+    if "EXTENDED WARRANTY" in label or re.search(r"\bEW\b", label):
+        return "WITH_EW_INSURANCE"
+    if "WITH INSURANCE" in label:
+        return "WITH_INSURANCE"
+    return None
+
+
+def _od_caps(note: str) -> dict[str, Decimal]:
+    caps: dict[str, Decimal] = {}
+    for line in re.split(r"\n|(?<=%)\s+", note):
+        match = re.search(r"^(.*?):.*?(\d+(?:\.\d+)?)\s*%", line.strip())
+        if not match:
+            continue
+        label = match.group(1).lower()
+        if "3+3" in label:
+            key = "THREE_PLUS_THREE"
+        elif "gcv" in label or "goods" in label:
+            key = "GCV"
+        elif "pcv" in label or "passenger" in label:
+            key = "PCV"
+        elif "private" in label or "car" in label:
+            key = "PRIVATE_CAR"
+        else:
+            continue
+        caps[key] = _q2(Decimal(match.group(2)))
+    return caps
 
 
 # ── dispatch ────────────────────────────────────────────────────────────────────

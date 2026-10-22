@@ -73,3 +73,71 @@ def test_a_failed_check_rolls_the_commit_back(tenant, monkeypatch) -> None:
     assert result["status"] == "FAILED"
     assert [c["check"] for c in result["checks"] if not c["ok"]] == ["SKUs in force on 2026-10-03"]
     assert _versions(engine, tenant_id) == 0
+
+
+def test_the_scheme_reload_dry_runs_then_commits_the_bulletins_on_their_dates(tenant) -> None:
+    """Review of PR 472: the scheme masters re-load (a "-schemes" tag), after
+    the price books. Every bulletin on the dates it prints, nothing applied
+    model-wide for variants that did not resolve, and Utkal's XUV 3XO AX5 PM
+    MT at 30,000 cash in September."""
+    engine, tenant_id = tenant
+    with engine.begin() as conn:
+        oem_code = conn.execute(text("SELECT o.oem_code FROM auditcore.projects p JOIN auditcore.oems o "
+                                     "ON o.oem_id = p.oem_id WHERE p.tenant_id = :t"), {"t": tenant_id}).scalar_one()
+        # The tenant's OEM reads the bulletins with Mahindra's model aliases.
+        conn.execute(text("INSERT INTO auditcore.oem_model_aliases (oem_code, alias_text, canonical_model_name) "
+                          "SELECT :o, alias_text, canonical_model_name FROM auditcore.oem_model_aliases "
+                          "WHERE oem_code = 'MAHINDRA' ON CONFLICT DO NOTHING"), {"o": oem_code})
+    tag = f"test-{uuid4().hex[:6]}"
+    assert run_master_reload(engine, f"{tag}-commit", tenant_ids=[tenant_id])[0]["status"] == "COMMITTED"
+
+    (dry,) = run_master_reload(engine, f"{tag}-schemes", tenant_ids=[tenant_id])
+    assert dry["status"] == "DRY_RUN_PASSED", [c for c in dry.get("checks", []) if not c["ok"]] or dry.get("error")
+    assert [(u["kind"], u["effectiveFrom"], u["effectiveTo"]) for u in dry["uploads"]] == [
+        (kind, on, until) for kind, _, on, until in oem_master_reload.SCHEME_RELOAD_PLAN]
+    assert dry["appliedPerModel"]["2026-09-15"]["XUV3XO"] > 0
+
+    (done,) = run_master_reload(engine, f"{tag}-schemes-commit", tenant_ids=[tenant_id])
+    assert done["status"] == "COMMITTED", [c for c in done.get("checks", []) if not c["ok"]] or done.get("error")
+    with engine.begin() as conn:
+        conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        ends = dict(conn.execute(text(
+            "SELECT DISTINCT v.effective_from, v.effective_to FROM auditcore.discount_scheme_versions v "
+            "JOIN auditcore.discount_scheme_benefits b ON b.discount_scheme_version_id = v.discount_scheme_version_id "
+            "WHERE v.tenant_id = :t"), {"t": tenant_id}).all())
+    assert ends == {date(2026, 9, 3): date(2026, 9, 30), date(2026, 10, 3): date(2026, 10, 31)}
+
+
+def test_the_real_october_grid_binds_scorpio_n_to_the_model_the_october_book_prices(tenant) -> None:
+    """Review of PR 472: the October grid (dated 1 Oct) names "SCORPIO-N"; the
+    October book (3 Oct) carries only NEW SCORPIO N. With the real files, the
+    line is bound to it, a deal of 15 Oct finds its grid line, and the dry
+    run's grid check is among the checks that pass."""
+    from audit_core.oem_master_reload import reload_schemes_tenant, reload_tenant
+    from audit_core.oem_price_masters import grid_row_for_model
+
+    engine, tenant_id = tenant
+    with engine.begin() as conn:
+        oem_code = conn.execute(text("SELECT o.oem_code FROM auditcore.projects p JOIN auditcore.oems o "
+                                     "ON o.oem_id = p.oem_id WHERE p.tenant_id = :t"), {"t": tenant_id}).scalar_one()
+        conn.execute(text("INSERT INTO auditcore.oem_model_aliases (oem_code, alias_text, canonical_model_name) "
+                          "SELECT :o, alias_text, canonical_model_name FROM auditcore.oem_model_aliases "
+                          "WHERE oem_code = 'MAHINDRA' ON CONFLICT DO NOTHING"), {"o": oem_code})
+    connection = engine.connect()
+    transaction = connection.begin()
+    try:
+        tag = f"test-{uuid4().hex[:6]}"
+        assert reload_tenant(connection, tenant_id=tenant_id, tag=tag, store=False)["passed"]
+        outcome = reload_schemes_tenant(connection, tenant_id=tenant_id, tag=f"{tag}-schemes", store=False)
+        failed = [c for c in outcome["checks"] if not c["ok"]]
+        assert not failed, failed
+        grid_checks = [c for c in outcome["checks"] if c["check"].startswith("discount grid of")]
+        assert len(grid_checks) >= 2 and all(c["ok"] for c in grid_checks)
+        new_scorpio = connection.execute(text(
+            "SELECT model_id FROM auditcore.product_models pm JOIN auditcore.projects p ON p.oem_id = pm.oem_id "
+            "WHERE p.tenant_id = :t AND pm.model_name = 'NEW SCORPIO N'"), {"t": tenant_id}).scalar_one()
+        row = grid_row_for_model(connection, tenant_id=tenant_id, model_id=new_scorpio, effective_on=date(2026, 10, 15))
+        assert row is not None and row["model_alias"].upper().startswith("SCORPIO")
+    finally:
+        transaction.rollback()
+        connection.close()

@@ -60,6 +60,7 @@ from uuid import UUID
 import structlog
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_masters_alignment import ENTITLEMENT_UNKNOWN_RESULTS
 from audit_core.uc03_p2_dates import parse_extracted_date
 from audit_core.uc03_p2_names import same_person
 from audit_core.uc03_p2_runtime import enqueue_work
@@ -464,6 +465,12 @@ def excess_discount(facts: _Facts) -> RuleOutcome:
     rows = [r for r in facts.sheet["discounts"] if any(r[c] is not None for c in ("billed", "booking", "effective"))]
     if not rows:
         return RuleOutcome(code, "PASS", "No discount on this deal.")
+    # 2026-10-20 (review of PR 472): a discount whose entitlement is not
+    # known (master not mapped, deal not reconciled, corporate category to
+    # be confirmed) is not an over-grant; its own task says why.
+    rows = [r for r in rows if not (r.get("entitled") is None and r.get("eligibility") in ENTITLEMENT_UNKNOWN_RESULTS)]
+    if not rows:
+        return RuleOutcome(code, "SKIPPED", "The entitlement of the discounts given is not known yet.")
     if not _standards_known(facts):
         return RuleOutcome(code, "SKIPPED", _NO_STANDARD)
     over: list[dict[str, Any]] = []

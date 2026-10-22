@@ -50,6 +50,7 @@ from audit_core.uc03_invoice_materialization import (
 from audit_core.uc03_masters_alignment import (
     CONDITIONAL_DISCOUNT_EVIDENCE_DOCUMENT,
     DISCOUNT_ACTUAL_FIELD_TO_BENEFIT_KEY,
+    ENTITLEMENT_UNKNOWN_RESULTS,
     canonical_discount_key,
 )
 from audit_core.uc03_p2_controls import control_statistics
@@ -1203,7 +1204,13 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         # Given with no scheme entitlement (reconciliation marks it
         # NOT_ELIGIBLE; a discretionary dealer discount never has one): the
         # entitlement is zero, so the whole amount is the over-grant.
-        if entitled is None and (row.get("eligibility_result") == "NOT_ELIGIBLE" or key == "ADDITIONAL_DISCOUNT"):
+        # An entitlement that is not known (the master is not mapped, the
+        # deal not reconciled, the corporate category to be confirmed) is
+        # never zero: it stays blank and the discount is taken as given.
+        unknown = row.get("eligibility_result") in ENTITLEMENT_UNKNOWN_RESULTS
+        if entitled is None and not unknown and (
+            row.get("eligibility_result") == "NOT_ELIGIBLE" or key == "ADDITIONAL_DISCOUNT"
+        ):
             entitled = Decimal(0)
         proof_type = CONDITIONAL_DISCOUNT_EVIDENCE_DOCUMENT.get(key)
         discount_rows.append({
@@ -1396,6 +1403,13 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         row["inStandard"] = row["entitled"] is not None and (
             row["key"] not in _CONDITIONAL_BENEFITS or claimed or bool((row.get("proof") or {}).get("onFile"))
         )
+        # Entitlement not known (2026-10-20, review of PR 472): the discount
+        # given is taken as given in the standard net, like a line the
+        # masters do not price, so it is never a variance of its own.
+        row["takenAsGiven"] = (
+            row["entitled"] is None and row.get("eligibility") in ENTITLEMENT_UNKNOWN_RESULTS
+            and row["current"] is not None
+        )
         if row["awaiting"] is None and (row["current"] is not None or row["key"] == mr_key):
             reference = row["current"]
             row["variance"] = _minus(reference, row["entitled"]) if reference is not None else None
@@ -1444,6 +1458,9 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         _column_total(counted_rows, c) for c in ("standard", "booking", "current", "billed", "ledger")
     )
     d_std = _column_total(standard_discounts, "entitled")
+    taken_as_given = [r for r in discount_rows if r.get("takenAsGiven")]
+    if taken_as_given:
+        d_std = str(Decimal(d_std or 0) + sum((Decimal(r["current"]) for r in taken_as_given), Decimal(0)))
     d_bk, d_cur, d_bl = (_column_total(discount_rows, c) for c in ("booking", "current", "billed"))
     # Standard net: every line at its standard and the benefits the deal
     # qualifies for. A line the masters do not price (no standard on record)
