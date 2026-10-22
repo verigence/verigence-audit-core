@@ -2,8 +2,9 @@
 
 A person (PC or TL) removes a refused or failed page with
 ``POST /pages/{queue}:remove`` (2026-10-21, #480). Product owner, 2026-10-22:
-every day at 23:30 IST (18:00 UTC) the worker does the same for every page
-that ended FAILED after its retries, instead of expecting the PC to remove it.
+every day at 02:00 IST (20:30 UTC, P2_DAYEND_SWEEP_UTC) the worker does the
+same for every page that ended FAILED after its retries -- pages refused by
+the scan-quality check included -- instead of expecting the PC to remove it.
 
 Both go through ``take_page_off_journey``: any Document Intelligence document
 held for the page is voided the way deleting a document voids it, the page
@@ -43,13 +44,6 @@ SWEEP_RUN_NAME = "P2_DAYEND_SWEEP"
 # A page with no failure code (none is expected) is swept with this one, so it
 # stays recognisable as a swept page that still waits to be resubmitted.
 UNKNOWN_FAILURE_CODE = "PAGE_FAILED"
-
-# Pages the scan-quality check refused (DI_QUALITY_*) are not swept: their
-# own task (PC_PAGE_QUALITY_REJECTED) closes only when the refused pages are
-# replaced by the same scan, read or removed, and a re-scan is different
-# bytes -- the PC removes the page from its card. Sweeping it would take that
-# card away and leave the task, and the delivery gate, open for good.
-_QUALITY_PREFIX = "DI_QUALITY_"
 
 # "Not completed or cancelled": the same two tests the nightly review and the
 # nightly SKU retry use (review not completed; the Booking not cancelled, a
@@ -152,8 +146,10 @@ def sweep_failed_pages(connection: Connection, *, tenant_id: str, now: datetime 
 
     Selects the page units whose queue_status is FAILED (or DEAD_LETTER, as
     ``:remove`` and the failure report treat it) and that are still on the
-    Journey, in Journeys not completed or cancelled, except pages refused by
-    the scan-quality check (DI_QUALITY_*). READY, NEEDS_REVIEW, SUPPORTING and
+    Journey, in Journeys not completed or cancelled. That includes the pages
+    the scan-quality check refused (DI_QUALITY_*, product owner 2026-10-22):
+    the sweep is only a clean-up, so their image-quality task stays open
+    exactly as the resubmit task does. READY, NEEDS_REVIEW, SUPPORTING and
     pages still being worked on are never touched, nor is any other state.
 
     Each page is taken off the Journey through ``take_page_off_journey``
@@ -176,7 +172,6 @@ def sweep_failed_pages(connection: Connection, *, tenant_id: str, now: datetime 
             JOIN auditcore.journeys j ON j.tenant_id=q.tenant_id AND j.journey_id=q.journey_id
             JOIN auditcore.p2_upload_batches b ON b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
             WHERE q.tenant_id=:t AND q.queue_status IN ('FAILED','DEAD_LETTER')
-              AND COALESCE(q.last_error, '') NOT LIKE '{_QUALITY_PREFIX}%'
               AND {_OPEN_JOURNEY}
             ORDER BY q.journey_id, q.page_number, q.queue_id
             FOR UPDATE OF q SKIP LOCKED

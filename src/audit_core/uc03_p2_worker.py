@@ -42,6 +42,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PdfReadError
 from sqlalchemy import Engine, text
 
+from audit_core import uc03_p2_runtime as _runtime
 from audit_core.config import SettingsError, load_settings
 from audit_core.db import set_platform_super_admin_context, set_tenant_context
 from audit_core.dependencies import get_engine
@@ -77,9 +78,11 @@ from audit_core.uc03_p2_price_variance import (
 )
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_runtime import (
+    DAYEND_SWEEP_DEFAULT_UTC,
     claim_scheduled_run,
     enqueue_work,
     fact_fingerprint,
+    hhmm,
     note_facts_changed,
     record_activity,
     request_page_reread,
@@ -187,21 +190,14 @@ _FACT_SWEEP_WINDOW_MINUTES = int(os.environ.get("P2_FACT_SWEEP_WINDOW_MINUTES", 
 _NIGHTLY_REVIEW_UTC = os.environ.get("P2_NIGHTLY_REVIEW_UTC", "20:30")
 
 
-def _hhmm(value: str, default: str) -> str:
-    """``HH:MM`` from an environment variable; anything that is not a clock
-    time falls back to ``default`` (a typo must not stop the worker)."""
-    hour, sep, minute = value.strip().partition(":")
-    if sep and hour.isdigit() and minute.isdigit() and 0 <= int(hour) <= 23 and 0 <= int(minute) <= 59:
-        return f"{int(hour):02d}:{int(minute):02d}"
-    logger.warning("p2_dayend_sweep_time_invalid", value=value, using=default)
-    return default
-
-
 # When (UTC, HH:MM) the day-end sweep clears the pages that ended FAILED from
-# their Journeys (product owner 2026-10-22): 23:30 IST = 18:00 UTC, every day.
-_DAYEND_SWEEP_DEFAULT_UTC = "18:00"
-_DAYEND_SWEEP_UTC = _hhmm(os.environ.get("P2_DAYEND_SWEEP_UTC", _DAYEND_SWEEP_DEFAULT_UTC),
-                          _DAYEND_SWEEP_DEFAULT_UTC)
+# their Journeys: 02:00 IST = 20:30 UTC by default (product owner 2026-10-22);
+# the one setting lives in uc03_p2_runtime because the PC's messages quote it.
+_hhmm = hhmm
+_DAYEND_SWEEP_DEFAULT_UTC = DAYEND_SWEEP_DEFAULT_UTC
+# A worker that was down at the time still runs the missed sweep when it is
+# back, for this long after the time; later, that night is skipped.
+_DAYEND_CATCHUP = timedelta(hours=6)
 _WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 # Page states that still need DI/Audit Core progress.
@@ -3627,22 +3623,29 @@ def _nightly_review_due(tenant_id: str, now: datetime | None = None) -> str | No
 
 
 def _dayend_sweep_due(tenant_id: str, now: datetime | None = None) -> str | None:
-    """The day (UTC date) whose day-end sweep this worker still owes, once
-    the configured UTC time has passed; None otherwise. A worker that was
-    down at the time still runs the day's sweep when it is back that day."""
+    """The sweep slot this worker still owes: the latest configured time
+    (UTC) that has passed, at most _DAYEND_CATCHUP ago, named by its UTC date
+    (20:30 UTC on the 22nd is 02:00 IST on the 23rd, and is claimed as
+    "2026-10-22"). None when no slot is open or this worker already ran it.
+    A worker that was down at the time still runs the missed slot when it is
+    back within the catch-up; later that night is skipped and the next
+    night's sweep takes what failed."""
     now = now or datetime.now(UTC)
-    hour, _, minute = _DAYEND_SWEEP_UTC.partition(":")
-    if now < now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0):
+    hour, _, minute = _runtime.DAYEND_SWEEP_UTC.partition(":")
+    slot = now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+    if now < slot:
+        slot -= timedelta(days=1)
+    if now - slot >= _DAYEND_CATCHUP:
         return None
-    today = now.date().isoformat()
-    return None if _last_dayend_sweep.get(tenant_id) == today else today
+    key = slot.date().isoformat()
+    return None if _last_dayend_sweep.get(tenant_id) == key else key
 
 
 def run_dayend_sweep(engine: Engine, tenant_id: str, now: datetime | None = None) -> dict[str, int] | None:
-    """Run the day's sweep of failed pages once (product owner 2026-10-22).
+    """Run the night's sweep of failed pages once (product owner 2026-10-22).
 
-    The day is claimed durably (p2_scheduled_runs, run P2_DAYEND_SWEEP, the
-    UTC date) in the same transaction as the sweep, so two worker instances,
+    The slot is claimed durably (p2_scheduled_runs, run P2_DAYEND_SWEEP, the
+    UTC date of the slot) in the same transaction as the sweep, so two worker instances,
     or a restart, never run it twice: the second claim finds the row and does
     nothing, and a run that fails rolls its claim back so the next pass tries
     again. Returns what the sweep did, or None when it is not due, was
