@@ -30,7 +30,11 @@ from sqlalchemy import Connection, text
 from audit_core.uc03_p2_document_health import TL_AFTER_SECONDS
 from audit_core.uc03_p2_names import display_name, same_organisation, same_person
 from audit_core.uc03_p2_registry import ControlTemplate, Registry, get_registry
-from audit_core.uc03_p2_runtime import dayend_removal_notice, swept_pending_sql
+from audit_core.uc03_p2_runtime import (
+    QUALITY_CLOSE_INSTRUCTION,
+    dayend_removal_notice,
+    swept_pending_sql,
+)
 from audit_core.uc03_p2_stage import unreviewed_fields
 from audit_core.uc03_p2_tasks import record_task_event
 
@@ -642,8 +646,10 @@ def page_open_path(tenant_id: str, journey_id: UUID, queue_id: UUID | str) -> st
 
 
 
-# Why the quality task closed. There is no time rule: an upload of some
-# other file never answers a refused page (review of #479, 2026-10-21).
+# Why the quality task closed by itself. There is no time rule: an upload of
+# some other file never answers a refused page (review of #479, 2026-10-21).
+# The PC closes the task by hand, with a comment, every time (2026-10-22;
+# CLOSE_TASK in uc03_p2_tasks).
 _QUALITY_CLOSED_EVIDENCE = {
     "reason": "No page of this file is refused any more: the refused pages were replaced by the same scan, "
               "read, or removed, or the file was deleted.",
@@ -674,9 +680,12 @@ def _sync_quality_task(
     as any refused page of the file is still refused -- exactly as the
     file's status task did for those pages before -- and closes itself once
     they are replaced by the same scan, read or removed, or the file is
-    deleted. Another file uploaded on the booking never closes it: nothing
-    says which document a refused page was (it was refused before it was
-    classified). Returns what happened to the task."""
+    deleted. The day-end clean-up never closes it. Another file uploaded on
+    the booking never closes it either: nothing says which document a
+    refused page was (it was refused before it was classified), so the PC
+    closes the task by hand with a comment (2026-10-22). A task closed that
+    way is not reopened by this sync (its ``acceptedIssueHash`` is kept).
+    Returns what happened to the task."""
     from audit_core.uc03_p2_daily_report import rejection_reason
     from audit_core.uc03_p2_document_task_groups import rejection_words
 
@@ -702,9 +711,9 @@ def _sync_quality_task(
     description = (f"Refused by the scan-quality check and not read: {why}. A retry will not help. "
                    f"{dayend_removal_notice(count)} Scan "
                    f"{'it' if count == 1 else 'them'} again in good light, flat and in focus, and upload from "
-                   "Upload / Edit Documents. This task closes itself once the refused pages are processed or "
-                   "removed (the day-end clean-up only takes them off the journey; it does not close this "
-                   "task); delete this booking if nothing on it can be used.")
+                   f"Upload / Edit Documents. {QUALITY_CLOSE_INSTRUCTION} This task also closes itself once "
+                   "the refused pages are processed or removed (the day-end clean-up only takes them off the "
+                   "journey; it does not close this task). Delete this booking if nothing on it can be used.")
     _, outcome = raise_or_refresh(
         connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=f"upload-quality:{journey_id}:{batch_id}",
         task_type="PC_PAGE_QUALITY_REJECTED", source_type="DOCUMENT", source_code="DOCUMENT_QUALITY_REJECTED",
@@ -715,6 +724,20 @@ def _sync_quality_task(
                                   for reason, group in by_reason.items()],
                    "pageQueues": [{"page": page, "queueId": queue} for page, queue in sorted(page_queues.items())]},
         severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
+    )
+    # A task raised before "Close task" existed has not got the
+    # action: give it to the ones still open (this task type only).
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_tasks SET allowed_actions=CAST(:actions AS jsonb), updated_at_utc=now()
+            WHERE tenant_id=:t AND dedupe_key=:k
+              AND task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')
+              AND allowed_actions IS DISTINCT FROM CAST(:actions AS jsonb)
+            """
+        ),
+        {"t": tenant_id, "k": f"upload-quality:{journey_id}:{batch_id}",
+         "actions": _json(list(registry.tasks["PC_PAGE_QUALITY_REJECTED"].actions))},
     )
     return outcome
 

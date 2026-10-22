@@ -612,6 +612,9 @@ def _split(journey, batch_id):
 BLUR = "DI_QUALITY_IMAGE_BLUR_SCORE"
 NOTICE = ("This page will be removed by the system at the day-end clean-up (02:00 IST). "
           "Please upload a clearer copy.")
+INSTRUCTION = ('Once uploaded, come back and close the task with the comment "Document Uploaded". '
+               'If the document does not need to be uploaded again, close the task with the comment '
+               '"Document Not required to be uploaded for Extraction".')
 
 
 def _tasks(journey, prefix):
@@ -626,6 +629,9 @@ def test_a_swept_image_quality_page_keeps_its_task_open_and_says_the_system_remo
     _sync(journey)
     before = _task(journey, batch_id, "upload-quality")
     assert before["task_status"] == "READY" and NOTICE in before["description"]
+    # What the PC does to close it: both phrases exactly, as guidance (not a fixed list).
+    assert INSTRUCTION in before["description"]
+    assert before["description"].count('"') == 4
     assert before["description"].startswith("Refused by the scan-quality check and not read: Page 2 is blurred. "
                                             "A retry will not help. " + NOTICE)
 
@@ -657,7 +663,7 @@ def test_a_swept_image_quality_page_keeps_its_task_open_and_says_the_system_remo
 
     card = document_detail({"task_type": "PC_PAGE_QUALITY_REJECTED", "source_code": "DOCUMENT_QUALITY_REJECTED",
                             "reference": after["reference"]}, "IMAGE_QUALITY")
-    assert card["reason"] == f"Page 2 is blurred. Re-scan and upload again. {NOTICE}"
+    assert card["reason"] == f"Page 2 is blurred. Re-scan and upload again. {NOTICE} {INSTRUCTION}"
     monkeypatch.setattr(runtime, "DAYEND_SWEEP_UTC", "19:15")
     _sync(journey)
     assert "(00:45 IST)" in _task(journey, batch_id, "upload-quality")["description"]
@@ -673,6 +679,7 @@ def test_several_swept_quality_pages_get_the_plural_message(journey):
     assert task["task_status"] == "READY" and task["reference"]["pageNumbers"] == [2, 3]
     assert ("These pages will be removed by the system at the day-end clean-up (02:00 IST). "
             "Please upload clearer copies.") in task["description"]
+    assert INSTRUCTION in task["description"]
     # (_file raised a resubmit task while the pages carried no code; it closed once they were refused for quality.)
     assert [t for t in _tasks(journey, "resubmit") if t["task_status"] != "VERIFIED_COMPLETE"] == []
 
@@ -707,10 +714,11 @@ def test_the_quality_task_closes_when_the_same_scan_is_uploaded_again(journey, m
     assert _sweep(journey)["pages"] == 0
 
 
-def test_a_different_scan_does_not_close_the_quality_task_only_removing_the_page_does(journey, monkeypatch):
-    """The limit, as it was before the sweep (#479, #480): a re-scan is different
-    bytes and was refused before it was classified, so nothing says which page it
-    replaces. Another upload never closes the task; the Remove card does."""
+def test_a_different_scan_does_not_close_the_quality_task_the_pc_or_the_remove_card_does(journey, monkeypatch):
+    """A re-scan is different bytes and was refused before it was classified, so
+    nothing says which page it replaces: another upload never closes the task.
+    The system cannot know, so the PC closes it by hand with a comment (tests
+    below); the Remove card closes it too."""
     storage = MemoryStorage()
     monkeypatch.setattr(worker, "get_p2_document_storage", lambda: storage)
     monkeypatch.setattr(worker, "_owned", lambda *args, **kwargs: None)
@@ -780,3 +788,143 @@ def test_the_nightly_review_at_the_same_time_leaves_swept_pages_and_their_tasks_
     assert _task(journey, batch_id)["task_status"] == "READY"
     assert worker._NIGHTLY_REVIEW_UTC == "20:30" and runtime.DAYEND_SWEEP_UTC == "20:30"
     assert _claims(journey) == ["2026-10-22"]
+
+
+# ------------------------------------------- the PC closes the image-quality task by hand (2026-10-22)
+
+CLOSE = "CLOSE_TASK"
+REASON = "Document Uploaded"
+
+
+def _quality_task(journey, *, sweep=False):
+    batch_id, rows = _file(journey, [("booking_form", "READY"), (None, "FAILED")])
+    _fail(journey, rows[1]["queue_id"], BLUR, "Page rejected: blurred. Re-scan this page and upload it again.")
+    _sync(journey)
+    if sweep:
+        assert _sweep(journey)["pages"] == 1
+    [row] = _sql(journey, "SELECT task_id FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k",
+                 k=f"upload-quality:{journey.journey_id}:{batch_id}")
+    assert _task(journey, batch_id, "upload-quality")["task_status"] == "READY"
+    return batch_id, rows, row["task_id"]
+
+
+def _as(journey, subject):
+    app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=subject)
+    app.dependency_overrides[get_security_authorization_client] = lambda: AllowAllAuthorization()
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def _act(journey, task_id, comment="__missing__", *, subject=None, action=CLOSE):
+    body = {"action": action} if comment == "__missing__" else {"action": action, "comment": comment}
+    return _as(journey, subject or journey.actor_id).post(
+        f"/p2/v1/tenants/{journey.tenant_id}/tasks/{task_id}/actions", json=body)
+
+
+def _events(journey, task_id):
+    return _sql(journey, "SELECT event_type, actor_id, actor_role_code, comment, details, created_at_utc "
+                         "FROM auditcore.p2_task_events WHERE tenant_id=:t AND task_id=:i ORDER BY task_event_id",
+                i=task_id)
+
+
+def _status(journey, task_id):
+    [row] = _sql(journey, "SELECT task_status, completion_result FROM auditcore.p2_tasks "
+                          "WHERE tenant_id=:t AND task_id=:i", i=task_id)
+    return row
+
+
+@pytest.mark.parametrize("swept_first", [False, True])
+def test_closing_the_task_by_hand_records_the_comment_who_and_when(journey, swept_first):
+    batch_id, rows, task_id = _quality_task(journey, sweep=swept_first)
+    assert _gate(journey) == ["PC_PAGE_QUALITY_REJECTED"]
+
+    response = _act(journey, task_id, f"  {REASON}  ")  # any non-blank comment closes it
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "VERIFIED_COMPLETE"
+
+    task = _status(journey, task_id)
+    result = task["completion_result"]
+    assert task["task_status"] == "VERIFIED_COMPLETE"
+    assert result["outcome"] == "CLOSED_BY_PC" and result["reason"] == REASON
+    assert result["closedBy"] == journey.actor_id and result["closedRole"] == "PC" and result["closedAt"]
+    [event] = [e for e in _events(journey, task_id) if e["event_type"] == CLOSE]
+    assert (event["actor_id"], event["actor_role_code"], event["comment"]) == (journey.actor_id, "PC", REASON)
+    assert event["created_at_utc"] is not None
+
+    # The History the web card reads carries it, with the reason.
+    detail = _as(journey, journey.actor_id).get(f"/p2/v1/tenants/{journey.tenant_id}/tasks/{task_id}").json()
+    shown = [e for e in detail["events"] if e["event_type"] == CLOSE]
+    assert [(e["actor_role_code"], e["comment"]) for e in shown] == [("PC", REASON)]
+
+    # The task is out of the delivery gate; nothing else about the file moves.
+    assert _gate(journey) == []
+    _sync(journey)
+    _sweep(journey)
+    _sync(journey)
+    assert _status(journey, task_id)["task_status"] == "VERIFIED_COMPLETE"  # not reopened by a sync or the sweep
+    page = _page(journey, rows[1]["queue_id"])
+    assert page["last_error"] == BLUR  # still the refused page, with its code and reason
+    assert page["queue_status"] == "CANCELLED"  # off the Journey by the sweep, as without the close
+    assert _batch_status(journey, batch_id) == "PARTIAL_FAILURE"
+    assert len(_sql(journey, "SELECT 1 FROM auditcore.p2_activity_events WHERE event_type='PAGE_SWEPT'")) == 1
+    assert _gate(journey) == []
+
+
+def test_closing_before_the_sweep_leaves_the_page_failed_until_the_sweep(journey):
+    _, rows, task_id = _quality_task(journey)
+    assert _act(journey, task_id, REASON).status_code == 200
+    assert _page(journey, rows[1]["queue_id"])["queue_status"] == "FAILED"
+    assert _sweep(journey)["pages"] == 1  # the clean-up still takes it off the Journey
+    assert _status(journey, task_id)["task_status"] == "VERIFIED_COMPLETE"
+
+
+@pytest.mark.parametrize("reason", ["__missing__", None, "", "   ", "\n\t "])
+def test_a_blank_comment_is_refused_by_the_server(journey, reason):
+    _, _, task_id = _quality_task(journey)
+    response = _act(journey, task_id, reason)
+    assert response.status_code == 422, response.text
+    assert "comment" in response.json()["detail"].lower()
+    assert _status(journey, task_id)["task_status"] == "READY"
+    assert [e for e in _events(journey, task_id) if e["event_type"] == CLOSE] == []
+    assert _gate(journey) == ["PC_PAGE_QUALITY_REJECTED"]
+
+
+def test_only_whoever_the_task_is_assigned_to_can_close_it(journey):
+    _, _, task_id = _quality_task(journey)
+    tl = _tl(journey)
+    refused = _act(journey, task_id, REASON, subject=tl)
+    assert refused.status_code == 403, refused.text
+    assert _status(journey, task_id)["task_status"] == "READY"
+    assert [e for e in _events(journey, task_id) if e["event_type"] == CLOSE] == []
+    # A task already closed is closed: a second attempt is a conflict, not a second event.
+    assert _act(journey, task_id, REASON).status_code == 200
+    assert _act(journey, task_id, "again").status_code == 409
+    assert len([e for e in _events(journey, task_id) if e["event_type"] == CLOSE]) == 1
+
+
+def test_the_action_belongs_to_the_image_quality_task_only(journey):
+    from audit_core.uc03_p2_registry import get_registry
+
+    tasks = get_registry().tasks
+    assert [name for name, template in tasks.items() if CLOSE in template.actions] == ["PC_PAGE_QUALITY_REJECTED"]
+    # The file's other failed page keeps its own, unchanged task and cannot use it.
+    batch_id, rows = _file(journey, [("booking_form", "READY"), (None, "FAILED"), (None, "FAILED")])
+    _fail(journey, rows[1]["queue_id"], BLUR)
+    _fail(journey, rows[2]["queue_id"])
+    _sync(journey)
+    resubmit = _task(journey, batch_id)
+    assert resubmit["task_type"] == "DOCUMENT_RESUBMIT" and resubmit["task_status"] == "READY"
+    [row] = _sql(journey, "SELECT task_id FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k",
+                 k=f"resubmit:{journey.journey_id}:{batch_id}")
+    assert _act(journey, row["task_id"], REASON).status_code == 422
+    assert _status(journey, row["task_id"])["task_status"] == "READY"
+
+
+def test_an_open_quality_task_raised_before_the_action_existed_gets_it(journey):
+    _, _, task_id = _quality_task(journey)
+    _sql(journey, "UPDATE auditcore.p2_tasks SET allowed_actions='[\"REUPLOAD_DOCUMENT\",\"ADD_COMMENT\"]'::jsonb "
+                  "WHERE task_id=:i", i=task_id)
+    assert _act(journey, task_id, REASON).status_code == 422
+    _sync(journey)
+    [row] = _sql(journey, "SELECT allowed_actions FROM auditcore.p2_tasks WHERE task_id=:i", i=task_id)
+    assert row["allowed_actions"] == ["REUPLOAD_DOCUMENT", CLOSE, "ADD_COMMENT"]
+    assert _act(journey, task_id, REASON).status_code == 200

@@ -32,6 +32,12 @@ _COMMENTARY_ACTIONS = frozenset({"ADD_COMMENT", "PROVIDE_FEEDBACK"})
 # Accepting a machine finding as a legitimate business exception is a
 # supervisory decision, regardless of which role the task is assigned to.
 _EXCEPTION_ROLES = frozenset({"TL", "PM"})
+# The image-quality task of a file with refused pages. Besides closing itself
+# (same scan, page removed, file deleted) the PC closes it by hand, every time,
+# with a comment (product owner 2026-10-22): the system cannot know which
+# upload answers it.
+QUALITY_TASK = "PC_PAGE_QUALITY_REJECTED"
+CLOSE_TASK = "CLOSE_TASK"
 
 
 class TaskStateError(ValueError):
@@ -194,6 +200,34 @@ def _task(connection: Connection, *, tenant_id: str, task_id: UUID) -> dict[str,
         {"tenant_id": tenant_id, "task_id": task_id},
     ).mappings().one()
     return dict(row)
+
+
+def _close_quality_task(
+    connection: Connection, *, tenant_id: str, task: dict[str, Any], actor_id: str, actor_role_code: str,
+    reason: str,
+) -> None:
+    """The PC closes the image-quality task by hand. The task event (written by
+    ``submit_action``) carries the comment, who and when; the result repeats
+    them. ``acceptedIssueHash`` keeps the file's next sync from reopening the
+    task while the refused page is still on the file: the page itself is not
+    touched (it stays failed, or swept by the day-end clean-up)."""
+    reference = dict(task["reference"] or {})
+    result: dict[str, Any] = {
+        "outcome": "CLOSED_BY_PC", "acceptedIssueHash": reference.get("issueHash"),
+        "closedBy": actor_id, "closedRole": actor_role_code, "closedAt": datetime.now(UTC).isoformat(),
+        "reason": reason,
+    }
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_tasks
+            SET task_status='VERIFIED_COMPLETE', verified_at_utc=now(),
+                completion_result=CAST(:result AS jsonb), updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND task_id=:task_id
+            """
+        ),
+        {"tenant_id": tenant_id, "task_id": task["task_id"], "result": _json(result)},
+    )
 
 
 def _enqueue_verification(
@@ -382,6 +416,15 @@ def submit_action(
             f"This task is assigned to role {assigned_role_code}, not {actor_role_code}"
         )
 
+    if action == CLOSE_TASK:
+        if task["task_type"] != QUALITY_TASK:
+            raise ValueError(f"Action {action} is only for the image-quality task")
+        # Checked here, on the server, before anything is written: the web
+        # page asks for the comment too, but is not what enforces it.
+        comment = (comment or "").strip()
+        if not comment:
+            raise ValueError("Write a comment to close this task, for example that the document was uploaded.")
+
     journey_id = UUID(str(task["journey_id"]))
     record_task_event(
         connection,
@@ -394,6 +437,13 @@ def submit_action(
         comment=comment,
         details=details,
     )
+
+    if action == CLOSE_TASK:
+        _close_quality_task(
+            connection, tenant_id=tenant_id, task=task, actor_id=actor_id,
+            actor_role_code=actor_role_code, reason=str(comment),
+        )
+        return {"taskId": str(task_id), "status": "VERIFIED_COMPLETE", "outcome": "CLOSED_BY_PC"}
 
     if action in {"ADD_COMMENT", "PROVIDE_FEEDBACK"}:
         connection.execute(
