@@ -138,7 +138,7 @@ _NIGHT_DUE = "2026-10-21T17:00:00+00:00"
           "attemptsMade": 3, **_AI}, "FAILED", f"AI reading failed — {_THREE}. Please upload this page again.",
          "DOCUMENT_AI_RESPONSE_INVALID"),
         ({"state": "FAILED", "failureCode": "DOCUMENT_AI_RATE_LIMITED", **_AI}, "FAILED",
-         "AI reading failed — tried again automatically. Please upload this page again.", "DOCUMENT_AI_RATE_LIMITED"),
+         "AI reading failed — tried once. Please upload this page again.", "DOCUMENT_AI_RATE_LIMITED"),
         # The AI refused outright: at once.
         ({"state": "CLASSIFIED", "processingStatus": "FAILED", "processingFailureCode": "DOCUMENT_AI_REQUEST_REJECTED",
           **_AI}, "FAILED", "AI couldn't read this page — please upload it again.", "DOCUMENT_AI_REQUEST_REJECTED"),

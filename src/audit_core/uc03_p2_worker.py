@@ -1670,12 +1670,17 @@ NOT_READ_IN_TIME_REASON = "Not read within 30 minutes. Please upload this page a
 
 
 def _attempts_text(di_item: dict[str, Any]) -> str:
-    """How many times the step was tried, as DI counted it (2026-10-21)."""
+    """How many times the step was tried, as DI counted it (2026-10-21).
+    One attempt -- or a count DI does not report -- says "tried once": DI
+    refuses a retry that would start more than 25 minutes after it received
+    the page, so a page that failed late (queued behind a burst) fails after
+    one attempt, and "tried again automatically" would be untrue (review of
+    #469, second review)."""
     attempts = di_item.get("attemptsMade")
     if isinstance(attempts, int) and attempts > 1:
         return f"tried {attempts} times (at once, then 10 and 20 minutes later)" if attempts == 3 \
             else f"tried {attempts} times"
-    return "tried again automatically"
+    return "tried once"
 
 
 def _di_failure_code(di_item: dict[str, Any]) -> str:
@@ -3532,10 +3537,14 @@ def apply_retry_policy_rollout(connection, *, tenant_id: str) -> int | None:
 # copying its values) counts as read.
 READ_CEILING = timedelta(minutes=30)
 # Grouping (review of #469, 2026-10-21): the pages of one document are put
-# together only once every page of the file is identified, which can be late
-# in the 30 minutes. Grouping and the documents it makes get a bounded grace:
-# they settle within 40 minutes of the upload, or fail and are resubmitted.
-GROUPING_CEILING = timedelta(minutes=40)
+# together only once every page of the file is identified. That gets no extra
+# time: a document made by grouping is bound by the same 30 minutes from the
+# upload ("No file should take more than 30 mins"), so a file never waits
+# longer than that before it is read or failed and resubmitted. (An earlier
+# draft gave grouping 40 minutes; the independent review found that broke the
+# rule.) GROUPING_CEILING stays a named constant so the rule is read in one
+# place, and is tied to READ_CEILING so the two cannot drift apart.
+GROUPING_CEILING = READ_CEILING
 _UNSETTLED_PAGE_STATES = tuple(s for s in _PAGE_ACTIVE_STATES if s != "SYNCING_TO_AUDIT_CORE")
 _UNSETTLED_BATCH_STATES = ("AWAITING_UPLOAD", "UPLOADED", "SPLITTING")
 GROUPING_FAILED_CODE = "GROUPING_FAILED"
@@ -3592,10 +3601,10 @@ def fail_unsettled_pages(connection, *, tenant_id: str, now: datetime | None = N
     - Every page still not settled 30 minutes after its clock started is
       FAILED with "Not read within 30 minutes" (a page our setup refused
       keeps that reason: the night re-read of it is what ran out of time).
-      A document grouping made from several pages settles within 40
-      minutes of the upload (GROUPING_CEILING).
+      A document made by grouping several pages gets the same 30 minutes
+      from the upload (GROUPING_CEILING is READ_CEILING).
     - Every file not uploaded or split into pages within 30 minutes is
-      FAILED; grouping not done within 40 minutes fails the pages that
+      FAILED; grouping not done within 30 minutes fails the pages that
       waited for it (_fail_grouping).
     - Their pending send / read-again / split / grouping work is cancelled,
       and the DI document of every page failed here is withdrawn (deleted at

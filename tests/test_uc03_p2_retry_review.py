@@ -230,13 +230,37 @@ def test_di_retrying_a_page_is_waited_for_and_its_final_failure_says_how_often_i
     ({"state": "FAILED", "failureCode": "CORRUPT", "failureKind": "DOCUMENT", "scanPassed": False},
      "File couldn't be scanned — please reload it."),
     ({"state": "CLASSIFIED", "processingStatus": "FAILED", "processingFailureCode": "DOCUMENT_AI_CONTENT_BLOCKED",
-      "failureKind": "AI", "scanPassed": True},
-     "AI couldn't read this page — please upload it again."),
+      "failureKind": "DOCUMENT", "scanPassed": True},
+     "AI declined to read this page's content — check the page and upload it again."),
 ])
 def test_a_refusal_fails_at_once(item, reason):
     outcome = worker.classify_page_outcome(di_item=item, extracted_count=0, submitted_at=None, facts_copy=None,
                                            now=datetime.now(UTC))
     assert (outcome.status, outcome.reason) == ("FAILED", reason)
+
+
+@pytest.mark.parametrize(("attempts", "tried"), [
+    (None, "tried once"),  # DI does not say how many: never claim a retry that may not have happened
+    (1, "tried once"),  # failed late (queued behind a burst): DI's 25-minute cap allowed no retry
+    (2, "tried 2 times"),
+    (3, "tried 3 times (at once, then 10 and 20 minutes later)"),
+])
+@pytest.mark.parametrize(("item", "template"), [
+    ({"state": "CLASSIFIED", "processingStatus": "FAILED", "processingFailureCode": "DOCUMENT_AI_UNAVAILABLE",
+      "failureKind": "AI", "scanPassed": True}, "AI reading failed — {tried}. Please upload this page again."),
+    ({"state": "FAILED", "failureCode": "CLASSIFICATION_FAILED", "failureKind": "TECHNICAL", "scanPassed": True},
+     "Document service couldn't process this page — {tried}. Retry the page from the card, or upload it again."),
+])
+def test_the_failure_reason_says_how_many_times_the_page_was_tried(item, template, attempts, tried):
+    """Review of #469 (second review): DI refuses a retry that would start more
+    than 25 minutes after it received the page, so a page can fail after one
+    attempt. The reason must then say "tried once", never "tried again"."""
+    if attempts is not None:
+        item = {**item, "attemptsMade": attempts}
+    outcome = worker.classify_page_outcome(di_item=item, extracted_count=0, submitted_at=None, facts_copy=None,
+                                           now=datetime.now(UTC))
+    assert (outcome.status, outcome.reason) == ("FAILED", template.format(tried=tried))
+    assert "again automatically" not in outcome.reason
 
 
 def test_a_dead_read_again_fails_the_page_for_the_pc(journey):
@@ -357,15 +381,15 @@ def test_one_resubmit_task_per_file_listing_each_failed_page(journey):
     batch_id, first, _ = add_page(journey, page_number=1, status="FAILED")
     _, second, _ = add_page(journey, page_number=2, status="FAILED")
     _sql(journey, "UPDATE auditcore.p2_document_queue SET batch_id=:b WHERE queue_id=:q", b=batch_id, q=second)
-    _sql(journey, "UPDATE auditcore.p2_document_queue SET status_reason='AI couldn''t read this page — please "
-                  "upload it again.', last_error='DOCUMENT_AI_CONTENT_BLOCKED' WHERE queue_id=:q", q=first)
+    _sql(journey, "UPDATE auditcore.p2_document_queue SET status_reason='AI declined to read this page''s "
+                  "content — check the page and upload it again.', last_error='DOCUMENT_AI_CONTENT_BLOCKED' WHERE queue_id=:q", q=first)
     _sql(journey, "UPDATE auditcore.p2_document_queue SET status_reason=:r, last_error='NOT_READ_IN_30_MIN' "
                   "WHERE queue_id=:q", q=second, r=worker.NOT_READ_IN_TIME_REASON)
     _sync_tasks(journey)
     [task] = _open_tasks(journey)
     assert task["title"] == "scan.pdf: 2 pages to resubmit"
-    assert task["description"].startswith("Page 1: AI couldn't read this page — please upload it again. "
-                                          "Page 2: Not read within 30 minutes. Please upload this page again.")
+    assert task["description"].startswith("Page 1: AI declined to read this page's content — check the page and "
+                                          "upload it again. Page 2: Not read within 30 minutes. Please upload this page again.")
     assert task["reference"]["category"] == "DOCUMENT_RESUBMIT" and task["reference"]["pageNumbers"] == [1, 2]
     assert [p["code"] for p in task["reference"]["pages"]] == ["DOCUMENT_AI_CONTENT_BLOCKED", "NOT_READ_IN_30_MIN"]
     # Page 2 is read after a Retry: it leaves the task; page 1 uploaded again (superseded): the task closes.
@@ -491,14 +515,15 @@ def test_the_daily_processing_report_carries_the_failed_pages(journey, monkeypat
     monkeypatch.setattr(storage, "get_p2_document_storage", lambda: FakeStorage())
     tl = _tl(journey)
     _, queue_id, _ = add_page(journey, status="FAILED")
-    _sql(journey, "UPDATE auditcore.p2_document_queue SET status_reason='AI couldn''t read this page — please "
-                  "upload it again.', last_error='DOCUMENT_AI_CONTENT_BLOCKED' WHERE queue_id=:q", q=queue_id)
+    _sql(journey, "UPDATE auditcore.p2_document_queue SET status_reason='AI declined to read this page''s "
+                  "content — check the page and upload it again.', last_error='DOCUMENT_AI_CONTENT_BLOCKED' WHERE queue_id=:q", q=queue_id)
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         day = connection.execute(text("SELECT (now() AT TIME ZONE 'Asia/Kolkata')::date")).scalar_one()
         report = build_daily_processing_report(connection, tenant_id=journey.tenant_id, actor_id=tl, day=day)
     [row] = report["failedPages"]
-    assert row["queueId"] == str(queue_id) and row["reason"] == "AI couldn't read this page — please upload it again."
+    assert row["queueId"] == str(queue_id) and (row["reason"] == "AI declined to read this page's content — check the page and "
+                                                            "upload it again.")
     assert row["openUrl"].startswith("https://signed.example/")
 
 
@@ -745,17 +770,19 @@ def test_the_grouping_resubmit_task_closes_when_the_pages_are_uploaded_again(jou
     assert _open_tasks(journey) == []
 
 
-def test_grouping_gets_a_bounded_grace_then_fails_with_a_resubmit_task(journey):
-    """Review of #469: grouping starts only once every page is identified,
-    so it (and the document it makes) may settle up to 40 minutes after the
-    upload; then it fails and the PC resubmits."""
-    batch_id, pages = _grouping_batch(journey, created_minutes_ago=35, grouping_status="PENDING")
+def test_grouping_gets_no_more_than_30_minutes_then_fails_with_a_resubmit_task(journey):
+    """Review of #469 (second review): grouping starts only once every page
+    is identified, but it gets no extra time -- no file takes more than 30
+    minutes, so a file whose grouping is still not done 30 minutes after the
+    upload fails and the PC resubmits."""
+    assert worker.GROUPING_CEILING == worker.READ_CEILING == timedelta(minutes=30)
+    batch_id, pages = _grouping_batch(journey, created_minutes_ago=25, grouping_status="PENDING")
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         enqueue_work(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id, work_type="BATCH_GROUP",
                      work_key=str(batch_id), payload={}, delay_seconds=600, correlation_id=None)
-    assert _watchdog(journey) == 0  # 35 minutes: inside the grace
-    _sql(journey, "UPDATE auditcore.p2_upload_batches SET created_at_utc=now() - interval '41 minutes' "
+    assert _watchdog(journey) == 0  # 25 minutes: still inside the 30
+    _sql(journey, "UPDATE auditcore.p2_upload_batches SET created_at_utc=now() - interval '31 minutes' "
                   "WHERE batch_id=:b", b=batch_id)
     assert _watchdog(journey) == 2
     assert queue_row(journey, "BATCH_GROUP", str(batch_id))["work_status"] == "CANCELLED"
@@ -763,16 +790,18 @@ def test_grouping_gets_a_bounded_grace_then_fails_with_a_resubmit_task(journey):
     assert [t["task_type"] for t in _open_tasks(journey)] == ["DOCUMENT_RESUBMIT"]
 
 
-def test_a_document_made_by_grouping_settles_within_40_minutes_of_the_upload(journey):
-    batch_id, _ = _grouping_batch(journey, created_minutes_ago=35, grouping_status="GROUPED")
+def test_a_document_made_by_grouping_is_failed_30_minutes_after_the_upload(journey):
+    """Review of #469 (second review): a document made by grouping is bound by
+    the same 30 minutes from the upload as every other unit -- not 40."""
+    batch_id, _ = _grouping_batch(journey, created_minutes_ago=25, grouping_status="GROUPED")
     [group] = _sql(journey, "INSERT INTO auditcore.p2_document_queue (tenant_id, batch_id, journey_id, page_number, "
                             "page_numbers, page_sha256, page_object_key, client_upload_id, queue_status, unit_kind) "
                             "VALUES (:t, :b, :j, 1, ARRAY[1,2], 'g', 'k', 'p2g-y', 'QUEUED', 'GROUP') "
                             "RETURNING queue_id", b=batch_id)
-    assert _watchdog(journey) == 0  # made at 35 minutes: not failed for the grouping starting late
-    _sql(journey, "UPDATE auditcore.p2_upload_batches SET created_at_utc=now() - interval '41 minutes' "
+    assert _watchdog(journey) == 0  # 25 minutes: not failed yet
+    _sql(journey, "UPDATE auditcore.p2_upload_batches SET created_at_utc=now() - interval '31 minutes' "
                   "WHERE batch_id=:b", b=batch_id)
-    assert _watchdog(journey) == 1
+    assert _watchdog(journey) == 1  # 31 minutes (the old 40-minute grace would have kept it)
     assert _page(journey, group["queue_id"])["last_error"] == "NOT_READ_IN_30_MIN"
 
 
