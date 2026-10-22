@@ -329,7 +329,11 @@ def raise_price_mismatch_task(
             "masterExShowroom": str(master) if master is not None else None,
             "documentExShowroom": str(offered) if offered is not None else None,
         },
-        severity="MEDIUM",
+        # 2026-10-22 product owner: where the SKU the booking form's words name has a
+        # master ex-showroom that differs from the booking form's own, the PC validating
+        # the model is a High priority task. A price that was not read, and the
+        # invoice's own price check, stay Medium: they are not part of that rule.
+        severity="HIGH" if (not invoice and offered is not None) else "MEDIUM",
         registry=get_registry(),
     )
     return key

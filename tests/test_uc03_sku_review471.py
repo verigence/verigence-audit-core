@@ -216,6 +216,7 @@ def test_s5_an_unreadable_invoice_price_task_stays_open(journey):
     task = _sku_task(c, "SKU_PRICE_MISMATCH")
     assert _vehicle(c)["match_basis"] == "AUTO_PRICE_MISMATCH" and task["task_status"] == "READY"
     assert task["title"] == "SKU price could not be checked: the vehicle invoice's ex-showroom was not read"
+    assert task["severity"] == "MEDIUM"  # only the booking form's differing price is High
 
 
 # ── B3 ────────────────────────────────────────────────────────────────────────
