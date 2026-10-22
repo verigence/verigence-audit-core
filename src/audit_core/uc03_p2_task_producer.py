@@ -30,7 +30,7 @@ from sqlalchemy import Connection, text
 from audit_core.uc03_p2_document_health import TL_AFTER_SECONDS
 from audit_core.uc03_p2_names import display_name, same_organisation, same_person
 from audit_core.uc03_p2_registry import ControlTemplate, Registry, get_registry
-from audit_core.uc03_p2_runtime import swept_pending_sql
+from audit_core.uc03_p2_runtime import dayend_removal_notice, swept_pending_sql
 from audit_core.uc03_p2_stage import unreviewed_fields
 from audit_core.uc03_p2_tasks import record_task_event
 
@@ -699,10 +699,12 @@ def _sync_quality_task(
                     f"{rejection_words(reason)}" for reason, group in by_reason.items())
     count = len(pages)
     title = f"{filename}: {count} page{'' if count == 1 else 's'} refused for image quality"
-    description = (f"Refused by the scan-quality check and not read: {why}. A retry will not help. Scan "
+    description = (f"Refused by the scan-quality check and not read: {why}. A retry will not help. "
+                   f"{dayend_removal_notice(count)} Scan "
                    f"{'it' if count == 1 else 'them'} again in good light, flat and in focus, and upload from "
                    "Upload / Edit Documents. This task closes itself once the refused pages are processed or "
-                   "removed; delete this booking if nothing on it can be used.")
+                   "removed (the day-end clean-up only takes them off the journey; it does not close this "
+                   "task); delete this booking if nothing on it can be used.")
     _, outcome = raise_or_refresh(
         connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=f"upload-quality:{journey_id}:{batch_id}",
         task_type="PC_PAGE_QUALITY_REJECTED", source_type="DOCUMENT", source_code="DOCUMENT_QUALITY_REJECTED",

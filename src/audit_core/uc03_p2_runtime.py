@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from typing import Any
 from uuid import UUID
 
+import structlog
 from sqlalchemy import Connection, text
 
 
@@ -223,6 +225,43 @@ def enqueue_work(
             "correlation_id": correlation_id,
         },
     )
+
+
+_runtime_logger = structlog.get_logger(__name__)
+
+
+def hhmm(value: str, default: str) -> str:
+    """``HH:MM`` from an environment variable; anything that is not a clock
+    time falls back to ``default`` (a typo must not stop the worker)."""
+    hour, sep, minute = value.strip().partition(":")
+    if sep and hour.isdigit() and minute.isdigit() and 0 <= int(hour) <= 23 and 0 <= int(minute) <= 59:
+        return f"{int(hour):02d}:{int(minute):02d}"
+    _runtime_logger.warning("p2_dayend_sweep_time_invalid", value=value, using=default)
+    return default
+
+
+# When (UTC, HH:MM) the day-end sweep runs (product owner 2026-10-22, moved
+# the same day): 02:00 IST = 20:30 UTC, the evening of the previous UTC day.
+# P2_DAYEND_SWEEP_UTC overrides it. The PC's messages quote this time in IST.
+DAYEND_SWEEP_DEFAULT_UTC = "20:30"
+DAYEND_SWEEP_UTC = hhmm(os.environ.get("P2_DAYEND_SWEEP_UTC", DAYEND_SWEEP_DEFAULT_UTC), DAYEND_SWEEP_DEFAULT_UTC)
+
+
+def dayend_sweep_ist() -> str:
+    """The configured sweep time as the PC reads it: ``HH:MM IST``."""
+    hour, _, minute = DAYEND_SWEEP_UTC.partition(":")
+    total = (int(hour) * 60 + int(minute) + 330) % 1440
+    return f"{total // 60:02d}:{total % 60:02d} IST"
+
+
+def dayend_removal_notice(pages: int = 1) -> str:
+    """What the PC is told about a page refused for image quality: the system
+    clears it at the day-end clean-up, and a clearer copy is still needed."""
+    if pages == 1:
+        return (f"This page will be removed by the system at the day-end clean-up ({dayend_sweep_ist()}). "
+                "Please upload a clearer copy.")
+    return (f"These pages will be removed by the system at the day-end clean-up ({dayend_sweep_ist()}). "
+            "Please upload clearer copies.")
 
 
 # The day-end sweep (product owner 2026-10-22) clears the pages that ended
