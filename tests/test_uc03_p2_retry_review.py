@@ -485,9 +485,10 @@ def test_no_night_look_up_or_night_marker_is_left_in_the_code():
         assert decision not in inspect.getsource(worker._recover_page)
 
 
-def test_the_nightly_review_of_deliveries_is_left_alone(journey, monkeypatch):
+def test_the_nightly_review_of_deliveries_is_left_alone(journey, monkeypatch, capsys):
     """The delivery review (P2_NIGHTLY_REVIEW_UTC) is not document processing
-    and still runs, claimed once, in the same pass."""
+    and still runs, claimed once, in the same pass. The nightly SKU retry is
+    switched off (product owner, 2026-10-22) and is not called."""
     assert worker._NIGHTLY_REVIEW_UTC == "20:30"
     called = []
     from audit_core import uc03_p2_audit_rules as rules
@@ -501,7 +502,10 @@ def test_the_nightly_review_of_deliveries_is_left_alone(journey, monkeypatch):
     worker._last_sweep_at.pop(journey.tenant_id, None)
     worker._last_nightly_review.pop(journey.tenant_id, None)
     worker._maybe_sweep(journey.engine, journey.tenant_id)
-    assert called == ["review", "sku"]
+    assert called == ["review"]
+    # The night's log line used to raise (a duplicate "journeys" keyword) and
+    # was reported as a failed review although the work was done.
+    assert "p2_nightly_review_failed" not in capsys.readouterr().out
 
 
 # ------------------------------------------------------------------- the failure report and the page link

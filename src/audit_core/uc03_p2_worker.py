@@ -3732,7 +3732,7 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
             queued = queue_nightly_review(connection, tenant_id=tenant_id)
             swept = queue_nightly_upload_sweep(connection, tenant_id=tenant_id)
         _last_nightly_review[tenant_id] = due
-        logger.info("p2_nightly_review_queued", tenant_id=tenant_id, night=due, journeys=queued, **swept)
+        logger.info("p2_nightly_review_queued", tenant_id=tenant_id, night=due, deliveries_reviewed=queued, **swept)
     except Exception:
         logger.warning("p2_nightly_review_failed", tenant_id=tenant_id, exc_info=True)
 
