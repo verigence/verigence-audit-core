@@ -281,11 +281,12 @@ QUALITY_CLOSE_INSTRUCTION = (
 # removes, a swept page keeps its failure code and reason, and it still counts
 # as a failed page of its file -- the file's "Document to resubmit" task stays
 # open, the failure report still lists it -- until it is replaced by a
-# re-upload or removed by a person (last_error then holds one of
-# SWEPT_RESOLVED_CODES). No column marks it: the event does.
+# re-upload (last_error then holds SWEPT_RESOLVED_CODES) or removed by a
+# person (a PAGE_REMOVED event for the unit; its failure code is kept, as for
+# any removed page). No column marks it: the events do.
 PAGE_SWEPT_EVENT = "PAGE_SWEPT"
-SWEPT_REMOVED_CODE = "SWEPT_PAGE_REMOVED"
-SWEPT_RESOLVED_CODES = ("SUPERSEDED_PAGE", SWEPT_REMOVED_CODE)
+PAGE_REMOVED_EVENT = "PAGE_REMOVED"
+SWEPT_RESOLVED_CODES = ("SUPERSEDED_PAGE",)
 
 
 def swept_pending_sql(alias: str = "q") -> str:
@@ -297,7 +298,10 @@ def swept_pending_sql(alias: str = "q") -> str:
         f"AND {alias}.last_error NOT IN ({resolved}) "
         f"AND EXISTS (SELECT 1 FROM auditcore.p2_activity_events sw "
         f"WHERE sw.tenant_id={alias}.tenant_id AND sw.journey_id={alias}.journey_id "
-        f"AND sw.event_type='{PAGE_SWEPT_EVENT}' AND sw.subject_id={alias}.queue_id::text))"
+        f"AND sw.event_type='{PAGE_SWEPT_EVENT}' AND sw.subject_id={alias}.queue_id::text) "
+        f"AND NOT EXISTS (SELECT 1 FROM auditcore.p2_activity_events rm "
+        f"WHERE rm.tenant_id={alias}.tenant_id AND rm.journey_id={alias}.journey_id "
+        f"AND rm.event_type='{PAGE_REMOVED_EVENT}' AND rm.subject_id={alias}.queue_id::text))"
     )
 
 
