@@ -1885,12 +1885,20 @@ def _document_tasks(
                     else "No vehicle invoice names this SKU at this price any more"),
         )
     if inv.get("review"):
-        for reading, res in inv["review"]:
+        review_keep = {
             raise_invoice_review_task(
                 connection, tenant_id=tenant_id, journey_id=journey_id, current_sku_code=state["sku_code"],
                 current_basis=state.get("match_basis"), invoice_row=res.row, invoice=reading,
                 evidence=_evidence(reading, res, check="MATCH", plan=ev["plan"], on=ev["on"]),
             )
+            for reading, res in inv["review"]
+        }
+        # A review of a SKU no invoice names any more closes (an invoice that
+        # was corrected must not leave the old SKU for the Team Lead to accept).
+        resolve_invoice_review_task(
+            connection, tenant_id=tenant_id, journey_id=journey_id, keep=review_keep,
+            reason="No vehicle invoice names this SKU at its master price any more",
+        )
         info["reviewRaised"] = True
     elif not ev.get("skipped"):
         resolve_invoice_review_task(connection, tenant_id=tenant_id, journey_id=journey_id)
@@ -2070,12 +2078,20 @@ def _invoice_colour_for_pin(connection: Connection, *, tenant_id: str, journey_i
 def _keep_pin(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, raise_findings: bool,
     state: dict[str, Any], info: dict[str, Any] | None = None, checked: bool = False,
-    ev: dict[str, Any] | None = None, named: bool = False,
+    ev: dict[str, Any] | None = None, named: bool = False, booking_not_naming: bool = False,
 ) -> dict[str, Any]:
-    from audit_core.uc03_sku_tasks import resolve_not_confirmed_task
+    from audit_core.uc03_sku_tasks import (
+        resolve_not_confirmed_task,
+        resolve_price_mismatch_tasks,
+    )
 
     if ev is not None and not ev.get("skipped"):
         _invoice_colour_for_pin(connection, tenant_id=tenant_id, journey_id=journey_id, ev=ev)
+    if booking_not_naming:
+        # KEEP: the booking form no longer names this SKU (it fits several, or
+        # none), so its "master X vs booking Y" task has nothing left to ask.
+        resolve_price_mismatch_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, source="BOOKING",
+                                     keep=set(), reason="The booking form no longer names this SKU")
     if named:
         resolve_not_confirmed_task(connection, tenant_id=tenant_id, journey_id=journey_id,
                                    reason="A document names the SKU again")
@@ -2374,6 +2390,13 @@ def _raise_not_identified(
         description=description, safe_payload=safe_payload, task_payload_extra=task_payload_extra,
         correlation_id=correlation_id,
     )
+    # A closest-SKU suggestion that no longer stands (the words now fit several
+    # SKUs, or the model is in another month's list) is closed: it must not
+    # stay for the PC to accept and pin with no document behind it.
+    if other_lists or not picked["guess"]:
+        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id,
+                        dedupe_key=f"sku-closest:{journey_id}",
+                        evidence={"reason": "The documents no longer suggest a closest SKU"})
     # Model in another month's list: a Team Lead approves pricing on it first.
     # A closest guess goes to the PC to accept or reject -- never pinned.
     if not other_lists:
@@ -2971,7 +2994,7 @@ def _sync_model_resolution_unguarded(
             return _apply_booking(connection, ev=ev, info=info, check=plan["check"], basis=plan["basis"], **common)
         if action == "KEEP":
             return _keep_pin(connection, state=state, info=info, checked=bool(ev["invoices"]), ev=ev,
-                             named=bool(plan.get("named")), **common)
+                             named=bool(plan.get("named")), booking_not_naming=True, **common)
         if action == "UNCONFIRMED":
             return _apply_unconfirmed(connection, ev=ev, state=state, plan=plan, info=info, **common)
         if action == "INVOICE_WORDS_PIN":

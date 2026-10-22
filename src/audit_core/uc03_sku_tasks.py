@@ -518,20 +518,23 @@ def resolve_not_confirmed_task(connection: Connection, *, tenant_id: str, journe
 def raise_invoice_review_task(
     connection: Connection, *, tenant_id: str, journey_id: UUID, current_sku_code: str | None,
     current_basis: str | None, invoice_row: dict[str, Any], invoice: dict[str, Any], evidence: dict[str, Any],
-) -> None:
+) -> str:
     """The vehicle invoice names a different SKU, at its master price, from
     the one a PC or Team Lead set. A human decision is never overwritten
-    automatically: the Team Lead applies the invoice's SKU or keeps it."""
+    automatically: the Team Lead applies the invoice's SKU or keeps it.
+    Returns the task's dedupe key (the caller keeps it open and closes the
+    others)."""
     from audit_core.uc03_p2_registry import get_registry
     from audit_core.uc03_p2_task_producer import raise_or_refresh
 
     vehicle = _vehicle_label(invoice_row.get("model_name"), invoice_row.get("variant_name"), None)
     who = "the Team Lead" if current_basis == "TL_APPROVED" else "the PC"
+    key = f"sku-invoice-review:{journey_id}:{invoice_row.get('product_sku_id')}"
     raise_or_refresh(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
-        dedupe_key=f"sku-invoice-review:{journey_id}:{invoice_row.get('product_sku_id')}",
+        dedupe_key=key,
         task_type=INVOICE_REVIEW_TASK,
         source_type="RESOLVER",
         source_code="SKU_INVOICE_REVIEW",
@@ -556,14 +559,22 @@ def raise_invoice_review_task(
         severity="HIGH",
         registry=get_registry(),
     )
+    return key
 
 
-def resolve_invoice_review_task(connection: Connection, *, tenant_id: str, journey_id: UUID) -> None:
+def resolve_invoice_review_task(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, keep: set[str] | None = None,
+    reason: str = "The invoice and the Journey's SKU agree",
+) -> None:
+    """Close the open invoice-review tasks except ``keep`` (the ones the
+    current invoices still call for): a review of a SKU no invoice names any
+    more must not stay for the Team Lead to accept."""
     from audit_core.uc03_p2_task_producer import resolve_if_open
 
     for key in _open_task_keys(connection, tenant_id=tenant_id, journey_id=journey_id, task_type=INVOICE_REVIEW_TASK):
-        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
-                        evidence={"reason": "The invoice and the Journey's SKU agree"})
+        if key not in (keep or set()):
+            resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                            evidence={"reason": reason})
 
 
 def resolve_automatic_match_tasks(
