@@ -721,6 +721,9 @@ def reresolve_all_skus(engine: Engine, tenant_id: str, *, actor_id: str | None =
       and basis, the proposed SKU and basis, the document's words, the
       master and document prices and the tasks that would be raised -- for
       the product owner to review before anything changes;
+    * the commit is refused (``CommitNotAllowed``, nothing written) unless a
+      completed dry run of the Project started in the last 24 hours exists
+      and no run has changed Journey data since;
     * the commit writes the same decisions, each Journey in its own
       transaction and savepoint (an error leaves it untouched, recorded as
       FAILED). An automatic SKU is replaced only when the documents now name
@@ -735,6 +738,9 @@ def reresolve_all_skus(engine: Engine, tenant_id: str, *, actor_id: str | None =
         result = backfill_sku_resolution_for_tenant(
             engine, tenant_id=tenant_id, offset=offset, limit=batch, run_id=run_id, actor_id=actor_id,
             recheck=RECHECK_COMMIT if commit else RECHECK_DRY_RUN,
+            # The same gate as the Apply button: no commit without a completed
+            # check of the Project from the last 24 hours (CommitNotAllowed).
+            require_check=commit,
         )
         run_id = result["runId"]
         offset = result["nextOffset"]

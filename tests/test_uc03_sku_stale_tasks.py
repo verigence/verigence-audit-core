@@ -10,6 +10,9 @@ is closed by the next run, never left READY for a PC / Team Lead to accept.
 """
 from __future__ import annotations
 
+from decimal import Decimal
+
+import pytest
 import test_uc03_model_resolution as base
 from sqlalchemy import text
 from test_uc03_model_resolution import (
@@ -167,3 +170,69 @@ def test_c_the_booking_price_task_closes_when_only_an_invoice_names_the_sku(jour
     assert [(t["severity"], t["reference"].get("source")) for t in open_price] == [("MEDIUM", "INVOICE")], open_price
     assert next(t for t in _all(c, "SKU_PRICE_MISMATCH") if t["task_id"] == booking_task["task_id"])[
         "task_status"] == "VERIFIED_COMPLETE"
+
+
+# ── no model read any more ────────────────────────────────────────────────────
+def test_the_closest_match_task_closes_when_no_model_is_read_any_more(mahindra_journey):
+    c = mahindra_journey
+    _closest_setup(c)
+    _sync(c)
+    assert len(_open(c, "SKU_CLOSEST_MATCH_CONFIRM")) == 1
+
+    c.execute(text("UPDATE auditcore.journey_products SET model_name_snapshot=NULL, variant_name_snapshot=NULL "
+                   "WHERE tenant_id=:t AND journey_id=:j"), {"t": c.tenant_id, "j": c.journey_id})
+    result = _sync(c)
+    assert result.get("skipped") is True and result.get("reason") == "no_vehicle_model_read", result
+    assert _open(c, "SKU_CLOSEST_MATCH_CONFIRM") == []
+    assert _all(c, "SKU_CLOSEST_MATCH_CONFIRM")[0]["task_status"] == "VERIFIED_COMPLETE"
+    assert _vehicle(c)["product_sku_id"] is None
+
+
+# ── _money is strict: an amount or nothing, never a guess ─────────────────────
+@pytest.mark.parametrize(("text_value", "expected"), [
+    ("852000", "852000"), ("852000.00", "852000.00"), ("8,52,000", "852000"), ("852,000", "852000"),
+    ("₹8,52,000", "852000"), ("INR 8,52,000", "852000"), ("₹ 1,234.50", "1234.50"),
+    ("Rs. 8,52,000", "852000"), ("Rs.852000", "852000"), ("Rs 852000", "852000"), ("rs.852000", "852000"),
+    ("852000/-", "852000"), ("Rs. 8,52,000/-", "852000"), ("852000 /-", "852000"),
+    (852000, "852000"), (852000.5, "852000.5"), (Decimal("852000.00"), "852000.00"),
+])
+def test_money_reads_the_ways_dealers_write_an_amount(text_value, expected):
+    assert mr._money(text_value) == Decimal(expected)
+
+
+@pytest.mark.parametrize("text_value", [
+    "852000.00 (incl. GST)", "8.52 lakh", "8,52,00", "1,2,3", "Rs. 1.2.3", "Rs.", "1e5", "abc", "NaN",
+    "", "  ", "-", "n/a", None, True, float("nan"),
+])
+def test_money_gives_none_for_anything_that_is_not_an_amount(text_value):
+    assert mr._money(text_value) is None
+
+
+def _booking_at(c, price):
+    (rx,) = _seed_price_list(c, [{"model": "THAR", "variant": "RX", "components": {"EX_SHOWROOM": "852000"}}])
+    _booking_form(c, {"vehicle_model": "THAR", "vehicle_variant": "RX", "ex_showroom_price": price})
+    _sync(c)
+    return rx
+
+
+def test_a_booking_price_written_rs_with_a_slash_dash_equals_the_master(journey):
+    c = journey
+    rx = _booking_at(c, "Rs. 8,52,000/-")
+    v = _vehicle(c)
+    assert (v["product_sku_id"], v["match_basis"]) == (rx, "AUTO_MATCHED"), v
+    assert _open(c, "SKU_PRICE_MISMATCH") == []
+
+
+def test_a_booking_price_written_rs_that_differs_is_a_high_task_with_the_real_amount(journey):
+    c = journey
+    _booking_at(c, "Rs. 8,00,000/-")
+    (task,) = _open(c, "SKU_PRICE_MISMATCH")
+    assert task["severity"] == "HIGH"
+    assert "Rs 8,00,000.00" in task["title"] and "Rs 8,52,000.00" in task["title"], task["title"]
+
+
+def test_a_booking_price_with_words_after_it_is_not_read_and_is_a_medium_task(journey):
+    c = journey
+    _booking_at(c, "852000.00 (incl. GST)")
+    (task,) = _open(c, "SKU_PRICE_MISMATCH")
+    assert task["severity"] == "MEDIUM" and "was not read" in task["title"], task["title"]

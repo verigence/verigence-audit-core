@@ -325,10 +325,28 @@ def test_a_run_is_continued_in_its_own_mode(project):
     assert _run(project, runId=uuid4(), offset=0).status_code == 404
 
 
-def test_the_worker_path_is_not_gated(project):
-    """AUDIT_CORE_SKU_RUN_TAG "...-commit" keeps writing without a check (an operator's call)."""
+def test_the_worker_commit_path_is_gated_like_apply(project):
+    """AUDIT_CORE_SKU_RUN_TAG "...-commit" (``reresolve_all_skus(commit=True)``) needs
+    the same completed check from the last 24 hours as the Apply button (product
+    owner, 2026-10-22); the dry-run path needs none."""
+    before = _snapshot(project)
+    with pytest.raises(backfill.CommitNotAllowed) as refused:
+        backfill.reresolve_all_skus(project.engine, project.tenant_id, commit=True, batch=25)
+    assert refused.value.detail["code"] == "NO_CHECK_RUN"
+    assert _snapshot(project) == before  # nothing written, no run row made
+    with project.engine.begin() as c:
+        set_tenant_context(c, project.tenant_id)
+        assert c.execute(text("SELECT count(*) FROM auditcore.sku_resolution_runs WHERE tenant_id=:t"),
+                         {"t": project.tenant_id}).scalar_one() == 0
+
+    check = backfill.reresolve_all_skus(project.engine, project.tenant_id, batch=25)
+    assert check["runMode"] == "RERESOLVE_DRY_RUN"
     result = backfill.reresolve_all_skus(project.engine, project.tenant_id, commit=True, batch=25)
-    assert result["runMode"] == "RERESOLVE_COMMIT" and result["checkedByRunId"] is None
+    assert result["runMode"] == "RERESOLVE_COMMIT" and result["checkedByRunId"] == check["runId"]
+    # The check is used up by the Apply, as for the button.
+    with pytest.raises(backfill.CommitNotAllowed) as again:
+        backfill.reresolve_all_skus(project.engine, project.tenant_id, commit=True, batch=25)
+    assert again.value.detail["code"] == "DATA_CHANGED_SINCE_CHECK"
 
 
 def test_only_a_super_admin_may_run_it():

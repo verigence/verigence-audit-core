@@ -59,3 +59,53 @@ def test_the_run_pages_until_done_and_does_not_repeat_for_the_same_tag(monkeypat
     done.clear()
     worker._sku_run_once(_Engine(), "unresolved-2026-10-20")
     assert flags[-1] is True
+
+
+def test_a_refused_commit_tag_says_so_in_plain_words_and_can_be_set_again(monkeypatch):
+    """The worker's "-commit" tag is gated like Apply: refused, it logs why in
+    plain words (not "sku_run_failed") and leaves no run row, so the same tag
+    runs once a check exists."""
+    logged: list[tuple[str, dict]] = []
+
+    class _Log:
+        def warning(self, event, **kw):
+            logged.append((event, kw))
+
+        def info(self, event, **kw):
+            logged.append((event, kw))
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, *_args, **_kwargs):
+            class _R:
+                def first(self_inner):
+                    return None
+            return _R()
+
+    class _Engine:
+        def begin(self):
+            return _Conn()
+
+    def refuse(engine, tenant_id, actor_id=None, commit=False):
+        raise backfill.CommitNotAllowed({
+            "code": "NO_CHECK_RUN",
+            "message": 'There is no completed check of this Project\'s SKUs. Run "Check SKUs" first, review it, then Apply.',
+            "check": None,
+        })
+
+    monkeypatch.setattr(worker, "_active_tenants", lambda engine: ["t1"])
+    monkeypatch.setattr(worker, "set_tenant_context", lambda connection, tenant_id: None)
+    monkeypatch.setattr(worker, "logger", _Log())
+    monkeypatch.setattr(backfill, "reresolve_all_skus", refuse)
+    worker._sku_run_once(_Engine(), "reresolve-2026-10-22-commit")
+    events = [e for e, _ in logged]
+    assert events == ["sku_run_refused"], events
+    kw = logged[0][1]
+    assert kw["code"] == "NO_CHECK_RUN" and kw["tag"] == "reresolve-2026-10-22-commit"
+    assert "NOT run" in kw["message"] and "changed nothing" in kw["message"]
+    assert "Check SKUs" in kw["message"] and "within 24 hours" in kw["message"]

@@ -610,16 +610,31 @@ def _vehicle_invoice_readings(connection: Connection, *, tenant_id: str, journey
 
 
 # ── rule R1: the invoice's ex-showroom ────────────────────────────────────────
+# A rupee amount the way dealers write it: a plain number, Indian (8,52,000) or
+# western (852,000) thousands separators, optionally behind "Rs." / "Rs" / "INR" /
+# the rupee sign and followed by "/-". Nothing else is a price (no scope of error).
+_MONEY_PREFIX = re.compile(r"^(?:rs\.?|inr|\u20b9)\s*", re.IGNORECASE)
+_MONEY_SUFFIX = re.compile(r"\s*/-$")
+_MONEY_NUMBER = re.compile(
+    r"^-?(?:\d+|\d{1,2}(?:,\d{2})*,\d{3}|\d{1,3}(?:,\d{3})+)(?:\.\d+)?$"
+)
+
+
 def _money(value: Any) -> Decimal | None:
+    """A price as a Decimal, or None when it is not read. Strict: text that is
+    not exactly an amount ("852000.00 (incl. GST)", "8.52 lakh", "8,52,00",
+    "Rs. 1.2.3") is NOT a price and gives None -- never a guess from the digits
+    in it (the old version stripped every letter, so "Rs. 8,52,000" read as
+    0.852)."""
     if value is None or isinstance(value, bool):
         return None
-    text_value = str(value).strip().replace(",", "").replace("₹", "")
-    if not text_value or text_value.lower() in {"n/a", "na", "none", "null", "-"}:
+    if isinstance(value, (int, float, Decimal)):
+        number = Decimal(str(value))
+        return number if number.is_finite() else None
+    text_value = _MONEY_SUFFIX.sub("", _MONEY_PREFIX.sub("", str(value).strip(), count=1), count=1).strip()
+    if not _MONEY_NUMBER.fullmatch(text_value):
         return None
-    try:
-        return Decimal(re.sub(r"[^0-9.\-]", "", text_value) or "x")
-    except (InvalidOperation, ValueError):
-        return None
+    return Decimal(text_value.replace(",", ""))
 
 
 def invoice_ex_showroom(fields: dict[str, Any], document_type: str = "customer_invoice_dms",
@@ -2977,6 +2992,15 @@ def _sync_model_resolution_unguarded(
         action = plan["action"]
         if action == "SKIP":
             if raise_findings:
+                if ev.get("reason") == "no_vehicle_model_read":
+                    # No document names a model any more: a closest-SKU
+                    # suggestion made from the old text must not stay to be
+                    # accepted and pinned with no document behind it.
+                    from audit_core.uc03_p2_task_producer import resolve_if_open
+
+                    resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                    dedupe_key=f"sku-closest:{journey_id}",
+                                    evidence={"reason": "The documents no longer suggest a closest SKU"})
                 return {**ev, "taskOpen": _no_sku_task(connection, tenant_id=tenant_id, journey_id=journey_id,
                                                        ev=ev)}
             return ev

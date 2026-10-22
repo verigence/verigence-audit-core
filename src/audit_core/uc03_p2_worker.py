@@ -3197,7 +3197,9 @@ def _sku_run_once(engine: Engine, tag: str) -> None:
     writes the decisions. Nothing is cleared first; a SKU a PC or Team Lead
     set is never touched."""
     from audit_core.uc03_backfill_document_sync_producers import (
+        CommitNotAllowed,
         backfill_sku_resolution_for_tenant,
+        check_numbers_text,
         reresolve_all_skus,
     )
 
@@ -3233,6 +3235,18 @@ def _sku_run_once(engine: Engine, tag: str) -> None:
                 journeys=result.get("journeysTotal"), with_sku_before=result.get("withSkuBefore"),
                 with_sku_after=result.get("withSkuAfter"), without_sku_after=result.get("withoutSkuAfter"),
                 failed=len(result.get("journeysFailed") or []),
+            )
+        except CommitNotAllowed as refused:
+            # Nothing was written and no run row was made, so the same tag can
+            # be set again once the check is done.
+            logger.warning(
+                "sku_run_refused", tenant_id=tenant_id, tag=tag, code=refused.detail.get("code"),
+                message=(
+                    f"The SKU Apply run '{tag}' was NOT run for this Project and changed nothing: "
+                    f"{refused.detail['message']} {check_numbers_text(refused.detail.get('check'))} "
+                    "Set a 'reresolve-...' tag without '-commit' to run the check, review it, then set the "
+                    "'-commit' tag again within 24 hours."
+                ).strip(),
             )
         except Exception:
             logger.warning("sku_run_failed", tenant_id=tenant_id, tag=tag, exc_info=True)
