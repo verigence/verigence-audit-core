@@ -30,6 +30,7 @@ from sqlalchemy import Connection, text
 from audit_core.uc03_p2_document_health import TL_AFTER_SECONDS
 from audit_core.uc03_p2_names import display_name, same_organisation, same_person
 from audit_core.uc03_p2_registry import ControlTemplate, Registry, get_registry
+from audit_core.uc03_p2_runtime import swept_pending_sql
 from audit_core.uc03_p2_stage import unreviewed_fields
 from audit_core.uc03_p2_tasks import record_task_event
 
@@ -605,7 +606,7 @@ def resubmit_page_reason(code: str | None, status_reason: str | None) -> str:
     from audit_core.uc03_p2_daily_report import rejection_reason
 
     if str(code or "") == SETUP_FAILURE_CODE:
-        return _SETUP_PAGE_TEXT
+        return SETUP_PAGE_TEXT
     rejected = rejection_reason(code)
     if rejected is not None:
         return (f"Rejected by the scan-quality check: {_REASON_WORDS.get(rejected, 'not clear enough')}. Scan it "
@@ -621,8 +622,10 @@ def resubmit_page_reason(code: str | None, status_reason: str | None) -> str:
 RESUBMIT_TASK_TYPE = "DOCUMENT_RESUBMIT"
 RESUBMIT_CATEGORY = "DOCUMENT_RESUBMIT"
 # Gemini refused our key or model: our setup, not the page (2026-10-21).
+# Since 2026-10-22 nothing re-reads such a page at night, so it is failed and
+# resubmitted like any other; the text still says whose problem it is.
 SETUP_FAILURE_CODE = "DOCUMENT_AI_NOT_CONFIGURED"
-_SETUP_PAGE_TEXT = "Our setup problem — will be re-read once fixed; no need to re-upload."
+SETUP_PAGE_TEXT = "Our setup problem, not a problem with your file. Please upload this page again."
 # Why a file failed as a whole under the 30-minute ceiling
 # (uc03_p2_worker.fail_unsettled_pages); stored on the upload batch.
 FILE_NOT_UPLOADED_IN_TIME_REASON = ("The file did not finish uploading within 30 minutes. "
@@ -746,9 +749,13 @@ def sync_processing_failure_tasks(
     cfg_wanted: set[str] = set()
     quality_wanted: set[str] = set()
     counts: dict[str, int] = {}
+    # A page the day-end sweep cleared from the Journey (CANCELLED, PAGE_SWEPT)
+    # is still a failed page of its file until it is resubmitted: it keeps the
+    # file's "Document to resubmit" task open (product owner 2026-10-22). Its
+    # row is read as FAILED here; pages in every other state are as they are.
     batches = connection.execute(
         text(
-            """
+            f"""
             SELECT b.batch_id, b.original_filename, b.page_count, b.batch_status, b.created_at_utc,
                    b.failure_reason,
                    COUNT(q.queue_id) FILTER (WHERE q.queue_status NOT IN ('CANCELLED','MERGED')) AS total,
@@ -772,7 +779,13 @@ def sync_processing_failure_tasks(
                             FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')
                                       AND q.last_error LIKE 'DI_QUALITY_%'), '[]'::jsonb) AS quality_pages
             FROM auditcore.p2_upload_batches b
-            LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id=b.tenant_id AND q.batch_id=b.batch_id
+            LEFT JOIN (
+              SELECT p.tenant_id, p.batch_id, p.queue_id, p.page_number, p.page_numbers, p.status_reason,
+                     p.last_error,
+                     CASE WHEN {swept_pending_sql("p")} THEN 'FAILED' ELSE p.queue_status END AS queue_status
+              FROM auditcore.p2_document_queue p
+              WHERE p.tenant_id=:t AND p.journey_id=:j
+            ) q ON q.tenant_id=b.tenant_id AND q.batch_id=b.batch_id
             WHERE b.tenant_id=:t AND b.journey_id=:j
               AND b.batch_status NOT IN ('CANCELLED','COMPLETED')
             GROUP BY b.batch_id, b.original_filename, b.page_count, b.batch_status, b.created_at_utc,
@@ -812,9 +825,9 @@ def sync_processing_failure_tasks(
                 title=f"{filename}: the AI service refused our credentials",
                 description=(f"The AI service (Gemini) refused Document Intelligence's key or model while reading "
                              f"{filename}. This is a configuration problem on our side, not the PC's: raise it "
-                             "with support now. The pages are read again overnight once it is fixed (or press "
-                             "Retry on a page once support confirms); the PC has been told there is no need to "
-                             "re-upload. This task closes itself when the pages are read."),
+                             "with support now. Nothing reads these pages again by itself: once it is fixed the PC "
+                             "uploads them again. This task closes itself when the pages are read, uploaded "
+                             "again or removed."),
                 reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": SETUP_FAILURE_CODE,
                            "batchId": str(row["batch_id"]), "filename": filename},
                 severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
@@ -839,9 +852,9 @@ def sync_processing_failure_tasks(
                 lines = [f"{filename}: {why}" + ("" if "upload the file again" in why.lower()
                                                      else " Upload the file again from Upload / Edit Documents.")]
             elif only_setup:
-                title = f"{filename}: {_pages_text(failed_pages)} not read — our setup problem, no need to re-upload"
-                lines = [(f"{_pages_text(failed_pages).capitalize()}: {_SETUP_PAGE_TEXT} Your Team Lead has been "
-                          "alerted.")]
+                title = f"{filename}: {_pages_text(failed_pages)} not read — our setup problem, upload again"
+                lines = [(f"{_pages_text(failed_pages).capitalize()}: {SETUP_PAGE_TEXT} Your Team Lead has been "
+                          "alerted. This task closes itself once the page is uploaded again.")]
             else:
                 n = len(failed_pages)
                 title = f"{filename}: {n} page{'' if n == 1 else 's'} to resubmit"
@@ -857,7 +870,7 @@ def sync_processing_failure_tasks(
                            "sourceCode": "DOCUMENT_PROCESSING_FAILED", "category": RESUBMIT_CATEGORY,
                            "batchId": str(row["batch_id"]), "filename": filename, "pageNumbers": failed_pages,
                            "pages": pages, "setupOnly": only_setup},
-                severity="INFO" if only_setup else "HIGH", registry=registry,
+                severity="HIGH", registry=registry,
                 evaluation_started_at=evaluation_started_at,
             )
             counts[outcome] = counts.get(outcome, 0) + 1

@@ -50,6 +50,7 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_p2_access import authorize_p2
+from audit_core.uc03_p2_runtime import swept_pending_sql
 
 router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-daily-report"])
 
@@ -181,10 +182,13 @@ def build_daily_processing_report(
     ).mappings().all()
     batch_ids = [b for row in uploads for b in row["batch_ids"]]
 
+    # A page the day-end sweep cleared is still a failed document of its upload.
     units = connection.execute(
         text(
-            """
-            SELECT q.batch_id, q.queue_status, q.last_error, q.unit_kind,
+            f"""
+            SELECT q.batch_id,
+                   CASE WHEN {swept_pending_sql("q")} THEN 'FAILED' ELSE q.queue_status END AS queue_status,
+                   q.last_error, q.unit_kind,
                    COALESCE(cardinality(q.page_numbers), 1) AS unit_pages
             FROM auditcore.p2_document_queue q
             WHERE q.tenant_id=:t AND q.batch_id = ANY(:batches)
@@ -475,7 +479,8 @@ def build_daily_processing_report(
              "unreadable) -- never read, the PC is asked to re-scan. The trend counts the last 14 days."),
             "Re-sync counts the journey's 'Re-sync with Document Intelligence'; who pressed it is not stored.",
             ("Night jobs run at about 02:00 local time; night-fixed counts pages the sweep asked for that were "
-             "read afterwards (since 2026-10-21 only pages our own setup refused are looked at by night)."),
+             "read afterwards. Since 2026-10-22 nothing is read again at night, so both counts are zero for "
+             "later days; days before keep their figures."),
             ("Failed pages lists every page and file that failed on the day and is still failed, with the reason "
              "and a link that opens it (valid 30 minutes from when the report was loaded)."),
             "Document Intelligence's own nightly re-processing keeps its per-document results in DI and is not counted here.",
@@ -557,8 +562,10 @@ def build_failed_pages_report(
     """Every page (document unit) now FAILED whose failure falls in [start,
     end), and every file that failed before it was split into pages, within
     the reader's own dealers and outlets. Newest failure first. A page the
-    PC uploaded again (superseded) or read again is no longer failed and is
-    not listed."""
+    day-end sweep cleared from the Journey (2026-10-22) is still listed, with
+    its reason and a link to its stored file, until it is resubmitted. A page
+    the PC uploaded again (superseded), removed or read again is no longer
+    failed and is not listed."""
     from audit_core.uc03_p2_task_producer import (
         FILE_NOT_UPLOADED_IN_TIME_REASON,
         SETUP_FAILURE_CODE,
@@ -577,6 +584,7 @@ def build_failed_pages_report(
                      b.created_at_utc AS uploaded_at,
                      COALESCE(q.page_numbers, ARRAY[q.page_number]) AS page_numbers,
                      q.attempt_count, q.status_reason, q.last_error, q.page_object_key,
+                     q.queue_status AS unit_status,
                      COALESCE(
                        (SELECT MAX(e.created_at_utc) FROM auditcore.p2_activity_events e
                         WHERE e.tenant_id=q.tenant_id AND e.journey_id=q.journey_id
@@ -590,7 +598,9 @@ def build_failed_pages_report(
               LEFT JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
               LEFT JOIN auditcore.dealer_outlets o
                 ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id AND o.outlet_id=j.outlet_id
-              WHERE q.tenant_id=:t AND q.queue_status IN ('FAILED','DEAD_LETTER') AND {_SCOPE}
+              WHERE q.tenant_id=:t
+                AND (q.queue_status IN ('FAILED','DEAD_LETTER') OR {swept_pending_sql("q")})
+                AND {_SCOPE}
             ) x
             WHERE x.failed_at >= :s AND x.failed_at < :e
             ORDER BY x.failed_at DESC
@@ -642,6 +652,9 @@ def build_failed_pages_report(
             "attempts": int(row["attempt_count"] or 0) or None,
             "reason": row["status_reason"] or "It could not be read.",
             "code": row["last_error"], "setupProblem": setup,
+            # CANCELLED: the day-end sweep cleared it from the Journey; it is
+            # listed until it is resubmitted. The file in storage is kept.
+            "clearedFromJourney": row["unit_status"] == "CANCELLED",
             "openUrl": _signed_link(row["page_object_key"]),
             "filePath": page_open_path(tenant_id, row["journey_id"], row["queue_id"]),
         })
@@ -650,7 +663,7 @@ def build_failed_pages_report(
         rows.append({
             **journey(row), "kind": "FILE", "queueId": None, "pageNumbers": [], "attempts": None,
             "reason": row["failure_reason"] or "The file could not be split into pages.",
-            "code": None, "setupProblem": False,
+            "code": None, "setupProblem": False, "clearedFromJourney": False,
             # A file that never finished uploading has nothing to open.
             "openUrl": None if not_uploaded else _signed_link(row["original_object_key"]),
             "filePath": None,

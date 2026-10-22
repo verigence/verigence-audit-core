@@ -225,6 +225,32 @@ def enqueue_work(
     )
 
 
+# The day-end sweep (product owner 2026-10-22) clears the pages that ended
+# FAILED from the Journey: the unit goes CANCELLED (hidden everywhere, as a
+# removed page is) and a PAGE_SWEPT event is recorded. Unlike a page a person
+# removes, a swept page keeps its failure code and reason, and it still counts
+# as a failed page of its file -- the file's "Document to resubmit" task stays
+# open, the failure report still lists it -- until it is replaced by a
+# re-upload or removed by a person (last_error then holds one of
+# SWEPT_RESOLVED_CODES). No column marks it: the event does.
+PAGE_SWEPT_EVENT = "PAGE_SWEPT"
+SWEPT_REMOVED_CODE = "SWEPT_PAGE_REMOVED"
+SWEPT_RESOLVED_CODES = ("SUPERSEDED_PAGE", SWEPT_REMOVED_CODE)
+
+
+def swept_pending_sql(alias: str = "q") -> str:
+    """SQL condition on a p2_document_queue row (``alias``): swept by the
+    day-end sweep and still waiting to be resubmitted."""
+    resolved = ",".join(f"'{code}'" for code in SWEPT_RESOLVED_CODES)
+    return (
+        f"({alias}.queue_status='CANCELLED' AND {alias}.last_error IS NOT NULL "
+        f"AND {alias}.last_error NOT IN ({resolved}) "
+        f"AND EXISTS (SELECT 1 FROM auditcore.p2_activity_events sw "
+        f"WHERE sw.tenant_id={alias}.tenant_id AND sw.journey_id={alias}.journey_id "
+        f"AND sw.event_type='{PAGE_SWEPT_EVENT}' AND sw.subject_id={alias}.queue_id::text))"
+    )
+
+
 def request_page_recovery(
     connection: Connection,
     *,
@@ -238,8 +264,9 @@ def request_page_recovery(
     """Ask the worker to recover a FAILED page: it looks at what Document
     Intelligence already holds for the page first and uploads it again only
     if DI gave it up (uc03_p2_worker._recover_page). A page DI never
-    received is sent straight away. ``marker`` is ``r`` for a PC's Retry,
-    ``n`` for the nightly sweep. Returns the client upload id in force."""
+    received is sent straight away. ``marker`` is ``r`` for a PC's Retry (the
+    nightly sweep ``n`` was withdrawn on 2026-10-22: nothing is recovered or
+    read again at night). Returns the client upload id in force."""
     row = connection.execute(
         text(
             """
@@ -255,23 +282,17 @@ def request_page_recovery(
             client_upload_id=str(row["client_upload_id"]), marker=marker, requested_by=requested_by,
             correlation_id=correlation_id,
         )
-    # The nightly look-up (only pages our setup refused, 2026-10-21) keeps
-    # the page's reason and last_error until it has an answer, so a DI
-    # hiccup during it never loses why the page failed. Either way the
-    # page's 30 minutes start again (product owner 2026-10-21).
+    # The page's 30 minutes start again (product owner 2026-10-21).
     connection.execute(
         text(
             """
             UPDATE auditcore.p2_document_queue
-            SET queue_status='QUEUED',
-                status_reason=CASE WHEN :keep THEN status_reason END,
-                last_error=CASE WHEN :keep THEN last_error END,
-                read_clock_started_at_utc=now(),
-                updated_at_utc=now()
+            SET queue_status='QUEUED', status_reason=NULL, last_error=NULL,
+                read_clock_started_at_utc=now(), updated_at_utc=now()
             WHERE tenant_id=:tenant_id AND queue_id=:queue_id
             """
         ),
-        {"tenant_id": tenant_id, "queue_id": queue_id, "keep": marker == "n"},
+        {"tenant_id": tenant_id, "queue_id": queue_id},
     )
     enqueue_work(
         connection, tenant_id=tenant_id, journey_id=journey_id, work_type="DOCUMENT_INGEST",
@@ -370,9 +391,8 @@ def requeue_page_for_ingest(
 ) -> str:
     """Send a page to Document Intelligence again as a fresh document: the
     queue row is reset and its ingest work re-queued. ``marker`` tells the
-    attempts apart in the client upload id: ``r`` for a PC's Retry, ``n``
-    for the nightly sweep (which re-drives a page once). Returns the new
-    client upload id."""
+    attempts apart in the client upload id: ``r`` for a PC's Retry. Returns
+    the new client upload id."""
     base = client_upload_id.split("~", 1)[0]
     # The next number is one past the highest already used for this page and
     # marker -- never a count of rows: the queue row carries its own id, so a

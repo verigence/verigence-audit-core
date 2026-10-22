@@ -20,6 +20,9 @@ def test_other_failures_keep_the_reason_on_the_card():
     assert resubmit_page_reason(None, None) == "It could not be read. Upload it again."
 
 
-def test_our_setup_problem_needs_no_re_upload():
-    assert resubmit_page_reason("DOCUMENT_AI_NOT_CONFIGURED", "anything") == (
-        "Our setup problem — will be re-read once fixed; no need to re-upload.")
+def test_our_setup_problem_says_whose_it_is_and_asks_for_the_page_again():
+    """2026-10-22: nothing re-reads such a page at night, so the old promise
+    ("will be re-read once fixed; no need to re-upload") is gone."""
+    text = resubmit_page_reason("DOCUMENT_AI_NOT_CONFIGURED", "anything")
+    assert text == "Our setup problem, not a problem with your file. Please upload this page again."
+    assert "re-read" not in text and "no need" not in text and "overnight" not in text

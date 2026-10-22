@@ -7,7 +7,9 @@ attempt of 2026-10-20) and the review fixes it keeps (real Postgres):
 - every failed page raises the file's "Document to resubmit" task
   (category DOCUMENT_RESUBMIT) with the reason and a link to the page;
 - the failure report lists every failed page with its link;
-- our own setup failure: no need to re-upload, the Team Lead is alerted;
+- our own setup failure: failed like any other page (the PC resubmits it),
+  the page says it is our setup problem, the Team Lead is alerted; nothing
+  is read again at night (2026-10-22);
 - F1: no second DI document for one page; CONFLICT adoption; no silent
   dead letters; durable once-only claims."""
 from __future__ import annotations
@@ -31,7 +33,11 @@ from sqlalchemy import text
 from audit_core import uc03_p2_worker as worker
 from audit_core.db import set_tenant_context
 from audit_core.di_capture_v2_client import DiCaptureV2Error
-from audit_core.uc03_p2_runtime import claim_scheduled_run, enqueue_work
+from audit_core.uc03_p2_runtime import (
+    claim_scheduled_run,
+    enqueue_work,
+    request_page_recovery,
+)
 
 SETUP = "DOCUMENT_AI_NOT_CONFIGURED"
 _AI_FAILED = {"state": "CLASSIFIED", "processingStatus": "FAILED", "processingFailureCode": "DOCUMENT_AI_UNAVAILABLE",
@@ -321,7 +327,7 @@ def test_retry_and_read_again_restart_the_pages_clock(journey):
     assert _page(journey, queue_id)["read_clock_started_at_utc"] is None  # runs from the upload
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
-        worker.request_page_recovery(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+        request_page_recovery(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
                                      queue_id=queue_id, marker="r", requested_by="pc", correlation_id=None)
     assert _page(journey, queue_id)["read_clock_started_at_utc"] is not None
     _, other, _ = add_page(journey, page_number=2, status="READY")
@@ -351,16 +357,17 @@ def test_a_file_not_uploaded_or_split_within_30_minutes_is_failed(journey, statu
     assert task["description"] == f"big.pdf: {reason}"
 
 
-def test_the_ceiling_keeps_the_reason_of_a_page_our_setup_refused(journey):
-    """The night re-read of a page our setup refused that runs out of time
-    goes back to FAILED as it was: still our problem, still no re-upload."""
+def test_the_ceiling_treats_a_page_our_setup_refused_like_any_other(journey):
+    """No night re-read since 2026-10-22: a setup-coded page that runs out of
+    time is failed on the clock with the ordinary reason, like any other."""
     _, queue_id, _ = add_page(journey, status="QUEUED")
     _sql(journey, "UPDATE auditcore.p2_document_queue SET last_error=:e, status_reason=:r, "
                   "read_clock_started_at_utc=now() - interval '31 minutes' WHERE queue_id=:q",
          q=queue_id, e=SETUP, r=worker._SETUP_REASON)
     assert _watchdog(journey) == 1
     page = _page(journey, queue_id)
-    assert (page["queue_status"], page["last_error"], page["status_reason"]) == ("FAILED", SETUP, worker._SETUP_REASON)
+    assert (page["queue_status"], page["last_error"], page["status_reason"]) == (
+        "FAILED", "NOT_READ_IN_30_MIN", worker.NOT_READ_IN_TIME_REASON)
 
 
 def test_the_worker_loop_runs_the_ceiling(journey, monkeypatch):
@@ -418,54 +425,83 @@ def test_a_file_with_failed_pages_may_be_uploaded_again_whole(journey):
     assert worker._refuse_duplicate_upload(journey.engine, item, batch_id=again, digest="abc") is True
 
 
-def test_our_setup_problem_tells_the_pc_no_need_to_re_upload_and_alerts_the_team_lead(journey):
+def test_our_setup_problem_is_resubmitted_like_any_other_page_and_alerts_the_team_lead(journey):
     _, queue_id, _ = add_page(journey, status="FAILED")
     _sql(journey, "UPDATE auditcore.p2_document_queue SET last_error=:e, status_reason=:r WHERE queue_id=:q",
          q=queue_id, e=SETUP, r=worker._SETUP_REASON)
     _sync_tasks(journey)
     resubmit, alert = sorted(_open_tasks(journey), key=lambda t: t["task_type"])
     assert alert["task_type"] == "TL_DOCUMENT_STUCK" and "refused our credentials" in alert["title"]
-    assert resubmit["task_type"] == "DOCUMENT_RESUBMIT" and resubmit["severity"] == "INFO"
-    assert resubmit["title"] == "scan.pdf: page 1 not read — our setup problem, no need to re-upload"
-    assert resubmit["description"] == ("Page 1: Our setup problem — will be re-read once fixed; no need to "
-                                       "re-upload. Your Team Lead has been alerted.")
-    assert resubmit["reference"]["setupOnly"] is True
+    assert "night" not in alert["description"].lower()
+    # HIGH like every other resubmit task; it says it is our problem and asks for the page again.
+    assert resubmit["task_type"] == "DOCUMENT_RESUBMIT" and resubmit["severity"] == "HIGH"
+    assert resubmit["title"] == "scan.pdf: page 1 not read — our setup problem, upload again"
+    assert resubmit["description"] == (
+        "Page 1: Our setup problem, not a problem with your file. Please upload this page again. "
+        "Your Team Lead has been alerted. This task closes itself once the page is uploaded again.")
+    for text_ in (resubmit["description"], worker._SETUP_REASON, alert["description"]):
+        assert "overnight" not in text_.lower() and "re-read once fixed" not in text_ and "no need to re-upload" not in text_
 
 
-def test_the_night_looks_only_at_pages_our_setup_refused(journey, monkeypatch):
-    _, setup_page, document_id = add_page(journey, page_number=1, status="FAILED")
+def test_the_nightly_sweep_looks_up_and_re_reads_nothing(journey):
+    """Product owner 2026-10-22: no night re-read anywhere. Pages our setup
+    refused, any other failed page, and a classified page held unread: the
+    sweep queues nothing for them and changes none of them."""
+    _, setup_page, _ = add_page(journey, page_number=1, status="FAILED")
     _, ai_page, _ = add_page(journey, page_number=2, status="FAILED")
+    _, held, _ = add_page(journey, page_number=3, status="SUPPORTING")
     _sql(journey, "UPDATE auditcore.p2_document_queue SET last_error=:e, status_reason=:r WHERE queue_id=:q",
          q=setup_page, e=SETUP, r=worker._SETUP_REASON)
     _sql(journey, "UPDATE auditcore.p2_document_queue SET last_error='DOCUMENT_AI_UNAVAILABLE' WHERE queue_id=:q",
          q=ai_page)
-    assert _sweep(journey)["retried"] == 1
-    assert _page(journey, ai_page)["queue_status"] == "FAILED"  # the PC's to resubmit, never sent again
-    page = _page(journey, setup_page)
-    assert page["queue_status"] == "QUEUED" and page["last_error"] == SETUP  # kept while it is looked up
-    # DI's night re-read read it: copied.
-    _run_ingest(journey, monkeypatch, FakeClient([{"documentId": str(document_id), "state": "CLASSIFIED",
-                                                   "processingStatus": "PROCESSED"}]))
-    assert _page(journey, setup_page)["queue_status"] == "SYNCING_TO_AUDIT_CORE"
+    _sql(journey, "UPDATE auditcore.p2_document_queue SET template_key='booking_form', "
+                  "updated_at_utc=now() - interval '2 days' WHERE queue_id=:q", q=held)
+    result = _sweep(journey)
+    assert "retried" not in result and "reread" not in result
+    assert _page(journey, setup_page)["queue_status"] == "FAILED"
+    assert _page(journey, ai_page)["queue_status"] == "FAILED"
+    assert _page(journey, held)["queue_status"] == "SUPPORTING"
+    assert _sql(journey, "SELECT work_type FROM auditcore.p2_work_queue WHERE tenant_id=:t "
+                         "AND work_type IN ('DOCUMENT_INGEST','PAGE_REREAD')") == []
+    assert _sql(journey, "SELECT 1 FROM auditcore.p2_activity_events WHERE tenant_id=:t "
+                         "AND event_type IN ('PAGE_RETRY_REQUESTED','PAGE_REREAD_REQUESTED')") == []
 
 
-def test_a_di_hiccup_during_the_nightly_lookup_keeps_the_setup_reason(journey, monkeypatch):
-    _, queue_id, _ = add_page(journey, status="FAILED")
-    _sql(journey, "UPDATE auditcore.p2_document_queue SET last_error=:e, status_reason=:r WHERE queue_id=:q",
-         q=queue_id, e=SETUP, r=worker._SETUP_REASON)
-    _sweep(journey)
-    _run_ingest(journey, monkeypatch, FakeClient(fail_listing=True))
-    row = queue_row(journey, "DOCUMENT_INGEST", str(queue_id))
-    assert row["work_status"] == "RETRY_WAIT" and row["attempt_count"] == 1
-    page = _page(journey, queue_id)
-    assert (page["queue_status"], page["last_error"], page["status_reason"]) == ("QUEUED", SETUP, worker._SETUP_REASON)
-    # It keeps failing: the page goes back to FAILED as it was and the next night looks again.
-    _sql(journey, "UPDATE auditcore.p2_work_queue SET attempt_count=12, next_attempt_at_utc=now() "
-                  "WHERE tenant_id=:t AND work_type='DOCUMENT_INGEST' AND work_key=:k", k=str(queue_id))
-    _run_ingest(journey, monkeypatch, FakeClient(fail_listing=True))
-    page = _page(journey, queue_id)
-    assert (page["queue_status"], page["last_error"]) == ("FAILED", SETUP)
-    assert _sweep(journey)["retried"] == 1
+def test_no_night_look_up_or_night_marker_is_left_in_the_code():
+    """The night work is gone, not merely idle: a work item marked "n" is an
+    ordinary document step, and nothing of the night re-read remains."""
+    import inspect
+
+    from audit_core import uc03_p2_runtime as runtime
+
+    assert not hasattr(worker, "_is_night_lookup") and not hasattr(worker, "_SETUP_NIGHT_RUNNING_REASON")
+    assert not hasattr(worker, "_DI_GONE_CODE")
+    # A document step carrying the old "n" marker gets the day-time ladder, not the polling one.
+    assert worker._max_attempts("DOCUMENT_INGEST", {"recover": "n"}) == worker._DOCUMENT_MAX_ATTEMPTS == 3
+    source = inspect.getsource(worker.queue_nightly_upload_sweep) + inspect.getsource(runtime.request_page_recovery)
+    assert 'marker="n"' not in source and "request_page_reread(" not in source
+    for decision in ("LEAVE", "TELL_PC", "GONE"):
+        assert decision not in inspect.getsource(worker.recovery_decision)
+        assert decision not in inspect.getsource(worker._recover_page)
+
+
+def test_the_nightly_review_of_deliveries_is_left_alone(journey, monkeypatch):
+    """The delivery review (P2_NIGHTLY_REVIEW_UTC) is not document processing
+    and still runs, claimed once, in the same pass."""
+    assert worker._NIGHTLY_REVIEW_UTC == "20:30"
+    called = []
+    from audit_core import uc03_p2_audit_rules as rules
+
+    monkeypatch.setattr(rules, "queue_nightly_review", lambda connection, **kw: called.append("review") or 0)
+    monkeypatch.setattr(rules, "queue_nightly_sku_retry", lambda connection, **kw: called.append("sku") or 0)
+    monkeypatch.setattr(worker, "_fact_sweep", lambda engine, tenant_id: 0)
+    monkeypatch.setattr(worker, "backfill_price_variance", lambda engine, tenant_id: 0)
+    monkeypatch.setattr(worker, "_NIGHTLY_REVIEW_UTC", "00:00")
+    monkeypatch.setattr(worker, "run_dayend_sweep", lambda engine, tenant_id: None)
+    worker._last_sweep_at.pop(journey.tenant_id, None)
+    worker._last_nightly_review.pop(journey.tenant_id, None)
+    worker._maybe_sweep(journey.engine, journey.tenant_id)
+    assert called == ["review", "sku"]
 
 
 # ------------------------------------------------------------------- the failure report and the page link
@@ -549,13 +585,13 @@ def _config_page(journey, *, di_state):
     return queue_id, document_id
 
 
-def test_retry_is_refused_for_a_page_our_setup_refused_while_being_identified(journey):
+def test_retry_of_a_page_our_setup_refused_while_being_identified_is_a_normal_retry(journey):
+    """Before 2026-10-22 this Retry was refused ("the document service will
+    read this page overnight"). There is no night re-read now."""
     queue_id, _ = _config_page(journey, di_state="FAILED")
     response = _retry(journey, queue_id)
-    assert response.status_code == 409
-    assert response.json()["detail"] == ("The document service will read this page overnight now that the setup "
-                                         "is fixed — nothing to do.")
-    assert _page(journey, queue_id)["queue_status"] == "FAILED"
+    assert response.status_code == 202, response.text
+    assert _page(journey, queue_id)["queue_status"] == "QUEUED"
 
 
 def test_retry_after_the_setup_is_fixed_reads_the_page_once_more(journey, monkeypatch):
@@ -568,25 +604,28 @@ def test_retry_after_the_setup_is_fixed_reads_the_page_once_more(journey, monkey
     assert "~" not in _page(journey, queue_id)["client_upload_id"], "no second upload"
 
 
-def test_the_worker_leaves_a_classification_stage_setup_refusal_for_the_night(journey, monkeypatch):
+def test_a_retry_of_a_classification_stage_setup_refusal_sends_the_page_again(journey, monkeypatch):
+    """The page DI refused while identifying it (our setup) has nothing to
+    read again: the PC's Retry deletes the old DI document and sends the
+    page afresh -- nothing waits for a night re-read any more."""
     queue_id, document_id = _config_page(journey, di_state="FAILED")
-    with journey.engine.begin() as connection:  # e.g. a Retry queued before the API refused it
+    with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
-        worker.request_page_recovery(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
-                                     queue_id=queue_id, marker="r", requested_by="pc", correlation_id=None)
+        request_page_recovery(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                              queue_id=queue_id, marker="r", requested_by="pc", correlation_id=None)
     client = FakeClient([{"documentId": str(document_id), "state": "FAILED", "failureCode": SETUP,
                           "failureKind": "CONFIGURATION", "scanPassed": True, "retryTonight": True}])
     _run_ingest(journey, monkeypatch, client)
     page = _page(journey, queue_id)
-    assert (page["queue_status"], page["last_error"], page["status_reason"]) == ("FAILED", SETUP, worker._SETUP_REASON)
-    assert "~" not in page["client_upload_id"] and client.deleted == []
+    assert client.deleted == [str(document_id)]
+    assert page["client_upload_id"].endswith("~r1") and page["di_document_id"] is None
 
 
 def test_an_upload_sent_again_deletes_the_old_di_document_first(journey, monkeypatch):
     _, queue_id, document_id = add_page(journey, status="FAILED")
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
-        worker.request_page_recovery(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+        request_page_recovery(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
                                      queue_id=queue_id, marker="r", requested_by="pc", correlation_id=None)
     client = FakeClient([{"documentId": str(document_id), "state": "FAILED", "failureCode": "CLASSIFICATION_FAILED",
                           "failureKind": "TECHNICAL"}])
@@ -846,14 +885,15 @@ def test_a_page_failed_while_its_send_was_running_stays_failed_and_its_di_copy_i
     assert client.deleted == [str(stored)]
 
 
-def test_the_clock_withdraws_the_di_copy_of_a_page_it_fails_but_not_a_setup_page(journey):
+def test_the_clock_withdraws_the_di_copy_of_every_page_it_fails_a_setup_page_too(journey):
     batch_id, _, reading_doc = add_page(journey, page_number=1, status="EXTRACTING")
-    _, setup, _ = add_page(journey, page_number=2, status="QUEUED")
+    _, setup, setup_doc = add_page(journey, page_number=2, status="QUEUED")
     _sql(journey, "UPDATE auditcore.p2_document_queue SET batch_id=:b, last_error=:e WHERE queue_id=:q",
          b=batch_id, q=setup, e=SETUP)
     _uploaded_minutes_ago(journey, batch_id, 31)
     assert _watchdog(journey) == 2
-    assert _withdrawals(journey) == [str(reading_doc)]  # DI re-reads the setup page at night
+    # DI no longer re-reads the setup page at night: its copy is withdrawn like the other.
+    assert sorted(_withdrawals(journey)) == sorted([str(reading_doc), str(setup_doc)])
 
 
 def test_the_background_step_task_closes_when_the_step_runs_again(journey):
