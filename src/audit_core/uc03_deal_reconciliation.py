@@ -493,12 +493,14 @@ def _registry_rows(
     if has_dated:
         if upload is None:
             return []  # the tenant's first list is dated after the deal
-        sql = ("SELECT corporate_code, corporate_name, privilege_category FROM auditcore.corporate_registry_entries "
+        sql = ("SELECT corporate_code, corporate_name, corporate_type, privilege_category "
+               "FROM auditcore.corporate_registry_entries "
                f"WHERE tenant_id = :t AND oem_code = :oem AND source_upload_id = :upload AND ({where}) "
                "ORDER BY corporate_code")
         params = {**params, "t": tenant_id, "upload": upload}
     else:
-        sql = ("SELECT corporate_code, corporate_name, privilege_category FROM auditcore.corporate_privilege_registry "
+        sql = ("SELECT corporate_code, corporate_name, corporate_type, privilege_category "
+               "FROM auditcore.corporate_privilege_registry "
                f"WHERE oem_code = :oem AND ({where}) ORDER BY corporate_code")
     return [dict(r) for r in connection.execute(text(sql), {**params, "oem": oem_code}).mappings().all()]
 
@@ -552,13 +554,25 @@ def _corporate_category(
     codes, names = _corporate_names_on_file(
         connection, tenant_id=tenant_id, journey_id=journey_id, basis=basis, customer_name=customer_name,
     )
+    return listed_corporate(connection, tenant_id=tenant_id, oem_code=oem_code, effective_on=effective_on,
+                            codes=codes, names=names)
+
+
+def listed_corporate(
+    connection: Connection, *, tenant_id: str, oem_code: str, effective_on: date | None,
+    codes: list[str], names: list[str],
+) -> dict[str, Any] | None:
+    """THE corporate lookup, used by the deal and by the SKU panel: the
+    corporate on the tenant's list in force on the date, by code, else by
+    exact name (spacing and case aside). Never a partial-name guess, and a
+    name listed in two categories is not decided."""
     for code in codes:
         rows = _registry_rows(connection, tenant_id=tenant_id, oem_code=oem_code, effective_on=effective_on,
                               where="upper(corporate_code) = upper(:code)", params={"code": code})
         if rows:
             row = rows[0]
             return {"category": row["privilege_category"], "code": row["corporate_code"],
-                    "name": row["corporate_name"], "matchedOn": "CODE"}
+                    "name": row["corporate_name"], "type": row.get("corporate_type"), "matchedOn": "CODE"}
     for name in names:
         matches = _registry_rows(
             connection, tenant_id=tenant_id, oem_code=oem_code, effective_on=effective_on,
@@ -569,7 +583,7 @@ def _corporate_category(
         if matches and len({m["privilege_category"] for m in matches}) == 1:
             first = matches[0]
             return {"category": first["privilege_category"], "code": first["corporate_code"],
-                    "name": first["corporate_name"], "matchedOn": "NAME"}
+                    "name": first["corporate_name"], "type": first.get("corporate_type"), "matchedOn": "NAME"}
     return None
 
 

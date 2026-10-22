@@ -131,6 +131,44 @@ def test_the_standard_answers_every_block_for_one_vehicle_on_a_date(connection) 
         "consumerScheme", "exchangeScheme", "corporate", "grid"]
 
 
+def test_the_panel_finds_a_corporate_on_the_list_in_force_on_the_date_by_exact_name(connection) -> None:  # noqa: F811
+    """Review of PR 472: the SKU panel reads the corporate the way the deal
+    does -- the tenant's list dated for the day, a code or an exact name,
+    never a partial name. The October list re-categorises Acme Steel from Z
+    to A: a 15 Sep panel shows Z, a 15 Oct panel shows A, and "Acme" alone
+    is not Acme Steel Ltd."""
+    from uuid import uuid4
+
+    from audit_core.oem_price_masters import _insert_registry_entries
+
+    tenant_id = _load_masters(connection)
+    _insert_registry_entries(connection, tenant_id=tenant_id, oem_code="MAHINDRA", upload_id=uuid4(),
+                             effective_from=date(2026, 10, 3),
+                             companies=[CorporateCompany("CORP-0001", "Acme Steel Ltd", "PSU", "A")])
+    version = price_version_on(connection, tenant_id=tenant_id, on=ON)
+    rows = catalogue_rows(connection, tenant_id=tenant_id, price_list_version_id=version["priceListVersionId"])
+    row = search_sku(rows, alias_map=_alias_map(connection, "MAHINDRA"), model="Thar Roxx",
+                     variant="mx1 pmt 2wd")["row"]
+
+    def corporate(on: date, **who):
+        return standard_for_sku(connection, tenant_id=tenant_id, on=on, row=row, version=version, **who)["corporate"]
+
+    sept = corporate(ON, corporate_name="acme  steel ltd")
+    assert sept["corporate"]["found"] is True and sept["corporate"]["privilegeCategory"] == "Z"
+    assert sept["exact"]["amount"] == "15000.00" and sept["corporate"]["type"] == "PSU"
+    assert corporate(ON, corporate_code="CORP-0001")["corporate"]["privilegeCategory"] == "Z"
+    october = corporate(date(2026, 10, 15), corporate_name="Acme Steel Ltd")
+    assert october["corporate"]["privilegeCategory"] == "A" and october["exact"]["amount"] == "6000.00"
+    # Before the tenant's first list: not on a list, whatever the OEM-wide table holds.
+    from audit_core.uc03_deal_reconciliation import listed_corporate
+
+    assert listed_corporate(connection, tenant_id=tenant_id, oem_code="MAHINDRA", effective_on=date(2026, 8, 15),
+                            codes=[], names=["Acme Steel Ltd"]) is None
+    # A part of a name is not a match.
+    assert corporate(ON, corporate_name="Acme")["corporate"] == {"lookedUp": "Acme", "found": False}
+    assert corporate(ON, corporate_name="Steel")["exact"] is None
+
+
 def test_a_scheme_reaches_a_model_the_oem_has_renamed(connection) -> None:  # noqa: F811
     """A bulletin naming 'XUV 3XO' must reach the priced 'XUV 3XO'.
 

@@ -1538,3 +1538,60 @@ def test_the_grid_reads_its_own_spellings_and_a_pick_up_never_takes_the_camper_l
     pick_up = grid_row_for_model(c, tenant_id=c.tenant_id, model_id=models["PICK UP"], effective_on=on,
                                  variant_name="BOL PIK UP FB 1.3T - BS6.2 - PS")
     assert pick_up["model_alias"] == "Pick-Up" and pick_up["agreed_buffer_amount"] == Decimal(7000)
+
+
+def test_a_grid_dated_before_its_book_reads_its_models_against_the_book_it_is_used_with(fresh_oem) -> None:
+    """Review of PR 472: the October grid is dated 1 Oct but the October book
+    starts 3 Oct, and the book of 1 Oct still prices the old Scorpio N. The
+    grid's "SCORPIO-N" is the new Scorpio N, which only the October book
+    carries: its line must reach NEW SCORPIO N (it was bound to the retired
+    SCORPIO N, so a deal on 15 Oct had no grid line), and a check must say
+    so when a line is bound to a model its book does not price."""
+    from audit_core.oem_master_parsers import GridRow
+    from audit_core.oem_price_masters import (
+        grid_lines_unbound_to_books,
+        grid_row_for_model,
+        ingest_discount_grid,
+    )
+
+    c = fresh_oem
+    oem_code = c.execute(text("SELECT oem_code FROM auditcore.oems WHERE oem_id = :o"), {"o": c.oem_id}).scalar_one()
+    _load(c, date(2026, 9, 3), _book(("PV", "XUV3XO", "AX5 PM MT", 1_029_900.54),
+                                     ("PV", "SCORPIO N", "Z8L D AT 2WD 7 STR BS6.2", 1_917_499.58)))
+    _load(c, date(2026, 10, 3), _book(("PV", "XUV 3XO", "AX5 PM MT", 999_901.32),
+                                      ("PV", "SCORPIO-N", "Z8L D AT 2WD 7 STR BS6.2 - Refresh", 1_988_996.00)))
+    models = dict(c.execute(text("SELECT model_name, model_id FROM auditcore.product_models WHERE oem_id = :o"),
+                            {"o": c.oem_id}).all())
+    assert {"SCORPIO N", "NEW SCORPIO N", "XUV3XO"} <= set(models)
+
+    def line(no: int, alias: str, buffer: int) -> GridRow:
+        return GridRow(row_no=no, model_alias=alias, model_aliases=[alias], in_scope=True, booking_protection_days=None,
+                       agreed_buffer_amount=Decimal(buffer), insurance_od_percent=None, out_of_territory_amount=None,
+                       raw={})
+
+    grid = ParseResult(kind="DISCOUNT_GRID")
+    grid.grid_rows = [line(1, "3XO", 7000), line(2, "SCORPIO-N", 12000)]
+    summary = ingest_discount_grid(c, tenant_id=c.tenant_id, oem_id=c.oem_id, oem_code=oem_code,
+                                   effective_from=date(2026, 10, 1), parsed=grid, upload_id=uuid4(), actor_id="admin")
+    assert summary["unresolved"] == []
+
+    def buffer_for(model: str, on: date):
+        row = grid_row_for_model(c, tenant_id=c.tenant_id, model_id=models[model], effective_on=on)
+        return row["agreed_buffer_amount"] if row else None
+
+    assert buffer_for("NEW SCORPIO N", date(2026, 10, 15)) == Decimal(12000)
+    assert buffer_for("XUV3XO", date(2026, 10, 15)) == Decimal(7000)
+    # The book of 1 - 2 Oct still prices the old Scorpio N: a deal then has its line too.
+    assert buffer_for("SCORPIO N", date(2026, 10, 2)) == Decimal(12000)
+    version = c.execute(text("SELECT grid_version_id FROM auditcore.dealer_discount_grid_versions "
+                             "WHERE tenant_id = :t"), {"t": c.tenant_id}).scalar_one()
+    assert grid_lines_unbound_to_books(c, tenant_id=c.tenant_id, oem_id=c.oem_id, oem_code=oem_code,
+                                       grid_version_id=version) == []
+
+    # A line bound only to the retired model (how it was stored) is reported.
+    c.execute(text("DELETE FROM auditcore.dealer_discount_grid_rows WHERE grid_version_id = :v AND model_alias = 'SCORPIO-N' "
+                   "AND model_id = :m"), {"v": version, "m": models["NEW SCORPIO N"]})
+    gaps = grid_lines_unbound_to_books(c, tenant_id=c.tenant_id, oem_id=c.oem_id, oem_code=oem_code,
+                                       grid_version_id=version)
+    assert len(gaps) == 1 and "'SCORPIO-N'" in gaps[0] and "NEW SCORPIO N" in gaps[0] and "SCORPIO N'" in gaps[0]
+    assert buffer_for("NEW SCORPIO N", date(2026, 10, 15)) is None

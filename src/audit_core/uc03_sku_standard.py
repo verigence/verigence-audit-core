@@ -358,7 +358,7 @@ def _exchange_block(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def _corporate_block(
-    connection: Connection, rows: list[dict[str, Any]], *, oem_code: str | None,
+    connection: Connection, rows: list[dict[str, Any]], *, tenant_id: str, on: date, oem_code: str | None,
     corporate_code: str | None, corporate_name: str | None,
 ) -> dict[str, Any] | None:
     by_category: dict[str, dict[str, Any]] = {}
@@ -371,21 +371,15 @@ def _corporate_block(
         return None
     registry = None
     if (corporate_code or corporate_name) and oem_code:
-        registry = connection.execute(
-            text(
-                """
-                SELECT corporate_code, corporate_name, corporate_type, privilege_category
-                FROM auditcore.corporate_privilege_registry
-                WHERE oem_code = :oem AND (
-                      (:code <> '' AND upper(corporate_code) = upper(:code))
-                   OR (:name <> '' AND lower(corporate_name) = lower(:name))
-                   OR (:name <> '' AND lower(corporate_name) LIKE '%' || lower(:name) || '%'))
-                ORDER BY (upper(corporate_code) = upper(:code)) DESC, (lower(corporate_name) = lower(:name)) DESC
-                LIMIT 1
-                """
-            ),
-            {"oem": oem_code, "code": corporate_code or "", "name": corporate_name or ""},
-        ).mappings().first()
+        # The deal's own lookup (the tenant's list in force on the date; a
+        # code, else an exact name; never a partial-name match).
+        from audit_core.uc03_deal_reconciliation import listed_corporate
+
+        registry = listed_corporate(
+            connection, tenant_id=tenant_id, oem_code=oem_code, effective_on=on,
+            codes=[corporate_code.strip()] if corporate_code and corporate_code.strip() else [],
+            names=[corporate_name.strip()] if corporate_name and corporate_name.strip() else [],
+        )
     amounts = [Decimal(b["amount"]) for b in by_category.values() if b["amount"]]
     block: dict[str, Any] = {
         "byCategory": {c: by_category[c] for c in sorted(by_category)},
@@ -397,10 +391,10 @@ def _corporate_block(
         if registry is None:
             block["corporate"] = {"lookedUp": corporate_code or corporate_name, "found": False}
         else:
-            category = registry["privilege_category"]
+            category = registry["category"]
             block["corporate"] = {
-                "lookedUp": corporate_code or corporate_name, "found": True, "code": registry["corporate_code"],
-                "name": registry["corporate_name"], "type": registry["corporate_type"], "privilegeCategory": category,
+                "lookedUp": corporate_code or corporate_name, "found": True, "code": registry["code"],
+                "name": registry["name"], "type": registry["type"], "privilegeCategory": category,
             }
             block["exact"] = by_category.get(category)
     return block
@@ -500,7 +494,8 @@ def standard_for_sku(
     price = _price_block(row, version, basis)
     consumer = _consumer_block(scheme_rows)
     exchange_block = _exchange_block(scheme_rows)
-    corporate = _corporate_block(connection, scheme_rows, oem_code=_oem_code(connection, tenant_id),
+    corporate = _corporate_block(connection, scheme_rows, tenant_id=tenant_id, on=on,
+                                 oem_code=_oem_code(connection, tenant_id),
                                  corporate_code=corporate_code, corporate_name=corporate_name)
     grid = _grid_block(connection, tenant_id=tenant_id, model_id=row["model_id"], on=on)
     return {

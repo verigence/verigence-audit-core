@@ -1420,6 +1420,31 @@ def _models_in_book(connection: Connection, *, tenant_id: str, effective_on: dat
     }
 
 
+def _books_in_use(connection: Connection, *, tenant_id: str, start: date, end: date | None = None) -> list[set[UUID]]:
+    """The models of every book in force at some date in [start, end): the
+    book standing on ``start`` and each later book that starts before
+    ``end`` (None: no end). A master dated before the book it will mostly be
+    used with (the October grid, dated 1 Oct, against the October book,
+    dated 3 Oct) is used with each of them."""
+    dates = [start, *connection.execute(
+        text(
+            """
+            SELECT DISTINCT effective_from FROM auditcore.price_list_versions
+            WHERE tenant_id = :t AND lifecycle_status IN ('PUBLISHED', 'RETIRED') AND effective_from > :s
+              AND (CAST(:e AS date) IS NULL OR effective_from < :e)
+            ORDER BY 1
+            """
+        ),
+        {"t": tenant_id, "s": start, "e": end},
+    ).scalars().all()]
+    books: list[set[UUID]] = []
+    for day in dates:
+        in_book = _models_in_book(connection, tenant_id=tenant_id, effective_on=day)
+        if in_book is not None and in_book not in books:
+            books.append(in_book)
+    return books
+
+
 def _match_variants(
     variant_texts: list[str], variants: list[tuple[str, UUID]]
 ) -> list[tuple[str, list[UUID]]]:
@@ -2126,6 +2151,77 @@ _GRID_MODEL_ALIASES: dict[str, str] = {
 }
 
 
+def _next_grid_start(connection: Connection, *, tenant_id: str, after: date) -> date | None:
+    """The day the next grid version starts (it takes over from then), or None."""
+    return connection.execute(
+        text(
+            "SELECT MIN(effective_from) FROM auditcore.dealer_discount_grid_versions "
+            "WHERE tenant_id = :t AND lifecycle_status IN ('PUBLISHED', 'RETIRED') AND effective_from > :a"
+        ),
+        {"t": tenant_id, "a": after},
+    ).scalar_one()
+
+
+def _grid_targets(
+    models: list[tuple[str, UUID, list[tuple[str, UUID]]]], alias_map: dict[str, str], alias: str,
+    books: list[set[UUID]],
+) -> list[_Target]:
+    """The models a grid line names, read against each book the grid is used
+    with: the book in force says which model the words mean (review of
+    PR 472: the October grid, dated 1 Oct, names the new Scorpio N, which
+    only the October book of 3 Oct prices). A model several books resolve
+    to is one target."""
+    targets: list[_Target] = []
+    seen: set[tuple[UUID, str | None]] = set()
+    for in_book in books or [None]:  # type: ignore[list-item]
+        found, _, _, _ = _model_targets(models, alias_map, alias, extra_aliases=_GRID_MODEL_ALIASES, in_book=in_book)
+        for target in found:
+            if (target.model_id, target.group) not in seen:
+                seen.add((target.model_id, target.group))
+                targets.append(target)
+    return targets
+
+
+def grid_lines_unbound_to_books(
+    connection: Connection, *, tenant_id: str, oem_id: UUID, oem_code: str, grid_version_id: UUID,
+) -> list[str]:
+    """Grid lines whose model is not the one the book they are used with
+    prices: for each book in force during the grid's validity, a line whose
+    wording names a model that book prices (read against that book) must be
+    bound to a model in it. Empty when every line is. A line is never
+    "matched" by a model of an earlier book alone."""
+    alias_map = _alias_map(connection, oem_code)
+    models = _model_catalogue(connection, oem_id)
+    version = connection.execute(
+        text("SELECT version_no, effective_from FROM auditcore.dealer_discount_grid_versions "
+             "WHERE tenant_id = :t AND grid_version_id = :v"),
+        {"t": tenant_id, "v": grid_version_id},
+    ).one()
+    stored: dict[str, set[UUID]] = {}
+    for alias, model_id in connection.execute(
+        text("SELECT model_alias, model_id FROM auditcore.dealer_discount_grid_rows "
+             "WHERE tenant_id = :t AND grid_version_id = :v"),
+        {"t": tenant_id, "v": grid_version_id},
+    ).all():
+        stored.setdefault(alias, set())
+        if model_id is not None:
+            stored[alias].add(model_id)
+    names = {model_id: name for name, model_id, _ in models}
+    books = _books_in_use(connection, tenant_id=tenant_id, start=version[1],
+                          end=_next_grid_start(connection, tenant_id=tenant_id, after=version[1]))
+    gaps: list[str] = []
+    for in_book in books:
+        for alias, bound in stored.items():
+            found, _, _, _ = _model_targets(models, alias_map, alias, extra_aliases=_GRID_MODEL_ALIASES, in_book=in_book)
+            wanted = {t.model_id for t in found} & in_book
+            if wanted and not bound & in_book:
+                gaps.append(
+                    f"grid v{version[0]} line '{alias}' names {sorted(names[m] for m in wanted)} in a book in force "
+                    f"during the grid, but is bound to {sorted(names.get(m, '?') for m in bound) or 'no model'}"
+                )
+    return list(dict.fromkeys(gaps))
+
+
 def ingest_discount_grid(
     connection: Connection,
     *,
@@ -2145,7 +2241,8 @@ def ingest_discount_grid(
     so the grid line for a deal is the one for its variant."""
     alias_map = _alias_map(connection, oem_code)
     models = _model_catalogue(connection, oem_id)
-    in_book = _models_in_book(connection, tenant_id=tenant_id, effective_on=effective_from)
+    books = _books_in_use(connection, tenant_id=tenant_id, start=effective_from,
+                          end=_next_grid_start(connection, tenant_id=tenant_id, after=effective_from))
     summary: dict[str, Any] = {"published": 0, "resolved": 0, "unresolved": [], "warnings": [], "parameters": len(parsed.grid_parameters)}
     version_no = int(connection.execute(
         text("SELECT COALESCE(MAX(version_no), 0) + 1 FROM auditcore.dealer_discount_grid_versions WHERE tenant_id = :t"),
@@ -2169,9 +2266,7 @@ def ingest_discount_grid(
     rows: list[dict[str, Any]] = []
     for grow in parsed.grid_rows:
         for alias in grow.model_aliases:
-            targets, _, _unknown, _not_loaded = _model_targets(
-                models, alias_map, alias, extra_aliases=_GRID_MODEL_ALIASES, in_book=in_book,
-            )
+            targets = _grid_targets(models, alias_map, alias, books)
             if not targets:
                 summary["unresolved"].append(f"grid row {grow.row_no}: model '{alias}' is not in the catalogue yet")
             else:

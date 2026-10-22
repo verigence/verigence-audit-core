@@ -327,6 +327,7 @@ def reload_schemes_tenant(connection: Connection, *, tenant_id: str, tag: str, s
     commits or rolls back), like ``reload_tenant``."""
     from audit_core.oem_master_parsers import parse_master
     from audit_core.oem_price_masters import (
+        grid_lines_unbound_to_books,
         ingest_corporate_policy,
         ingest_discount_document,
         ingest_discount_grid,
@@ -352,6 +353,7 @@ def reload_schemes_tenant(connection: Connection, *, tenant_id: str, tag: str, s
             planned.append((kind, DATA_DIR / relative, when, until))
 
     uploads: list[dict[str, Any]] = []
+    grid_versions: list[tuple[date, Any]] = []
     for kind, path, on, until in planned:
         content = path.read_bytes()
         parsed = parse_master(kind, content, filename=path.name)
@@ -377,6 +379,7 @@ def reload_schemes_tenant(connection: Connection, *, tenant_id: str, tag: str, s
                   "effective_from": on, "parsed": parsed, "actor_id": actor}
         if kind == "DISCOUNT_GRID":
             summary = ingest_discount_grid(connection, upload_id=upload_id, **common)
+            grid_versions.append((on, summary["gridVersionId"]))
         elif kind == "CORPORATE_POLICY":
             summary = ingest_corporate_policy(connection, upload_id=upload_id, effective_to=until, **common)
         else:
@@ -404,6 +407,14 @@ def reload_schemes_tenant(connection: Connection, *, tenant_id: str, tag: str, s
                         "unresolved": len(summary.get("unresolved") or []),
                         "unresolvedVariants": len(summary.get("unresolvedVariants") or []),
                         "gridResolved": summary.get("resolved")})
+
+    # A grid line must be bound to a model of every book the grid is used with
+    # (the October grid, dated 1 Oct, named the new Scorpio N, which only the
+    # book of 3 Oct prices; review of PR 472).
+    for on, grid_version_id in grid_versions:
+        gaps = grid_lines_unbound_to_books(connection, tenant_id=tenant_id, oem_id=project["oem_id"],
+                                           oem_code=project["oem_code"], grid_version_id=grid_version_id)
+        check(f"discount grid of {on}: every line bound to a model of the books it is used with", not gaps, [], gaps)
 
     applied: dict[str, dict[str, int]] = {}
     for on in SCHEME_CHECK_DATES:
