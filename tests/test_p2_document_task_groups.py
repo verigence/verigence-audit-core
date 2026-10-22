@@ -35,6 +35,10 @@ from audit_core.uc03_p2_tasks import create_p2_task, task_queue_tab
 
 # ---------------------------------------------------------------- the map
 
+CLOSE_INSTRUCTION = ('Once uploaded, come back and close the task with the comment "Document Uploaded". '
+                     'If the document does not need to be uploaded again, close the task with the comment '
+                     '"Document Not required to be uploaded for Extraction".')
+
 
 @pytest.mark.parametrize(
     ("task_type", "category", "source_code", "expected"),
@@ -109,7 +113,7 @@ def test_rows_say_file_pages_and_reason_in_plain_words():
         "category": "IMAGE_QUALITY", "categoryLabel": "Image quality", "file": "bundle.pdf", "pages": [3, 5, 7],
         "reason": ("Page 3 is too faded (low contrast); pages 5 and 7 are blurred. Re-scan and upload again. "
                    "These pages will be removed by the system at the day-end clean-up (02:00 IST). "
-                   "Please upload clearer copies."),
+                   "Please upload clearer copies. " + CLOSE_INSTRUCTION),
         "documentId": None,
     }
     failed = document_detail({
@@ -378,7 +382,7 @@ def test_the_task_list_carries_categories_and_grouped_counts(journey):
     assert rows[quality]["document"] == {
         "category": "IMAGE_QUALITY", "categoryLabel": "Image quality", "file": "scan.pdf", "pages": [2],
         "reason": ("Page 2 is blurred. Re-scan and upload again. This page will be removed by the system at "
-                       "the day-end clean-up (02:00 IST). Please upload a clearer copy."),
+                       "the day-end clean-up (02:00 IST). Please upload a clearer copy. " + CLOSE_INSTRUCTION),
             "documentId": None,
     }
     # Not document work: unchanged.

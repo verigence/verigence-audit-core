@@ -29,7 +29,7 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from audit_core.uc03_p2_runtime import dayend_removal_notice
+from audit_core.uc03_p2_runtime import QUALITY_CLOSE_INSTRUCTION, dayend_removal_notice
 
 # The four categories, in the order the Task Queue shows them.
 DOCUMENT_CATEGORIES: tuple[str, ...] = ("MANUAL_VERIFICATION", "FAILED_TO_READ", "IMAGE_QUALITY", "MISSING_DOCUMENT")
@@ -215,7 +215,8 @@ def document_detail(item: Mapping[str, Any], category: str, registry: Any = None
                 parts.append(f"{_pages_phrase(group_pages)} {'is' if len(group_pages) == 1 else 'are'} "
                              f"{rejection_words(group.get('reason'))}")
         reason = _capital("; ".join(parts) + "." if parts else "Refused by the scan-quality check.") + \
-            " Re-scan and upload again. " + dayend_removal_notice(max(1, len(pages)))
+            " Re-scan and upload again. " + dayend_removal_notice(max(1, len(pages))) + \
+            " " + QUALITY_CLOSE_INSTRUCTION
     elif task_type == "PC_UPLOAD_STATUS":
         counts = ref.get("pages") or {}
         if source == "DOCUMENT_PROCESSING_SLOW" or ref.get("retrying"):

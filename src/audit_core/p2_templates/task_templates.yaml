@@ -20,6 +20,9 @@ actions:
 # A Team Lead's verdict on the finding behind a task (Phase 1 finding actions).
 - CONFIRM_BREACH
 - MARK_FALSE_POSITIVE
+# The PC closes an image-quality task by hand, with a comment
+# (PC_PAGE_QUALITY_REJECTED only).
+- CLOSE_TASK
 exception_roles:
 - TL
 - PM
@@ -143,9 +146,14 @@ task_types:
   # (blurred, faded / low contrast, too small: any DI_QUALITY_* refusal),
   # naming the pages and why (product owner 2026-10-21: image quality is
   # its own group of document tasks). A retry cannot fix such a page, so
-  # the PC re-scans it. The task closes itself only when the refused pages
-  # are replaced by the same scan, read or removed, or the file is deleted;
-  # another upload on the journey never closes it.
+  # the PC re-scans it. The day-end clean-up takes the page off the journey
+  # but never closes the task. The system cannot know which upload answers
+  # it, so the PC closes it by hand every time (product owner 2026-10-22):
+  # CLOSE_TASK with a mandatory comment ("Document Uploaded", "Document Not
+  # required to be uploaded for Extraction" or his own words). It also still
+  # closes by itself when the refused pages are replaced by the same scan,
+  # read or removed, or the file is deleted; a file uploaded on the booking
+  # never closes it.
   PC_PAGE_QUALITY_REJECTED:
     category: DOCUMENT_REUPLOAD
     owner: PC
@@ -154,6 +162,7 @@ task_types:
     completion: MACHINE_VERIFIED
     actions:
     - REUPLOAD_DOCUMENT
+    - CLOSE_TASK
     - ADD_COMMENT
   # A file still not read a day after upload (decision 2026-10-01): the
   # Team Lead is told, with what the PC already has. Closes itself.

@@ -264,6 +264,17 @@ def dayend_removal_notice(pages: int = 1) -> str:
             "Please upload clearer copies.")
 
 
+# What the PC does to close an image-quality task (product owner 2026-10-22):
+# the system cannot know which upload answers it, so he closes it by hand with
+# a comment. These two phrases are the guidance, quoted exactly; they are not a
+# fixed list: any non-blank comment closes the task.
+QUALITY_CLOSE_INSTRUCTION = (
+    'Once uploaded, come back and close the task with the comment "Document Uploaded". '
+    'If the document does not need to be uploaded again, close the task with the comment '
+    '"Document Not required to be uploaded for Extraction".'
+)
+
+
 # The day-end sweep (product owner 2026-10-22) clears the pages that ended
 # FAILED from the Journey: the unit goes CANCELLED (hidden everywhere, as a
 # removed page is) and a PAGE_SWEPT event is recorded. Unlike a page a person
