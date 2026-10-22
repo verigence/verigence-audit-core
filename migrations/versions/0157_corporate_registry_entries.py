@@ -1,4 +1,4 @@
-"""0154_corporate_registry_entries — the corporate registry, dated and per
+"""0157_corporate_registry_entries — the corporate registry, dated and per
 tenant (2026-10-20 product owner rules, R5; the review of PR 472, S5).
 
 ``corporate_privilege_registry`` holds one OEM-wide list that every corporate
@@ -18,8 +18,10 @@ from __future__ import annotations
 from alembic import op
 from sqlalchemy import text
 
-revision = "0154_corporate_registry_entries"
-down_revision = "0153_source_values_per_document"
+revision = "0157_corporate_registry_entries"
+# Renumbered 0154 -> 0157 and chained after 0154_sku_run_checked_by on 2026-10-22
+# (#469 and #471 merged to dev first); Alembic needs one head.
+down_revision = "0154_sku_run_checked_by"
 branch_labels = None
 depends_on = None
 
