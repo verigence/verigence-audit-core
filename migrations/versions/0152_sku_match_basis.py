@@ -60,7 +60,9 @@ from __future__ import annotations
 from alembic import op
 
 revision = "0152_sku_match_basis"
-down_revision = "0153_source_values_per_document"
+# Chained after 0156 on 2026-10-22: #469 (0155, 0156) merged to dev first, and
+# Alembic needs one head. The number is not an order; this one runs after 0156.
+down_revision = "0156_p2_read_clock"
 branch_labels = None
 depends_on = None
 
