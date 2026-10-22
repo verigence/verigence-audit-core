@@ -124,6 +124,21 @@ task_types:
     actions:
     - REUPLOAD_DOCUMENT
     - ADD_COMMENT
+  # "Document to resubmit" (product owner 2026-10-21): one task per uploaded
+  # file with pages that failed (after T0, T0+10 and T0+20 minutes, at once
+  # for a refusal, or when not read within 30 minutes), listing each failed
+  # page, the reason in plain words and a link that opens the page. Category
+  # key DOCUMENT_RESUBMIT. It updates and closes itself once the pages are
+  # read again or uploaded again.
+  DOCUMENT_RESUBMIT:
+    category: DOCUMENT_RESUBMIT
+    owner: PC
+    origin: SYSTEM
+    source: DOCUMENT
+    completion: MACHINE_VERIFIED
+    actions:
+    - REUPLOAD_DOCUMENT
+    - ADD_COMMENT
   # One task per uploaded file with pages refused by the scan-quality check
   # (blurred, faded / low contrast, too small: any DI_QUALITY_* refusal),
   # naming the pages and why (product owner 2026-10-21: image quality is

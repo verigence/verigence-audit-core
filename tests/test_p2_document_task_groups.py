@@ -45,6 +45,7 @@ from audit_core.uc03_p2_tasks import create_p2_task, task_queue_tab
         ("DUPLICATE_RECEIPT_NOTICE", "DUPLICATE_RECEIPT_NOTICE", None, "MANUAL_VERIFICATION"),
         ("DOCUMENT_MISSING", "DOCUMENT_REUPLOAD", "WRONG_CUSTOMER_NAME", "MANUAL_VERIFICATION"),
         ("PC_UPLOAD_STATUS", "DOCUMENT_EXCEPTION", "DOCUMENT_PROCESSING_FAILED", "FAILED_TO_READ"),
+        ("DOCUMENT_RESUBMIT", "DOCUMENT_RESUBMIT", "DOCUMENT_PROCESSING_FAILED", "FAILED_TO_READ"),
         ("PC_VERIFY_UNRECOGNIZED_DOCUMENT", "DOCUMENT_VERIFICATION", "DOCUMENT_UNCLASSIFIED", "FAILED_TO_READ"),
         ("TL_DOCUMENT_STUCK", "SUPERVISORY_NOTICE", "DOCUMENT_PROCESSING_STUCK", "FAILED_TO_READ"),
         ("PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE", "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE", None, "FAILED_TO_READ"),
@@ -79,15 +80,14 @@ def test_every_task_type_has_its_document_category(task_type, category, source_c
 
 
 def test_a_new_resubmit_category_slots_in_by_its_key():
-    # DOCUMENT_RESUBMIT (being added on another branch) under any task type name.
+    # DOCUMENT_RESUBMIT (the resubmit task of 2026-10-21) under any task type name.
     assert document_category("PC_DOCUMENT_RESUBMIT", "DOCUMENT_RESUBMIT", None) == "FAILED_TO_READ"
     assert document_category("SOMETHING_NEW", "SOMETHING_NEW", None) is None
 
 
 def test_every_mapped_p2_task_type_exists_or_is_a_known_legacy_type():
     registry = get_registry()
-    legacy = {"FIELD_CORRECTION_REVIEW", "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE", "PC_DOCUMENT_REUPLOAD",
-              "DOCUMENT_RESUBMIT"}
+    legacy = {"FIELD_CORRECTION_REVIEW", "PC_RESOLVE_DOCUMENT_PROCESSING_FAILURE", "PC_DOCUMENT_REUPLOAD"}
     assert set(DOCUMENT_CATEGORY_BY_TASK_TYPE) - set(registry.tasks) <= legacy
 
 
@@ -250,12 +250,15 @@ def test_refused_pages_get_their_own_task_per_file(journey):
     assert quality["reference"]["pageNumbers"] == [2, 3, 4]
     assert [r["reason"] for r in quality["reference"]["rejections"]] == ["faded", "blurred", "tooSmall"]
 
-    # The file's status task now speaks only of the page that failed otherwise.
-    status = _task(journey, f"upload-status:{journey.journey_id}:{batch}")
-    assert status["title"] == "packet.pdf: 1 page could not be processed"
-    assert status["reference"]["pageNumbers"] == [5]
-    assert "faded" not in status["description"] and "blurred" not in status["description"]
-    assert sorted(_gate_tasks(journey)) == ["PC_PAGE_QUALITY_REJECTED", "PC_UPLOAD_STATUS"]
+    # The file's "Document to resubmit" task (2026-10-21) speaks only of the
+    # page that failed otherwise: a refused page never has two tasks.
+    resubmit = _task(journey, f"resubmit:{journey.journey_id}:{batch}")
+    assert resubmit["task_type"] == "DOCUMENT_RESUBMIT"
+    assert resubmit["title"] == "packet.pdf: 1 page to resubmit"
+    assert resubmit["reference"]["pageNumbers"] == [5]
+    assert "faded" not in resubmit["description"] and "blurred" not in resubmit["description"]
+    assert _task(journey, f"upload-status:{journey.journey_id}:{batch}") is None
+    assert sorted(_gate_tasks(journey)) == ["DOCUMENT_RESUBMIT", "PC_PAGE_QUALITY_REJECTED"]
 
     # One refused page is read after all: the task names only the others.
     _page_status(journey, pages[1]["queue_id"], "READY")
@@ -282,13 +285,16 @@ def test_moving_from_the_old_status_task_keeps_the_refused_page_covered(journey)
     """Review of #479: a status task raised by the old code for a file whose
     only failed page was refused for quality closes, and in the same pass
     the quality task opens -- the gate is never left uncovered."""
-    from audit_core.uc03_p2_task_producer import _failed_pages_text, raise_or_refresh
+    from audit_core.uc03_p2_task_producer import raise_or_refresh
 
     batch, pages = add_batch_pages(journey, [("booking_form", "READY"), (None, "QUEUED")])
     _fail(journey, pages[1]["queue_id"], "DI_QUALITY_IMAGE_BLUR_SCORE")
     _batch_status(journey, batch, "PARTIAL_FAILURE")
     _unrelated_upload(journey)
-    old_title, old_text = _failed_pages_text("packet.pdf", ["2|DI_QUALITY_IMAGE_BLUR_SCORE"], [2], None)
+    # The wording the code before 2026-10-21 left on file.
+    old_title = "packet.pdf: 1 page rejected at upload"
+    old_text = ("Rejected by the scan-quality check and not read: Page 2 is blurred. Scan it again in good light, "
+                "flat and in focus, and upload from Upload / Edit Documents.")
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         raise_or_refresh(  # what the code before this change left on file
@@ -313,6 +319,7 @@ def test_a_file_with_only_refused_pages_has_no_status_task(journey):
     _batch_status(journey, batch, "FAILED")
     _sync(journey)
     assert _task(journey, f"upload-status:{journey.journey_id}:{batch}") is None
+    assert _task(journey, f"resubmit:{journey.journey_id}:{batch}") is None  # never two tasks for one page
     assert _task(journey, f"upload-quality:{journey.journey_id}:{batch}")["task_status"] == "READY"
 
 

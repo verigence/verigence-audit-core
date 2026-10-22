@@ -146,7 +146,8 @@ def test_a_page_that_failed_otherwise_can_be_removed_too(journey):
     _fail(journey, pages[1]["queue_id"], "DOCUMENT_AI_RESPONSE_INVALID")
     _sql(journey, "UPDATE auditcore.p2_upload_batches SET batch_status='PARTIAL_FAILURE' WHERE batch_id=:b", b=batch)
     _sync(journey)
-    key = f"upload-status:{journey.journey_id}:{batch}"
+    # Since 2026-10-21 a page that failed otherwise raises "Document to resubmit".
+    key = f"resubmit:{journey.journey_id}:{batch}"
     assert _task(journey, key)["task_status"] == "READY"
     assert _remove(journey, pages[1]["queue_id"], reason="Uploaded again on its own").status_code == 200
     task = _task(journey, key)
